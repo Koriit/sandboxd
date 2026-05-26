@@ -34,3 +34,4 @@ pub mod error;
 pub mod events_http;
 pub mod policy_http;
 pub mod propagation;
+pub mod proxy_http;

@@ -785,6 +785,39 @@ impl LimaManager {
         )))
     }
 
+    /// Resolve a session's per-VM SSH port via `limactl list --json`.
+    ///
+    /// Reads the `sshLocalPort` field on the entry matching
+    /// `sandbox-{session_id}` — the host-side TCP port Lima forwards to
+    /// the in-VM sshd's port 22. Used by the daemon's
+    /// `GET /sessions/{id}/proxy` handler to dial `127.0.0.1:<port>`
+    /// for byte-forwarding to the in-VM sshd.
+    ///
+    /// Returns `None` if the entry exists but Lima has not assigned a
+    /// port yet (typical for VMs in `Stopped` status). Returns an error
+    /// if the VM is not registered at all.
+    ///
+    /// Synchronous shell-out per the project convention: this is a
+    /// short one-shot probe and is invoked from `spawn_blocking` on the
+    /// async side. The long-lived byte pumps in the proxy handler
+    /// follow a different convention (see the async-I/O carve-out in
+    /// the cross-user CLI access spec § Architecture → Async I/O note).
+    pub fn ssh_local_port_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<u16>, SandboxError> {
+        let vms = self.list_vms_raw()?;
+        let target = vm_name(session_id);
+        for entry in vms {
+            if entry.name.as_deref() == Some(target.as_str()) {
+                return Ok(entry.ssh_local_port);
+            }
+        }
+        Err(SandboxError::Lima(format!(
+            "VM {target} not found in limactl list"
+        )))
+    }
+
     /// List all sandbox-prefixed VMs known to Lima.
     pub fn list_vms(&self) -> Result<Vec<VmInfo>, SandboxError> {
         let entries = self.list_vms_raw()?;
@@ -2057,6 +2090,14 @@ struct LimactlListEntry {
     name: Option<String>,
     #[serde(rename = "status", alias = "Status")]
     status: Option<String>,
+    /// Host-side TCP port Lima forwards to the VM's port 22 — Lima's
+    /// documented machine-readable surface (`sshLocalPort`). Stable
+    /// across Lima minor versions per the cross-user CLI access spec's
+    /// proxy endpoint design. Optional because the field is absent when
+    /// the VM is `Stopped`; the daemon's proxy handler dials
+    /// `127.0.0.1:<port>` only on running VMs.
+    #[serde(rename = "sshLocalPort", alias = "SSHLocalPort", default)]
+    ssh_local_port: Option<u16>,
 }
 
 /// Parse the NDJSON output of `limactl list --json`.
@@ -2930,6 +2971,23 @@ mod tests {
 
         let entries = parse_limactl_list_output("  \n  \n").unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// `sshLocalPort` is the host-side TCP port Lima forwards to the
+    /// in-VM sshd's port 22. The cross-user CLI access proxy handler
+    /// dials `127.0.0.1:<sshLocalPort>` to byte-forward into the
+    /// session's sshd, so the parser must capture the field reliably.
+    /// Lima omits the field on `Stopped` VMs — the parser must accept
+    /// that case as `None` rather than failing.
+    #[test]
+    fn test_parse_ssh_local_port() {
+        let output = r#"{"name":"sandbox-aaaabbbbccc1","status":"Running","sshLocalPort":60022}
+{"name":"sandbox-aaaabbbbccc2","status":"Stopped"}
+"#;
+        let entries = parse_limactl_list_output(output).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].ssh_local_port, Some(60022));
+        assert_eq!(entries[1].ssh_local_port, None);
     }
 
     #[test]

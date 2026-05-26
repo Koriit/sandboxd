@@ -18,7 +18,14 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 async-trait = "0.1"
-axum = "0.8"
+# `ws` enables `axum::extract::ws::WebSocketUpgrade` so the daemon's
+# `GET /sessions/{id}/proxy` endpoint can perform the standard
+# HTTP-to-WebSocket upgrade handshake over the unix socket. The
+# transitive `tokio-tungstenite` dependency that pulls in is the same
+# library every other Rust WebSocket implementation in the ecosystem
+# wraps; choosing the built-in axum surface avoids introducing a
+# parallel WebSocket library.
+axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 enumset = { version = "1", features = ["serde"] }

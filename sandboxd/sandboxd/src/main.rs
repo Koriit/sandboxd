@@ -1310,6 +1310,7 @@ fn app(state: Arc<AppState>) -> Router {
         )
         .route("/sessions/{id}/health", get(session_health))
         .route("/sessions/{id}/ssh-config", get(get_ssh_config))
+        .route("/sessions/{id}/proxy", get(get_proxy))
         .route("/rebuild-image", post(rebuild_image))
         .route("/base-image-status", get(base_image_status))
         .route("/health", get(health_check))
@@ -6535,6 +6536,45 @@ async fn get_ssh_config(
         private_key,
     };
     (StatusCode::OK, Json(dto)).into_response()
+}
+
+/// `GET /sessions/{id}/proxy` — WebSocket byte mover into the
+/// session's sshd.
+///
+/// Implements the cross-user CLI access spec § Daemon API → `GET
+/// /sessions/{id}/proxy`. The handler:
+///
+/// 1. Looks up the session under the calling operator (per-caller
+///    isolation; a foreign-owner session reads as 404, identical to a
+///    truly non-existent id).
+/// 2. Performs the HTTP-to-WebSocket upgrade (axum's built-in `ws`
+///    feature; binary frames only — SSH does its own multiplexing
+///    inside the tunnel, so we deliberately do not adopt the
+///    Kubernetes channel-id-prefix framing).
+/// 3. Bidirectionally byte-pipes the WebSocket payload with the
+///    session's sshd transport per backend (see
+///    [`sandboxd::proxy_http`]).
+///
+/// The long-lived byte pumps in [`sandboxd::proxy_http`] deliberately
+/// use `tokio::process::Command` with async pipes rather than the
+/// project's standard `std::process::Command` + `spawn_blocking`
+/// pattern — see the inline carve-out comment in that module for the
+/// rationale. The one-shot `limactl list` probe used for the Lima
+/// `sshLocalPort` discovery follows the standard convention.
+async fn get_proxy(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+    Path(id): Path<String>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    let proxy_state = Arc::new(sandboxd::proxy_http::ProxyState {
+        store: Arc::clone(&state.store),
+        lima: Arc::clone(state.lima_runtime.manager()),
+    });
+    match sandboxd::proxy_http::handle_proxy(proxy_state, operator.name, id, ws).await {
+        Ok(resp) => resp.into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Read the daemon's Lima-managed SSH private key from

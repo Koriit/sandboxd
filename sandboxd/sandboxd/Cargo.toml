@@ -19,6 +19,13 @@ axum-extra = { version = "0.10", features = ["query"] }
 # line async code.  Alternative is hand-rolling `futures::stream::unfold`,
 # which costs ~20 extra lines and obscures the ordering contract.
 async-stream = "0.3"
+# `futures-util::StreamExt` lets the WebSocket-to-byte-stream adapter
+# in `proxy_http` call `.next()` on `axum::extract::ws::WebSocket`
+# (which implements `futures::Stream`, not `tokio`'s native shape).
+# Already a transitive dep via axum; the direct line just makes the
+# import legible. Default features are off because we only need the
+# stream extension traits, not the executor / I/O reexports.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # The follow streaming path stamps synthetic
 # `lifecycle.ring_buffer_lag` JSONL lines with an RFC-3339 UTC
 # timestamp.  chrono was already a dev-dep; promoted to a direct dep
@@ -84,4 +91,11 @@ http-body-util = { workspace = true }
 refinery.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
+# `tokio-tungstenite` is the WebSocket client the proxy integration
+# test uses to drive a real WebSocket against the `axum`-served
+# `GET /sessions/{id}/proxy` endpoint. The same version axum's `ws`
+# feature pulls transitively (0.29.x), pinned here so the dev-dep
+# graph is self-documenting. Default features are off because we only
+# need the plain ws:// client — no TLS, no native-tls plumbing.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 tower = { version = "0.5", features = ["util"] }
