@@ -1862,6 +1862,46 @@ def _read_log_window(path: Path, start_offset: int) -> tuple[str, int, int]:
     return ("\n".join(lines), effective_start, end)
 
 
+def _dump_journalctl_for_test_window(
+    service: str, since: str, fallback_lines: int = 200
+) -> str:
+    """Return the ``journalctl -u <service>`` output for a given window.
+
+    Used by the dump-on-failure fixture in ``sandbox-systemd`` mode to
+    extract just the lines logged during the test that just failed,
+    rather than every line since boot. Falls back to the last
+    ``fallback_lines`` lines if ``--since`` produces nothing (e.g. very
+    short tests that didn't emit anything within the window).
+
+    Best-effort: returns a descriptive placeholder if ``journalctl`` is
+    not available or the sudo probe denies access; never raises.
+    """
+    try:
+        cp = subprocess.run(
+            ["sudo", "-n", "journalctl", "-u", service,
+             f"--since={since}", "--no-pager"],
+            capture_output=True, text=True, timeout=15,
+        )
+        text = cp.stdout
+        if not text.strip():
+            # Empty window — fall back to a small tail so we still get
+            # *something* actionable. ``-n N`` is unioned with
+            # ``--since=`` so we explicitly drop the latter for the
+            # fallback.
+            cp_tail = subprocess.run(
+                ["sudo", "-n", "journalctl", "-u", service,
+                 f"-n", str(fallback_lines), "--no-pager"],
+                capture_output=True, text=True, timeout=15,
+            )
+            text = (
+                "(no entries since test start; falling back to last "
+                f"{fallback_lines} lines)\n{cp_tail.stdout}"
+            )
+        return text
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return f"(journalctl unavailable: {exc!r})"
+
+
 @pytest.fixture(autouse=True)
 def _dump_daemon_log_on_failure(request, sandbox_daemon):
     """Print the per-test window of sandboxd's stderr+stdout on failure.
@@ -1873,13 +1913,26 @@ def _dump_daemon_log_on_failure(request, sandbox_daemon):
     ``test_daemon_restart_recovery``, which deliberately writes to the
     same log paths).
 
+    Under ``SANDBOX_HARNESS=sandbox-systemd`` the daemon's output goes to
+    the systemd journal, *not* the per-session log files: those files
+    exist as zero-byte placeholders just so the offset book-keeping
+    above is uniform across harnesses. To make systemd failures
+    debuggable we additionally dump ``journalctl --since=<test start>``
+    for the test unit on failure. The journal window is anchored to the
+    pre-yield timestamp captured here so the dump shows exactly the
+    lines emitted during the failing test body, mirroring the file-log
+    window behaviour for the other harnesses.
+
     Driven by the per-phase outcome stashed by ``pytest_runtest_makereport``.
     Only fires when ``rep_call`` (the test body) failed — setup/teardown
     failures get reported separately and rarely correlate with daemon logs.
 
-    The window is capped at ``_DUMP_MAX_LINES`` / ``_DUMP_MAX_BYTES`` from
-    the tail with a ``(truncated)`` marker; if the file shrank during the
-    test (rotation), the dump falls back to reading from offset 0.
+    The file window is capped at ``_DUMP_MAX_LINES`` / ``_DUMP_MAX_BYTES``
+    from the tail with a ``(truncated)`` marker; if the file shrank
+    during the test (rotation), the dump falls back to reading from
+    offset 0. The journalctl window has no analogous cap because
+    journalctl itself bounds output, but we apply a 15 s subprocess
+    timeout so a stuck journald daemon cannot hang teardown.
 
     Depends on ``sandbox_daemon`` (session-scoped) so every test that uses
     a daemon — directly or transitively — gets the dump for free. Tests
@@ -1892,9 +1945,30 @@ def _dump_daemon_log_on_failure(request, sandbox_daemon):
         key: _capture_log_offset(sandbox_daemon[key])
         for _, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log"))
     }
+    # journalctl --since= accepts the "YYYY-MM-DD HH:MM:SS" format
+    # (local time) directly; we snapshot it pre-yield so the post-test
+    # dump targets exactly the test's wall-clock window.
+    journal_since = time.strftime("%Y-%m-%d %H:%M:%S")
     yield
     rep = getattr(request.node, "rep_call", None)
     if rep is None or not rep.failed:
+        return
+    harness = sandbox_daemon.get("_harness", "test-user")
+    if harness == "sandbox-systemd":
+        # The file-log windows under systemd are zero-byte placeholders
+        # (the daemon's output is routed to the journal, not those
+        # files). Emitting them anyway is just noise; jump straight to
+        # the journalctl dump.
+        journal = _dump_journalctl_for_test_window(
+            _SANDBOXD_TEST_SERVICE, journal_since,
+        )
+        print(
+            f"\n=== sandboxd journalctl "
+            f"(unit={_SANDBOXD_TEST_SERVICE}, --since={journal_since!r}) ===\n"
+            f"{journal}\n"
+            f"=== end sandboxd journalctl ===\n",
+            file=sys.stderr,
+        )
         return
     for label, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log")):
         path = sandbox_daemon[key]
