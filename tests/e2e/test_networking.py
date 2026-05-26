@@ -39,7 +39,7 @@ from conftest import (
     gateway_container_name,
     make_create_args,
     parse_session_id,
-    wait_for_daemon_ready,
+    restart_test_daemon,
     wait_for_state,
     write_policy_file,
 )
@@ -927,9 +927,17 @@ def test_concurrent_sessions(sandbox_cli):
 def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, backend):
     """Create a session, kill the daemon, restart it, verify the session
     is recovered and functional.
+
+    Restart mechanics are harness-aware via :func:`restart_test_daemon`:
+    under ``sandbox-systemd`` the restart routes through ``systemctl
+    start`` and re-uses the existing :class:`_SystemdDaemonHandle`;
+    under ``test-user`` / ``sandbox-sudo`` the restart spawns a fresh
+    ``subprocess.Popen`` and we swap it into ``sandbox_daemon["process"]``
+    on the way out.
     """
     session_id = None
-    restarted_proc = None
+    restarted_handle = None
+    handed_off = False
     try:
         # 1. Create a session.
         result = sandbox_cli(
@@ -943,11 +951,10 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "net-daemon-test", "Running", timeout=10)
 
-        # 2. Kill the daemon process.
+        # 2. Kill the daemon process. Works on both Popen and
+        #    _SystemdDaemonHandle (the latter routes the signal through
+        #    ``systemctl kill -s SIGKILL``).
         daemon_proc = sandbox_daemon["process"]
-        socket_path = sandbox_daemon["socket"]
-        base_dir = sandbox_daemon["base_dir"]
-
         daemon_proc.send_signal(signal.SIGKILL)
         daemon_proc.wait(timeout=10)
         assert daemon_proc.poll() is not None, "Daemon did not die after SIGKILL"
@@ -958,38 +965,7 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
         # 3. Restart the daemon with the same socket and base-dir.
         #    The daemon should reconcile state from the session store and
         #    Lima VM inventory on startup.
-        #
-        #    Redirect stdout/stderr to the existing daemon log files so the
-        #    restarted daemon doesn't deadlock on a full pipe buffer once the
-        #    session-scoped fixture adopts it for the rest of the suite.
-        stdout_log = sandbox_daemon["_stdout_log"]
-        stderr_log = sandbox_daemon["_stderr_log"]
-        new_stdout_fh = open(stdout_log, "a")
-        new_stderr_fh = open(stderr_log, "a")
-        restarted_proc = subprocess.Popen(
-            [
-                str(sandbox_binaries.sandboxd),
-                "--socket", socket_path,
-                "--base-dir", base_dir,
-            ],
-            stdout=new_stdout_fh,
-            stderr=new_stderr_fh,
-        )
-
-        # Wait for the restarted daemon to accept connections.
-        try:
-            wait_for_daemon_ready(socket_path, restarted_proc, 15)
-        except BaseException:
-            if restarted_proc.poll() is None:
-                restarted_proc.kill()
-            new_stdout_fh.close()
-            new_stderr_fh.close()
-            print(
-                f"Restarted daemon failed to start.\n"
-                f"stdout: {stdout_log.read_text()}\n"
-                f"stderr: {stderr_log.read_text()}"
-            )
-            raise
+        restarted_handle = restart_test_daemon(sandbox_daemon, sandbox_binaries)
 
         # Allow time for reconciliation (gateway restart, network restoration).
         time.sleep(5)
@@ -1024,46 +1000,40 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
 
         # 7. Hand the restarted daemon back to the session-scoped fixture so
         #    subsequent tests (and fixture teardown) use the live process.
-        sandbox_daemon["process"] = restarted_proc
-        sandbox_daemon["_stdout_fh"] = new_stdout_fh
-        sandbox_daemon["_stderr_fh"] = new_stderr_fh
-        restarted_proc = None  # prevent finally from killing it
+        sandbox_daemon["process"] = restarted_handle
+        if hasattr(restarted_handle, "_sandbox_stdout_fh"):
+            sandbox_daemon["_stdout_fh"] = restarted_handle._sandbox_stdout_fh
+            sandbox_daemon["_stderr_fh"] = restarted_handle._sandbox_stderr_fh
+        handed_off = True
 
     finally:
         if session_id is not None:
             sandbox_cli("rm", "net-daemon-test", timeout=120)
 
-        # Ensure a live daemon exists for subsequent tests.  If the handoff
-        # already happened (restarted_proc is None), the fixture is fine.
-        # Otherwise we need to either adopt the restarted proc or start a
-        # fresh one so the session-scoped daemon isn't left dead.
-        if restarted_proc is not None:
-            if restarted_proc.poll() is None:
-                # Restarted daemon is alive but wasn't handed off — adopt it.
-                sandbox_daemon["process"] = restarted_proc
-            else:
-                # Restarted daemon also died.  Start a fresh one.
-                restarted_proc = None  # fall through to recovery below
+        # Ensure a live daemon exists for subsequent tests. If the
+        # handoff already happened the fixture is fine. Otherwise
+        # either adopt the restarted handle or start a fresh one.
+        if not handed_off and restarted_handle is not None:
+            if restarted_handle.poll() is None:
+                # Restarted daemon is alive but wasn't handed off — adopt.
+                sandbox_daemon["process"] = restarted_handle
+                if hasattr(restarted_handle, "_sandbox_stdout_fh"):
+                    sandbox_daemon["_stdout_fh"] = (
+                        restarted_handle._sandbox_stdout_fh
+                    )
+                    sandbox_daemon["_stderr_fh"] = (
+                        restarted_handle._sandbox_stderr_fh
+                    )
+                handed_off = True
 
-        # If the daemon (original or restarted) is dead, start a fresh one
-        # so subsequent tests don't cascade-fail.  Redirect output to the
-        # existing log files (see comment in step 3 for rationale).
+        # If the daemon is dead, start a fresh one via the harness-aware
+        # restart helper so subsequent tests don't cascade-fail.
         if sandbox_daemon["process"].poll() is not None:
-            fresh_stdout_fh = open(sandbox_daemon["_stdout_log"], "a")
-            fresh_stderr_fh = open(sandbox_daemon["_stderr_log"], "a")
-            fresh_proc = subprocess.Popen(
-                [
-                    str(sandbox_binaries.sandboxd),
-                    "--socket", sandbox_daemon["socket"],
-                    "--base-dir", sandbox_daemon["base_dir"],
-                ],
-                stdout=fresh_stdout_fh,
-                stderr=fresh_stderr_fh,
-            )
-            wait_for_daemon_ready(sandbox_daemon["socket"], fresh_proc, 15)
-            sandbox_daemon["process"] = fresh_proc
-            sandbox_daemon["_stdout_fh"] = fresh_stdout_fh
-            sandbox_daemon["_stderr_fh"] = fresh_stderr_fh
+            fresh_handle = restart_test_daemon(sandbox_daemon, sandbox_binaries)
+            sandbox_daemon["process"] = fresh_handle
+            if hasattr(fresh_handle, "_sandbox_stdout_fh"):
+                sandbox_daemon["_stdout_fh"] = fresh_handle._sandbox_stdout_fh
+                sandbox_daemon["_stderr_fh"] = fresh_handle._sandbox_stderr_fh
 
 
 @pytest.mark.timeout(600)

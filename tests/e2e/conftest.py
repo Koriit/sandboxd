@@ -797,13 +797,14 @@ class _SystemdDaemonHandle:
     terms of ``systemctl`` commands so existing test code that pokes
     ``sandbox_daemon["process"]`` keeps working without change.
 
-    ``test_daemon_restart_recovery`` in ``test_networking.py`` and the
-    matching test in ``test_lite.py`` swap the ``process`` entry for a
-    fresh ``Popen`` mid-test; under the systemd harness those tests
-    will need to be reworked to drive ``systemctl restart`` instead.
-    Out of scope for the cross-user harness rollout — see the Phase-1
-    acceptance set in the spec; this shim documents the API delta so
-    the rework is mechanical.
+    The restart-recovery e2e tests use :func:`restart_test_daemon` to
+    drive a harness-aware "kill the daemon, restart, hand it back to the
+    session-scoped fixture" workflow. Under the systemd harness that
+    routes through ``systemctl kill`` + ``systemctl start`` on this same
+    handle (no ``Popen`` swap); under the test-user / sandbox-sudo
+    harnesses it produces a fresh ``Popen``. Tests should not poke at
+    ``systemctl`` directly — call :func:`restart_test_daemon` and let it
+    dispatch on ``sandbox_daemon["_harness"]``.
     """
 
     def __init__(self, service: str):
@@ -847,13 +848,62 @@ class _SystemdDaemonHandle:
             self._returncode = 0
 
     def kill(self) -> None:
+        # ``--kill-who=main`` to match :py:meth:`subprocess.Popen.kill`
+        # — only the daemon process receives SIGKILL, not the cgroup
+        # (see send_signal() for the full rationale).
         if self.poll() is None:
             subprocess.run(
-                ["sudo", "-n", "systemctl", "kill", "-s", "SIGKILL",
+                ["sudo", "-n", "systemctl", "kill",
+                 "--kill-who=main", "-s", "SIGKILL",
                  self._service],
                 capture_output=True, timeout=30,
             )
             self._returncode = -9
+
+    def send_signal(self, sig: int) -> None:
+        """Send ``sig`` to the unit's main process via ``systemctl kill``.
+
+        Implements the same surface as :py:meth:`subprocess.Popen.send_signal`
+        so the restart-recovery tests can ``daemon_proc.send_signal(SIGKILL)``
+        on either flavour of handle without branching. ``systemctl kill``
+        accepts the signal name (``SIGKILL``, ``SIGTERM``, ...) or the
+        numeric form; we translate from the Python ``signal.SIG*``
+        integer to a name for clarity in ``journalctl``.
+
+        ``--kill-who=main`` is load-bearing: without it ``systemctl
+        kill`` defaults to ``--kill-who=cgroup``, which delivers the
+        signal to *every* process in the unit's cgroup — including the
+        daemon's children (``limactl``, ``qemu-system-x86_64``, ``ssh``
+        forwarders, ...). The restart-recovery tests are reproducing
+        an abrupt daemon crash where the VM is expected to *survive*
+        the kill and be recovered as Running after the daemon comes
+        back; a cgroup-wide SIGKILL would also tear down QEMU and
+        defeat that contract. ``--kill-who=main`` matches the kernel
+        semantics of :py:meth:`subprocess.Popen.send_signal` — only
+        the parent process receives the signal.
+
+        Does *not* eagerly set ``_returncode`` — we leave that to the
+        next ``poll()`` / ``wait()`` call, which queries ``systemctl
+        show`` for the actual ``ExecMainStatus``. Setting it eagerly
+        here would race with the kernel: ``systemctl kill`` only
+        guarantees the signal has been *delivered* by the time it
+        returns, not that the unit has transitioned to inactive.
+        """
+        if self.poll() is not None:
+            return
+        # Translate the int to its canonical SIG* name when possible;
+        # fall back to the integer for exotic signals.
+        try:
+            import signal as _sig
+            sig_name = _sig.Signals(sig).name
+        except (ValueError, ImportError):
+            sig_name = str(int(sig))
+        subprocess.run(
+            ["sudo", "-n", "systemctl", "kill",
+             "--kill-who=main", "-s", sig_name,
+             self._service],
+            capture_output=True, timeout=30,
+        )
 
     def wait(self, timeout: float | None = None) -> int:
         deadline = (
@@ -865,6 +915,16 @@ class _SystemdDaemonHandle:
                 raise subprocess.TimeoutExpired(self._service, timeout)
             time.sleep(0.1)
         return self._returncode if self._returncode is not None else 0
+
+    def reset_for_restart(self) -> None:
+        """Forget the cached exit status so the next ``poll()`` re-evaluates
+        the live unit.
+
+        Called by :func:`restart_test_daemon` after re-starting the unit
+        via ``systemctl start``; without this the handle would still
+        report the pre-kill exit code.
+        """
+        self._returncode = None
 
     @property
     def returncode(self) -> int | None:
@@ -990,6 +1050,18 @@ def _write_systemd_drop_in(
         # and the test fails with a clear "daemon exited" diagnostic
         # rather than mysteriously coming back up.
         Restart=no
+        # ``KillMode=process`` so a ``systemctl kill`` (and the
+        # eventual main-process exit it triggers) leaves the daemon's
+        # children alone — most importantly QEMU and limactl
+        # forwarders that own per-session VMs. The default
+        # ``KillMode=control-group`` would propagate SIGTERM/SIGKILL
+        # to every process in the cgroup once the main process dies,
+        # which the restart-recovery tests cannot tolerate: they
+        # SIGKILL the daemon and then assert the surviving VM is
+        # recovered as Running once the daemon comes back up.
+        # Matches the semantics of ``Popen.send_signal`` /
+        # ``Popen.kill`` from the legacy test-user harness.
+        KillMode=process
         """
     )
     # Stage to a tempfile in /tmp the operator can write, then
@@ -1387,6 +1459,158 @@ def _launch_daemon_as_test_user(
         "_stderr_log": stderr_log,
         "_harness": "test-user",
     }
+
+
+def restart_test_daemon(
+    sandbox_daemon: dict,
+    sandbox_binaries: SandboxBinaries,
+    *,
+    ready_timeout: float = 15,
+) -> "subprocess.Popen | _SystemdDaemonHandle":
+    """Harness-aware "restart the daemon mid-test" helper.
+
+    Used by the restart-recovery e2e tests (``test_networking::
+    test_daemon_restart_recovery``, ``test_lite::
+    test_lite_orphan_cleanup_on_daemon_restart``, ``test_policy_persistence::
+    test_policy_persists_across_daemon_restart``). All three tests
+    SIGKILL the daemon first to assert state-reconciliation behaviour
+    that depends on no graceful shutdown happening; this helper handles
+    the *restart* leg and the in-place re-registration into
+    ``sandbox_daemon`` so the session-scoped fixture stays coherent.
+
+    Dispatch on ``sandbox_daemon["_harness"]``:
+
+    * **sandbox-systemd** — Re-start the unit via ``sudo systemctl
+      start <unit>``, reset the cached exit-code on the existing
+      :class:`_SystemdDaemonHandle`, wait for the socket to come back
+      up, and return the *same* handle (no swap). The session-scope
+      fixture's teardown closes ``info["_stdout_fh"]``/``_stderr_fh``
+      so we leave those alone — under systemd the daemon's output
+      goes to the journal anyway, and tests dumping logs on failure
+      should use :func:`journalctl_for_test_window` instead of the
+      log-file path.
+
+    * **sandbox-sudo** — Re-spawn the daemon as the ``sandbox`` user via
+      ``sudo -n -u sandbox sandboxd``, returning the fresh
+      :class:`subprocess.Popen`. Tests re-register it into
+      ``sandbox_daemon["process"]``.
+
+    * **test-user** — Re-spawn the daemon as the test process's own
+      user, returning the fresh ``Popen``. Identical to the legacy
+      Popen-swap pattern.
+
+    Callers are expected to register the returned handle into
+    ``sandbox_daemon["process"]`` before returning, so the session-
+    scoped teardown operates on the live daemon. The helper does not
+    do this automatically because the tests need the returned handle
+    accessible to their per-test cleanup ``finally`` blocks.
+    """
+    harness = sandbox_daemon.get("_harness", "test-user")
+    socket_path = sandbox_daemon["socket"]
+    base_dir = sandbox_daemon["base_dir"]
+
+    if harness == "sandbox-systemd":
+        handle = sandbox_daemon["process"]
+        if not isinstance(handle, _SystemdDaemonHandle):
+            pytest.fail(
+                "restart_test_daemon: harness=sandbox-systemd but "
+                f"sandbox_daemon['process'] is {type(handle).__name__}, "
+                "expected _SystemdDaemonHandle"
+            )
+        # Best-effort reset of any "failed" state from the SIGKILL the
+        # test issued; ``systemctl start`` on a unit in failed state
+        # without ``reset-failed`` will refuse to re-start.
+        subprocess.run(
+            ["sudo", "-n", "systemctl", "reset-failed",
+             _SANDBOXD_TEST_SERVICE],
+            capture_output=True, timeout=10,
+        )
+        start = subprocess.run(
+            ["sudo", "-n", "systemctl", "start", _SANDBOXD_TEST_SERVICE],
+            capture_output=True, text=True, timeout=30,
+        )
+        if start.returncode != 0:
+            journal = subprocess.run(
+                ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
+                 "--no-pager", "-n", "200"],
+                capture_output=True, text=True, timeout=15,
+            )
+            pytest.fail(
+                "restart_test_daemon: systemctl start failed (rc="
+                f"{start.returncode}).\nstdout: {start.stdout}\n"
+                f"stderr: {start.stderr}\njournal tail:\n{journal.stdout}"
+            )
+        handle.reset_for_restart()
+        # Use a per-handle _is_dead closure so the ready probe can
+        # surface a re-killed unit as a clean failure (mirrors
+        # _launch_daemon_as_sandbox_via_systemd).
+        def _is_dead() -> tuple[bool, str]:
+            rc = handle.poll()
+            if rc is None:
+                return (False, "")
+            journal = subprocess.run(
+                ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
+                 "--no-pager", "-n", "200"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+            return (True, f"unit exited rc={rc}; journal:\n{journal}")
+
+        _wait_for_daemon_socket(
+            Path(socket_path), _is_dead, ready_timeout,
+        )
+        return handle
+
+    # Non-systemd harnesses: spawn a fresh subprocess.Popen against the
+    # same socket and base-dir. Re-use the session-scope log files (the
+    # session teardown reads them via the existing `_stdout_log`/
+    # `_stderr_log` keys); append-mode so the per-test dump fixture's
+    # offset book-keeping still works.
+    stdout_log = sandbox_daemon["_stdout_log"]
+    stderr_log = sandbox_daemon["_stderr_log"]
+    new_stdout_fh = open(stdout_log, "a")
+    new_stderr_fh = open(stderr_log, "a")
+
+    argv: list[str]
+    daemon_env = os.environ.copy()
+    if harness == "sandbox-sudo":
+        argv = [
+            "sudo", "-n", "-u", "sandbox",
+            str(sandbox_binaries.sandboxd),
+            "--socket", str(socket_path),
+            "--base-dir", str(base_dir),
+        ]
+        daemon_env["SANDBOX_USERS_CONF"] = os.environ["SANDBOX_USERS_CONF"]
+        daemon_env["SANDBOX_BASE_VM_NAME"] = os.environ["SANDBOX_BASE_VM_NAME"]
+    else:
+        argv = [
+            str(sandbox_binaries.sandboxd),
+            "--socket", str(socket_path),
+            "--base-dir", str(base_dir),
+        ]
+
+    proc = subprocess.Popen(
+        argv,
+        env=daemon_env,
+        stdout=new_stdout_fh,
+        stderr=new_stderr_fh,
+    )
+
+    try:
+        wait_for_daemon_ready(socket_path, proc, ready_timeout)
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+        new_stdout_fh.close()
+        new_stderr_fh.close()
+        raise
+
+    # Stash the new file-handles on the proc itself so the test's
+    # finally-block can re-register them into sandbox_daemon alongside
+    # the new process handle. ``Popen`` objects accept attribute
+    # assignment.
+    proc._sandbox_stdout_fh = new_stdout_fh  # type: ignore[attr-defined]
+    proc._sandbox_stderr_fh = new_stderr_fh  # type: ignore[attr-defined]
+    return proc
 
 
 def _purge_sessions_via_api(socket_path: str) -> None:

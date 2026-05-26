@@ -53,7 +53,7 @@ from conftest import (
     cleanup_policy_file,
     make_create_args,
     parse_session_id,
-    wait_for_daemon_ready,
+    restart_test_daemon,
     wait_for_state,
     write_policy_file,
 )
@@ -204,11 +204,11 @@ def test_policy_survives_daemon_restart(
             context="pre-restart denied",
         )
 
-        # 4. SIGTERM the daemon and await graceful exit.
+        # 4. SIGTERM the daemon and await graceful exit. The handle's
+        #    ``send_signal`` works uniformly across Popen and
+        #    _SystemdDaemonHandle (the latter routes through
+        #    ``systemctl kill -s SIGTERM``).
         daemon_proc = sandbox_daemon["process"]
-        socket_path = sandbox_daemon["socket"]
-        base_dir = sandbox_daemon["base_dir"]
-
         daemon_proc.send_signal(signal.SIGTERM)
         try:
             daemon_proc.wait(timeout=15)
@@ -230,39 +230,9 @@ def test_policy_survives_daemon_restart(
         #    before reconcile_networking rebuilds the gateway; if it does
         #    not, the gateway will come back with allow-all DNS and step 7
         #    will wrongly observe the denied destination as reachable.
-        #
-        #    Append to the existing log files (same pattern as
-        #    test_networking::test_daemon_restart_recovery) so the
-        #    session-scoped fixture can adopt the restarted process
-        #    without ending up with a dangling pipe.
-        stdout_log = sandbox_daemon["_stdout_log"]
-        stderr_log = sandbox_daemon["_stderr_log"]
-        new_stdout_fh = open(stdout_log, "a")
-        new_stderr_fh = open(stderr_log, "a")
-        restarted_proc = subprocess.Popen(
-            [
-                str(sandbox_binaries.sandboxd),
-                "--socket", socket_path,
-                "--base-dir", base_dir,
-            ],
-            stdout=new_stdout_fh,
-            stderr=new_stderr_fh,
-        )
-
-        # Wait for the restarted daemon to accept connections.
-        try:
-            wait_for_daemon_ready(socket_path, restarted_proc, 15)
-        except BaseException:
-            if restarted_proc.poll() is None:
-                restarted_proc.kill()
-            new_stdout_fh.close()
-            new_stderr_fh.close()
-            print(
-                f"Restarted daemon failed to start.\n"
-                f"stdout: {stdout_log.read_text()}\n"
-                f"stderr: {stderr_log.read_text()}"
-            )
-            raise
+        #    Harness-aware: ``systemctl start`` under sandbox-systemd,
+        #    ``Popen`` swap under test-user / sandbox-sudo.
+        restarted_proc = restart_test_daemon(sandbox_daemon, sandbox_binaries)
 
         # 6. Allow reconciliation to finish (gateway restart + DNS
         #    propagation after the hydrated policy lands in the map).
@@ -305,9 +275,10 @@ def test_policy_survives_daemon_restart(
         #     so subsequent tests (and fixture teardown) operate on the
         #     live process.
         sandbox_daemon["process"] = restarted_proc
-        sandbox_daemon["_stdout_fh"] = new_stdout_fh
-        sandbox_daemon["_stderr_fh"] = new_stderr_fh
-        restarted_proc = None  # prevent finally from killing it
+        if hasattr(restarted_proc, "_sandbox_stdout_fh"):
+            sandbox_daemon["_stdout_fh"] = restarted_proc._sandbox_stdout_fh
+            sandbox_daemon["_stderr_fh"] = restarted_proc._sandbox_stderr_fh
+        restarted_proc = None  # prevent finally from re-adopting
 
     finally:
         if session_id is not None:
@@ -315,31 +286,27 @@ def test_policy_survives_daemon_restart(
         if policy_path is not None:
             cleanup_policy_file(policy_path)
 
-        # Recovery path mirrors test_networking::test_daemon_restart_recovery:
-        # the session-scoped sandbox_daemon fixture MUST end the test with
-        # a live daemon process, otherwise every subsequent test in the
-        # module will cascade-fail.
+        # Recovery path: the session-scoped sandbox_daemon fixture MUST
+        # end the test with a live daemon process, otherwise every
+        # subsequent test in the module will cascade-fail.
         if restarted_proc is not None:
             if restarted_proc.poll() is None:
                 # Alive but not yet handed off — adopt it.
                 sandbox_daemon["process"] = restarted_proc
+                if hasattr(restarted_proc, "_sandbox_stdout_fh"):
+                    sandbox_daemon["_stdout_fh"] = (
+                        restarted_proc._sandbox_stdout_fh
+                    )
+                    sandbox_daemon["_stderr_fh"] = (
+                        restarted_proc._sandbox_stderr_fh
+                    )
             else:
                 # Restarted daemon died too; fall through to recovery.
                 restarted_proc = None
 
         if sandbox_daemon["process"].poll() is not None:
-            fresh_stdout_fh = open(sandbox_daemon["_stdout_log"], "a")
-            fresh_stderr_fh = open(sandbox_daemon["_stderr_log"], "a")
-            fresh_proc = subprocess.Popen(
-                [
-                    str(sandbox_binaries.sandboxd),
-                    "--socket", sandbox_daemon["socket"],
-                    "--base-dir", sandbox_daemon["base_dir"],
-                ],
-                stdout=fresh_stdout_fh,
-                stderr=fresh_stderr_fh,
-            )
-            wait_for_daemon_ready(sandbox_daemon["socket"], fresh_proc, 15)
-            sandbox_daemon["process"] = fresh_proc
-            sandbox_daemon["_stdout_fh"] = fresh_stdout_fh
-            sandbox_daemon["_stderr_fh"] = fresh_stderr_fh
+            fresh_handle = restart_test_daemon(sandbox_daemon, sandbox_binaries)
+            sandbox_daemon["process"] = fresh_handle
+            if hasattr(fresh_handle, "_sandbox_stdout_fh"):
+                sandbox_daemon["_stdout_fh"] = fresh_handle._sandbox_stdout_fh
+                sandbox_daemon["_stderr_fh"] = fresh_handle._sandbox_stderr_fh

@@ -36,7 +36,7 @@ from conftest import (
     SandboxBinaries,
     cleanup_policy_file,
     parse_session_id,
-    wait_for_daemon_ready,
+    restart_test_daemon,
     wait_for_state,
     write_policy_file,
 )
@@ -701,17 +701,17 @@ def test_lite_orphan_cleanup_on_daemon_restart(
     )
 
     daemon_proc = sandbox_daemon["process"]
-    socket_path = sandbox_daemon["socket"]
     base_dir = sandbox_daemon["base_dir"]
     db_path = os.path.join(base_dir, "sessions.db")
 
-    restarted_proc = None
-    new_stdout_fh = None
-    new_stderr_fh = None
+    restarted_handle = None
+    handed_off = False
     try:
         # 1. SIGKILL the daemon. Abrupt — no graceful shutdown, so the
         #    daemon has no chance to remove the container/volume on the
         #    way out. This is the regime the orphan reaper exists for.
+        #    ``send_signal``/``wait``/``poll`` work uniformly across
+        #    Popen and _SystemdDaemonHandle.
         daemon_proc.send_signal(signal.SIGKILL)
         daemon_proc.wait(timeout=10)
         assert daemon_proc.poll() is not None, (
@@ -745,38 +745,9 @@ def test_lite_orphan_cleanup_on_daemon_restart(
             conn.close()
 
         # 3. Restart the daemon with the same socket and base-dir.
-        #    Append to the existing log files (mirrors
-        #    test_networking::test_daemon_restart_recovery) so the
-        #    fixture can adopt the restarted process without leaving a
-        #    dangling pipe behind.
-        stdout_log = sandbox_daemon["_stdout_log"]
-        stderr_log = sandbox_daemon["_stderr_log"]
-        new_stdout_fh = open(stdout_log, "a")
-        new_stderr_fh = open(stderr_log, "a")
-        restarted_proc = subprocess.Popen(
-            [
-                str(sandbox_binaries.sandboxd),
-                "--socket", socket_path,
-                "--base-dir", base_dir,
-            ],
-            stdout=new_stdout_fh,
-            stderr=new_stderr_fh,
-        )
-
-        # Wait for the restarted daemon to accept connections.
-        try:
-            wait_for_daemon_ready(socket_path, restarted_proc, 15)
-        except BaseException:
-            if restarted_proc.poll() is None:
-                restarted_proc.kill()
-            new_stdout_fh.close()
-            new_stderr_fh.close()
-            print(
-                f"Restarted daemon failed to start.\n"
-                f"stdout: {stdout_log.read_text()}\n"
-                f"stderr: {stderr_log.read_text()}"
-            )
-            raise
+        #    Harness-aware: ``systemctl start`` under sandbox-systemd,
+        #    ``Popen`` swap under test-user / sandbox-sudo.
+        restarted_handle = restart_test_daemon(sandbox_daemon, sandbox_binaries)
 
         # 4. Allow the boot-time orphan reaper to run. The reaper is
         #    invoked once during startup before `serve` starts handling
@@ -822,12 +793,11 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         #    fixture so subsequent tests (and fixture teardown) run
         #    against the live process. Without this handoff the rest
         #    of the suite cascade-fails on a dead socket.
-        sandbox_daemon["process"] = restarted_proc
-        sandbox_daemon["_stdout_fh"] = new_stdout_fh
-        sandbox_daemon["_stderr_fh"] = new_stderr_fh
-        restarted_proc = None  # prevent finally from killing it
-        new_stdout_fh = None
-        new_stderr_fh = None
+        sandbox_daemon["process"] = restarted_handle
+        if hasattr(restarted_handle, "_sandbox_stdout_fh"):
+            sandbox_daemon["_stdout_fh"] = restarted_handle._sandbox_stdout_fh
+            sandbox_daemon["_stderr_fh"] = restarted_handle._sandbox_stderr_fh
+        handed_off = True
 
     finally:
         # The lite_harness still tracks `sid` in its session list; the
@@ -836,43 +806,26 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         # gone), and the harness tolerates that branch — see
         # `LiteBackendHarness.rm`.
 
-        # Recovery path mirrors test_networking::test_daemon_restart_recovery:
-        # ensure the session-scoped fixture ends the test with a live
-        # daemon process. If our restart never made it that far (e.g. an
-        # assertion fired between SIGKILL and the handoff), spin up a
-        # fresh daemon so subsequent tests don't cascade-fail.
-        if restarted_proc is not None:
-            if restarted_proc.poll() is None:
-                # Alive but not yet handed off — adopt it.
-                sandbox_daemon["process"] = restarted_proc
-                sandbox_daemon["_stdout_fh"] = new_stdout_fh
-                sandbox_daemon["_stderr_fh"] = new_stderr_fh
-                restarted_proc = None
-                new_stdout_fh = None
-                new_stderr_fh = None
-            else:
-                # Restarted daemon died too — fall through to recovery.
-                if new_stdout_fh is not None and not new_stdout_fh.closed:
-                    new_stdout_fh.close()
-                if new_stderr_fh is not None and not new_stderr_fh.closed:
-                    new_stderr_fh.close()
-                restarted_proc = None
-                new_stdout_fh = None
-                new_stderr_fh = None
+        # Recovery path: the session-scoped sandbox_daemon fixture MUST
+        # end the test with a live daemon process. If our restart never
+        # made it that far (e.g. an assertion fired between SIGKILL and
+        # the handoff), spin up a fresh daemon so subsequent tests don't
+        # cascade-fail.
+        if not handed_off and restarted_handle is not None:
+            if restarted_handle.poll() is None:
+                sandbox_daemon["process"] = restarted_handle
+                if hasattr(restarted_handle, "_sandbox_stdout_fh"):
+                    sandbox_daemon["_stdout_fh"] = (
+                        restarted_handle._sandbox_stdout_fh
+                    )
+                    sandbox_daemon["_stderr_fh"] = (
+                        restarted_handle._sandbox_stderr_fh
+                    )
+                handed_off = True
 
         if sandbox_daemon["process"].poll() is not None:
-            fresh_stdout_fh = open(sandbox_daemon["_stdout_log"], "a")
-            fresh_stderr_fh = open(sandbox_daemon["_stderr_log"], "a")
-            fresh_proc = subprocess.Popen(
-                [
-                    str(sandbox_binaries.sandboxd),
-                    "--socket", sandbox_daemon["socket"],
-                    "--base-dir", sandbox_daemon["base_dir"],
-                ],
-                stdout=fresh_stdout_fh,
-                stderr=fresh_stderr_fh,
-            )
-            wait_for_daemon_ready(sandbox_daemon["socket"], fresh_proc, 15)
-            sandbox_daemon["process"] = fresh_proc
-            sandbox_daemon["_stdout_fh"] = fresh_stdout_fh
-            sandbox_daemon["_stderr_fh"] = fresh_stderr_fh
+            fresh_handle = restart_test_daemon(sandbox_daemon, sandbox_binaries)
+            sandbox_daemon["process"] = fresh_handle
+            if hasattr(fresh_handle, "_sandbox_stdout_fh"):
+                sandbox_daemon["_stdout_fh"] = fresh_handle._sandbox_stdout_fh
+                sandbox_daemon["_stderr_fh"] = fresh_handle._sandbox_stderr_fh
