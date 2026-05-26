@@ -3,6 +3,9 @@ Description=sandboxd — isolated environment broker
 Documentation=https://github.com/kontaktio/sandbox-daemon
 After=docker.service
 Wants=docker.service
+# StartLimitIntervalSec belongs in [Unit] (systemd ≥ 230); placing it in
+# [Service] generates a deprecation warning at unit-load time.
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -33,7 +36,6 @@ ExecStart=/usr/local/bin/sandboxd \
 # in 5 minutes (likely a config problem that won't fix itself).
 Restart=on-failure
 RestartSec=5s
-StartLimitIntervalSec=300
 StartLimitBurst=5
 
 # Hardening — each directive has a one-line rationale in § 4.2.
