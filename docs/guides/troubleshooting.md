@@ -58,7 +58,7 @@ systemctl --user status sandbox.slice     # Cgroup memory usage
 
 The default VM uses 4096 MB. The host needs about 3.8 GB free per session. Fix: create sessions with less memory (`sandbox create --memory 2048`) or increase host RAM.
 
-If `systemd-run` is not available, QEMU runs without cgroup limits and a memory-hungry guest can trigger the host OOM killer. Check with `command -v systemd-run`. Enable user sessions with `loginctl enable-linger $USER`.
+If `systemd-run` is not on `PATH` **or** the daemon's user-systemd bus is unreachable (the QEMU wrapper probes both before opting into the cgroup-limited path), QEMU runs without cgroup limits and a memory-hungry guest can trigger the host OOM killer. Check with `command -v systemd-run` and `sudo -u <daemon-user> systemctl --user show-environment`. Enable user sessions with `loginctl enable-linger <daemon-user>` so the user manager persists across logouts (in particular, the system user `sandbox` started by the production systemd unit has no active login session and therefore no user-bus by default).
 
 ## Gateway unhealthy
 

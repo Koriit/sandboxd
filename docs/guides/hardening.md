@@ -54,7 +54,7 @@ Each absent device (USB, sound, VGA) removes a category of device-emulation bugs
 
 ### Cgroup resource limits
 
-When `SANDBOX_QEMU_MEMORY_MB` and `SANDBOX_QEMU_CPUS` are set and `systemd-run` is available, the wrapper places QEMU in a transient `sandbox.slice` scope:
+When `SANDBOX_QEMU_MEMORY_MB` and `SANDBOX_QEMU_CPUS` are set and the user-systemd bus is reachable, the wrapper places QEMU in a transient `sandbox.slice` scope:
 
 | Limit | Default | Purpose |
 |---|---|---|
@@ -70,7 +70,7 @@ cat /proc/<pid>/cgroup
 systemctl --user status sandbox.slice
 ```
 
-If `systemd-run` is not available, the wrapper falls back to running QEMU directly — device lockdown still applies, but resource limits default to the kernel's baseline.
+If `systemd-run` is not on `PATH` **or** the daemon's user-systemd bus is not reachable (for example when the daemon runs as the `sandbox` system user via the production systemd unit and `loginctl enable-linger sandbox` has not been issued), the wrapper falls back to running QEMU directly — device lockdown still applies, but resource limits default to the kernel's baseline. To restore the cgroup-limited posture for a system-user daemon, run `loginctl enable-linger <daemon-user>` so the user manager persists across logouts.
 
 ### Seccomp is deliberately off
 
