@@ -438,6 +438,28 @@ Fix: install the missing client. Standard OpenSSH (`ssh`, `scp`) and `rsync` are
 
 Fix: this is usually a stale local SSH config combined with a daemon-side key rotation that the CLI's single-retry path did not pick up (e.g. the session was deleted and recreated under the same name out-of-band). Run `sandbox ls` once — its opportunistic reconcile pass will rewrite the `~/.ssh/sandbox/sandbox-<id>` entry to match the daemon's current keypair — then retry the original command.
 
+### Drift-recovery: stale `~/.ssh/sandbox/` entry
+
+**Symptom:** an `sandbox ssh <id>`, `sandbox cp`, `sandbox sync`, or `sandbox workspace push|pull` invocation prints `Permission denied (publickey)` on its first attempt, then the same command silently retries and succeeds — both attempts share the same parent process, so the operator sees the deny line followed (after a short pause) by the command's normal output.
+
+This is the **drift-recovery path** working as designed, not an error. The CLI keeps a per-session SSH config entry at `~/.ssh/sandbox/sandbox-<id>` and a matching private key at `~/.ssh/sandbox/sandbox-<id>.key`. When the daemon-side keypair has rotated past whatever the local entry carries (e.g. the session was deleted and recreated out-of-band, or another operator on the same host rotated it via `sandbox` plumbing), the first SSH attempt fails publickey auth. The CLI's outermost dispatch matches the locale-pinned `Permission denied (publickey)` substring on the spawned tool's stderr, re-fetches `/sessions/<id>/ssh-config` from the daemon, overwrites the on-disk entry with the fresh DTO, and re-spawns the underlying tool **once**. A second failure propagates the deny verbatim with the conventional SSH fatal-error exit code (255), so the operator never sees a third attempt.
+
+The retry is intentionally **excluded from `sandbox proxy`** — that subcommand is the `ProxyCommand` shim invoked recursively from the operator's `~/.ssh/config` Include block, so wrapping it in drift recovery would let nested `git-remote-sandbox` calls stack retries. Drift recovery fires only at the outermost CLI dispatch.
+
+Both attempts' stderr is teed live to the operator's terminal, so the deny line on the first attempt is visible even when the retry succeeds. If you want to silence the visible deny, you can pre-emptively nuke the local cache and let the next invocation fetch a fresh entry:
+
+```bash
+# Drop the stale entry for one session (idempotent — missing files are silently ignored).
+rm -f ~/.ssh/sandbox/sandbox-<id> ~/.ssh/sandbox/sandbox-<id>.key
+
+# Or drop every per-session entry the CLI is currently caching.
+rm -f ~/.ssh/sandbox/sandbox-* ~/.ssh/sandbox/sandbox-*.key
+```
+
+The next `sandbox ssh`/`cp`/`sync`/`workspace` invocation re-creates the entry from the daemon's current view. `sandbox ls` also performs an opportunistic reconcile pass — running it once is the lightest-weight way to refresh every entry without removing files by hand.
+
+If the retry **also** fails (you see two `Permission denied (publickey)` lines before the command exits with 255), the daemon-side keypair is not what the operator's `authorized_keys` carry — most often because the session has been removed and the local entry is referencing a session id that no longer exists. Run `sandbox describe <id>` to confirm; on a missing session the daemon returns `404 Not Found` on the proxy endpoint and the CLI lazily cleans up the local entry on the very next `sandbox ssh`/`proxy` call.
+
 ### `sandbox sync` against a stopped session
 
 **Symptom:** rsync's `ssh` transport handshakes but the daemon returns close code `4001 BACKEND_UNAVAILABLE` on the WebSocket because the in-session sshd is not reachable; you'll see `Connection closed by remote host` from `ssh` followed by `rsync error: unexplained error (code 255) at ...`.

@@ -74,6 +74,26 @@ The lite container runs as the host operator's uid:gid. When the host uid is not
 
 The daemon does **not** use Docker user-namespace remapping (`--userns=...`). Userns-remap would force a chown on host files at mount time, which is destructive and surprising. The straightforward `--user` flag aligns the in-container uid to the host uid for the same observable effect, with no host-side filesystem mutation.
 
+## Bundled sshd
+
+The lite image bundles a small OpenSSH server that the lite container starts as part of its init sequence. It binds to `127.0.0.1:22` **inside the container's network namespace** and is never published to a host port — so a host-side `ss -tlnp` will never show it, and another lite session on the same host cannot collide with it.
+
+The daemon reaches this sshd through the same byte-mover endpoint operators talk to (`GET /sessions/<id>/proxy`, the WebSocket the `sandbox proxy` shim is wired into). The server-side ferry runs the equivalent of:
+
+```bash
+docker exec -i <container> socat - TCP:127.0.0.1:22
+```
+
+…and bidirectionally pipes the WebSocket frames against `socat`'s stdio. The session's sshd sees a normal TCP connection from inside its own loopback; the operator's `ssh sandbox-<id>` client sees a normal SSH connection through `ProxyCommand sandbox proxy <id>`. The Lima backend uses an analogous TCP-stream path against the VM's port-forwarded sshd; both backends converge on the same WebSocket so operator-side tooling (`sandbox ssh`, `sandbox cp`, `sandbox sync`, `git-remote-sandbox`, VS Code Remote-SSH, JetBrains Gateway) is backend-agnostic.
+
+The design picks **daemon-mediated proxy over host-port forwarding** for three concrete reasons:
+
+- **No host-port conflicts.** Multiple concurrent lite sessions on the same host would otherwise have to negotiate disjoint host ports (or accept that only one can bind `22`). With the in-container loopback the operator never thinks about port allocation; the session id is the only handle.
+- **The daemon owns reachability.** Authorization to reach a session's sshd is gated by `GET /sessions/<id>/proxy` (which returns `404 Not Found` when the caller is not the session's owner per `owner_username`). A host-published port would push authorization to the operator's firewall, which is not a place sandboxd controls.
+- **Same plumbing for both backends.** Lima sessions already use a WebSocket against an in-VM sshd; reusing the same shape for the lite backend means CLI tools, docs, and integration tests do not branch by backend.
+
+The cost is one extra hop (WebSocket-to-socat) in the SSH datapath. That hop is in-process for the daemon and uses tokio's async pipes for the long-lived byte pump, so the throughput penalty is on the order of one extra mmap; in practice it is invisible against the SSH cipher's own throughput ceiling.
+
 ## Prerequisites
 
 Lite mode requires Docker 24.0+ on the host. That is already a sandboxd prerequisite; see [Installation](/sandboxd/start/installation/) for the install steps. If you only intend to use lite mode and never spin up a Lima VM, the Lima/QEMU/KVM stack is not needed at runtime — but you still build the workspace via `make build`, which compiles every crate.

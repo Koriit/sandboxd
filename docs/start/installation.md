@@ -108,7 +108,7 @@ This is a known limitation, deliberately not mitigated in v1 — see [GitHub iss
 
 #### Dev install opt-out
 
-The dev install (`make setup-dev-env`) deliberately skips this shape: contributors run the daemon as their own user with state under `~/.local/share/sandboxd/`. See [Developer install](#developer-install-make-setup-dev-env) below.
+The dev install (`make setup-dev-env`) deliberately skips the daemon-owning side of this shape: contributors run the daemon as their own user with state under `~/.local/share/sandboxd/`. The `sandbox` system user is still created (the e2e harness launches the daemon as `sandbox` to exercise the cross-user split that production runs by default) — see `make setup-sandbox-user` under [`sandbox` system user and operator group membership](#sandbox-system-user-and-operator-group-membership) for the dev-mode equivalent of `install.sh` Step 12, and [Developer install](#developer-install-make-setup-dev-env) for the full walkthrough.
 
 ### Trust chain
 
