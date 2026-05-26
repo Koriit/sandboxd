@@ -56,9 +56,9 @@ use tokio::process::Command as TokioCommand;
 use tracing::{debug, error, info, warn};
 
 /// WebSocket close codes the daemon uses to signal structured failure
-/// to the CLI shim. The CLI (M18-S5) matches on these so it can render
-/// operator-actionable messages and (for the not-found case) clean up
-/// stale local entries.
+/// to the CLI shim. The CLI (`sandbox-cli::proxy`) matches on these so
+/// it can render operator-actionable messages on top of the generic
+/// SSH-disconnect path.
 ///
 /// We use the IANA-reserved private range (4000-4999) for application-
 /// specific codes so we do not collide with RFC 6455 standard codes
@@ -141,8 +141,8 @@ impl axum::response::IntoResponse for ProxyHttpError {
 
 /// Run the per-backend byte pump until either side closes. On error
 /// (backend dial failure, mid-stream backend exit, etc.) close the
-/// WebSocket with a structured code from [`close_codes`] so M18-S5's
-/// CLI can render a useful diagnostic.
+/// WebSocket with a structured code from [`close_codes`] so the CLI
+/// shim (`sandbox-cli::proxy`) can render a useful diagnostic.
 async fn run_proxy(socket: WebSocket, session: Session, lima: Arc<LimaManager>) {
     let session_id = session.id;
     match session.backend {

@@ -14,24 +14,35 @@
 //! # Wire-format commitment
 //!
 //! The subcommand name (`proxy`) and its single positional argument
-//! (`<id>`) are treated as wire format from M18-S5 onward — the daemon-
-//! emitted SSH config block carries `ProxyCommand sandbox proxy <id>`
-//! verbatim. Renaming either is a wire break with the daemon's
+//! (`<id>`) are treated as wire format — the daemon-emitted SSH
+//! config block carries `ProxyCommand sandbox proxy <id>` verbatim.
+//! Renaming either is a wire break with the daemon's
 //! `sandbox_core::render_ssh_config_block`. Both ends ship in the
 //! same crate so a rename ripples; the constants are pinned by tests
 //! on both sides.
 //!
 //! # Thin shim — no business logic
 //!
-//! The M18-S5 milestone explicitly limits this subcommand to the byte-
-//! mover loop. No SSH parsing, no retry, no drift recovery, no
-//! lifecycle cleanup. M18-S6 wraps the outer CLI commands with the
-//! single-retry drift-recovery path; M18-S7 adds lazy-404 cleanup *as
-//! a post-WebSocket-failure side effect*, but the cleanup itself
-//! lives in the M18-S5 `ssh_config` module and is dispatched from a
-//! single well-isolated branch we leave as a TODO sentinel hook
-//! here. The shim must remain easy to audit for "what does this do
-//! before/after the handshake?".
+//! The subcommand is limited to the byte-mover loop: no SSH parsing,
+//! no retry, no drift recovery, no nested cleanup. The outer CLI
+//! commands wrap drift recovery; lazy-404 cleanup of stale local
+//! entries is dispatched from the [`EXIT_SESSION_NOT_FOUND`] branch
+//! of [`run`] via [`lazy_cleanup_local_entry`] — a one-shot
+//! housekeeping side effect kept here so the proxy invocation stays
+//! a single sequential flow. The shim must remain easy to audit for
+//! "what does this do before/after the handshake?".
+//!
+//! # WebSocket close-code consumption
+//!
+//! After a successful upgrade, the daemon may close the WebSocket
+//! with a structured close code from [`sandboxd::proxy_http::
+//! close_codes`] when a backend operation fails mid-flight (sshd not
+//! listening, container exited, Lima port lookup empty, etc.). The
+//! ferry inspects the close frame and renders an operator-actionable
+//! stderr line on its way out — without that, the operator only
+//! sees `ssh`'s generic
+//! `kex_exchange_identification: Connection closed by remote host`,
+//! which gives them nothing to act on.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -65,8 +76,8 @@ pub const EXIT_GENERIC_FAILURE: i32 = 1;
 
 /// Daemon returned `404 Not Found` for the session id. The session
 /// either does not exist (typo, since-deleted, or never created) or
-/// belongs to another operator. M18-S7 wires lazy-cleanup of the
-/// local `~/.ssh/sandbox/sandbox-<id>` entry off this exit shape.
+/// belongs to another operator. The `run` arm uses this to trigger
+/// lazy cleanup of the local `~/.ssh/sandbox/sandbox-<id>` entry.
 pub const EXIT_SESSION_NOT_FOUND: i32 = 2;
 
 // ---------------------------------------------------------------------------
@@ -122,7 +133,18 @@ pub async fn run(socket_path: &str, id: &str) -> i32 {
     }
 
     match run_inner(socket_path, id).await {
-        Ok(()) => EXIT_OK,
+        Ok(None) => EXIT_OK,
+        Ok(Some(close)) => {
+            // Daemon emitted a structured close code mid-ferry. The
+            // bytes have already gone to ssh's stdin, so the operator
+            // is about to see ssh's generic
+            // "kex_exchange_identification: Connection closed by
+            // remote host". Surface the daemon's reason on stderr
+            // here so the operator has something actionable instead
+            // of just the generic transport message.
+            emit_structured_close_stderr(&close);
+            EXIT_GENERIC_FAILURE
+        }
         Err(ProxyError::SocketDial { socket, source }) => {
             eprintln!(
                 "sandbox proxy: cannot connect to sandboxd at {} ({source}). \
@@ -147,12 +169,12 @@ pub async fn run(socket_path: &str, id: &str) -> i32 {
                 // find a stranded config block pointing at a
                 // ProxyCommand that will 404 again. The cleanup is a
                 // **one-shot housekeeping action** (no retry), which
-                // is why it lives here rather than in the M18-S6
-                // drift-recovery wrapper (`sandbox proxy` is
-                // deliberately excluded from drift recovery to keep
-                // nested `git-remote-sandbox` invocations from
-                // stacking retries; lazy-404 cleanup has no such
-                // stacking concern).
+                // is why it lives here rather than in the drift-
+                // recovery wrapper (`sandbox proxy` is deliberately
+                // excluded from drift recovery to keep nested
+                // `git-remote-sandbox` invocations from stacking
+                // retries; lazy-404 cleanup has no such stacking
+                // concern).
                 //
                 // Local-cleanup failure (permission denied on the
                 // file, filesystem full, …) is surfaced as a stderr
@@ -172,6 +194,56 @@ pub async fn run(socket_path: &str, id: &str) -> i32 {
         Err(e) => {
             eprintln!("sandbox proxy: {e}");
             EXIT_GENERIC_FAILURE
+        }
+    }
+}
+
+/// Render an operator-actionable stderr line for a structured close
+/// code the daemon emitted. Pulled out into a helper so the hermetic
+/// tests can drive it without standing up the full ferry.
+fn emit_structured_close_stderr(close: &StructuredClose) {
+    match close.code {
+        CLOSE_CODE_BACKEND_UNAVAILABLE => {
+            if close.reason.is_empty() {
+                eprintln!(
+                    "sandbox proxy: session backend is unavailable — \
+                     it may be starting up; retry in a moment."
+                );
+            } else {
+                eprintln!(
+                    "sandbox proxy: session backend is unavailable ({reason}) — \
+                     it may be starting up; retry in a moment.",
+                    reason = close.reason,
+                );
+            }
+        }
+        CLOSE_CODE_BACKEND_ERROR => {
+            if close.reason.is_empty() {
+                eprintln!(
+                    "sandbox proxy: session backend exited unexpectedly — \
+                     inspect `sandbox logs <id>` and the daemon journal."
+                );
+            } else {
+                eprintln!(
+                    "sandbox proxy: session backend exited unexpectedly ({reason}) — \
+                     inspect `sandbox logs <id>` and the daemon journal.",
+                    reason = close.reason,
+                );
+            }
+        }
+        other => {
+            // Future-proofing: a code we do not recognise still
+            // surfaces verbatim. The CLI never sees these in practice
+            // (the daemon emits only the two codes above), but the
+            // wire shape leaves room for both ends to evolve.
+            if close.reason.is_empty() {
+                eprintln!("sandbox proxy: daemon closed with code {other}");
+            } else {
+                eprintln!(
+                    "sandbox proxy: daemon closed with code {other}: {reason}",
+                    reason = close.reason,
+                );
+            }
         }
     }
 }
@@ -220,8 +292,9 @@ fn lazy_cleanup_local_entry_at(home: &std::path::Path, id: &str) {
 }
 
 /// Pre-handshake error path is fallible; once we are inside the byte-
-/// ferry, errors propagate up here as `ProxyError::Io`.
-async fn run_inner(socket_path: &str, id: &str) -> Result<(), ProxyError> {
+/// ferry, errors propagate up here as `ProxyError::Io` and structured
+/// close codes surface as `Ok(Some(StructuredClose))`.
+async fn run_inner(socket_path: &str, id: &str) -> Result<Option<StructuredClose>, ProxyError> {
     let stream = UnixStream::connect(socket_path)
         .await
         .map_err(|e| ProxyError::SocketDial {
@@ -239,8 +312,13 @@ async fn run_inner(socket_path: &str, id: &str) -> Result<(), ProxyError> {
 }
 
 /// Perform the HTTP/1.1 → WebSocket upgrade over `stream`, then enter
-/// the byte-ferry loop.
-async fn upgrade_and_ferry(stream: UnixStream, id: &str) -> Result<(), ProxyError> {
+/// the byte-ferry loop. Returns `Some(close)` when the daemon ended
+/// the session via a structured close code; the outer caller renders
+/// the operator-facing stderr line.
+async fn upgrade_and_ferry(
+    stream: UnixStream,
+    id: &str,
+) -> Result<Option<StructuredClose>, ProxyError> {
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, String>(io)
         .await
@@ -293,9 +371,9 @@ async fn upgrade_and_ferry(stream: UnixStream, id: &str) -> Result<(), ProxyErro
     let status = resp.status();
     if status != hyper::StatusCode::SWITCHING_PROTOCOLS {
         // Non-101: collect the body and surface to the caller. This
-        // is the branch the daemon takes on a missing-session 404 or
-        // a foreign-owner 404, exactly the shape M18-S7 will hook for
-        // lazy-cleanup.
+        // is the branch the daemon takes on a missing-session 404
+        // or a foreign-owner 404; the outer `run` arm catches the
+        // 404 and triggers `lazy_cleanup_local_entry`.
         let body_bytes = resp
             .into_body()
             .collect()
@@ -330,25 +408,57 @@ async fn upgrade_and_ferry(stream: UnixStream, id: &str) -> Result<(), ProxyErro
     // completes — it has no more HTTP work to do. Drop it.
     drop(conn_task);
 
-    ferry_stdio_websocket(ws).await?;
-    Ok(())
+    let close_info = ferry_stdio_websocket(ws).await?;
+    Ok(close_info)
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket close codes — must stay in sync with `sandboxd::proxy_http::
+// close_codes`. Both ends ship in the same workspace so a wire drift here
+// is a compile-time-adjacent break (the daemon side is pinned by tests in
+// `proxy_http.rs::tests::close_codes_are_in_iana_private_range`).
+// ---------------------------------------------------------------------------
+
+/// Daemon could not dial the backend (sshd not listening, container
+/// stopped, Lima sshLocalPort empty / unreachable, etc.). Operator-
+/// actionable: wait a moment and retry.
+pub const CLOSE_CODE_BACKEND_UNAVAILABLE: u16 = 4001;
+
+/// Daemon's backend pump exited non-zero or hit a runtime panic.
+/// Operator-actionable: inspect daemon logs.
+pub const CLOSE_CODE_BACKEND_ERROR: u16 = 4002;
 
 // ---------------------------------------------------------------------------
 // Byte ferry: stdin <-> WebSocket binary frames
 // ---------------------------------------------------------------------------
+
+/// A close frame the daemon sent with one of our structured close
+/// codes. The outer [`run`] arm uses this to render an operator-
+/// actionable stderr line on top of the generic ferry exit.
+#[derive(Debug, Clone)]
+pub struct StructuredClose {
+    pub code: u16,
+    pub reason: String,
+}
 
 /// Bridge process stdin and stdout to the WebSocket's binary frames.
 /// Returns when either direction hits EOF / close / error; the
 /// surviving direction is cancelled and any in-flight bytes are
 /// dropped on the floor (SSH's framing tolerates a clipped tail).
 ///
+/// `Ok(Some(close))` is returned when the daemon closed the
+/// WebSocket with one of the structured codes
+/// (`BACKEND_UNAVAILABLE`/`BACKEND_ERROR`); the caller renders an
+/// actionable stderr line on top of the generic exit. `Ok(None)` is
+/// the clean shutdown case (operator closed stdin, daemon emitted
+/// `Close(None)` after a normal EOF, etc.).
+///
 /// `WS` is generic over the upgraded stream type so the hermetic
 /// tests can exercise this function against an in-process pair of
 /// `WebSocketStream`s (no Unix socket, no daemon).
 pub async fn ferry_stdio_websocket<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
-) -> Result<(), std::io::Error>
+) -> Result<Option<StructuredClose>, std::io::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -382,21 +492,39 @@ where
 
     let ws_to_stdout = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
+        let mut captured: Option<StructuredClose> = None;
         while let Some(msg) = stream.next().await {
             match msg {
                 Ok(Message::Binary(bytes)) => {
                     if let Err(e) = stdout.write_all(&bytes).await {
                         debug!(error = %e, "stdout write error; ending ws->stdout ferry");
-                        return;
+                        return captured;
                     }
                     if let Err(e) = stdout.flush().await {
                         debug!(error = %e, "stdout flush error; ending ws->stdout ferry");
-                        return;
+                        return captured;
                     }
                 }
-                Ok(Message::Close(_)) => {
+                Ok(Message::Close(frame)) => {
+                    // The daemon may close with one of our structured
+                    // codes to signal an actionable backend failure;
+                    // tungstenite represents the absent-code case as
+                    // `None` (translated to code 1005 on the wire by
+                    // peers that need a numeric value). Capture the
+                    // payload for the outer caller and exit the ferry.
+                    if let Some(cf) = frame {
+                        let code = u16::from(cf.code);
+                        if code == CLOSE_CODE_BACKEND_UNAVAILABLE
+                            || code == CLOSE_CODE_BACKEND_ERROR
+                        {
+                            captured = Some(StructuredClose {
+                                code,
+                                reason: cf.reason.to_string(),
+                            });
+                        }
+                    }
                     debug!("daemon sent close frame; ending ws->stdout ferry");
-                    return;
+                    return captured;
                 }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
                     // Auto-handled by tungstenite.
@@ -412,29 +540,54 @@ where
                 }
                 Err(e) => {
                     debug!(error = %e, "ws recv error; ending ws->stdout ferry");
-                    return;
+                    return captured;
                 }
             }
         }
+        captured
     });
 
-    // First half to finish wins; we abort the other so the process
-    // does not hang waiting on a quiet side (e.g. stdin reads from
-    // /dev/null reach EOF immediately, but the daemon may take time
-    // to drain before closing).
-    tokio::select! {
-        r = stdin_to_ws => {
+    // Wait for either direction to finish, then collect any
+    // structured close-code observed by ws_to_stdout. Earlier this
+    // was a bare `tokio::select!` that returned the first arm's
+    // result — but stdin_to_ws can win the race when stdin is EOF
+    // (`ProxyCommand` invoked under a non-interactive shell, or
+    // hermetic tests with no real stdin) and drop the daemon's
+    // close-code on the floor. We `select!` on the first finisher,
+    // then give ws_to_stdout a bounded drain window so an in-flight
+    // close frame still lands.
+    let mut stdin_to_ws = stdin_to_ws;
+    let mut ws_to_stdout = ws_to_stdout;
+    let captured: Option<StructuredClose> = tokio::select! {
+        r = &mut stdin_to_ws => {
             if let Err(e) = r {
                 debug!(error = %e, "stdin->ws task panic");
             }
-        }
-        r = ws_to_stdout => {
-            if let Err(e) = r {
-                debug!(error = %e, "ws->stdout task panic");
+            // stdin_to_ws finished first; drain ws_to_stdout briefly
+            // so an in-flight close frame still surfaces.
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                ws_to_stdout,
+            ).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    debug!(error = %e, "ws->stdout task panic during drain");
+                    None
+                }
+                Err(_) => None,
             }
         }
-    }
-    Ok(())
+        r = &mut ws_to_stdout => {
+            match r {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(error = %e, "ws->stdout task panic");
+                    None
+                }
+            }
+        }
+    };
+    Ok(captured)
 }
 
 // ---------------------------------------------------------------------------
@@ -817,5 +970,214 @@ mod tests {
         let nonexistent = "/tmp/sandbox-proxy-nonexistent-12345.sock";
         let code = run(nonexistent, "deadbeefcafe").await;
         assert_eq!(code, EXIT_GENERIC_FAILURE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured close-code consumption — daemon's mid-ferry close frame
+    // -----------------------------------------------------------------------
+
+    /// The daemon emits `BACKEND_UNAVAILABLE` (4001) when it cannot dial
+    /// the in-session sshd (container stopped, Lima sshLocalPort empty,
+    /// etc.). The ferry must capture the close frame, return it to the
+    /// caller, and the caller renders an operator-actionable stderr
+    /// line. Pinning the capture mechanism in isolation (the outer
+    /// stderr rendering is covered by `emit_structured_close_*`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ferry_captures_backend_unavailable_close_code() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let (client, mut server) = paired_ws().await;
+
+        let server_task = tokio::spawn(async move {
+            let frame = CloseFrame {
+                code: CloseCode::from(CLOSE_CODE_BACKEND_UNAVAILABLE),
+                reason: "sshd not yet listening".into(),
+            };
+            server
+                .send(Message::Close(Some(frame)))
+                .await
+                .expect("server send close");
+            let _ = server.close(None).await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ferry_stdio_websocket(client),
+        )
+        .await
+        .expect("ferry must exit within 5s")
+        .expect("ferry must not error");
+
+        let close = result.expect("structured close must be captured");
+        assert_eq!(close.code, CLOSE_CODE_BACKEND_UNAVAILABLE);
+        assert!(
+            close.reason.contains("sshd not yet listening"),
+            "reason must be propagated verbatim; got: {:?}",
+            close.reason
+        );
+        server_task.await.expect("server task");
+    }
+
+    /// `BACKEND_ERROR` (4002) — the daemon-side spawn-blocking-panic /
+    /// runtime-error branch — must surface the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ferry_captures_backend_error_close_code() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let (client, mut server) = paired_ws().await;
+
+        let server_task = tokio::spawn(async move {
+            let frame = CloseFrame {
+                code: CloseCode::from(CLOSE_CODE_BACKEND_ERROR),
+                reason: "spawn_blocking join failed".into(),
+            };
+            server
+                .send(Message::Close(Some(frame)))
+                .await
+                .expect("server send close");
+            let _ = server.close(None).await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ferry_stdio_websocket(client),
+        )
+        .await
+        .expect("ferry must exit within 5s")
+        .expect("ferry must not error");
+
+        let close = result.expect("structured close must be captured");
+        assert_eq!(close.code, CLOSE_CODE_BACKEND_ERROR);
+        assert!(close.reason.contains("spawn_blocking"));
+        server_task.await.expect("server task");
+    }
+
+    /// `Close(None)` is the natural-EOF clean shutdown (operator
+    /// disconnected, backend's stdout reached EOF without error). No
+    /// structured close-code is in scope; the ferry must return
+    /// `Ok(None)` rather than fabricating one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ferry_returns_none_on_natural_close() {
+        let (client, mut server) = paired_ws().await;
+
+        let server_task = tokio::spawn(async move {
+            server
+                .send(Message::Close(None))
+                .await
+                .expect("server send close");
+            let _ = server.close(None).await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ferry_stdio_websocket(client),
+        )
+        .await
+        .expect("ferry must exit within 5s")
+        .expect("ferry must not error");
+
+        assert!(
+            result.is_none(),
+            "natural close (no code) must yield None; got: {result:?}"
+        );
+        server_task.await.expect("server task");
+    }
+
+    /// A standard RFC 6455 close code outside our private range (e.g.
+    /// 1000 normal close, 1001 going-away) must NOT be captured as a
+    /// structured close — those are wire-level events, not actionable
+    /// daemon signals. Pins the boundary so a future widening of the
+    /// match arm is deliberate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ferry_ignores_non_structured_close_codes() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let (client, mut server) = paired_ws().await;
+
+        let server_task = tokio::spawn(async move {
+            let frame = CloseFrame {
+                code: CloseCode::Normal, // 1000 — RFC standard, not ours
+                reason: "normal".into(),
+            };
+            server
+                .send(Message::Close(Some(frame)))
+                .await
+                .expect("server send close");
+            let _ = server.close(None).await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ferry_stdio_websocket(client),
+        )
+        .await
+        .expect("ferry must exit within 5s")
+        .expect("ferry must not error");
+
+        assert!(
+            result.is_none(),
+            "non-structured close codes must not surface; got: {result:?}"
+        );
+        server_task.await.expect("server task");
+    }
+
+    /// `emit_structured_close_stderr` is pure side-effect on stderr
+    /// — there is no return shape to assert against. The test pins
+    /// only that the function does not panic for every variant the
+    /// daemon can emit (the two known codes plus a forward-compat
+    /// "unknown but in range" code we may add later). Combined with
+    /// the close-code-constant pin below this gives us the smallest
+    /// useful safety net for the stderr-rendering surface.
+    #[test]
+    fn emit_structured_close_stderr_does_not_panic_on_all_variants() {
+        // Known codes, with and without a reason payload.
+        emit_structured_close_stderr(&StructuredClose {
+            code: CLOSE_CODE_BACKEND_UNAVAILABLE,
+            reason: String::new(),
+        });
+        emit_structured_close_stderr(&StructuredClose {
+            code: CLOSE_CODE_BACKEND_UNAVAILABLE,
+            reason: "sshd not yet listening".into(),
+        });
+        emit_structured_close_stderr(&StructuredClose {
+            code: CLOSE_CODE_BACKEND_ERROR,
+            reason: String::new(),
+        });
+        emit_structured_close_stderr(&StructuredClose {
+            code: CLOSE_CODE_BACKEND_ERROR,
+            reason: "spawn_blocking join failed".into(),
+        });
+        // Forward-compat "unknown structured close" branch.
+        emit_structured_close_stderr(&StructuredClose {
+            code: 4003,
+            reason: "future code".into(),
+        });
+        emit_structured_close_stderr(&StructuredClose {
+            code: 4999,
+            reason: String::new(),
+        });
+    }
+
+    /// The CLI-side close-code constants must match the daemon's
+    /// `sandboxd::proxy_http::close_codes` constants exactly — both
+    /// ends ship in the same workspace, so a drift here is a
+    /// compile-time-adjacent break. We pin the literal values so the
+    /// drift is loud at test time.
+    #[test]
+    fn close_code_constants_match_daemon_values() {
+        assert_eq!(
+            CLOSE_CODE_BACKEND_UNAVAILABLE, 4001,
+            "BACKEND_UNAVAILABLE wire value must remain 4001"
+        );
+        assert_eq!(
+            CLOSE_CODE_BACKEND_ERROR, 4002,
+            "BACKEND_ERROR wire value must remain 4002"
+        );
+        // Both must live in the IANA private 4000-4999 range.
+        assert!((4000..=4999).contains(&CLOSE_CODE_BACKEND_UNAVAILABLE));
+        assert!((4000..=4999).contains(&CLOSE_CODE_BACKEND_ERROR));
     }
 }
