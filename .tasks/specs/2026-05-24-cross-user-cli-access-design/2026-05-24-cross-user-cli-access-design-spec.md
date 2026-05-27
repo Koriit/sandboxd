@@ -491,6 +491,110 @@ as the test user. The test user is added to the `sandbox` group by
 the existing install/setup script so it can talk to the daemon
 socket.
 
+### Privilege model: spawn-helper pattern
+
+The daemon (`sandboxd`) runs as the unprivileged `sandbox` system
+user with **zero** file capabilities. Per-session runtime spawning
+needs to drop into the operator's uid before invoking the runtime
+tool (QEMU for Lima, container-init for the lite-mode container) so
+the resulting process aligns with the operator's identity for the
+in-VM/in-container `$HOME`, for QEMU's 9p `shared:` server's
+host-side DAC, and for any host write-back the runtime performs on
+the guest's behalf. `setresuid(operator_uid)` requires `CAP_SETUID`.
+
+Rather than grant `CAP_SETUID` to the daemon itself — which would
+expand its privileged surface to several thousand lines of Rust with
+hundreds of call sites — the capability is factored into a separate
+setcap binary mirroring the established `sandbox-route-helper`
+precedent: `sandbox-spawn-helper`. The helper is ~100 lines, has
+exactly one job (drop uid, drop caps, `execve`), and is installed
+at `/usr/local/libexec/sandboxd/sandbox-spawn-helper` with file
+capability `cap_setuid+ep` (Permitted + Effective; no Inheritable —
+the runtime tool inherits zero capabilities).
+
+The helper's authorisation gate is **caller membership in the
+`sandbox` OS group**, checked via `getgroups(2)` + `getgid(2)`
+against the gid resolved from `getgrnam_r("sandbox")`. This inherits
+the same trust premise stated in § Security considerations: members
+of the `sandbox` OS group are trusted with every session's private
+key, and are now (by the same membership) trusted with the
+`setresuid(operator_uid)` primitive. Non-members exec'ing the helper
+exit with code `2` ("caller not authorised") before any privilege
+change.
+
+The daemon's `sandboxd.service` carries **no** new
+`AmbientCapabilities` or `CapabilityBoundingSet` directives. The
+daemon stays uncapped; the privileged surface lives exclusively in
+the cap'd helper binary, ~100 lines that can be reviewed as a
+standalone unit (the same shape as `sandbox-route-helper`'s ~1200
+lines, which is itself the canonical pattern documented in the
+project's `CLAUDE.md`).
+
+### Cross-user runtime invocation
+
+Per-session runtime invocation goes through the spawn-helper:
+
+```
+sandboxd (uid 999, no caps)
+  └── execve(sandbox-spawn-helper, [operator_uid, runtime_argv...])
+      └── (helper) check caller-in-sandbox-group → setresuid(operator_uid)
+          → capset clear all sets → execve(runtime_argv0, runtime_argv)
+              └── runtime tool runs at operator_uid with zero capabilities
+```
+
+Three failure modes converge on the same root cause without this
+chain:
+
+1. **Interactive shells in the container start as uid 999** against a
+   `/home/sandbox` owned by uid 1000 from the lite-image build; `cd ~`
+   fails Permission denied.
+2. **QEMU runs at uid 999** and cannot read the operator's workspace
+   directory for 9p `shared:` mode → empty/inaccessible mount.
+3. **Any host write QEMU performs on the guest's behalf** back-propagates
+   as uid 999, leaving files in the operator's project directory that
+   they cannot reopen.
+
+The helper-chain fix is the one-line architectural change that
+addresses all three. Backend-specific finishing touches:
+
+- **Container backend**: `docker create --user
+  <operator_uid>:<operator_gid>` so the container init runs at the
+  operator's uid. The lite-image's `/home/sandbox` is owned by the
+  in-image `sandbox` user at uid 1000; for any operator uid other
+  than 1000, the launch wrapper does an idempotent `chown -R` of
+  `/home/sandbox` to the running uid before exec'ing
+  `sandbox-guest`. The synthetic `/etc/passwd` overlay (already
+  threaded through the M18-S3 work) bakes the operator's uid so
+  `getpwuid(geteuid())` inside the container resolves correctly.
+- **Lima backend**: cloud-init runs `usermod -u $OPERATOR_UID
+  sandbox && groupmod -g $OPERATOR_GID sandbox && chown -R
+  $OPERATOR_UID:$OPERATOR_GID /home/sandbox` (Lima passes
+  environment via the per-instance YAML's `env:` block). The in-VM
+  `sandbox` user's uid is rewritten per session to match the host
+  operator's uid, so `id sandbox` inside the VM returns the
+  operator's host uid; 9p `shared:` mode and any host-visible write
+  align naturally.
+
+The operator uid is captured at session-create time from the
+daemon's socket-peer credentials (`SO_PEERCRED`) and persisted on
+the session row alongside the existing `owner_username` column —
+the same identity, simply represented numerically so the spawn
+chain can pass it through without re-resolving via NSS. The
+on-disk schema gains nullable `operator_uid` / `operator_gid`
+columns via a new forward-only migration; pre-migration rows
+deserialise with `None` and route through the legacy
+spawn-as-daemon path so rollback is always safe.
+
+9p `shared:` mode stays the default for cross-user Lima sessions.
+Mapped-xattr semantics (the default 9p `shared:` security model)
+are correct once QEMU runs at the operator's uid; the alternative
+of switching to 9p `passthrough` mode — considered during M18-S9
+triage — is rejected because passthrough requires the QEMU process
+to actually be the operator's uid, which is the very thing the
+spawn-helper establishes. Re-stating the requirement does not change
+the implementation, only the security-model label of the resulting
+mount.
+
 ## Phase 1 — test infrastructure
 
 **Goal: reproduce the bug in CI before changing any production
