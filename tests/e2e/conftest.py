@@ -1732,12 +1732,27 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
     except Exception:
         pass
 
-    # Collect any Lima VM names from the daemon's session db so we can clean
-    # them up even if the test forgot to `rm`.
+    # Collect any Lima VM names from the daemon's session db so we can
+    # clean them up even if the test forgot to `rm`. Under the
+    # production-shaped harnesses (``sandbox-systemd`` / ``sandbox-
+    # sudo``) the daemon owns its Lima registry at
+    # ``/home/sandbox/.lima/``; bare ``limactl`` runs as the test
+    # operator and only sees ``~/.lima/`` — so we route the probe and
+    # the delete through ``sudo -n -u sandbox`` to query the right
+    # registry. The ``sandbox`` NOPASSWD sudoers fragment installed by
+    # ``make setup-dev-env`` (see Phase 1 of the 2026-05-24 spec)
+    # authorises the test operator for these specific commands. In the
+    # legacy ``test-user`` harness the daemon and the test operator
+    # share a uid, so the bare ``limactl`` is correct.
+    if info.get("_harness") in ("sandbox-systemd", "sandbox-sudo"):
+        limactl_argv_prefix: list[str] = ["sudo", "-n", "-u", "sandbox", "limactl"]
+    else:
+        limactl_argv_prefix = ["limactl"]
+
     vm_names_to_clean: list[str] = []
     try:
         lima_output = subprocess.run(
-            ["limactl", "list", "--json"],
+            limactl_argv_prefix + ["list", "--json"],
             capture_output=True, text=True, timeout=30,
         )
         if lima_output.stdout.strip():
@@ -1764,16 +1779,12 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
             current_proc.kill()
             current_proc.wait(timeout=5)
 
-    # Force-delete any leftover VMs. Under the production-shaped
-    # harnesses the daemon registered VMs as the ``sandbox`` user, so
-    # ``limactl`` invoked here as the test operator finds nothing —
-    # that is precisely the bug under reproduction. The Lima-as-sandbox
-    # cleanup runs as part of the dir wipe at next session start; here
-    # we sweep VMs visible to the test operator only.
+    # Force-delete any leftover VMs through the same prefix so we
+    # actually mutate the daemon-owned registry under cross-user.
     for vm_name in vm_names_to_clean:
         try:
             subprocess.run(
-                ["limactl", "delete", "--force", vm_name],
+                limactl_argv_prefix + ["delete", "--force", vm_name],
                 capture_output=True, timeout=60,
             )
         except Exception:
