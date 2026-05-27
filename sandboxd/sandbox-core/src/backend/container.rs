@@ -298,6 +298,29 @@ pub struct ContainerNetwork {
     /// SSH_NOT_AVAILABLE` for any container session whose row reaches
     /// the runtime without staged credentials.
     pub ssh_host_dir: Option<PathBuf>,
+    /// Operator identity pair (numeric uid + gid) the runtime stamps
+    /// onto `docker create --user <uid>:<gid>` when set. Captured at
+    /// session-create time from the daemon socket's `SO_PEERCRED`
+    /// and threaded through the per-session registry rather than
+    /// pulled from the daemon-wide [`ContainerRuntime::user_uid`] /
+    /// [`ContainerRuntime::user_gid`] defaults, because the
+    /// supervisor-fork pattern aligns the container's runtime
+    /// identity with the *caller* of `POST /sessions` rather than the
+    /// daemon's own uid.
+    ///
+    /// `None` means "no operator identity captured" — the daemon row
+    /// pre-dates V008 (legacy spawn-as-daemon path) or the synthetic
+    /// fixture used by an integration test does not exercise the
+    /// supervisor-fork. In both cases the runtime falls back to its
+    /// constructor-time `user_uid` / `user_gid` defaults, preserving
+    /// the existing behaviour for legacy sessions and tests.
+    ///
+    /// The pair is required to travel together: the
+    /// `--user <uid>:<gid>` flag and the synthetic `/etc/passwd`
+    /// overlay both consume both halves, so a `Some(uid)` /
+    /// `None(gid)` mismatch is structurally meaningless and a future
+    /// refactor that allows the asymmetric shape should be challenged.
+    pub operator_identity: Option<(u32, u32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +568,31 @@ fn capabilities_for_container() -> Capabilities {
 // load-bearing flags without spawning a docker subprocess.
 // ---------------------------------------------------------------------------
 
+/// Choose the (uid, gid) pair the container runs under at
+/// `docker create --user <uid>:<gid>` time.
+///
+/// Decision rule: the operator identity (captured at session-create
+/// time from `SO_PEERCRED` and threaded through the per-session
+/// [`ContainerNetwork::operator_identity`] field) wins when present.
+/// When the network registry carries `None` — pre-V008 sessions, or
+/// integration-test fixtures that do not exercise the supervisor-fork
+/// — fall back to the runtime's constructor-time defaults
+/// ([`ContainerRuntime::user_uid`] / [`ContainerRuntime::user_gid`]),
+/// preserving the legacy spawn-as-daemon shape for existing sessions
+/// and tests.
+///
+/// Extracted into a pure function so the
+/// `effective_container_user_*` unit tests pin the decision rule
+/// without spawning a real docker process.
+#[inline]
+pub(crate) fn effective_container_user(
+    operator_identity: Option<(u32, u32)>,
+    fallback_uid: u32,
+    fallback_gid: u32,
+) -> (u32, u32) {
+    operator_identity.unwrap_or((fallback_uid, fallback_gid))
+}
+
 /// Compose the `docker create` argv for a container session.
 ///
 /// Pure function — no syscalls, no docker invocation. The runtime
@@ -728,12 +776,18 @@ impl SessionRuntime for ContainerRuntime {
         let network = self.lookup_session(session_id)?;
         let (memory_mb, cpus) = self.resource_ceilings(spec)?;
 
+        let (effective_uid, effective_gid) = effective_container_user(
+            network.operator_identity,
+            self.user_uid,
+            self.user_gid,
+        );
+
         let args = build_create_argv(
             session_id,
             &network,
             &self.image_tag,
-            self.user_uid,
-            self.user_gid,
+            effective_uid,
+            effective_gid,
             memory_mb,
             cpus,
             &self.guest_bind_source,
@@ -1897,6 +1951,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
             ssh_host_dir: None,
+            operator_identity: None,
         };
         rt.register_session(sid, net.clone());
         let got = rt.lookup_session(&sid).expect("registered");
@@ -1935,6 +1990,7 @@ mod tests {
             route_helper_path: Some(std::path::PathBuf::from("sandbox-route-helper")),
             ca_host_path: None,
             ssh_host_dir: None,
+            operator_identity: None,
         };
         rt.register_session(sid, net);
         let got = rt.lookup_session(&sid).expect("registered");
@@ -2000,6 +2056,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: Some(host_path.clone()),
             ssh_host_dir: None,
+            operator_identity: None,
         };
 
         let args = build_ca_mount_args(&net);
@@ -2055,6 +2112,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
             ssh_host_dir: None,
+            operator_identity: None,
         };
         assert!(
             build_ca_mount_args(&no_ca).is_empty(),
@@ -2082,6 +2140,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
             ssh_host_dir: None,
+            operator_identity: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
@@ -2160,6 +2219,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
             ssh_host_dir: None,
+            operator_identity: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
@@ -2329,6 +2389,7 @@ mod tests {
                 route_helper_path: None,
                 ca_host_path: None,
                 ssh_host_dir: None,
+                operator_identity: None,
             },
         );
         // `hardened: false` so we move past `SessionSpec::validate` (which
@@ -2537,6 +2598,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
             ssh_host_dir: Some(dir.clone()),
+            operator_identity: None,
         };
 
         let args = build_ssh_mount_args(&net);
@@ -2590,6 +2652,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
             ssh_host_dir: None,
+            operator_identity: None,
         };
         assert!(build_ssh_mount_args(&net).is_empty());
     }
@@ -2698,6 +2761,124 @@ mod tests {
         );
     }
 
+    /// `effective_container_user` honours the operator identity when
+    /// the per-session registry carries one — the captured
+    /// `SO_PEERCRED` pair wins over the runtime's constructor-time
+    /// defaults. This is the supervisor-fork happy path: every
+    /// session created on a V008+ daemon stamps the operator's uid
+    /// onto the `--user <uid>:<gid>` flag, so workspace bind-mount
+    /// writes land owned by the operator (not the daemon).
+    #[test]
+    fn effective_container_user_prefers_operator_identity_when_present() {
+        let (uid, gid) = effective_container_user(Some((2001, 2002)), 1000, 1000);
+        assert_eq!(uid, 2001, "operator uid must override the runtime default");
+        assert_eq!(gid, 2002, "operator gid must override the runtime default");
+    }
+
+    /// `effective_container_user` falls back to the runtime's
+    /// constructor-time defaults when the per-session registry carries
+    /// no operator identity. This is the legacy-rollback path: a
+    /// pre-V008 session row (or an integration-test fixture not
+    /// exercising the supervisor-fork) deserialises with
+    /// `operator_identity = None` and the container still runs under
+    /// the daemon's `user_uid`/`user_gid` pair.
+    #[test]
+    fn effective_container_user_falls_back_to_defaults_when_absent() {
+        let (uid, gid) = effective_container_user(None, 1000, 1000);
+        assert_eq!(uid, 1000, "fallback uid must apply when no operator captured");
+        assert_eq!(gid, 1000, "fallback gid must apply when no operator captured");
+    }
+
+    /// `--user <uid>:<gid>` argv reflects the operator identity when
+    /// the network carries one — drives the call through the public
+    /// helper to pin that the chosen pair actually reaches the
+    /// rendered flag (not just the decision function in isolation).
+    /// This is the unit-test analogue of "container runs as the
+    /// operator on the host" without needing a docker daemon.
+    #[test]
+    fn container_run_argv_user_flag_reflects_operator_identity() {
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+        let network = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: None,
+            route_helper_path: None,
+            ca_host_path: None,
+            ssh_host_dir: None,
+            operator_identity: Some((2001, 2002)),
+        };
+        // Choose the effective pair the way `ContainerRuntime::create`
+        // does (defaults `1000:1000`).
+        let (uid, gid) = effective_container_user(network.operator_identity, 1000, 1000);
+        let guest_bind_source =
+            std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
+        let args = build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            uid,
+            gid,
+            512,
+            1.0,
+            &guest_bind_source,
+        );
+
+        // The `--user` flag must be present with the operator's pair —
+        // a regression that silently propagated the daemon defaults
+        // (1000:1000) would show up here.
+        let user_idx = args
+            .iter()
+            .position(|a| a == "--user")
+            .expect("--user flag must be present");
+        let user_arg = args.get(user_idx + 1).expect("--user must have a value");
+        assert_eq!(
+            user_arg, "2001:2002",
+            "--user value must reflect the operator identity; got {user_arg:?} in {args:?}",
+        );
+    }
+
+    /// Symmetric to the previous test: with `operator_identity = None`,
+    /// the `--user` flag falls back to the daemon's defaults.
+    #[test]
+    fn container_run_argv_user_flag_falls_back_to_defaults_when_no_operator() {
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+        let network = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: None,
+            route_helper_path: None,
+            ca_host_path: None,
+            ssh_host_dir: None,
+            operator_identity: None,
+        };
+        let (uid, gid) = effective_container_user(network.operator_identity, 1000, 1000);
+        let guest_bind_source =
+            std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
+        let args = build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            uid,
+            gid,
+            512,
+            1.0,
+            &guest_bind_source,
+        );
+
+        let user_idx = args
+            .iter()
+            .position(|a| a == "--user")
+            .expect("--user flag must be present");
+        let user_arg = args.get(user_idx + 1).expect("--user must have a value");
+        assert_eq!(
+            user_arg, "1000:1000",
+            "--user value must reflect the daemon defaults when no operator captured; \
+             got {user_arg:?} in {args:?}",
+        );
+    }
+
     /// End-to-end: when `ContainerNetwork.ssh_host_dir = Some(dir)`,
     /// `build_create_argv` produces the three expected per-file
     /// bind-mounts before the trailing image-tag positional, and they
@@ -2716,6 +2897,7 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
             ssh_host_dir: Some(ssh_dir.clone()),
+            operator_identity: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");

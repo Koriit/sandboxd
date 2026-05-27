@@ -2044,21 +2044,28 @@ async fn create_session(
             {
                 // Stage the three files (authorized_keys, passwd,
                 // group) on a blocking task — `stage_ssh_credentials`
-                // performs sync I/O. `daemon_uid`/`daemon_gid` come
-                // from the container runtime's configured identity so
-                // the synthetic passwd entry matches whatever uid the
-                // container will actually run under at
-                // `--user <uid>:<gid>` time.
+                // performs sync I/O.
+                //
+                // The synthetic `/etc/passwd` overlay's uid/gid line
+                // must match whatever uid/gid the container will
+                // actually run under at `--user <uid>:<gid>` time:
+                // sshd's `getpwuid(geteuid())` lookup fails (and sshd
+                // aborts on startup) if the running uid does not have
+                // an entry in `/etc/passwd`. Under the supervisor-fork
+                // pattern, that uid is the *operator's* (the caller of
+                // `POST /sessions`), not the daemon's own. Stamp the
+                // synthetic passwd entry with the operator's
+                // `SO_PEERCRED` pair so the two stay in lockstep.
                 let ssh_host_dir_owned = ssh_host_dir.clone();
                 let kp_owned = ssh_keypair_for_staging.clone();
-                let daemon_uid = state.container_runtime.user_uid();
-                let daemon_gid = state.container_runtime.user_gid();
+                let operator_uid = operator.uid;
+                let operator_gid = operator.gid;
                 let stage_result = tokio::task::spawn_blocking(move || {
                     sandbox_core::backend::stage_ssh_credentials(
                         &ssh_host_dir_owned,
                         &kp_owned,
-                        daemon_uid,
-                        daemon_gid,
+                        operator_uid,
+                        operator_gid,
                     )
                 })
                 .await;
@@ -2116,6 +2123,15 @@ async fn create_session(
                 // three files we just staged above
                 // (authorized_keys + synthetic passwd / group).
                 ssh_host_dir: Some(ssh_host_dir),
+                // Operator identity (uid, gid) captured from the
+                // accepting socket's `SO_PEERCRED`. The container
+                // runtime stamps this onto `--user <uid>:<gid>` at
+                // `docker create` time so the container process runs as
+                // the operator on the host (not the daemon's own uid),
+                // and so workspace bind-mount writes land with operator
+                // ownership. Travels as `Some((uid, gid))` here because
+                // the supervisor-fork pattern requires both halves.
+                operator_identity: Some((operator.uid, operator.gid)),
             };
             state
                 .container_runtime

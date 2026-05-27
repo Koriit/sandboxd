@@ -140,6 +140,7 @@ impl TestNetwork {
             route_helper_path: helper,
             ca_host_path: None,
             ssh_host_dir: None,
+            operator_identity: None,
         }
     }
 }

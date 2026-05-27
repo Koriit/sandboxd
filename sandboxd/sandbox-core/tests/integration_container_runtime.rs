@@ -141,6 +141,7 @@ impl TestNetwork {
             // best-effort sshd path documented in the lite-image
             // launch wrapper.
             ssh_host_dir: None,
+            operator_identity: None,
         }
     }
 }
