@@ -357,6 +357,8 @@ async fn integration_create_session_container_backend_round_trip() {
             "test-operator",
             0,
             "",
+            None,
+            None,
         )
         .expect("persist session row");
     assert_eq!(session.backend, BackendKind::Container);

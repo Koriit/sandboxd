@@ -70,7 +70,11 @@ fn build_router(store: Arc<SessionStore>, states: Arc<PropagationStates>) -> axu
     // it through `Extension<OperatorIdentity>` resolve successfully —
     // the production daemon's `operator_identity_layer` inserts it from
     // `SO_PEERCRED`; tests using `oneshot` need to inject it directly.
-    policy_router(state).layer(axum::Extension(OperatorIdentity::new(1000, TEST_CALLER)))
+    policy_router(state).layer(axum::Extension(OperatorIdentity::new(
+        1000,
+        1000,
+        TEST_CALLER,
+    )))
 }
 
 /// Issue a `GET /sessions/{id}/policy/propagation-status` against
@@ -258,7 +262,7 @@ async fn foreign_session_id_returns_404() {
     let state = Arc::new(sandboxd::policy_http::PolicyApiState::new(store, states));
     // Route bob's requests — bob's identity, not alice's.
     let router = sandboxd::policy_http::policy_router(state)
-        .layer(axum::Extension(OperatorIdentity::new(2000, "bob")));
+        .layer(axum::Extension(OperatorIdentity::new(2000, 2000, "bob")));
 
     // GET alice's session id under bob's identity must be 404 with the
     // same body shape as a truly unknown id.
@@ -284,7 +288,7 @@ async fn foreign_session_id_returns_404() {
         .unwrap();
     let state2 = Arc::new(sandboxd::policy_http::PolicyApiState::new(store2, states2));
     let router2 = sandboxd::policy_http::policy_router(state2)
-        .layer(axum::Extension(OperatorIdentity::new(2000, "bob")));
+        .layer(axum::Extension(OperatorIdentity::new(2000, 2000, "bob")));
     let (status_by_name, _) = get_status(router2, "alice-secret").await;
     assert_eq!(
         status_by_name,

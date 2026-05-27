@@ -565,6 +565,8 @@ impl SessionStore {
             owner_username,
             guest_proto,
             guest_bin_ver,
+            None,
+            None,
         )
     }
 
@@ -572,6 +574,17 @@ impl SessionStore {
     /// owns the session. Threaded through by the `POST /sessions`
     /// handler so the container path persists `backend = 'container'`
     /// rather than relying on the SQL `DEFAULT 'lima'`.
+    ///
+    /// `operator_uid` / `operator_gid` (V008) carry the operator's
+    /// kernel-supplied `SO_PEERCRED` pair. `None` for both is the
+    /// legacy spawn-as-daemon path; `Some(uid)`/`Some(gid)` engages the
+    /// supervisor-fork pattern (container `--user <uid>:<gid>`, Lima
+    /// spawn-helper + cloud-init usermod). Tests that pre-date V008
+    /// keep passing `None`/`None` to opt into the legacy shape.
+    #[allow(clippy::too_many_arguments)] // Each arg is a load-bearing
+    // slot — collapsing into a struct hides the V006/V007/V008-shape
+    // additions at the call site, which is exactly where readers
+    // need to see them.
     pub fn create_session_with_backend(
         &self,
         config: SessionConfig,
@@ -580,6 +593,8 @@ impl SessionStore {
         owner_username: &str,
         guest_proto: u32,
         guest_bin_ver: &str,
+        operator_uid: Option<u32>,
+        operator_gid: Option<u32>,
     ) -> Result<Session, SandboxError> {
         let config_json = serde_json::to_string(&config)
             .map_err(|e| SandboxError::Internal(format!("failed to serialize config: {e}")))?;
@@ -591,6 +606,8 @@ impl SessionStore {
             session.owner_username = owner_username.to_string();
             session.guest_protocol_version = guest_proto;
             session.guest_binary_version = guest_bin_ver.to_string();
+            session.operator_uid = operator_uid;
+            session.operator_gid = operator_gid;
             match self.try_insert_session(&session, &config_json) {
                 Ok(()) => {
                     fs::create_dir_all(self.session_dir(&session.id))?;
@@ -636,8 +653,9 @@ impl SessionStore {
 
         let res = conn.execute(
             "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
+                 operator_uid, operator_gid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 session.id.as_str(),
                 session.name,
@@ -650,6 +668,10 @@ impl SessionStore {
                 session.guest_protocol_version as i64,
                 session.guest_binary_version,
                 ssh_keypair_json,
+                // V008: nullable; None routes through the legacy spawn-as-daemon
+                // path (no `--user <uid>:<gid>` argv; no Lima cloud-init usermod).
+                session.operator_uid.map(|u| u as i64),
+                session.operator_gid.map(|g| g as i64),
             ],
         );
 
@@ -683,7 +705,8 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
+                 operator_uid, operator_gid
              FROM sessions WHERE id = ?1 AND owner_username = ?2",
         )?;
 
@@ -713,7 +736,8 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
+                 operator_uid, operator_gid
              FROM sessions WHERE id = ?1",
         )?;
 
@@ -744,7 +768,8 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
+                 operator_uid, operator_gid
              FROM sessions ORDER BY created_at ASC",
         )?;
 
@@ -776,7 +801,8 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
+                 operator_uid, operator_gid
              FROM sessions WHERE owner_username = ?1 ORDER BY created_at ASC",
         )?;
 
@@ -1048,7 +1074,7 @@ impl SessionStore {
             let mut stmt = conn.prepare(
                 "SELECT id, name, state, config, created_at, updated_at, backend, \
                      owner_username, guest_protocol_version, guest_binary_version, \
-                     ssh_keypair_json
+                     ssh_keypair_json, operator_uid, operator_gid
                  FROM sessions WHERE name = ?1 AND owner_username = ?2",
             )?;
 
@@ -1846,7 +1872,7 @@ enum InsertError {
 /// Column order matches every `SELECT ... FROM sessions` in this module:
 /// `id, name, state, config, created_at, updated_at, backend,
 ///  owner_username, guest_protocol_version, guest_binary_version,
-///  ssh_keypair_json`.
+///  ssh_keypair_json, operator_uid, operator_gid`.
 fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let id_str: String = row.get(0)?;
     let name: Option<String> = row.get(1)?;
@@ -1875,6 +1901,15 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     // always store `NULL` because Lima manages its own keys outside
     // the daemon DB.
     let ssh_keypair_json: Option<String> = row.get(10)?;
+    // Columns 11..=12 (`operator_uid`, `operator_gid`) were introduced
+    // by V008. Both are nullable so pre-V008 rows read back with
+    // `None` for both — the daemon routes those through the legacy
+    // spawn-as-daemon path (no `--user <uid>:<gid>` argv on the
+    // container backend, no Lima cloud-init usermod step). i64 here
+    // because rusqlite's `INTEGER` type maps to that; we narrow via
+    // `try_from` to keep the surfaced u32 honest.
+    let operator_uid_raw: Option<i64> = row.get(11)?;
+    let operator_gid_raw: Option<i64> = row.get(12)?;
 
     let id = SessionId::parse(&id_str)
         .map_err(|e| SandboxError::Internal(format!("invalid session id in database: {e}")))?;
@@ -1909,6 +1944,23 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         None => None,
     };
 
+    // Narrow the persisted i64 to u32 — the SQLite column is `INTEGER NULL`
+    // but uids/gids never exceed u32. A persisted negative value is a
+    // sign of corruption (the daemon never stamps a negative) and is
+    // surfaced as `Internal` rather than silently coerced.
+    let operator_uid = match operator_uid_raw {
+        Some(raw) => Some(u32::try_from(raw).map_err(|_| {
+            SandboxError::Internal(format!("operator_uid out of u32 range: {raw}"))
+        })?),
+        None => None,
+    };
+    let operator_gid = match operator_gid_raw {
+        Some(raw) => Some(u32::try_from(raw).map_err(|_| {
+            SandboxError::Internal(format!("operator_gid out of u32 range: {raw}"))
+        })?),
+        None => None,
+    };
+
     Ok(Session {
         id,
         name,
@@ -1921,6 +1973,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         guest_protocol_version,
         guest_binary_version,
         ssh_keypair,
+        operator_uid,
+        operator_gid,
     })
 }
 
@@ -4408,6 +4462,104 @@ mod tests {
         assert!(
             after.ssh_keypair.is_none(),
             "foreign-caller set_ssh_keypair must not mutate the row"
+        );
+    }
+
+    /// V008: `operator_uid` and `operator_gid` round-trip through the
+    /// store. Pinned alongside the V007 ssh_keypair round-trip so a
+    /// regression that drops either column from the SELECT-list or
+    /// INSERT-list surfaces immediately. Tests both the `Some(_)` path
+    /// (the supervisor-fork happy path stamping the operator's
+    /// `SO_PEERCRED` pair) and the `None` path (the legacy
+    /// spawn-as-daemon fallback that pre-V008 rows take).
+    #[test]
+    fn test_operator_uid_gid_round_trip_with_values() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session_with_backend(
+                SessionConfig::default(),
+                None,
+                crate::backend::BackendKind::Container,
+                "alice",
+                0,
+                "",
+                Some(2001),
+                Some(2002),
+            )
+            .expect("create");
+
+        let fetched = store
+            .get_session(&session.id, "alice")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            fetched.operator_uid,
+            Some(2001),
+            "operator_uid must round-trip through INSERT + SELECT"
+        );
+        assert_eq!(
+            fetched.operator_gid,
+            Some(2002),
+            "operator_gid must round-trip through INSERT + SELECT"
+        );
+    }
+
+    /// `None` for both operator fields persists as SQLite NULL and
+    /// reads back as `None`. This is the legacy-rollback path: a
+    /// pre-V008 daemon (or a session created before the supervisor-fork
+    /// pattern shipped) carries `None` for both fields and routes
+    /// through the legacy spawn-as-daemon code path.
+    #[test]
+    fn test_operator_uid_gid_round_trip_with_none() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session_with_backend(
+                SessionConfig::default(),
+                None,
+                crate::backend::BackendKind::Lima,
+                "alice",
+                0,
+                "",
+                None,
+                None,
+            )
+            .expect("create");
+
+        let fetched = store
+            .get_session(&session.id, "alice")
+            .expect("get")
+            .expect("exists");
+        assert!(
+            fetched.operator_uid.is_none(),
+            "operator_uid = None must survive INSERT/SELECT round-trip"
+        );
+        assert!(
+            fetched.operator_gid.is_none(),
+            "operator_gid = None must survive INSERT/SELECT round-trip"
+        );
+    }
+
+    /// The `create_session` back-compat shim stamps `None` for both
+    /// operator-uid fields. Pinned so any future refactor that
+    /// reverses the default — e.g. silently inheriting the daemon's
+    /// own uid — surfaces immediately. The supervisor-fork pattern
+    /// requires kernel-supplied `SO_PEERCRED` uids; falling back to
+    /// the daemon's identity would re-introduce the spawn-as-daemon
+    /// bug the supervisor-fork is built to fix.
+    #[test]
+    fn test_create_session_shim_stamps_none_for_operator_pair() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .expect("create");
+
+        assert!(
+            session.operator_uid.is_none(),
+            "back-compat create_session shim must default operator_uid to None"
+        );
+        assert!(
+            session.operator_gid.is_none(),
+            "back-compat create_session shim must default operator_gid to None"
         );
     }
 

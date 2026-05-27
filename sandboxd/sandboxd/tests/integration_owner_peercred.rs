@@ -415,6 +415,8 @@ async fn integration_synthetic_foreign_owner_returns_404() {
                 "synthetic-other",
                 0,
                 "",
+                None,
+                None,
             )
             .expect("seed foreign-owner row");
         foreign_id_str = session.id.as_str().to_string();
@@ -459,6 +461,8 @@ async fn integration_list_returns_only_callers_sessions() {
                 "synthetic-other",
                 0,
                 "",
+                None,
+                None,
             )
             .expect("seed foreign-owner row");
         foreign_id_str = foreign.id.as_str().to_string();
@@ -470,6 +474,8 @@ async fn integration_list_returns_only_callers_sessions() {
                 &runner,
                 0,
                 "",
+                None,
+                None,
             )
             .expect("seed runner-owner row");
         runner_id_str = owned.id.as_str().to_string();

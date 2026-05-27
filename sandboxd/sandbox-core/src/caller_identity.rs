@@ -44,6 +44,14 @@ pub struct OperatorIdentity {
     /// accepted connection. Kernel-supplied; cannot be spoofed by the
     /// client.
     pub uid: u32,
+    /// Numeric primary gid of the operator, read from `SO_PEERCRED` on
+    /// the accepted connection alongside `uid`. Kernel-supplied; cannot
+    /// be spoofed by the client. Used by the supervisor-fork pattern to
+    /// align the in-container `--user <uid>:<gid>` flag (and the Lima
+    /// cloud-init usermod step) with the operator's primary group on
+    /// the host so workspace bind-mount writes land with the expected
+    /// ownership.
+    pub gid: u32,
     /// Username the daemon resolved `uid` to via `getpwuid_r` at accept
     /// time. Strict resolution: a uid that does not resolve closes the
     /// connection before the value reaches a handler.
@@ -54,9 +62,10 @@ impl OperatorIdentity {
     /// Construct an identity. Useful in tests that need to bypass the
     /// peer-cred read (e.g. by mocking the extension via
     /// `MockConnectInfo`).
-    pub fn new(uid: u32, name: impl Into<String>) -> Self {
+    pub fn new(uid: u32, gid: u32, name: impl Into<String>) -> Self {
         Self {
             uid,
+            gid,
             name: name.into(),
         }
     }
@@ -68,8 +77,9 @@ mod tests {
 
     #[test]
     fn operator_identity_roundtrips_through_new() {
-        let id = OperatorIdentity::new(1000, "alice");
+        let id = OperatorIdentity::new(1000, 1000, "alice");
         assert_eq!(id.uid, 1000);
+        assert_eq!(id.gid, 1000);
         assert_eq!(id.name, "alice");
     }
 
@@ -79,8 +89,22 @@ mod tests {
     /// silently drops `Clone` would break the connect-info layer.
     #[test]
     fn operator_identity_is_clone_and_eq() {
-        let id = OperatorIdentity::new(1000, "alice");
+        let id = OperatorIdentity::new(1000, 1000, "alice");
         let cloned = id.clone();
         assert_eq!(id, cloned);
+    }
+
+    /// Pin that uid and gid are independent fields — early plumbing
+    /// errors that aliased the two (`gid: uid`) would silently produce
+    /// an operator identity that misnames its primary group. The
+    /// supervisor-fork pattern relies on the distinction whenever the
+    /// operator's primary gid differs from their uid (typical on
+    /// multi-user hosts).
+    #[test]
+    fn operator_identity_uid_and_gid_are_independent() {
+        let id = OperatorIdentity::new(1000, 2000, "alice");
+        assert_eq!(id.uid, 1000);
+        assert_eq!(id.gid, 2000);
+        assert_ne!(id.uid, id.gid);
     }
 }

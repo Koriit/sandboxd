@@ -997,6 +997,40 @@ pub struct Session {
     /// every additive `Session` / `SessionConfig` field follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_keypair: Option<crate::ssh::SshKeypair>,
+    /// Numeric uid of the operator who created this session, captured
+    /// at `POST /sessions` time via `SO_PEERCRED`. Persisted in the
+    /// `sessions.operator_uid` column (V008 migration) so the
+    /// supervisor-fork spawn path can recover the operator identity
+    /// after a daemon restart without re-resolving via NSS.
+    ///
+    /// `None` on pre-V008 rows (the column is nullable; the migration
+    /// does not backfill). Sessions with `None` route through the
+    /// legacy spawn-as-daemon path — no operator-uid alignment, no
+    /// `--user <uid>:<gid>` flag on `docker create`, no Lima cloud-init
+    /// usermod step. Newly created sessions on V008+ daemons always
+    /// carry `Some(uid)`.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// keeps the JSON envelope omitted when absent so an older daemon
+    /// rolling back over a record this newer daemon wrote silently
+    /// skips the unknown field. Mirrors the forward-compat convention
+    /// every additive `Session` field follows (see CLAUDE.md
+    /// "On-disk compatibility").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_uid: Option<u32>,
+    /// Numeric primary gid of the operator who created this session,
+    /// captured alongside [`Self::operator_uid`]. Persisted in the
+    /// `sessions.operator_gid` column (V008 migration).
+    ///
+    /// Travels with `operator_uid` because the supervisor-fork's
+    /// `setresuid` + container `--user <uid>:<gid>` flag both need
+    /// the full pair. `None` semantics match [`Self::operator_uid`]
+    /// (pre-V008 row, route through the legacy spawn path).
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// per the forward-compat convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_gid: Option<u32>,
 }
 
 impl Session {
@@ -1019,6 +1053,8 @@ impl Session {
             guest_protocol_version: 0,
             guest_binary_version: String::new(),
             ssh_keypair: None,
+            operator_uid: None,
+            operator_gid: None,
         }
     }
 
@@ -1050,6 +1086,8 @@ impl Session {
             guest_protocol_version: 0,
             guest_binary_version: String::new(),
             ssh_keypair: None,
+            operator_uid: None,
+            operator_gid: None,
         }
     }
 
@@ -1207,6 +1245,83 @@ mod tests {
         assert_eq!(session.config.cpus, deserialized.config.cpus);
         assert_eq!(session.config.memory_mb, deserialized.config.memory_mb);
         assert_eq!(session.config.disk_gb, deserialized.config.disk_gb);
+    }
+
+    /// Pre-V008 serialised `Session` records carry no `operator_uid` /
+    /// `operator_gid` keys at all. Both fields must deserialise to
+    /// `None` via `#[serde(default)]` so an older row hand-edited or
+    /// produced by a pre-V008 daemon still loads cleanly. The
+    /// rollback-from-newer-daemon case is the same shape: an older
+    /// reader sees the unknown keys and silently drops them (per
+    /// `Session`'s deny-unknown-fields-off default).
+    #[test]
+    fn operator_uid_gid_default_to_none_on_legacy_record() {
+        // Minimal Session JSON without the V008 fields. Keys that
+        // pre-date V008: id, state, created_at, updated_at, config,
+        // backend, owner_username, guest_protocol_version,
+        // guest_binary_version.
+        let json = r#"{
+            "id": "abcdef012345",
+            "state": "running",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "config": {"cpus": 2, "memory_mb": 4096, "disk_gb": 20},
+            "owner_username": "alice"
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert!(
+            session.operator_uid.is_none(),
+            "pre-V008 record must deserialise with operator_uid = None; got {:?}",
+            session.operator_uid
+        );
+        assert!(
+            session.operator_gid.is_none(),
+            "pre-V008 record must deserialise with operator_gid = None; got {:?}",
+            session.operator_gid
+        );
+    }
+
+    /// `operator_uid` / `operator_gid` round-trip through serde when
+    /// stamped with concrete values — the wire form emits both keys,
+    /// and the deserialiser recovers the integer pair. Companion to
+    /// the legacy-record test above.
+    #[test]
+    fn operator_uid_gid_round_trip_with_values() {
+        let mut session = Session::new(Some("with-operator".into()));
+        session.operator_uid = Some(1234);
+        session.operator_gid = Some(5678);
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(
+            json.contains("\"operator_uid\":1234"),
+            "operator_uid must be emitted on the wire when Some; got {json}"
+        );
+        assert!(
+            json.contains("\"operator_gid\":5678"),
+            "operator_gid must be emitted on the wire when Some; got {json}"
+        );
+        let deser: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.operator_uid, Some(1234));
+        assert_eq!(deser.operator_gid, Some(5678));
+    }
+
+    /// `operator_uid` / `operator_gid` are omitted from the wire when
+    /// `None` (per `#[serde(skip_serializing_if = "Option::is_none")]`).
+    /// This pins the rollback shape: a newer daemon's record that
+    /// happens to have `None` for both fields persists no `operator_uid`
+    /// / `operator_gid` keys, so an older reader sees exactly the
+    /// pre-V008 wire form.
+    #[test]
+    fn operator_uid_gid_omitted_when_none() {
+        let session = Session::new(Some("legacy-shape".into()));
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(
+            !json.contains("operator_uid"),
+            "operator_uid must be omitted from wire when None; got {json}"
+        );
+        assert!(
+            !json.contains("operator_gid"),
+            "operator_gid must be omitted from wire when None; got {json}"
+        );
     }
 
     #[test]

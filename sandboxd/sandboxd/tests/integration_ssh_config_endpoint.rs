@@ -331,6 +331,8 @@ async fn integration_get_ssh_config_container_backend() {
                 &owner,
                 0,
                 "",
+                None,
+                None,
             )
             .expect("create container session row");
         let id = session.id;
@@ -411,6 +413,8 @@ async fn integration_get_ssh_config_lima_backend() {
                 &owner,
                 0,
                 "",
+                None,
+                None,
             )
             .expect("create lima session row");
         session.id.to_string()
@@ -466,6 +470,8 @@ async fn integration_get_ssh_config_container_returns_404_when_keypair_absent() 
                 &owner,
                 0,
                 "",
+                None,
+                None,
             )
             .expect("create container session row");
         // Intentionally do NOT call set_ssh_keypair — the row's

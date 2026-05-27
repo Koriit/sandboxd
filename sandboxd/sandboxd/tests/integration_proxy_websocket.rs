@@ -354,6 +354,8 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
             operator,
             0,
             "",
+            None,
+            None,
         )
         .expect("create container session row");
     let session_id = session.id;

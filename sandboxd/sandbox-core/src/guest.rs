@@ -1022,6 +1022,8 @@ mod tests {
                 "test-operator",
                 0,
                 "",
+                None,
+                None,
             )
             .unwrap();
 
@@ -1047,6 +1049,8 @@ mod tests {
                 "test-operator",
                 0,
                 "",
+                None,
+                None,
             )
             .unwrap();
 
@@ -1092,6 +1096,8 @@ mod tests {
                 "test-operator",
                 0,
                 "",
+                None,
+                None,
             )
             .unwrap();
 

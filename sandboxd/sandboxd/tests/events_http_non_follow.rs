@@ -186,7 +186,11 @@ fn build_router(store: Arc<SessionStore>, bus: EventBus) -> axum::Router {
     // it through `Extension<OperatorIdentity>` resolve successfully —
     // the production daemon's `operator_identity_layer` inserts it from
     // `SO_PEERCRED`; tests using `oneshot` need to inject it directly.
-    events_router(state).layer(axum::Extension(OperatorIdentity::new(1000, TEST_CALLER)))
+    events_router(state).layer(axum::Extension(OperatorIdentity::new(
+        1000,
+        1000,
+        TEST_CALLER,
+    )))
 }
 
 /// Thin convenience around `ServiceExt::oneshot` that takes a

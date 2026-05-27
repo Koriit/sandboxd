@@ -237,6 +237,8 @@ fn seed_running_container_session(base_dir: &Path) -> SessionId {
             &owner,
             0,
             "",
+            None,
+            None,
         )
         .expect("seed session row");
     // Transition Creating -> Running through the owner-filtered API.
@@ -262,6 +264,8 @@ fn seed_creating_container_session(base_dir: &Path) -> SessionId {
             &current_username(),
             0,
             "",
+            None,
+            None,
         )
         .expect("seed session row");
     session.id

@@ -361,6 +361,8 @@ async fn integration_proxy_websocket_round_trip_lima_backend() {
                 &owner,
                 0,
                 "",
+                None,
+                None,
             )
             .expect("create lima session row");
         session.id.to_string()

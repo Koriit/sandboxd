@@ -469,6 +469,8 @@ async fn integration_guest_refresh_container_backend() {
             // Stale stamp — simulates an older daemon's session.
             0,
             "",
+            None,
+            None,
         )
         .expect("persist session");
 
@@ -583,6 +585,8 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
             SANDBOX_GUEST_VERSION,
+            None,
+            None,
         )
         .expect("persist session #1");
     // Create the docker network AFTER the session row exists so its
@@ -624,6 +628,8 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
             SANDBOX_GUEST_VERSION,
+            None,
+            None,
         )
         .expect("persist session #2");
     // New network for container #2 (each container needs its own /28
@@ -712,6 +718,8 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
             SANDBOX_GUEST_VERSION,
+            None,
+            None,
         )
         .expect("persist session A");
     // Create the docker network AFTER the session row exists so its
@@ -738,6 +746,8 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
             SANDBOX_GUEST_VERSION,
+            None,
+            None,
         )
         .expect("persist session B");
     // Same canonical-name rationale as container A above.

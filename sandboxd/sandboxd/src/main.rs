@@ -1129,13 +1129,24 @@ impl axum::serve::Listener for PeerCredListener {
             };
 
             let uid_raw = ucred.uid();
+            // `gid()` returns the operator's primary gid as kernel-reported by
+            // `SO_PEERCRED`. Captured alongside `uid` so the supervisor-fork
+            // pattern can align both halves of the container's
+            // `--user <uid>:<gid>` flag (and the Lima cloud-init usermod step)
+            // with the operator's on-host identity. Kernel-supplied, cannot be
+            // spoofed by the client.
+            let gid_raw = ucred.gid();
             match resolve_uid_to_name_with_retry(uid_raw, UID_RESOLVE_ATTEMPTS, UID_RESOLVE_BACKOFF)
                 .await
             {
                 Some(name) => {
                     return (
                         stream,
-                        PeerCredAddr(OperatorIdentity { uid: uid_raw, name }),
+                        PeerCredAddr(OperatorIdentity {
+                            uid: uid_raw,
+                            gid: gid_raw,
+                            name,
+                        }),
                     );
                 }
                 None => {
@@ -1712,6 +1723,16 @@ async fn create_session(
         &operator.name,
         sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
         sandbox_core::guest::SANDBOX_GUEST_VERSION,
+        // Stamp the operator's kernel-supplied `SO_PEERCRED` (uid, gid)
+        // onto the new row. The container backend reads these back to
+        // build the `--user <uid>:<gid>` argv on `docker create`; the
+        // Lima backend reads them back to drive the cloud-init usermod
+        // step. Both halves travel together because the
+        // supervisor-fork `setresuid`/`setresgid` primitive consumes
+        // them as a pair. Pre-V008 rows have `None` for both and
+        // continue to route through the legacy spawn-as-daemon path.
+        Some(operator.uid),
+        Some(operator.gid),
     ) {
         Ok(s) => s,
         Err(e) => return error_response(e).into_response(),
