@@ -21,3 +21,6 @@ __pycache__/
 
 .claude/*.local.md
 .claude/scheduled_tasks.lock
+
+# graphify knowledge-graph artefacts (project-level tooling — generated)
+/graphify-out/
