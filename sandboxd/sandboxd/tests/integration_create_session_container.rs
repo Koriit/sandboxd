@@ -280,6 +280,7 @@ fn container_spec() -> SessionSpec {
         template: None,
         disk_gb: None,
         no_cache: None,
+        operator_identity: None,
     }
 }
 
@@ -625,6 +626,7 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
         template: None,
         disk_gb: None,
         no_cache: None,
+        operator_identity: None,
     };
     shared_spec
         .validate(runtime.capabilities())
@@ -646,6 +648,7 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
         template: None,
         disk_gb: None,
         no_cache: None,
+        operator_identity: None,
     };
     clone_spec
         .validate(runtime.capabilities())

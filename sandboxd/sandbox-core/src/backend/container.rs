@@ -776,11 +776,8 @@ impl SessionRuntime for ContainerRuntime {
         let network = self.lookup_session(session_id)?;
         let (memory_mb, cpus) = self.resource_ceilings(spec)?;
 
-        let (effective_uid, effective_gid) = effective_container_user(
-            network.operator_identity,
-            self.user_uid,
-            self.user_gid,
-        );
+        let (effective_uid, effective_gid) =
+            effective_container_user(network.operator_identity, self.user_uid, self.user_gid);
 
         let args = build_create_argv(
             session_id,
@@ -2408,6 +2405,7 @@ mod tests {
             template: None,
             disk_gb: None,
             no_cache: None,
+            operator_identity: None,
         };
 
         let err = rt
@@ -2443,6 +2441,7 @@ mod tests {
             template: None,
             disk_gb: None,
             no_cache: None,
+            operator_identity: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_zero).unwrap();
         assert_eq!(mem, 2048, "0 → default_memory_mb");
@@ -2459,6 +2458,7 @@ mod tests {
             template: None,
             disk_gb: None,
             no_cache: None,
+            operator_identity: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_explicit).unwrap();
         assert_eq!(mem, 4096);
@@ -2479,6 +2479,7 @@ mod tests {
             template: None,
             disk_gb: None,
             no_cache: None,
+            operator_identity: None,
         };
         let (_mem, cpus) = rt.resource_ceilings(&spec_fractional).unwrap();
         assert!(
@@ -2785,8 +2786,14 @@ mod tests {
     #[test]
     fn effective_container_user_falls_back_to_defaults_when_absent() {
         let (uid, gid) = effective_container_user(None, 1000, 1000);
-        assert_eq!(uid, 1000, "fallback uid must apply when no operator captured");
-        assert_eq!(gid, 1000, "fallback gid must apply when no operator captured");
+        assert_eq!(
+            uid, 1000,
+            "fallback uid must apply when no operator captured"
+        );
+        assert_eq!(
+            gid, 1000,
+            "fallback gid must apply when no operator captured"
+        );
     }
 
     /// `--user <uid>:<gid>` argv reflects the operator identity when

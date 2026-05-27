@@ -207,6 +207,7 @@ fn container_spec() -> SessionSpec {
         template: None,
         disk_gb: None,
         no_cache: None,
+        operator_identity: None,
     }
 }
 

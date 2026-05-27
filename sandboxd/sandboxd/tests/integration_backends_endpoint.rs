@@ -35,7 +35,7 @@ async fn integration_backends_endpoint_lists_registered_backends_in_stable_order
         LimaManager::new(tmp.path().to_path_buf(), DEFAULT_BASE_VM_NAME.to_string())
             .expect("LimaManager::new"),
     );
-    let lima = LimaRuntime::new(manager);
+    let lima = LimaRuntime::new(manager, None);
 
     let mut runtimes: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
     runtimes.insert(BackendKind::Lima, lima);

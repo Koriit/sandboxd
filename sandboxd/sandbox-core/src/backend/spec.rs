@@ -138,6 +138,27 @@ pub struct SessionSpec {
     /// [`UnsupportedFeature::PerSessionNoCache`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_cache: Option<bool>,
+    /// Operator's `(uid, gid)` pair from `SO_PEERCRED`, threaded into
+    /// the backend so it can align the in-VM/in-container effective
+    /// identity with the operator on the host.
+    ///
+    /// **Daemon-stamped, not client-supplied.** The CLI never sets this
+    /// field — it is overwritten by the daemon's session-create handler
+    /// from the connecting socket's peer credentials immediately before
+    /// `SessionRuntime::create` is invoked. The serde shape is
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// purely for forward-compat on persisted records and inter-backend
+    /// JSON traffic; client requests that smuggle a value are ignored
+    /// (the handler unconditionally overrides).
+    ///
+    /// Consumed by the Lima backend's per-session cloud-init `usermod`
+    /// provision step (the YAML is generated at `create` time, so the
+    /// pair must be available before `LimaManager::create_vm` runs).
+    /// The container backend consumes the same pair via the separate
+    /// `ContainerNetwork.operator_identity` field, also stamped by the
+    /// daemon at the call site of `ContainerRuntime::register_session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_identity: Option<(u32, u32)>,
     // Forward-compat: new fields go here as Option<T> with
     // #[serde(default)].
 }
@@ -251,6 +272,7 @@ mod tests {
             template: None,
             disk_gb: None,
             no_cache: None,
+            operator_identity: None,
         }
     }
 
@@ -266,6 +288,7 @@ mod tests {
             template: None,
             disk_gb: None,
             no_cache: None,
+            operator_identity: None,
         }
     }
 
@@ -422,6 +445,12 @@ mod tests {
         // with `None` so the validate gate's "absent flag = cached
         // fast path" semantics hold for legacy daemons rolling forward.
         assert!(parsed.no_cache.is_none());
+        // Records predating the `operator_identity` field round-trip
+        // with `None` — the field is daemon-stamped at handler time,
+        // so a record authored by an older daemon (or read back from
+        // a persisted blob) must default to None and let the legacy
+        // spawn-as-daemon path keep working.
+        assert!(parsed.operator_identity.is_none());
     }
 
     /// `SessionSpec::backend()` is a thin wrapper over

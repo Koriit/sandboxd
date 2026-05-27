@@ -706,6 +706,28 @@ fn read_cap_xattr(path: &std::path::Path) -> Option<Vec<u8>> {
 ///     only need to know that the blob is well-formed and that
 ///     `CAP_SYS_ADMIN+ep` is set.
 fn xattr_has_cap_sys_admin_effective(buf: &[u8]) -> bool {
+    xattr_has_cap_effective(buf, CAP_SYS_ADMIN_BIT)
+}
+
+/// Capability bit for `CAP_SETUID` (UAPI `linux/capability.h` —
+/// `#define CAP_SETUID 7`). Required by `sandbox-spawn-helper`'s
+/// `setresuid(2)` call.
+const CAP_SETUID_BIT: u32 = 7;
+
+/// Generalised inner of [`xattr_has_cap_sys_admin_effective`] — decode
+/// a raw `vfs_cap_data` blob and return whether the bit at
+/// `cap_bit` is present in `permitted` *and* the blob's `effective`
+/// flag is set. Pure function: identical to the existing
+/// `cap_sys_admin` check but parameterized over which capability bit
+/// to look for so the spawn-helper resolver (which needs `CAP_SETUID`)
+/// can share the xattr-decoding logic.
+///
+/// We only consult `data[0].permitted` because every capability the
+/// resolver checks today (`CAP_SYS_ADMIN` = 21, `CAP_SETUID` = 7) fits
+/// in the low 32 bits of the 64-bit permitted set. Future helpers that
+/// need a high-numbered capability (≥ 32) would also need to consult
+/// `data[1].permitted`; deferred until the first such caller exists.
+fn xattr_has_cap_effective(buf: &[u8], cap_bit: u32) -> bool {
     if buf.len() != VFS_CAP_DATA_V2_SIZE && buf.len() != VFS_CAP_DATA_V3_SIZE {
         return false;
     }
@@ -721,10 +743,138 @@ fn xattr_has_cap_sys_admin_effective(buf: &[u8]) -> bool {
     if magic_etc & VFS_CAP_FLAGS_EFFECTIVE == 0 {
         return false;
     }
-    // CAP_SYS_ADMIN bit number is 21, which fits in the low 32 bits
-    // of the 64-bit permitted set, so we only need data[0].permitted.
+    // Both `CAP_SYS_ADMIN` (21) and `CAP_SETUID` (7) live in the low
+    // 32 bits of the 64-bit permitted set, so `data[0].permitted`
+    // suffices. See the function comment above for the high-cap
+    // extension story.
     let permitted_lo = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
-    permitted_lo & (1u32 << CAP_SYS_ADMIN_BIT) != 0
+    permitted_lo & (1u32 << cap_bit) != 0
+}
+
+// ---------------------------------------------------------------------------
+// sandbox-spawn-helper path resolution
+// ---------------------------------------------------------------------------
+//
+// The Lima backend dispatches `limactl start` through
+// `sandbox-spawn-helper` so the per-session QEMU process runs under
+// the operator's uid (not the daemon's). The helper is a cap'd setcap
+// binary (`cap_setuid+ep`) at the FHS-canonical install path
+// `/usr/local/libexec/sandboxd/sandbox-spawn-helper`. Resolution
+// mirrors the route-helper precedent:
+//
+//   0. `$SANDBOX_SPAWN_HELPER_PATH` — explicit operator override. If
+//      set, the resolver uses this path and only this path (fail-closed
+//      if missing or un-cap'd). Used by tests; production operators
+//      don't set it.
+//   1. `/usr/local/libexec/sandboxd/sandbox-spawn-helper` (FHS § 4.7).
+//      Installed by `make install-spawn-helper-prod-cap`.
+//
+// The resolver returns `None` when no candidate is usable — the Lima
+// runtime then falls back to spawning `limactl` under the daemon's own
+// uid (the legacy "spawn-as-daemon" path). This is a soft fallback
+// because the spawn-helper is only needed for the cross-user case
+// (daemon uid 999 + operator uid 1000+); single-user dev installs
+// where the daemon already runs as the operator don't need it.
+//
+// **Why `Option<PathBuf>` instead of `Result<PathBuf, _>`**: this
+// matches the historical container-backend `route_helper_path:
+// Option<PathBuf>` shape on `ContainerNetwork`. The route helper is
+// also optional at the *type* level — the runtime decides whether to
+// invoke it based on `Some`/`None` at the call site. Keeping the same
+// shape for the spawn helper lets the Lima runtime apply the same
+// "if-Some-then-helper-else-direct" gate without a special error
+// type.
+
+/// Canonical install path (FHS § 4.7) for `sandbox-spawn-helper`.
+const SPAWN_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-spawn-helper";
+
+/// Environment variable for explicit operator override of the
+/// spawn-helper path. When set, the resolver uses this path and only
+/// this path (fail-closed if missing or un-cap'd). Intended for tests
+/// and unusual deployments; production operators should not set it.
+const SPAWN_HELPER_PATH_ENV: &str = "SANDBOX_SPAWN_HELPER_PATH";
+
+/// Resolve the absolute path to `sandbox-spawn-helper` for use as
+/// `LimaRuntime::new`'s `spawn_helper_path` argument.
+///
+/// Returns `None` when no usable candidate exists (no env override,
+/// canonical path missing or un-cap'd). The Lima runtime treats `None`
+/// as "fall back to direct `limactl` spawn under daemon uid" — same
+/// soft-fallback semantics the daemon used before M18 cross-user work.
+///
+/// When `$SANDBOX_SPAWN_HELPER_PATH` is set, the resolver uses it
+/// exclusively (fail-closed: if the path is missing or un-cap'd, the
+/// resolver returns `None` AND logs at warn level so operators see the
+/// misconfiguration in journalctl).
+pub(crate) fn resolve_spawn_helper_path() -> Option<PathBuf> {
+    let env_override = std::env::var_os(SPAWN_HELPER_PATH_ENV).map(PathBuf::from);
+    let install_path = PathBuf::from(SPAWN_HELPER_INSTALL_PATH);
+    resolve_spawn_helper_path_from(env_override.as_deref(), &install_path, has_setuid_cap)
+}
+
+/// Pure inner of [`resolve_spawn_helper_path`].
+///
+/// Two-step resolver (parallel to [`resolve_route_helper_path_from`]):
+///
+///   - If `env_override` is `Some(path)`, that is the ONLY candidate.
+///     `None` if `is_usable(path)` is false (with a warn log) —
+///     explicit operator intent must not silently fall through to the
+///     canonical install path.
+///   - Otherwise the canonical `install_path` is the only candidate.
+///     `None` if not usable.
+///
+/// Parameterized over `is_usable` so unit tests can drive the resolver
+/// without `setcap`-ing real binaries (the test harness lacks
+/// `CAP_SETFCAP`).
+pub(crate) fn resolve_spawn_helper_path_from<F>(
+    env_override: Option<&std::path::Path>,
+    install_path: &std::path::Path,
+    is_usable: F,
+) -> Option<PathBuf>
+where
+    F: Fn(&std::path::Path) -> bool,
+{
+    if let Some(env_path) = env_override {
+        if is_usable(env_path) {
+            return Some(env_path.to_path_buf());
+        }
+        tracing::warn!(
+            path = %env_path.display(),
+            env_var = SPAWN_HELPER_PATH_ENV,
+            "sandbox-spawn-helper env-override path is not usable \
+             (must be a regular file carrying cap_setuid+ep); \
+             falling back to legacy spawn-as-daemon path. \
+             To install: `sudo setcap 'cap_setuid+ep' {path}`",
+            path = env_path.display(),
+        );
+        return None;
+    }
+    if is_usable(install_path) {
+        return Some(install_path.to_path_buf());
+    }
+    tracing::info!(
+        path = %install_path.display(),
+        "sandbox-spawn-helper not installed at the canonical path; \
+         Lima sessions will spawn under the daemon's own uid. \
+         Install with `make install-spawn-helper-prod-cap` to \
+         enable cross-user uid alignment."
+    );
+    None
+}
+
+/// Predicate used by [`resolve_spawn_helper_path`] to decide whether a
+/// candidate path is a usable spawn-helper binary: the file must exist
+/// *and* carry `CAP_SETUID` in the effective-on-exec set. Mirrors
+/// [`has_required_caps`] for the route helper but inspects
+/// `CAP_SETUID` instead of `CAP_SYS_ADMIN`.
+fn has_setuid_cap(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    match read_cap_xattr(path) {
+        Some(buf) => xattr_has_cap_effective(&buf, CAP_SETUID_BIT),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1140,7 @@ fn session_spec_from_config(
     config: &SessionConfig,
     kind: BackendKind,
     no_cache: Option<bool>,
+    operator_identity: Option<(u32, u32)>,
 ) -> sandbox_core::SessionSpec {
     let backend_specific = match kind {
         BackendKind::Lima => sandbox_core::BackendSpecific::Lima {
@@ -1010,6 +1161,13 @@ fn session_spec_from_config(
         template: config.template.clone(),
         disk_gb: Some(config.disk_gb),
         no_cache,
+        // Daemon-stamped operator identity (resolved from `SO_PEERCRED`
+        // on the connecting socket). Per `SessionSpec::operator_identity`
+        // contract, the wire-level value from the request is ignored —
+        // the handler always overrides with the kernel-supplied
+        // (uid, gid). Lima's `create_vm` reads this back to stamp the
+        // cloud-init `usermod` step in the per-session template.
+        operator_identity,
     }
 }
 
@@ -1635,7 +1793,20 @@ async fn create_session(
     // ensures a non-CLI HTTP client posting
     // `{"backend":"container","no_cache":true}` is refused by
     // `SessionSpec::validate` rather than silently honoured.
-    let spec = session_spec_from_config(&config, backend_kind, req.no_cache);
+    let spec = session_spec_from_config(
+        &config,
+        backend_kind,
+        req.no_cache,
+        // Operator identity captured from `SO_PEERCRED` on the
+        // connecting socket. The Lima backend reads this back through
+        // `LimaRuntime::create` to interpolate the cloud-init `usermod`
+        // step into the per-session YAML; the container backend reads
+        // it through its parallel `ContainerNetwork.operator_identity`
+        // field. Pre-V008 / fixture-test rows that did not capture
+        // peercred default to `None` here and route through the legacy
+        // spawn-as-daemon path.
+        Some((operator.uid, operator.gid)),
+    );
     let runtime_for_validation = runtime_for(&state, backend_kind);
     if let Err(unsupported) = spec.validate(runtime_for_validation.capabilities()) {
         // `UnsupportedFeature: Display` produces the operator-facing
@@ -2169,6 +2340,13 @@ async fn create_session(
                 lima_mac: None,
                 lima_config: None,
                 for_user: Some(operator.name.clone()),
+                // Container backend doesn't read `operator_identity`
+                // off `RuntimeStartArgs` (it travels via the parallel
+                // `ContainerNetwork.operator_identity` field installed
+                // at `register_session` time). Populated here for
+                // symmetry with the Lima path and to keep the gate
+                // explicit at the call site.
+                operator_identity: Some((operator.uid, operator.gid)),
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -2780,6 +2958,12 @@ async fn create_session(
                 lima_mac: Some(vm_mac.clone()),
                 lima_config: Some(config.clone()),
                 for_user: Some(operator.name.clone()),
+                // Operator identity drives `limactl start` through the
+                // spawn-helper (`setresuid(operator_uid)`) when the
+                // runtime has a resolved helper path. `None` means the
+                // runtime drops back to the legacy spawn-as-daemon
+                // shape — pre-V008 rows or fixture-test paths.
+                operator_identity: Some((operator.uid, operator.gid)),
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -2826,6 +3010,8 @@ async fn create_session(
                 lima_mac: Some(vm_mac.clone()),
                 lima_config: Some(config.clone()),
                 for_user: Some(operator.name.clone()),
+                // See the matching note on the fast-path branch above.
+                operator_identity: Some((operator.uid, operator.gid)),
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -3675,11 +3861,24 @@ async fn start_session(
         // `SO_PEERCRED` on the connecting socket. Container backends
         // emit it as the route helper's `--for-user` argv; Lima ignores
         // it but accepts the field for forward-compatibility.
+        //
+        // `operator_identity` is read off the persisted session row
+        // (V008) rather than the live `operator` extension, because a
+        // restart issued by a different host operator must still
+        // re-spawn the VM/container under the original operator's uid
+        // — the per-session uid is what the workspace bind-mount
+        // ownership and the synthetic /etc/passwd line are pinned to.
+        // Pre-V008 rows return `(None, None)` and route through the
+        // legacy spawn-as-daemon path.
         let args = RuntimeStartArgs {
             lima_bridge: bridge_name.clone(),
             lima_mac: vm_mac.clone(),
             lima_config: Some(session.config.clone()),
             for_user: Some(operator.name.clone()),
+            operator_identity: match (session.operator_uid, session.operator_gid) {
+                (Some(uid), Some(gid)) => Some((uid, gid)),
+                _ => None,
+            },
         };
         match runtime.start(&handle, &args).await {
             Ok(()) => {}
@@ -8054,7 +8253,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // held both as a typed handle (for Lima-only orchestration via
     // `LimaRuntime::manager()`) and inside `runtimes` (for handler-side
     // trait dispatch).
-    let lima_runtime = LimaRuntime::new(Arc::clone(&lima));
+    //
+    // `resolve_spawn_helper_path()` consults `$SANDBOX_SPAWN_HELPER_PATH`
+    // then `/usr/local/libexec/sandboxd/sandbox-spawn-helper`; both must
+    // carry `cap_setuid+ep`. The resolver returns `None` (with an info
+    // log) when no usable candidate exists — Lima sessions then fall
+    // back to spawning `limactl start` directly under the daemon's own
+    // uid (the pre-M18 shape). This is a soft fallback by design: the
+    // helper is only required for the cross-user case (daemon uid 999 +
+    // operator uid 1000), so a single-user dev install where the
+    // daemon runs as the operator doesn't strictly need it.
+    let spawn_helper_path = resolve_spawn_helper_path();
+    info!(
+        spawn_helper_path = ?spawn_helper_path,
+        "resolved sandbox-spawn-helper path for Lima backend"
+    );
+    let lima_runtime = LimaRuntime::new(Arc::clone(&lima), spawn_helper_path);
     let mut runtimes: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
     runtimes.insert(
         BackendKind::Lima,
@@ -9680,6 +9894,80 @@ mod tests {
             }
             Err(other) => panic!("expected SandboxError::Internal, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // sandbox-spawn-helper path resolution.
+    //
+    // The shape and rationale mirror the route-helper resolver tests
+    // above: pure `_from` inner is hit with a custom `is_usable`
+    // predicate so we don't need real cap'd binaries on the test host.
+    // The spawn-helper resolver differs from the route-helper resolver
+    // in one structural way — `None` is a soft-fallback return value
+    // (legacy spawn-as-daemon path), not an error. So the tests assert
+    // `Option<PathBuf>` outcomes rather than `Result<PathBuf, _>`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_spawn_helper_path_from_uses_env_override_when_set_and_usable() {
+        let env_path = std::path::PathBuf::from("/tmp/explicit-spawn-helper");
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
+        let resolved = resolve_spawn_helper_path_from(
+            Some(env_path.as_path()),
+            install_path,
+            // Predicate: both candidates are "usable" — pinning the
+            // env override TAKES PRECEDENCE. A resolver that walked the
+            // canonical path first on env-set would fail this test.
+            |p| p == env_path.as_path() || p == install_path,
+        )
+        .expect("env override path is usable; resolver must return it");
+        assert_eq!(resolved, env_path);
+    }
+
+    #[test]
+    fn resolve_spawn_helper_path_from_returns_none_when_env_override_set_but_unusable() {
+        // env-set, env-path NOT usable, canonical IS usable. Per the
+        // "explicit operator intent is not silently overruled"
+        // contract, the resolver must return None and warn — NOT walk
+        // through to the canonical path. The warn-line itself is not
+        // assertable in a unit test, but the None return is sufficient
+        // to pin the no-fallthrough invariant.
+        let env_path = std::path::PathBuf::from("/tmp/missing-spawn-helper");
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
+        let resolved =
+            resolve_spawn_helper_path_from(Some(env_path.as_path()), install_path, |p| {
+                p == install_path
+            });
+        assert!(
+            resolved.is_none(),
+            "env-override unusable; resolver must NOT fall through to canonical \
+             (got Some({:?}))",
+            resolved
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_helper_path_from_uses_canonical_when_env_unset_and_usable() {
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
+        let resolved = resolve_spawn_helper_path_from(None, install_path, |p| p == install_path)
+            .expect("canonical install is usable");
+        assert_eq!(resolved, install_path);
+    }
+
+    #[test]
+    fn resolve_spawn_helper_path_from_returns_none_when_env_unset_and_canonical_unusable() {
+        // env-unset, canonical NOT usable. The resolver must return
+        // None (soft fallback) and emit an info log — Lima runs under
+        // the daemon's own uid. That's a degraded but supported mode
+        // for single-user dev installs that haven't run
+        // `make install-spawn-helper-prod-cap`.
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
+        let resolved = resolve_spawn_helper_path_from(None, install_path, |_| false);
+        assert!(
+            resolved.is_none(),
+            "no usable candidate; resolver must return None (got Some({:?}))",
+            resolved
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -232,6 +232,7 @@ fn container_spec() -> SessionSpec {
         template: None,
         disk_gb: None,
         no_cache: None,
+        operator_identity: None,
     }
 }
 
@@ -419,6 +420,10 @@ async fn integration_route_helper_for_user_falls_through_lima() {
         lima_mac: Some("52:54:00:00:00:01".to_string()),
         lima_config: None,
         for_user: Some("daemon-test-operator".to_string()),
+        // None here mirrors the pre-V008 / fixture-test fallback; the
+        // Lima call site under test does not exercise the spawn-helper
+        // dispatch (no operator pair captured).
+        operator_identity: None,
     };
     // Sanity: the field shape is symmetric to the container path; the
     // type compiles with `for_user` present. If a future change drops

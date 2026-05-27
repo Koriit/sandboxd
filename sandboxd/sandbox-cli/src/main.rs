@@ -6195,6 +6195,7 @@ async fn dispatch_create_preflight(
         // `None` — the daemon-side validate does the authoritative
         // check via the request's `no_cache` field.
         no_cache: None,
+        operator_identity: None,
     };
 
     if let Err(unsupported) = spec.validate(&caps) {

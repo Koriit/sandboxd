@@ -335,8 +335,9 @@ impl LimaManager {
         &self,
         session_id: &SessionId,
         config: &SessionConfig,
+        operator_identity: Option<(u32, u32)>,
     ) -> Result<(), SandboxError> {
-        let template = self.generate_template(session_id, config);
+        let template = self.generate_template(session_id, config, operator_identity);
         let session_dir = self.session_dir(session_id);
         std::fs::create_dir_all(&session_dir)?;
 
@@ -445,20 +446,45 @@ impl LimaManager {
         config: &SessionConfig,
         bridge_name: Option<&str>,
         vm_mac: Option<&str>,
+        spawn_helper_path: Option<&std::path::Path>,
+        operator_identity: Option<(u32, u32)>,
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
+
+        // Decide whether to dispatch `limactl start` through the
+        // spawn helper. Both halves must be Some — the resolved helper
+        // binary (from daemon-startup `resolve_spawn_helper_path`) AND
+        // the operator pair (from the session's V008 columns). Either
+        // missing falls back to the legacy direct spawn under the
+        // daemon's own uid.
+        let use_helper = matches!((spawn_helper_path, operator_identity), (Some(_), Some(_)));
 
         info!(
             session_id = %session_id,
             vm = %vm_name,
             hardened = config.hardened,
             bridge = bridge_name.unwrap_or("none"),
+            use_helper,
+            operator_uid = operator_identity.map(|(u, _)| u),
             "starting VM"
         );
 
         let hardened_flag = if config.hardened { "1" } else { "0" };
-        let mut cmd = Command::new(&self.limactl);
+        // Construct the argv list. When dispatching through
+        // `sandbox-spawn-helper`, the helper's contract is
+        // `<helper> <operator_uid> <runtime_argv0> [runtime_argv...]`
+        // — the helper does the `setresuid` then `execvp`s the rest.
+        // Without the helper, the daemon invokes `limactl` directly.
+        let mut cmd = match (use_helper, spawn_helper_path, operator_identity) {
+            (true, Some(helper), Some((uid, _))) => {
+                let mut c = Command::new(helper);
+                c.arg(uid.to_string());
+                c.arg(&self.limactl);
+                c
+            }
+            _ => Command::new(&self.limactl),
+        };
         cmd.args(["start", &vm_name])
             .arg("--tty=false")
             .arg(format!("--timeout={}s", START_VM_TIMEOUT.as_secs()))
@@ -1501,7 +1527,12 @@ provision:
     /// practice this cannot happen because `WorkspaceMode::parse_flag`
     /// validates the path before it reaches this point, but the check here
     /// acts as defense-in-depth.
-    pub fn generate_template(&self, session_id: &SessionId, config: &SessionConfig) -> String {
+    pub fn generate_template(
+        &self,
+        session_id: &SessionId,
+        config: &SessionConfig,
+        operator_identity: Option<(u32, u32)>,
+    ) -> String {
         // Hostname includes the full 12-hex session id. At 20 chars it is
         // well under the POSIX HOST_NAME_MAX of 64.
         let hostname = format!("sandbox-{session_id}");
@@ -1570,6 +1601,61 @@ mounts:
             ""
         };
 
+        // Optional cloud-init step that re-aligns the in-VM `sandbox`
+        // user's uid/gid with the operator's host-side identity.
+        //
+        // The base image bakes `sandbox` at uid 1000 / gid 1000 (the
+        // common case). When the operator on the host happens to also
+        // be uid 1000 / gid 1000 (single-user dev box, the typical
+        // Linux desktop), this step is a no-op and we elide it to keep
+        // cloud-init runs quick. When the operator is a different uid
+        // (multi-user host, NFS-backed home dir at uid 5xxx, CI box at
+        // uid 2000), we run `usermod` + `groupmod` + a recursive
+        // chown on `/home/agent` so:
+        //
+        //   - the in-VM `sandbox` user owns its home dir
+        //   - 9p `mapped-xattr` shared workspaces don't trip the
+        //     ownership-mismatch check on bind-mount writes
+        //   - the QEMU process spawned via `sandbox-spawn-helper` (uid
+        //     = operator's) can `setuid(sandbox)` on the in-VM side
+        //     and end up with the expected uid for the agent runtime
+        //
+        // `/home/agent` itself stays as the home directory regardless
+        // of the new uid — operator-facing paths
+        // (`/home/agent/workspace`, ssh-config snippets, rsync
+        // commands) are name-baked, not uid-baked, so the rename to
+        // `sandbox` at M18-S8 Wave A is the only naming change. The
+        // chown is recursive because the base image populated the dir
+        // tree (e.g. `.bash_profile`, sshd authorized_keys staging)
+        // before this step runs.
+        let usermod_section = match operator_identity {
+            Some((uid, gid)) if uid != 1000 || gid != 1000 => format!(
+                "- mode: system\n  \
+                 script: |\n    \
+                 #!/bin/bash\n    \
+                 set -eux -o pipefail\n    \
+                 echo \"[sandbox-provision] step=operator-uid start=$(date -u +%Y-%m-%dT%H:%M:%S)\"\n    \
+                 # Re-align the in-VM `sandbox` account's uid/gid with the\n    \
+                 # operator's host-side identity ({uid}:{gid}). The base\n    \
+                 # image bakes uid/gid 1000; this step bumps them to the\n    \
+                 # operator's values so 9p mapped-xattr shared workspaces\n    \
+                 # and synthetic /etc/passwd consistency hold.\n    \
+                 if id sandbox &>/dev/null; then\n    \
+                   current_uid=$(id -u sandbox)\n    \
+                   current_gid=$(id -g sandbox)\n    \
+                   if [ \"$current_uid\" != \"{uid}\" ] || [ \"$current_gid\" != \"{gid}\" ]; then\n    \
+                     # `groupmod` first because `usermod -u` validates\n    \
+                     # the primary group still exists at the new gid.\n    \
+                     groupmod -g {gid} sandbox\n    \
+                     usermod -u {uid} -g {gid} sandbox\n    \
+                     chown -R {uid}:{gid} /home/agent\n    \
+                   fi\n    \
+                 fi\n    \
+                 echo \"[sandbox-provision] step=operator-uid done=$(date -u +%Y-%m-%dT%H:%M:%S)\"\n"
+            ),
+            _ => String::new(),
+        };
+
         format!(
             r#"# Auto-generated Lima template for sandbox session {session_id}
 minimumLimaVersion: "2.0.0"
@@ -1626,7 +1712,7 @@ provision:
     echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
     chmod 0440 /etc/sudoers.d/sandbox
     echo "[sandbox-provision] step=user done=$(date -u +%Y-%m-%dT%H:%M:%S)"
-- mode: system
+{usermod_section}- mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
@@ -1735,6 +1821,7 @@ provision:
             disk_gib = disk_gib,
             mounts_section = mounts_section,
             hardened_section = hardened_section,
+            usermod_section = usermod_section,
             hostname = hostname,
         )
     }
@@ -2326,7 +2413,7 @@ mod tests {
         let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default(); // 2 CPU, 4096 MB, 20 GB
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         // Parse as YAML via serde_json (Lima YAML is a superset; we
         // just verify key fields are present via string inspection and
@@ -2429,7 +2516,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         assert!(
             template.contains("cpus: 8"),
@@ -2478,7 +2565,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
         assert!(
             template.contains("memory: \"1.5GiB\""),
             "template should handle fractional GiB"
@@ -2520,7 +2607,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         // Should NOT contain the empty mounts placeholder.
         assert!(
@@ -2595,7 +2682,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         // SF-17 round-trip: an explicit `Some(MappedXattr)` should
         // serialize to the same `securityModel: mapped-xattr` line as
@@ -2633,7 +2720,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         // SF-17 round-trip: an explicit `Some(NoneMapping)` should
         // serialize to `securityModel: none` (the YAML wire form).
@@ -2666,7 +2753,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         // Clone mode should NOT add mounts — cloning is handled post-boot.
         assert!(
@@ -2715,7 +2802,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         assert!(
             template.contains("mounts: []"),
@@ -2870,7 +2957,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         assert!(
             template.contains("display: \"none\""),
@@ -2911,7 +2998,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config);
+        let template = mgr.generate_template(&id, &config, None);
 
         assert!(
             !template.contains("display: \"none\""),
@@ -2931,6 +3018,115 @@ mod tests {
         );
     }
 
+    /// `generate_template` is the source of truth for the per-session
+    /// Lima YAML. When the daemon stamps `operator_identity = None`
+    /// (pre-V008 records, fixture-test rows that did not capture
+    /// peercred), the resulting YAML must NOT carry the operator-uid
+    /// cloud-init step — the legacy "in-VM sandbox stays at uid 1000"
+    /// path applies. This pins the omit-on-None invariant.
+    #[test]
+    fn generate_template_omits_operator_uid_step_when_identity_is_none() {
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, None);
+        assert!(
+            !template.contains("step=operator-uid"),
+            "operator_identity=None must NOT emit the operator-uid \
+             cloud-init step (got template excerpt: {})",
+            &template[..template.len().min(800)]
+        );
+    }
+
+    /// When the operator pair happens to coincide with the base
+    /// image's baked uid/gid (1000:1000), the cloud-init step would
+    /// be a no-op. Elide it entirely so cloud-init runs stay quick
+    /// and the YAML diff is empty for the common-case dev install.
+    #[test]
+    fn generate_template_omits_operator_uid_step_when_identity_is_1000_1000() {
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, Some((1000, 1000)));
+        assert!(
+            !template.contains("step=operator-uid"),
+            "operator_identity=Some((1000, 1000)) coincides with the \
+             baked uid/gid; the cloud-init step must be elided"
+        );
+    }
+
+    /// `generate_template` interpolates the operator pair into a
+    /// system-mode cloud-init step that re-aligns the in-VM `sandbox`
+    /// user's uid/gid. The step must:
+    ///   - be `mode: system` (root-equivalent inside the VM)
+    ///   - call `groupmod -g <gid>` BEFORE `usermod -u <uid>` so the
+    ///     primary group still resolves after the renumbering
+    ///   - chown `/home/agent` recursively at the operator's uid:gid
+    ///   - leave the home dir path itself as `/home/agent` (Wave A
+    ///     username-only rename — names not uids are baked in to
+    ///     operator-facing paths)
+    /// All four are structural invariants of the cross-user
+    /// supervisor-fork pattern and regressing any of them silently
+    /// would break 9p mapped-xattr workspaces. Pin all four here.
+    #[test]
+    fn generate_template_emits_operator_uid_step_with_correct_shape() {
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, Some((5001, 5001)));
+        // Step header.
+        assert!(
+            template.contains("step=operator-uid start="),
+            "template must emit step=operator-uid start banner; got: {}",
+            template
+        );
+        // mode: system precedes the step (sibling of the step=user
+        // block). We don't pin the exact YAML formatting, just that
+        // the script body lives under a `mode: system` clause.
+        assert!(
+            template.contains("step=operator-uid"),
+            "template must emit the operator-uid step"
+        );
+        // groupmod-before-usermod ordering.
+        let groupmod_idx = template
+            .find("groupmod -g 5001 sandbox")
+            .expect("template must call groupmod -g <gid> sandbox");
+        let usermod_idx = template
+            .find("usermod -u 5001 -g 5001 sandbox")
+            .expect("template must call usermod -u <uid> -g <gid> sandbox");
+        assert!(
+            groupmod_idx < usermod_idx,
+            "groupmod must precede usermod so the primary group is in \
+             place before the usermod call validates it; groupmod={groupmod_idx} \
+             usermod={usermod_idx}"
+        );
+        // Recursive chown on /home/agent (NOT /home/sandbox — the
+        // Wave A rename touched the username, not the home path).
+        assert!(
+            template.contains("chown -R 5001:5001 /home/agent"),
+            "template must chown /home/agent recursively to the \
+             operator pair; got: {}",
+            template
+        );
+        assert!(
+            !template.contains("chown -R 5001:5001 /home/sandbox"),
+            "template must NOT chown /home/sandbox — Lima home dir \
+             is /home/agent; got: {}",
+            template
+        );
+    }
     #[test]
     fn test_ensure_qemu_wrapper_creates_file() {
         let dir = tempfile::TempDir::new().expect("create temp dir");

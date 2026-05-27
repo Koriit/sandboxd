@@ -19,6 +19,7 @@
 //!   the IP from the daemon's per-session `NetworkInfo.vm_ip` map
 //!   (one less round-trip; works pre-boot).
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -77,6 +78,19 @@ impl From<VmStatus> for RuntimeStatus {
 pub struct LimaRuntime {
     manager: Arc<LimaManager>,
     capabilities: Capabilities,
+    /// Absolute path to the `sandbox-spawn-helper` binary, when the
+    /// daemon's startup resolver located a usable (`cap_setuid+ep`)
+    /// install. Threaded through to [`LimaManager::start_vm`] so
+    /// `limactl start` runs under the operator's uid via the helper's
+    /// `setresuid` + `execvp` chain.
+    ///
+    /// `None` means the operator-aligned spawn path is unavailable —
+    /// either the daemon was launched without the helper installed (a
+    /// dev environment that hasn't run `make install-spawn-helper-*`)
+    /// or the per-session start args lack `operator_identity`. In
+    /// either case the runtime falls back to the legacy
+    /// "spawn-as-daemon" `limactl start`.
+    spawn_helper_path: Option<PathBuf>,
 }
 
 impl LimaRuntime {
@@ -85,11 +99,27 @@ impl LimaRuntime {
     /// into `AppState.runtimes: HashMap<BackendKind, Arc<dyn
     /// SessionRuntime>>` (Phase 1C) without an extra allocation at
     /// dispatch time.
-    pub fn new(manager: Arc<LimaManager>) -> Arc<Self> {
+    ///
+    /// `spawn_helper_path` carries the absolute path of the
+    /// `sandbox-spawn-helper` binary resolved at daemon startup; pass
+    /// `None` when no helper is installed (the runtime then falls back
+    /// to spawning `limactl` directly under the daemon's own uid).
+    /// Resolving the path at daemon startup (not per-session) keeps the
+    /// `getcap` xattr probe off the request-time hot path; the resolver
+    /// lives in `sandboxd::main` alongside the route-helper resolver.
+    pub fn new(manager: Arc<LimaManager>, spawn_helper_path: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             manager,
             capabilities: Capabilities::for_lima(),
+            spawn_helper_path,
         })
+    }
+
+    /// Access the resolved spawn-helper path, if any. Exposed for the
+    /// daemon's diagnostic / `doctor` surface and for tests that need
+    /// to assert the wiring decision.
+    pub fn spawn_helper_path(&self) -> Option<&std::path::Path> {
+        self.spawn_helper_path.as_deref()
     }
 
     /// Access the inner [`LimaManager`] for Lima-specific operations
@@ -196,11 +226,16 @@ impl SessionRuntime for LimaRuntime {
         let manager = Arc::clone(&self.manager);
         let session_id_owned = *session_id;
         let template = spec.template.clone();
-
-        // CLAUDE.md: every `std::process::Command` call in async
-        // contexts is wrapped in `spawn_blocking`. Both
-        // `LimaManager::create_vm` and `create_vm_with_custom_template`
-        // shell out via `process::run_with_timeout`.
+        // Per `SessionSpec::operator_identity` contract: daemon-stamped,
+        // not client-supplied. The Lima manager interpolates the pair
+        // into the per-session cloud-init `usermod` provision step so
+        // the in-VM `sandbox` user ends up at the operator's uid/gid.
+        // `None` here means the legacy "no usermod, in-VM sandbox stays
+        // at uid 1000" path — preserved for pre-V008 records and tests
+        // that don't exercise the supervisor-fork pattern. Templates
+        // that operators supply directly
+        // (`create_vm_with_custom_template`) are never rewritten by us.
+        let operator_identity = spec.operator_identity;
         tokio::task::spawn_blocking(move || {
             if let Some(template_path) = &template {
                 manager.create_vm_with_custom_template(
@@ -208,7 +243,7 @@ impl SessionRuntime for LimaRuntime {
                     std::path::Path::new(template_path),
                 )
             } else {
-                manager.create_vm(&session_id_owned, &config)
+                manager.create_vm(&session_id_owned, &config, operator_identity)
             }
         })
         .await
@@ -247,9 +282,23 @@ impl SessionRuntime for LimaRuntime {
                 SessionConfig::default()
             }
         };
+        // The spawn-helper path is a runtime-level field (resolved at
+        // daemon startup); the operator pair travels per-request on
+        // `args.operator_identity`. Both must be Some for the helper
+        // dispatch to kick in — `LimaManager::start_vm`'s `use_helper`
+        // gate. Either missing means the legacy direct-spawn shape.
+        let spawn_helper = self.spawn_helper_path.clone();
+        let operator_identity = args.operator_identity;
 
         tokio::task::spawn_blocking(move || {
-            manager.start_vm(&session_id, &config, bridge.as_deref(), mac.as_deref())
+            manager.start_vm(
+                &session_id,
+                &config,
+                bridge.as_deref(),
+                mac.as_deref(),
+                spawn_helper.as_deref(),
+                operator_identity,
+            )
         })
         .await
         .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))??;
@@ -698,7 +747,7 @@ mod tests {
             PathBuf::from("limactl"),
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
         ));
-        LimaRuntime::new(manager)
+        LimaRuntime::new(manager, None)
     }
 
     /// `LimaRuntime::kind()` is the `BackendKind::Lima` constant —
@@ -811,6 +860,7 @@ mod tests {
             template: None,
             disk_gb: None,
             no_cache: None,
+            operator_identity: None,
         };
 
         let err = rt
@@ -835,5 +885,40 @@ mod tests {
         let err =
             LimaRuntime::session_id_from_handle(&bogus).expect_err("bogus handle must be rejected");
         assert!(matches!(err, SandboxError::InvalidArgument(_)));
+    }
+
+    /// The spawn-helper path is daemon-startup state, threaded into the
+    /// runtime via `LimaRuntime::new`. `None` is the legitimate
+    /// "spawn-helper not installed; fall back to direct limactl
+    /// invocation" mode; `Some(path)` means the runtime will dispatch
+    /// `limactl start` through the helper.
+    ///
+    /// This pins the constructor wiring + the public accessor. A future
+    /// contributor who refactors the field shape (e.g. wraps it in an
+    /// `Option<Arc<_>>` or moves it onto `RuntimeStartArgs`) must keep
+    /// this round-trip green.
+    #[test]
+    fn spawn_helper_path_round_trips_through_constructor() {
+        let manager = Arc::new(LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/sandbox-test"),
+            PathBuf::from("limactl"),
+            crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
+        ));
+
+        // Without a helper: getter returns None.
+        let no_helper = LimaRuntime::new(Arc::clone(&manager), None);
+        assert!(
+            no_helper.spawn_helper_path().is_none(),
+            "constructor called with None must surface None on the getter"
+        );
+
+        // With a helper: getter returns the same path verbatim.
+        let helper_path = PathBuf::from("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
+        let with_helper = LimaRuntime::new(Arc::clone(&manager), Some(helper_path.clone()));
+        assert_eq!(
+            with_helper.spawn_helper_path(),
+            Some(helper_path.as_path()),
+            "constructor must thread the helper path verbatim to the getter"
+        );
     }
 }

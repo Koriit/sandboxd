@@ -114,6 +114,25 @@ pub struct RuntimeStartArgs {
     /// assertion against `users.conf`, so a compromised daemon cannot
     /// invent operators not already paired with the daemon's runtime uid.
     pub for_user: Option<String>,
+    /// Operator's `(uid, gid)` pair captured from the connecting socket's
+    /// `SO_PEERCRED`, threaded into the runtime so it can align the
+    /// in-VM/in-container effective identity with the operator on the
+    /// host.
+    ///
+    /// `Some((uid, gid))` is set by the daemon's session-create handler
+    /// for every backend whenever the operator identity has been
+    /// resolved (post-V008). The container runtime uses it for
+    /// `docker create --user <uid>:<gid>`; the Lima runtime uses it to
+    /// dispatch `limactl start` through `sandbox-spawn-helper` (which
+    /// `setresuid(uid)` before exec) and to interpolate the operator's
+    /// uid/gid into the per-session cloud-init `usermod` provision step.
+    ///
+    /// `None` means the operator identity is unavailable — either a
+    /// pre-V008 record where the daemon didn't yet capture peercred, or
+    /// a fixture-test row that omits it. Both backends fall back to the
+    /// legacy "spawn as the daemon's own uid/gid" path, preserving
+    /// pre-supervisor-fork behaviour.
+    pub operator_identity: Option<(u32, u32)>,
 }
 
 /// Opaque per-backend handle to a created session, returned by
