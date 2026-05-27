@@ -8,6 +8,7 @@ members = [
     "sandbox-nft-deny-logger",
     "sandbox-guest",
     "sandbox-route-helper",
+    "sandbox-spawn-helper",
 ]
 resolver = "2"
 
