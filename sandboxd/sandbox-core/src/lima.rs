@@ -487,12 +487,21 @@ impl LimaManager {
         let hardened_flag = if config.hardened { "1" } else { "0" };
         // Construct the argv list. When dispatching through
         // `sandbox-spawn-helper`, the helper's contract is
-        // `<helper> <operator_uid> <runtime_argv0> [runtime_argv...]`
-        // — the helper does the `setresuid` then `execvp`s the rest.
+        // `<helper> [--prepare-lima-spawn] <operator_uid> <runtime_argv0> [runtime_argv...]`
+        // — the helper optionally chowns Lima's SSH identity (hardcoded
+        // path inside the helper, not passed as an argument), then does
+        // the `setresuid` and `execvp`s the rest.
         // Without the helper, the daemon invokes `limactl` directly.
         let mut cmd = match (use_helper, spawn_helper_path, operator_identity) {
             (true, Some(helper), Some((uid, _))) => {
                 let mut c = Command::new(helper);
+                // Instruct the helper to transfer ownership of Lima's
+                // shared SSH identity to the operator uid before
+                // setresuid. The target path is hardcoded inside the
+                // helper (LIMA_USER_KEY). This lets the helper-pivoted
+                // hostagent satisfy OpenSSH's StrictKeyfileMode check
+                // (st_uid == getuid()).
+                c.arg("--prepare-lima-spawn");
                 c.arg(uid.to_string());
                 c.arg(&self.limactl);
                 c
@@ -741,10 +750,9 @@ impl LimaManager {
 
             // chmod instance dir to 0770 (rwxrwx---) so the operator uid can
             // traverse, read, write, and unlink files inside.
-            if let Err(e) = std::fs::set_permissions(
-                &instance_dir,
-                std::fs::Permissions::from_mode(0o770),
-            ) {
+            if let Err(e) =
+                std::fs::set_permissions(&instance_dir, std::fs::Permissions::from_mode(0o770))
+            {
                 warn!(
                     vm,
                     path = %instance_dir.display(),

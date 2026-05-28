@@ -525,8 +525,10 @@ sandboxd/target/debug/sandbox-route-helper:
 # otherwise be able to redirect the group check to a group they
 # already belong to, bypassing the `sandbox`-group gate).
 #
-# The cap is `cap_setuid+ep` — narrower than the route helper's
-# `cap_net_admin,cap_sys_admin=eip`. The helper does NOT need
+# The cap is `cap_setuid,cap_chown+ep` — narrower than the route
+# helper's `cap_net_admin,cap_sys_admin=eip`. cap_chown is added so
+# the helper can transfer ownership of Lima's shared SSH identity
+# (StrictKeyfileMode fix) before setresuid. The helper does NOT need
 # inheritable; it `setresuid`'s to the operator and `capset`'s its
 # own permitted+effective+inheritable to empty before `execve`'ing
 # the runtime tool, so the runtime tool inherits zero capabilities
@@ -538,15 +540,15 @@ sandboxd/target/.dev-env-stamps/spawn-helper-prod.stamp: sandboxd/target/release
 	@mkdir -p $(dir $@)
 	@if [ -f "$(SPAWN_HELPER_PROD_PATH)" ] && \
 	    cmp -s "sandboxd/target/release/sandbox-spawn-helper" "$(SPAWN_HELPER_PROD_PATH)" && \
-	    getcap "$(SPAWN_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_setuid; then \
-	  echo "$(GREEN)✓ already configured: $(SPAWN_HELPER_PROD_PATH) (cap_setuid+ep, content matches build)$(RESET)"; \
+	    getcap "$(SPAWN_HELPER_PROD_PATH)" 2>/dev/null | grep -qE 'cap_setuid|cap_chown'; then \
+	  echo "$(GREEN)✓ already configured: $(SPAWN_HELPER_PROD_PATH) (cap_setuid,cap_chown+ep, content matches build)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-spawn-helper $(SPAWN_HELPER_PROD_PATH)"; \
-	  echo "[sudo] setcap cap_setuid+ep $(SPAWN_HELPER_PROD_PATH)"; \
+	  echo "[sudo] setcap cap_setuid,cap_chown+ep $(SPAWN_HELPER_PROD_PATH)"; \
 	  sudo -k install -D -m 0755 \
 	    sandboxd/target/release/sandbox-spawn-helper \
 	    "$(SPAWN_HELPER_PROD_PATH)"; \
-	  sudo -k setcap 'cap_setuid+ep' "$(SPAWN_HELPER_PROD_PATH)"; \
+	  sudo -k setcap 'cap_setuid,cap_chown+ep' "$(SPAWN_HELPER_PROD_PATH)"; \
 	fi
 	@touch $@
 
@@ -576,15 +578,15 @@ sandboxd/target/.dev-env-stamps/spawn-helper-test.stamp: sandboxd/target/debug/s
 	@mkdir -p $(dir $@)
 	@if [ -f "$(SPAWN_HELPER_TEST_PATH)" ] && \
 	    cmp -s "sandboxd/target/debug/sandbox-spawn-helper" "$(SPAWN_HELPER_TEST_PATH)" && \
-	    getcap "$(SPAWN_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_setuid; then \
-	  echo "$(GREEN)✓ already configured: $(SPAWN_HELPER_TEST_PATH) (cap_setuid+ep, content matches test build)$(RESET)"; \
+	    getcap "$(SPAWN_HELPER_TEST_PATH)" 2>/dev/null | grep -qE 'cap_setuid|cap_chown'; then \
+	  echo "$(GREEN)✓ already configured: $(SPAWN_HELPER_TEST_PATH) (cap_setuid,cap_chown+ep, content matches test build)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-spawn-helper $(SPAWN_HELPER_TEST_PATH)"; \
-	  echo "[sudo] setcap cap_setuid+ep $(SPAWN_HELPER_TEST_PATH)"; \
+	  echo "[sudo] setcap cap_setuid,cap_chown+ep $(SPAWN_HELPER_TEST_PATH)"; \
 	  sudo -k install -D -m 0755 \
 	    sandboxd/target/debug/sandbox-spawn-helper \
 	    "$(SPAWN_HELPER_TEST_PATH)"; \
-	  sudo -k setcap 'cap_setuid+ep' "$(SPAWN_HELPER_TEST_PATH)"; \
+	  sudo -k setcap 'cap_setuid,cap_chown+ep' "$(SPAWN_HELPER_TEST_PATH)"; \
 	fi
 	@touch $@
 

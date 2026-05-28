@@ -5,22 +5,32 @@
 //! # Invocation
 //!
 //! ```text
-//! sandbox-spawn-helper <operator_uid> <runtime_argv0> [runtime_argv...]
+//! sandbox-spawn-helper [--prepare-lima-spawn] <operator_uid> <runtime_argv0> [runtime_argv...]
 //! ```
 //!
-//! Two or more positional arguments. No stdin. No env-var configuration
-//! in production (a `SANDBOX_SPAWN_HELPER_TEST_SANDBOX_GROUP` override
-//! exists for the `test-env-override` Cargo feature only — see the
-//! crate-level note in `Cargo.toml`).
+//! The optional `--prepare-lima-spawn` flag tells the helper to chown
+//! `LIMA_USER_KEY` (Lima's shared SSH identity file, hardcoded in this
+//! binary) to `(operator_uid, sandbox_gid)` BEFORE `setresuid`.  The
+//! target path is NOT derived from caller input — it is a compile-time
+//! constant, reviewed once, immutable at runtime.  This gives the
+//! helper-pivoted hostagent (`limactl start`) a key file it owns so
+//! OpenSSH's `StrictKeyfileMode` check (`st_uid == getuid()`) is
+//! satisfied.
+//!
+//! Two or more positional arguments after any flags. No stdin. No
+//! env-var configuration in production (a
+//! `SANDBOX_SPAWN_HELPER_TEST_SANDBOX_GROUP` override exists for the
+//! `test-env-override` Cargo feature only — see the crate-level note in
+//! `Cargo.toml`).
 //!
 //! # Authorisation flow
 //!
 //! Each invocation runs ordered steps; any step that denies prints a
 //! single `sandbox-spawn-helper: <reason>` line to stderr and exits with
-//! the matching exit code (1..=5). No privilege change happens on the
+//! the matching exit code (1..=7). No privilege change happens on the
 //! deny path — the helper exits before `setresuid` is reached.
 //!
-//! 1. Argv parse — `<operator_uid> <runtime_argv0> [runtime_argv...]`.
+//! 1. Argv parse — `[--prepare-lima-spawn] <operator_uid> <runtime_argv0> [runtime_argv...]`.
 //! 2. Caller authorisation — the calling process must be a member of
 //!    the `sandbox` group. Membership is read from `getgroups(2)`
 //!    (which reflects the process's *supplementary* groups, populated
@@ -32,16 +42,21 @@
 //! 3. Operator-uid resolution — `getpwuid(operator_uid)` via
 //!    `User::from_uid` must return `Ok(Some(_))`. STRICT — an
 //!    unresolvable uid denies.
+//!
+//! 3a. Optional Lima-spawn preparation — if `--prepare-lima-spawn` was
+//!     supplied, call `chown(LIMA_USER_KEY, operator_uid, sandbox_gid)`
+//!     (exit 7 on failure). Runs BEFORE `setresuid` so the helper
+//!     still holds `CAP_CHOWN` at the time of the call.
 //! 4. `setresuid(operator_uid, operator_uid, operator_uid)` — drop all
 //!    three uids (real, effective, saved) to the operator. The helper
-//!    has `cap_setuid+ep` so this succeeds; on failure the helper
-//!    exits without invoking the runtime tool.
+//!    has `cap_setuid,cap_chown+ep` so this succeeds; on failure the
+//!    helper exits without invoking the runtime tool.
 //! 5. Capability self-clear — `capset` with empty `permitted`,
 //!    `effective`, and `inheritable` sets, then drop the ambient set
 //!    via `caps::clear(None, CapSet::Ambient)`. The runtime tool
 //!    inherits zero capabilities even though the helper carried
-//!    `cap_setuid+ep` into the exec chain. Defence-in-depth: the
-//!    `setresuid(operator_uid)` in step 4 already clears the
+//!    `cap_setuid,cap_chown+ep` into the exec chain. Defence-in-depth:
+//!    the `setresuid(operator_uid)` in step 4 already clears the
 //!    permitted/effective sets for any non-root uid per the kernel's
 //!    SECBIT rules, but we issue the explicit `capset` so the
 //!    contract is grep-able and unambiguous.
@@ -53,17 +68,18 @@
 //! # Privilege model
 //!
 //! The helper requires `CAP_SETUID` to call `setresuid(2)` to an
-//! arbitrary uid. Operators install it with:
+//! arbitrary uid, and `CAP_CHOWN` to call `chown(2)` on files owned by
+//! another user. Operators install it with:
 //!
 //! ```text
-//! sudo setcap 'cap_setuid+ep' /usr/local/libexec/sandboxd/sandbox-spawn-helper
+//! sudo setcap 'cap_setuid,cap_chown+ep' /usr/local/libexec/sandboxd/sandbox-spawn-helper
 //! ```
 //!
-//! The `+ep` flags put `CAP_SETUID` in the file's Permitted and
-//! Effective sets (no Inheritable — the runtime tool does NOT need
-//! this capability). On exec by an unprivileged caller, the thread's
-//! Permitted gets the file Permitted (gated by bset); Effective tracks
-//! Permitted because the file Effective bit is set.
+//! The `+ep` flags put `CAP_SETUID` and `CAP_CHOWN` in the file's
+//! Permitted and Effective sets (no Inheritable — the runtime tool does
+//! NOT need these capabilities). On exec by an unprivileged caller, the
+//! thread's Permitted gets the file Permitted (gated by bset); Effective
+//! tracks Permitted because the file Effective bit is set.
 //!
 //! The production install path is `/usr/local/libexec/sandboxd/` per
 //! FHS § 4.7 (libexec is for non-user-facing helper binaries). This
@@ -99,6 +115,24 @@ const EXIT_CALLER_NOT_AUTHORIZED: u8 = 2;
 const EXIT_OPERATOR_UID_UNRESOLVED: u8 = 3;
 const EXIT_SETRESUID_FAILED: u8 = 4;
 const EXIT_CAPSET_FAILED: u8 = 5;
+/// The `--prepare-lima-spawn` chown step failed (chown(2) returned an error).
+const EXIT_LIMA_PREPARE_FAILED: u8 = 7;
+
+/// Lima's shared SSH identity file.
+///
+/// This is the ONLY path that `--prepare-lima-spawn` acts on. The path
+/// is a compile-time constant — never derived from caller input. A
+/// future contributor who wants to chown a different file must change
+/// this source and go through review; there is no runtime override.
+///
+/// Lima's hostagent reads this private key to establish SSH connections
+/// to the VM. The daemon (uid 999, `sandbox`) creates it as
+/// `sandbox:sandbox 0600`. OpenSSH's `StrictKeyfileMode` check
+/// (`st_uid == getuid()`) rejects the file for the helper-pivoted
+/// hostagent (uid 1000) because the uid does not match. Transferring
+/// ownership to the operator uid before `setresuid` lets the hostagent
+/// satisfy the check.
+const LIMA_USER_KEY: &str = "/var/lib/sandbox/.lima/_config/user";
 
 /// The literal group name whose membership authorises a caller. The
 /// `test-env-override` Cargo feature lets integration tests swap this
@@ -151,6 +185,7 @@ fn run() -> ExitCode {
         }
     };
     let ParsedArgs {
+        prepare_lima_spawn,
         operator_uid,
         runtime_argv,
     } = parsed;
@@ -188,6 +223,16 @@ fn run() -> ExitCode {
         Err(err) => {
             eprintln!("sandbox-spawn-helper: operator uid {operator_uid} resolution error: {err}",);
             return ExitCode::from(EXIT_OPERATOR_UID_UNRESOLVED);
+        }
+    }
+
+    // Step 3a — optional Lima-spawn preparation. Runs BEFORE setresuid so
+    // the helper still holds cap_chown at the time of the call. The target
+    // path is the compile-time constant LIMA_USER_KEY — no caller input.
+    if prepare_lima_spawn {
+        if let Err(msg) = chown_lima_user_key(operator_uid, target_gid) {
+            eprintln!("sandbox-spawn-helper: {msg}");
+            return ExitCode::from(EXIT_LIMA_PREPARE_FAILED);
         }
     }
 
@@ -264,27 +309,44 @@ fn run() -> ExitCode {
 /// Parsed argv. `runtime_argv[0]` is the program name passed to
 /// `execvp`; subsequent entries are the program's arguments.
 struct ParsedArgs {
+    /// Whether `--prepare-lima-spawn` was present in argv.
+    prepare_lima_spawn: bool,
     operator_uid: u32,
     runtime_argv: Vec<OsString>,
 }
 
-/// Parse argv: `<operator_uid> <runtime_argv0> [runtime_argv...]`.
+/// Parse argv: `[--prepare-lima-spawn] <operator_uid> <runtime_argv0> [runtime_argv...]`.
 ///
 /// Hand-rolled — the helper deliberately does not pull in a CLI
 /// parsing crate so the TCB stays small.
 fn parse_argv(args: &[OsString]) -> Result<ParsedArgs, String> {
-    const USAGE: &str =
-        "usage: sandbox-spawn-helper <operator_uid> <runtime_argv0> [runtime_argv...]";
+    const USAGE: &str = "usage: sandbox-spawn-helper [--prepare-lima-spawn] <operator_uid> <runtime_argv0> [runtime_argv...]";
 
-    if args.len() < 3 {
+    let mut idx = 1usize; // skip argv[0] (program name)
+    let mut prepare_lima_spawn = false;
+
+    if args
+        .get(idx)
+        .map(|a| a.as_os_str())
+        .map(|s| s == "--prepare-lima-spawn")
+        .unwrap_or(false)
+    {
+        prepare_lima_spawn = true;
+        idx += 1;
+    }
+
+    // After optional flags, we need at least: <operator_uid> <runtime_argv0>
+    if args.len() < idx + 2 {
         return Err(USAGE.to_string());
     }
-    let uid_arg = args[1].to_string_lossy();
+
+    let uid_arg = args[idx].to_string_lossy();
     let operator_uid: u32 = uid_arg
         .parse()
         .map_err(|_| format!("invalid operator_uid: {uid_arg}"))?;
-    let runtime_argv: Vec<OsString> = args[2..].to_vec();
+    let runtime_argv: Vec<OsString> = args[idx + 1..].to_vec();
     Ok(ParsedArgs {
+        prepare_lima_spawn,
         operator_uid,
         runtime_argv,
     })
@@ -404,6 +466,42 @@ fn clear_all_capabilities() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Lima-spawn preparation (chown the shared SSH identity key)
+// ---------------------------------------------------------------------------
+
+/// Transfer ownership of `LIMA_USER_KEY` to `(new_uid, new_gid)`.
+///
+/// This must be called BEFORE `setresuid` so the helper still holds
+/// `CAP_CHOWN`. Returns an error message string on failure.
+///
+/// The target path is the compile-time constant `LIMA_USER_KEY`. The
+/// caller cannot redirect this to a different path — there is no
+/// path argument to this function.
+fn chown_lima_user_key(new_uid: u32, new_gid: u32) -> Result<(), String> {
+    // SAFETY: LIMA_USER_KEY is a valid UTF-8 string with no interior NUL
+    // bytes, so the CString::new call below cannot fail.
+    let path_c =
+        CString::new(LIMA_USER_KEY).expect("LIMA_USER_KEY is a valid C string (no NUL bytes)");
+    // SAFETY: path_c is a valid NUL-terminated C string. chown(2) is a
+    // pure kernel syscall with no Rust-side invariants.
+    let rc = unsafe {
+        libc::chown(
+            path_c.as_ptr(),
+            new_uid as libc::uid_t,
+            new_gid as libc::gid_t,
+        )
+    };
+    if rc < 0 {
+        // SAFETY: errno is thread-local and set by the failed syscall.
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(format!(
+            "--prepare-lima-spawn: chown('{LIMA_USER_KEY}', {new_uid}, {new_gid}) failed: errno {errno}"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Sanitised environment construction
 // ---------------------------------------------------------------------------
 
@@ -466,6 +564,7 @@ mod tests {
         let args = argv(&["1000", "/bin/sh"]);
         let parsed = parse_argv(&args).expect("two-arg form should parse");
         assert_eq!(parsed.operator_uid, 1000);
+        assert!(!parsed.prepare_lima_spawn);
         assert_eq!(parsed.runtime_argv, vec![OsString::from("/bin/sh")]);
     }
 
@@ -474,6 +573,7 @@ mod tests {
         let args = argv(&["1000", "/bin/sh", "-c", "echo hi"]);
         let parsed = parse_argv(&args).expect("multi-arg form should parse");
         assert_eq!(parsed.operator_uid, 1000);
+        assert!(!parsed.prepare_lima_spawn);
         assert_eq!(
             parsed.runtime_argv,
             vec![
@@ -481,6 +581,79 @@ mod tests {
                 OsString::from("-c"),
                 OsString::from("echo hi"),
             ]
+        );
+    }
+
+    /// `--prepare-lima-spawn` flag is parsed before the operator uid.
+    #[test]
+    fn parse_argv_accepts_prepare_lima_spawn_flag() {
+        let args = argv(&[
+            "--prepare-lima-spawn",
+            "1000",
+            "/usr/bin/limactl",
+            "start",
+            "sandbox-abc",
+        ]);
+        let parsed = parse_argv(&args).expect("--prepare-lima-spawn form should parse");
+        assert!(parsed.prepare_lima_spawn);
+        assert_eq!(parsed.operator_uid, 1000);
+        assert_eq!(
+            parsed.runtime_argv,
+            vec![
+                OsString::from("/usr/bin/limactl"),
+                OsString::from("start"),
+                OsString::from("sandbox-abc"),
+            ]
+        );
+    }
+
+    /// Without the flag, prepare_lima_spawn is false even with otherwise valid argv.
+    #[test]
+    fn parse_argv_no_flag_means_no_prepare() {
+        let args = argv(&["1000", "/usr/bin/limactl", "start", "sandbox-abc"]);
+        let parsed = parse_argv(&args).expect("no-flag form should parse");
+        assert!(!parsed.prepare_lima_spawn);
+    }
+
+    /// `--prepare-lima-spawn` with no subsequent uid+argv0 is rejected.
+    #[test]
+    fn parse_argv_rejects_prepare_flag_without_subsequent_uid_and_argv0() {
+        let args = argv(&["--prepare-lima-spawn"]);
+        assert!(parse_argv(&args).is_err());
+        // Also: flag + uid but no runtime_argv0
+        let args = argv(&["--prepare-lima-spawn", "1000"]);
+        assert!(parse_argv(&args).is_err());
+    }
+
+    /// `LIMA_USER_KEY` constant must match the expected literal so that a
+    /// future contributor cannot quietly redirect the helper to a different
+    /// file without going through review.
+    #[test]
+    fn lima_user_key_is_expected_literal() {
+        assert_eq!(
+            LIMA_USER_KEY, "/var/lib/sandbox/.lima/_config/user",
+            "LIMA_USER_KEY changed unexpectedly — update this pin if intentional"
+        );
+    }
+
+    /// `chown_lima_user_key` fails when the file does not exist.
+    ///
+    /// In the unit-test environment the Lima state directory does not exist,
+    /// so chown(2) returns ENOENT (errno 2).  We confirm the call returns an
+    /// `Err` containing a non-empty message.  The exact errno value is not
+    /// pinned — the test only verifies that a failure is reported.
+    #[test]
+    fn chown_lima_user_key_fails_when_file_absent() {
+        // The Lima directory does not exist in the unit-test environment.
+        let result = chown_lima_user_key(1000, 1001);
+        assert!(
+            result.is_err(),
+            "expected Err when LIMA_USER_KEY does not exist, got Ok(())"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            !msg.is_empty(),
+            "error message should be non-empty, got empty string"
         );
     }
 
