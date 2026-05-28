@@ -665,15 +665,17 @@ impl LimaManager {
     /// that a helper-pivoted `limactl start` (running as the operator uid,
     /// which is a member of the daemon's `sandbox` group) can read the YAML.
     ///
-    /// `limactl create` / `limactl clone` write the per-VM dir and `lima.yaml`
-    /// owned by the daemon (uid 999), with restrictive 0700/0600 modes. The
-    /// spawn-helper pivots to the operator uid for `limactl start`, so the
-    /// operator uid must be able to traverse, read, and write within the dir.
-    /// `limactl start` deletes `ha.stdout.log` from a prior boot before
-    /// re-creating it; `unlinkat` requires write+execute on the **directory**
-    /// (not the file), so the dir must be group-writable:
-    ///   - instance dir → 0o770 (rwxrwx---)
-    ///   - lima.yaml    → 0o640 (rw-r-----)
+    /// `limactl create` / `limactl clone` write the per-VM dir and all files
+    /// inside it owned by the daemon (uid 999) with restrictive 0700/0600
+    /// modes.  The spawn-helper pivots to the operator uid (1000) for
+    /// `limactl start`, whose hostagent needs to:
+    ///   - traverse the dir           → dir needs x for group
+    ///   - unlink files (ha.stdout.log, etc.) → dir needs w for group
+    ///   - open/overwrite files (ssh.config, etc.) → files need w for group
+    ///
+    /// Correct modes after this call:
+    ///   - instance dir        → 0o770 (rwxrwx---)
+    ///   - every regular file  → 0o660 (rw-rw----)
     ///
     /// Errors are logged but not surfaced — this is best-effort. If it fails
     /// (e.g. LIMA_HOME not resolvable) `start_vm` will fail for a different
@@ -699,41 +701,58 @@ impl LimaManager {
             };
 
             let instance_dir = lima_home.join(vm);
-            let yaml_path = instance_dir.join("lima.yaml");
 
-            // chmod instance dir to 0770 (rwxrwx---) so the operator uid
-            // (sandbox group member) can both traverse and unlink files inside.
-            if instance_dir.exists() {
-                if let Err(e) = std::fs::set_permissions(
-                    &instance_dir,
-                    std::fs::Permissions::from_mode(0o770),
-                ) {
+            if !instance_dir.exists() {
+                return;
+            }
+
+            // chmod every regular file to 0660 so the operator uid (sandbox
+            // group member) can overwrite files created by the daemon uid.
+            match std::fs::read_dir(&instance_dir) {
+                Err(e) => {
                     warn!(
                         vm,
                         path = %instance_dir.display(),
                         error = %e,
-                        "failed to chmod Lima instance dir to 0770"
+                        "failed to read Lima instance dir for permission relaxation"
                     );
-                } else {
-                    debug!(vm, path = %instance_dir.display(), "chmod Lima instance dir to 0770");
+                }
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Err(e) = std::fs::set_permissions(
+                                &path,
+                                std::fs::Permissions::from_mode(0o660),
+                            ) {
+                                warn!(
+                                    vm,
+                                    path = %path.display(),
+                                    error = %e,
+                                    "failed to chmod Lima instance file to 0660"
+                                );
+                            } else {
+                                debug!(vm, path = %path.display(), "chmod Lima instance file to 0660");
+                            }
+                        }
+                    }
                 }
             }
 
-            // chmod lima.yaml to 0640 (rw-r-----)
-            if yaml_path.exists() {
-                if let Err(e) = std::fs::set_permissions(
-                    &yaml_path,
-                    std::fs::Permissions::from_mode(0o640),
-                ) {
-                    warn!(
-                        vm,
-                        path = %yaml_path.display(),
-                        error = %e,
-                        "failed to chmod lima.yaml to 0640"
-                    );
-                } else {
-                    debug!(vm, path = %yaml_path.display(), "chmod lima.yaml to 0640");
-                }
+            // chmod instance dir to 0770 (rwxrwx---) so the operator uid can
+            // traverse, read, write, and unlink files inside.
+            if let Err(e) = std::fs::set_permissions(
+                &instance_dir,
+                std::fs::Permissions::from_mode(0o770),
+            ) {
+                warn!(
+                    vm,
+                    path = %instance_dir.display(),
+                    error = %e,
+                    "failed to chmod Lima instance dir to 0770"
+                );
+            } else {
+                debug!(vm, path = %instance_dir.display(), "chmod Lima instance dir to 0770");
             }
         }
     }
