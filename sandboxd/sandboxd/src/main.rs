@@ -3063,18 +3063,42 @@ async fn create_session(
     }
 
     // 5. Verify the guest agent is responsive.
-    match state.guest.ping(&session_id).await {
-        Ok(true) => {
-            info!(%session_id, "guest agent responded to ping");
+    //
+    // Cloned VMs may need a moment after `limactl start` returns for the
+    // guest agent service to begin accepting connections.  Retry up to 15
+    // times with 2 s between attempts (30 s max wall-clock) before giving up.
+    {
+        const MAX_PING_ATTEMPTS: u32 = 15;
+        let mut last_err: Option<SandboxError> = None;
+        let mut succeeded = false;
+        for attempt in 1..=MAX_PING_ATTEMPTS {
+            match state.guest.ping(&session_id).await {
+                Ok(true) => {
+                    info!(%session_id, attempts = attempt, "guest agent responded to ping");
+                    succeeded = true;
+                    break;
+                }
+                Ok(false) => {
+                    let err = SandboxError::Internal(
+                        "guest agent returned unexpected response to ping".into(),
+                    );
+                    error!(%session_id, "guest agent ping: unexpected response");
+                    cleanup_and_return!(state, session_id, error_response(err).into_response());
+                }
+                Err(e) => {
+                    debug!(%session_id, attempt, error = %e, "guest agent ping failed, retrying");
+                    last_err = Some(e);
+                    if attempt < MAX_PING_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
         }
-        Ok(false) => {
-            let err =
-                SandboxError::Internal("guest agent returned unexpected response to ping".into());
-            error!(%session_id, "guest agent ping: unexpected response");
-            cleanup_and_return!(state, session_id, error_response(err).into_response());
-        }
-        Err(e) => {
-            error!(%session_id, error = %e, "guest agent ping failed");
+        if !succeeded {
+            let e = last_err.unwrap_or_else(|| {
+                SandboxError::Internal("guest agent ping failed after all attempts".into())
+            });
+            error!(%session_id, error = %e, "guest agent ping failed after all attempts");
             cleanup_and_return!(state, session_id, error_response(e).into_response());
         }
     }
