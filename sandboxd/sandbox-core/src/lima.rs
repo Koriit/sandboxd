@@ -668,10 +668,11 @@ impl LimaManager {
     /// `limactl create` / `limactl clone` write the per-VM dir and `lima.yaml`
     /// owned by the daemon (uid 999), with restrictive 0700/0600 modes. The
     /// spawn-helper pivots to the operator uid for `limactl start`, so the
-    /// operator uid must be able to traverse the dir and read the YAML. Since
-    /// operators are always members of the `sandbox` group, group-read is the
-    /// minimal and correct fix:
-    ///   - instance dir → 0o750 (rwxr-x---)
+    /// operator uid must be able to traverse, read, and write within the dir.
+    /// `limactl start` deletes `ha.stdout.log` from a prior boot before
+    /// re-creating it; `unlinkat` requires write+execute on the **directory**
+    /// (not the file), so the dir must be group-writable:
+    ///   - instance dir → 0o770 (rwxrwx---)
     ///   - lima.yaml    → 0o640 (rw-r-----)
     ///
     /// Errors are logged but not surfaced — this is best-effort. If it fails
@@ -700,20 +701,21 @@ impl LimaManager {
             let instance_dir = lima_home.join(vm);
             let yaml_path = instance_dir.join("lima.yaml");
 
-            // chmod instance dir to 0750 (rwxr-x---)
+            // chmod instance dir to 0770 (rwxrwx---) so the operator uid
+            // (sandbox group member) can both traverse and unlink files inside.
             if instance_dir.exists() {
                 if let Err(e) = std::fs::set_permissions(
                     &instance_dir,
-                    std::fs::Permissions::from_mode(0o750),
+                    std::fs::Permissions::from_mode(0o770),
                 ) {
                     warn!(
                         vm,
                         path = %instance_dir.display(),
                         error = %e,
-                        "failed to chmod Lima instance dir to 0750"
+                        "failed to chmod Lima instance dir to 0770"
                     );
                 } else {
-                    debug!(vm, path = %instance_dir.display(), "chmod Lima instance dir to 0750");
+                    debug!(vm, path = %instance_dir.display(), "chmod Lima instance dir to 0770");
                 }
             }
 
