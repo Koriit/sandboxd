@@ -377,6 +377,15 @@ impl LimaManager {
         }
 
         info!(session_id = %session_id, vm = %vm_name, "VM created");
+
+        // `limactl create` writes the per-VM instance dir and lima.yaml as
+        // uid 999 (daemon), mode 0600 / 0700. When the spawn-helper pivots
+        // `limactl start` to the operator uid (1000), it can't read the YAML
+        // unless the daemon's group (sandbox, gid 1001) has read access.
+        // chmod the dir to 0750 and lima.yaml to 0640 so the operator, who
+        // is a member of the sandbox group, can traverse and read them.
+        self.relax_lima_instance_perms(&vm_name);
+
         Ok(())
     }
 
@@ -425,6 +434,11 @@ impl LimaManager {
         }
 
         info!(session_id = %session_id, vm = %vm_name, "VM created with custom template");
+
+        // Same group-read fix as create_vm — operator uid needs read access
+        // to the daemon-owned lima.yaml before helper-pivoted limactl start.
+        self.relax_lima_instance_perms(&vm_name);
+
         Ok(())
     }
 
@@ -643,6 +657,81 @@ impl LimaManager {
                     vm,
                     "could not resolve LIMA_HOME or $HOME for partial-clone cleanup; manual rm -rf may be required"
                 );
+            }
+        }
+    }
+
+    /// Widen permissions on a freshly-created Lima instance directory so
+    /// that a helper-pivoted `limactl start` (running as the operator uid,
+    /// which is a member of the daemon's `sandbox` group) can read the YAML.
+    ///
+    /// `limactl create` / `limactl clone` write the per-VM dir and `lima.yaml`
+    /// owned by the daemon (uid 999), with restrictive 0700/0600 modes. The
+    /// spawn-helper pivots to the operator uid for `limactl start`, so the
+    /// operator uid must be able to traverse the dir and read the YAML. Since
+    /// operators are always members of the `sandbox` group, group-read is the
+    /// minimal and correct fix:
+    ///   - instance dir → 0o750 (rwxr-x---)
+    ///   - lima.yaml    → 0o640 (rw-r-----)
+    ///
+    /// Errors are logged but not surfaced — this is best-effort. If it fails
+    /// (e.g. LIMA_HOME not resolvable) `start_vm` will fail for a different
+    /// but equally diagnosable reason.
+    fn relax_lima_instance_perms(&self, vm: &str) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let lima_home = std::env::var("LIMA_HOME")
+                .map(PathBuf::from)
+                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".lima")));
+
+            let lima_home = match lima_home {
+                Ok(h) => h,
+                Err(_) => {
+                    warn!(
+                        vm,
+                        "could not resolve LIMA_HOME or $HOME; skipping permission relaxation"
+                    );
+                    return;
+                }
+            };
+
+            let instance_dir = lima_home.join(vm);
+            let yaml_path = instance_dir.join("lima.yaml");
+
+            // chmod instance dir to 0750 (rwxr-x---)
+            if instance_dir.exists() {
+                if let Err(e) = std::fs::set_permissions(
+                    &instance_dir,
+                    std::fs::Permissions::from_mode(0o750),
+                ) {
+                    warn!(
+                        vm,
+                        path = %instance_dir.display(),
+                        error = %e,
+                        "failed to chmod Lima instance dir to 0750"
+                    );
+                } else {
+                    debug!(vm, path = %instance_dir.display(), "chmod Lima instance dir to 0750");
+                }
+            }
+
+            // chmod lima.yaml to 0640 (rw-r-----)
+            if yaml_path.exists() {
+                if let Err(e) = std::fs::set_permissions(
+                    &yaml_path,
+                    std::fs::Permissions::from_mode(0o640),
+                ) {
+                    warn!(
+                        vm,
+                        path = %yaml_path.display(),
+                        error = %e,
+                        "failed to chmod lima.yaml to 0640"
+                    );
+                } else {
+                    debug!(vm, path = %yaml_path.display(), "chmod lima.yaml to 0640");
+                }
             }
         }
     }
@@ -1326,6 +1415,11 @@ impl LimaManager {
         }
 
         info!(session_id = %session_id, vm = %target, "VM cloned from base image");
+
+        // limactl clone writes the per-VM dir and lima.yaml owned by uid 999;
+        // subsequent helper-pivoted limactl start (uid 1000) needs group-read.
+        self.relax_lima_instance_perms(&target);
+
         Ok(())
     }
 
