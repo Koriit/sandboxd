@@ -429,15 +429,16 @@ sandboxd/target/.dev-env-stamps/route-helper-prod.stamp: sandboxd/target/release
 	@if [ -f "$(ROUTE_HELPER_PROD_PATH)" ] && \
 	    cmp -s "sandboxd/target/release/sandbox-route-helper" "$(ROUTE_HELPER_PROD_PATH)" && \
 	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_net_admin && \
-	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
-	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_net_admin,cap_sys_admin=eip, content matches build)$(RESET)"; \
+	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_admin && \
+	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_ptrace; then \
+	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip, content matches build)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-route-helper $(ROUTE_HELPER_PROD_PATH)"; \
-	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_PROD_PATH)"; \
+	  echo "[sudo] setcap cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip $(ROUTE_HELPER_PROD_PATH)"; \
 	  sudo -k install -D -m 0755 \
 	    sandboxd/target/release/sandbox-route-helper \
 	    "$(ROUTE_HELPER_PROD_PATH)"; \
-	  sudo -k setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_PROD_PATH)"; \
+	  sudo -k setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' "$(ROUTE_HELPER_PROD_PATH)"; \
 	fi
 	@touch $@
 
@@ -481,15 +482,16 @@ sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/s
 	@if [ -f "$(ROUTE_HELPER_TEST_PATH)" ] && \
 	    cmp -s "sandboxd/target/debug/sandbox-route-helper" "$(ROUTE_HELPER_TEST_PATH)" && \
 	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_net_admin && \
-	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
-	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_net_admin,cap_sys_admin=eip, content matches test build)$(RESET)"; \
+	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_admin && \
+	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_ptrace; then \
+	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip, content matches test build)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
-	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_TEST_PATH)"; \
+	  echo "[sudo] setcap cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip $(ROUTE_HELPER_TEST_PATH)"; \
 	  sudo -k install -D -m 0755 \
 	    sandboxd/target/debug/sandbox-route-helper \
 	    "$(ROUTE_HELPER_TEST_PATH)"; \
-	  sudo -k setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_TEST_PATH)"; \
+	  sudo -k setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' "$(ROUTE_HELPER_TEST_PATH)"; \
 	fi
 	@touch $@
 
