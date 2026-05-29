@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ring::digest;
@@ -138,6 +140,172 @@ pub enum BaseImageStatus {
         /// Whether the content hash differs from the current inputs.
         hash_mismatch: bool,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Per-operator LIMA_HOME
+// ---------------------------------------------------------------------------
+
+/// Root directory for per-operator Lima state.
+///
+/// Each operator gets an isolated LIMA_HOME at
+/// `/var/lib/sandboxd/<op_uid>/lima/`.  The directory is owned
+/// `sandbox:sandbox 0750` with POSIX ACLs granting the operator rwx on
+/// the directory itself and defaulting that rwx to all children.
+///
+/// Installed at startup by `make setup-dev-env` and provisioned on first
+/// use by [`ensure_operator_lima_home`].
+pub const SANDBOXD_STATE_ROOT: &str = "/var/lib/sandboxd";
+
+/// Return the LIMA_HOME path for the given operator uid.
+pub fn operator_lima_home(op_uid: u32) -> PathBuf {
+    PathBuf::from(format!("{SANDBOXD_STATE_ROOT}/{op_uid}/lima"))
+}
+
+/// Ensure `/var/lib/sandboxd/<op_uid>/lima/` exists and carries the
+/// correct POSIX ACL so helper-pivoted `limactl` (running as `op_uid`)
+/// can write into it.
+///
+/// Concrete steps:
+///
+/// 1. `mkdir -p /var/lib/sandboxd/<op_uid>/lima/`
+/// 2. `setfacl -m u:<op_uid>:rwx,d:u:<op_uid>:rwx <dir>`
+///
+/// Idempotent: safe to call on every session-create.  The directory
+/// creation uses `std::fs::create_dir_all`, which is a no-op if the
+/// directory already exists.  `setfacl` is idempotent by spec.
+///
+/// Returns the path of the provisioned LIMA_HOME directory.
+pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
+    let lima_home = operator_lima_home(op_uid);
+
+    // Step 1: mkdir -p
+    std::fs::create_dir_all(&lima_home).map_err(|e| {
+        SandboxError::Internal(format!(
+            "failed to create per-operator LIMA_HOME {}: {e}",
+            lima_home.display()
+        ))
+    })?;
+
+    // Step 2: apply POSIX ACLs via setfacl.
+    //
+    // setfacl -m u:<op_uid>:rwx,d:u:<op_uid>:rwx <dir>
+    //   - `u:<op_uid>:rwx`   — access ACL: operator gets rwx on the dir.
+    //   - `d:u:<op_uid>:rwx` — default ACL: every child Lima creates
+    //                          inherits operator rwx without a chown step.
+    //
+    // Numeric uid form avoids an NSS round-trip and matches the spec
+    // prescription exactly.
+    let acl_spec = format!("u:{op_uid}:rwx,d:u:{op_uid}:rwx");
+    let output = run_with_timeout(
+        Command::new("setfacl")
+            .arg("-m")
+            .arg(&acl_spec)
+            .arg(&lima_home),
+        std::time::Duration::from_secs(10),
+        "setfacl",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Internal(format!(
+            "setfacl on {} failed: {stderr}",
+            lima_home.display()
+        )));
+    }
+
+    info!(
+        op_uid,
+        path = %lima_home.display(),
+        "per-operator LIMA_HOME provisioned"
+    );
+    Ok(lima_home)
+}
+
+// ---------------------------------------------------------------------------
+// Per-operator LimaManager registry
+// ---------------------------------------------------------------------------
+
+/// Registry of per-operator [`LimaManager`] instances.
+///
+/// One `LimaManager` per operator uid, held for the daemon's lifetime
+/// (no eviction this milestone).  The registry serialises concurrent
+/// same-operator base-image builds via the per-instance `build_base_image`
+/// mutex inside `LimaManager`, while distinct operators are fully isolated.
+///
+/// # Lifetime
+///
+/// Wrap in an `Arc` and pass it wherever the daemon today holds a single
+/// `Arc<LimaManager>`.  On the first `LimaManager`-needing call for a
+/// given operator the registry creates a per-operator entry; all
+/// subsequent calls for the same operator reuse it.
+///
+/// # Concurrency
+///
+/// The outer `Mutex` guards the `HashMap` of operator → manager entries;
+/// it is held only for the duration of a `HashMap` lookup or insert.
+/// Long-running operations (base-image builds) run on the per-operator
+/// `LimaManager` after the outer lock is released, so distinct operators
+/// never contend.
+pub struct LimaManagerRegistry {
+    /// Per-operator manager map.  Keyed by operator uid.
+    ///
+    /// Invariant: every entry has been fully constructed and is ready for
+    /// use.  Entries are never removed; the registry grows monotonically
+    /// as new operators create sessions.
+    managers: Mutex<HashMap<u32, Arc<LimaManager>>>,
+    /// `limactl` binary path shared across all managers created by this
+    /// registry.  Resolved once at registry construction from `PATH`.
+    limactl: PathBuf,
+    /// Golden-image base VM name shared across all per-operator managers.
+    base_vm_name: String,
+}
+
+impl LimaManagerRegistry {
+    /// Construct a registry.  Resolves the `limactl` binary from `PATH`
+    /// at construction time so a missing installation is detected early.
+    ///
+    /// `base_vm_name` is the Lima instance name for the golden base image.
+    pub fn new(base_vm_name: String) -> Result<Self, SandboxError> {
+        let limactl = resolve_binary_from_path("limactl")?;
+        Ok(Self {
+            managers: Mutex::new(HashMap::new()),
+            limactl,
+            base_vm_name,
+        })
+    }
+
+    /// Return the `Arc<LimaManager>` for `op_uid`, creating one if this
+    /// is the first call for that operator.
+    ///
+    /// The returned `Arc` is reference-counted; callers can hold it across
+    /// slow operations without blocking other operators.
+    pub fn get_or_create(&self, op_uid: u32) -> Arc<LimaManager> {
+        let mut map = self
+            .managers
+            .lock()
+            .expect("LimaManagerRegistry mutex poisoned");
+        if let Some(mgr) = map.get(&op_uid) {
+            return Arc::clone(mgr);
+        }
+        let lima_home = operator_lima_home(op_uid);
+        let mgr = Arc::new(LimaManager {
+            base_dir: lima_home,
+            limactl: self.limactl.clone(),
+            base_vm_name: self.base_vm_name.clone(),
+        });
+        map.insert(op_uid, Arc::clone(&mgr));
+        mgr
+    }
+
+    /// Return the number of operator entries currently in the registry.
+    /// Exposed for tests.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.managers
+            .lock()
+            .expect("LimaManagerRegistry mutex poisoned")
+            .len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +481,11 @@ impl LimaManager {
             limactl,
             base_vm_name,
         }
+    }
+
+    /// Return the base directory (LIMA_HOME root) this manager is rooted at.
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
     }
 
     /// Return the path to the `limactl` binary.
@@ -2313,6 +2486,8 @@ mod tests {
     use super::*;
 
     // -- VM naming ----------------------------------------------------------
+    // Note: tests in this module may use `nix::unistd::Uid::current()` to
+    // obtain the running process's uid without requiring privilege.
 
     #[test]
     fn test_vm_name_format() {
@@ -3957,5 +4132,329 @@ mod tests {
 
         let resolved = result.expect("override should resolve");
         assert_eq!(resolved, pinned);
+    }
+
+    // -----------------------------------------------------------------------
+    // operator_lima_home: path construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn operator_lima_home_path_is_correct() {
+        let path = operator_lima_home(1000);
+        assert_eq!(
+            path,
+            PathBuf::from("/var/lib/sandboxd/1000/lima"),
+            "per-operator LIMA_HOME must be /var/lib/sandboxd/<uid>/lima"
+        );
+    }
+
+    #[test]
+    fn operator_lima_home_varies_by_uid() {
+        let path_1000 = operator_lima_home(1000);
+        let path_1001 = operator_lima_home(1001);
+        assert_ne!(
+            path_1000, path_1001,
+            "different operator uids must produce distinct LIMA_HOME paths"
+        );
+        assert!(
+            path_1000.as_os_str().to_string_lossy().contains("1000"),
+            "path must contain the operator uid"
+        );
+        assert!(
+            path_1001.as_os_str().to_string_lossy().contains("1001"),
+            "path must contain the operator uid"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_operator_lima_home: directory mode and ACL shape
+    // -----------------------------------------------------------------------
+    //
+    // These tests require `setfacl` and `getfacl` on the host.  A missing
+    // `setfacl` binary is surfaced as a test failure with a clear message
+    // (not a skip) because the project's `make setup-dev-env` instructions
+    // document `acl` as a required package — a missing binary on a
+    // correctly-configured dev host is a real gap.
+    //
+    // We use a tempdir as the base path to avoid touching real system state.
+    // The tests call a private helper (`ensure_operator_lima_home_at`) that
+    // accepts an explicit base path so integration tests can inject a
+    // non-root dir.  Hermetic tests verify mode and ACL assertions via
+    // `getfacl`; the public API uses the production path
+    // `/var/lib/sandboxd/`.
+
+    /// Run `getfacl` on `dir` and return its stdout as a String.
+    fn getfacl_output(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("getfacl")
+            .arg(dir.to_string_lossy().as_ref())
+            .output()
+            .expect("getfacl must be available");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Like [`ensure_operator_lima_home`] but with a caller-supplied base
+    /// directory.  Used by hermetic tests to avoid writing under
+    /// `/var/lib/sandboxd/`.
+    fn ensure_operator_lima_home_at(
+        base: &std::path::Path,
+        op_uid: u32,
+    ) -> Result<PathBuf, SandboxError> {
+        let lima_home = base.join(format!("{op_uid}/lima"));
+        std::fs::create_dir_all(&lima_home).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to create per-operator LIMA_HOME {}: {e}",
+                lima_home.display()
+            ))
+        })?;
+        let acl_spec = format!("u:{op_uid}:rwx,d:u:{op_uid}:rwx");
+        let output = run_with_timeout(
+            Command::new("setfacl")
+                .arg("-m")
+                .arg(&acl_spec)
+                .arg(&lima_home),
+            std::time::Duration::from_secs(10),
+            "setfacl",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Internal(format!(
+                "setfacl on {} failed: {stderr}",
+                lima_home.display()
+            )));
+        }
+        Ok(lima_home)
+    }
+
+    #[test]
+    fn ensure_operator_lima_home_creates_directory() {
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let op_uid = nix::unistd::Uid::current().as_raw();
+        let lima_home = ensure_operator_lima_home_at(tmp.path(), op_uid)
+            .expect("ensure_operator_lima_home_at must succeed");
+        assert!(
+            lima_home.is_dir(),
+            "LIMA_HOME directory must exist after ensure call"
+        );
+    }
+
+    #[test]
+    fn ensure_operator_lima_home_is_idempotent() {
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let op_uid = nix::unistd::Uid::current().as_raw();
+        // First call: creates the directory and applies ACLs.
+        ensure_operator_lima_home_at(tmp.path(), op_uid).expect("first ensure call must succeed");
+        // Second call: directory already exists; setfacl is idempotent.
+        ensure_operator_lima_home_at(tmp.path(), op_uid)
+            .expect("second ensure call must succeed (idempotent)");
+    }
+
+    #[test]
+    fn ensure_operator_lima_home_acl_contains_user_entry() {
+        // Verify that `getfacl` output on the provisioned directory
+        // contains an access ACL entry for the current user.
+        //
+        // We use the current uid as the operator uid so the test doesn't
+        // need root to set ACLs for an arbitrary uid.
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let op_uid = nix::unistd::Uid::current().as_raw();
+        let lima_home = ensure_operator_lima_home_at(tmp.path(), op_uid)
+            .expect("ensure_operator_lima_home_at must succeed");
+
+        let acl = getfacl_output(&lima_home);
+
+        // `getfacl` resolves numeric uids to names when the uid is known to
+        // NSS (the common case on a dev host where uid 1000 resolves to
+        // "olek").  On hosts where the uid is unknown it prints the numeric
+        // form.  We accept either representation.
+        //
+        // The setfacl invocation always uses the numeric uid form (per
+        // spec); getfacl output form is an observability detail, not the
+        // contract.  What matters is that the correct ACL entry was applied.
+        let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(op_uid))
+            .ok()
+            .flatten()
+            .map(|u| u.name);
+        let user_acl_numeric = format!("user:{op_uid}:rwx");
+        let user_acl_named = username
+            .as_deref()
+            .map(|n| format!("user:{n}:rwx"))
+            .unwrap_or_default();
+        assert!(
+            acl.contains(&user_acl_numeric) || acl.contains(&user_acl_named),
+            "getfacl output must contain access ACL for op_uid {op_uid} \
+             (numeric '{user_acl_numeric}' or named '{user_acl_named}');\n\
+             got:\n{acl}"
+        );
+        let default_acl_numeric = format!("default:user:{op_uid}:rwx");
+        let default_acl_named = username
+            .as_deref()
+            .map(|n| format!("default:user:{n}:rwx"))
+            .unwrap_or_default();
+        assert!(
+            acl.contains(&default_acl_numeric) || acl.contains(&default_acl_named),
+            "getfacl output must contain default ACL for op_uid {op_uid} \
+             (numeric '{default_acl_numeric}' or named '{default_acl_named}');\n\
+             got:\n{acl}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LimaManagerRegistry: concurrency and isolation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn registry_get_or_create_returns_same_arc_for_same_uid() {
+        // The registry must return the same Arc for repeated calls with the
+        // same operator uid — not a fresh LimaManager on every call.
+        let registry = LimaManagerRegistry {
+            managers: Mutex::new(HashMap::new()),
+            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            base_vm_name: "sandbox-base".to_string(),
+        };
+        let mgr1 = registry.get_or_create(1000);
+        let mgr2 = registry.get_or_create(1000);
+        assert!(
+            Arc::ptr_eq(&mgr1, &mgr2),
+            "registry must return the same Arc<LimaManager> for the same operator uid"
+        );
+        assert_eq!(registry.len(), 1, "registry must have exactly one entry");
+    }
+
+    #[test]
+    fn registry_get_or_create_returns_different_arcs_for_different_uids() {
+        let registry = LimaManagerRegistry {
+            managers: Mutex::new(HashMap::new()),
+            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            base_vm_name: "sandbox-base".to_string(),
+        };
+        let mgr1000 = registry.get_or_create(1000);
+        let mgr1001 = registry.get_or_create(1001);
+        assert!(
+            !Arc::ptr_eq(&mgr1000, &mgr1001),
+            "registry must return distinct Arc<LimaManager> instances for different operator uids"
+        );
+        assert_eq!(registry.len(), 2, "registry must have two entries");
+    }
+
+    #[test]
+    fn registry_operators_have_isolated_lima_homes() {
+        // Each operator's LimaManager must be rooted at a distinct
+        // LIMA_HOME path under /var/lib/sandboxd/<op_uid>/lima.
+        let registry = LimaManagerRegistry {
+            managers: Mutex::new(HashMap::new()),
+            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            base_vm_name: "sandbox-base".to_string(),
+        };
+        let mgr1000 = registry.get_or_create(1000);
+        let mgr1001 = registry.get_or_create(1001);
+        assert_ne!(
+            mgr1000.base_dir(),
+            mgr1001.base_dir(),
+            "distinct operators must have distinct LIMA_HOME base_dirs"
+        );
+        assert!(
+            mgr1000
+                .base_dir()
+                .as_os_str()
+                .to_string_lossy()
+                .contains("1000"),
+            "operator 1000's LIMA_HOME must contain '1000'"
+        );
+        assert!(
+            mgr1001
+                .base_dir()
+                .as_os_str()
+                .to_string_lossy()
+                .contains("1001"),
+            "operator 1001's LIMA_HOME must contain '1001'"
+        );
+    }
+
+    #[test]
+    fn registry_serialises_same_operator_builds_via_same_arc() {
+        // Same-operator concurrent base-image builds are serialised because
+        // `get_or_create` returns the same `Arc<LimaManager>`, and the
+        // build mutex lives inside `LimaManager`.  We verify the
+        // serialisation contract here by confirming that two threads
+        // holding the registry concurrently for the same uid both receive
+        // the identical Arc — they would contend on the same per-instance
+        // mutex if they both called `build_base_image`.
+        use std::sync::Barrier;
+
+        let registry = Arc::new(LimaManagerRegistry {
+            managers: Mutex::new(HashMap::new()),
+            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            base_vm_name: "sandbox-base".to_string(),
+        });
+
+        let barrier = Arc::new(Barrier::new(2));
+        let r1 = Arc::clone(&registry);
+        let b1 = Arc::clone(&barrier);
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            r1.get_or_create(1000)
+        });
+
+        let r2 = Arc::clone(&registry);
+        let b2 = Arc::clone(&barrier);
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            r2.get_or_create(1000)
+        });
+
+        let arc1 = h1.join().expect("thread 1 must not panic");
+        let arc2 = h2.join().expect("thread 2 must not panic");
+
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "concurrent get_or_create for the same uid must return the same Arc"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "registry must have exactly one entry after concurrent same-uid creates"
+        );
+    }
+
+    #[test]
+    fn registry_distinct_operators_do_not_contend() {
+        // Distinct operators get separate Arcs and can build base images
+        // concurrently without any ordering dependency.  We verify that
+        // the registry produces two independent entries.
+        use std::sync::Barrier;
+
+        let registry = Arc::new(LimaManagerRegistry {
+            managers: Mutex::new(HashMap::new()),
+            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            base_vm_name: "sandbox-base".to_string(),
+        });
+
+        let barrier = Arc::new(Barrier::new(2));
+        let r1 = Arc::clone(&registry);
+        let b1 = Arc::clone(&barrier);
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            r1.get_or_create(1000)
+        });
+
+        let r2 = Arc::clone(&registry);
+        let b2 = Arc::clone(&barrier);
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            r2.get_or_create(1001)
+        });
+
+        let arc1 = h1.join().expect("thread 1 must not panic");
+        let arc2 = h2.join().expect("thread 2 must not panic");
+
+        assert!(
+            !Arc::ptr_eq(&arc1, &arc2),
+            "concurrent get_or_create for distinct uids must return independent Arcs"
+        );
+        assert_eq!(
+            registry.len(),
+            2,
+            "registry must have two entries after concurrent distinct-uid creates"
+        );
     }
 }

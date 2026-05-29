@@ -273,8 +273,49 @@ QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 # keeping it as a Makefile-local constant is enough).
 TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
 
-setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-spawn-helper-prod-cap install-spawn-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-spawn-helper-prod-cap install-spawn-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir
 	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
+
+# setup-sandboxd-state-dir — create /var/lib/sandboxd/ owned by sandbox:sandbox
+# mode 0750.  This is the root of per-operator Lima state trees
+# (/var/lib/sandboxd/<op_uid>/lima/); per-operator subdirs are created at
+# first session-create time by the daemon via ensure_operator_lima_home().
+#
+# Idempotence:
+#   - Directory present with correct ownership and mode → ✓ already configured.
+#   - Directory present but wrong ownership/mode → correct in place.
+#   - Directory absent → create it.
+#
+# The `acl` package must be installed on the host (provides setfacl/getfacl).
+# The daemon uses setfacl to apply per-operator ACLs at session-create time.
+setup-sandboxd-state-dir:
+	@if ! getent passwd sandbox >/dev/null 2>&1; then \
+	  echo "ERROR: system user 'sandbox' does not exist; run 'make setup-sandbox-user' first"; \
+	  exit 1; \
+	fi
+	@if [ ! -d /var/lib/sandboxd ]; then \
+	  echo "[sudo] mkdir -p /var/lib/sandboxd"; \
+	  sudo -k mkdir -p /var/lib/sandboxd; \
+	  echo "[sudo] chown sandbox:sandbox /var/lib/sandboxd"; \
+	  sudo -k chown sandbox:sandbox /var/lib/sandboxd; \
+	  echo "[sudo] chmod 0750 /var/lib/sandboxd"; \
+	  sudo -k chmod 0750 /var/lib/sandboxd; \
+	else \
+	  owner=$$(stat -c '%U:%G' /var/lib/sandboxd 2>/dev/null || echo "?:?"); \
+	  mode=$$(stat -c '%a' /var/lib/sandboxd 2>/dev/null || echo "?"); \
+	  if [ "$$owner" = "sandbox:sandbox" ] && [ "$$mode" = "750" ]; then \
+	    echo "$(GREEN)✓ already configured: /var/lib/sandboxd (sandbox:sandbox 0750)$(RESET)"; \
+	  else \
+	    echo "[sudo] chown sandbox:sandbox /var/lib/sandboxd (was: $$owner $$mode)"; \
+	    sudo -k chown sandbox:sandbox /var/lib/sandboxd; \
+	    echo "[sudo] chmod 0750 /var/lib/sandboxd"; \
+	    sudo -k chmod 0750 /var/lib/sandboxd; \
+	  fi; \
+	fi
+	@if ! command -v setfacl >/dev/null 2>&1; then \
+	  echo "WARNING: setfacl not found — install the 'acl' package (apt install acl / dnf install acl)."; \
+	  echo "         The daemon uses setfacl to provision per-operator LIMA_HOME ACLs at session-create time."; \
+	fi
 
 # setup-sandbox-user — create the `sandbox` system user and group
 # that the e2e harness drops the daemon to. Mirrors the production

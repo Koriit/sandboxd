@@ -878,6 +878,106 @@ fn has_setuid_cap(path: &std::path::Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// sandbox-lima-helper path resolution
+// ---------------------------------------------------------------------------
+//
+// `sandbox-lima-helper` is the daemon's setcap pivot for every limactl
+// call: the helper validates the caller, drops to the operator's uid via
+// `setresuid`, clears all capabilities, and execs `limactl` with a
+// sanitised argument set and env block.  Unlike the spawn-helper there is
+// NO soft fallback — the cross-user Lima model requires the helper; if it
+// is absent or un-cap'd the daemon refuses to start with a clear journal
+// line.  Resolution follows the route-helper precedent exactly:
+//
+//   0. `$SANDBOX_LIMA_HELPER_PATH` — explicit operator override.  If set,
+//      the resolver uses ONLY this path.  Fail-closed: if the path is
+//      missing or lacks `cap_setuid` in the effective set, the daemon
+//      errors out with a message naming the env var.  Used by tests;
+//      production operators should not set it.
+//   1. `/usr/local/libexec/sandboxd/sandbox-lima-helper` — canonical
+//      production install path (FHS § 4.7).  Installed and cap'd by
+//      `make install-lima-helper-prod-cap`.
+//
+// Returns `Result<PathBuf, SandboxError>` (not `Option`) — there is no
+// fallback.  Daemon startup fatals on resolution failure.  Cap check:
+// `cap_setuid` in the file's Permitted set (same as spawn-helper; both
+// use `CAP_SETUID_BIT` / [`has_setuid_cap`]).
+
+/// Canonical install path (FHS § 4.7) for `sandbox-lima-helper`.
+const LIMA_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-lima-helper";
+
+/// Environment variable for explicit operator override of the lima-helper
+/// path.  When set, the resolver uses this path and only this path
+/// (fail-closed if missing or un-cap'd).  Intended for tests and unusual
+/// deployments; production operators should not set it.
+const LIMA_HELPER_PATH_ENV: &str = "SANDBOX_LIMA_HELPER_PATH";
+
+/// Resolve the absolute path to `sandbox-lima-helper`.
+///
+/// Lookup order: `$SANDBOX_LIMA_HELPER_PATH` (fail-closed override) then
+/// the canonical install path.  Returns `Err` on any failure — there is
+/// no soft fallback.  Daemon startup treats `Err` as fatal.
+pub(crate) fn resolve_lima_helper_path() -> Result<PathBuf, SandboxError> {
+    let env_override = std::env::var_os(LIMA_HELPER_PATH_ENV).map(PathBuf::from);
+    let install_path = PathBuf::from(LIMA_HELPER_INSTALL_PATH);
+    resolve_lima_helper_path_from(env_override.as_deref(), &install_path, has_setuid_cap)
+}
+
+/// Pure inner of [`resolve_lima_helper_path`].
+///
+/// Two-step resolver (mirrors [`resolve_route_helper_path_from`]):
+///
+///   - If `env_override` is `Some(path)`, that is the ONLY candidate.
+///     Fail-closed if `is_usable(path)` is false — explicit operator
+///     intent is not silently overruled by falling through to the
+///     canonical path.
+///   - Otherwise the canonical `install_path` is the only candidate.
+///     Same `is_usable` requirement; an un-cap'd file at the canonical
+///     path is a misconfiguration, not a "fall back to something else"
+///     situation.
+///
+/// Parameterized over `is_usable` so unit tests can drive the resolver
+/// without `setcap`-ing real binaries.
+pub(crate) fn resolve_lima_helper_path_from<F>(
+    env_override: Option<&std::path::Path>,
+    install_path: &std::path::Path,
+    is_usable: F,
+) -> Result<PathBuf, SandboxError>
+where
+    F: Fn(&std::path::Path) -> bool,
+{
+    if let Some(env_path) = env_override {
+        if is_usable(env_path) {
+            return Ok(env_path.to_path_buf());
+        }
+        return Err(SandboxError::Internal(format!(
+            "sandbox-lima-helper not usable at {env_path} (set via \
+             ${LIMA_HELPER_PATH_ENV}); the file must exist as a regular \
+             file AND carry the cap_setuid file capability (effective): \
+             `sudo setcap cap_setuid+ep {env_path}`. To use the canonical \
+             install instead, unset ${env}; the resolver then looks up \
+             {install} (installed by `make install-lima-helper-prod-cap`). \
+             See docs/guides/installation.md § \"sandbox-lima-helper\".",
+            env_path = env_path.display(),
+            env = LIMA_HELPER_PATH_ENV,
+            install = install_path.display(),
+        )));
+    }
+    if is_usable(install_path) {
+        return Ok(install_path.to_path_buf());
+    }
+    Err(SandboxError::Internal(format!(
+        "no usable sandbox-lima-helper found at the canonical install \
+         path {install}. The file must exist as a regular file AND carry \
+         the cap_setuid file capability (effective). Install it with: \
+         `make install-lima-helper-prod-cap` (production) or set \
+         ${LIMA_HELPER_PATH_ENV} to a custom path. See \
+         docs/guides/installation.md § \"sandbox-lima-helper\".",
+        install = install_path.display(),
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
@@ -8258,6 +8358,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(base_vm_name = %base_vm_name, "base VM name resolved");
     let lima = Arc::new(LimaManager::new(base_dir.clone(), base_vm_name)?);
 
+    // Resolve `sandbox-lima-helper` at startup.  The helper is required
+    // for the cross-user Lima model (daemon uid ≠ operator uid); the
+    // resolver returns `Result` — `Err` is fatal and the daemon refuses
+    // to start.  `resolve_lima_helper_path()` consults
+    // `$SANDBOX_LIMA_HELPER_PATH` first (fail-closed if set but
+    // missing/un-cap'd) then the canonical install path
+    // `/usr/local/libexec/sandboxd/sandbox-lima-helper` (FHS § 4.7).
+    // Both must carry `cap_setuid+ep`.  There is no soft fallback.
+    let lima_helper_path = match resolve_lima_helper_path() {
+        Ok(path) => {
+            info!(
+                path = %path.display(),
+                "resolved sandbox-lima-helper path"
+            );
+            path
+        }
+        Err(e) => {
+            error!(error = %e, "sandbox-lima-helper not usable; daemon cannot start");
+            eprintln!("sandboxd: {e}");
+            return Err(e.into());
+        }
+    };
+
     // Wrap the existing `LimaManager` in a [`LimaRuntime`] and register
     // it in the backend dispatch table. The same `Arc<LimaRuntime>` is
     // held both as a typed handle (for Lima-only orchestration via
@@ -8278,6 +8401,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spawn_helper_path = ?spawn_helper_path,
         "resolved sandbox-spawn-helper path for Lima backend"
     );
+    // Store the resolved lima-helper path on the Lima runtime so S13 can
+    // thread it into every call site without a separate resolver call.
+    // For now it is held on `LimaRuntime` as substrate — no call site
+    // routes through it yet (that is the S13 flip).
+    let _ = &lima_helper_path; // suppress unused-variable lint until S13 wires it
     let lima_runtime = LimaRuntime::new(Arc::clone(&lima), spawn_helper_path);
     let mut runtimes: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
     runtimes.insert(
@@ -9978,6 +10106,187 @@ mod tests {
             "no usable candidate; resolver must return None (got Some({:?}))",
             resolved
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // sandbox-lima-helper path resolution.
+    //
+    // The lima-helper resolver differs from the spawn-helper resolver in
+    // one structural way: `Result<PathBuf, SandboxError>` instead of
+    // `Option<PathBuf>` — there is no soft fallback.  The four-corner
+    // hermetic tests mirror the route-helper set; the outer-wrapper tests
+    // mirror the spawn-helper outer tests (env-read + env-unset branches).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_lima_helper_path_from_uses_env_override_when_set_and_usable() {
+        let env_path = std::path::PathBuf::from("/tmp/explicit-lima-helper");
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-lima-helper");
+        // Both are marked usable; env-override must take precedence.
+        let resolved = resolve_lima_helper_path_from(Some(env_path.as_path()), install_path, |p| {
+            p == env_path.as_path() || p == install_path
+        })
+        .expect("env override path is usable; resolver must use it");
+        assert_eq!(resolved, env_path);
+    }
+
+    #[test]
+    fn resolve_lima_helper_path_from_errors_when_env_override_set_but_unusable() {
+        // env-set, env-path NOT usable, canonical IS usable.  The resolver
+        // must fail closed — explicit operator intent is not silently
+        // overruled.  The error must name the env var and the cap
+        // requirement.
+        let env_path = std::path::PathBuf::from("/tmp/missing-lima-helper");
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-lima-helper");
+        let err = resolve_lima_helper_path_from(
+            Some(env_path.as_path()),
+            install_path,
+            |p| p == install_path, // only canonical is usable
+        )
+        .expect_err("env-override unusable; resolver must NOT fall through");
+        match err {
+            SandboxError::Internal(msg) => {
+                assert!(
+                    msg.contains("/tmp/missing-lima-helper"),
+                    "error must name the env-override path that failed, got: {msg}"
+                );
+                assert!(
+                    msg.contains("SANDBOX_LIMA_HELPER_PATH"),
+                    "error must name the env var so operators can unset it, got: {msg}"
+                );
+                assert!(
+                    msg.contains("cap_setuid"),
+                    "error must mention the cap requirement, got: {msg}"
+                );
+            }
+            other => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_lima_helper_path_from_uses_canonical_when_env_unset_and_usable() {
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-lima-helper");
+        let resolved = resolve_lima_helper_path_from(None, install_path, |p| p == install_path)
+            .expect("canonical install is usable");
+        assert_eq!(resolved, install_path);
+    }
+
+    #[test]
+    fn resolve_lima_helper_path_from_errors_when_env_unset_and_canonical_unusable() {
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-lima-helper");
+        let err = resolve_lima_helper_path_from(None, install_path, |_| false)
+            .expect_err("no usable candidate; resolver must surface error");
+        match err {
+            SandboxError::Internal(msg) => {
+                assert!(
+                    msg.contains("sandbox-lima-helper"),
+                    "error must mention the binary name, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&install_path.display().to_string()),
+                    "error must name the canonical install path, got: {msg}"
+                );
+                assert!(
+                    msg.contains("cap_setuid"),
+                    "error must mention the cap requirement, got: {msg}"
+                );
+                assert!(
+                    msg.contains("install-lima-helper-prod-cap"),
+                    "error must point at the make target operators can run, got: {msg}"
+                );
+                assert!(
+                    msg.contains("SANDBOX_LIMA_HELPER_PATH"),
+                    "error must mention env-var alternative, got: {msg}"
+                );
+            }
+            other => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_lima_helper_path_reads_env_var_when_set() {
+        // SAFETY: same rationale as resolve_route_helper_path_reads_env_var_when_set.
+        let prev = std::env::var(LIMA_HELPER_PATH_ENV).ok();
+        let env_path = "/tmp/sandbox-lima-helper-outer-env-read-test-DOES-NOT-EXIST";
+        unsafe {
+            std::env::set_var(LIMA_HELPER_PATH_ENV, env_path);
+        }
+
+        let result = resolve_lima_helper_path();
+
+        // Restore before any assertion can panic.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(LIMA_HELPER_PATH_ENV, v),
+                None => std::env::remove_var(LIMA_HELPER_PATH_ENV),
+            }
+        }
+
+        match result {
+            Err(SandboxError::Internal(msg)) => {
+                assert!(
+                    msg.contains(env_path),
+                    "outer must consult $SANDBOX_LIMA_HELPER_PATH and surface the \
+                     env-set path on fail-closed; got: {msg}"
+                );
+                assert!(
+                    msg.contains(LIMA_HELPER_PATH_ENV),
+                    "outer must name the env var so the operator knows what to fix; got: {msg}"
+                );
+            }
+            Ok(path) => panic!(
+                "env-set path is non-existent so the resolver must NOT return Ok; got: {}",
+                path.display()
+            ),
+            Err(other) => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_lima_helper_path_falls_back_to_canonical_when_env_unset() {
+        // SAFETY: same rationale as resolve_route_helper_path_falls_back_to_canonical_when_env_unset.
+        let prev = std::env::var(LIMA_HELPER_PATH_ENV).ok();
+        let unique_marker = "/tmp/sandbox-lima-helper-outer-fallback-test-MARKER-NOT-IN-CANONICAL";
+        unsafe {
+            std::env::remove_var(LIMA_HELPER_PATH_ENV);
+        }
+
+        let result = resolve_lima_helper_path();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(LIMA_HELPER_PATH_ENV, v),
+                None => std::env::remove_var(LIMA_HELPER_PATH_ENV),
+            }
+        }
+
+        // Two acceptable outcomes depending on host state:
+        //   * canonical install present and cap'd → Ok(canonical_path)
+        //   * canonical absent or un-cap'd → Err(message naming canonical)
+        // In neither case may the result reference the marker (env var was
+        // removed; the env-set branch must not fire).
+        match result {
+            Ok(path) => {
+                assert_eq!(
+                    path,
+                    PathBuf::from(LIMA_HELPER_INSTALL_PATH),
+                    "env unset and canonical usable ⇒ resolver must return the canonical \
+                     install path verbatim; got: {}",
+                    path.display(),
+                );
+            }
+            Err(SandboxError::Internal(msg)) => {
+                assert!(
+                    msg.contains(LIMA_HELPER_INSTALL_PATH),
+                    "env-unset error must name the canonical install path; got: {msg}"
+                );
+                assert!(
+                    !msg.contains(unique_marker),
+                    "env-unset branch must not surface any env-derived path; got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
