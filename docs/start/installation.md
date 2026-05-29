@@ -24,6 +24,7 @@ If you want the fast path through create/exec/ssh once installed, see [Quickstar
 | Rust | 1.88+ (stable) | Developer install only — for building from source |
 | Go | 1.22+ | Developer install only — for the CoreDNS policy plugin |
 | Python | 3.12+ | Developer install only — for E2E tests |
+| `acl` (`setfacl`/`getfacl`) | any recent | Lima backend only — required at runtime for per-operator LIMA_HOME ACL setup; Debian/Ubuntu: `apt install acl`, RHEL/Fedora: `dnf install acl` |
 
 Sections below cover the prerequisites in detail. If `install.sh` finds any missing it will refuse and print the exact package names per detected distro.
 
@@ -78,6 +79,7 @@ Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes
 | `sandboxd` binary | `/usr/local/bin/sandboxd` |
 | `sandbox` CLI | `/usr/local/bin/sandbox` |
 | `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` (with `cap_net_admin,cap_sys_admin=eip`) |
+| `sandbox-lima-helper` | `/usr/local/libexec/sandboxd/sandbox-lima-helper` (with `cap_setuid+ep`; Lima backend only) |
 | systemd unit | `/etc/systemd/system/sandboxd.service` |
 | `users.conf` | `/etc/sandboxd/users.conf` |
 | Bridge authorization | `allow sb-*` appended to `/etc/qemu/bridge.conf` |
@@ -463,6 +465,8 @@ This composes the sub-targets below. Each is independently runnable if you only 
 |---|---|
 | `make install-route-helper-prod-cap` | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-route-helper` |
 | `make install-route-helper-test-cap` | Installs the cap'd `test-env-override`-feature helper at `/usr/local/libexec/sandboxd-test/sandbox-route-helper` (used by `make test-integration`) |
+| `make install-lima-helper-prod-cap` | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-lima-helper` with `cap_setuid+ep`; required for the Lima backend |
+| `make setup-sandboxd-state-dir` | Creates `/var/lib/sandboxd/` owned `sandbox:sandbox` mode `0750`; checks that `setfacl` (`acl` package) is installed, as it is required for per-operator LIMA_HOME provisioning |
 | `make setup-bridge-conf` | Ensures `/etc/qemu/bridge.conf` authorizes sandbox bridges (`sb-*`); refuses to silently mutate an existing file with conflicting content |
 | `make setup-users-conf` | Installs `/etc/sandboxd/users.conf` from `contrib/users.conf.example` with `$USER` substituted; leaves an existing file alone |
 | `make setup-bridge-helper-setuid` | `chmod u+s /usr/lib/qemu/qemu-bridge-helper` if not already setuid |
@@ -680,6 +684,7 @@ After installation, run `sandbox doctor` to verify every load-bearing invariant 
 - the daemon's uid can read+write `/dev/kvm`;
 - the gateway and lite container images are loaded (the lite image is built on first use);
 - the route-helper has its setcap capability;
+- the lima-helper has its `cap_setuid` capability (Lima backend);
 - the state directory exists with the expected mode + ownership;
 - `users.conf` parses and lists the daemon's user;
 - no running session is on a drift'd guest protocol;
@@ -688,6 +693,14 @@ After installation, run `sandbox doctor` to verify every load-bearing invariant 
 Exit codes follow the `git`/`make` convention: `0` for clean, `1` for "at least one check failed", `2` for "doctor itself could not run". Add `--verbose` to see every check (passes are suppressed by default so the failure list is the actionable surface). Each failure carries a `hint:` line operators can copy-paste — usually a single shell command that fixes it.
 
 In dev mode (no `sandbox` system user, daemon run by hand), checks specific to the system-service shape (group membership, socket-mode strictness, state-dir ownership) degrade to informational skips so the dev workflow still passes a clean run.
+
+### Common startup failure modes
+
+| Error message | Cause | Remediation |
+|---|---|---|
+| `ERROR sandbox-lima-helper not usable; daemon cannot start` | `sandbox-lima-helper` is missing or lacks `cap_setuid+ep` | `make install-lima-helper-prod-cap` |
+| daemon refuses to start, logs mention missing subnet for daemon uid | `/etc/sandboxd/users.conf` absent or daemon uid not listed | `make setup-users-conf` then verify with `sandbox doctor` |
+| `setfacl: command not found` during first Lima session-create | `acl` package not installed | `apt install acl` (Debian/Ubuntu) or `dnf install acl` (RHEL/Fedora) |
 
 ## Next steps
 

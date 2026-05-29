@@ -23,6 +23,22 @@ This mirrors the `sandbox-route-helper` privilege model documented in
 
 ---
 
+## Why the daemon never calls `limactl` directly
+
+Every Lima control-plane operation — session create, start, stop, delete, clone,
+shell, list, proxy-port lookup, and base-image build — runs through
+`sandbox-lima-helper`. No limactl call bypasses it. The reason is structural:
+Lima writes and reads files in `LIMA_HOME` as the calling uid. If any limactl
+invocation ran as the daemon uid (uid 999, `sandbox`), it would either write
+files the operator cannot own (breaking `StrictKeyfileMode`), or read from the
+wrong per-operator LIMA_HOME and silently miss the session. The per-operator
+LIMA_HOME model only holds if the isolation is airtight — a single daemon-uid
+limactl call leaks across the boundary. This is why every call site uses the
+helper unconditionally, including the orphan-scan path that runs at daemon
+startup.
+
+---
+
 ## Required directories
 
 ### `/var/lib/sandboxd/`
@@ -108,7 +124,15 @@ via `$SANDBOX_LIMA_HELPER_PATH`.
 
 ## Per-operator base-image serialization
 
-Each operator's first session-create triggers a base-image build (5–10 min).
+Each operator has their own base image seeded inside their per-operator LIMA_HOME.
+This is a structural consequence of the per-operator LIMA_HOME design: Lima's clone
+operation reads from the source VM's directory under LIMA_HOME, so the template must
+live in the same LIMA_HOME the operator's sessions will use. A shared base image in a
+global LIMA_HOME would require the daemon to access that global path with daemon-uid
+permissions, contradicting the invariant that every limactl call runs as the operator.
+The first session-create for a new operator therefore triggers a base-image build
+(5–10 min on first run, image cached for subsequent creates from the same operator).
+
 The daemon holds a `LimaManagerRegistry` — a `Mutex<HashMap<u32, Arc<LimaManager>>>`
 keyed by operator uid.  Concurrent session-creates from the **same** operator
 queue on the per-instance build mutex; concurrent creates from **different**
