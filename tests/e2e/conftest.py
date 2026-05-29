@@ -153,8 +153,8 @@ BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 #   clobbering any production unit on the host) together with a drop-in
 #   override that points ``ExecStart`` at the workspace's debug binary,
 #   disables ``ProtectHome`` (the unit's hardening blocks reads of the
-#   workspace binary and writes to ``/home/sandbox/.lima/`` — and the
-#   cross-user Lima bug requires both), and threads through the test
+#   workspace binary and writes to ``/var/lib/sandboxd/<op-uid>/lima/`` — and the
+#   cross-user Lima setup requires both), and threads through the test
 #   harness's ``SANDBOX_USERS_CONF`` tempfile via ``Environment=``. Falls
 #   back automatically to ``"sandbox-sudo"`` when systemd is not running
 #   on the host (``/run/systemd/system`` missing).
@@ -1050,9 +1050,9 @@ def _write_systemd_drop_in(
         # binary under ``/usr/local/libexec/sandboxd-test/`` so the
         # Lima cross-user code path (every limactl call routed through
         # ``sandbox-lima-helper`` to pivot to the operator's uid) is
-        # exercised by the e2e matrix. sandbox-spawn-helper was removed
-        # in M18-S13; all Lima control-plane operations now go through
-        # the lima-helper. Fail-closed under the resolver (a missing
+        # exercised by the e2e matrix. sandbox-spawn-helper was removed;
+        # all Lima control-plane operations now go through the lima-helper.
+        # Fail-closed under the resolver (a missing
         # or un-cap'd path here is a hard error that prevents startup).
         Environment="SANDBOX_LIMA_HELPER_PATH=/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
         # Disable Restart= so a daemon that crashes mid-test stays down
@@ -1181,6 +1181,39 @@ def _reset_sandbox_state_dir() -> None:
         ],
         capture_output=True, timeout=30,
     )
+
+    # Per-operator LIMA_HOME: wipe the base VM directory and freshness
+    # metadata so each test session rebuilds from scratch. This prevents
+    # a partially-initialised base VM (e.g. killed mid-cloud-init) from
+    # being reused via a stale base-image-meta.json left over from a
+    # prior session. The download cache is preserved so the ~580 MiB
+    # qcow2 is not re-fetched. The directory is owned sandbox:sandbox
+    # 0750 (ACL grants the operator rwx), so deletes are routed through
+    # ``sudo -n -u sandbox find … -delete`` — mirroring the pattern
+    # above for /var/lib/sandbox.
+    op_uid = os.getuid()
+    op_lima_home = Path(f"/var/lib/sandboxd/{op_uid}/lima")
+    if op_lima_home.exists():
+        op_cache_dir = str(op_lima_home / ".cache" / "lima")
+        op_base_vm_dir = str(
+            op_lima_home / os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
+        )
+        op_meta_file = str(op_lima_home / "base-image-meta.json")
+        subprocess.run(
+            [
+                "sudo", "-n", "-u", "sandbox",
+                "find", str(op_lima_home),
+                "-mindepth", "1",
+                "(",
+                "-path", op_cache_dir,
+                "-o", "-path", op_base_vm_dir,
+                "-o", "-path", op_meta_file,
+                ")",
+                "-prune",
+                "-o", "-delete",
+            ],
+            capture_output=True, timeout=30,
+        )
 
 
 def _launch_daemon_as_sandbox_via_systemd(
@@ -1352,16 +1385,12 @@ def _launch_daemon_as_sandbox_via_sudo(
     # whitelisted by sudoers and is more brittle).
     #
     # ``SANDBOX_LIMA_HELPER_PATH`` is set here for symmetry with the
-    # systemd Environment block above (sandbox-spawn-helper was removed
-    # in M18-S13; all Lima operations now go through sandbox-lima-helper).
-    # The current sudoers ``env_keep`` does NOT list it — sudo will strip
-    # the variable on the way through and the daemon's lima-helper resolver
-    # falls back to the canonical ``/usr/local/libexec/sandboxd/`` path,
-    # which is not installed on developer hosts. Extending the sudoers
-    # fragment to whitelist the variable is the follow-up required to
-    # exercise the Lima cross-user code path under
-    # ``SANDBOX_HARNESS=sandbox-sudo``; the default ``sandbox-systemd``
-    # harness used by ``make test-e2e-matrix`` is unaffected.
+    # systemd Environment block above (sandbox-spawn-helper was removed;
+    # all Lima operations now go through sandbox-lima-helper). The sudoers
+    # fragment installed by ``make setup-test-sudoers-fragment`` includes
+    # ``SANDBOX_LIMA_HELPER_PATH`` in ``env_keep`` so the variable
+    # propagates through sudo and the daemon's lima-helper resolver finds
+    # the test-cap'd binary rather than hard-failing at startup.
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", "sandbox",
@@ -1504,7 +1533,11 @@ def restart_test_daemon(
     Dispatch on ``sandbox_daemon["_harness"]``:
 
     * **sandbox-systemd** — Re-start the unit via ``sudo systemctl
-      start <unit>``, reset the cached exit-code on the existing
+      start <unit>`` (not ``restart``). ``restart`` on a unit that is
+      already in the ``failed`` state from a SIGKILL does nothing unless
+      ``reset-failed`` is called first; this helper issues
+      ``reset-failed`` then ``start`` so the sequencing is explicit and
+      correct. Reset the cached exit-code on the existing
       :class:`_SystemdDaemonHandle`, wait for the socket to come back
       up, and return the *same* handle (no swap). The session-scope
       fixture's teardown closes ``info["_stdout_fh"]``/``_stderr_fh``
@@ -1759,16 +1792,22 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
     # clean them up even if the test forgot to `rm`. Under the
     # production-shaped harnesses (``sandbox-systemd`` / ``sandbox-
     # sudo``) the daemon owns its Lima registry at
-    # ``/home/sandbox/.lima/``; bare ``limactl`` runs as the test
-    # operator and only sees ``~/.lima/`` — so we route the probe and
-    # the delete through ``sudo -n -u sandbox`` to query the right
-    # registry. The ``sandbox`` NOPASSWD sudoers fragment installed by
+    # ``/var/lib/sandboxd/<op-uid>/lima/``; bare ``limactl`` runs as the
+    # test operator and only sees ``~/.lima/`` — so we route the probe
+    # and the delete through ``sudo -n -u sandbox`` with the correct
+    # ``LIMA_HOME`` to query the right registry. The ``sandbox`` NOPASSWD sudoers fragment installed by
     # ``make setup-dev-env`` (see Phase 1 of the 2026-05-24 spec)
     # authorises the test operator for these specific commands. In the
     # legacy ``test-user`` harness the daemon and the test operator
     # share a uid, so the bare ``limactl`` is correct.
     if info.get("_harness") in ("sandbox-systemd", "sandbox-sudo"):
-        limactl_argv_prefix: list[str] = ["sudo", "-n", "-u", "sandbox", "limactl"]
+        op_uid = os.getuid()
+        op_lima_home = f"/var/lib/sandboxd/{op_uid}/lima"
+        limactl_argv_prefix: list[str] = [
+            "sudo", "-n", "-u", "sandbox",
+            "env", f"LIMA_HOME={op_lima_home}",
+            "limactl",
+        ]
     else:
         limactl_argv_prefix = ["limactl"]
 

@@ -1,7 +1,7 @@
-"""E2E tests for M18-S13: sandbox-lima-helper cross-user pivot.
+"""E2E tests for sandbox-lima-helper cross-user pivot.
 
-These tests verify that after the M18-S13 atomic flip every daemon limactl
-invocation goes through ``sandbox-lima-helper`` with the operator's uid, so:
+These tests verify that every daemon limactl invocation goes through
+``sandbox-lima-helper`` with the operator's uid, so:
 
 1. The Lima VM's ``_config/user`` SSH private key is owned by the *operator*
    uid (not the daemon uid 999), satisfying OpenSSH ``StrictKeyfileMode``.
@@ -75,35 +75,15 @@ def sandbox(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedPro
         capture_output=True,
         text=True,
         check=check,
-        timeout=120,
+        timeout=300,      # cross-user first-boot: limactl start + usermod cloud-init
         **kwargs,
     )
-
-
-def _limactl_list_json_for_vm(vm_name: str) -> dict | None:
-    """Return the limactl list entry for ``vm_name``, or None if absent."""
-    result = subprocess.run(
-        ["limactl", "list", "--json"],
-        capture_output=True, text=True, timeout=30,
-    )
-    import json
-    for line in (result.stdout or "").strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("name") == vm_name:
-            return entry
-    return None
 
 
 def _config_user_path_for_vm(vm_name: str) -> Path | None:
     """Return the path to _config/user for vm_name inside the per-operator LIMA_HOME.
 
-    Under M18-S13 this lives at /var/lib/sandboxd/<op_uid>/lima/<vm_name>/_config/user.
+    This lives at /var/lib/sandboxd/<op_uid>/lima/<vm_name>/_config/user.
     We derive op_uid from os.getuid() (the test runner is the operator).
     """
     op_uid = os.getuid()
@@ -147,7 +127,7 @@ class TestHelperPivotKeyOwnership:
                 f"_config/user at {key_path} is owned by uid {stat_info.st_uid}, "
                 f"expected operator uid {operator_uid}. "
                 "This means sandbox-lima-helper did NOT pivot to the operator uid "
-                "before limactl create — the M18-S13 flip is broken."
+                "before limactl create — the sandbox-lima-helper pivot is broken."
             )
 
             # Also assert key mode is 0600 (OpenSSH StrictKeyfileMode requirement).
@@ -205,8 +185,8 @@ class TestHelperPivotSessionReachability:
 class TestHelperPivot9pSharedWorkspace:
     """9p shared: workspace cross-user read+write round-trip.
 
-    Under M18-S13, the base VM's in-VM sandbox user has its uid/gid aligned
-    with the operator's host uid/gid via a cloud-init usermod step.  9p
+    The base VM's in-VM sandbox user has its uid/gid aligned with the
+    operator's host uid/gid via a cloud-init usermod step.  9p
     mapped-xattr then translates host-side file ownership correctly so:
     - Files written by the operator on the host are readable/writable in the VM.
     - Files written by the in-VM sandbox user are owned by the operator uid
@@ -286,16 +266,22 @@ class TestHelperPivot9pSharedWorkspace:
 
             # Under mapped-xattr, when op_uid != 1000, the file's host-side
             # owner should be op_uid (9p re-maps uid 1000 → op_uid via the
-            # cloud-init usermod step). Skip the ownership assertion when
-            # op_uid == 1000 (no remapping needed).
-            if op_uid != 1000:
-                stat_info = guest_file.stat()
-                assert stat_info.st_uid == op_uid, (
-                    f"VM-written file on host is owned by uid {stat_info.st_uid}, "
-                    f"expected operator uid {op_uid}. "
-                    "This suggests the 9p mapped-xattr uid remapping via "
-                    "cloud-init usermod did not take effect."
+            # cloud-init usermod step). When op_uid == 1000 no remapping
+            # occurs (base image bakes uid 1000), so the assertion is a
+            # trivial no-op that proves nothing; skip visibly instead.
+            if op_uid == 1000:
+                pytest.skip(
+                    "ownership remapping assertion skipped: operator uid is 1000 "
+                    "(base image bakes uid 1000; no remapping occurs). "
+                    "Run as a uid != 1000 to exercise mapped-xattr translation."
                 )
+            stat_info = guest_file.stat()
+            assert stat_info.st_uid == op_uid, (
+                f"VM-written file on host is owned by uid {stat_info.st_uid}, "
+                f"expected operator uid {op_uid}. "
+                "This suggests the 9p mapped-xattr uid remapping via "
+                "cloud-init usermod did not take effect."
+            )
         finally:
             if session_id:
                 sandbox("rm", session_id, check=False)
