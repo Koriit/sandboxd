@@ -253,6 +253,11 @@ fn integration_lima_helper_caller_not_in_sandbox_group_denied() {
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("caller not in sandbox group"),
+        "stderr should mention 'caller not in sandbox group': {stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -347,14 +352,15 @@ fn integration_lima_helper_op_uid_not_in_group_rejected() {
     // very unlikely to be a member of the runner's primary group.
     let output = run_helper_as_sandbox(&helper, &[], &["list-json", "--op-uid", nobody_uid_str]);
 
-    // Should be EXIT_BAD_OP_UID (3) because uid 65534 is not in the runner's primary group.
+    // Must be EXIT_BAD_OP_UID (3): the group-membership check fires before
+    // limactl resolution, so code 6 would mean the group check was skipped.
     let code = output.status.code();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // It could also be limactl-not-found (6) if the group check passes (nobody happens
-    // to be in the group) and limactl isn't installed. We accept 3 or 6 here.
-    assert!(
-        code == Some(3) || code == Some(6),
-        "expected EXIT_BAD_OP_UID (3) or EXIT_LIMACTL_NOT_FOUND (6), got {code:?}\nstderr: {stderr}"
+    assert_eq!(
+        code,
+        Some(3),
+        "expected EXIT_BAD_OP_UID (3) — group check must fire before limactl resolution, \
+         got {code:?}\nstderr: {stderr}"
     );
 }
 

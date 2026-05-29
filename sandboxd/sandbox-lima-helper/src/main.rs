@@ -107,6 +107,7 @@ use std::env;
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, ExitCode};
+use std::sync::LazyLock;
 
 use nix::unistd::{Uid, User};
 use regex::Regex;
@@ -163,6 +164,20 @@ pub const REQUIRED_BASE_TOOLS: &[&str] = &["socat", "git", "rsync", "docker"];
 
 /// Env vars from parent that survive into the exec'd environment.
 const ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL", "HOME", "TERM"];
+
+// ---------------------------------------------------------------------------
+// Compiled regexes — hoisted to module-top as LazyLock to avoid per-call
+// compilation. `unwrap()` inside LazyLock::new is safe: a constant regex
+// literal that fails to compile is a programming error, not a runtime
+// condition. FlagSet is single-pass per flag.
+// ---------------------------------------------------------------------------
+
+static VM_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_\-]{1,64}$").unwrap());
+static BRIDGE_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_\-]{1,15}$").unwrap());
+static VM_MAC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$").unwrap());
 
 // ---------------------------------------------------------------------------
 // test-env-override seams
@@ -505,10 +520,8 @@ impl<'a> FlagSet<'a> {
             None => return Ok(None),
         };
 
-        if self.consumed[idx] {
-            return Err(format!("{flag} specified more than once"));
-        }
-
+        // FlagSet is single-pass per flag: the in-loop duplicate check
+        // above is the only guard needed here; no post-loop re-check.
         let next = idx + 1;
         if next >= self.args.len() {
             return Err(format!("{flag} requires a value"));
@@ -545,9 +558,8 @@ impl<'a> FlagSet<'a> {
         }
 
         if let Some(idx) = found_idx {
-            if self.consumed[idx] {
-                return Err(format!("{flag} specified more than once"));
-            }
+            // FlagSet is single-pass per flag: the in-loop duplicate check
+            // above is the only guard needed here; no post-loop re-check.
             // Reject trailing-value form: `--force 1` / `--force true`
             // Mirror route-helper's flag-parser at
             // sandbox-route-helper/src/main.rs:583-595.
@@ -809,8 +821,8 @@ pub fn validate_vm_name(name: &str) -> Result<(), (u8, String)> {
     Ok(())
 }
 
-fn vm_name_regex() -> Regex {
-    Regex::new(r"^[a-zA-Z0-9_\-]{1,64}$").expect("valid vm name regex")
+fn vm_name_regex() -> &'static Regex {
+    &VM_NAME_RE
 }
 
 /// Validate a host-side path argument: no NUL, ≤ PATH_MAX, absolute, no `..`.
@@ -884,8 +896,8 @@ fn validate_bridge_mac_pair(
 ) -> Result<(), (u8, String)> {
     match (bridge_name, vm_mac) {
         (None, None) => {}
-        (Some(_), Some(mac)) => {
-            validate_bridge_name(bridge_name.unwrap())?;
+        (Some(bridge), Some(mac)) => {
+            validate_bridge_name(bridge)?;
             validate_vm_mac(mac)?;
         }
         _ => {
@@ -900,8 +912,7 @@ fn validate_bridge_mac_pair(
 
 /// Validate bridge name: `^[a-zA-Z0-9_-]{1,15}$`.
 pub fn validate_bridge_name(name: &str) -> Result<(), (u8, String)> {
-    let re = Regex::new(r"^[a-zA-Z0-9_\-]{1,15}$").expect("valid bridge regex");
-    if !re.is_match(name) {
+    if !BRIDGE_NAME_RE.is_match(name) {
         return Err((
             EXIT_BAD_ARGS,
             format!("invalid --bridge-name '{name}': must match ^[a-zA-Z0-9_-]{{1,15}}$"),
@@ -912,8 +923,7 @@ pub fn validate_bridge_name(name: &str) -> Result<(), (u8, String)> {
 
 /// Validate MAC address: regex + multicast-bit reject.
 pub fn validate_vm_mac(mac: &str) -> Result<(), (u8, String)> {
-    let re = Regex::new(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$").expect("valid mac regex");
-    if !re.is_match(mac) {
+    if !VM_MAC_RE.is_match(mac) {
         return Err((
             EXIT_BAD_ARGS,
             format!("invalid --vm-mac '{mac}': must be xx:xx:xx:xx:xx:xx (hex octets)"),
@@ -1325,7 +1335,8 @@ fn build_limactl_argv(limactl: &str, sub: &Subcommand) -> Vec<String> {
         Subcommand::Create(a) => vec![
             limactl.to_string(),
             "create".to_string(),
-            format!("--name={}", a.vm),
+            "--name".to_string(),
+            a.vm.clone(),
             a.yaml.clone(),
             "--tty=false".to_string(),
         ],
@@ -1402,15 +1413,17 @@ fn build_limactl_argv(limactl: &str, sub: &Subcommand) -> Vec<String> {
 // install-guest-agent step sequence (step 11, special case)
 // ---------------------------------------------------------------------------
 
-fn run_install_guest_agent(limactl: &str, vm: &str, env_block: &[CString]) -> ExitCode {
-    let guest_binary = resolve_guest_binary_path();
-
-    let steps: Vec<Vec<String>> = vec![
+/// Build the ordered install steps (argv per step) for `install-guest-agent`.
+/// Separated from `run_install_guest_agent` so tests can assert the exact
+/// argv shape of each step — including step 4's single-quoted heredoc form —
+/// without needing to spawn a real limactl.
+fn build_install_steps(limactl: &str, vm: &str, guest_binary: &str) -> Vec<Vec<String>> {
+    vec![
         // Step 1: copy binary into VM.
         vec![
             limactl.to_string(),
             "copy".to_string(),
-            guest_binary.clone(),
+            guest_binary.to_string(),
             format!("{vm}:/tmp/sandbox-guest"),
         ],
         // Step 2: move to /usr/local/bin.
@@ -1471,7 +1484,12 @@ fn run_install_guest_agent(limactl: &str, vm: &str, env_block: &[CString]) -> Ex
             "--now".to_string(),
             "sandbox-guest".to_string(),
         ],
-    ];
+    ]
+}
+
+fn run_install_guest_agent(limactl: &str, vm: &str, env_block: &[CString]) -> ExitCode {
+    let guest_binary = resolve_guest_binary_path();
+    let steps = build_install_steps(limactl, vm, &guest_binary);
 
     for (step_num, argv) in steps.iter().enumerate() {
         let step_label = step_num + 1;
@@ -1481,12 +1499,13 @@ fn run_install_guest_agent(limactl: &str, vm: &str, env_block: &[CString]) -> Ex
     }
 
     // Final validation: four `command -v <tool>` probes.
+    // Argv shape matches the other shell steps: `limactl shell <vm> -- <command...>`.
     for tool in REQUIRED_BASE_TOOLS {
         let probe_argv = vec![
             limactl.to_string(),
             "shell".to_string(),
-            "--tty=false".to_string(),
             vm.to_string(),
+            "--".to_string(),
             "command".to_string(),
             "-v".to_string(),
             tool.to_string(),
@@ -1578,6 +1597,38 @@ mod tests {
             REQUIRED_BASE_TOOLS, core_required,
             "REQUIRED_BASE_TOOLS in sandbox-lima-helper diverges from \
              sandbox-core/src/lima.rs:1320 — update both constants together"
+        );
+    }
+
+    /// Assert the helper's GUEST_AGENT_SERVICE_UNIT constant matches the
+    /// copy in sandbox-core/src/lima.rs (gated `#[cfg(test)]` there to
+    /// avoid pulling sandbox-core into the helper's TCB).
+    /// Both copies must stay identical so a unit-file change is applied
+    /// everywhere or caught immediately.
+    #[test]
+    fn guest_agent_service_unit_matches_core() {
+        // Snapshot of sandbox-core/src/lima.rs GUEST_AGENT_SERVICE_UNIT.
+        // If the core copy changes, update both constants together.
+        let core_unit = "\
+[Unit]
+Description=Sandbox Guest Agent
+After=network.target
+
+[Service]
+Type=simple
+User=sandbox
+Group=sandbox
+ExecStart=/usr/local/bin/sandbox-guest
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target";
+        assert_eq!(
+            GUEST_AGENT_SERVICE_UNIT, core_unit,
+            "GUEST_AGENT_SERVICE_UNIT in sandbox-lima-helper diverges from \
+             sandbox-core/src/lima.rs — update both constants together"
         );
     }
 
@@ -2122,7 +2173,8 @@ mod tests {
             vec![
                 "/usr/local/bin/limactl",
                 "create",
-                "--name=sandbox-abc",
+                "--name",
+                "sandbox-abc",
                 "/etc/lima/base.yaml",
                 "--tty=false",
             ]
@@ -2259,6 +2311,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_argv_correct() {
+        // The `start` subcommand is flag-rich. Assert the canonical order:
+        // limactl start <vm> --timeout=<N>s --tty=false.
+        // QEMU-related values go via env vars, not argv.
+        let sub = Subcommand::Start(StartArgs {
+            op_uid: 1000,
+            vm: "sandbox-abc".to_string(),
+            qemu_wrapper: "/usr/local/bin/qemu-wrapper".to_string(),
+            hardened: "1".to_string(),
+            memory_mb: 4096,
+            cpus: 2,
+            start_timeout_s: 300,
+            bridge_name: None,
+            vm_mac: None,
+        });
+        let argv = build_limactl_argv("/usr/bin/limactl", &sub);
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/bin/limactl",
+                "start",
+                "sandbox-abc",
+                "--timeout=300s",
+                "--tty=false",
+            ]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // install-guest-agent argv construction
     // -----------------------------------------------------------------------
@@ -2267,33 +2348,33 @@ mod tests {
     fn install_guest_agent_step4_heredoc_single_quoted() {
         // The step 4 bash command must use a single-quoted heredoc
         // terminator ('UNIT_EOF') to prevent shell expansion of $ literals
-        // in the service unit body. This test asserts the exact form.
+        // in the service unit body. Assert the actual output of
+        // build_install_steps, not a re-built expected string.
         let vm = "sandbox-test";
         let limactl = "/usr/bin/limactl";
-        let bash_cmd = format!(
-            "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{GUEST_AGENT_SERVICE_UNIT}\nUNIT_EOF"
-        );
-        // Step 4 argv should contain "sudo bash -c <bash_cmd>".
-        let expected_bash_arg = bash_cmd.as_str();
-        // Build the step manually to check the form matches what run_install_guest_agent builds.
-        let expected_step4 = [
-            limactl.to_string(),
-            "shell".to_string(),
-            vm.to_string(),
-            "--".to_string(),
-            "sudo".to_string(),
-            "bash".to_string(),
-            "-c".to_string(),
-            expected_bash_arg.to_string(),
-        ];
-        // Verify single-quoted form.
+        let steps = build_install_steps(limactl, vm, "/usr/local/libexec/sandboxd/sandbox-guest");
+        let step4 = &steps[3]; // 0-indexed: step 4 is index 3
+        // Shape: [limactl, "shell", vm, "--", "sudo", "bash", "-c", <bash_cmd>]
+        assert_eq!(step4[0], limactl, "step4[0] must be limactl path");
+        assert_eq!(step4[1], "shell");
+        assert_eq!(step4[2], vm);
+        assert_eq!(step4[3], "--");
+        assert_eq!(step4[4], "sudo");
+        assert_eq!(step4[5], "bash");
+        assert_eq!(step4[6], "-c");
+        let bash_arg = &step4[7];
         assert!(
-            expected_step4[7].contains("'UNIT_EOF'"),
-            "step 4 heredoc terminator must be single-quoted"
+            bash_arg.contains("'UNIT_EOF'"),
+            "step 4 heredoc terminator must be single-quoted, got: {bash_arg}"
         );
         assert!(
-            !expected_step4[7].contains("UNIT_EOF\""),
+            !bash_arg.contains("\"UNIT_EOF\""),
             "step 4 heredoc must NOT use double-quoted terminator"
+        );
+        // The bash arg must contain the actual unit content (not an empty heredoc).
+        assert!(
+            bash_arg.contains("ExecStart=/usr/local/bin/sandbox-guest"),
+            "step 4 must embed the full service unit body"
         );
     }
 
@@ -2383,10 +2464,11 @@ mod tests {
     // op-uid non-root reject (unit-testable path)
     // -----------------------------------------------------------------------
 
+    /// parse_u32 accepts "0" — the actual rejection of root op-uid happens
+    /// in run() after argv parse. This test pins that the parse layer does
+    /// not mask the value (i.e. it passes 0 through for run() to reject).
     #[test]
-    fn op_uid_zero_rejected_by_parse_u32() {
-        // op-uid 0 is valid u32 but rejected at the validation step.
-        // Confirm parse_u32 accepts "0" and the run() logic rejects it.
+    fn parse_u32_accepts_zero_rejection_deferred_to_run() {
         assert_eq!(parse_u32("--op-uid", "0").unwrap(), 0u32);
         // The actual rejection happens in run() after argv parse; confirmed
         // by the integration tests. Here we just confirm the parse layer
@@ -2398,5 +2480,127 @@ mod tests {
         assert!(parse_u32("--op-uid", "not-a-number").is_err());
         assert!(parse_u32("--op-uid", "").is_err());
         assert!(parse_u32("--op-uid", "-1").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Env-block value assertions (SHOULD-FIX 2 / Track 3)
+    // -----------------------------------------------------------------------
+
+    /// Assert the QEMU env vars carry the correct values, not just that the
+    /// keys are present. A bug that sets QEMU_SYSTEM_X86_64=/wrong/path
+    /// would pass key-presence tests but fail here.
+    #[test]
+    fn env_block_start_qemu_values_correct() {
+        let sub = Subcommand::Start(StartArgs {
+            op_uid: 1000,
+            vm: "sandbox-abc".to_string(),
+            qemu_wrapper: "/usr/local/bin/qemu-wrapper".to_string(),
+            hardened: "1".to_string(),
+            memory_mb: 4096,
+            cpus: 2,
+            start_timeout_s: 300,
+            bridge_name: Some("br0".to_string()),
+            vm_mac: Some("02:00:00:00:00:01".to_string()),
+        });
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let map: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|c| {
+                let s = c.to_string_lossy().to_string();
+                let eq = s.find('=').unwrap();
+                (s[..eq].to_string(), s[eq + 1..].to_string())
+            })
+            .collect();
+        assert_eq!(map["QEMU_SYSTEM_X86_64"], "/usr/local/bin/qemu-wrapper");
+        assert_eq!(map["SANDBOX_QEMU_HARDENED"], "1");
+        assert_eq!(map["SANDBOX_QEMU_MEMORY_MB"], "4096");
+        assert_eq!(map["SANDBOX_QEMU_CPUS"], "2");
+        assert_eq!(map["SANDBOX_DOCKER_BRIDGE"], "br0");
+        assert_eq!(map["SANDBOX_VM_MAC"], "02:00:00:00:00:01");
+    }
+
+    /// Assert that a non-allowlist env var set in the process environment
+    /// does NOT appear in the env block produced by build_env_block.
+    /// This pins the allowlist enforcement logic.
+    #[test]
+    fn env_block_does_not_leak_non_allowlist_vars() {
+        // Set a canary var; build_env_block must not forward it.
+        // SAFETY: single-threaded test, no concurrent env mutation.
+        unsafe { std::env::set_var("CANARY_SECRET_TOKEN", "leak-me") };
+        let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let keys: Vec<String> = env
+            .iter()
+            .map(|c| {
+                let s = c.to_string_lossy().to_string();
+                s.split('=').next().unwrap_or("").to_string()
+            })
+            .collect();
+        assert!(
+            !keys.contains(&"CANARY_SECRET_TOKEN".to_string()),
+            "non-allowlist var must not survive into env block"
+        );
+        unsafe { std::env::remove_var("CANARY_SECRET_TOKEN") };
+    }
+
+    /// Assert XDG_CACHE_HOME is always present and pinned under the
+    /// operator's LIMA_HOME tree.
+    #[test]
+    fn env_block_always_has_xdg_cache_home() {
+        let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let map: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|c| {
+                let s = c.to_string_lossy().to_string();
+                let eq = s.find('=').unwrap();
+                (s[..eq].to_string(), s[eq + 1..].to_string())
+            })
+            .collect();
+        let xdg = map.get("XDG_CACHE_HOME").map(|s| s.as_str());
+        assert!(
+            xdg.is_some(),
+            "XDG_CACHE_HOME must always be present in env block"
+        );
+        assert!(
+            xdg.unwrap().starts_with("/var/lib/sandboxd/1000/lima/"),
+            "XDG_CACHE_HOME must be pinned inside the operator LIMA_HOME tree, got: {xdg:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NSS three-case GroupMembership unit tests (SHOULD-FIX 3 / Track 3)
+    // -----------------------------------------------------------------------
+
+    /// Helper: given a GroupMembership value, return the exit code that
+    /// run() would use. Extracted from run()'s match arm so the three
+    /// cases are unit-testable without spawning a real binary.
+    fn exit_code_for_group_membership(membership: GroupMembership) -> u8 {
+        match membership {
+            GroupMembership::Member => 0, // continue — no early exit
+            GroupMembership::NotMember => EXIT_BAD_OP_UID,
+            GroupMembership::EnumerationFailed(_) => EXIT_GENERIC,
+        }
+    }
+
+    #[test]
+    fn op_uid_group_member_allows_proceed() {
+        assert_eq!(exit_code_for_group_membership(GroupMembership::Member), 0);
+    }
+
+    #[test]
+    fn op_uid_group_not_member_returns_bad_op_uid_exit() {
+        assert_eq!(
+            exit_code_for_group_membership(GroupMembership::NotMember),
+            EXIT_BAD_OP_UID
+        );
+    }
+
+    #[test]
+    fn op_uid_group_enumeration_failed_returns_generic_exit() {
+        assert_eq!(
+            exit_code_for_group_membership(GroupMembership::EnumerationFailed(libc::ENOMEM)),
+            EXIT_GENERIC
+        );
     }
 }

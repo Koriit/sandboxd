@@ -4802,4 +4802,88 @@ mod tests {
         assert_ne!(alices_view.id, bobs_staging.id);
         assert_ne!(bobs_view.id, alices_staging.id);
     }
+
+    /// V009 migration: rows with `operator_uid IS NULL` are deleted; rows
+    /// with a non-NULL operator_uid survive. This test inserts both kinds
+    /// of row at the V008 schema level using a raw connection (skipping the
+    /// V009 migration), then opens the store (which runs V009) and asserts
+    /// the expected row state.
+    #[test]
+    fn v009_migration_drops_null_operator_uid_rows_and_retains_others() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = dir.path().join("sessions.db");
+
+        // --- Phase 1: seed the DB at V008 using a raw connection ---
+        {
+            let mut conn = rusqlite::Connection::open(&db_path).expect("open raw db");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("wal");
+            conn.pragma_update(None, "foreign_keys", "ON")
+                .expect("fk on");
+
+            // Apply migrations up to and including V008 only; skip V009.
+            super::embedded::migrations::runner()
+                .set_target(refinery::Target::Version(8))
+                .run(&mut conn)
+                .expect("migrations up to V008 must succeed");
+
+            // Insert a row with operator_uid IS NULL (legacy operatorless).
+            // Provide all NOT-NULL-without-default columns: id, config,
+            // created_at, updated_at. backend/owner_username/guest_* have
+            // defaults; ssh_keypair_json and operator_* are nullable.
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, state, config, created_at, updated_at, \
+                  owner_username, ssh_keypair_json, operator_uid, operator_gid) \
+                 VALUES (?1, 'Creating', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
+                  'legacy', NULL, NULL, NULL)",
+                rusqlite::params!["aaaaaaaaaaaa"],
+            )
+            .expect("insert null-operator row");
+
+            // Insert a row with operator_uid = 1000 (modern, should survive).
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, state, config, created_at, updated_at, \
+                  owner_username, ssh_keypair_json, operator_uid, operator_gid) \
+                 VALUES (?1, 'Creating', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
+                  'alice', NULL, 1000, 1000)",
+                rusqlite::params!["bbbbbbbbbbbb"],
+            )
+            .expect("insert non-null-operator row");
+        }
+
+        // --- Phase 2: open the store — this applies V009 ---
+        let (_store, _orphans) =
+            SessionStore::new(dir.path().to_path_buf()).expect("SessionStore::new must succeed");
+
+        // --- Phase 3: verify via raw SQL ---
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw db for verify");
+
+            let null_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = 'aaaaaaaaaaaa'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count null row");
+            assert_eq!(
+                null_count, 0,
+                "V009 must delete the row with operator_uid IS NULL"
+            );
+
+            let non_null_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = 'bbbbbbbbbbbb'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count non-null row");
+            assert_eq!(
+                non_null_count, 1,
+                "V009 must NOT delete the row with operator_uid = 1000"
+            );
+        }
+    }
 }

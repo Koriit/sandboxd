@@ -49,6 +49,13 @@ use tracing::info;
 use crate::backend::BackendKind;
 use crate::error::SandboxError;
 
+/// Caller-side rsync `-e` transport token for Lima sessions.
+/// Passed to rsync as the remote-shell argument; rsync (running as the
+/// operator uid on the CLI side) exec's `limactl shell <vm> <cmd>`.
+/// The daemon never spawns this command directly — this is a string
+/// token in an argv array built for rsync, not a daemon `Command::new`.
+const LIMACTL_SHELL_TOKEN: &str = "limactl shell";
+
 /// Direction of a workspace rsync mirror. Push: host → guest; Pull:
 /// guest → host. Carried into [`build_workspace_rsync_argv`] so the
 /// builder emits the correct src/dst ordering. A flat enum rather
@@ -133,7 +140,7 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
     // shell exec, matching the convention `plan_sync_command` uses
     // for operator-driven `sandbox sync` in the CLI.
     let transport = match opts.backend {
-        BackendKind::Lima => "limactl shell",
+        BackendKind::Lima => LIMACTL_SHELL_TOKEN,
         // `-i` forwards stdin into the container so rsync can speak
         // its binary protocol both ways. No `-t` — a TTY would line-
         // buffer and corrupt the wire format. Mirrors
@@ -377,7 +384,7 @@ mod tests {
                 "--delete",
                 "--filter=:- .gitignore",
                 "-e",
-                "limactl shell",
+                LIMACTL_SHELL_TOKEN,
                 "--mkpath",
                 "/home/op/work/",
                 "sandbox-abc123:/home/agent/workspace/",
@@ -438,7 +445,7 @@ mod tests {
                 "-aL",
                 "--delete",
                 "-e",
-                "limactl shell",
+                LIMACTL_SHELL_TOKEN,
                 "--mkpath",
                 "/data/x/",
                 "sandbox-ghi789:/home/agent/workspace/",
@@ -560,7 +567,7 @@ mod tests {
                 "--delete",
                 "--filter=:- .gitignore",
                 "-e",
-                "limactl shell",
+                LIMACTL_SHELL_TOKEN,
                 "sandbox-pull1:/home/agent/workspace/",
                 "/home/op/work/",
             ]

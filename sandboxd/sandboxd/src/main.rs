@@ -947,14 +947,10 @@ struct AppState {
     /// reconciliation loops check this set so they don't accidentally
     /// restart a gateway that was intentionally stopped.
     sessions_stopping: Mutex<HashSet<SessionId>>,
-    /// Serializes base image check-and-build operations.
-    ///
-    /// Without this lock, concurrent `create_session` requests can each
-    /// see `BaseImageStatus::Missing` and independently trigger
-    /// `build_base_image()`.  The second build starts a new base VM in
-    /// Running state, which causes all `limactl clone` calls to fail
-    /// with "cannot clone a running instance."
-    base_image_lock: Mutex<()>,
+    // base_image_lock was removed: per-operator base-image build
+    // serialization is now handled by `LimaManager::build_lock` inside
+    // `build_base_image_inner`. Same-operator concurrent builds serialise
+    // on the per-operator mutex; distinct operators build in parallel.
     /// Per-session unified event bus.
     ///
     /// Sessions are registered when their networking is set up and
@@ -2847,12 +2843,10 @@ async fn create_session(
     } else if use_cache {
         // ---- Fast path: clone from golden base image ----
 
-        // Serialize check + build behind a lock so that concurrent
-        // create_session requests don't each see Missing and all
-        // independently trigger build_base_image().
+        // Same-operator concurrent check+build is serialised by the
+        // per-operator `build_lock` inside `LimaManager::build_base_image_inner`.
+        // Distinct operators build in parallel.
         {
-            let _base_guard = state.base_image_lock.lock().await;
-
             let base_status = {
                 let lima_check = match state.lima_runtime.manager_for(operator.uid) {
                     Ok(m) => m,
@@ -2928,7 +2922,7 @@ async fn create_session(
                     // Good to go.
                 }
             }
-        } // drop _base_guard — other requests can now check/build
+        }
 
         // Clone from the base image.
         {
@@ -6962,7 +6956,8 @@ async fn rebuild_image(
             // rebuilds it from scratch — that is the cache-bust. The
             // `no_cache` flag is therefore a no-op on the Lima path;
             // no new flag plumbing is required.
-            let _base_guard = state.base_image_lock.lock().await;
+            // Per-operator build serialization is handled by the
+            // `build_lock` inside `LimaManager::build_base_image_inner`.
             let lima = match state.lima_runtime.manager_for(operator.uid) {
                 Ok(m) => m,
                 Err(e) => return error_response(e).into_response(),
@@ -6975,13 +6970,8 @@ async fn rebuild_image(
             }
         }
         BackendKind::Container => {
-            // Per the documented contract: the container rebuild lock
-            // is owned inside `rebuild_lite_image` (the same
-            // image-namespace lock that `ensure_image` uses), so we
-            // deliberately do NOT acquire `state.base_image_lock`
-            // here — that lock is Lima-scoped and would needlessly
-            // serialise concurrent `rebuild --backend lima` and
-            // `rebuild --backend container` calls.
+            // The container rebuild lock is owned inside `rebuild_lite_image`
+            // (the same image-namespace lock that `ensure_image` uses).
             let daemon_version = env!("CARGO_PKG_VERSION").to_string();
             let no_cache = req.no_cache;
             match tokio::task::spawn_blocking(move || rebuild_lite_image(&daemon_version, no_cache))
@@ -8603,7 +8593,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dns_caches: Arc::new(Mutex::new(HashMap::new())),
         session_policies: Arc::new(Mutex::new(hydrated_policies)),
         sessions_stopping: Mutex::new(HashSet::new()),
-        base_image_lock: Mutex::new(()),
         event_bus,
         vm_ip_map,
         component_health_state: Mutex::new(HashMap::new()),

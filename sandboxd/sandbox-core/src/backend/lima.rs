@@ -33,6 +33,17 @@ use crate::lima::{self, LimaManager, LimaManagerRegistry, VmStatus};
 use crate::session::{SessionConfig, SessionId};
 
 // ---------------------------------------------------------------------------
+// Timeout constants for refresh_lima_guest_binary_via_helper
+// ---------------------------------------------------------------------------
+
+/// Wall-clock budget for `limactl start` during a guest-binary refresh.
+const REFRESH_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
+/// Wall-clock budget for `install-guest-agent` (6 steps + 4 probes).
+const REFRESH_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
+/// Wall-clock budget for `limactl stop` after a guest-binary refresh.
+const REFRESH_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+// ---------------------------------------------------------------------------
 // VmStatus -> RuntimeStatus
 // ---------------------------------------------------------------------------
 
@@ -365,13 +376,6 @@ fn refresh_lima_guest_binary_via_helper(
     manager: &LimaManager,
     vm_name: &str,
 ) -> Result<(), SandboxError> {
-    /// Wall-clock budget for `start` (boot may take several seconds).
-    const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
-    /// Wall-clock budget for `install-guest-agent` (6 steps + 4 probes).
-    const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
-    /// Wall-clock budget for `stop`.
-    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
     // `start` requires qemu-wrapper, hardened, memory-mb, cpus,
     // start-timeout-s. For the refresh path we use conservative defaults:
     // hardened=1, 4096 MiB, 4 CPUs, 300s Lima-internal SSH wait. The
@@ -397,7 +401,7 @@ fn refresh_lima_guest_binary_via_helper(
             "--start-timeout-s",
             "300",
         ],
-        START_TIMEOUT,
+        REFRESH_START_TIMEOUT,
         "sandbox-lima-helper start (guest refresh)",
     )?;
     if !output.status.success() {
@@ -411,7 +415,7 @@ fn refresh_lima_guest_binary_via_helper(
     let output = manager.run_helper(
         "install-guest-agent",
         &["--vm", vm_name],
-        INSTALL_TIMEOUT,
+        REFRESH_INSTALL_TIMEOUT,
         "sandbox-lima-helper install-guest-agent (guest refresh)",
     )?;
     if !output.status.success() {
@@ -425,7 +429,7 @@ fn refresh_lima_guest_binary_via_helper(
     let output = manager.run_helper(
         "stop",
         &["--vm", vm_name],
-        STOP_TIMEOUT,
+        REFRESH_STOP_TIMEOUT,
         "sandbox-lima-helper stop (guest refresh)",
     )?;
     if !output.status.success() {
@@ -462,6 +466,13 @@ pub struct LimaTransport {
     /// if `get_or_create` failed. Deferred to `connect()` so that
     /// `guest_transport` (a non-fallible trait method) can return without
     /// erroring — the error surfaces when the transport is actually used.
+    ///
+    /// **Sticky-error note:** the cached `Err` is fixed for the lifetime of
+    /// this transport. A second `connect()` call after a provisioning error
+    /// will return the same error. This is intentional: `LimaTransport` is
+    /// per-session, so a new session (fresh `guest_transport` call) creates
+    /// a fresh transport with a fresh registry lookup. Session-management
+    /// code must not reuse a `LimaTransport` across reconcile cycles.
     manager: Result<Arc<LimaManager>, SandboxError>,
     /// VM name (`sandbox-{session_id}`), captured at transport
     /// construction so [`SessionRuntime::guest_transport`] can return

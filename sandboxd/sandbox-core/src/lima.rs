@@ -231,8 +231,10 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
 ///
 /// One `LimaManager` per operator uid, held for the daemon's lifetime
 /// (no eviction this milestone).  The registry serialises concurrent
-/// same-operator base-image builds via the per-instance `build_base_image`
-/// mutex inside `LimaManager`, while distinct operators are fully isolated.
+/// same-operator base-image builds via the `build_lock` mutex inside each
+/// [`LimaManager`] — acquired in `build_base_image_inner` for the full
+/// duration of the build.  Distinct operators hold separate `LimaManager`
+/// instances with separate locks, so they build in parallel.
 ///
 /// # Lifetime
 ///
@@ -244,10 +246,11 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
 /// # Concurrency
 ///
 /// The outer `Mutex` guards the `HashMap` of operator → manager entries;
-/// it is held only for the duration of a `HashMap` lookup or insert.
+/// it is held only for the duration of a `HashMap` lookup or insert
+/// (never across `ensure_operator_lima_home` / `setfacl` I/O).
 /// Long-running operations (base-image builds) run on the per-operator
 /// `LimaManager` after the outer lock is released, so distinct operators
-/// never contend.
+/// never contend on the registry mutex.
 pub struct LimaManagerRegistry {
     /// Per-operator manager map.  Keyed by operator uid.
     ///
@@ -262,16 +265,20 @@ pub struct LimaManagerRegistry {
     helper_path: PathBuf,
     /// Golden-image base VM name shared across all per-operator managers.
     base_vm_name: String,
-    /// In tests only: override the base directory for
-    /// `ensure_operator_lima_home` so registry tests can provision into a
-    /// temporary directory instead of the production `/var/lib/sandboxd/`
-    /// path, keeping unit tests hermetic.
-    #[cfg(test)]
-    state_root_override: Option<PathBuf>,
+    /// Provisioning function: creates the per-operator LIMA_HOME directory
+    /// and applies the POSIX ACL.  Production wiring uses
+    /// `ensure_operator_lima_home`; tests inject a closure that provisions
+    /// into a caller-owned tmpdir instead of `/var/lib/sandboxd/`.
+    ///
+    /// This construction-time seam eliminates any `#[cfg(test)]` divergence
+    /// from the production code path: the function is a plain field, so the
+    /// struct layout is identical in all builds.
+    provision_lima_home: Box<dyn Fn(u32) -> Result<PathBuf, SandboxError> + Send + Sync>,
 }
 
 impl LimaManagerRegistry {
-    /// Construct a registry.
+    /// Construct a registry backed by the production
+    /// `ensure_operator_lima_home` provisioning function.
     ///
     /// `helper_path` is the absolute path to `sandbox-lima-helper`, resolved
     /// at daemon startup by `resolve_lima_helper_path()`.
@@ -282,23 +289,28 @@ impl LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
             helper_path,
             base_vm_name,
-            #[cfg(test)]
-            state_root_override: None,
+            provision_lima_home: Box::new(ensure_operator_lima_home),
         }
     }
 
-    /// Construct a registry that provisions LIMA_HOME directories under
-    /// `state_root` instead of the production `/var/lib/sandboxd/` path.
+    /// Construct a registry with an injected provisioning function.
     ///
-    /// Only available in tests.  Keeps registry unit tests hermetic by
-    /// redirecting `ensure_operator_lima_home` to a caller-owned tmpdir.
-    #[cfg(test)]
-    pub fn new_for_test(base_vm_name: String, helper_path: PathBuf, state_root: PathBuf) -> Self {
+    /// The `provision` closure is called with the operator uid on the first
+    /// `get_or_create` for that operator; it must return the absolute path
+    /// to the operator's LIMA_HOME or an error.
+    ///
+    /// Production code uses [`Self::new`].  Tests inject a closure that
+    /// provisions into a caller-owned tmpdir so registry unit tests remain
+    /// hermetic and do not touch `/var/lib/sandboxd/`.
+    pub fn new_with_provisioner<F>(base_vm_name: String, helper_path: PathBuf, provision: F) -> Self
+    where
+        F: Fn(u32) -> Result<PathBuf, SandboxError> + Send + Sync + 'static,
+    {
         Self {
             managers: Mutex::new(HashMap::new()),
             helper_path,
             base_vm_name,
-            state_root_override: Some(state_root),
+            provision_lima_home: Box::new(provision),
         }
     }
 
@@ -316,39 +328,46 @@ impl LimaManagerRegistry {
     ///
     /// The returned `Arc` is reference-counted; callers can hold it across
     /// slow operations without blocking other operators.
+    ///
+    /// # Concurrency
+    ///
+    /// Uses a double-checked insert pattern so `self.managers` is NOT held
+    /// across the `ensure_operator_lima_home` / `setfacl` shell-out (up to
+    /// 10 s under `run_with_timeout`).  The outer lock is held only for the
+    /// fast `HashMap` lookup and the final `entry().or_insert_with` insert.
     pub fn get_or_create(&self, op_uid: u32) -> Result<Arc<LimaManager>, SandboxError> {
-        let mut map = self
-            .managers
-            .lock()
-            .expect("LimaManagerRegistry mutex poisoned");
-        if let Some(mgr) = map.get(&op_uid) {
-            return Ok(Arc::clone(mgr));
-        }
+        // Fast path: check under a short-lived lock.
+        {
+            let map = self.managers.lock().map_err(|e| {
+                SandboxError::Internal(format!("LimaManagerRegistry mutex poisoned: {e}"))
+            })?;
+            if let Some(mgr) = map.get(&op_uid) {
+                return Ok(Arc::clone(mgr));
+            }
+        } // lock released before the slow provisioning step
+
         // Provision the LIMA_HOME directory and apply the operator's ACL
-        // before constructing the manager. This must happen before any
-        // limactl invocation so that the operator-uid-pivoted limactl can
-        // write into the directory. `ensure_operator_lima_home` is
-        // idempotent: it applies the ACL even if the dir was already
-        // created by an earlier `create_dir_all` call that skipped the ACL.
-        //
-        // In test builds, `state_root_override` redirects provisioning into
-        // a caller-owned tmpdir so registry unit tests stay hermetic.
-        #[cfg(test)]
-        let lima_home = if let Some(ref base) = self.state_root_override {
-            tests::ensure_operator_lima_home_at(base, op_uid)?
-        } else {
-            ensure_operator_lima_home(op_uid)?
-        };
-        #[cfg(not(test))]
-        let lima_home = ensure_operator_lima_home(op_uid)?;
-        let mgr = Arc::new(LimaManager {
-            base_dir: lima_home,
-            helper_path: self.helper_path.clone(),
+        // outside the lock. This is idempotent: `setfacl` is safe to run
+        // more than once for the same operator.  A concurrent winner for
+        // the same op_uid runs the same idempotent provisioning and the
+        // `entry().or_insert_with` below retains whichever manager was
+        // inserted first.
+        let lima_home = (self.provision_lima_home)(op_uid)?;
+
+        let mgr = Arc::new(LimaManager::new(
+            lima_home,
+            self.helper_path.clone(),
             op_uid,
-            base_vm_name: self.base_vm_name.clone(),
-        });
-        map.insert(op_uid, Arc::clone(&mgr));
-        Ok(mgr)
+            self.base_vm_name.clone(),
+        ));
+
+        // Re-lock and insert, using entry().or_insert_with so that a
+        // concurrent winner's manager is kept and ours is discarded.
+        let mut map = self.managers.lock().map_err(|e| {
+            SandboxError::Internal(format!("LimaManagerRegistry mutex poisoned: {e}"))
+        })?;
+        let inserted = map.entry(op_uid).or_insert_with(|| Arc::clone(&mgr));
+        Ok(Arc::clone(inserted))
     }
 
     /// Return the number of operator entries currently in the registry.
@@ -357,8 +376,17 @@ impl LimaManagerRegistry {
     pub fn len(&self) -> usize {
         self.managers
             .lock()
-            .expect("LimaManagerRegistry mutex poisoned")
+            .map_err(|e| panic!("LimaManagerRegistry mutex poisoned in test: {e}"))
+            .unwrap()
             .len()
+    }
+
+    /// Return `true` if the registry has no entries.
+    /// Paired with [`len`](Self::len) to satisfy the `len_without_is_empty` lint.
+    /// Exposed for tests.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -515,6 +543,15 @@ pub struct LimaManager {
     /// and test daemons don't collide on a single user-global Lima
     /// instance.
     base_vm_name: String,
+    /// Serialises concurrent `build_base_image` calls for this operator.
+    /// A single `Arc<LimaManager>` is shared across all callers for the
+    /// same operator (vended by `LimaManagerRegistry`), so two concurrent
+    /// `create_session` requests for the same operator will both call
+    /// `build_base_image` if the golden image is absent — without this
+    /// lock the second `limactl create` would clash with the first.
+    /// Different operators hold separate `LimaManager` instances and
+    /// therefore separate locks, so they build independently in parallel.
+    build_lock: std::sync::Mutex<()>,
 }
 
 impl LimaManager {
@@ -536,6 +573,7 @@ impl LimaManager {
             helper_path,
             op_uid,
             base_vm_name,
+            build_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -553,6 +591,7 @@ impl LimaManager {
             helper_path,
             op_uid,
             base_vm_name,
+            build_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -1132,7 +1171,16 @@ impl LimaManager {
 
     /// Inner build steps (start, install agent, stop, write metadata).
     /// Separated from `build_base_image` so the caller can clean up on error.
+    ///
+    /// Acquires `self.build_lock` for its duration so that concurrent
+    /// same-operator `build_base_image` calls serialise here. Different
+    /// operators hold separate `LimaManager` instances and separate locks,
+    /// so they proceed in parallel.
     fn build_base_image_inner(&self) -> Result<(), SandboxError> {
+        let _build_guard = self
+            .build_lock
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("LimaManager build_lock poisoned: {e}")))?;
         // 3. Start the VM with QEMU wrapper for hardening.
         info!("starting base VM (this may take several minutes for cloud-init)");
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
@@ -2903,6 +2951,7 @@ mod tests {
     /// `generate_template` interpolates the operator pair into a
     /// system-mode cloud-init step that re-aligns the in-VM `sandbox`
     /// user's uid/gid. The step must:
+    ///
     ///   - be `mode: system` (root-equivalent inside the VM)
     ///   - call `groupmod -g <gid>` BEFORE `usermod -u <uid>` so the
     ///     primary group still resolves after the renumbering
@@ -2910,6 +2959,7 @@ mod tests {
     ///   - leave the home dir path itself as `/home/agent` (Wave A
     ///     username-only rename — names not uids are baked in to
     ///     operator-facing paths)
+    ///
     /// All four are structural invariants of the cross-user
     /// supervisor-fork pattern and regressing any of them silently
     /// would break 9p mapped-xattr workspaces. Pin all four here.
@@ -2927,8 +2977,7 @@ mod tests {
         // Step header.
         assert!(
             template.contains("step=operator-uid start="),
-            "template must emit step=operator-uid start banner; got: {}",
-            template
+            "template must emit step=operator-uid start banner; got: {template}"
         );
         // mode: system precedes the step (sibling of the step=user
         // block). We don't pin the exact YAML formatting, just that
@@ -2955,14 +3004,12 @@ mod tests {
         assert!(
             template.contains("chown -R 5001:5001 /home/agent"),
             "template must chown /home/agent recursively to the \
-             operator pair; got: {}",
-            template
+             operator pair; got: {template}"
         );
         assert!(
             !template.contains("chown -R 5001:5001 /home/sandbox"),
             "template must NOT chown /home/sandbox — Lima home dir \
-             is /home/agent; got: {}",
-            template
+             is /home/agent; got: {template}"
         );
     }
     #[test]
@@ -4012,10 +4059,11 @@ mod tests {
         // The registry must return the same Arc for repeated calls with the
         // same operator uid — not a fresh LimaManager on every call.
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let registry = LimaManagerRegistry::new_for_test(
+        let root = tmp.path().to_path_buf();
+        let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            tmp.path().to_path_buf(),
+            move |uid| ensure_operator_lima_home_at(&root, uid),
         );
         let mgr1 = registry.get_or_create(1000).expect("get_or_create");
         let mgr2 = registry.get_or_create(1000).expect("get_or_create");
@@ -4029,10 +4077,11 @@ mod tests {
     #[test]
     fn registry_get_or_create_returns_different_arcs_for_different_uids() {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let registry = LimaManagerRegistry::new_for_test(
+        let root = tmp.path().to_path_buf();
+        let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            tmp.path().to_path_buf(),
+            move |uid| ensure_operator_lima_home_at(&root, uid),
         );
         let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
         let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
@@ -4048,10 +4097,11 @@ mod tests {
         // Each operator's LimaManager must be rooted at a distinct
         // LIMA_HOME path under <state_root>/<op_uid>/lima.
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let registry = LimaManagerRegistry::new_for_test(
+        let root = tmp.path().to_path_buf();
+        let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            tmp.path().to_path_buf(),
+            move |uid| ensure_operator_lima_home_at(&root, uid),
         );
         let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
         let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
@@ -4090,10 +4140,11 @@ mod tests {
         use std::sync::Barrier;
 
         let tmp = tempfile::TempDir::new().expect("tmpdir");
-        let registry = Arc::new(LimaManagerRegistry::new_for_test(
+        let root = tmp.path().to_path_buf();
+        let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            tmp.path().to_path_buf(),
+            move |uid| ensure_operator_lima_home_at(&root, uid),
         ));
 
         let barrier = Arc::new(Barrier::new(2));
@@ -4139,10 +4190,11 @@ mod tests {
         use std::sync::Barrier;
 
         let tmp = tempfile::TempDir::new().expect("tmpdir");
-        let registry = Arc::new(LimaManagerRegistry::new_for_test(
+        let root = tmp.path().to_path_buf();
+        let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            tmp.path().to_path_buf(),
+            move |uid| ensure_operator_lima_home_at(&root, uid),
         ));
 
         let barrier = Arc::new(Barrier::new(2));
