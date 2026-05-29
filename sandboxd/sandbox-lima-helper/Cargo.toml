@@ -1,0 +1,55 @@
+[package]
+name = "sandbox-lima-helper"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandbox-lima-helper"
+path = "src/main.rs"
+
+[features]
+# `test-env-override` — opts the helper into honouring environment-variable
+# seams used by integration tests:
+#
+#   SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER  — override the `sandbox` username
+#     constant so tests can drive the getuid() == sandbox-uid check against
+#     a synthetic account the test runner owns.
+#
+#   SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP — override the `sandbox` group
+#     name constant so tests can drive the sandbox-group membership check
+#     against a synthetic group.
+#
+#   SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH — override the compile-time
+#     SANDBOX_GUEST_HOST_PATH constant used by `install-guest-agent` so
+#     tests can supply a stub binary without touching the production install
+#     path.
+#
+# Default (production) builds ignore all three env vars. The cap'd binary
+# must not be redirectable to attacker-controlled identities via process
+# environment variables.
+#
+# The integration-test make target enables this feature explicitly so the
+# tests can drive all three seams. See `Makefile`'s
+# `install-lima-helper-test-cap` target.
+test-env-override = []
+
+[dependencies]
+# Feature set:
+#   - "user"  — `User::from_uid` / `User::from_name` for operator-uid
+#               resolution via `getpwuid_r(3)` / `getpwnam_r(3)`.
+nix = { version = "0.29", features = ["user"] }
+# Direct syscall wrappers: setresuid(2), getgroups(2), getgrouplist(3),
+# getgid(2), access(2), stat(2). nix 0.29 exposes setresuid under its
+# `user` feature but we use libc directly for a minimal TCB.
+libc = "0.2"
+# Manipulate the helper's own capability sets so the exec'd limactl
+# inherits zero capabilities even though the helper carries cap_setuid+ep.
+caps = "0.5"
+# Regex validation for vm names, bridge names, and MAC addresses.
+regex = "1"
+
+[dev-dependencies]
+ring.workspace = true
+tempfile.workspace = true

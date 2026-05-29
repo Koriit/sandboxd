@@ -1807,6 +1807,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-lima-helper"
+version = "0.1.0"
+dependencies = [
+ "caps",
+ "libc",
+ "nix",
+ "regex",
+ "ring",
+ "tempfile",
+]
+
+[[package]]
 name = "sandbox-nft-allow-logger"
 version = "0.1.0"
 dependencies = [

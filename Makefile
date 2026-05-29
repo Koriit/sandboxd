@@ -1,5 +1,5 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
-	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-spawn-helper-prod-cap install-spawn-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
+	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-spawn-helper-prod-cap install-spawn-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
@@ -47,10 +47,10 @@ test:
 # `install-route-helper-test-cap`). Flag must match the install step
 # or the test's checksum check rejects the on-disk cap'd binary as
 # stale.
-test-integration: gateway-image lite-image install-route-helper-test-cap install-spawn-helper-test-cap
+test-integration: gateway-image lite-image install-route-helper-test-cap install-spawn-helper-test-cap install-lima-helper-test-cap
 	cd sandboxd && \
-	    cargo build --workspace --features sandbox-route-helper/test-env-override,sandbox-spawn-helper/test-env-override && \
-	    cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override,sandbox-spawn-helper/test-env-override
+	    cargo build --workspace --features sandbox-route-helper/test-env-override,sandbox-spawn-helper/test-env-override,sandbox-lima-helper/test-env-override && \
+	    cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override,sandbox-spawn-helper/test-env-override,sandbox-lima-helper/test-env-override
 
 # The stamp filename embeds the host's Python minor version (e.g.
 # `.installed.python3.12`) so a host interpreter upgrade — say
@@ -259,6 +259,8 @@ ROUTE_HELPER_PROD_PATH      := /usr/local/libexec/sandboxd/sandbox-route-helper
 ROUTE_HELPER_TEST_PATH      := /usr/local/libexec/sandboxd-test/sandbox-route-helper
 SPAWN_HELPER_PROD_PATH      := /usr/local/libexec/sandboxd/sandbox-spawn-helper
 SPAWN_HELPER_TEST_PATH      := /usr/local/libexec/sandboxd-test/sandbox-spawn-helper
+LIMA_HELPER_PROD_PATH       := /usr/local/libexec/sandboxd/sandbox-lima-helper
+LIMA_HELPER_TEST_PATH       := /usr/local/libexec/sandboxd-test/sandbox-lima-helper
 USERS_CONF_PATH             := /etc/sandboxd/users.conf
 BRIDGE_CONF_PATH            := /etc/qemu/bridge.conf
 QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
@@ -271,7 +273,7 @@ QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 # keeping it as a Makefile-local constant is enough).
 TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
 
-setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-spawn-helper-prod-cap install-spawn-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-spawn-helper-prod-cap install-spawn-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment
 	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
 
 # setup-sandbox-user — create the `sandbox` system user and group
@@ -594,6 +596,81 @@ sandboxd/target/.dev-env-stamps/spawn-helper-test.stamp: sandboxd/target/debug/s
 sandboxd/target/debug/sandbox-spawn-helper:
 	cd sandboxd && cargo build --workspace --tests \
 	  --features sandbox-spawn-helper/test-env-override
+
+# install-lima-helper-prod-cap — production cap'd install at the
+# canonical FHS-libexec path. Default-feature build (no
+# `test-env-override`), so the cap'd binary at this path REFUSES to
+# honor the test env vars (privilege boundary: any user who can exec
+# the cap'd helper would otherwise be able to redirect the user/group
+# checks to accounts they already control, bypassing the sandbox-user
+# gate).
+#
+# The cap is `cap_setuid+ep` — narrower than the route helper's
+# `cap_net_admin,cap_sys_admin=eip`. Only `setresuid` needs elevation;
+# the helper clears all caps from permitted+effective+inheritable+ambient
+# before exec'ing limactl so limactl inherits zero capabilities.
+install-lima-helper-prod-cap: sandboxd/target/.dev-env-stamps/lima-helper-prod.stamp
+	@true
+
+sandboxd/target/.dev-env-stamps/lima-helper-prod.stamp: sandboxd/target/release/sandbox-lima-helper
+	@mkdir -p $(dir $@)
+	@if [ -f "$(LIMA_HELPER_PROD_PATH)" ] && \
+	    cmp -s "sandboxd/target/release/sandbox-lima-helper" "$(LIMA_HELPER_PROD_PATH)" && \
+	    getcap "$(LIMA_HELPER_PROD_PATH)" 2>/dev/null | grep -q 'cap_setuid'; then \
+	  echo "$(GREEN)✓ already configured: $(LIMA_HELPER_PROD_PATH) (cap_setuid+ep, content matches build)$(RESET)"; \
+	else \
+	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-lima-helper $(LIMA_HELPER_PROD_PATH)"; \
+	  echo "[sudo] setcap cap_setuid+ep $(LIMA_HELPER_PROD_PATH)"; \
+	  sudo -k install -D -m 0755 \
+	    sandboxd/target/release/sandbox-lima-helper \
+	    "$(LIMA_HELPER_PROD_PATH)"; \
+	  sudo -k setcap 'cap_setuid+ep' "$(LIMA_HELPER_PROD_PATH)"; \
+	fi
+	@touch $@
+
+# See `install-route-helper-prod-cap` for the `.PHONY` rationale —
+# the same mtime-preservation problem applies to a `git checkout`
+# of `sandbox-lima-helper`'s sources.
+.PHONY: sandboxd/target/release/sandbox-lima-helper
+sandboxd/target/release/sandbox-lima-helper:
+	cd sandboxd && cargo build --release -p sandbox-lima-helper
+
+# install-lima-helper-test-cap — test cap'd install. Built with
+# `--features test-env-override` so the integration tests can pass
+# `SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER`, `SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP`,
+# and `SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH` to drive the helper
+# against synthetic accounts.
+#
+# Mirrors `install-spawn-helper-test-cap` byte-for-byte modulo the
+# binary name and capability set:
+#   - debug profile (matches nextest's `CARGO_BIN_EXE_*`)
+#   - `--workspace --tests --features ...` so dev-dependency feature
+#     edges are unified
+#   - install to `/usr/local/libexec/sandboxd-test/` so the prod
+#     install is never clobbered
+install-lima-helper-test-cap: sandboxd/target/.dev-env-stamps/lima-helper-test.stamp
+	@true
+
+sandboxd/target/.dev-env-stamps/lima-helper-test.stamp: sandboxd/target/debug/sandbox-lima-helper
+	@mkdir -p $(dir $@)
+	@if [ -f "$(LIMA_HELPER_TEST_PATH)" ] && \
+	    cmp -s "sandboxd/target/debug/sandbox-lima-helper" "$(LIMA_HELPER_TEST_PATH)" && \
+	    getcap "$(LIMA_HELPER_TEST_PATH)" 2>/dev/null | grep -q 'cap_setuid'; then \
+	  echo "$(GREEN)✓ already configured: $(LIMA_HELPER_TEST_PATH) (cap_setuid+ep, content matches test build)$(RESET)"; \
+	else \
+	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-lima-helper $(LIMA_HELPER_TEST_PATH)"; \
+	  echo "[sudo] setcap cap_setuid+ep $(LIMA_HELPER_TEST_PATH)"; \
+	  sudo -k install -D -m 0755 \
+	    sandboxd/target/debug/sandbox-lima-helper \
+	    "$(LIMA_HELPER_TEST_PATH)"; \
+	  sudo -k setcap 'cap_setuid+ep' "$(LIMA_HELPER_TEST_PATH)"; \
+	fi
+	@touch $@
+
+.PHONY: sandboxd/target/debug/sandbox-lima-helper
+sandboxd/target/debug/sandbox-lima-helper:
+	cd sandboxd && cargo build --workspace --tests \
+	  --features sandbox-lima-helper/test-env-override
 
 # setup-bridge-conf — `/etc/qemu/bridge.conf`. The QEMU bridge helper
 # (qemu-bridge-helper) reads this file to decide which bridges

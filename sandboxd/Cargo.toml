@@ -7,6 +7,7 @@ members = [
     "sandbox-nft-allow-logger",
     "sandbox-nft-deny-logger",
     "sandbox-guest",
+    "sandbox-lima-helper",
     "sandbox-route-helper",
     "sandbox-spawn-helper",
 ]
