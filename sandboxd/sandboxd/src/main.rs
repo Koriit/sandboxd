@@ -3021,18 +3021,6 @@ async fn create_session(
             }
         }
 
-        // 2c. Install the guest agent into the VM. Resolve the host-
-        // side source via the shared `guest_agent_path` resolver so
-        // production installs read from `/usr/local/libexec/sandboxd/`
-        // and dev builds fall back to the cargo target — the same
-        // contract the container-backend startup-staging path uses.
-        let guest_binary_path = match sandbox_core::guest_agent_path() {
-            Ok(p) => p,
-            Err(e) => {
-                cleanup_and_return!(state, session_id, error_response(e).into_response());
-            }
-        };
-
         {
             // `install_guest_agent` is Lima-specific (it shells out to
             // `limactl shell` to inject the binary) and stays behind
@@ -3040,11 +3028,9 @@ async fn create_session(
             // trait surface grows to cover agent bootstrapping in a
             // backend-agnostic way.
             let lima = Arc::clone(state.lima_runtime.manager());
-            let sid = session_id;
-            let guest_bin = guest_binary_path.clone();
-            match tokio::task::spawn_blocking(move || lima.install_guest_agent(&sid, &guest_bin))
-                .await
-            {
+            let op_uid = operator.uid;
+            let vm = sandbox_core::vm_name(&session_id);
+            match tokio::task::spawn_blocking(move || lima.install_guest_agent(op_uid, &vm)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     error!(%session_id, error = %e, "failed to install guest agent");

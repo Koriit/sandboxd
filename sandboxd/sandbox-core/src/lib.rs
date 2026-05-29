@@ -93,7 +93,7 @@ pub use lds_ack::{
 };
 pub use lima::{
     BaseImageMeta, BaseImageStatus, DEFAULT_BASE_VM_NAME, GUEST_BINARY_PATH_OVERRIDE_ENV,
-    LimaManager, PRODUCTION_GUEST_BINARY_PATH, VmInfo, VmStatus, guest_agent_path,
+    LimaManager, PRODUCTION_GUEST_BINARY_PATH, VmInfo, VmStatus, guest_agent_path, vm_name,
 };
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{

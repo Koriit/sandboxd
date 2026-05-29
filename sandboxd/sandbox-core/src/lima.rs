@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -768,14 +768,18 @@ impl LimaManager {
     /// Copy the sandbox-guest binary into a running VM and start it as a
     /// systemd service.
     ///
+    /// `op_uid` identifies the operator that owns this session. The parameter
+    /// is present now so call sites carry the right shape before the helper
+    /// pivot lands in a later session; privilege behavior in this session is
+    /// unchanged — the install sequence still runs the same six `limactl`
+    /// steps under the daemon uid. The binary path is resolved via
+    /// `guest_agent_path()`, which honours the production install location and
+    /// dev-build fallbacks.
+    ///
     /// This should be called after the VM has booted (i.e. after `start_vm`
     /// or `create_vm` + start).
-    pub fn install_guest_agent(
-        &self,
-        session_id: &SessionId,
-        binary_path: &Path,
-    ) -> Result<(), SandboxError> {
-        let vm_name = vm_name(session_id);
+    pub fn install_guest_agent(&self, _op_uid: u32, vm_name: &str) -> Result<(), SandboxError> {
+        let binary_path = guest_agent_path()?;
 
         if !binary_path.exists() {
             return Err(SandboxError::Internal(format!(
@@ -814,7 +818,7 @@ impl LimaManager {
         let output = run_with_timeout(
             Command::new(&self.limactl).args([
                 "shell",
-                &vm_name,
+                vm_name,
                 "--",
                 "sudo",
                 "mv",
@@ -841,7 +845,7 @@ impl LimaManager {
         let output = run_with_timeout(
             Command::new(&self.limactl).args([
                 "shell",
-                &vm_name,
+                vm_name,
                 "--",
                 "sudo",
                 "chmod",
@@ -871,7 +875,7 @@ impl LimaManager {
         let output = run_with_timeout(
             Command::new(&self.limactl)
                 .args([
-                    "shell", &vm_name, "--",
+                    "shell", vm_name, "--",
                     "sudo", "bash", "-c",
                     &format!(
                         "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{service_unit}\nUNIT_EOF"
@@ -899,7 +903,7 @@ impl LimaManager {
         let output = run_with_timeout(
             Command::new(&self.limactl).args([
                 "shell",
-                &vm_name,
+                vm_name,
                 "--",
                 "sudo",
                 "systemctl",
@@ -925,7 +929,7 @@ impl LimaManager {
         let output = run_with_timeout(
             Command::new(&self.limactl).args([
                 "shell",
-                &vm_name,
+                vm_name,
                 "--",
                 "sudo",
                 "systemctl",
@@ -1223,8 +1227,10 @@ impl LimaManager {
 
         // 4. Install the guest agent.
         info!("installing guest agent into base VM");
-        let agent_path = guest_agent_path()?;
-        self.install_guest_agent_by_vm_name(&self.base_vm_name, &agent_path)?;
+        // op_uid is unused until the helper pivot lands in a later session;
+        // 0 is the placeholder for the base-image build path, which has no
+        // operator context at this stage.
+        self.install_guest_agent(0, &self.base_vm_name)?;
         info!("guest agent installed in base VM");
 
         // 5. Stop the VM. Try graceful first so a hung in-guest unit
@@ -2005,191 +2011,6 @@ provision:
 
     fn session_dir(&self, session_id: &SessionId) -> PathBuf {
         self.base_dir.join("sessions").join(session_id.as_str())
-    }
-
-    /// Install the guest agent into a VM identified by name.
-    ///
-    /// This is the internal implementation shared by `install_guest_agent()`
-    /// (which takes a session UUID) and `build_base_image()` (which uses
-    /// the configured `base_vm_name`).
-    fn install_guest_agent_by_vm_name(
-        &self,
-        vm_name: &str,
-        binary_path: &Path,
-    ) -> Result<(), SandboxError> {
-        if !binary_path.exists() {
-            return Err(SandboxError::Internal(format!(
-                "guest agent binary not found at {}",
-                binary_path.display()
-            )));
-        }
-
-        // 1. Copy the binary into the VM.
-        debug!(vm = %vm_name, binary = %binary_path.display(), "copying guest agent binary");
-        let copy_src = binary_path.to_string_lossy().to_string();
-        let copy_dst = format!("{vm_name}:/tmp/sandbox-guest");
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args(["copy", &copy_src, &copy_dst]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl copy (guest agent)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl copy (guest agent)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to copy guest agent to {vm_name}: {stderr}"
-            )));
-        }
-
-        // 2. Move the binary to /usr/local/bin with sudo and make it executable.
-        debug!(vm = %vm_name, "installing guest agent binary");
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "mv",
-                "/tmp/sandbox-guest",
-                "/usr/local/bin/sandbox-guest",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell mv",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell mv", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to move guest agent in {vm_name}: {stderr}"
-            )));
-        }
-
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "chmod",
-                "+x",
-                "/usr/local/bin/sandbox-guest",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell chmod",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell chmod", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to chmod guest agent in {vm_name}: {stderr}"
-            )));
-        }
-
-        // 3. Create a systemd service file.
-        debug!(vm = %vm_name, "creating systemd service");
-        let service_unit = GUEST_AGENT_SERVICE_UNIT;
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", vm_name, "--",
-                    "sudo", "bash", "-c",
-                    &format!(
-                        "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{service_unit}\nUNIT_EOF"
-                    ),
-                ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell (create service)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (create service)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to create systemd service in {vm_name}: {stderr}"
-            )));
-        }
-
-        // 4. Reload systemd and start the service.
-        debug!(vm = %vm_name, "starting guest agent service");
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "systemctl",
-                "daemon-reload",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell (daemon-reload)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (daemon-reload)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to reload systemd in {vm_name}: {stderr}"
-            )));
-        }
-
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "systemctl",
-                "enable",
-                "--now",
-                "sandbox-guest",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell (enable service)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (enable service)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to start guest agent service in {vm_name}: {stderr}"
-            )));
-        }
-
-        info!(vm = %vm_name, "guest agent installed and started");
-        Ok(())
     }
 
     /// Run `limactl list --json` and deserialize the raw entries.
@@ -3422,6 +3243,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-env-override")]
     #[test]
     fn test_install_guest_agent_missing_binary() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
@@ -3430,12 +3252,23 @@ mod tests {
             PathBuf::from("limactl"),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
-        let session_id = SessionId::generate();
 
-        let result = mgr.install_guest_agent(
-            &session_id,
-            std::path::Path::new("/nonexistent/path/sandbox-guest"),
-        );
+        // Pin the guest-agent path override to a nonexistent location so
+        // install_guest_agent (which resolves the binary via guest_agent_path()
+        // rather than accepting it as a parameter) hits the "not found" branch.
+        let nonexistent = dir.path().join("no-such-sandbox-guest");
+        let prev = std::env::var(GUEST_BINARY_PATH_OVERRIDE_ENV).ok();
+        // SAFETY: env mutation in tests is only safe when no other threads
+        // read the same var; test isolation is the caller's responsibility.
+        unsafe { std::env::set_var(GUEST_BINARY_PATH_OVERRIDE_ENV, &nonexistent) };
+        let result = mgr.install_guest_agent(0, "sandbox-test-vm");
+        // SAFETY: see rationale above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(GUEST_BINARY_PATH_OVERRIDE_ENV, v),
+                None => std::env::remove_var(GUEST_BINARY_PATH_OVERRIDE_ENV),
+            }
+        }
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
