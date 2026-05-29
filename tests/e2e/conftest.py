@@ -1046,23 +1046,15 @@ def _write_systemd_drop_in(
         # Thread test-harness env-vars through to the daemon.
         Environment="SANDBOX_USERS_CONF={users_conf_path}"
         Environment="SANDBOX_BASE_VM_NAME={sandbox_base_vm_name}"
-        # Point the daemon's spawn-helper resolver at the test-cap'd
+        # Point the daemon's lima-helper resolver at the test-cap'd
         # binary under ``/usr/local/libexec/sandboxd-test/`` so the
-        # Lima cross-user code path (``limactl start`` routed through
-        # ``sandbox-spawn-helper`` to drop into the operator's uid)
-        # is exercised by the e2e matrix. Without this override the
-        # daemon's two-step resolver (env var, then canonical FHS
-        # path) falls back to ``None`` because the prod-canonical
-        # ``/usr/local/libexec/sandboxd/sandbox-spawn-helper`` is
-        # operator-installed only (``make install-spawn-helper-prod-cap``)
-        # and should not be installed on developer hosts — the test
-        # variant carries the same ``cap_setuid+ep`` xattr and is the
-        # right binary for harness use. Fail-closed under the
-        # resolver (a missing or un-cap'd path here returns ``None``
-        # with a warn log; the Lima runtime then falls back to the
-        # legacy spawn-as-daemon path and the matrix's cross-user
-        # assertions fail loudly, which is the desired signal).
-        Environment="SANDBOX_SPAWN_HELPER_PATH=/usr/local/libexec/sandboxd-test/sandbox-spawn-helper"
+        # Lima cross-user code path (every limactl call routed through
+        # ``sandbox-lima-helper`` to pivot to the operator's uid) is
+        # exercised by the e2e matrix. sandbox-spawn-helper was removed
+        # in M18-S13; all Lima control-plane operations now go through
+        # the lima-helper. Fail-closed under the resolver (a missing
+        # or un-cap'd path here is a hard error that prevents startup).
+        Environment="SANDBOX_LIMA_HELPER_PATH=/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
         # Disable Restart= so a daemon that crashes mid-test stays down
         # and the test fails with a clear "daemon exited" diagnostic
         # rather than mysteriously coming back up.
@@ -1359,14 +1351,15 @@ def _launch_daemon_as_sandbox_via_sudo(
     # without ``--preserve-env`` (which itself would also have to be
     # whitelisted by sudoers and is more brittle).
     #
-    # ``SANDBOX_SPAWN_HELPER_PATH`` is set here for symmetry with the
-    # systemd Environment block above, but the current sudoers
-    # ``env_keep`` does NOT list it — sudo will strip the variable on
-    # the way through and the daemon's spawn-helper resolver falls
-    # back to the canonical ``/usr/local/libexec/sandboxd/`` path,
-    # which is not installed on developer hosts. Extending the
-    # sudoers fragment to whitelist the variable is the follow-up
-    # required to exercise the Lima cross-user code path under
+    # ``SANDBOX_LIMA_HELPER_PATH`` is set here for symmetry with the
+    # systemd Environment block above (sandbox-spawn-helper was removed
+    # in M18-S13; all Lima operations now go through sandbox-lima-helper).
+    # The current sudoers ``env_keep`` does NOT list it — sudo will strip
+    # the variable on the way through and the daemon's lima-helper resolver
+    # falls back to the canonical ``/usr/local/libexec/sandboxd/`` path,
+    # which is not installed on developer hosts. Extending the sudoers
+    # fragment to whitelist the variable is the follow-up required to
+    # exercise the Lima cross-user code path under
     # ``SANDBOX_HARNESS=sandbox-sudo``; the default ``sandbox-systemd``
     # harness used by ``make test-e2e-matrix`` is unaffected.
     proc = subprocess.Popen(
@@ -1380,8 +1373,8 @@ def _launch_daemon_as_sandbox_via_sudo(
             **daemon_env,
             "SANDBOX_USERS_CONF": os.environ["SANDBOX_USERS_CONF"],
             "SANDBOX_BASE_VM_NAME": os.environ["SANDBOX_BASE_VM_NAME"],
-            "SANDBOX_SPAWN_HELPER_PATH":
-                "/usr/local/libexec/sandboxd-test/sandbox-spawn-helper",
+            "SANDBOX_LIMA_HELPER_PATH":
+                "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
         },
         stdout=stdout_fh,
         stderr=stderr_fh,

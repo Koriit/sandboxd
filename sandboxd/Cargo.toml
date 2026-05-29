@@ -9,7 +9,6 @@ members = [
     "sandbox-guest",
     "sandbox-lima-helper",
     "sandbox-route-helper",
-    "sandbox-spawn-helper",
 ]
 resolver = "2"
 

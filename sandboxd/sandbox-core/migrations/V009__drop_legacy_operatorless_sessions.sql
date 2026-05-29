@@ -1,0 +1,37 @@
+-- V009 cutover migration for the per-operator LIMA_HOME + sandbox-lima-helper
+-- pivot (M18-S10..S13 spec). This is the hard break that completes the V008
+-- operator_uid contract.
+--
+-- Background on V008:
+--   V008 added `operator_uid INTEGER NULL` and `operator_gid INTEGER NULL`
+--   to the `sessions` table (columns are nullable for back-compat). Its
+--   header comment referenced the abandoned supervisor-fork-as-operator design
+--   and `sandbox-spawn-helper`, both superseded by this spec. V008 is left
+--   byte-for-byte untouched because refinery checksums every applied migration
+--   and an in-place edit would trip a divergent-checksum error on any DB
+--   already at V008.
+--
+-- What this migration does:
+--   Deletes every session row where operator_uid IS NULL. These rows were
+--   created by pre-V008 daemon versions; their VMs live in the old host-global
+--   LIMA_HOME (/var/lib/sandbox/.lima/) which the new daemon does not use,
+--   their _config/user is daemon-owned (OpenSSH StrictKeyfileMode rejects it),
+--   and operator uid cannot be recovered from on-disk state. The sessions are
+--   unusable under the new model regardless of whether they are kept or dropped.
+--
+-- Operator impact:
+--   Any session previously created under a pre-V008 daemon must be recreated
+--   via `sandbox create` after upgrade. The old VMs at /var/lib/sandbox/.lima/
+--   become abandoned filesystem state; operators may delete them manually.
+--   A `make uninstall-legacy-lima` convenience target is available for cleanup.
+--
+-- Refinery safety:
+--   V009 applies cleanly on a DB already at V008 — refinery sees a new,
+--   higher-numbered migration and applies it without touching V008's checksum.
+--   Forward-compat: post-V009 every surviving session row has
+--   operator_uid IS NOT NULL, so the daemon-side assertion
+--   "session.operator_uid must be Some" is unconditionally satisfied.
+
+-- Hard break: legacy sessions cannot run under the new cross-user model
+-- (no recoverable operator uid, VMs in the wrong LIMA_HOME). Drop them.
+DELETE FROM sessions WHERE operator_uid IS NULL;

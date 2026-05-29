@@ -1,12 +1,10 @@
 //! Lima/QEMU backend implementation of [`super::SessionRuntime`] and
 //! [`super::GuestTransport`].
 //!
-//! Wraps the existing [`crate::lima::LimaManager`] behind the
-//! `SessionRuntime` trait so HTTP handlers dispatch through
-//! `Arc<dyn SessionRuntime>`. Lima-specific orchestration that does
-//! not generalize to the container backend (clone, base-image
-//! lifecycle, guest-agent install, list/reconcile) remains accessible
-//! via [`LimaRuntime::manager`].
+//! Holds a [`LimaManagerRegistry`] that vends per-operator
+//! [`LimaManager`] instances on demand. Every limactl operation is
+//! dispatched through `sandbox-lima-helper` pivoted to the operator's
+//! uid; the daemon never invokes `limactl` directly.
 //!
 //! - [`LimaRuntime::create`] dispatches to `LimaManager::create_vm`
 //!   (or `create_vm_with_custom_template` when the design carries a
@@ -14,29 +12,24 @@
 //! - [`LimaRuntime::start`] consumes [`RuntimeStartArgs`] for
 //!   docker bridge / MAC / `SessionConfig` populated by the daemon
 //!   from `NetworkInfo`.
-//! - [`LimaRuntime::ip`] shells out to `limactl shell ... ip -4 addr
-//!   show eth1` and parses the dotted-quad. Future polish: source
-//!   the IP from the daemon's per-session `NetworkInfo.vm_ip` map
-//!   (one less round-trip; works pre-boot).
+//! - [`LimaRuntime::stop`] / `delete` / `status` carry `operator_uid`
+//!   so the right per-operator manager is selected from the registry.
 
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tracing::debug;
 
 use crate::backend::capabilities::{BackendKind, Capabilities};
 use crate::backend::spec::{BackendSpecific, SessionSpec};
 use crate::backend::{
-    AsyncReadWrite, ExitCode, GuestTransport, RuntimeHandle, RuntimeStartArgs, RuntimeStatus,
-    SessionRuntime,
+    AsyncReadWrite, GuestTransport, RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime,
 };
 use crate::error::SandboxError;
-use crate::guest::GUEST_AGENT_PORT;
-use crate::lima::{self, LimaManager, VmStatus};
+use crate::lima::{self, LimaManager, LimaManagerRegistry, VmStatus};
 use crate::session::{SessionConfig, SessionId};
 
 // ---------------------------------------------------------------------------
@@ -70,65 +63,41 @@ impl From<VmStatus> for RuntimeStatus {
 ///
 /// One instance is shared across every Lima-backed session — the trait
 /// is stateless over [`RuntimeHandle`] (see the trait doc on
-/// [`SessionRuntime`]). Wraps [`crate::lima::LimaManager`] as a private
-/// inner field; folding the manager content into this module and
-/// narrowing the [`Self::manager`] accessor is deferred until the
-/// trait surface widens enough to cover daemon-startup orchestration
-/// without an escape hatch.
+/// [`SessionRuntime`]). Holds a [`LimaManagerRegistry`] that vends
+/// per-operator [`LimaManager`] instances on demand; every limactl
+/// operation is dispatched through `sandbox-lima-helper` pivoted to the
+/// operator's uid. The daemon never invokes `limactl` directly.
 pub struct LimaRuntime {
-    manager: Arc<LimaManager>,
+    registry: Arc<LimaManagerRegistry>,
     capabilities: Capabilities,
-    /// Absolute path to the `sandbox-spawn-helper` binary, when the
-    /// daemon's startup resolver located a usable (`cap_setuid+ep`)
-    /// install. Threaded through to [`LimaManager::start_vm`] so
-    /// `limactl start` runs under the operator's uid via the helper's
-    /// `setresuid` + `execvp` chain.
-    ///
-    /// `None` means the operator-aligned spawn path is unavailable —
-    /// either the daemon was launched without the helper installed (a
-    /// dev environment that hasn't run `make install-spawn-helper-*`)
-    /// or the per-session start args lack `operator_identity`. In
-    /// either case the runtime falls back to the legacy
-    /// "spawn-as-daemon" `limactl start`.
-    spawn_helper_path: Option<PathBuf>,
 }
 
 impl LimaRuntime {
-    /// Construct a [`LimaRuntime`] wrapping an existing
-    /// [`LimaManager`]. Returns an `Arc` so the daemon can drop it
-    /// into `AppState.runtimes: HashMap<BackendKind, Arc<dyn
-    /// SessionRuntime>>` (Phase 1C) without an extra allocation at
-    /// dispatch time.
+    /// Construct a [`LimaRuntime`] backed by the given registry.
+    /// Returns an `Arc` so the daemon can drop it into
+    /// `AppState.runtimes` without an extra allocation at dispatch time.
     ///
-    /// `spawn_helper_path` carries the absolute path of the
-    /// `sandbox-spawn-helper` binary resolved at daemon startup; pass
-    /// `None` when no helper is installed (the runtime then falls back
-    /// to spawning `limactl` directly under the daemon's own uid).
-    /// Resolving the path at daemon startup (not per-session) keeps the
-    /// `getcap` xattr probe off the request-time hot path; the resolver
-    /// lives in `sandboxd::main` alongside the route-helper resolver.
-    pub fn new(manager: Arc<LimaManager>, spawn_helper_path: Option<PathBuf>) -> Arc<Self> {
+    /// `registry` holds per-operator [`LimaManager`] instances; every
+    /// session-context limactl call obtains the operator's manager from
+    /// the registry and dispatches through `sandbox-lima-helper`.
+    pub fn new(registry: Arc<LimaManagerRegistry>) -> Arc<Self> {
         Arc::new(Self {
-            manager,
+            registry,
             capabilities: Capabilities::for_lima(),
-            spawn_helper_path,
         })
     }
 
-    /// Access the resolved spawn-helper path, if any. Exposed for the
-    /// daemon's diagnostic / `doctor` surface and for tests that need
-    /// to assert the wiring decision.
-    pub fn spawn_helper_path(&self) -> Option<&std::path::Path> {
-        self.spawn_helper_path.as_deref()
+    /// Access the per-operator manager for Lima-specific operations
+    /// not on the trait surface — base-image build, template
+    /// generation, base-image hash check, etc.
+    pub fn manager_for(&self, op_uid: u32) -> Arc<LimaManager> {
+        self.registry.get_or_create(op_uid)
     }
 
-    /// Access the inner [`LimaManager`] for Lima-specific operations
-    /// not on the trait surface — base-image build, template
-    /// generation, base-image hash check, etc. Future polish: deferred
-    /// until the trait grows enough to cover the daemon-startup flow
-    /// without escape hatches.
-    pub fn manager(&self) -> &Arc<LimaManager> {
-        &self.manager
+    /// Access the registry directly. Used by `reconcile` and startup
+    /// orphan scan to iterate per-operator managers.
+    pub fn registry(&self) -> &Arc<LimaManagerRegistry> {
+        &self.registry
     }
 
     /// Convert a [`SessionSpec`] into the resource-shaped
@@ -205,36 +174,30 @@ impl SessionRuntime for LimaRuntime {
 
     /// Create the inert VM entity for `spec`.
     ///
-    /// Mirrors today's daemon "slow path" (`use_cache == false`): writes
-    /// the per-session Lima template and shells out to `limactl create`.
-    /// The VM is **not** booted, **not** cloned from the golden image,
-    /// and the guest agent is **not** installed — those orchestration
-    /// steps remain in `AppState` (clone path lives behind
-    /// [`Self::manager`] until the trait generalises them).
+    /// Writes the per-session Lima template and invokes
+    /// `sandbox-lima-helper create` to run `limactl create` as the
+    /// operator uid. The VM is **not** booted and the guest agent is
+    /// **not** installed — those steps happen in `AppState`.
     ///
-    /// When [`SessionSpec::template`] is `Some`, the runtime delegates to
-    /// [`LimaManager::create_vm_with_custom_template`]; otherwise it
-    /// generates the template inline via
-    /// [`LimaManager::create_vm`]. This branch was previously open-coded
-    /// in the daemon handler (see Phase 1C handoff).
+    /// When [`SessionSpec::template`] is `Some`, delegates to
+    /// [`LimaManager::create_vm_with_custom_template`]; otherwise
+    /// generates the template via [`LimaManager::create_vm`].
     async fn create(
         &self,
         session_id: &SessionId,
         spec: &SessionSpec,
     ) -> Result<RuntimeHandle, SandboxError> {
         let config = Self::spec_to_config(spec)?;
-        let manager = Arc::clone(&self.manager);
+        let op_uid = spec.operator_identity.map(|(u, _)| u).ok_or_else(|| {
+            SandboxError::Internal(
+                "LimaRuntime::create called without operator_identity; \
+                 post-V009 sessions must carry operator_uid"
+                    .into(),
+            )
+        })?;
+        let manager = self.registry.get_or_create(op_uid);
         let session_id_owned = *session_id;
         let template = spec.template.clone();
-        // Per `SessionSpec::operator_identity` contract: daemon-stamped,
-        // not client-supplied. The Lima manager interpolates the pair
-        // into the per-session cloud-init `usermod` provision step so
-        // the in-VM `sandbox` user ends up at the operator's uid/gid.
-        // `None` here means the legacy "no usermod, in-VM sandbox stays
-        // at uid 1000" path — preserved for pre-V008 records and tests
-        // that don't exercise the supervisor-fork pattern. Templates
-        // that operators supply directly
-        // (`create_vm_with_custom_template`) are never rewritten by us.
         let operator_identity = spec.operator_identity;
         tokio::task::spawn_blocking(move || {
             if let Some(template_path) = &template {
@@ -254,21 +217,23 @@ impl SessionRuntime for LimaRuntime {
 
     /// Boot the VM with the bridge / MAC / config carried by `args`.
     ///
-    /// Phase 1C plumbs the persisted [`SessionConfig`] and per-session
-    /// docker-bridge / MAC through [`RuntimeStartArgs`]; the daemon
-    /// (`AppState`) is the source of truth for these values and passes
-    /// them in unchanged from what it allocates / persists per session.
-    /// `args.lima_config == None` falls back to
-    /// [`SessionConfig::default()`] for test paths that omit a config —
-    /// the runtime emits a `warn!` so the silent-default behavior is
-    /// audible rather than hidden, matching the Phase 1B trade-off.
+    /// Dispatches through `sandbox-lima-helper start` with all QEMU
+    /// resource flags as typed arguments. The per-operator `LimaManager`
+    /// is looked up from the registry using `args.operator_identity`.
     async fn start(
         &self,
         handle: &RuntimeHandle,
         args: &RuntimeStartArgs,
     ) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
-        let manager = Arc::clone(&self.manager);
+        let op_uid = args.operator_identity.map(|(u, _)| u).ok_or_else(|| {
+            SandboxError::Internal(
+                "LimaRuntime::start called without operator_identity; \
+                 post-V009 sessions must carry operator_uid"
+                    .into(),
+            )
+        })?;
+        let manager = self.registry.get_or_create(op_uid);
         let bridge = args.lima_bridge.clone();
         let mac = args.lima_mac.clone();
         let config = match &args.lima_config {
@@ -282,32 +247,18 @@ impl SessionRuntime for LimaRuntime {
                 SessionConfig::default()
             }
         };
-        // The spawn-helper path is a runtime-level field (resolved at
-        // daemon startup); the operator pair travels per-request on
-        // `args.operator_identity`. Both must be Some for the helper
-        // dispatch to kick in — `LimaManager::start_vm`'s `use_helper`
-        // gate. Either missing means the legacy direct-spawn shape.
-        let spawn_helper = self.spawn_helper_path.clone();
-        let operator_identity = args.operator_identity;
 
         tokio::task::spawn_blocking(move || {
-            manager.start_vm(
-                &session_id,
-                &config,
-                bridge.as_deref(),
-                mac.as_deref(),
-                spawn_helper.as_deref(),
-                operator_identity,
-            )
+            manager.start_vm(&session_id, &config, bridge.as_deref(), mac.as_deref())
         })
         .await
         .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))??;
         Ok(())
     }
 
-    async fn stop(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+    async fn stop(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
-        let manager = Arc::clone(&self.manager);
+        let manager = self.registry.get_or_create(operator_uid);
 
         tokio::task::spawn_blocking(move || manager.stop_vm(&session_id))
             .await
@@ -315,9 +266,9 @@ impl SessionRuntime for LimaRuntime {
         Ok(())
     }
 
-    async fn delete(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+    async fn delete(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
-        let manager = Arc::clone(&self.manager);
+        let manager = self.registry.get_or_create(operator_uid);
 
         tokio::task::spawn_blocking(move || manager.delete_vm(&session_id))
             .await
@@ -325,9 +276,13 @@ impl SessionRuntime for LimaRuntime {
         Ok(())
     }
 
-    async fn status(&self, handle: &RuntimeHandle) -> Result<RuntimeStatus, SandboxError> {
+    async fn status(
+        &self,
+        handle: &RuntimeHandle,
+        operator_uid: u32,
+    ) -> Result<RuntimeStatus, SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
-        let manager = Arc::clone(&self.manager);
+        let manager = self.registry.get_or_create(operator_uid);
 
         let vm_status = tokio::task::spawn_blocking(move || manager.vm_status(&session_id))
             .await
@@ -335,141 +290,61 @@ impl SessionRuntime for LimaRuntime {
         Ok(vm_status.into())
     }
 
-    fn guest_transport(&self, handle: &RuntimeHandle) -> Arc<dyn GuestTransport> {
+    fn guest_transport(
+        &self,
+        handle: &RuntimeHandle,
+        operator_uid: u32,
+    ) -> Arc<dyn GuestTransport> {
         // Resolving the session id can fail for malformed handles, but
         // `guest_transport` is non-fallible by trait contract. We
         // construct the transport with whichever name the handle
         // carries — `LimaTransport::connect` will surface the failure
-        // when `limactl shell` rejects the unknown VM name.
+        // when the helper rejects the unknown VM name.
+        let manager = self.registry.get_or_create(operator_uid);
         Arc::new(LimaTransport {
-            manager: Arc::clone(&self.manager),
+            manager,
             vm_name: handle.as_str().to_string(),
+            operator_uid,
         })
     }
 
-    /// Refresh the guest binary inside a Lima VM.
+    /// Refresh the guest binary inside a Lima VM by routing through
+    /// `sandbox-lima-helper`.
     ///
-    /// Lima provisions a full VM with systemd inside; the steps mirror
-    /// the existing `LimaManager::install_guest_agent` body but operate
-    /// on an already-created VM rather than first-time install:
+    /// Composed from existing helper subcommands:
     ///
-    /// 1. Ensure the VM is running (`limactl start` is idempotent — it
-    ///    no-ops on an already-running VM and brings up a stopped one).
-    ///    Required because `limactl copy` needs a running VM.
-    /// 2. Stage the daemon-side guest binary to a host tempfile.
-    /// 3. `limactl copy` → `sudo mv` → `sudo chmod +x` to land the
-    ///    binary at the canonical in-VM path.
-    /// 4. `systemctl restart sandbox-guest` so the systemd service
-    ///    re-execs against the new binary.
-    /// 5. `limactl stop` to return the VM to the Stopped baseline. The
-    ///    orchestrator's subsequent `runtime.start` brings the VM back
-    ///    up cleanly; the second start is fast (warm caches) and keeps
-    ///    `Session.state` in lockstep with the substrate.
-    ///
-    /// Wrapped in `tokio::task::spawn_blocking` per `CLAUDE.md` because
-    /// `limactl` invocations are synchronous `std::process::Command`
-    /// calls.
-    async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+    /// 1. `helper start --op-uid N --vm V ...` — ensure the VM is running
+    ///    (idempotent: no-op on a running VM, boots a stopped one). The
+    ///    qemu-wrapper, hardened flag, memory/cpu, and timeout are all required
+    ///    by the helper; they are sourced from the session config stored on the
+    ///    manager. Since refresh happens before `runtime.start` re-runs with
+    ///    the real config, we use the manager's per-operator LIMA_HOME and the
+    ///    defaults (hardened=1, 4096 MiB, 4 CPUs) to boot the VM.
+    /// 2. `helper install-guest-agent --op-uid N --vm V` — copy, install, and
+    ///    restart the guest-agent service (the subcommand already encapsulates
+    ///    copy → mv → chmod → systemd unit write → daemon-reload → enable
+    ///    --now, all idempotent). The tool probes at the end are a no-op on a
+    ///    correctly provisioned base image.
+    /// 3. `helper stop --op-uid N --vm V` — return the VM to Stopped baseline
+    ///    so the orchestrator's subsequent `runtime.start` controls the
+    ///    lifecycle cleanly and `Session.state` stays in lockstep.
+    async fn refresh_guest_binary(
+        &self,
+        handle: &RuntimeHandle,
+        operator_uid: u32,
+    ) -> Result<(), SandboxError> {
         let vm_name = handle.as_str().to_string();
-        let manager = Arc::clone(&self.manager);
+        let manager = self.registry.get_or_create(operator_uid);
 
-        // Stage the host-side tempfile before spawning the blocking
-        // closure so the tempfile's lifetime spans every `limactl copy`
-        // / `shell` call below.
-        let tempfile = tokio::task::spawn_blocking(crate::guest::stage_guest_binary_to_tempfile)
-            .await
-            .map_err(|e| {
-                SandboxError::Internal(format!(
-                    "spawn_blocking join failed staging guest binary: {e}"
-                ))
-            })??;
-        let tempfile_path = tempfile.path().to_path_buf();
-
-        let result = tokio::task::spawn_blocking(move || {
-            refresh_lima_guest_binary_blocking(&manager, &vm_name, &tempfile_path)
+        tokio::task::spawn_blocking(move || {
+            refresh_lima_guest_binary_via_helper(&manager, &vm_name)
         })
         .await
         .map_err(|e| {
             SandboxError::Internal(format!(
                 "spawn_blocking join failed during Lima guest refresh: {e}"
             ))
-        })?;
-
-        // Drop the tempfile only after the blocking sequence finishes.
-        drop(tempfile);
-
-        result
-    }
-
-    /// Run a command inside the VM with stdio streamed through the
-    /// caller-supplied byte sinks. Mirrors today's `sandbox ssh` /
-    /// `sandbox exec` flow (`limactl shell <vm> -- <cmd>`) but with
-    /// the streams under the daemon's control rather than inheriting
-    /// from the CLI process.
-    async fn exec_interactive(
-        &self,
-        handle: &RuntimeHandle,
-        cmd: Vec<String>,
-        mut stdin: Box<dyn AsyncRead + Unpin + Send>,
-        mut stdout: Box<dyn AsyncWrite + Unpin + Send>,
-        mut stderr: Box<dyn AsyncWrite + Unpin + Send>,
-    ) -> Result<ExitCode, SandboxError> {
-        let vm_name = handle.as_str().to_string();
-
-        let mut command = Command::new(self.manager.limactl_path());
-        command
-            .arg("shell")
-            .arg(&vm_name)
-            .arg("--")
-            .args(&cmd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = command.spawn().map_err(|e| {
-            SandboxError::Lima(format!("failed to spawn limactl shell for {vm_name}: {e}"))
-        })?;
-
-        let mut child_stdin = child.stdin.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdin of limactl shell".into())
-        })?;
-        let mut child_stdout = child.stdout.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdout of limactl shell".into())
-        })?;
-        let mut child_stderr = child.stderr.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stderr of limactl shell".into())
-        })?;
-
-        // Pump caller stdin -> child stdin, child stdout -> caller
-        // stdout, child stderr -> caller stderr concurrently. Each
-        // direction ends naturally on EOF; we drop child_stdin first
-        // so the child sees EOF on its end too.
-        let stdin_task = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stdin, &mut child_stdin).await;
-            // Closing child_stdin tells the remote process EOF.
-            let _ = child_stdin.shutdown().await;
-        });
-        let stdout_task = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut child_stdout, &mut stdout).await;
-        });
-        let stderr_task = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut child_stderr, &mut stderr).await;
-        });
-
-        let status = child.wait().await.map_err(|e| {
-            SandboxError::Lima(format!(
-                "failed to wait for limactl shell exit ({vm_name}): {e}"
-            ))
-        })?;
-
-        // Best-effort: let the pipe pumpers drain anything still in
-        // flight before returning.
-        let _ = stdin_task.await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-
-        Ok(ExitCode(status.code().unwrap_or(-1)))
+        })?
     }
 }
 
@@ -478,144 +353,87 @@ impl SessionRuntime for LimaRuntime {
 /// `tokio::task::spawn_blocking` without capturing the trait's `&self`
 /// across the boundary.
 ///
-/// `tempfile_path` is the host-side staged guest binary; the caller
-/// owns the `NamedTempFile` and drops it once this function returns.
-fn refresh_lima_guest_binary_blocking(
+/// Composes `sandbox-lima-helper` subcommands:
+///   1. `start` — ensure the VM is running (idempotent).
+///   2. `install-guest-agent` — copy + install + restart the agent.
+///   3. `stop` — return VM to Stopped baseline.
+///
+/// This eliminates every direct `limactl` invocation from this path.
+fn refresh_lima_guest_binary_via_helper(
     manager: &LimaManager,
     vm_name: &str,
-    tempfile_path: &std::path::Path,
 ) -> Result<(), SandboxError> {
-    use std::process::Command as StdCommand;
+    /// Wall-clock budget for `start` (boot may take several seconds).
+    const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
+    /// Wall-clock budget for `install-guest-agent` (6 steps + 4 probes).
+    const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
+    /// Wall-clock budget for `stop`.
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
-    use crate::process::run_with_timeout;
+    // `start` requires qemu-wrapper, hardened, memory-mb, cpus,
+    // start-timeout-s. For the refresh path we use conservative defaults:
+    // hardened=1, 4096 MiB, 4 CPUs, 300s Lima-internal SSH wait. The
+    // real per-session config is applied on the subsequent `runtime.start`
+    // by the orchestrator; the refresh boot is just to reach Running.
+    let qemu_wrapper = manager.ensure_qemu_wrapper_for_test()?;
+    let qemu_wrapper_str = qemu_wrapper.to_string_lossy().to_string();
 
-    /// Wall-clock per-step timeout. Matches the `INSTALL_GUEST_AGENT_STEP_TIMEOUT`
-    /// used by the existing `LimaManager::install_guest_agent` path.
-    const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-    /// Wall-clock timeout for `limactl start` — first-boot of a stopped
-    /// VM can take longer than a single shell command. Mirrors
-    /// `LimaManager`'s start-VM timeout intent (the manager's start
-    /// path uses a larger budget too).
-    const START_VM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
-    let limactl = manager.limactl_path();
-
-    // 1. Ensure the VM is running. `limactl start` is idempotent — a
-    //    no-op on a running VM, boots a stopped one — so we don't need
-    //    to check the status first.
-    tracing::debug!(vm = %vm_name, "refresh_guest_binary: ensuring VM is running");
-    let output = run_with_timeout(
-        StdCommand::new(limactl)
-            .args(["start", vm_name])
-            .arg("--tty=false"),
-        START_VM_TIMEOUT,
-        "limactl start (guest refresh)",
-    )?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::Lima(format!(
-            "failed to start VM {vm_name} for guest refresh: {stderr}"
-        )));
-    }
-
-    // 2. Copy the staged binary into the VM (writable user path).
-    let copy_src = tempfile_path.to_string_lossy().to_string();
-    let copy_dst = format!("{vm_name}:/tmp/sandbox-guest-new");
-    let output = run_with_timeout(
-        StdCommand::new(limactl).args(["copy", &copy_src, &copy_dst]),
-        STEP_TIMEOUT,
-        "limactl copy (guest refresh)",
-    )?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::Lima(format!(
-            "failed to copy guest binary to {vm_name}: {stderr}"
-        )));
-    }
-
-    // 3a. sudo mv into /usr/local/bin/.
-    let output = run_with_timeout(
-        StdCommand::new(limactl).args([
-            "shell",
+    tracing::debug!(vm = %vm_name, "refresh_guest_binary: ensuring VM running via helper");
+    let output = manager.run_helper(
+        "start",
+        &[
+            "--vm",
             vm_name,
-            "--",
-            "sudo",
-            "mv",
-            "/tmp/sandbox-guest-new",
-            "/usr/local/bin/sandbox-guest",
-        ]),
-        STEP_TIMEOUT,
-        "limactl shell mv (guest refresh)",
+            "--qemu-wrapper",
+            &qemu_wrapper_str,
+            "--hardened",
+            "1",
+            "--memory-mb",
+            "4096",
+            "--cpus",
+            "4",
+            "--start-timeout-s",
+            "300",
+        ],
+        START_TIMEOUT,
+        "sandbox-lima-helper start (guest refresh)",
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SandboxError::Lima(format!(
-            "failed to install refreshed guest binary in {vm_name}: {stderr}"
+            "refresh: failed to start VM {vm_name}: {stderr}"
         )));
     }
 
-    // 3b. sudo chmod +x.
-    let output = run_with_timeout(
-        StdCommand::new(limactl).args([
-            "shell",
-            vm_name,
-            "--",
-            "sudo",
-            "chmod",
-            "+x",
-            "/usr/local/bin/sandbox-guest",
-        ]),
-        STEP_TIMEOUT,
-        "limactl shell chmod (guest refresh)",
+    tracing::debug!(vm = %vm_name, "refresh_guest_binary: running install-guest-agent via helper");
+    let output = manager.run_helper(
+        "install-guest-agent",
+        &["--vm", vm_name],
+        INSTALL_TIMEOUT,
+        "sandbox-lima-helper install-guest-agent (guest refresh)",
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SandboxError::Lima(format!(
-            "failed to chmod refreshed guest binary in {vm_name}: {stderr}"
+            "refresh: install-guest-agent failed for {vm_name}: {stderr}"
         )));
     }
 
-    // 4. Restart the systemd service so the running guest is the new
-    //    binary.
-    let output = run_with_timeout(
-        StdCommand::new(limactl).args([
-            "shell",
-            vm_name,
-            "--",
-            "sudo",
-            "systemctl",
-            "restart",
-            "sandbox-guest",
-        ]),
-        STEP_TIMEOUT,
-        "limactl shell systemctl restart (guest refresh)",
+    tracing::debug!(vm = %vm_name, "refresh_guest_binary: stopping VM via helper");
+    let output = manager.run_helper(
+        "stop",
+        &["--vm", vm_name],
+        STOP_TIMEOUT,
+        "sandbox-lima-helper stop (guest refresh)",
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SandboxError::Lima(format!(
-            "failed to restart sandbox-guest service in {vm_name}: {stderr}"
+            "refresh: failed to stop VM {vm_name} after refresh: {stderr}"
         )));
     }
 
-    // 5. Return the VM to the Stopped baseline. `runtime.start` from
-    //    the orchestrator will boot it back up, keeping `Session.state`
-    //    in lockstep with the substrate transition.
-    let output = run_with_timeout(
-        StdCommand::new(limactl)
-            .args(["stop", vm_name])
-            .arg("--tty=false"),
-        STEP_TIMEOUT,
-        "limactl stop (guest refresh)",
-    )?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::Lima(format!(
-            "failed to stop VM {vm_name} after guest refresh: {stderr}"
-        )));
-    }
-
-    tracing::info!(vm = %vm_name, "guest binary refreshed");
+    tracing::info!(vm = %vm_name, "guest binary refreshed via helper");
     Ok(())
 }
 
@@ -623,36 +441,50 @@ fn refresh_lima_guest_binary_blocking(
 // LimaTransport
 // ---------------------------------------------------------------------------
 
-/// [`GuestTransport`] over `limactl shell <vm> -- socat -
-/// TCP:127.0.0.1:5123`. Each [`Self::connect`] call spawns a fresh
-/// `limactl shell` child whose stdio is wired to the in-VM TCP socket
-/// the guest agent listens on; the returned bidirectional stream owns
-/// the child handle and tears it down on drop (`kill_on_drop(true)`).
+/// [`GuestTransport`] over `sandbox-lima-helper guest-socat --op-uid
+/// <uid> --vm <vm>`, which exec's `limactl shell <vm> -- socat -
+/// TCP:127.0.0.1:5123` as the operator uid. Each [`Self::connect`] call
+/// spawns a fresh helper child whose stdio is wired to the in-VM TCP
+/// socket the guest agent listens on; the returned bidirectional stream
+/// owns the child handle and tears it down on drop (`kill_on_drop(true)`).
 ///
-/// Mirrors the inline construct used by [`crate::guest::GuestConnector`]
-/// today (which Phase 1B does not refactor — see the handoff Task 4).
+/// # Async-I/O carve-out
+///
+/// This is the long-lived async-I/O carve-out documented in `CLAUDE.md`.
+/// The helper is spawned via `tokio::process::Command` with async stdio
+/// (NOT `spawn_blocking`): a blocking-task-slot capture for the full
+/// SSH session duration (potentially hours under VS Code Remote-SSH or
+/// JetBrains Gateway) would deadlock the executor under load.
 pub struct LimaTransport {
     manager: Arc<LimaManager>,
     /// VM name (`sandbox-{session_id}`), captured at transport
     /// construction so [`SessionRuntime::guest_transport`] can return
     /// without resolving fallible handle parsing here.
     vm_name: String,
+    /// Operator uid for the `--op-uid` flag passed to the helper.
+    operator_uid: u32,
 }
 
 #[async_trait]
 impl GuestTransport for LimaTransport {
     async fn connect(&self) -> Result<Box<dyn AsyncReadWrite + Send + Unpin>, SandboxError> {
-        debug!(vm = %self.vm_name, "opening limactl shell socat transport");
+        // Async-I/O carve-out: spawn via tokio::process::Command (NOT
+        // spawn_blocking). See LimaTransport doc-comment and CLAUDE.md
+        // "Async-I/O carve-out for long-lived child processes."
+        debug!(
+            vm = %self.vm_name,
+            op_uid = self.operator_uid,
+            "opening sandbox-lima-helper guest-socat transport"
+        );
 
-        let mut command = Command::new(self.manager.limactl_path());
+        let mut command = Command::new(self.manager.helper_path());
         command
             .args([
-                "shell",
+                "guest-socat",
+                "--op-uid",
+                &self.operator_uid.to_string(),
+                "--vm",
                 &self.vm_name,
-                "--",
-                "socat",
-                "-",
-                &format!("TCP:127.0.0.1:{GUEST_AGENT_PORT}"),
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -661,7 +493,7 @@ impl GuestTransport for LimaTransport {
 
         let mut child = command.spawn().map_err(|e| {
             SandboxError::Lima(format!(
-                "failed to spawn limactl shell socat for {}: {e}",
+                "failed to spawn sandbox-lima-helper guest-socat for {}: {e}",
                 self.vm_name
             ))
         })?;
@@ -739,15 +571,14 @@ mod tests {
     use crate::session::WorkspaceModeKind;
 
     /// Construct a hermetic `LimaRuntime` for unit tests. Uses
-    /// `LimaManager::with_limactl_path` (gated `#[cfg(test)]` in
-    /// `lima.rs`) so no `limactl` binary must be present on `$PATH`.
+    /// `LimaManager::with_helper_path` (gated `#[cfg(test)]` in
+    /// `lima.rs`) so no helper binary must be present on the host.
     fn test_runtime() -> Arc<LimaRuntime> {
-        let manager = Arc::new(LimaManager::with_limactl_path(
-            PathBuf::from("/tmp/sandbox-test"),
-            PathBuf::from("limactl"),
+        let registry = Arc::new(crate::lima::LimaManagerRegistry::new(
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
         ));
-        LimaRuntime::new(manager, None)
+        LimaRuntime::new(registry)
     }
 
     /// `LimaRuntime::kind()` is the `BackendKind::Lima` constant —
@@ -887,38 +718,20 @@ mod tests {
         assert!(matches!(err, SandboxError::InvalidArgument(_)));
     }
 
-    /// The spawn-helper path is daemon-startup state, threaded into the
-    /// runtime via `LimaRuntime::new`. `None` is the legitimate
-    /// "spawn-helper not installed; fall back to direct limactl
-    /// invocation" mode; `Some(path)` means the runtime will dispatch
-    /// `limactl start` through the helper.
-    ///
-    /// This pins the constructor wiring + the public accessor. A future
-    /// contributor who refactors the field shape (e.g. wraps it in an
-    /// `Option<Arc<_>>` or moves it onto `RuntimeStartArgs`) must keep
-    /// this round-trip green.
+    /// `LimaRuntime::new` accepts a `LimaManagerRegistry` and exposes it
+    /// via `registry()`. The registry is the source of per-operator
+    /// `LimaManager` instances; this pins the constructor wiring.
     #[test]
-    fn spawn_helper_path_round_trips_through_constructor() {
-        let manager = Arc::new(LimaManager::with_limactl_path(
-            PathBuf::from("/tmp/sandbox-test"),
-            PathBuf::from("limactl"),
+    fn registry_round_trips_through_constructor() {
+        let helper = PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper");
+        let registry = Arc::new(crate::lima::LimaManagerRegistry::new(
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
+            helper.clone(),
         ));
-
-        // Without a helper: getter returns None.
-        let no_helper = LimaRuntime::new(Arc::clone(&manager), None);
+        let rt = LimaRuntime::new(Arc::clone(&registry));
         assert!(
-            no_helper.spawn_helper_path().is_none(),
-            "constructor called with None must surface None on the getter"
-        );
-
-        // With a helper: getter returns the same path verbatim.
-        let helper_path = PathBuf::from("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
-        let with_helper = LimaRuntime::new(Arc::clone(&manager), Some(helper_path.clone()));
-        assert_eq!(
-            with_helper.spawn_helper_path(),
-            Some(helper_path.as_path()),
-            "constructor must thread the helper path verbatim to the getter"
+            Arc::ptr_eq(rt.registry(), &registry),
+            "constructor must thread the registry through to the getter"
         );
     }
 }

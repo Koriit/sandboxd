@@ -736,7 +736,7 @@ async fn integration_container_local_pull() {
 
     // Tear the container down explicitly so a stray container does not
     // race the next test's namespace.
-    runtime.delete(&handle).await.expect("runtime.delete");
+    runtime.delete(&handle, 0).await.expect("runtime.delete");
 }
 
 // ===========================================================================

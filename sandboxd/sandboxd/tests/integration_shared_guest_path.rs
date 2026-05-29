@@ -359,7 +359,7 @@ async fn integration_shared_guest_path_container() {
     // above don't leave a stray container that the next test in the
     // suite might race against. The ContainerCleanup Drop covers the
     // panic path; this is the happy-path tidy-up.
-    runtime.delete(&handle).await.expect("runtime.delete");
+    runtime.delete(&handle, 0).await.expect("runtime.delete");
 }
 
 // ---------------------------------------------------------------------------

@@ -314,51 +314,25 @@ impl SessionStore {
         );
     }
 
-    /// Run `limactl list --json` and `warn!`-log each VM whose name
-    /// starts with `sandbox-`. Returns the count of orphans logged.
+    /// Lima VM orphan scan for V006. Neutralized: under the
+    /// new per-operator LIMA_HOME model, a single `limactl list` (daemon
+    /// uid) cannot see operator VMs, and V009 deletes the operatorless
+    /// session rows that this scan would have back-filled anyway. The
+    /// authoritative per-operator orphan scan is `reconcile` in the daemon
+    /// (which uses `sandbox-lima-helper list-json --op-uid` per operator
+    /// after the registry and AppState are available). This function is
+    /// kept as a no-op stub so the V006 migration path continues to
+    /// compile without changes to the migration SQL or the surrounding
+    /// `run_v006_orphan_scan` call site.
     fn v006_scan_lima_vms() -> u32 {
-        let output = match Command::new("limactl").args(["list", "--json"]).output() {
-            Ok(o) if o.status.success() => o,
-            Ok(_) | Err(_) => {
-                warn!(
-                    event = "v006_orphan_scan_tool_unavailable",
-                    tool = "limactl",
-                    "V006 orphan scan: limactl is unavailable or failed; \
-                     skipping Lima VM enumeration"
-                );
-                return 0;
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut found = 0u32;
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parsed: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let name = match parsed.get("name").and_then(|n| n.as_str()) {
-                Some(n) if n.starts_with("sandbox-") => n.to_string(),
-                _ => continue,
-            };
-            let status = parsed
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            warn!(
-                event = "v006_orphan_lima_vm",
-                vm_name = %name,
-                status = %status,
-                "orphaned Lima VM after V006: {name} (status: {status})"
-            );
-            found += 1;
-        }
-        found
+        warn!(
+            event = "v006_orphan_scan_lima_skipped",
+            "V006 Lima orphan scan skipped: per-operator LIMA_HOMEs require \
+             the daemon registry (not available at store-open time). \
+             The startup reconcile loop performs per-operator VM scanning \
+             via sandbox-lima-helper list-json --op-uid."
+        );
+        0
     }
 
     /// Run a `docker ...` command and parse one orphan per output

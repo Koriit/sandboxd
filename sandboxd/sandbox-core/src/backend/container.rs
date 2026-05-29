@@ -74,15 +74,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::Command as TokioCommand;
 use tracing::{debug, info, warn};
 
 use crate::backend::capabilities::{BackendKind, Capabilities, IsolationLevel};
 use crate::backend::spec::{BackendSpecific, SessionSpec};
 use crate::backend::{
-    AsyncReadWrite, ExitCode, GuestTransport, RuntimeHandle, RuntimeStartArgs, RuntimeStatus,
-    SessionRuntime,
+    AsyncReadWrite, GuestTransport, RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime,
 };
 use crate::error::SandboxError;
 use crate::guest::GUEST_AGENT_PORT;
@@ -859,7 +858,7 @@ impl SessionRuntime for ContainerRuntime {
     /// recognisable "is not running" / "No such container" stderr.
     /// Both shapes map to `Ok(())` so callers do not need to special-
     /// case the redundant-stop path.
-    async fn stop(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+    async fn stop(&self, handle: &RuntimeHandle, _operator_uid: u32) -> Result<(), SandboxError> {
         let container_name = handle.as_str().to_string();
         let args = [
             "stop".to_string(),
@@ -884,7 +883,7 @@ impl SessionRuntime for ContainerRuntime {
     /// nonexistent container, and `docker volume rm` against a
     /// nonexistent volume, both surface as "No such ..." in stderr —
     /// translated to `Ok(())`.
-    async fn delete(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+    async fn delete(&self, handle: &RuntimeHandle, _operator_uid: u32) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
         let container_name = handle.as_str().to_string();
 
@@ -908,7 +907,11 @@ impl SessionRuntime for ContainerRuntime {
         Ok(())
     }
 
-    async fn status(&self, handle: &RuntimeHandle) -> Result<RuntimeStatus, SandboxError> {
+    async fn status(
+        &self,
+        handle: &RuntimeHandle,
+        _operator_uid: u32,
+    ) -> Result<RuntimeStatus, SandboxError> {
         let container_name = handle.as_str().to_string();
         let args = [
             "inspect".to_string(),
@@ -937,7 +940,11 @@ impl SessionRuntime for ContainerRuntime {
         }
     }
 
-    fn guest_transport(&self, handle: &RuntimeHandle) -> Arc<dyn GuestTransport> {
+    fn guest_transport(
+        &self,
+        handle: &RuntimeHandle,
+        _operator_uid: u32,
+    ) -> Arc<dyn GuestTransport> {
         Arc::new(ContainerTransport {
             container_name: handle.as_str().to_string(),
         })
@@ -963,7 +970,11 @@ impl SessionRuntime for ContainerRuntime {
     /// stop is idempotent ("is not running" / "No such container" are
     /// swallowed) so a future caller invoking refresh against a hot
     /// container does not surface a spurious error.
-    async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+    async fn refresh_guest_binary(
+        &self,
+        handle: &RuntimeHandle,
+        _operator_uid: u32,
+    ) -> Result<(), SandboxError> {
         let container_name = handle.as_str().to_string();
 
         // 1. Defensive stop. Idempotent — `start_session` only invokes
@@ -996,70 +1007,6 @@ impl SessionRuntime for ContainerRuntime {
         run_docker(&restart_args, "docker restart (guest refresh)").await?;
 
         Ok(())
-    }
-
-    async fn exec_interactive(
-        &self,
-        handle: &RuntimeHandle,
-        cmd: Vec<String>,
-        mut stdin: Box<dyn AsyncRead + Unpin + Send>,
-        mut stdout: Box<dyn AsyncWrite + Unpin + Send>,
-        mut stderr: Box<dyn AsyncWrite + Unpin + Send>,
-    ) -> Result<ExitCode, SandboxError> {
-        let container_name = handle.as_str().to_string();
-
-        let mut command = TokioCommand::new("docker");
-        command
-            .arg("exec")
-            .arg("-i")
-            .arg(&container_name)
-            .args(&cmd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = command.spawn().map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to spawn docker exec for {container_name}: {e}"
-            ))
-        })?;
-
-        let mut child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| SandboxError::Internal("failed to capture docker exec stdin".into()))?;
-        let mut child_stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SandboxError::Internal("failed to capture docker exec stdout".into()))?;
-        let mut child_stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| SandboxError::Internal("failed to capture docker exec stderr".into()))?;
-
-        let stdin_task = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stdin, &mut child_stdin).await;
-            let _ = child_stdin.shutdown().await;
-        });
-        let stdout_task = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut child_stdout, &mut stdout).await;
-        });
-        let stderr_task = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut child_stderr, &mut stderr).await;
-        });
-
-        let status = child.wait().await.map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to wait for docker exec exit ({container_name}): {e}"
-            ))
-        })?;
-
-        let _ = stdin_task.await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-
-        Ok(ExitCode(status.code().unwrap_or(-1)))
     }
 }
 

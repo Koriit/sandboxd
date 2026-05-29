@@ -1,0 +1,882 @@
+{
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-nft-deny-logger/src/tcp.rs": {
+    "mtime": 1779532018.8768594,
+    "ast_hash": "dd96eabfca370ac39eeb1a9ebb8fb7c0",
+    "semantic_hash": "dd96eabfca370ac39eeb1a9ebb8fb7c0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-nft-deny-logger/src/nflog.rs": {
+    "mtime": 1779532038.8195198,
+    "ast_hash": "908385b5c70e9a4538a129e29ae7e6e6",
+    "semantic_hash": "908385b5c70e9a4538a129e29ae7e6e6"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-nft-deny-logger/src/main.rs": {
+    "mtime": 1779526538.3850126,
+    "ast_hash": "bf31eae8ffb749191aa91ee0b2d735b0",
+    "semantic_hash": "bf31eae8ffb749191aa91ee0b2d735b0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-guest/src/main.rs": {
+    "mtime": 1779526538.3870125,
+    "ast_hash": "cd7145d64a36e5a4319cb1b06515aeec",
+    "semantic_hash": "cd7145d64a36e5a4319cb1b06515aeec"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/build.rs": {
+    "mtime": 1779526538.3770123,
+    "ast_hash": "cfbb3695b171b766672defcce18ab182",
+    "semantic_hash": "cfbb3695b171b766672defcce18ab182"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V009__drop_legacy_operatorless_sessions.sql": {
+    "mtime": 1780069600.1750617,
+    "ast_hash": "d6ac44da4b277d1263ac6398ef3e5beb",
+    "semantic_hash": "d6ac44da4b277d1263ac6398ef3e5beb"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V004__port_explicit_policy_rules.sql": {
+    "mtime": 1779524571.0219672,
+    "ast_hash": "360ffefe7094b6d25c2cdf69bf502c27",
+    "semantic_hash": "360ffefe7094b6d25c2cdf69bf502c27"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V001__create_sessions.sql": {
+    "mtime": 1776438527.8759396,
+    "ast_hash": "a55e01593c10331745e2e31b26038a2b",
+    "semantic_hash": "a55e01593c10331745e2e31b26038a2b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V005__session_backend_column.sql": {
+    "mtime": 1777246343.30633,
+    "ast_hash": "0ccc0a42df0a38422f5ae0c0c4b91644",
+    "semantic_hash": "0ccc0a42df0a38422f5ae0c0c4b91644"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V008__add_operator_uid.sql": {
+    "mtime": 1779868940.575902,
+    "ast_hash": "7302d4205a8f8f4831b37d9906668530",
+    "semantic_hash": "7302d4205a8f8f4831b37d9906668530"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V007__add_ssh_keypair.sql": {
+    "mtime": 1779714319.6370735,
+    "ast_hash": "355fbdf8600d17291c73db9d409abb91",
+    "semantic_hash": "355fbdf8600d17291c73db9d409abb91"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V002__add_network_info.sql": {
+    "mtime": 1776438527.89194,
+    "ast_hash": "12d200e7a452280aae6003af0d9aac9f",
+    "semantic_hash": "12d200e7a452280aae6003af0d9aac9f"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V003__add_policy_tables.sql": {
+    "mtime": 1776441814.1718535,
+    "ast_hash": "63c8c58516d3b30db2a5a5f26967a2c8",
+    "semantic_hash": "63c8c58516d3b30db2a5a5f26967a2c8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/migrations/V006__add_owner_and_guest_versions.sql": {
+    "mtime": 1779525878.5582328,
+    "ast_hash": "cf5369c2a253e65c5ba61e5c2546efca",
+    "semantic_hash": "cf5369c2a253e65c5ba61e5c2546efca"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/guest.rs": {
+    "mtime": 1780069768.109346,
+    "ast_hash": "52456835aff010e00ccacfb5b8cba92b",
+    "semantic_hash": "52456835aff010e00ccacfb5b8cba92b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/workspace_lock.rs": {
+    "mtime": 1779534807.6806037,
+    "ast_hash": "3e883d83181eaabf2a95d298fc7dedac",
+    "semantic_hash": "3e883d83181eaabf2a95d298fc7dedac"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/ssh.rs": {
+    "mtime": 1779783170.3861063,
+    "ast_hash": "968a1a477d8fcbb29da1575aa710baeb",
+    "semantic_hash": "968a1a477d8fcbb29da1575aa710baeb"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/qmp.rs": {
+    "mtime": 1779526538.395293,
+    "ast_hash": "6b080bbb96a5c51647ac305d107d90d0",
+    "semantic_hash": "6b080bbb96a5c51647ac305d107d90d0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/vm_network.rs": {
+    "mtime": 1779526538.3960838,
+    "ast_hash": "e2ccc78eec67db676d52b3b0db7bb60d",
+    "semantic_hash": "e2ccc78eec67db676d52b3b0db7bb60d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/bridge_conf.rs": {
+    "mtime": 1779526538.397013,
+    "ast_hash": "68d80be4ed18fe91d3d146e687fa5bdc",
+    "semantic_hash": "68d80be4ed18fe91d3d146e687fa5bdc"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/gateway.rs": {
+    "mtime": 1779526538.406013,
+    "ast_hash": "e356184e404d361e69f6055856fbd38a",
+    "semantic_hash": "e356184e404d361e69f6055856fbd38a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/users_conf.rs": {
+    "mtime": 1779537287.1168966,
+    "ast_hash": "07cdfc3ce81aeb914c80c58840d1f23e",
+    "semantic_hash": "07cdfc3ce81aeb914c80c58840d1f23e"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/workspace_rsync.rs": {
+    "mtime": 1779526538.4160132,
+    "ast_hash": "a18ac6fda75896d275dc6789667d7c0e",
+    "semantic_hash": "a18ac6fda75896d275dc6789667d7c0e"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/policy_distributor.rs": {
+    "mtime": 1779527030.2001705,
+    "ast_hash": "c0ef459c6490703d486339717a75f333",
+    "semantic_hash": "c0ef459c6490703d486339717a75f333"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/caller_identity.rs": {
+    "mtime": 1779873986.4159298,
+    "ast_hash": "5d161e4fd84e2b24edf021f0c0b489ce",
+    "semantic_hash": "5d161e4fd84e2b24edf021f0c0b489ce"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/lib.rs": {
+    "mtime": 1780063378.7118983,
+    "ast_hash": "21fdacb66439cb380de61736e72dec38",
+    "semantic_hash": "21fdacb66439cb380de61736e72dec38"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/dns_propagation.rs": {
+    "mtime": 1779527042.5375013,
+    "ast_hash": "2d0053fbd11bfbc6969508c8eaf0a9cb",
+    "semantic_hash": "2d0053fbd11bfbc6969508c8eaf0a9cb"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/atomic_listener_writer.rs": {
+    "mtime": 1779527004.601484,
+    "ast_hash": "e91607fb2220eacacf7d16a9cd170180",
+    "semantic_hash": "e91607fb2220eacacf7d16a9cd170180"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/lima.rs": {
+    "mtime": 1780070715.3390157,
+    "ast_hash": "6791d888f73a25d483629cd4ef99f845",
+    "semantic_hash": "6791d888f73a25d483629cd4ef99f845"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/lds_ack.rs": {
+    "mtime": 1779526538.439014,
+    "ast_hash": "d8926ff9a4da66aa581c33020d5574e1",
+    "semantic_hash": "d8926ff9a4da66aa581c33020d5574e1"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/process.rs": {
+    "mtime": 1779526538.4409351,
+    "ast_hash": "76898bc8e9fdf643290032275c4c41ab",
+    "semantic_hash": "76898bc8e9fdf643290032275c4c41ab"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/policy.rs": {
+    "mtime": 1779527090.253781,
+    "ast_hash": "6b89ea324020add03f7076429b5eebf8",
+    "semantic_hash": "6b89ea324020add03f7076429b5eebf8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/session.rs": {
+    "mtime": 1779874823.7759256,
+    "ast_hash": "5ea181cfeae8e305b1d19c13e8ca74b4",
+    "semantic_hash": "5ea181cfeae8e305b1d19c13e8ca74b4"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/network.rs": {
+    "mtime": 1779526538.472015,
+    "ast_hash": "2a67cb1b593703f8fe43e742b6f7869c",
+    "semantic_hash": "2a67cb1b593703f8fe43e742b6f7869c"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/store.rs": {
+    "mtime": 1780069073.6010969,
+    "ast_hash": "a8e6930fe2a5934990552e62f4cc7501",
+    "semantic_hash": "a8e6930fe2a5934990552e62f4cc7501"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/ca.rs": {
+    "mtime": 1779526538.4900153,
+    "ast_hash": "6ea262657ba58ed47d5c901abe813fdf",
+    "semantic_hash": "6ea262657ba58ed47d5c901abe813fdf"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/error.rs": {
+    "mtime": 1779775108.49473,
+    "ast_hash": "3d8d20ced87fba4477cbde392d56b938",
+    "semantic_hash": "3d8d20ced87fba4477cbde392d56b938"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/dns_gate.rs": {
+    "mtime": 1779527048.3756578,
+    "ast_hash": "3e6ad9177d8222a433270c4a0f485dda",
+    "semantic_hash": "3e6ad9177d8222a433270c4a0f485dda"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/api/dto.rs": {
+    "mtime": 1779774773.9747005,
+    "ast_hash": "ca6155c15ecc9d71561c19c5d3a63e54",
+    "semantic_hash": "ca6155c15ecc9d71561c19c5d3a63e54"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/api/events_filter.rs": {
+    "mtime": 1779532088.6621535,
+    "ast_hash": "28a8ab73d5b0ca269068c42247c14a0d",
+    "semantic_hash": "28a8ab73d5b0ca269068c42247c14a0d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/api/mapper.rs": {
+    "mtime": 1779532066.80244,
+    "ast_hash": "26f58a97cd54ca017aa058fd3d23f36d",
+    "semantic_hash": "26f58a97cd54ca017aa058fd3d23f36d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/api/event_mapper.rs": {
+    "mtime": 1779527619.8002527,
+    "ast_hash": "3d7b116e267d720919203614582f2a49",
+    "semantic_hash": "3d7b116e267d720919203614582f2a49"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/api/mod.rs": {
+    "mtime": 1779714319.6730745,
+    "ast_hash": "98581dcdf5c957442d7d179bfdb8ae8f",
+    "semantic_hash": "98581dcdf5c957442d7d179bfdb8ae8f"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/api/events_query_dto.rs": {
+    "mtime": 1779536958.8959332,
+    "ast_hash": "631a9c0fdc737ae2353b237154a27932",
+    "semantic_hash": "631a9c0fdc737ae2353b237154a27932"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/api/event_dto.rs": {
+    "mtime": 1779537217.0439816,
+    "ast_hash": "38e1a47be882f3557c59be0b779ec4a6",
+    "semantic_hash": "38e1a47be882f3557c59be0b779ec4a6"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/vm_ip_map.rs": {
+    "mtime": 1779526538.7221816,
+    "ast_hash": "bb4e6ef372da2e56f8c2e2ff62e87503",
+    "semantic_hash": "bb4e6ef372da2e56f8c2e2ff62e87503"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/envelope.rs": {
+    "mtime": 1779527506.6739624,
+    "ast_hash": "e02d5482ef3f82592d9b6e4b4ddac107",
+    "semantic_hash": "e02d5482ef3f82592d9b6e4b4ddac107"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/health_transition.rs": {
+    "mtime": 1779526538.7263072,
+    "ast_hash": "9c4ed8e8ddf436045f6f5267b84aebb8",
+    "semantic_hash": "9c4ed8e8ddf436045f6f5267b84aebb8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/lifecycle.rs": {
+    "mtime": 1779527057.328898,
+    "ast_hash": "23bb4e0db70a8ee87ab3aea5e32910a0",
+    "semantic_hash": "23bb4e0db70a8ee87ab3aea5e32910a0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/mod.rs": {
+    "mtime": 1779527052.56077,
+    "ast_hash": "a605d3ec2e7425edcbd603f21c99d2c0",
+    "semantic_hash": "a605d3ec2e7425edcbd603f21c99d2c0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/bus.rs": {
+    "mtime": 1779527547.3870564,
+    "ast_hash": "68ef59e21e880f2c9fb9539cf4f255be",
+    "semantic_hash": "68ef59e21e880f2c9fb9539cf4f255be"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/ingest/mitmproxy.rs": {
+    "mtime": 1779526538.8052955,
+    "ast_hash": "a07290ea6cf68e5ebb8e6d627560957b",
+    "semantic_hash": "a07290ea6cf68e5ebb8e6d627560957b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/ingest/watcher.rs": {
+    "mtime": 1779532192.0534737,
+    "ast_hash": "8ccef6ab204887eae79f24db544a2b33",
+    "semantic_hash": "8ccef6ab204887eae79f24db544a2b33"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/ingest/coredns.rs": {
+    "mtime": 1779526538.8080237,
+    "ast_hash": "b1aa6a67f8ebce1c9f43413e376c7add",
+    "semantic_hash": "b1aa6a67f8ebce1c9f43413e376c7add"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/ingest/envoy.rs": {
+    "mtime": 1779527535.2667308,
+    "ast_hash": "f4c918fb948edf966c0610af5cc0754a",
+    "semantic_hash": "f4c918fb948edf966c0610af5cc0754a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/ingest/mod.rs": {
+    "mtime": 1779527063.6570678,
+    "ast_hash": "97379b23052f0087b5726fb344e9b2eb",
+    "semantic_hash": "97379b23052f0087b5726fb344e9b2eb"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/ingest/jsonl_reader.rs": {
+    "mtime": 1779526538.8123171,
+    "ast_hash": "961707841ecc195b8fb3caac5196287e",
+    "semantic_hash": "961707841ecc195b8fb3caac5196287e"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/ingest/nft_logger.rs": {
+    "mtime": 1779527068.1881893,
+    "ast_hash": "7bfb1649c5392ca6afb4c4f4127e34e5",
+    "semantic_hash": "7bfb1649c5392ca6afb4c4f4127e34e5"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/persist/pruner.rs": {
+    "mtime": 1779526538.815251,
+    "ast_hash": "a55c527a4453e8adef16c2762151368b",
+    "semantic_hash": "a55c527a4453e8adef16c2762151368b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/persist/mod.rs": {
+    "mtime": 1779526538.817024,
+    "ast_hash": "cd7a6164168c93c642881e11c6bc401b",
+    "semantic_hash": "cd7a6164168c93c642881e11c6bc401b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/persist/writer.rs": {
+    "mtime": 1779528240.366521,
+    "ast_hash": "586a9166d824f76065882a1b661999ce",
+    "semantic_hash": "586a9166d824f76065882a1b661999ce"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/events/persist/rotator.rs": {
+    "mtime": 1779526538.819024,
+    "ast_hash": "3aec130affcfd271282fbaff02cd26fa",
+    "semantic_hash": "3aec130affcfd271282fbaff02cd26fa"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/backend/container.rs": {
+    "mtime": 1780069768.0073414,
+    "ast_hash": "7a6c95784fef6eea2f1fd52b60e32655",
+    "semantic_hash": "7a6c95784fef6eea2f1fd52b60e32655"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/backend/orphan_reaper.rs": {
+    "mtime": 1779532198.5396793,
+    "ast_hash": "26ac5592038e313c9c08d4abf5759c72",
+    "semantic_hash": "26ac5592038e313c9c08d4abf5759c72"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/backend/spec.rs": {
+    "mtime": 1779896829.6058815,
+    "ast_hash": "ee9e404d5272f05b248e48c6839c7ffa",
+    "semantic_hash": "ee9e404d5272f05b248e48c6839c7ffa"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/backend/container_rootless_probe.rs": {
+    "mtime": 1779532171.4208179,
+    "ast_hash": "77fc98beb72b8b32d0e76979f3af801f",
+    "semantic_hash": "77fc98beb72b8b32d0e76979f3af801f"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/backend/mod.rs": {
+    "mtime": 1780069768.02841,
+    "ast_hash": "9a098626af5c54cb5db62702daa6eba2",
+    "semantic_hash": "9a098626af5c54cb5db62702daa6eba2"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/backend/capabilities.rs": {
+    "mtime": 1779537150.5141637,
+    "ast_hash": "42b0e138e5811641f41caa88ac63bbc2",
+    "semantic_hash": "42b0e138e5811641f41caa88ac63bbc2"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/backend/lima.rs": {
+    "mtime": 1780069859.9022732,
+    "ast_hash": "68aa0ab3d9926f527cf51123a06919b8",
+    "semantic_hash": "68aa0ab3d9926f527cf51123a06919b8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/test_support/docker_path_stub.rs": {
+    "mtime": 1779526538.755326,
+    "ast_hash": "6d48bc011171e738af03cee90912c8a5",
+    "semantic_hash": "6d48bc011171e738af03cee90912c8a5"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/src/test_support/mod.rs": {
+    "mtime": 1779526538.7569072,
+    "ast_hash": "2988e745f86a24b5a539ccb0abd4e767",
+    "semantic_hash": "2988e745f86a24b5a539ccb0abd4e767"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_gateway_image_pinning.rs": {
+    "mtime": 1779532114.3109853,
+    "ast_hash": "0395ad4de28019844a6d9db4add2b856",
+    "semantic_hash": "0395ad4de28019844a6d9db4add2b856"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/validators.rs": {
+    "mtime": 1779526538.4980156,
+    "ast_hash": "4308f4ee1fb8e616d63b478baf0f22e1",
+    "semantic_hash": "4308f4ee1fb8e616d63b478baf0f22e1"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/cross_session_l4_isolation_integration.rs": {
+    "mtime": 1779526538.4992223,
+    "ast_hash": "8dd5ddcb13a84a44efd4a6f130c6f85d",
+    "semantic_hash": "8dd5ddcb13a84a44efd4a6f130c6f85d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/lifecycle_events_integration.rs": {
+    "mtime": 1779526538.5000155,
+    "ast_hash": "a5b62c77ecfb4e21629287914a5e0225",
+    "semantic_hash": "a5b62c77ecfb4e21629287914a5e0225"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_lite_image_sshd_cross_user.rs": {
+    "mtime": 1779783368.002282,
+    "ast_hash": "2615d8bcc6410eb98e3efb33da59f7db",
+    "semantic_hash": "2615d8bcc6410eb98e3efb33da59f7db"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/update_state_reconcile_allow_list.rs": {
+    "mtime": 1779526538.5020156,
+    "ast_hash": "d2c98b2476d3bab1e56c5b47a7e17ec7",
+    "semantic_hash": "d2c98b2476d3bab1e56c5b47a7e17ec7"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_lite_image_rebuild.rs": {
+    "mtime": 1779526538.5030158,
+    "ast_hash": "ecf9ab7b71add14ba3deff013f271058",
+    "semantic_hash": "ecf9ab7b71add14ba3deff013f271058"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_orphan_reaper_cidr.rs": {
+    "mtime": 1779532239.9619846,
+    "ast_hash": "6068f7ed7d58e52363dbaff7c7954f7a",
+    "semantic_hash": "6068f7ed7d58e52363dbaff7c7954f7a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/dns_gate_integration.rs": {
+    "mtime": 1779526538.506393,
+    "ast_hash": "be9ce9671dce902ef96ee39c7ac7c098",
+    "semantic_hash": "be9ce9671dce902ef96ee39c7ac7c098"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/qemu_helper_path_lint.rs": {
+    "mtime": 1779532245.7361655,
+    "ast_hash": "68fd607345b0ba60ca5d9c9008c7d2a9",
+    "semantic_hash": "68fd607345b0ba60ca5d9c9008c7d2a9"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/migrations.rs": {
+    "mtime": 1779526538.508758,
+    "ast_hash": "165751f27adba46af6eaa73ede968f65",
+    "semantic_hash": "165751f27adba46af6eaa73ede968f65"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/events_ingest_integration.rs": {
+    "mtime": 1779532082.5489545,
+    "ast_hash": "2f8435332a742d4419e5511bb3d5773f",
+    "semantic_hash": "2f8435332a742d4419e5511bb3d5773f"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_orphan_reaper.rs": {
+    "mtime": 1779526538.511016,
+    "ast_hash": "322996dc0f2467c189c83612fd55c70a",
+    "semantic_hash": "322996dc0f2467c189c83612fd55c70a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/network_integration.rs": {
+    "mtime": 1779526538.5129447,
+    "ast_hash": "9f1ee95d81dbc7d5b4a1811048815d39",
+    "semantic_hash": "9f1ee95d81dbc7d5b4a1811048815d39"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_lite_image_sshd.rs": {
+    "mtime": 1779714319.783385,
+    "ast_hash": "a260f6df7eebe9e63ec1a64cb89a69a1",
+    "semantic_hash": "a260f6df7eebe9e63ec1a64cb89a69a1"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_qemu_wrapper_netdev.rs": {
+    "mtime": 1780070561.2803473,
+    "ast_hash": "0795b8cad96ff9e83441885ec50101fa",
+    "semantic_hash": "0795b8cad96ff9e83441885ec50101fa"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_lite_image_build.rs": {
+    "mtime": 1779526538.5142407,
+    "ast_hash": "4e8080346782abc23494badfcd42421d",
+    "semantic_hash": "4e8080346782abc23494badfcd42421d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_container_runtime.rs": {
+    "mtime": 1780070621.7779815,
+    "ast_hash": "c3d239f0a253bd21d70b876b93b1d1fe",
+    "semantic_hash": "c3d239f0a253bd21d70b876b93b1d1fe"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/gateway_integration.rs": {
+    "mtime": 1779528232.25029,
+    "ast_hash": "fac9e2238f52ea25e5029b19ee563d98",
+    "semantic_hash": "fac9e2238f52ea25e5029b19ee563d98"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-core/tests/integration_session_create_image_contracts.rs": {
+    "mtime": 1779532283.012329,
+    "ast_hash": "8931ef9f2cf2800992140bdbf96d8b5a",
+    "semantic_hash": "8931ef9f2cf2800992140bdbf96d8b5a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-route-helper/src/audit.rs": {
+    "mtime": 1779537299.203227,
+    "ast_hash": "6d464f373617a3588992d4f35a709460",
+    "semantic_hash": "6d464f373617a3588992d4f35a709460"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-route-helper/src/pair_check.rs": {
+    "mtime": 1779534662.0896494,
+    "ast_hash": "b75b7bf2d7b998c88f9d30913a78ec87",
+    "semantic_hash": "b75b7bf2d7b998c88f9d30913a78ec87"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-route-helper/src/main.rs": {
+    "mtime": 1779534686.638315,
+    "ast_hash": "ee3db2aee01a035aa621a8360a9375c8",
+    "semantic_hash": "ee3db2aee01a035aa621a8360a9375c8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-route-helper/tests/integration_route_helper.rs": {
+    "mtime": 1779532269.4589071,
+    "ast_hash": "00aeb23a22ce404a683a74e3e006b756",
+    "semantic_hash": "00aeb23a22ce404a683a74e3e006b756"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-lima-helper/src/main.rs": {
+    "mtime": 1780055693.5720255,
+    "ast_hash": "bea9d9af1ab6dd16c40811796f0c3e80",
+    "semantic_hash": "bea9d9af1ab6dd16c40811796f0c3e80"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-lima-helper/tests/integration_lima_helper.rs": {
+    "mtime": 1780056046.1137118,
+    "ast_hash": "6097f894105b80e81f620edaf005bb9d",
+    "semantic_hash": "6097f894105b80e81f620edaf005bb9d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/tests/helpers/peercred-connector/src/main.rs": {
+    "mtime": 1779532310.286175,
+    "ast_hash": "7c4c850a09c11eb137b95b55129dbf68",
+    "semantic_hash": "7c4c850a09c11eb137b95b55129dbf68"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/ssh_commands.rs": {
+    "mtime": 1779805774.108894,
+    "ast_hash": "fccef8469f011f501fddd227d9d7b773",
+    "semantic_hash": "fccef8469f011f501fddd227d9d7b773"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/cli_xdg.rs": {
+    "mtime": 1779534403.0796678,
+    "ast_hash": "0b08fadd7b6adff765a3e118888e8190",
+    "semantic_hash": "0b08fadd7b6adff765a3e118888e8190"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/backends_cache.rs": {
+    "mtime": 1779526538.632019,
+    "ast_hash": "caeca859a284254d6861758be4eeaacd",
+    "semantic_hash": "caeca859a284254d6861758be4eeaacd"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/backend.rs": {
+    "mtime": 1779538146.6004217,
+    "ast_hash": "b6461c7c19957d1019f4e2c6e0786056",
+    "semantic_hash": "b6461c7c19957d1019f4e2c6e0786056"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/proxy.rs": {
+    "mtime": 1779773615.958947,
+    "ast_hash": "39c9fce9c8b711b20d15ac6e387836b9",
+    "semantic_hash": "39c9fce9c8b711b20d15ac6e387836b9"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/lib.rs": {
+    "mtime": 1779761081.587942,
+    "ast_hash": "1124459c47f413abbf8665c000241358",
+    "semantic_hash": "1124459c47f413abbf8665c000241358"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/doctor.rs": {
+    "mtime": 1779537268.9083989,
+    "ast_hash": "64d080380b7e22c92f9946ccdc9a2126",
+    "semantic_hash": "64d080380b7e22c92f9946ccdc9a2126"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/ssh_config.rs": {
+    "mtime": 1779774672.830912,
+    "ast_hash": "2787608e89c4eb8d54abdda5b7d9a1f5",
+    "semantic_hash": "2787608e89c4eb8d54abdda5b7d9a1f5"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/main.rs": {
+    "mtime": 1779896948.9599564,
+    "ast_hash": "7ef34c1ec2c15b1f96504981230ef2f0",
+    "semantic_hash": "7ef34c1ec2c15b1f96504981230ef2f0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/presets/param.rs": {
+    "mtime": 1779526538.7570224,
+    "ast_hash": "3241e9515573c023579dc5387929d96f",
+    "semantic_hash": "3241e9515573c023579dc5387929d96f"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/presets/builtin.rs": {
+    "mtime": 1779714319.6100729,
+    "ast_hash": "ebbc27809dec5ae91d7962c560c28bec",
+    "semantic_hash": "ebbc27809dec5ae91d7962c560c28bec"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/presets/merge.rs": {
+    "mtime": 1779532485.7535226,
+    "ast_hash": "5ac7fcd9c82e1a03af1b4320da1e8d47",
+    "semantic_hash": "5ac7fcd9c82e1a03af1b4320da1e8d47"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/presets/expand.rs": {
+    "mtime": 1779528312.4905674,
+    "ast_hash": "cc3701e43384350f0222ce315273067a",
+    "semantic_hash": "cc3701e43384350f0222ce315273067a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/presets/mod.rs": {
+    "mtime": 1779527119.0345533,
+    "ast_hash": "bb5f10b82b5d9274c9b48e9e81a54e94",
+    "semantic_hash": "bb5f10b82b5d9274c9b48e9e81a54e94"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/presets/user.rs": {
+    "mtime": 1779527648.8911493,
+    "ast_hash": "a03f91a958c4d91884f9a9761d0cf3db",
+    "semantic_hash": "a03f91a958c4d91884f9a9761d0cf3db"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/presets/method.rs": {
+    "mtime": 1779532465.9319258,
+    "ast_hash": "277ae051398ac306471a959fe6d3df30",
+    "semantic_hash": "277ae051398ac306471a959fe6d3df30"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/cfg_migrations/version.rs": {
+    "mtime": 1779534459.5301821,
+    "ast_hash": "e9667b7334609437b37823df544c5ce9",
+    "semantic_hash": "e9667b7334609437b37823df544c5ce9"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/cfg_migrations/mod.rs": {
+    "mtime": 1779537253.1169674,
+    "ast_hash": "db69a2f0f26693ff5f851099848e7d69",
+    "semantic_hash": "db69a2f0f26693ff5f851099848e7d69"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/cfg_migrations/v001_add_sandbox_to_allow_users.rs": {
+    "mtime": 1779537262.4402223,
+    "ast_hash": "b83c403a08e12d9429260989d6034793",
+    "semantic_hash": "b83c403a08e12d9429260989d6034793"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/update/fetch.rs": {
+    "mtime": 1779534526.5269852,
+    "ast_hash": "6c0e3f7e2ae54d7e79083d60e691c694",
+    "semantic_hash": "6c0e3f7e2ae54d7e79083d60e691c694"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/update/lock.rs": {
+    "mtime": 1779532608.2671778,
+    "ast_hash": "5fef308ba9a4ba4fe97e871e468904e1",
+    "semantic_hash": "5fef308ba9a4ba4fe97e871e468904e1"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/update/migrate.rs": {
+    "mtime": 1779534981.5283446,
+    "ast_hash": "e09c7ee3c01302924c982a7089ccaac1",
+    "semantic_hash": "e09c7ee3c01302924c982a7089ccaac1"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/update/mod.rs": {
+    "mtime": 1779537228.485294,
+    "ast_hash": "15db368b90838f3263aaba5ca2fc8c06",
+    "semantic_hash": "15db368b90838f3263aaba5ca2fc8c06"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/src/update/backup.rs": {
+    "mtime": 1779537243.6737092,
+    "ast_hash": "b62dba59e8722201567b33824aec6611",
+    "semantic_hash": "b62dba59e8722201567b33824aec6611"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_cp_dispatch.rs": {
+    "mtime": 1779783283.5706434,
+    "ast_hash": "ee75ff5d63b39bff3c121d850cc9d364",
+    "semantic_hash": "ee75ff5d63b39bff3c121d850cc9d364"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_backends_cache.rs": {
+    "mtime": 1779534406.5017593,
+    "ast_hash": "844851eede4147b903f7dd90b5d19270",
+    "semantic_hash": "844851eede4147b903f7dd90b5d19270"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_update_fetch.rs": {
+    "mtime": 1779534972.8241067,
+    "ast_hash": "db98a4eec46c84d4f4daafe18d87b00d",
+    "semantic_hash": "db98a4eec46c84d4f4daafe18d87b00d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_sync_dispatch.rs": {
+    "mtime": 1779783292.7919316,
+    "ast_hash": "8fbefbe8ca2606cf8681c0c5f6956da0",
+    "semantic_hash": "8fbefbe8ca2606cf8681c0c5f6956da0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_no_cache_rejection.rs": {
+    "mtime": 1779527685.8132794,
+    "ast_hash": "d7bd86f1194c08c89cf7229ed8086fe7",
+    "semantic_hash": "d7bd86f1194c08c89cf7229ed8086fe7"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/events_binary.rs": {
+    "mtime": 1779526538.6880207,
+    "ast_hash": "7a09b87455156580eba1871525dba4f4",
+    "semantic_hash": "7a09b87455156580eba1871525dba4f4"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_version_skew.rs": {
+    "mtime": 1779532718.3254194,
+    "ast_hash": "52fa5784ffce63f0518105edc9f47d89",
+    "semantic_hash": "52fa5784ffce63f0518105edc9f47d89"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/preset_cli.rs": {
+    "mtime": 1779528287.419857,
+    "ast_hash": "fe1f724b6d58a34118a367f5e5a8acec",
+    "semantic_hash": "fe1f724b6d58a34118a367f5e5a8acec"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_update_flow_idempotent.rs": {
+    "mtime": 1779534908.0923398,
+    "ast_hash": "f8876e593875c7319092724d69130a34",
+    "semantic_hash": "f8876e593875c7319092724d69130a34"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_cfg_migrations_cli.rs": {
+    "mtime": 1779534912.5104604,
+    "ast_hash": "dd581ec8927494dd245bfa7d2b73f766",
+    "semantic_hash": "dd581ec8927494dd245bfa7d2b73f766"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_isolation_warning.rs": {
+    "mtime": 1779534409.581842,
+    "ast_hash": "a2f9457e72f7473c3ecf9d3c4b61e0b8",
+    "semantic_hash": "a2f9457e72f7473c3ecf9d3c4b61e0b8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/integration_describe_verbose.rs": {
+    "mtime": 1779527192.5185251,
+    "ast_hash": "eb5e5d0390bf6daa591fa3333d60ceda",
+    "semantic_hash": "eb5e5d0390bf6daa591fa3333d60ceda"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/fixtures/cargo_fetch_trace.json": {
+    "mtime": 1779528270.3323724,
+    "ast_hash": "8c3b4d6185102d0e9595f36022a15270",
+    "semantic_hash": "8c3b4d6185102d0e9595f36022a15270"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-cli/tests/common/mod.rs": {
+    "mtime": 1779526538.8040237,
+    "ast_hash": "d6787447f86144f1864e8633f6086f44",
+    "semantic_hash": "d6787447f86144f1864e8633f6086f44"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-event-emitter/src/health.rs": {
+    "mtime": 1779526538.698021,
+    "ast_hash": "202051437ad0ca530aff5a4b7de884ce",
+    "semantic_hash": "202051437ad0ca530aff5a4b7de884ce"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-event-emitter/src/lib.rs": {
+    "mtime": 1779526538.6988358,
+    "ast_hash": "47d2a215b1c85dcc347614581f16eb2e",
+    "semantic_hash": "47d2a215b1c85dcc347614581f16eb2e"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-event-emitter/src/event.rs": {
+    "mtime": 1779532628.519777,
+    "ast_hash": "0423265e439e2909426cc057d459c284",
+    "semantic_hash": "0423265e439e2909426cc057d459c284"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-event-emitter/src/limits.rs": {
+    "mtime": 1779534849.855752,
+    "ast_hash": "dce0b9b071026dbf197def5fc1b5af75",
+    "semantic_hash": "dce0b9b071026dbf197def5fc1b5af75"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/backends_http.rs": {
+    "mtime": 1779527424.3867517,
+    "ast_hash": "1db3d6bf34e19e723cf925fdf0a1ba15",
+    "semantic_hash": "1db3d6bf34e19e723cf925fdf0a1ba15"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/events_http.rs": {
+    "mtime": 1779532678.8552608,
+    "ast_hash": "19d1bf436b620fa307e7852934fae61a",
+    "semantic_hash": "19d1bf436b620fa307e7852934fae61a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/propagation.rs": {
+    "mtime": 1779526538.5380166,
+    "ast_hash": "0a200d495316a19fedc7b0f88027f978",
+    "semantic_hash": "0a200d495316a19fedc7b0f88027f978"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/policy_http.rs": {
+    "mtime": 1779526538.5392008,
+    "ast_hash": "198d762e73f8f2ee67dda68391654425",
+    "semantic_hash": "198d762e73f8f2ee67dda68391654425"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/proxy_http.rs": {
+    "mtime": 1780069769.1633794,
+    "ast_hash": "f3b9dc819ba5f1befb7445355b30cfc8",
+    "semantic_hash": "f3b9dc819ba5f1befb7445355b30cfc8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/lib.rs": {
+    "mtime": 1779715966.512262,
+    "ast_hash": "d4f49f6da9fd54e6f936ca1941708fff",
+    "semantic_hash": "d4f49f6da9fd54e6f936ca1941708fff"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/main.rs": {
+    "mtime": 1780070744.8663414,
+    "ast_hash": "1da9a3df308a97a2e57249a3db3507c8",
+    "semantic_hash": "1da9a3df308a97a2e57249a3db3507c8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/src/error.rs": {
+    "mtime": 1779526538.5804434,
+    "ast_hash": "dac6f13183c4ef409d96b7337b42600d",
+    "semantic_hash": "dac6f13183c4ef409d96b7337b42600d"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_owner_peercred.rs": {
+    "mtime": 1779874662.781033,
+    "ast_hash": "fd2a8f36d862f3283f3d0dba63318a01",
+    "semantic_hash": "fd2a8f36d862f3283f3d0dba63318a01"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_backends_endpoint.rs": {
+    "mtime": 1780070353.101982,
+    "ast_hash": "0bf8952e645b353e44651d89d4058ecd",
+    "semantic_hash": "0bf8952e645b353e44651d89d4058ecd"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_workspace_lock.rs": {
+    "mtime": 1780070329.860374,
+    "ast_hash": "0419a58eb898b579a9da25ff31c74edb",
+    "semantic_hash": "0419a58eb898b579a9da25ff31c74edb"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/log_file.rs": {
+    "mtime": 1779526538.5873668,
+    "ast_hash": "1e08c4e9c6c30751e544ca38a9f30f2b",
+    "semantic_hash": "1e08c4e9c6c30751e544ca38a9f30f2b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_users_conf_startup.rs": {
+    "mtime": 1779526538.5879729,
+    "ast_hash": "e8a0ebec9d117665c435cc3b58cc5a2a",
+    "semantic_hash": "e8a0ebec9d117665c435cc3b58cc5a2a"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_schema_mismatch_refusal.rs": {
+    "mtime": 1779531985.7637537,
+    "ast_hash": "fe7e277e3ba6f7417ebe065925a5410b",
+    "semantic_hash": "fe7e277e3ba6f7417ebe065925a5410b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_version_endpoint.rs": {
+    "mtime": 1779531963.7050104,
+    "ast_hash": "2c1667386c112216e18ca5886c498ed8",
+    "semantic_hash": "2c1667386c112216e18ca5886c498ed8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_create_session_container.rs": {
+    "mtime": 1780070329.87172,
+    "ast_hash": "124c88a8c41f1b7f44427f95d8789e63",
+    "semantic_hash": "124c88a8c41f1b7f44427f95d8789e63"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_ssh_config_endpoint.rs": {
+    "mtime": 1779874662.8039517,
+    "ast_hash": "288368b090242cf9eb93db90807288d7",
+    "semantic_hash": "288368b090242cf9eb93db90807288d7"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_rootless_docker.rs": {
+    "mtime": 1779541883.5808148,
+    "ast_hash": "fdd65279a239c11ed7ae79c7a6c139fb",
+    "semantic_hash": "fdd65279a239c11ed7ae79c7a6c139fb"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_proxy_websocket.rs": {
+    "mtime": 1780070255.588879,
+    "ast_hash": "34c862f19a4da816d4699984babaaddc",
+    "semantic_hash": "34c862f19a4da816d4699984babaaddc"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_shared_guest_path.rs": {
+    "mtime": 1780070329.8827202,
+    "ast_hash": "28fccab861b26dd8e13cbcde90054d26",
+    "semantic_hash": "28fccab861b26dd8e13cbcde90054d26"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/events_persist_e2e.rs": {
+    "mtime": 1779526538.5991986,
+    "ast_hash": "7b85930c08e02a14a39b2c4fdab68cf7",
+    "semantic_hash": "7b85930c08e02a14a39b2c4fdab68cf7"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/event_ingestion_pipeline.rs": {
+    "mtime": 1779526538.6010182,
+    "ast_hash": "7178afe1094ff9c85a9b24a7dfebc7d0",
+    "semantic_hash": "7178afe1094ff9c85a9b24a7dfebc7d0"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/policy_http.rs": {
+    "mtime": 1779875093.455287,
+    "ast_hash": "84d2a36bce9135cf6914f085a0c3abda",
+    "semantic_hash": "84d2a36bce9135cf6914f085a0c3abda"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_proxy_websocket_lima.rs": {
+    "mtime": 1779874662.8190684,
+    "ast_hash": "1b8edf820852f56694b4f8854cbf9504",
+    "semantic_hash": "1b8edf820852f56694b4f8854cbf9504"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_local_workspace.rs": {
+    "mtime": 1779896948.9909565,
+    "ast_hash": "ccd2fa6e67685427d3531f39e4c85571",
+    "semantic_hash": "ccd2fa6e67685427d3531f39e4c85571"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/events_http_follow.rs": {
+    "mtime": 1779875092.9631813,
+    "ast_hash": "eb58add7628f89ce9a31ca7e0e88b4f1",
+    "semantic_hash": "eb58add7628f89ce9a31ca7e0e88b4f1"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_guest_refresh.rs": {
+    "mtime": 1780070812.2559466,
+    "ast_hash": "64e6d0fa27c423644b3e486b6787ef6e",
+    "semantic_hash": "64e6d0fa27c423644b3e486b6787ef6e"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_route_helper_propagation.rs": {
+    "mtime": 1780070329.8937204,
+    "ast_hash": "867bf7436fa06159a43aed6826984627",
+    "semantic_hash": "867bf7436fa06159a43aed6826984627"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/gateway_deny_pipeline.rs": {
+    "mtime": 1779527167.918865,
+    "ast_hash": "86b0dbf2b44772ca342a75eb10efe5b6",
+    "semantic_hash": "86b0dbf2b44772ca342a75eb10efe5b6"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/policy_persistence.rs": {
+    "mtime": 1779526538.6192536,
+    "ast_hash": "284b44ff825329491bc65801cb77d1c8",
+    "semantic_hash": "284b44ff825329491bc65801cb77d1c8"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_doctor_diagnostics.rs": {
+    "mtime": 1779532712.0432353,
+    "ast_hash": "bb965ddf7dfb5be4ca7d2c7ebc8e1b65",
+    "semantic_hash": "bb965ddf7dfb5be4ca7d2c7ebc8e1b65"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/events_http_non_follow.rs": {
+    "mtime": 1779875092.9904118,
+    "ast_hash": "3a6bba51b79f8c0b3f2359d164f44856",
+    "semantic_hash": "3a6bba51b79f8c0b3f2359d164f44856"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_nft_allow_logger_ingest.rs": {
+    "mtime": 1779526538.624019,
+    "ast_hash": "1316d78e89f4b4637ac7f961c5efaa20",
+    "semantic_hash": "1316d78e89f4b4637ac7f961c5efaa20"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandboxd/tests/integration_session_create_refused_on_missing_gateway_image.rs": {
+    "mtime": 1779526538.6250188,
+    "ast_hash": "ead4008b923815fa5065a583de85aa5b",
+    "semantic_hash": "ead4008b923815fa5065a583de85aa5b"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-nft-allow-logger/src/nfct.rs": {
+    "mtime": 1779532044.3607025,
+    "ast_hash": "cab91f9b74df4df0c7abd5635cc2a8ac",
+    "semantic_hash": "cab91f9b74df4df0c7abd5635cc2a8ac"
+  },
+  "/home/olek/Projects/claude-sandbox/sandboxd/sandbox-nft-allow-logger/src/main.rs": {
+    "mtime": 1779532041.6036117,
+    "ast_hash": "004203228cc99772f4ca6c7ef22ef4f2",
+    "semantic_hash": "004203228cc99772f4ca6c7ef22ef4f2"
+  }
+}

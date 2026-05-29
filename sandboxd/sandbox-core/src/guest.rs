@@ -344,7 +344,11 @@ impl GuestConnector {
         })?;
 
         let handle = RuntimeHandle::from_session_id(session_id);
-        let transport = runtime.guest_transport(&handle);
+        // operator_uid drives sandbox-lima-helper guest-socat --op-uid.
+        // Post-V009 every session row carries a non-None operator_uid;
+        // fall back to 0 only for test rows (container runtime ignores it).
+        let op_uid = session.operator_uid.unwrap_or(0);
+        let transport = runtime.guest_transport(&handle, op_uid);
 
         debug!(
             session_id = %session_id,
@@ -845,8 +849,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::backend::{
-        AsyncReadWrite, BackendKind, Capabilities, ExitCode, GuestTransport, IsolationLevel,
-        RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec,
+        AsyncReadWrite, BackendKind, Capabilities, GuestTransport, IsolationLevel, RuntimeHandle,
+        RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec,
     };
     use crate::session::SessionConfig;
     use crate::store::SessionStore;
@@ -921,37 +925,46 @@ mod tests {
             unimplemented!("StubRuntime::start — not exercised by guest dispatch tests")
         }
 
-        async fn stop(&self, _handle: &RuntimeHandle) -> Result<(), SandboxError> {
+        async fn stop(
+            &self,
+            _handle: &RuntimeHandle,
+            _operator_uid: u32,
+        ) -> Result<(), SandboxError> {
             unimplemented!("StubRuntime::stop — not exercised by guest dispatch tests")
         }
 
-        async fn delete(&self, _handle: &RuntimeHandle) -> Result<(), SandboxError> {
+        async fn delete(
+            &self,
+            _handle: &RuntimeHandle,
+            _operator_uid: u32,
+        ) -> Result<(), SandboxError> {
             unimplemented!("StubRuntime::delete — not exercised by guest dispatch tests")
         }
 
-        async fn status(&self, _handle: &RuntimeHandle) -> Result<RuntimeStatus, SandboxError> {
+        async fn status(
+            &self,
+            _handle: &RuntimeHandle,
+            _operator_uid: u32,
+        ) -> Result<RuntimeStatus, SandboxError> {
             unimplemented!("StubRuntime::status — not exercised by guest dispatch tests")
         }
 
-        fn guest_transport(&self, _handle: &RuntimeHandle) -> Arc<dyn GuestTransport> {
+        fn guest_transport(
+            &self,
+            _handle: &RuntimeHandle,
+            _operator_uid: u32,
+        ) -> Arc<dyn GuestTransport> {
             Arc::new(StubTransport {
                 kind: self.kind,
                 observed: Arc::clone(&self.observed),
             })
         }
 
-        async fn exec_interactive(
+        async fn refresh_guest_binary(
             &self,
             _handle: &RuntimeHandle,
-            _cmd: Vec<String>,
-            _stdin: Box<dyn AsyncRead + Unpin + Send>,
-            _stdout: Box<dyn AsyncWrite + Unpin + Send>,
-            _stderr: Box<dyn AsyncWrite + Unpin + Send>,
-        ) -> Result<ExitCode, SandboxError> {
-            unimplemented!("StubRuntime::exec_interactive — not exercised by guest dispatch tests")
-        }
-
-        async fn refresh_guest_binary(&self, _handle: &RuntimeHandle) -> Result<(), SandboxError> {
+            _operator_uid: u32,
+        ) -> Result<(), SandboxError> {
             unimplemented!(
                 "StubRuntime::refresh_guest_binary — not exercised by guest dispatch tests"
             )

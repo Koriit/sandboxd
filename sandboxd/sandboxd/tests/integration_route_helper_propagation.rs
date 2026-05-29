@@ -347,7 +347,7 @@ async fn integration_route_helper_for_user_propagated() {
         "fourth argv item must be the gateway IP we provisioned; got: {argv:?}"
     );
 
-    runtime.delete(&handle).await.expect("runtime.delete");
+    runtime.delete(&handle, 0).await.expect("runtime.delete");
     // Hold the tempdir alive until after the assertions read it.
     drop(stub_dir);
 }
@@ -522,5 +522,5 @@ async fn integration_route_helper_missing_for_user_with_helper_path_errors() {
         "stub helper must not have been invoked on the error path; got: {argv:?}"
     );
 
-    runtime.delete(&handle).await.expect("runtime.delete");
+    runtime.delete(&handle, 0).await.expect("runtime.delete");
 }

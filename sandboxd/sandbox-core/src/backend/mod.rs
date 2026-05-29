@@ -123,15 +123,14 @@ pub struct RuntimeStartArgs {
     /// for every backend whenever the operator identity has been
     /// resolved (post-V008). The container runtime uses it for
     /// `docker create --user <uid>:<gid>`; the Lima runtime uses it to
-    /// dispatch `limactl start` through `sandbox-spawn-helper` (which
-    /// `setresuid(uid)` before exec) and to interpolate the operator's
-    /// uid/gid into the per-session cloud-init `usermod` provision step.
+    /// interpolate the operator's uid/gid into the per-session cloud-init
+    /// `usermod` provision step. All Lima limactl operations are dispatched
+    /// through the per-operator `LimaManager` (keyed by uid), so uid
+    /// alignment for `limactl start` is implicit.
     ///
     /// `None` means the operator identity is unavailable — either a
     /// pre-V008 record where the daemon didn't yet capture peercred, or
-    /// a fixture-test row that omits it. Both backends fall back to the
-    /// legacy "spawn as the daemon's own uid/gid" path, preserving
-    /// pre-supervisor-fork behaviour.
+    /// a fixture-test row that omits it.
     pub operator_identity: Option<(u32, u32)>,
 }
 
@@ -209,29 +208,6 @@ pub enum RuntimeStatus {
     Unknown(String),
 }
 
-/// Process exit status returned by [`SessionRuntime::exec_interactive`].
-///
-/// A thin newtype around an `i32` exit code so call sites do not couple
-/// to `std::process::ExitStatus` (whose representation varies by
-/// platform and whose constructor is unstable). Backends translate
-/// their native exit-status types (e.g. `std::process::ExitStatus`,
-/// container exec wait codes) into this newtype.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExitCode(pub i32);
-
-impl ExitCode {
-    /// `true` when the process exited with status `0`.
-    pub fn success(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl std::fmt::Display for ExitCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Convenience trait combining [`AsyncRead`] and [`AsyncWrite`] for
 /// the bidirectional stream returned by [`GuestTransport::connect`].
 ///
@@ -306,36 +282,50 @@ pub trait SessionRuntime: Send + Sync {
 
     /// Gracefully stop a running session. Idempotent: stopping a
     /// stopped session must not error.
-    async fn stop(&self, handle: &RuntimeHandle) -> Result<(), SandboxError>;
+    ///
+    /// `operator_uid` is the numeric uid of the operator that owns the
+    /// session. The Lima runtime dispatches through `sandbox-lima-helper
+    /// stop --op-uid`; the container runtime accepts and ignores it.
+    async fn stop(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError>;
 
     /// Delete a stopped session and its artefacts. Idempotent.
-    async fn delete(&self, handle: &RuntimeHandle) -> Result<(), SandboxError>;
+    ///
+    /// `operator_uid` is the numeric uid of the operator that owns the
+    /// session. The Lima runtime dispatches through `sandbox-lima-helper
+    /// delete --op-uid`; the container runtime accepts and ignores it.
+    async fn delete(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError>;
 
     /// Query the current state of a session.
-    async fn status(&self, handle: &RuntimeHandle) -> Result<RuntimeStatus, SandboxError>;
+    ///
+    /// `operator_uid` is the numeric uid of the operator that owns the
+    /// session. The Lima runtime dispatches through `sandbox-lima-helper
+    /// list-json --op-uid`; the container runtime accepts and ignores it.
+    async fn status(
+        &self,
+        handle: &RuntimeHandle,
+        operator_uid: u32,
+    ) -> Result<RuntimeStatus, SandboxError>;
 
     /// Return a guest-agent transport bound to this session's
     /// handle. The returned transport is cheap to clone and is
     /// expected to be reusable across many `connect()` calls.
-    fn guest_transport(&self, handle: &RuntimeHandle) -> Arc<dyn GuestTransport>;
-
-    /// Run an arbitrary command inside the session with stdio
-    /// streamed through the supplied byte sinks. Used by `sandbox
-    /// ssh`, `sandbox exec`, and `git-remote-sandbox`. Distinct from
-    /// [`GuestTransport::connect`]: this path is raw process exec
-    /// with stdio piping, not a structured-JSON agent dialogue.
-    async fn exec_interactive(
-        &self,
-        handle: &RuntimeHandle,
-        cmd: Vec<String>,
-        stdin: Box<dyn AsyncRead + Unpin + Send>,
-        stdout: Box<dyn AsyncWrite + Unpin + Send>,
-        stderr: Box<dyn AsyncWrite + Unpin + Send>,
-    ) -> Result<ExitCode, SandboxError>;
+    ///
+    /// `operator_uid` is the numeric uid of the operator that owns the session.
+    /// The Lima runtime uses it to pivot to the operator's uid via
+    /// `sandbox-lima-helper guest-socat`; the container runtime accepts
+    /// and ignores it (Docker's `--user` mediation handles cross-user
+    /// isolation there).
+    fn guest_transport(&self, handle: &RuntimeHandle, operator_uid: u32)
+    -> Arc<dyn GuestTransport>;
 
     /// Push the daemon's embedded `sandbox-guest` binary into the
     /// session addressed by `handle` so that the next
     /// `runtime.start` exec picks up the new binary.
+    ///
+    /// `operator_uid` is the numeric uid of the operator that owns the
+    /// session. The Lima runtime dispatches through `sandbox-lima-helper`
+    /// (`start` → `install-guest-agent` → `stop`); the container runtime
+    /// accepts and ignores it (Docker handles cross-user isolation).
     ///
     /// Implementations are responsible for the order of operations
     /// within their own substrate (start the runtime if it was stopped,
@@ -348,7 +338,11 @@ pub trait SessionRuntime: Send + Sync {
     /// Idempotent — repeated invocations of this method on the same
     /// session must observe the same outcome as a single invocation,
     /// so crash-recovery flows can re-run refresh without harm.
-    async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError>;
+    async fn refresh_guest_binary(
+        &self,
+        handle: &RuntimeHandle,
+        operator_uid: u32,
+    ) -> Result<(), SandboxError>;
 }
 
 #[cfg(test)]
@@ -396,15 +390,8 @@ mod tests {
         _assert_clone::<RuntimeStartArgs>();
     }
 
-    /// `ExitCode::success` matches POSIX convention: only zero is
-    /// success.
-    #[test]
-    fn exit_code_success_only_for_zero() {
-        assert!(ExitCode(0).success());
-        assert!(!ExitCode(1).success());
-        assert!(!ExitCode(-1).success());
-        assert!(!ExitCode(127).success());
-    }
+    // exit_code_success_only_for_zero test removed — ExitCode removed with
+    // exec_interactive.
 
     /// `dyn SessionRuntime` and `dyn GuestTransport` are object-safe
     /// so the daemon can hold them as trait objects in `AppState`.

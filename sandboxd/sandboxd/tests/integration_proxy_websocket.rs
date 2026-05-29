@@ -60,7 +60,7 @@ use sandbox_core::SshKeypair;
 use sandbox_core::backend::{
     BackendKind, LITE_IMAGE_REPOSITORY, ensure_image, stage_ssh_credentials,
 };
-use sandbox_core::{LimaManager, SessionConfig, SessionStore};
+use sandbox_core::{LimaManagerRegistry, SessionConfig, SessionStore};
 use sandboxd::proxy_http::{ProxyState, handle_proxy};
 use tempfile::TempDir;
 
@@ -435,17 +435,17 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
     // Step 6: mount the production proxy handler behind a one-route
     // axum router and serve on a TCP loopback listener.
     let store = Arc::new(store);
-    // LimaManager is never invoked on the container path; constructed
-    // pointing at the test's base_dir so its `~/.lima/`-rooted state
-    // never escapes the tempdir.
-    let lima = Arc::new(
-        LimaManager::new(
-            base_dir.path().to_path_buf(),
-            "sandbox-base-test".to_string(),
-        )
-        .expect("LimaManager::new"),
-    );
-    let proxy_state = Arc::new(ProxyState { store, lima });
+    // LimaManagerRegistry is never invoked on the container path;
+    // constructed with a stub helper path so the registry is present but
+    // never triggers a real helper invocation in this test.
+    let lima_registry = Arc::new(LimaManagerRegistry::new(
+        "sandbox-base-test".to_string(),
+        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+    ));
+    let proxy_state = Arc::new(ProxyState {
+        store,
+        lima_registry,
+    });
     let app = build_router(proxy_state, operator.to_string());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

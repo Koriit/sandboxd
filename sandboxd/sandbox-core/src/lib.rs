@@ -51,7 +51,7 @@ pub use atomic_listener_writer::{
 pub use backend::{
     AsyncReadWrite, BackendInfo, BackendKind, BackendSpecific, Capabilities, CliDockerOps,
     ContainerNetwork, ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG, DockerOps,
-    EnsureImageOutcome, ExitCode, GuestTransport, IsolationLevel, LITE_FIRST_USE_WARNING,
+    EnsureImageOutcome, GuestTransport, IsolationLevel, LITE_FIRST_USE_WARNING,
     LITE_IMAGE_REPOSITORY, LITE_TAG_OVERRIDE_ENV, LimaRuntime, LimaTransport, ReaperReport,
     RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec,
     UnsupportedFeature, compute_default_resource_limits, ensure_image,

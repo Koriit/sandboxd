@@ -390,7 +390,7 @@ async fn integration_create_session_container_backend_round_trip() {
         .await
         .expect("runtime.start");
 
-    let status = runtime.status(&handle).await.expect("runtime.status");
+    let status = runtime.status(&handle, 0).await.expect("runtime.status");
     assert!(
         matches!(status, RuntimeStatus::Running),
         "container must be Running after start; got {status:?}"
@@ -406,7 +406,7 @@ async fn integration_create_session_container_backend_round_trip() {
 
     // Tear down the docker side; the SessionStore TempDir drops with
     // the test scope.
-    runtime.delete(&handle).await.expect("runtime.delete");
+    runtime.delete(&handle, 0).await.expect("runtime.delete");
 }
 
 /// Phase 3D contract (b) — the lite image first-use warning surfaces

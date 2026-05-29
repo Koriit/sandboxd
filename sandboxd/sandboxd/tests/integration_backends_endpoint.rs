@@ -20,22 +20,20 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use tempfile::TempDir;
 use tower::ServiceExt;
 
 use sandbox_core::backend::{BackendInfo, BackendKind, IsolationLevel, SessionRuntime};
 use sandbox_core::lima::DEFAULT_BASE_VM_NAME;
-use sandbox_core::{LimaManager, LimaRuntime};
+use sandbox_core::{LimaManagerRegistry, LimaRuntime};
 use sandboxd::backends_http::{BackendsApiState, backends_router};
 
 #[tokio::test]
 async fn integration_backends_endpoint_lists_registered_backends_in_stable_order() {
-    let tmp = TempDir::new().expect("tempdir");
-    let manager = Arc::new(
-        LimaManager::new(tmp.path().to_path_buf(), DEFAULT_BASE_VM_NAME.to_string())
-            .expect("LimaManager::new"),
-    );
-    let lima = LimaRuntime::new(manager, None);
+    let registry = Arc::new(LimaManagerRegistry::new(
+        DEFAULT_BASE_VM_NAME.to_string(),
+        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+    ));
+    let lima = LimaRuntime::new(registry);
 
     let mut runtimes: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
     runtimes.insert(BackendKind::Lima, lima);

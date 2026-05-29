@@ -32,11 +32,11 @@ use sandbox_core::{
     DnsCache, DockerExecLdsProbe, DockerHealth, EventBus, EventBusConfig, ExecRequest,
     ExecResponse, GateRequest, GateService, GateServiceOutcome, GateStatus, GatewayHealth,
     GatewayManager, GatewayShutdownReason, GatewayStatus, GuestConnector, GuestResponse,
-    HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, LockState, LockToken,
+    HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManagerRegistry, LockState, LockToken,
     NetworkHealth, NetworkInfo, NetworkManager, OperatorIdentity, PersistConfig, PersistentSink,
     Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session,
     SessionConfig, SessionDto, SessionHealth, SessionId, SessionIngestor, SessionMountInfo,
-    SessionNetworkInfo, SessionState, SessionStore, UpdatePolicyRequest, UsersConfig,
+    SessionNetworkInfo, SessionState, SessionStore, UpdatePolicyRequest, UsersConfig, VmInfo,
     VmIpSessionMap, VmStatus, WorkspaceLockAcquireRequest, WorkspaceLockAcquireResponse,
     WorkspaceLockReleaseRequest, WorkspaceOp, attach_vm_to_bridge, bind_gate_listener,
     detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules, hash_policy,
@@ -404,7 +404,7 @@ fn validate_base_vm_name(name: &str) -> Result<(), SandboxError> {
 ///
 /// Validation happens here so a single early failure stops the daemon
 /// before any limactl argv is built. Returns the validated name as an
-/// owned `String` ready to hand to [`LimaManager::new`].
+/// owned `String` ready to hand to [`LimaManagerRegistry::new`].
 fn resolve_base_vm_name() -> Result<String, SandboxError> {
     let raw = std::env::var(BASE_VM_NAME_ENV)
         .unwrap_or_else(|_| sandbox_core::DEFAULT_BASE_VM_NAME.to_string());
@@ -710,8 +710,8 @@ fn xattr_has_cap_sys_admin_effective(buf: &[u8]) -> bool {
 }
 
 /// Capability bit for `CAP_SETUID` (UAPI `linux/capability.h` —
-/// `#define CAP_SETUID 7`). Required by `sandbox-spawn-helper`'s
-/// `setresuid(2)` call.
+/// `#define CAP_SETUID 7`). Required by `sandbox-lima-helper`'s
+/// `setresuid(2)` call (checked by the daemon resolver at startup).
 const CAP_SETUID_BIT: u32 = 7;
 
 /// Generalised inner of [`xattr_has_cap_sys_admin_effective`] — decode
@@ -719,7 +719,7 @@ const CAP_SETUID_BIT: u32 = 7;
 /// `cap_bit` is present in `permitted` *and* the blob's `effective`
 /// flag is set. Pure function: identical to the existing
 /// `cap_sys_admin` check but parameterized over which capability bit
-/// to look for so the spawn-helper resolver (which needs `CAP_SETUID`)
+/// to look for so the lima-helper resolver (which needs `CAP_SETUID`)
 /// can share the xattr-decoding logic.
 ///
 /// We only consult `data[0].permitted` because every capability the
@@ -752,120 +752,20 @@ fn xattr_has_cap_effective(buf: &[u8], cap_bit: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// sandbox-spawn-helper path resolution
+// sandbox-lima-helper path resolution
 // ---------------------------------------------------------------------------
 //
-// The Lima backend dispatches `limactl start` through
-// `sandbox-spawn-helper` so the per-session QEMU process runs under
-// the operator's uid (not the daemon's). The helper is a cap'd setcap
-// binary (`cap_setuid+ep`) at the FHS-canonical install path
-// `/usr/local/libexec/sandboxd/sandbox-spawn-helper`. Resolution
-// mirrors the route-helper precedent:
-//
-//   0. `$SANDBOX_SPAWN_HELPER_PATH` — explicit operator override. If
-//      set, the resolver uses this path and only this path (fail-closed
-//      if missing or un-cap'd). Used by tests; production operators
-//      don't set it.
-//   1. `/usr/local/libexec/sandboxd/sandbox-spawn-helper` (FHS § 4.7).
-//      Installed by `make install-spawn-helper-prod-cap`.
-//
-// The resolver returns `None` when no candidate is usable — the Lima
-// runtime then falls back to spawning `limactl` under the daemon's own
-// uid (the legacy "spawn-as-daemon" path). This is a soft fallback
-// because the spawn-helper is only needed for the cross-user case
-// (daemon uid 999 + operator uid 1000+); single-user dev installs
-// where the daemon already runs as the operator don't need it.
-//
-// **Why `Option<PathBuf>` instead of `Result<PathBuf, _>`**: this
-// matches the historical container-backend `route_helper_path:
-// Option<PathBuf>` shape on `ContainerNetwork`. The route helper is
-// also optional at the *type* level — the runtime decides whether to
-// invoke it based on `Some`/`None` at the call site. Keeping the same
-// shape for the spawn helper lets the Lima runtime apply the same
-// "if-Some-then-helper-else-direct" gate without a special error
-// type.
+// sandbox-lima-helper is the privileged setcap helper that pivots the daemon
+// to the operator's uid before exec'ing limactl for every Lima control-plane
+// operation. The former sandbox-spawn-helper has been removed; its only caller was
+// start_vm, which now routes through the lima-helper registry.
+// The resolve_spawn_helper_path / resolve_spawn_helper_path_from functions
+// and their unit tests were deleted in the same session.
 
-/// Canonical install path (FHS § 4.7) for `sandbox-spawn-helper`.
-const SPAWN_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-spawn-helper";
-
-/// Environment variable for explicit operator override of the
-/// spawn-helper path. When set, the resolver uses this path and only
-/// this path (fail-closed if missing or un-cap'd). Intended for tests
-/// and unusual deployments; production operators should not set it.
-const SPAWN_HELPER_PATH_ENV: &str = "SANDBOX_SPAWN_HELPER_PATH";
-
-/// Resolve the absolute path to `sandbox-spawn-helper` for use as
-/// `LimaRuntime::new`'s `spawn_helper_path` argument.
-///
-/// Returns `None` when no usable candidate exists (no env override,
-/// canonical path missing or un-cap'd). The Lima runtime treats `None`
-/// as "fall back to direct `limactl` spawn under daemon uid" — same
-/// soft-fallback semantics the daemon used before M18 cross-user work.
-///
-/// When `$SANDBOX_SPAWN_HELPER_PATH` is set, the resolver uses it
-/// exclusively (fail-closed: if the path is missing or un-cap'd, the
-/// resolver returns `None` AND logs at warn level so operators see the
-/// misconfiguration in journalctl).
-pub(crate) fn resolve_spawn_helper_path() -> Option<PathBuf> {
-    let env_override = std::env::var_os(SPAWN_HELPER_PATH_ENV).map(PathBuf::from);
-    let install_path = PathBuf::from(SPAWN_HELPER_INSTALL_PATH);
-    resolve_spawn_helper_path_from(env_override.as_deref(), &install_path, has_setuid_cap)
-}
-
-/// Pure inner of [`resolve_spawn_helper_path`].
-///
-/// Two-step resolver (parallel to [`resolve_route_helper_path_from`]):
-///
-///   - If `env_override` is `Some(path)`, that is the ONLY candidate.
-///     `None` if `is_usable(path)` is false (with a warn log) —
-///     explicit operator intent must not silently fall through to the
-///     canonical install path.
-///   - Otherwise the canonical `install_path` is the only candidate.
-///     `None` if not usable.
-///
-/// Parameterized over `is_usable` so unit tests can drive the resolver
-/// without `setcap`-ing real binaries (the test harness lacks
-/// `CAP_SETFCAP`).
-pub(crate) fn resolve_spawn_helper_path_from<F>(
-    env_override: Option<&std::path::Path>,
-    install_path: &std::path::Path,
-    is_usable: F,
-) -> Option<PathBuf>
-where
-    F: Fn(&std::path::Path) -> bool,
-{
-    if let Some(env_path) = env_override {
-        if is_usable(env_path) {
-            return Some(env_path.to_path_buf());
-        }
-        tracing::warn!(
-            path = %env_path.display(),
-            env_var = SPAWN_HELPER_PATH_ENV,
-            "sandbox-spawn-helper env-override path is not usable \
-             (must be a regular file carrying cap_setuid+ep); \
-             falling back to legacy spawn-as-daemon path. \
-             To install: `sudo setcap 'cap_setuid+ep' {path}`",
-            path = env_path.display(),
-        );
-        return None;
-    }
-    if is_usable(install_path) {
-        return Some(install_path.to_path_buf());
-    }
-    tracing::info!(
-        path = %install_path.display(),
-        "sandbox-spawn-helper not installed at the canonical path; \
-         Lima sessions will spawn under the daemon's own uid. \
-         Install with `make install-spawn-helper-prod-cap` to \
-         enable cross-user uid alignment."
-    );
-    None
-}
-
-/// Predicate used by [`resolve_spawn_helper_path`] to decide whether a
-/// candidate path is a usable spawn-helper binary: the file must exist
+/// Predicate used by `has_setuid_cap` to decide whether a
+/// candidate path is a usable helper binary: the file must exist
 /// *and* carry `CAP_SETUID` in the effective-on-exec set. Mirrors
-/// [`has_required_caps`] for the route helper but inspects
+/// `has_required_caps` for the route helper but inspects
 /// `CAP_SETUID` instead of `CAP_SYS_ADMIN`.
 fn has_setuid_cap(path: &std::path::Path) -> bool {
     if !path.is_file() {
@@ -993,8 +893,8 @@ struct AppState {
     /// Backend dispatch table keyed by [`BackendKind`].
     ///
     /// Handler call sites talking to the *generic* lifecycle
-    /// (create / start / stop / delete / status / ip / exec_interactive
-    /// / guest_transport) go through the trait, while Lima-specific
+    /// (create / start / stop / delete / status / guest_transport /
+    /// refresh_guest_binary) go through the trait, while Lima-specific
     /// orchestration (clone, base image, agent install, list_vms)
     /// continues to call the typed runtime directly via
     /// [`LimaRuntime::manager`]. The same `Arc<LimaRuntime>` is
@@ -1004,11 +904,11 @@ struct AppState {
     /// under [`BackendKind::Container`].
     runtimes: Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>>,
     /// Typed handle to the Lima/QEMU runtime, retained so the daemon
-    /// can still call Lima-specific orchestration that does not (yet)
-    /// have a trait surface — base-image build/check/rebuild, golden
-    /// VM clone, custom-template create, guest agent install, and the
-    /// admin `/vms` listing. See [`LimaRuntime::manager`] for the
-    /// escape hatch that keeps these calls one method-chain away.
+    /// can call Lima-specific orchestration that does not have a trait
+    /// surface — base-image build/check/rebuild, golden VM clone,
+    /// custom-template create, guest agent install, and the admin `/vms`
+    /// listing. Use `lima_runtime.manager_for(op_uid)` to get the
+    /// per-operator [`LimaManager`] for a given operator's LIMA_HOME.
     lima_runtime: Arc<LimaRuntime>,
     /// Typed handle to the Docker/lite container runtime, retained
     /// alongside `runtimes` for the same reason `lima_runtime` is —
@@ -2112,7 +2012,7 @@ async fn create_session(
         ($state:expr, $session_id:expr, $err_resp:expr) => {{
             let runtime = runtime_for(&*$state, backend_kind);
             let handle = RuntimeHandle::from_session_id(&$session_id);
-            let _ = runtime.delete(&handle).await;
+            let _ = runtime.delete(&handle, operator.uid).await;
             let network = $state.network.clone();
             let base_dir = $state.base_dir.clone();
             let sid = $session_id;
@@ -2954,7 +2854,7 @@ async fn create_session(
             let _base_guard = state.base_image_lock.lock().await;
 
             let base_status = {
-                let lima_check = Arc::clone(state.lima_runtime.manager());
+                let lima_check = state.lima_runtime.manager_for(operator.uid);
                 match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
@@ -2979,7 +2879,7 @@ async fn create_session(
                 BaseImageStatus::Missing => {
                     // Must build -- no choice.
                     info!("base image missing, building...");
-                    let lima_build = Arc::clone(state.lima_runtime.manager());
+                    let lima_build = state.lima_runtime.manager_for(operator.uid);
                     match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
@@ -3014,7 +2914,7 @@ async fn create_session(
 
         // Clone from the base image.
         {
-            let lima_clone = Arc::clone(state.lima_runtime.manager());
+            let lima_clone = state.lima_runtime.manager_for(operator.uid);
             let sid = session_id;
             let cpus = config.cpus;
             let memory_mb = config.memory_mb;
@@ -3122,15 +3022,12 @@ async fn create_session(
         }
 
         {
-            // `install_guest_agent` is Lima-specific (it shells out to
-            // `limactl shell` to inject the binary) and stays behind
-            // the `LimaRuntime::manager()` escape hatch until the
-            // trait surface grows to cover agent bootstrapping in a
-            // backend-agnostic way.
-            let lima = Arc::clone(state.lima_runtime.manager());
-            let op_uid = operator.uid;
+            // install_guest_agent is Lima-specific (dispatched through
+            // sandbox-lima-helper install-guest-agent). Uses the per-operator
+            // manager from the registry.
+            let lima = state.lima_runtime.manager_for(operator.uid);
             let vm = sandbox_core::vm_name(&session_id);
-            match tokio::task::spawn_blocking(move || lima.install_guest_agent(op_uid, &vm)).await {
+            match tokio::task::spawn_blocking(move || lima.install_guest_agent(&vm)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     error!(%session_id, error = %e, "failed to install guest agent");
@@ -3621,7 +3518,7 @@ async fn list_sessions(
     // matches on `VmStatus`. Multi-backend listing (fan-out across
     // every registered runtime) is a future extension once additional
     // backends ship a comparable inventory surface.
-    let lima = Arc::clone(state.lima_runtime.manager());
+    let lima = state.lima_runtime.manager_for(operator.uid);
     let vm_list = tokio::task::spawn_blocking(move || lima.list_vms().unwrap_or_default())
         .await
         .unwrap_or_default();
@@ -3690,7 +3587,8 @@ async fn get_session(
     {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
-        if let Ok(rt_status) = runtime.status(&handle).await {
+        let op_uid = session.operator_uid.unwrap_or(operator.uid);
+        if let Ok(rt_status) = runtime.status(&handle, op_uid).await {
             match (&session.state, &rt_status) {
                 (SessionState::Running, sandbox_core::backend::RuntimeStatus::Stopped) => {
                     session.state = SessionState::Stopped;
@@ -3898,7 +3796,13 @@ async fn start_session(
             );
             let runtime = runtime_for(&state, session.backend);
             let handle = RuntimeHandle::from_session_id(&session.id);
-            match runtime.refresh_guest_binary(&handle).await {
+            // operator_uid is required by the Lima backend to dispatch through
+            // sandbox-lima-helper; post-V009 every session carries one.
+            let op_uid_for_refresh = session.operator_uid.unwrap_or(operator.uid);
+            match runtime
+                .refresh_guest_binary(&handle, op_uid_for_refresh)
+                .await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     error!(
@@ -4212,7 +4116,8 @@ async fn stop_session(
         // Dispatch through the trait, keyed off the persisted backend.
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
-        match runtime.stop(&handle).await {
+        let op_uid = session.operator_uid.unwrap_or(operator.uid);
+        match runtime.stop(&handle, op_uid).await {
             Ok(()) => {}
             Err(e) => {
                 state.sessions_stopping.lock().await.remove(&session.id);
@@ -4334,7 +4239,8 @@ async fn remove_session(
     {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
-        let _ = runtime.delete(&handle).await;
+        let op_uid_for_delete = session.operator_uid.unwrap_or(operator.uid);
+        let _ = runtime.delete(&handle, op_uid_for_delete).await;
 
         let gateway = state.gateway.clone();
         let network = state.network.clone();
@@ -6667,7 +6573,8 @@ async fn session_health(
     let vm_status = {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
-        match runtime.status(&handle).await {
+        let op_uid = session.operator_uid.unwrap_or(operator.uid);
+        match runtime.status(&handle, op_uid).await {
             Ok(sandbox_core::backend::RuntimeStatus::Running) => "running".to_string(),
             Ok(sandbox_core::backend::RuntimeStatus::Stopped) => "stopped".to_string(),
             Ok(sandbox_core::backend::RuntimeStatus::Creating) => "creating".to_string(),
@@ -6919,7 +6826,7 @@ async fn get_proxy(
 ) -> impl IntoResponse {
     let proxy_state = Arc::new(sandboxd::proxy_http::ProxyState {
         store: Arc::clone(&state.store),
-        lima: Arc::clone(state.lima_runtime.manager()),
+        lima_registry: Arc::clone(state.lima_runtime.registry()),
     });
     match sandboxd::proxy_http::handle_proxy(proxy_state, operator.name, id, ws).await {
         Ok(resp) => resp.into_response(),
@@ -6993,7 +6900,11 @@ impl Default for RebuildImageRequest {
 /// no body and expect Lima behavior. Axum's `Json<T>` extractor rejects
 /// empty bodies outright, so the body is read raw via the [`Bytes`]
 /// extractor and parsed manually with `serde_json::from_slice`.
-async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+async fn rebuild_image(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+    body: Bytes,
+) -> impl IntoResponse {
     // Decode the body. Empty body → default (Lima, no_cache=false) for
     // backwards-compat. Malformed JSON or unknown backend kind → 400.
     let req: RebuildImageRequest = if body.is_empty() {
@@ -7017,7 +6928,7 @@ async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl 
             // `no_cache` flag is therefore a no-op on the Lima path;
             // no new flag plumbing is required.
             let _base_guard = state.base_image_lock.lock().await;
-            let lima = Arc::clone(state.lima_runtime.manager());
+            let lima = state.lima_runtime.manager_for(operator.uid);
             match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
                 Ok(Ok(())) => (StatusCode::OK, "base image rebuilt").into_response(),
                 Ok(Err(e)) => error_response(e).into_response(),
@@ -7048,11 +6959,13 @@ async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl 
 }
 
 /// `GET /base-image-status` -- check the status of the golden base image.
-async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn base_image_status(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+) -> impl IntoResponse {
     // Base-image status is Lima-specific (the hash-and-age check
-    // operates on the golden VM); kept on the typed runtime's escape
-    // hatch.
-    let lima = Arc::clone(state.lima_runtime.manager());
+    // operates on the golden VM); uses the per-operator manager.
+    let lima = state.lima_runtime.manager_for(operator.uid);
     match tokio::task::spawn_blocking(move || lima.check_base_image()).await {
         Ok(Ok(status)) => {
             let json = match status {
@@ -7300,11 +7213,10 @@ async fn diagnostics_handler(
     // is NOT in the caller's list. An operator only sees resources
     // they cannot account for — they cannot infer another operator's
     // session ids from this surface.
-    let lima_runtime_for_blocking = Arc::clone(&state.lima_runtime);
+    let lima_mgr = state.lima_runtime.manager_for(operator.uid);
     let caller_session_ids_for_lima = caller_session_ids.clone();
     let lima_orphans: Vec<String> = tokio::task::spawn_blocking(move || {
-        lima_runtime_for_blocking
-            .manager()
+        lima_mgr
             .list_vms()
             .unwrap_or_default()
             .into_iter()
@@ -7430,13 +7342,9 @@ async fn diagnostics_handler(
 /// - If the VM exists and states match -> no action
 /// - If the VM exists but states disagree -> update store to match Lima
 ///
-/// Takes the wrapping [`LimaRuntime`] rather than the
-/// raw [`LimaManager`], reaching for `list_vms()` through
-/// [`LimaRuntime::manager`]. The body still pattern-matches on the
-/// Lima-native [`VmStatus`] because the reconciliation contract is
-/// single-backend; per-backend reconciliation fan-out is a future
-/// extension once additional backends ship a comparable inventory
-/// surface.
+/// Under the per-operator LIMA_HOME model, VMs are enumerated per-operator
+/// via `sandbox-lima-helper list-json --op-uid`. Sessions without an
+/// operator_uid (deleted by V009 on upgrade) are skipped.
 fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
     // Daemon startup path — runs before any HTTP handler, so per-caller
     // filtering would be meaningless here. Use the unfiltered helper to
@@ -7454,13 +7362,32 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
         return;
     }
 
-    let vm_list = match lima_runtime.manager().list_vms() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "reconciliation: failed to list VMs, skipping");
-            return;
+    // Collect Lima sessions grouped by operator uid.
+    let mut op_uids: std::collections::HashMap<u32, Vec<&sandbox_core::Session>> =
+        std::collections::HashMap::new();
+    for session in &sessions {
+        if session.backend == BackendKind::Lima {
+            if let Some(uid) = session.operator_uid {
+                op_uids.entry(uid).or_default().push(session);
+            }
         }
-    };
+    }
+
+    // Build a merged VM list by querying each operator's LIMA_HOME.
+    let mut vm_list: Vec<VmInfo> = Vec::new();
+    for &op_uid in op_uids.keys() {
+        let mgr = lima_runtime.registry().get_or_create(op_uid);
+        match mgr.list_vms() {
+            Ok(vms) => vm_list.extend(vms),
+            Err(e) => {
+                warn!(
+                    op_uid,
+                    error = %e,
+                    "reconciliation: failed to list VMs for operator, skipping"
+                );
+            }
+        }
+    }
 
     let mut ok_count = 0u32;
     let mut fixed_count = 0u32;
@@ -8356,16 +8283,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     info!(base_vm_name = %base_vm_name, "base VM name resolved");
-    let lima = Arc::new(LimaManager::new(base_dir.clone(), base_vm_name)?);
-
-    // Resolve `sandbox-lima-helper` at startup.  The helper is required
-    // for the cross-user Lima model (daemon uid ≠ operator uid); the
-    // resolver returns `Result` — `Err` is fatal and the daemon refuses
-    // to start.  `resolve_lima_helper_path()` consults
-    // `$SANDBOX_LIMA_HELPER_PATH` first (fail-closed if set but
-    // missing/un-cap'd) then the canonical install path
-    // `/usr/local/libexec/sandboxd/sandbox-lima-helper` (FHS § 4.7).
-    // Both must carry `cap_setuid+ep`.  There is no soft fallback.
+    // Resolve `sandbox-lima-helper` at startup. The helper is required for
+    // the cross-user Lima model; the resolver returns `Result` — `Err` is
+    // fatal and the daemon refuses to start. There is no soft fallback.
     let lima_helper_path = match resolve_lima_helper_path() {
         Ok(path) => {
             info!(
@@ -8381,32 +8301,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Wrap the existing `LimaManager` in a [`LimaRuntime`] and register
-    // it in the backend dispatch table. The same `Arc<LimaRuntime>` is
-    // held both as a typed handle (for Lima-only orchestration via
-    // `LimaRuntime::manager()`) and inside `runtimes` (for handler-side
-    // trait dispatch).
-    //
-    // `resolve_spawn_helper_path()` consults `$SANDBOX_SPAWN_HELPER_PATH`
-    // then `/usr/local/libexec/sandboxd/sandbox-spawn-helper`; both must
-    // carry `cap_setuid+ep`. The resolver returns `None` (with an info
-    // log) when no usable candidate exists — Lima sessions then fall
-    // back to spawning `limactl start` directly under the daemon's own
-    // uid (the pre-M18 shape). This is a soft fallback by design: the
-    // helper is only required for the cross-user case (daemon uid 999 +
-    // operator uid 1000), so a single-user dev install where the
-    // daemon runs as the operator doesn't strictly need it.
-    let spawn_helper_path = resolve_spawn_helper_path();
-    info!(
-        spawn_helper_path = ?spawn_helper_path,
-        "resolved sandbox-spawn-helper path for Lima backend"
-    );
-    // Store the resolved lima-helper path on the Lima runtime so S13 can
-    // thread it into every call site without a separate resolver call.
-    // For now it is held on `LimaRuntime` as substrate — no call site
-    // routes through it yet (that is the S13 flip).
-    let _ = &lima_helper_path; // suppress unused-variable lint until S13 wires it
-    let lima_runtime = LimaRuntime::new(Arc::clone(&lima), spawn_helper_path);
+    // Build the per-operator LimaManager registry. One LimaManager per
+    // operator uid, created lazily on first session-create. All limactl
+    // operations go through sandbox-lima-helper (pivoted to operator uid).
+    let lima_registry = Arc::new(LimaManagerRegistry::new(base_vm_name, lima_helper_path));
+
+    // Build the Lima runtime backed by the registry and register it in
+    // the backend dispatch table. The same Arc<LimaRuntime> is held both
+    // as a typed handle (for Lima-only orchestration via
+    // LimaRuntime::manager_for(op_uid)) and inside `runtimes` (for
+    // handler-side trait dispatch).
+    let lima_runtime = LimaRuntime::new(Arc::clone(&lima_registry));
     let mut runtimes: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
     runtimes.insert(
         BackendKind::Lima,
@@ -8627,13 +8532,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // `lima` is intentionally not stashed on `AppState` directly any
-    // more — handlers reach the runtime through `runtimes` (trait
-    // dispatch) or `lima_runtime.manager()` (Lima-only orchestration).
-    // The original `Arc<LimaManager>` was cloned into `LimaRuntime::new`;
-    // `GuestConnector` now dispatches via the runtime registry rather
-    // than holding a `LimaManager` directly. The local binding above is
-    // dropped at end of scope.
+    // Handlers reach the runtime through `runtimes` (trait dispatch) or
+    // `lima_runtime.manager_for(op_uid)` (Lima-only orchestration with the
+    // per-operator manager from the registry). The lima_registry Arc is
+    // held inside lima_runtime; no separate binding is needed.
     let state = Arc::new(AppState {
         base_dir,
         store,
@@ -10034,79 +9936,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // sandbox-spawn-helper path resolution.
-    //
-    // The shape and rationale mirror the route-helper resolver tests
-    // above: pure `_from` inner is hit with a custom `is_usable`
-    // predicate so we don't need real cap'd binaries on the test host.
-    // The spawn-helper resolver differs from the route-helper resolver
-    // in one structural way — `None` is a soft-fallback return value
-    // (legacy spawn-as-daemon path), not an error. So the tests assert
-    // `Option<PathBuf>` outcomes rather than `Result<PathBuf, _>`.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_spawn_helper_path_from_uses_env_override_when_set_and_usable() {
-        let env_path = std::path::PathBuf::from("/tmp/explicit-spawn-helper");
-        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
-        let resolved = resolve_spawn_helper_path_from(
-            Some(env_path.as_path()),
-            install_path,
-            // Predicate: both candidates are "usable" — pinning the
-            // env override TAKES PRECEDENCE. A resolver that walked the
-            // canonical path first on env-set would fail this test.
-            |p| p == env_path.as_path() || p == install_path,
-        )
-        .expect("env override path is usable; resolver must return it");
-        assert_eq!(resolved, env_path);
-    }
-
-    #[test]
-    fn resolve_spawn_helper_path_from_returns_none_when_env_override_set_but_unusable() {
-        // env-set, env-path NOT usable, canonical IS usable. Per the
-        // "explicit operator intent is not silently overruled"
-        // contract, the resolver must return None and warn — NOT walk
-        // through to the canonical path. The warn-line itself is not
-        // assertable in a unit test, but the None return is sufficient
-        // to pin the no-fallthrough invariant.
-        let env_path = std::path::PathBuf::from("/tmp/missing-spawn-helper");
-        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
-        let resolved =
-            resolve_spawn_helper_path_from(Some(env_path.as_path()), install_path, |p| {
-                p == install_path
-            });
-        assert!(
-            resolved.is_none(),
-            "env-override unusable; resolver must NOT fall through to canonical \
-             (got Some({:?}))",
-            resolved
-        );
-    }
-
-    #[test]
-    fn resolve_spawn_helper_path_from_uses_canonical_when_env_unset_and_usable() {
-        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
-        let resolved = resolve_spawn_helper_path_from(None, install_path, |p| p == install_path)
-            .expect("canonical install is usable");
-        assert_eq!(resolved, install_path);
-    }
-
-    #[test]
-    fn resolve_spawn_helper_path_from_returns_none_when_env_unset_and_canonical_unusable() {
-        // env-unset, canonical NOT usable. The resolver must return
-        // None (soft fallback) and emit an info log — Lima runs under
-        // the daemon's own uid. That's a degraded but supported mode
-        // for single-user dev installs that haven't run
-        // `make install-spawn-helper-prod-cap`.
-        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-spawn-helper");
-        let resolved = resolve_spawn_helper_path_from(None, install_path, |_| false);
-        assert!(
-            resolved.is_none(),
-            "no usable candidate; resolver must return None (got Some({:?}))",
-            resolved
-        );
-    }
+    // The sandbox-spawn-helper resolver tests were deleted with that crate.
+    // sandbox-spawn-helper was removed; its only consumer was the Lima
+    // start path, which now routes through sandbox-lima-helper.
 
     // -----------------------------------------------------------------------
     // sandbox-lima-helper path resolution.

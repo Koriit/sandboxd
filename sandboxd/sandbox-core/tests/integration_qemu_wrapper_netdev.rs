@@ -47,13 +47,17 @@ use sandbox_core::lima::{DEFAULT_BASE_VM_NAME, LimaManager};
 fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
     let dir = tempfile::TempDir::new().expect("tempdir");
 
-    // The LimaManager constructor probes PATH for `limactl`. On CI
-    // runners that have Docker but not Lima (e.g. ubuntu-latest), this
-    // returns Err — the caller skips rather than panics.
-    let mgr = match LimaManager::new(dir.path().to_path_buf(), DEFAULT_BASE_VM_NAME.to_string()) {
-        Ok(m) => m,
-        Err(_) => return None,
-    };
+    // The LimaManager constructor no longer probes PATH for limactl
+    // (limactl is resolved inside sandbox-lima-helper post-setresuid).
+    // Construct with a stub helper path — only ensure_qemu_wrapper_for_test
+    // is exercised here, which writes a shell script and does not invoke
+    // the helper.
+    let mgr = LimaManager::new(
+        dir.path().to_path_buf(),
+        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        nix::unistd::Uid::current().as_raw(),
+        DEFAULT_BASE_VM_NAME.to_string(),
+    );
     let wrapper_path: PathBuf = mgr
         .ensure_qemu_wrapper_for_test()
         .expect("write wrapper script");

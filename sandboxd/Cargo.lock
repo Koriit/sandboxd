@@ -1871,16 +1871,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-spawn-helper"
-version = "0.1.0"
-dependencies = [
- "caps",
- "libc",
- "nix",
- "tempfile",
-]
-
-[[package]]
 name = "sandboxd"
 version = "0.1.0"
 dependencies = [

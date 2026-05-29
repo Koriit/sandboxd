@@ -291,7 +291,7 @@ async fn integration_container_runtime_create_start_stop_delete_round_trip() {
     assert_eq!(handle.as_str(), format!("sandbox-{session_id}"));
 
     // Pre-start, docker reports `created`.
-    let status = runtime.status(&handle).await.unwrap();
+    let status = runtime.status(&handle, 0).await.unwrap();
     assert_eq!(
         status,
         RuntimeStatus::Stopped,
@@ -304,26 +304,26 @@ async fn integration_container_runtime_create_start_stop_delete_round_trip() {
         .expect("ContainerRuntime::start should succeed");
 
     // Post-start, docker reports `running`.
-    let status = runtime.status(&handle).await.unwrap();
+    let status = runtime.status(&handle, 0).await.unwrap();
     assert_eq!(status, RuntimeStatus::Running);
 
     runtime
-        .stop(&handle)
+        .stop(&handle, 0)
         .await
         .expect("ContainerRuntime::stop should succeed");
 
     // Post-stop, docker reports `exited` → Stopped.
-    let status = runtime.status(&handle).await.unwrap();
+    let status = runtime.status(&handle, 0).await.unwrap();
     assert_eq!(status, RuntimeStatus::Stopped);
 
     runtime
-        .delete(&handle)
+        .delete(&handle, 0)
         .await
         .expect("ContainerRuntime::delete should succeed");
 
     // Post-delete, the container is gone — status maps the
     // "No such container" stderr to Stopped.
-    let status = runtime.status(&handle).await.unwrap();
+    let status = runtime.status(&handle, 0).await.unwrap();
     assert_eq!(status, RuntimeStatus::Stopped);
 }
 
@@ -441,7 +441,7 @@ async fn integration_container_runtime_hardening_flags_match_spec() {
     assert_eq!(label, session_id.to_string(), "session_id label missing");
 
     runtime
-        .delete(&handle)
+        .delete(&handle, 0)
         .await
         .expect("ContainerRuntime::delete");
 
@@ -473,7 +473,7 @@ async fn integration_container_runtime_status_reflects_docker_state() {
         .expect("ContainerRuntime::start");
 
     assert_eq!(
-        runtime.status(&handle).await.unwrap(),
+        runtime.status(&handle, 0).await.unwrap(),
         RuntimeStatus::Running,
         "post-start must be Running"
     );
@@ -492,13 +492,13 @@ async fn integration_container_runtime_status_reflects_docker_state() {
     );
 
     assert_eq!(
-        runtime.status(&handle).await.unwrap(),
+        runtime.status(&handle, 0).await.unwrap(),
         RuntimeStatus::Stopped,
         "out-of-band docker stop must surface as RuntimeStatus::Stopped"
     );
 
     runtime
-        .delete(&handle)
+        .delete(&handle, 0)
         .await
         .expect("ContainerRuntime::delete");
 
@@ -524,7 +524,7 @@ async fn integration_container_runtime_delete_is_idempotent() {
         .expect("ContainerRuntime::create");
 
     runtime
-        .delete(&handle)
+        .delete(&handle, 0)
         .await
         .expect("first ContainerRuntime::delete should succeed");
 
@@ -532,7 +532,7 @@ async fn integration_container_runtime_delete_is_idempotent() {
     // gone; the runtime must translate "No such container" /
     // "No such volume" stderr into Ok(()).
     runtime
-        .delete(&handle)
+        .delete(&handle, 0)
         .await
         .expect("second ContainerRuntime::delete must be idempotent");
 
@@ -540,7 +540,7 @@ async fn integration_container_runtime_delete_is_idempotent() {
     // where a recovery flow re-derives the handle from the session
     // id rather than reusing the one returned by create()).
     runtime
-        .delete(&RuntimeHandle::from_session_id(&session_id))
+        .delete(&RuntimeHandle::from_session_id(&session_id), 0)
         .await
         .expect("delete via re-derived handle must be idempotent");
 

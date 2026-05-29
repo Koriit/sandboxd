@@ -496,11 +496,11 @@ async fn integration_guest_refresh_container_backend() {
     // Stop before refresh — the orchestrator (`start_session`) asserts
     // `state == Stopped` before invoking refresh; mirror that
     // precondition.
-    runtime.stop(&handle).await.expect("runtime.stop");
+    runtime.stop(&handle, 0).await.expect("runtime.stop");
 
     // Drive refresh = `docker restart`.
     runtime
-        .refresh_guest_binary(&handle)
+        .refresh_guest_binary(&handle, 0)
         .await
         .expect("refresh_guest_binary (first call)");
 
@@ -523,7 +523,7 @@ async fn integration_guest_refresh_container_backend() {
     // no-op modulo restarting it again. The bind-mount source hasn't
     // changed; the container's binary stays bit-identical.
     runtime
-        .refresh_guest_binary(&handle)
+        .refresh_guest_binary(&handle, 0)
         .await
         .expect("refresh_guest_binary (second call)");
     let after_second = read_in_container_guest_bytes(&container_name);
@@ -554,7 +554,7 @@ async fn integration_guest_refresh_container_backend() {
     assert_eq!(row.guest_protocol_version, DAEMON_GUEST_PROTO_VERSION);
     assert_eq!(row.guest_binary_version, SANDBOX_GUEST_VERSION);
 
-    runtime.delete(&handle).await.expect("runtime.delete");
+    runtime.delete(&handle, 0).await.expect("runtime.delete");
 }
 
 /// Change the host-side bind-mount source bytes between two container
@@ -659,11 +659,11 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
     );
 
     runtime
-        .delete(&handle_one)
+        .delete(&handle_one, 0)
         .await
         .expect("runtime.delete #1");
     runtime
-        .delete(&handle_two)
+        .delete(&handle_two, 0)
         .await
         .expect("runtime.delete #2");
 }
@@ -823,8 +823,14 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
         }
     }
 
-    runtime.delete(&handle_a).await.expect("runtime.delete A");
-    runtime.delete(&handle_b).await.expect("runtime.delete B");
+    runtime
+        .delete(&handle_a, 0)
+        .await
+        .expect("runtime.delete A");
+    runtime
+        .delete(&handle_b, 0)
+        .await
+        .expect("runtime.delete B");
 }
 
 /// Read the host-side `Source` of the bind-mount targeting

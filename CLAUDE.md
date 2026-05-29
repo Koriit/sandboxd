@@ -10,6 +10,7 @@ Sandbox daemon providing isolated Linux environments for coding agents — Lima/
   - `sandbox-cli` — `sandbox` CLI binary (also installed as `git-remote-sandbox`)
   - `sandbox-guest` — guest-agent binary that runs inside each VM/container
   - `sandbox-route-helper` — privileged setcap binary that installs the default route inside a container netns on behalf of an authorized caller
+  - `sandbox-lima-helper` — privileged setcap binary that pivots to an operator's uid before exec'ing `limactl` for every Lima control-plane operation
   - `sandbox-event-emitter` — shared lib used by both nft-loggers (JSONL writer + record types)
   - `sandbox-nft-deny-logger` — gateway-container binary that emits `deny` records (TCP DNAT + UDP NFLOG)
   - `sandbox-nft-allow-logger` — gateway-container binary that audits allowed UDP flows via NFCT
@@ -93,7 +94,10 @@ Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 - Git remote helper: `git-remote-sandbox` symlink to `sandbox` binary, uses `sandbox::session/repo-path` URLs
 - Config files: all config files (daemon, CLI, per-session metadata) use JSON — not TOML, not YAML
 - **No milestone tags in code or tests.** Comments like `// M11-S10 added X` or `// M12-S2 Decision N` belong in git log and PR descriptions, not in source. Code should explain itself in its own terms.
-- **Privilege model: narrowly-scoped setcap helpers over broad daemon capabilities.** The daemon (`sandboxd`) runs as the unprivileged `sandbox` system user without elevated capabilities. When an operation genuinely needs `CAP_*`, factor it into a separate setcap helper binary rather than granting the capability to the daemon itself. `sandbox-route-helper` is the canonical pattern: tiny binary, pair-membership check on the caller, `setcap cap_net_admin,cap_sys_admin=eip` install at a known path (`/usr/local/libexec/sandboxd/`), end-to-end auditable. Do NOT add `AmbientCapabilities` / `CapabilityBoundingSet` to `sandboxd.service`, do NOT setcap the daemon binary itself, and do NOT run the daemon as root. The narrow-helper approach keeps the privileged surface ~50–100 lines per capability, separately reviewable, and tightly scoped to its specific purpose.
+- **Privilege model: narrowly-scoped setcap helpers over broad daemon capabilities.** The daemon (`sandboxd`) runs as the unprivileged `sandbox` system user without elevated capabilities. When an operation genuinely needs `CAP_*`, factor it into a separate setcap helper binary rather than granting the capability to the daemon itself. Two helpers are installed at `/usr/local/libexec/sandboxd/`:
+  - `sandbox-route-helper` — `cap_net_admin,cap_sys_admin=eip`; installs the default route inside a container netns; pair-membership check on the caller.
+  - `sandbox-lima-helper` — `cap_setuid+ep`; pivots to an operator's uid via `setresuid` before exec'ing `limactl` for every Lima control-plane operation; `getuid()==sandbox-user-uid` (kernel-checked) + sandbox-group membership as caller gates. The daemon **never invokes `limactl` directly** — every limactl call goes through this helper after M18-S13.
+  Do NOT add `AmbientCapabilities` / `CapabilityBoundingSet` to `sandboxd.service`, do NOT setcap the daemon binary itself, and do NOT run the daemon as root. The narrow-helper approach keeps the privileged surface ~50–100 lines per capability, separately reviewable, and tightly scoped to its specific purpose.
 
 ## On-disk compatibility
 

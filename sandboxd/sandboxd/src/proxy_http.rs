@@ -48,8 +48,9 @@ use std::sync::Arc;
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
+use sandbox_core::LimaManager;
 use sandbox_core::backend::BackendKind;
-use sandbox_core::{LimaManager, SandboxError, Session, SessionId, SessionStore};
+use sandbox_core::{LimaManagerRegistry, SandboxError, Session, SessionId, SessionStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command as TokioCommand;
@@ -74,7 +75,8 @@ pub mod close_codes {
 
 /// State the proxy handler depends on. Borrows the daemon's
 /// `SessionStore` (for the per-caller ownership check) and
-/// `LimaManager` (for `sshLocalPort` discovery on the Lima path).
+/// `LimaManagerRegistry` (for `sshLocalPort` discovery on the Lima path,
+/// routed through `sandbox-lima-helper list-json --op-uid`).
 ///
 /// The container path needs neither: it shells out to `docker exec
 /// <name> socat ...`, deriving the container name from the session id
@@ -82,7 +84,7 @@ pub mod close_codes {
 /// — see `RuntimeHandle::from_session_id`).
 pub struct ProxyState {
     pub store: Arc<SessionStore>,
-    pub lima: Arc<LimaManager>,
+    pub lima_registry: Arc<LimaManagerRegistry>,
 }
 
 /// Entry point for `GET /sessions/{id}/proxy`.
@@ -114,9 +116,9 @@ pub async fn handle_proxy(
 
     // The upgrade closure may not borrow state captures (it outlives
     // the handler future), so hand it owned clones.
-    let lima_for_upgrade = Arc::clone(&state.lima);
+    let lima_registry_for_upgrade = Arc::clone(&state.lima_registry);
     Ok(ws.on_upgrade(move |socket| async move {
-        run_proxy(socket, session, lima_for_upgrade).await;
+        run_proxy(socket, session, lima_registry_for_upgrade).await;
     }))
 }
 
@@ -143,7 +145,7 @@ impl axum::response::IntoResponse for ProxyHttpError {
 /// (backend dial failure, mid-stream backend exit, etc.) close the
 /// WebSocket with a structured code from [`close_codes`] so the CLI
 /// shim (`sandbox-cli::proxy`) can render a useful diagnostic.
-async fn run_proxy(socket: WebSocket, session: Session, lima: Arc<LimaManager>) {
+async fn run_proxy(socket: WebSocket, session: Session, lima_registry: Arc<LimaManagerRegistry>) {
     let session_id = session.id;
     match session.backend {
         BackendKind::Container => {
@@ -156,6 +158,24 @@ async fn run_proxy(socket: WebSocket, session: Session, lima: Arc<LimaManager>) 
             }
         }
         BackendKind::Lima => {
+            // Operator uid from the session row (post-V009, always Some).
+            let op_uid = match session.operator_uid {
+                Some(uid) => uid,
+                None => {
+                    error!(
+                        session = %session_id,
+                        "Lima proxy: session has no operator_uid (pre-V009 row?); closing"
+                    );
+                    close_with_code(
+                        socket,
+                        close_codes::BACKEND_ERROR,
+                        "session has no operator_uid",
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let lima = lima_registry.get_or_create(op_uid);
             if let Err(e) = pump_lima(socket, &session_id, lima).await {
                 warn!(
                     session = %session_id,
@@ -267,23 +287,26 @@ async fn pump_container(socket: WebSocket, session_id: &SessionId) -> Result<(),
     Ok(())
 }
 
-/// Lima path: look up the per-VM `sshLocalPort` via `limactl list
-/// --json`, open a `tokio::net::TcpStream` to `127.0.0.1:<port>`, then
-/// ferry bytes. The port lookup is a one-shot `std::process::Command`
-/// invocation behind `spawn_blocking` per the project's standard
-/// convention — the async-I/O carve-out applies only to the long-lived
-/// byte pump (which here is the `TcpStream`).
+/// Lima path: look up the per-VM `sshLocalPort` via
+/// `sandbox-lima-helper list-json --op-uid`, open a
+/// `tokio::net::TcpStream` to `127.0.0.1:<port>`, then ferry bytes.
+/// The port lookup is a one-shot `std::process::Command` invocation
+/// behind `spawn_blocking` per the project's standard convention —
+/// the async-I/O carve-out applies only to the long-lived byte pump
+/// (which here is the `TcpStream`).
+///
+/// `lima` is the per-operator [`LimaManager`] obtained from the
+/// registry using the session's `operator_uid`.
 async fn pump_lima(
     socket: WebSocket,
     session_id: &SessionId,
     lima: Arc<LimaManager>,
 ) -> Result<(), SandboxError> {
-    // One-shot `limactl list --json`. `LimaManager::ssh_local_port_
-    // for_session` wraps `std::process::Command` synchronously; we
-    // dispatch it through `spawn_blocking` to keep the async runtime
-    // free per the project's standard `std::process::Command`
-    // convention. (The long-lived byte pump below is a deliberate
-    // carve-out — see the container path's inline comment.)
+    // One-shot `sandbox-lima-helper list-json`. The manager's
+    // `ssh_local_port_for_session` wraps `std::process::Command`
+    // synchronously; dispatch through `spawn_blocking` per the
+    // project's standard convention. (The long-lived byte pump below
+    // is a deliberate carve-out — see the container path's comment.)
     let session_id_for_blocking = *session_id;
     let lima_for_blocking = Arc::clone(&lima);
     let port = match tokio::task::spawn_blocking(move || {

@@ -28,8 +28,10 @@ const STOP_VM_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for `limactl delete`.
 const DELETE_VM_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Timeout for each step of the guest agent installation sequence.
-const INSTALL_GUEST_AGENT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+// INSTALL_GUEST_AGENT_STEP_TIMEOUT was removed: the install
+// sequence now runs inside sandbox-lima-helper (install-guest-agent subcommand)
+// with its own per-step budget. The total wall-clock is INSTALL_TOTAL_TIMEOUT
+// inside install_guest_agent().
 
 /// Timeout for `limactl list`.
 const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,7 +86,7 @@ const CLONE_VM_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default VM name for the pre-provisioned golden base image.
 ///
 /// Callers that don't need to pin a specific name (typically tests) can
-/// pass this into [`LimaManager::new`]/[`LimaManager::with_limactl_path`].
+/// pass this into [`LimaManager::new`] or [`LimaManager::with_helper_path`].
 /// The daemon resolves the actual name from the `SANDBOX_BASE_VM_NAME`
 /// environment variable at startup so production and test daemons don't
 /// collide on a single user-global Lima instance.
@@ -253,25 +255,28 @@ pub struct LimaManagerRegistry {
     /// use.  Entries are never removed; the registry grows monotonically
     /// as new operators create sessions.
     managers: Mutex<HashMap<u32, Arc<LimaManager>>>,
-    /// `limactl` binary path shared across all managers created by this
-    /// registry.  Resolved once at registry construction from `PATH`.
-    limactl: PathBuf,
+    /// Path to `sandbox-lima-helper`, shared across all managers.
+    /// Resolved once at registry construction from `resolve_lima_helper_path()`.
+    /// The daemon never invokes `limactl` directly — all limactl operations
+    /// go through the helper, which resolves limactl post-setresuid.
+    helper_path: PathBuf,
     /// Golden-image base VM name shared across all per-operator managers.
     base_vm_name: String,
 }
 
 impl LimaManagerRegistry {
-    /// Construct a registry.  Resolves the `limactl` binary from `PATH`
-    /// at construction time so a missing installation is detected early.
+    /// Construct a registry.
+    ///
+    /// `helper_path` is the absolute path to `sandbox-lima-helper`, resolved
+    /// at daemon startup by `resolve_lima_helper_path()`.
     ///
     /// `base_vm_name` is the Lima instance name for the golden base image.
-    pub fn new(base_vm_name: String) -> Result<Self, SandboxError> {
-        let limactl = resolve_binary_from_path("limactl")?;
-        Ok(Self {
+    pub fn new(base_vm_name: String, helper_path: PathBuf) -> Self {
+        Self {
             managers: Mutex::new(HashMap::new()),
-            limactl,
+            helper_path,
             base_vm_name,
-        })
+        }
     }
 
     /// Return the `Arc<LimaManager>` for `op_uid`, creating one if this
@@ -290,7 +295,8 @@ impl LimaManagerRegistry {
         let lima_home = operator_lima_home(op_uid);
         let mgr = Arc::new(LimaManager {
             base_dir: lima_home,
-            limactl: self.limactl.clone(),
+            helper_path: self.helper_path.clone(),
+            op_uid,
             base_vm_name: self.base_vm_name.clone(),
         });
         map.insert(op_uid, Arc::clone(&mgr));
@@ -313,6 +319,10 @@ impl LimaManagerRegistry {
 // ---------------------------------------------------------------------------
 
 /// Systemd unit file for the sandbox guest agent service.
+/// Retained in daemon-side `lima.rs` for unit test assertions that verify
+/// the constant matches the helper's copy. Production installs go through
+/// `sandbox-lima-helper install-guest-agent` which embeds its own copy.
+#[cfg(test)]
 const GUEST_AGENT_SERVICE_UNIT: &str = "\
 [Unit]
 Description=Sandbox Guest Agent
@@ -437,9 +447,20 @@ fi
 /// All VMs are named `sandbox-{session_id}` so they can be distinguished from
 /// user-created Lima instances.  Templates and other per-session artefacts are
 /// stored under `{base_dir}/sessions/{session_id}/`.
+///
+/// Each `LimaManager` instance is bound to a single operator uid. Every
+/// `limactl` operation is dispatched through `sandbox-lima-helper` with
+/// `--op-uid <self.op_uid>` so the helper pivots to the operator's uid before
+/// exec'ing `limactl`. The daemon never invokes `limactl` directly.
 pub struct LimaManager {
     base_dir: PathBuf,
-    limactl: PathBuf,
+    /// Absolute path to the `sandbox-lima-helper` binary, resolved at daemon
+    /// startup by `resolve_lima_helper_path()`. Every limactl invocation goes
+    /// through the helper — `limactl` is never exec'd directly by the daemon.
+    helper_path: PathBuf,
+    /// Operator uid this manager is bound to. Passed as `--op-uid <N>` on
+    /// every helper invocation. The helper rejects `--op-uid 0`.
+    op_uid: u32,
     /// Name of the singleton golden-image VM this manager owns. The daemon
     /// resolves this from `SANDBOX_BASE_VM_NAME` at startup; the test
     /// daemon picks a distinct name (`sandbox-test-base`) so production
@@ -449,36 +470,40 @@ pub struct LimaManager {
 }
 
 impl LimaManager {
-    /// Create a new manager rooted at the given base directory.
+    /// Create a new manager for the given operator, rooted at the per-operator
+    /// LIMA_HOME directory.
     ///
-    /// `base_dir` is typically `~/.local/share/sandboxd/` (`$XDG_DATA_HOME/sandboxd`)
-    /// — the same directory used by [`crate::SessionStore`].
+    /// `helper_path` is the absolute path to the `sandbox-lima-helper` binary,
+    /// resolved once at daemon startup by `resolve_lima_helper_path()`.
+    ///
+    /// `op_uid` is the numeric uid of the operator that owns this manager.
+    /// The helper rejects `--op-uid 0`; callers must never pass 0.
     ///
     /// `base_vm_name` is the Lima instance name for the golden base image
     /// this manager owns. Production callers pass the validated value of
     /// `SANDBOX_BASE_VM_NAME`; tests typically pass [`DEFAULT_BASE_VM_NAME`].
-    /// The caller is responsible for validating the name — this constructor
-    /// trusts it as-is and threads it directly into limactl argv.
-    ///
-    /// Resolves the `limactl` binary from `PATH` at construction time so
-    /// that a missing installation is detected early with a clear error.
-    pub fn new(base_dir: PathBuf, base_vm_name: String) -> Result<Self, SandboxError> {
-        let limactl = resolve_binary_from_path("limactl")?;
-        Ok(Self {
-            base_dir,
-            limactl,
-            base_vm_name,
-        })
-    }
-
-    /// Create a manager with a caller-supplied `limactl` path, skipping
-    /// PATH resolution.  Useful for tests and environments where the binary
-    /// location is already known.
-    #[cfg(test)]
-    pub fn with_limactl_path(base_dir: PathBuf, limactl: PathBuf, base_vm_name: String) -> Self {
+    pub fn new(base_dir: PathBuf, helper_path: PathBuf, op_uid: u32, base_vm_name: String) -> Self {
         Self {
             base_dir,
-            limactl,
+            helper_path,
+            op_uid,
+            base_vm_name,
+        }
+    }
+
+    /// Create a manager with a caller-supplied helper path and operator uid,
+    /// skipping any path resolution. Useful for tests.
+    #[cfg(test)]
+    pub fn with_helper_path(
+        base_dir: PathBuf,
+        helper_path: PathBuf,
+        op_uid: u32,
+        base_vm_name: String,
+    ) -> Self {
+        Self {
+            base_dir,
+            helper_path,
+            op_uid,
             base_vm_name,
         }
     }
@@ -488,9 +513,14 @@ impl LimaManager {
         &self.base_dir
     }
 
-    /// Return the path to the `limactl` binary.
-    pub fn limactl_path(&self) -> &std::path::Path {
-        &self.limactl
+    /// Return the operator uid this manager is bound to.
+    pub fn op_uid(&self) -> u32 {
+        self.op_uid
+    }
+
+    /// Return the path to the `sandbox-lima-helper` binary.
+    pub fn helper_path(&self) -> &std::path::Path {
+        &self.helper_path
     }
 
     /// Return the VM name this manager uses for the golden base image.
@@ -498,12 +528,38 @@ impl LimaManager {
         &self.base_vm_name
     }
 
+    /// Helper: build and run the helper with the given subcommand and args.
+    /// Wraps `run_with_timeout` and maps spawn errors.
+    pub(crate) fn run_helper(
+        &self,
+        subcommand: &str,
+        extra_args: &[&str],
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<std::process::Output, SandboxError> {
+        let mut cmd = Command::new(&self.helper_path);
+        cmd.arg(subcommand)
+            .arg("--op-uid")
+            .arg(self.op_uid.to_string());
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+        run_with_timeout(&mut cmd, timeout, label).map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => SandboxError::Lima(
+                format!("{label}: sandbox-lima-helper not found or not executable: {msg}"),
+            ),
+            other => other,
+        })
+    }
+
     // -- public API ---------------------------------------------------------
 
     /// Create a new VM for the given session.
     ///
     /// Generates a Lima YAML template, writes it to the session directory, and
-    /// shells out to `limactl create`.
+    /// invokes `sandbox-lima-helper create` to run `limactl create` as the
+    /// operator uid (so `_config/user` is written as the operator, satisfying
+    /// OpenSSH `StrictKeyfileMode`).
     pub fn create_vm(
         &self,
         session_id: &SessionId,
@@ -518,6 +574,7 @@ impl LimaManager {
         std::fs::write(&template_path, &template)?;
 
         let vm_name = vm_name(session_id);
+        let template_str = template_path.to_string_lossy().to_string();
 
         info!(
             session_id = %session_id,
@@ -529,20 +586,12 @@ impl LimaManager {
             "creating VM"
         );
 
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["create", "--name", &vm_name])
-                .arg(&template_path)
-                .arg("--tty=false"),
+        let output = self.run_helper(
+            "create",
+            &["--vm", &vm_name, "--yaml", &template_str],
             CREATE_VM_TIMEOUT,
-            "limactl create",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl create", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+            "sandbox-lima-helper create",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -550,22 +599,13 @@ impl LimaManager {
         }
 
         info!(session_id = %session_id, vm = %vm_name, "VM created");
-
-        // `limactl create` writes the per-VM instance dir and lima.yaml as
-        // uid 999 (daemon), mode 0600 / 0700. When the spawn-helper pivots
-        // `limactl start` to the operator uid (1000), it can't read the YAML
-        // unless the daemon's group (sandbox, gid 1001) has read access.
-        // chmod the dir to 0750 and lima.yaml to 0640 so the operator, who
-        // is a member of the sandbox group, can traverse and read them.
-        self.relax_lima_instance_perms(&vm_name);
-
         Ok(())
     }
 
     /// Create a new VM using a custom Lima template file.
     ///
     /// The template is copied to the session directory before invoking
-    /// `limactl create`.
+    /// `sandbox-lima-helper create`.
     pub fn create_vm_with_custom_template(
         &self,
         session_id: &SessionId,
@@ -578,6 +618,7 @@ impl LimaManager {
         std::fs::copy(template_path, &dest)?;
 
         let vm_name = vm_name(session_id);
+        let dest_str = dest.to_string_lossy().to_string();
 
         info!(
             session_id = %session_id,
@@ -586,20 +627,12 @@ impl LimaManager {
             "creating VM with custom template"
         );
 
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["create", "--name", &vm_name])
-                .arg(&dest)
-                .arg("--tty=false"),
+        let output = self.run_helper(
+            "create",
+            &["--vm", &vm_name, "--yaml", &dest_str],
             CREATE_VM_TIMEOUT,
-            "limactl create",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl create", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+            "sandbox-lima-helper create (custom template)",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -607,101 +640,80 @@ impl LimaManager {
         }
 
         info!(session_id = %session_id, vm = %vm_name, "VM created with custom template");
-
-        // Same group-read fix as create_vm — operator uid needs read access
-        // to the daemon-owned lima.yaml before helper-pivoted limactl start.
-        self.relax_lima_instance_perms(&vm_name);
-
         Ok(())
     }
 
     /// Start an existing (stopped) VM.
     ///
-    /// A QEMU wrapper script is injected via `QEMU_SYSTEM_X86_64` so that the
-    /// resulting VM has a PCIe root-port available for NIC hot-add,
-    /// device lockdown, and cgroup resource limits.
+    /// Dispatches `sandbox-lima-helper start` with all QEMU resource flags as
+    /// typed arguments. The helper sets the appropriate environment variables
+    /// (`QEMU_SYSTEM_X86_64`, `SANDBOX_QEMU_*`) after setresuid to the
+    /// operator uid, satisfying OpenSSH `StrictKeyfileMode` for `_config/user`.
     ///
-    /// The `config` parameter controls hardening and propagates resource limits
-    /// (memory, CPU) to the QEMU wrapper script via environment variables.
-    ///
-    /// When `bridge_name` and `vm_mac` are provided, the QEMU wrapper adds a
-    /// second NIC connected to the Docker bridge via `qemu-bridge-helper`.
-    /// This eliminates the need for host-side TAP/veth setup.
+    /// The `config` parameter controls hardening and propagates resource limits.
+    /// When `bridge_name` and `vm_mac` are provided (both must be Some together),
+    /// the QEMU wrapper adds a second NIC via `qemu-bridge-helper`.
     pub fn start_vm(
         &self,
         session_id: &SessionId,
         config: &SessionConfig,
         bridge_name: Option<&str>,
         vm_mac: Option<&str>,
-        spawn_helper_path: Option<&std::path::Path>,
-        operator_identity: Option<(u32, u32)>,
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
-
-        // Decide whether to dispatch `limactl start` through the
-        // spawn helper. Both halves must be Some — the resolved helper
-        // binary (from daemon-startup `resolve_spawn_helper_path`) AND
-        // the operator pair (from the session's V008 columns). Either
-        // missing falls back to the legacy direct spawn under the
-        // daemon's own uid.
-        let use_helper = matches!((spawn_helper_path, operator_identity), (Some(_), Some(_)));
+        let qemu_wrapper_str = qemu_wrapper.to_string_lossy().to_string();
+        let hardened_flag = if config.hardened { "1" } else { "0" };
+        let timeout_s = START_VM_TIMEOUT.as_secs().to_string();
+        let memory_mb_s = config.memory_mb.to_string();
+        let cpus_s = config.cpus.to_string();
 
         info!(
             session_id = %session_id,
             vm = %vm_name,
             hardened = config.hardened,
             bridge = bridge_name.unwrap_or("none"),
-            use_helper,
-            operator_uid = operator_identity.map(|(u, _)| u),
+            op_uid = self.op_uid,
             "starting VM"
         );
 
-        let hardened_flag = if config.hardened { "1" } else { "0" };
-        // Construct the argv list. When dispatching through
-        // `sandbox-spawn-helper`, the helper's contract is
-        // `<helper> [--prepare-lima-spawn] <operator_uid> <runtime_argv0> [runtime_argv...]`
-        // — the helper optionally chowns Lima's SSH identity (hardcoded
-        // path inside the helper, not passed as an argument), then does
-        // the `setresuid` and `execvp`s the rest.
-        // Without the helper, the daemon invokes `limactl` directly.
-        let mut cmd = match (use_helper, spawn_helper_path, operator_identity) {
-            (true, Some(helper), Some((uid, _))) => {
-                let mut c = Command::new(helper);
-                // Instruct the helper to transfer ownership of Lima's
-                // shared SSH identity to the operator uid before
-                // setresuid. The target path is hardcoded inside the
-                // helper (LIMA_USER_KEY). This lets the helper-pivoted
-                // hostagent satisfy OpenSSH's StrictKeyfileMode check
-                // (st_uid == getuid()).
-                c.arg("--prepare-lima-spawn");
-                c.arg(uid.to_string());
-                c.arg(&self.limactl);
-                c
-            }
-            _ => Command::new(&self.limactl),
-        };
-        cmd.args(["start", &vm_name])
-            .arg("--tty=false")
-            .arg(format!("--timeout={}s", START_VM_TIMEOUT.as_secs()))
-            .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
-            .env("SANDBOX_QEMU_HARDENED", hardened_flag)
-            .env("SANDBOX_QEMU_MEMORY_MB", config.memory_mb.to_string())
-            .env("SANDBOX_QEMU_CPUS", config.cpus.to_string());
+        let mut extra: Vec<&str> = vec![
+            "--vm",
+            &vm_name,
+            "--qemu-wrapper",
+            &qemu_wrapper_str,
+            "--hardened",
+            hardened_flag,
+            "--memory-mb",
+            &memory_mb_s,
+            "--cpus",
+            &cpus_s,
+            "--start-timeout-s",
+            &timeout_s,
+        ];
 
-        // Pass bridge networking env vars to the QEMU wrapper when provided.
+        // Bridge/MAC must be supplied together.
+        let bridge_owned;
+        let mac_owned;
         if let (Some(bridge), Some(mac)) = (bridge_name, vm_mac) {
-            cmd.env("SANDBOX_DOCKER_BRIDGE", bridge)
-                .env("SANDBOX_VM_MAC", mac);
+            bridge_owned = bridge.to_string();
+            mac_owned = mac.to_string();
+            extra.push("--bridge-name");
+            extra.push(&bridge_owned);
+            extra.push("--vm-mac");
+            extra.push(&mac_owned);
         }
 
-        let output =
-            run_with_timeout(&mut cmd, START_VM_TIMEOUT, "limactl start").map_err(|e| match e {
-                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                    lima_io_error("limactl start", std::io::Error::other(msg))
-                }
-                other => other,
-            })?;
+        let output = self.run_helper(
+            "start",
+            &extra,
+            // Host-side wall-clock kill: slightly longer than Lima's own
+            // --timeout so Lima can report its own error instead of being
+            // killed. This is distinct from `--start-timeout-s` (above)
+            // which is Lima's internal SSH-reachability wait.
+            START_VM_TIMEOUT + Duration::from_secs(30),
+            "sandbox-lima-helper start",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -718,19 +730,12 @@ impl LimaManager {
 
         info!(session_id = %session_id, vm = %vm_name, "stopping VM");
 
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["stop", &vm_name])
-                .arg("--tty=false"),
+        let output = self.run_helper(
+            "stop",
+            &["--vm", &vm_name],
             STOP_VM_TIMEOUT,
-            "limactl stop",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl stop", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+            "sandbox-lima-helper stop",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -747,19 +752,12 @@ impl LimaManager {
 
         info!(session_id = %session_id, vm = %vm_name, "deleting VM");
 
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["delete", "--force", &vm_name])
-                .arg("--tty=false"),
+        let output = self.run_helper(
+            "delete",
+            &["--vm", &vm_name],
             DELETE_VM_TIMEOUT,
-            "limactl delete",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl delete", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+            "sandbox-lima-helper delete",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -772,168 +770,57 @@ impl LimaManager {
 
     /// Best-effort cleanup of a partial Lima instance directory.
     ///
-    /// `limactl clone` is non-atomic: a failure mid-clone can leave
+    /// `sandbox-lima-helper clone` is non-atomic: a failure mid-clone can leave
     /// behind `disk` and `cidata.iso` without a `lima.yaml`. From that
     /// point on every subsequent `limactl` invocation host-wide fatals
     /// while enumerating instances ("open lima.yaml: no such file or
     /// directory"), poisoning all other Lima operations until the
     /// orphan dir is removed manually.
     ///
-    /// We try the clean path first (`limactl delete --force`) and fall
-    /// back to a direct `rm -rf $LIMA_HOME/<vm>` when limactl refuses
+    /// We try the clean path first (`sandbox-lima-helper delete`) and fall
+    /// back to a direct `rm -rf <LIMA_HOME>/<vm>` when limactl refuses
     /// to operate on a corrupted instance. Errors are swallowed — this
     /// runs from the error path of another operation, and the caller
     /// already has a primary failure to report.
     fn cleanup_partial_lima_instance(&self, vm: &str) {
-        let delete_attempt = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["delete", "--force", vm])
-                .arg("--tty=false"),
+        let delete_attempt = self.run_helper(
+            "delete",
+            &["--vm", vm],
             DELETE_VM_TIMEOUT,
-            "limactl delete (partial-clone cleanup)",
+            "sandbox-lima-helper delete (partial-clone cleanup)",
         );
         match delete_attempt {
             Ok(out) if out.status.success() => {
-                debug!(vm, "partial Lima instance removed via limactl delete");
+                debug!(vm, "partial Lima instance removed via helper delete");
                 return;
             }
             Ok(out) => {
                 debug!(
                     vm,
                     stderr = %String::from_utf8_lossy(&out.stderr),
-                    "limactl delete on partial clone failed; falling back to fs cleanup"
+                    "helper delete on partial clone failed; falling back to fs cleanup"
                 );
             }
             Err(e) => {
                 debug!(
                     vm, error = %e,
-                    "limactl delete on partial clone errored; falling back to fs cleanup"
+                    "helper delete on partial clone errored; falling back to fs cleanup"
                 );
             }
         }
 
-        // Fallback: rm -rf the dir directly. Lima resolves
-        // `$LIMA_HOME` (default `$HOME/.lima`) to locate instance
-        // dirs; mirror that resolution here so we hit the same path.
-        let lima_home = std::env::var("LIMA_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".lima")));
-        match lima_home {
-            Ok(dir) => {
-                let target = dir.join(vm);
-                if target.exists()
-                    && let Err(e) = std::fs::remove_dir_all(&target)
-                {
-                    warn!(
-                        vm,
-                        path = %target.display(),
-                        error = %e,
-                        "failed to rm -rf partial Lima instance dir (manual cleanup may be required)"
-                    );
-                } else if target.exists() {
-                    debug!(vm, path = %target.display(), "removed partial Lima instance dir");
-                }
-            }
-            Err(_) => {
+        // Fallback: rm -rf the dir directly under the per-operator LIMA_HOME.
+        let target = self.base_dir.join(vm);
+        if target.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&target) {
                 warn!(
                     vm,
-                    "could not resolve LIMA_HOME or $HOME for partial-clone cleanup; manual rm -rf may be required"
-                );
-            }
-        }
-    }
-
-    /// Widen permissions on a freshly-created Lima instance directory so
-    /// that a helper-pivoted `limactl start` (running as the operator uid,
-    /// which is a member of the daemon's `sandbox` group) can read the YAML.
-    ///
-    /// `limactl create` / `limactl clone` write the per-VM dir and all files
-    /// inside it owned by the daemon (uid 999) with restrictive 0700/0600
-    /// modes.  The spawn-helper pivots to the operator uid (1000) for
-    /// `limactl start`, whose hostagent needs to:
-    ///   - traverse the dir           → dir needs x for group
-    ///   - unlink files (ha.stdout.log, etc.) → dir needs w for group
-    ///   - open/overwrite files (ssh.config, etc.) → files need w for group
-    ///
-    /// Correct modes after this call:
-    ///   - instance dir        → 0o770 (rwxrwx---)
-    ///   - every regular file  → 0o660 (rw-rw----)
-    ///
-    /// Errors are logged but not surfaced — this is best-effort. If it fails
-    /// (e.g. LIMA_HOME not resolvable) `start_vm` will fail for a different
-    /// but equally diagnosable reason.
-    fn relax_lima_instance_perms(&self, vm: &str) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let lima_home = std::env::var("LIMA_HOME")
-                .map(PathBuf::from)
-                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".lima")));
-
-            let lima_home = match lima_home {
-                Ok(h) => h,
-                Err(_) => {
-                    warn!(
-                        vm,
-                        "could not resolve LIMA_HOME or $HOME; skipping permission relaxation"
-                    );
-                    return;
-                }
-            };
-
-            let instance_dir = lima_home.join(vm);
-
-            if !instance_dir.exists() {
-                return;
-            }
-
-            // chmod every regular file to 0660 so the operator uid (sandbox
-            // group member) can overwrite files created by the daemon uid.
-            match std::fs::read_dir(&instance_dir) {
-                Err(e) => {
-                    warn!(
-                        vm,
-                        path = %instance_dir.display(),
-                        error = %e,
-                        "failed to read Lima instance dir for permission relaxation"
-                    );
-                }
-                Ok(entries) => {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            if let Err(e) = std::fs::set_permissions(
-                                &path,
-                                std::fs::Permissions::from_mode(0o660),
-                            ) {
-                                warn!(
-                                    vm,
-                                    path = %path.display(),
-                                    error = %e,
-                                    "failed to chmod Lima instance file to 0660"
-                                );
-                            } else {
-                                debug!(vm, path = %path.display(), "chmod Lima instance file to 0660");
-                            }
-                        }
-                    }
-                }
-            }
-
-            // chmod instance dir to 0770 (rwxrwx---) so the operator uid can
-            // traverse, read, write, and unlink files inside.
-            if let Err(e) =
-                std::fs::set_permissions(&instance_dir, std::fs::Permissions::from_mode(0o770))
-            {
-                warn!(
-                    vm,
-                    path = %instance_dir.display(),
+                    path = %target.display(),
                     error = %e,
-                    "failed to chmod Lima instance dir to 0770"
+                    "failed to rm -rf partial Lima instance dir (manual cleanup may be required)"
                 );
             } else {
-                debug!(vm, path = %instance_dir.display(), "chmod Lima instance dir to 0770");
+                debug!(vm, path = %target.display(), "removed partial Lima instance dir");
             }
         }
     }
@@ -941,189 +828,33 @@ impl LimaManager {
     /// Copy the sandbox-guest binary into a running VM and start it as a
     /// systemd service.
     ///
-    /// `op_uid` identifies the operator that owns this session. The parameter
-    /// is present now so call sites carry the right shape before the helper
-    /// pivot lands in a later session; privilege behavior in this session is
-    /// unchanged — the install sequence still runs the same six `limactl`
-    /// steps under the daemon uid. The binary path is resolved via
-    /// `guest_agent_path()`, which honours the production install location and
-    /// dev-build fallbacks.
+    /// Delegates to `sandbox-lima-helper install-guest-agent`, which performs
+    /// the full six-step sequence (copy, mv, chmod, write unit, daemon-reload,
+    /// enable --now) followed by four `command -v` probes
+    /// (socat/git/rsync/docker). The helper runs as `self.op_uid` post-setresuid.
     ///
     /// This should be called after the VM has booted (i.e. after `start_vm`
-    /// or `create_vm` + start).
-    pub fn install_guest_agent(&self, _op_uid: u32, vm_name: &str) -> Result<(), SandboxError> {
-        let binary_path = guest_agent_path()?;
+    /// or `create_vm` + start). On failure the helper exits non-zero; partial
+    /// cleanup is the caller's responsibility (per spec: `cleanup_partial_lima_instance`
+    /// is the closest pattern; `build_base_image`'s cleanup path already handles
+    /// the base-image case).
+    pub fn install_guest_agent(&self, vm_name: &str) -> Result<(), SandboxError> {
+        // Wall-clock budget: 6 steps × 30s each + 4 probes × 30s + headroom.
+        const INSTALL_TOTAL_TIMEOUT: Duration = Duration::from_secs(360);
 
-        if !binary_path.exists() {
-            return Err(SandboxError::Internal(format!(
-                "guest agent binary not found at {}",
-                binary_path.display()
-            )));
-        }
+        info!(vm = %vm_name, op_uid = self.op_uid, "installing guest agent via helper");
 
-        // 1. Copy the binary into the VM (to a user-writable temp path first,
-        //    then move it with sudo, because limactl copy uses rsync which
-        //    runs as the unprivileged user).
-        debug!(vm = %vm_name, binary = %binary_path.display(), "copying guest agent binary");
-        let copy_src = binary_path.to_string_lossy().to_string();
-        let copy_dst = format!("{vm_name}:/tmp/sandbox-guest");
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args(["copy", &copy_src, &copy_dst]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl copy (guest agent)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl copy (guest agent)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+        let output = self.run_helper(
+            "install-guest-agent",
+            &["--vm", vm_name],
+            INSTALL_TOTAL_TIMEOUT,
+            "sandbox-lima-helper install-guest-agent",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SandboxError::Lima(format!(
-                "failed to copy guest agent to {vm_name}: {stderr}"
-            )));
-        }
-
-        // 2. Move the binary to /usr/local/bin with sudo and make it executable.
-        debug!(vm = %vm_name, "installing guest agent binary");
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "mv",
-                "/tmp/sandbox-guest",
-                "/usr/local/bin/sandbox-guest",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell mv",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell mv", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to move guest agent in {vm_name}: {stderr}"
-            )));
-        }
-
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "chmod",
-                "+x",
-                "/usr/local/bin/sandbox-guest",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell chmod",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell chmod", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to chmod guest agent in {vm_name}: {stderr}"
-            )));
-        }
-
-        // 3. Create a systemd service file.
-        debug!(vm = %vm_name, "creating systemd service");
-        let service_unit = GUEST_AGENT_SERVICE_UNIT;
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", vm_name, "--",
-                    "sudo", "bash", "-c",
-                    &format!(
-                        "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{service_unit}\nUNIT_EOF"
-                    ),
-                ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell (create service)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (create service)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to create systemd service in {vm_name}: {stderr}"
-            )));
-        }
-
-        // 4. Reload systemd and start the service.
-        debug!(vm = %vm_name, "starting guest agent service");
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "systemctl",
-                "daemon-reload",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell (daemon-reload)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (daemon-reload)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to reload systemd in {vm_name}: {stderr}"
-            )));
-        }
-
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
-                "shell",
-                vm_name,
-                "--",
-                "sudo",
-                "systemctl",
-                "enable",
-                "--now",
-                "sandbox-guest",
-            ]),
-            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
-            "limactl shell (enable service)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (enable service)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "failed to start guest agent service in {vm_name}: {stderr}"
+                "sandbox-lima-helper install-guest-agent failed for {vm_name}: {stderr}"
             )));
         }
 
@@ -1294,11 +1025,16 @@ impl LimaManager {
 
     /// Build the golden base image from scratch.
     ///
-    /// This creates a new Lima VM named after `self.base_vm_name`, boots
-    /// it, installs the guest agent, then stops it. The resulting VM
+    /// Creates a new Lima VM named after `self.base_vm_name`, boots it,
+    /// installs the guest agent (via `sandbox-lima-helper install-guest-agent`,
+    /// which also runs the four `command -v` tool probes that replace the old
+    /// `validate_base_provisioning` step), then stops it. The resulting VM
     /// serves as a template that can be cloned for each new session.
+    ///
+    /// All `limactl` operations run as `self.op_uid` via the helper, so
+    /// `_config/user` is written as the operator uid.
     pub fn build_base_image(&self) -> Result<(), SandboxError> {
-        info!("building golden base image");
+        info!(op_uid = self.op_uid, "building golden base image");
 
         // 1. Generate and write the base template.
         let template = self.generate_base_template();
@@ -1306,23 +1042,16 @@ impl LimaManager {
         let template_path = self.base_dir.join("base-template.yaml");
         std::fs::write(&template_path, &template)?;
         info!(path = %template_path.display(), "wrote base template");
+        let template_str = template_path.to_string_lossy().to_string();
 
-        // 2. Create the VM.
+        // 2. Create the VM via helper.
         info!("creating base VM");
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["create", "--name", &self.base_vm_name])
-                .arg(&template_path)
-                .arg("--tty=false"),
+        let output = self.run_helper(
+            "create",
+            &["--vm", &self.base_vm_name, "--yaml", &template_str],
             BASE_CREATE_TIMEOUT,
-            "limactl create (base image)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl create (base image)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+            "sandbox-lima-helper create (base image)",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1341,10 +1070,12 @@ impl LimaManager {
             }
             Err(e) => {
                 warn!(error = %e, "base image build failed, cleaning up partial VM");
-                let _ = run_with_timeout(
-                    Command::new(&self.limactl).args(["delete", "--force", &self.base_vm_name]),
+                // Best-effort cleanup — errors here are swallowed.
+                let _ = self.run_helper(
+                    "delete",
+                    &["--vm", &self.base_vm_name],
                     Duration::from_secs(60),
-                    "limactl delete (base image cleanup)",
+                    "sandbox-lima-helper delete (base image cleanup)",
                 );
                 Err(e)
             }
@@ -1357,27 +1088,30 @@ impl LimaManager {
         // 3. Start the VM with QEMU wrapper for hardening.
         info!("starting base VM (this may take several minutes for cloud-init)");
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
+        let qemu_wrapper_str = qemu_wrapper.to_string_lossy().to_string();
+        let timeout_s = BASE_START_TIMEOUT.as_secs().to_string();
 
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["start", &self.base_vm_name])
-                .arg("--tty=false")
-                .arg(format!("--timeout={}s", BASE_START_TIMEOUT.as_secs()))
-                .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
-                .env("SANDBOX_QEMU_HARDENED", "1")
-                .env("SANDBOX_QEMU_MEMORY_MB", "4096")
-                .env("SANDBOX_QEMU_CPUS", "4"),
-            // Our process timeout is slightly longer than Lima's to let Lima
-            // report its own error message instead of being killed.
+        let output = self.run_helper(
+            "start",
+            &[
+                "--vm",
+                &self.base_vm_name,
+                "--qemu-wrapper",
+                &qemu_wrapper_str,
+                "--hardened",
+                "1",
+                "--memory-mb",
+                "4096",
+                "--cpus",
+                "4",
+                "--start-timeout-s",
+                &timeout_s,
+            ],
+            // Host-side wall-clock kill: slightly longer than Lima's own
+            // --timeout so Lima can report its own error message.
             BASE_START_TIMEOUT + Duration::from_secs(30),
-            "limactl start (base image)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl start (base image)", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+            "sandbox-lima-helper start (base image)",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1385,47 +1119,22 @@ impl LimaManager {
         }
         info!("base VM started");
 
-        // 3a. Validate that cloud-init's per-boot provision scripts
-        // actually finished installing the tools the session contract
-        // depends on. Lima's `cc_scripts_per_boot` reports any
-        // provision-script failure as a non-fatal warning, so
-        // `limactl start` returning success does NOT imply
-        // provisioning succeeded — see e.g. an apt-get hitting a
-        // mirror EAGAIN mid-`apt install docker-ce`. Without this
-        // check the daemon happily declares the base image golden,
-        // every cloned session VM re-runs the same provisioning on
-        // its own first boot, hits the same flakiness, and fails to
-        // come up.
-        self.validate_base_provisioning()?;
-
-        // 4. Install the guest agent.
+        // 4. Install the guest agent (helper also runs the four
+        //    `command -v {socat,git,rsync,docker}` probes, which replace
+        //    the old `validate_base_provisioning` step).
         info!("installing guest agent into base VM");
-        // op_uid is unused until the helper pivot lands in a later session;
-        // 0 is the placeholder for the base-image build path, which has no
-        // operator context at this stage.
-        self.install_guest_agent(0, &self.base_vm_name)?;
+        self.install_guest_agent(&self.base_vm_name)?;
         info!("guest agent installed in base VM");
 
-        // 5. Stop the VM. Try graceful first so a hung in-guest unit
-        // surfaces as a clear shutdown failure; fall back to -f under
-        // contention so heavy host I/O can't wedge the build. The
-        // warn! on fallback is the diagnostic signal — operators
-        // correlating recurring fallbacks with host load vs. guest-side
-        // regressions should grep daemon logs for it.
+        // 5. Stop the VM. Try graceful first; fall back to --force on timeout.
+        // The warn! on fallback is the diagnostic signal.
         info!("stopping base VM");
-        let graceful = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["stop", &self.base_vm_name])
-                .arg("--tty=false"),
+        let graceful = self.run_helper(
+            "stop",
+            &["--vm", &self.base_vm_name],
             BASE_STOP_GRACEFUL_BUDGET,
-            "limactl stop (base image)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl stop (base image)", std::io::Error::other(msg))
-            }
-            other => other,
-        });
+            "sandbox-lima-helper stop (base image)",
+        );
         match graceful {
             Ok(output) if output.status.success() => {
                 info!("base VM stopped (graceful)");
@@ -1434,29 +1143,20 @@ impl LimaManager {
                 warn!(
                     outcome = ?other,
                     vm = %self.base_vm_name,
-                    "graceful limactl stop did not complete in {}s; \
-                     falling back to -f. Usually indicates host I/O \
-                     contention; investigate ~/.lima/{}/serial.log if \
-                     recurring.",
+                    "graceful stop did not complete in {}s; \
+                     falling back to --force. Usually indicates host I/O \
+                     contention.",
                     BASE_STOP_GRACEFUL_BUDGET.as_secs(),
-                    self.base_vm_name,
                 );
-                let force = run_with_timeout(
-                    Command::new(&self.limactl)
-                        .args(["stop", "-f", &self.base_vm_name])
-                        .arg("--tty=false"),
+                let force = self.run_helper(
+                    "stop",
+                    &["--vm", &self.base_vm_name, "--force"],
                     BASE_STOP_FORCE_BUDGET,
-                    "limactl stop -f (base image fallback)",
-                )
-                .map_err(|e| match e {
-                    SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                        lima_io_error("limactl stop -f (base image)", std::io::Error::other(msg))
-                    }
-                    other => other,
-                })?;
+                    "sandbox-lima-helper stop --force (base image fallback)",
+                )?;
                 if !force.status.success() {
                     let stderr = String::from_utf8_lossy(&force.stderr);
-                    return Err(parse_limactl_error("stop -f (base image)", &stderr));
+                    return Err(parse_limactl_error("stop --force (base image)", &stderr));
                 }
                 info!("base VM stopped (force, after graceful timeout)");
             }
@@ -1478,66 +1178,23 @@ impl LimaManager {
         Ok(())
     }
 
-    /// Probe the running base VM to confirm cloud-init's
-    /// `provision.system` scripts actually finished installing the
-    /// tools the session contract relies on.
-    ///
-    /// Required tools, drawn from the base template's provision
-    /// blocks: `socat` (guest-agent transport), `git` (`--repo` and
-    /// the git remote helper), `rsync` (`sandbox sync` and lima cp on
-    /// limactl 2.x), and `docker` (in-VM container workloads).
-    /// Missing any of these means a provision step failed silently —
-    /// most commonly an apt-mirror EAGAIN during Docker install — and
-    /// the base image must not be stamped golden.
-    fn validate_base_provisioning(&self) -> Result<(), SandboxError> {
-        const REQUIRED: &[&str] = &["socat", "git", "rsync", "docker"];
-        const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-        info!("validating base VM provisioning");
-        for tool in REQUIRED {
-            let probe = run_with_timeout(
-                Command::new(&self.limactl).args([
-                    "shell",
-                    "--tty=false",
-                    &self.base_vm_name,
-                    "command",
-                    "-v",
-                    tool,
-                ]),
-                PROBE_TIMEOUT,
-                "limactl shell (base provisioning probe)",
-            )
-            .map_err(|e| match e {
-                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                    lima_io_error("limactl shell (probe)", std::io::Error::other(msg))
-                }
-                other => other,
-            })?;
-            if !probe.status.success() {
-                return Err(SandboxError::Internal(format!(
-                    "base image provisioning incomplete: '{tool}' not found in VM. \
-                     Cloud-init's provision scripts likely failed silently \
-                     (often an apt-mirror EAGAIN during Docker install). \
-                     Inspect the base VM's serial.log for `step=...` markers, \
-                     then re-run with `sandbox rebuild-image`."
-                )));
-            }
-            debug!(tool, "base provisioning probe ok");
-        }
-        info!("base VM provisioning validated");
-        Ok(())
-    }
+    // validate_base_provisioning was removed; its tool probes now run inside the helper's install-guest-agent step.
+    // The four `command -v {socat,git,rsync,docker}` probes are now
+    // performed by `sandbox-lima-helper install-guest-agent` as its built-in
+    // final validation phase (REQUIRED_BASE_TOOLS in the helper crate).
+    // install_guest_agent() returns an error if any probe fails, so the
+    // "stamp golden only after tools verified" invariant is preserved.
 
     /// Delete and rebuild the golden base image.
     pub fn rebuild_base_image(&self) -> Result<(), SandboxError> {
-        info!("rebuilding golden base image");
+        info!(op_uid = self.op_uid, "rebuilding golden base image");
 
         // Delete the existing VM (ignore errors if it doesn't exist).
-        let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["delete", "--force", &self.base_vm_name])
-                .arg("--tty=false"),
+        let output = self.run_helper(
+            "delete",
+            &["--vm", &self.base_vm_name],
             DELETE_VM_TIMEOUT,
-            "limactl delete (base image)",
+            "sandbox-lima-helper delete (base image)",
         );
 
         match output {
@@ -1566,6 +1223,9 @@ impl LimaManager {
     ///
     /// The cloned VM gets the specified resource limits. The base image
     /// must exist and be stopped (call `build_base_image()` first).
+    ///
+    /// Uses `sandbox-lima-helper clone` so the cloned VM is written under
+    /// the per-operator LIMA_HOME and `_config/user` is owned by `self.op_uid`.
     pub fn clone_vm(
         &self,
         session_id: SessionId,
@@ -1574,6 +1234,9 @@ impl LimaManager {
         disk_gb: u32,
     ) -> Result<(), SandboxError> {
         let target = vm_name(&session_id);
+        let cpus_s = cpus.to_string();
+        let memory_gib_s = mib_to_gib_string(memory_mb);
+        let disk_s = disk_gb.to_string();
 
         info!(
             session_id = %session_id,
@@ -1581,53 +1244,41 @@ impl LimaManager {
             cpus,
             memory_mb,
             disk_gb,
+            op_uid = self.op_uid,
             "cloning base image"
         );
 
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args([
+        let output = self
+            .run_helper(
                 "clone",
-                &self.base_vm_name,
-                &target,
-                "--cpus",
-                &cpus.to_string(),
-                "--memory",
-                &mib_to_gib_string(memory_mb),
-                "--disk",
-                &disk_gb.to_string(),
-            ]),
-            CLONE_VM_TIMEOUT,
-            "limactl clone",
-        )
-        .map_err(|e| {
-            // The spawn or timeout may itself have left a half-written
-            // instance dir behind — `limactl clone` writes `disk` and
-            // `cidata.iso` before `lima.yaml`, so an interruption here
-            // would orphan a dir that poisons all later limactl calls.
-            self.cleanup_partial_lima_instance(&target);
-            match e {
-                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                    lima_io_error("limactl clone", std::io::Error::other(msg))
-                }
-                other => other,
-            }
-        })?;
+                &[
+                    "--base",
+                    &self.base_vm_name,
+                    "--vm",
+                    &target,
+                    "--cpus",
+                    &cpus_s,
+                    "--memory",
+                    &memory_gib_s,
+                    "--disk",
+                    &disk_s,
+                ],
+                CLONE_VM_TIMEOUT,
+                "sandbox-lima-helper clone",
+            )
+            .inspect_err(|_| {
+                // A timeout or spawn error may have left a half-written instance
+                // dir behind. Best-effort cleanup.
+                self.cleanup_partial_lima_instance(&target);
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Clean up the partial instance dir before surfacing the
-            // error. Without this, a single failed clone can wedge
-            // every subsequent limactl invocation host-wide.
             self.cleanup_partial_lima_instance(&target);
             return Err(parse_limactl_error("clone", &stderr));
         }
 
         info!(session_id = %session_id, vm = %target, "VM cloned from base image");
-
-        // limactl clone writes the per-VM dir and lima.yaml owned by uid 999;
-        // subsequent helper-pivoted limactl start (uid 1000) needs group-read.
-        self.relax_lima_instance_perms(&target);
-
         Ok(())
     }
 
@@ -1918,15 +1569,15 @@ mounts:
         //   - the in-VM `sandbox` user owns its home dir
         //   - 9p `mapped-xattr` shared workspaces don't trip the
         //     ownership-mismatch check on bind-mount writes
-        //   - the QEMU process spawned via `sandbox-spawn-helper` (uid
-        //     = operator's) can `setuid(sandbox)` on the in-VM side
-        //     and end up with the expected uid for the agent runtime
+        //   - the QEMU process spawned via `sandbox-lima-helper` (uid
+        //     = operator's, after setresuid) can `setuid(sandbox)` on
+        //     the in-VM side and end up with the expected uid
         //
         // `/home/agent` itself stays as the home directory regardless
         // of the new uid — operator-facing paths
         // (`/home/agent/workspace`, ssh-config snippets, rsync
         // commands) are name-baked, not uid-baked, so the rename to
-        // `sandbox` at M18-S8 Wave A is the only naming change. The
+        // `sandbox` (the guest-user rename) is the only naming change. The
         // chown is recursive because the base image populated the dir
         // tree (e.g. `.bash_profile`, sshd authorized_keys staging)
         // before this step runs.
@@ -2151,7 +1802,7 @@ provision:
     /// Lima does not expose a way to pass extra QEMU arguments, so we
     /// interpose a shell wrapper that Lima invokes via the
     /// `QEMU_SYSTEM_X86_64` environment variable.
-    fn ensure_qemu_wrapper(&self) -> Result<PathBuf, SandboxError> {
+    pub(crate) fn ensure_qemu_wrapper(&self) -> Result<PathBuf, SandboxError> {
         let wrapper_dir = self.base_dir.join("libexec");
         std::fs::create_dir_all(&wrapper_dir)?;
         let wrapper_path = wrapper_dir.join("qemu-system-x86_64");
@@ -2186,19 +1837,17 @@ provision:
         self.base_dir.join("sessions").join(session_id.as_str())
     }
 
-    /// Run `limactl list --json` and deserialize the raw entries.
+    /// Run `sandbox-lima-helper list-json` and deserialize the raw entries.
+    ///
+    /// The helper execvp's `limactl list --json --tty=false` as `self.op_uid`
+    /// with `LIMA_HOME` set to the per-operator path.
     fn list_vms_raw(&self) -> Result<Vec<LimactlListEntry>, SandboxError> {
-        let output = run_with_timeout(
-            Command::new(&self.limactl).args(["list", "--json"]),
+        let output = self.run_helper(
+            "list-json",
+            &[],
             LIST_VMS_TIMEOUT,
-            "limactl list",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl list", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+            "sandbox-lima-helper list-json",
+        )?;
 
         // Lima writes a warning to stderr and returns empty stdout when no
         // instances exist.  Treat empty stdout as an empty list.
@@ -2382,45 +2031,11 @@ fn parse_status_field(s: &str) -> VmStatus {
 // Error helpers
 // ---------------------------------------------------------------------------
 
-/// Wrap an I/O error from spawning limactl.
-fn lima_io_error(context: &str, err: std::io::Error) -> SandboxError {
-    if err.kind() == std::io::ErrorKind::NotFound {
-        SandboxError::Lima(format!("{context}: limactl not found (is Lima installed?)"))
-    } else {
-        SandboxError::Lima(format!("{context}: {err}"))
-    }
-}
-
-/// Produce an error from limactl stderr, always preserving the raw output.
+/// Produce an error from limactl stderr (surfaced via the helper), always
+/// preserving the raw output.
 fn parse_limactl_error(subcommand: &str, stderr: &str) -> SandboxError {
     let stderr = stderr.trim();
     SandboxError::Lima(format!("limactl {subcommand} failed: {stderr}"))
-}
-
-/// Resolve a binary name to its absolute path using the system `PATH`.
-///
-/// Shells out to `command -v <name>` (POSIX) to find the binary.  Returns a
-/// clear error if the binary is not installed.
-fn resolve_binary_from_path(name: &str) -> Result<PathBuf, SandboxError> {
-    let output = Command::new("sh")
-        .args(["-c", &format!("command -v {name}")])
-        .output()
-        .map_err(|e| SandboxError::Internal(format!("failed to run 'command -v {name}': {e}")))?;
-
-    if !output.status.success() {
-        return Err(SandboxError::Lima(format!(
-            "{name} not found on PATH — is it installed?"
-        )));
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Err(SandboxError::Lima(format!(
-            "{name} not found on PATH — is it installed?"
-        )));
-    }
-
-    Ok(PathBuf::from(path))
 }
 
 /// Sanitise a filesystem path for safe interpolation into a YAML
@@ -2524,9 +2139,10 @@ mod tests {
 
     #[test]
     fn test_generate_template() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
@@ -2616,9 +2232,10 @@ mod tests {
 
     #[test]
     fn test_generate_template_custom_config() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("a1b2c3d4e5f6").unwrap();
@@ -2665,9 +2282,10 @@ mod tests {
 
     #[test]
     fn test_generate_template_fractional_memory() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::generate();
@@ -2701,9 +2319,10 @@ mod tests {
 
     #[test]
     fn test_generate_template_shared_workspace() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
@@ -2778,9 +2397,10 @@ mod tests {
     fn test_generate_template_shared_workspace_with_mapped_xattr() {
         use crate::session::WorkspaceSecurityModel;
 
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
@@ -2816,9 +2436,10 @@ mod tests {
     fn test_generate_template_shared_workspace_with_none_mapping() {
         use crate::session::WorkspaceSecurityModel;
 
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
@@ -2851,9 +2472,10 @@ mod tests {
 
     #[test]
     fn test_generate_template_clone_workspace_no_mount() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::generate();
@@ -2899,9 +2521,10 @@ mod tests {
     /// stays eligible (a 9p block would invalidate the cache key).
     #[test]
     fn test_generate_template_local_workspace_no_mount() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::generate();
@@ -3057,9 +2680,10 @@ mod tests {
 
     #[test]
     fn test_generate_template_hardened_video_audio() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::generate();
@@ -3098,9 +2722,10 @@ mod tests {
 
     #[test]
     fn test_generate_template_not_hardened_no_video_audio() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::generate();
@@ -3145,9 +2770,10 @@ mod tests {
     /// path applies. This pins the omit-on-None invariant.
     #[test]
     fn generate_template_omits_operator_uid_step_when_identity_is_none() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
@@ -3167,9 +2793,10 @@ mod tests {
     /// and the YAML diff is empty for the common-case dev install.
     #[test]
     fn generate_template_omits_operator_uid_step_when_identity_is_1000_1000() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
@@ -3197,9 +2824,10 @@ mod tests {
     /// would break 9p mapped-xattr workspaces. Pin all four here.
     #[test]
     fn generate_template_emits_operator_uid_step_with_correct_shape() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
@@ -3249,9 +2877,10 @@ mod tests {
     #[test]
     fn test_ensure_qemu_wrapper_creates_file() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             dir.path().to_path_buf(),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
 
@@ -3418,40 +3047,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test-env-override")]
-    #[test]
-    fn test_install_guest_agent_missing_binary() {
-        let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::with_limactl_path(
-            dir.path().to_path_buf(),
-            PathBuf::from("limactl"),
-            DEFAULT_BASE_VM_NAME.to_string(),
-        );
-
-        // Pin the guest-agent path override to a nonexistent location so
-        // install_guest_agent (which resolves the binary via guest_agent_path()
-        // rather than accepting it as a parameter) hits the "not found" branch.
-        let nonexistent = dir.path().join("no-such-sandbox-guest");
-        let prev = std::env::var(GUEST_BINARY_PATH_OVERRIDE_ENV).ok();
-        // SAFETY: env mutation in tests is only safe when no other threads
-        // read the same var; test isolation is the caller's responsibility.
-        unsafe { std::env::set_var(GUEST_BINARY_PATH_OVERRIDE_ENV, &nonexistent) };
-        let result = mgr.install_guest_agent(0, "sandbox-test-vm");
-        // SAFETY: see rationale above.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(GUEST_BINARY_PATH_OVERRIDE_ENV, v),
-                None => std::env::remove_var(GUEST_BINARY_PATH_OVERRIDE_ENV),
-            }
-        }
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("not found"),
-            "error should mention binary not found: {err}"
-        );
-    }
+    // test_install_guest_agent_missing_binary was removed; the install now runs in the helper.
+    // The guest-agent binary path is now a compile-time constant inside
+    // sandbox-lima-helper (SANDBOX_GUEST_HOST_PATH), not resolved by the daemon.
+    // Integration coverage of the install-guest-agent path lives in the
+    // helper's own integration tests (against the setcap-installed binary).
 
     // -- QEMU wrapper script tests ------------------------------------------
 
@@ -3685,9 +3285,10 @@ mod tests {
     #[test]
     fn test_qemu_wrapper_written_to_filesystem() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             dir.path().to_path_buf(),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
 
@@ -3723,9 +3324,10 @@ mod tests {
 
     #[test]
     fn test_generate_base_template_valid_yaml_fields() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
 
@@ -3832,9 +3434,10 @@ mod tests {
 
     #[test]
     fn test_generate_base_template_deterministic() {
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
         );
 
@@ -4035,9 +3638,10 @@ mod tests {
         // A LimaManager built with a non-default base name must produce a
         // base template that references that name in every place where the
         // hard-coded `sandbox-base` used to appear (hostname provisioning).
-        let mgr = LimaManager::with_limactl_path(
+        let mgr = LimaManager::with_helper_path(
             PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
             "sandbox-test-base".to_string(),
         );
 
@@ -4308,7 +3912,7 @@ mod tests {
         // same operator uid — not a fresh LimaManager on every call.
         let registry = LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
-            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
             base_vm_name: "sandbox-base".to_string(),
         };
         let mgr1 = registry.get_or_create(1000);
@@ -4324,7 +3928,7 @@ mod tests {
     fn registry_get_or_create_returns_different_arcs_for_different_uids() {
         let registry = LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
-            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
             base_vm_name: "sandbox-base".to_string(),
         };
         let mgr1000 = registry.get_or_create(1000);
@@ -4342,7 +3946,7 @@ mod tests {
         // LIMA_HOME path under /var/lib/sandboxd/<op_uid>/lima.
         let registry = LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
-            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
             base_vm_name: "sandbox-base".to_string(),
         };
         let mgr1000 = registry.get_or_create(1000);
@@ -4383,7 +3987,7 @@ mod tests {
 
         let registry = Arc::new(LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
-            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
             base_vm_name: "sandbox-base".to_string(),
         });
 
@@ -4425,7 +4029,7 @@ mod tests {
 
         let registry = Arc::new(LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
-            limactl: PathBuf::from("/usr/local/bin/limactl"),
+            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
             base_vm_name: "sandbox-base".to_string(),
         });
 
