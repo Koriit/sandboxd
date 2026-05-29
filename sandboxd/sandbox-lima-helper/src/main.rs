@@ -432,8 +432,10 @@ fn run() -> ExitCode {
     }
 
     // Step 10 — build sanitised env block.
+    // Pass pw_dir (captured in step 3, reused for limactl resolution in
+    // step 7) as op_home so HOME is set to the operator's own directory.
     let lima_home = format!("/var/lib/sandboxd/{op_uid_raw}/lima/");
-    let env_block = build_env_block(&subcommand, &lima_home);
+    let env_block = build_env_block(&subcommand, &lima_home, &pw_dir);
 
     // Step 11 — exec (or step-sequence for install-guest-agent).
     match &subcommand {
@@ -1215,9 +1217,15 @@ fn clear_all_capabilities() -> Result<(), String> {
 // Environment block construction (step 10)
 // ---------------------------------------------------------------------------
 
-fn build_env_block(sub: &Subcommand, lima_home: &str) -> Vec<CString> {
+fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str) -> Vec<CString> {
+    // Pass through allowlisted parent vars, skipping HOME: HOME is always
+    // set explicitly below to the operator's pw_dir (captured in step 3).
+    // This prevents the daemon's own HOME=/var/lib/sandbox from leaking
+    // into the pivoted process, which runs as the operator uid and would
+    // have no write access to /var/lib/sandbox anyway.
     let mut env: Vec<CString> = ENV_ALLOWLIST
         .iter()
+        .filter(|key| **key != "HOME")
         .filter_map(|key| {
             let value = env::var_os(key)?;
             let mut buf = OsString::from(*key);
@@ -1226,6 +1234,15 @@ fn build_env_block(sub: &Subcommand, lima_home: &str) -> Vec<CString> {
             CString::new(buf.as_bytes()).ok()
         })
         .collect();
+
+    // Set HOME to the operator's home directory (pw_dir from getpwuid_r in
+    // step 3). Reuses the same value used for limactl path resolution in
+    // step 7 — no re-resolution. Post-setresuid the process runs as the
+    // operator uid; limactl auxiliary lookups ($HOME/.ssh/config, etc.)
+    // must resolve against the operator's own home, not the daemon's.
+    if let Ok(c) = CString::new(format!("HOME={op_home}")) {
+        env.push(c);
+    }
 
     // Always set LIMA_HOME to the per-operator path.
     if let Ok(c) = CString::new(format!("LIMA_HOME={lima_home}")) {
@@ -2392,11 +2409,42 @@ WantedBy=multi-user.target";
     #[test]
     fn env_block_always_has_lima_home() {
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
         let has_lima_home = env
             .iter()
             .any(|c| c.to_string_lossy().starts_with("LIMA_HOME="));
         assert!(has_lima_home, "env block must always include LIMA_HOME=");
+    }
+
+    /// Assert that HOME in the env block is the operator's pw_dir, NOT the
+    /// daemon's inherited HOME. This is the #231(c) fix: after setresuid to
+    /// the operator uid, limactl must see the operator's own home directory.
+    #[test]
+    fn env_block_home_is_operator_pw_dir() {
+        let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
+        let op_home = "/home/operator-1000";
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", op_home);
+        let map: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|c| {
+                let s = c.to_string_lossy().to_string();
+                let eq = s.find('=').unwrap();
+                (s[..eq].to_string(), s[eq + 1..].to_string())
+            })
+            .collect();
+        assert_eq!(
+            map.get("HOME").map(|s| s.as_str()),
+            Some(op_home),
+            "HOME must equal the operator's pw_dir, not the daemon's inherited HOME"
+        );
+        // Confirm the daemon's HOME is NOT present as the value
+        // (the daemon's home is /var/lib/sandbox; if this assertion fails,
+        // the allowlist pass-through is leaking instead of the explicit set).
+        assert_ne!(
+            map.get("HOME").map(|s| s.as_str()),
+            Some("/var/lib/sandbox"),
+            "daemon HOME must not appear in operator env block"
+        );
     }
 
     #[test]
@@ -2412,7 +2460,7 @@ WantedBy=multi-user.target";
             bridge_name: Some("br0".to_string()),
             vm_mac: Some("02:00:00:00:00:01".to_string()),
         });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
         let keys: Vec<String> = env
             .iter()
             .map(|c| {
@@ -2448,7 +2496,7 @@ WantedBy=multi-user.target";
             bridge_name: None,
             vm_mac: None,
         });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
         let keys: Vec<String> = env
             .iter()
             .map(|c| {
@@ -2502,7 +2550,7 @@ WantedBy=multi-user.target";
             bridge_name: Some("br0".to_string()),
             vm_mac: Some("02:00:00:00:00:01".to_string()),
         });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
         let map: std::collections::HashMap<String, String> = env
             .iter()
             .map(|c| {
@@ -2528,7 +2576,7 @@ WantedBy=multi-user.target";
         // SAFETY: single-threaded test, no concurrent env mutation.
         unsafe { std::env::set_var("CANARY_SECRET_TOKEN", "leak-me") };
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
         let keys: Vec<String> = env
             .iter()
             .map(|c| {
@@ -2548,7 +2596,7 @@ WantedBy=multi-user.target";
     #[test]
     fn env_block_always_has_xdg_cache_home() {
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/");
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
         let map: std::collections::HashMap<String, String> = env
             .iter()
             .map(|c| {
