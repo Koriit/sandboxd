@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -41,9 +40,9 @@ import pytest
 from conftest import (
     SANDBOX_BIN,
     SANDBOX_HARNESS,
+    _SANDBOX_PROD_SOCKET,
     _VM_RESOURCE_ARGS,
     parse_session_id,
-    wait_for_state,
 )
 
 pytestmark = pytest.mark.lima
@@ -66,9 +65,13 @@ if SANDBOX_HARNESS == "test-user":
 
 
 def sandbox(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
-    """Invoke the sandbox CLI and return the result."""
+    """Invoke the sandbox CLI against the cross-user test daemon and return the result.
+
+    Passes ``--socket`` explicitly so the CLI reaches the production-shaped
+    daemon socket at ``_SANDBOX_PROD_SOCKET`` rather than the XDG default.
+    """
     return subprocess.run(
-        [str(SANDBOX_BIN), *args],
+        [str(SANDBOX_BIN), "--socket", str(_SANDBOX_PROD_SOCKET), *args],
         capture_output=True,
         text=True,
         check=check,
@@ -167,10 +170,8 @@ class TestHelperPivotSessionReachability:
             result = sandbox("create", "--wait", *_VM_RESOURCE_ARGS)
             session_id = parse_session_id(result.stdout)
 
-            # Session must reach Running state.
-            wait_for_state(session_id, "running", timeout=300)
-
             # Guest agent must respond to a ping (exec an innocuous command).
+            # ``--wait`` on sandbox create already blocks until Running state.
             result = sandbox("exec", session_id, "--", "echo", "hello-from-pivot")
             assert "hello-from-pivot" in result.stdout, (
                 f"guest exec returned unexpected output: {result.stdout!r}"
@@ -233,7 +234,7 @@ class TestHelperPivot9pSharedWorkspace:
                 *_VM_RESOURCE_ARGS,
             )
             session_id = parse_session_id(result.stdout)
-            wait_for_state(session_id, "running", timeout=300)
+            # ``--wait`` on sandbox create already blocks until Running state.
 
             # Read the file from inside the VM.
             result = sandbox(
@@ -263,7 +264,7 @@ class TestHelperPivot9pSharedWorkspace:
                 *_VM_RESOURCE_ARGS,
             )
             session_id = parse_session_id(result.stdout)
-            wait_for_state(session_id, "running", timeout=300)
+            # ``--wait`` on sandbox create already blocks until Running state.
 
             # Write a file from inside the VM.
             sandbox(

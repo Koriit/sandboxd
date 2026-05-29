@@ -52,8 +52,16 @@ fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
     // Construct with a stub helper path — only ensure_qemu_wrapper_for_test
     // is exercised here, which writes a shell script and does not invoke
     // the helper.
+    //
+    // base_dir must be a subdirectory of the TempDir (mirroring the
+    // production layout where base_dir == LIMA_HOME and its parent is the
+    // operator state root).  ensure_qemu_wrapper writes the wrapper to
+    // base_dir/../libexec/, which resolves to dir.path()/libexec/ — still
+    // inside the TempDir and cleaned up automatically.
+    let lima_home = dir.path().join("lima");
+    std::fs::create_dir_all(&lima_home).expect("create lima_home");
     let mgr = LimaManager::new(
-        dir.path().to_path_buf(),
+        lima_home,
         std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
         nix::unistd::Uid::current().as_raw(),
         DEFAULT_BASE_VM_NAME.to_string(),
@@ -68,7 +76,9 @@ fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
     //
     // The wrapper deliberately skips its own SCRIPT_DIR when searching
     // PATH (to avoid recursive self-invocation), so the stub must NOT
-    // live in the same directory as the wrapper itself.
+    // live in the same directory as the wrapper itself.  The wrapper
+    // is now under dir.path()/libexec/ and the stub under
+    // dir.path()/stub-bin/, so the exclusion still does not affect the stub.
     let stub_dir = dir.path().join("stub-bin");
     std::fs::create_dir(&stub_dir).expect("create stub bin dir");
     let stub_path = stub_dir.join("qemu-system-x86_64");

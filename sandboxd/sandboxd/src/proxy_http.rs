@@ -175,7 +175,23 @@ async fn run_proxy(socket: WebSocket, session: Session, lima_registry: Arc<LimaM
                     return;
                 }
             };
-            let lima = lima_registry.get_or_create(op_uid);
+            let lima = match lima_registry.get_or_create(op_uid) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(
+                        session = %session_id,
+                        error = %e,
+                        "Lima proxy: failed to provision operator LIMA_HOME; closing"
+                    );
+                    close_with_code(
+                        socket,
+                        close_codes::BACKEND_ERROR,
+                        "failed to provision operator LIMA_HOME",
+                    )
+                    .await;
+                    return;
+                }
+            };
             if let Err(e) = pump_lima(socket, &session_id, lima).await {
                 warn!(
                     session = %session_id,

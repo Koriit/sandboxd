@@ -1222,6 +1222,26 @@ fn build_env_block(sub: &Subcommand, lima_home: &str) -> Vec<CString> {
         env.push(c);
     }
 
+    // Pin XDG_CACHE_HOME inside the per-operator LIMA_HOME tree.
+    //
+    // Lima resolves its download cache as `$XDG_CACHE_HOME/lima/download/`
+    // when `XDG_CACHE_HOME` is set, or `$HOME/.cache/lima/download/` otherwise.
+    // The helper inherits `HOME=/var/lib/sandbox` from the daemon process (the
+    // sandbox system user's home); after `setresuid` to the operator uid, limactl
+    // would try to write into `/var/lib/sandbox/.cache/` which is owned by the
+    // daemon uid and mode 0700 — the operator uid has no write access there.
+    //
+    // Redirecting `XDG_CACHE_HOME` into the per-operator LIMA_HOME tree keeps
+    // the cache under `/var/lib/sandboxd/<op_uid>/lima/.cache/lima/download/`.
+    // That dir sits inside the tree that `ensure_operator_lima_home` ACL-grants
+    // with `d:u:<op_uid>:rwx`, so the operator uid can create and write it.
+    // Using `<lima_home>/.cache` (one level below LIMA_HOME itself, not inside
+    // Lima's instance namespace) avoids any conflict with Lima's own directory
+    // layout under `<lima_home>/<instance>/`.
+    if let Ok(c) = CString::new(format!("XDG_CACHE_HOME={lima_home}/.cache")) {
+        env.push(c);
+    }
+
     // start-specific QEMU env vars.
     if let Subcommand::Start(a) = sub {
         let extras = [
@@ -2256,7 +2276,7 @@ mod tests {
         // Step 4 argv should contain "sudo bash -c <bash_cmd>".
         let expected_bash_arg = bash_cmd.as_str();
         // Build the step manually to check the form matches what run_install_guest_agent builds.
-        let expected_step4 = vec![
+        let expected_step4 = [
             limactl.to_string(),
             "shell".to_string(),
             vm.to_string(),

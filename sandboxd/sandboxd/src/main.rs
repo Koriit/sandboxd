@@ -2854,7 +2854,16 @@ async fn create_session(
             let _base_guard = state.base_image_lock.lock().await;
 
             let base_status = {
-                let lima_check = state.lima_runtime.manager_for(operator.uid);
+                let lima_check = match state.lima_runtime.manager_for(operator.uid) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(e).into_response()
+                        );
+                    }
+                };
                 match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
@@ -2879,7 +2888,16 @@ async fn create_session(
                 BaseImageStatus::Missing => {
                     // Must build -- no choice.
                     info!("base image missing, building...");
-                    let lima_build = state.lima_runtime.manager_for(operator.uid);
+                    let lima_build = match state.lima_runtime.manager_for(operator.uid) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            cleanup_net_ca_and_return!(
+                                state,
+                                session_id,
+                                error_response(e).into_response()
+                            );
+                        }
+                    };
                     match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
@@ -2914,7 +2932,16 @@ async fn create_session(
 
         // Clone from the base image.
         {
-            let lima_clone = state.lima_runtime.manager_for(operator.uid);
+            let lima_clone = match state.lima_runtime.manager_for(operator.uid) {
+                Ok(m) => m,
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(e).into_response()
+                    );
+                }
+            };
             let sid = session_id;
             let cpus = config.cpus;
             let memory_mb = config.memory_mb;
@@ -3025,7 +3052,13 @@ async fn create_session(
             // install_guest_agent is Lima-specific (dispatched through
             // sandbox-lima-helper install-guest-agent). Uses the per-operator
             // manager from the registry.
-            let lima = state.lima_runtime.manager_for(operator.uid);
+            let lima = match state.lima_runtime.manager_for(operator.uid) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(%session_id, error = %e, "failed to provision operator LIMA_HOME");
+                    cleanup_and_return!(state, session_id, error_response(e).into_response());
+                }
+            };
             let vm = sandbox_core::vm_name(&session_id);
             match tokio::task::spawn_blocking(move || lima.install_guest_agent(&vm)).await {
                 Ok(Ok(())) => {}
@@ -3518,10 +3551,12 @@ async fn list_sessions(
     // matches on `VmStatus`. Multi-backend listing (fan-out across
     // every registered runtime) is a future extension once additional
     // backends ship a comparable inventory surface.
-    let lima = state.lima_runtime.manager_for(operator.uid);
-    let vm_list = tokio::task::spawn_blocking(move || lima.list_vms().unwrap_or_default())
-        .await
-        .unwrap_or_default();
+    let vm_list = match state.lima_runtime.manager_for(operator.uid) {
+        Ok(lima) => tokio::task::spawn_blocking(move || lima.list_vms().unwrap_or_default())
+            .await
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
 
     let reconciled: Vec<Session> = sessions
         .into_iter()
@@ -6928,7 +6963,10 @@ async fn rebuild_image(
             // `no_cache` flag is therefore a no-op on the Lima path;
             // no new flag plumbing is required.
             let _base_guard = state.base_image_lock.lock().await;
-            let lima = state.lima_runtime.manager_for(operator.uid);
+            let lima = match state.lima_runtime.manager_for(operator.uid) {
+                Ok(m) => m,
+                Err(e) => return error_response(e).into_response(),
+            };
             match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
                 Ok(Ok(())) => (StatusCode::OK, "base image rebuilt").into_response(),
                 Ok(Err(e)) => error_response(e).into_response(),
@@ -6965,7 +7003,10 @@ async fn base_image_status(
 ) -> impl IntoResponse {
     // Base-image status is Lima-specific (the hash-and-age check
     // operates on the golden VM); uses the per-operator manager.
-    let lima = state.lima_runtime.manager_for(operator.uid);
+    let lima = match state.lima_runtime.manager_for(operator.uid) {
+        Ok(m) => m,
+        Err(e) => return error_response(e).into_response(),
+    };
     match tokio::task::spawn_blocking(move || lima.check_base_image()).await {
         Ok(Ok(status)) => {
             let json = match status {
@@ -7213,26 +7254,28 @@ async fn diagnostics_handler(
     // is NOT in the caller's list. An operator only sees resources
     // they cannot account for — they cannot infer another operator's
     // session ids from this surface.
-    let lima_mgr = state.lima_runtime.manager_for(operator.uid);
     let caller_session_ids_for_lima = caller_session_ids.clone();
-    let lima_orphans: Vec<String> = tokio::task::spawn_blocking(move || {
-        lima_mgr
-            .list_vms()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|vm| {
-                vm.session_id.and_then(|sid| {
-                    if caller_session_ids_for_lima.contains(&sid) {
-                        None
-                    } else {
-                        Some(vm.name)
-                    }
+    let lima_orphans: Vec<String> = match state.lima_runtime.manager_for(operator.uid) {
+        Ok(lima_mgr) => tokio::task::spawn_blocking(move || {
+            lima_mgr
+                .list_vms()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|vm| {
+                    vm.session_id.and_then(|sid| {
+                        if caller_session_ids_for_lima.contains(&sid) {
+                            None
+                        } else {
+                            Some(vm.name)
+                        }
+                    })
                 })
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default();
+                .collect()
+        })
+        .await
+        .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
 
     let caller_session_ids_for_docker = caller_session_ids.clone();
     let container_orphans: Vec<String> = tokio::task::spawn_blocking(move || {
@@ -7376,7 +7419,17 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
     // Build a merged VM list by querying each operator's LIMA_HOME.
     let mut vm_list: Vec<VmInfo> = Vec::new();
     for &op_uid in op_uids.keys() {
-        let mgr = lima_runtime.registry().get_or_create(op_uid);
+        let mgr = match lima_runtime.registry().get_or_create(op_uid) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    op_uid,
+                    error = %e,
+                    "reconciliation: failed to provision LIMA_HOME for operator, skipping"
+                );
+                continue;
+            }
+        };
         match mgr.list_vms() {
             Ok(vms) => vm_list.extend(vms),
             Err(e) => {

@@ -90,7 +90,10 @@ impl LimaRuntime {
     /// Access the per-operator manager for Lima-specific operations
     /// not on the trait surface — base-image build, template
     /// generation, base-image hash check, etc.
-    pub fn manager_for(&self, op_uid: u32) -> Arc<LimaManager> {
+    ///
+    /// Returns an error if per-operator LIMA_HOME provisioning fails
+    /// on first use (e.g. `setfacl` absent or state-root unwritable).
+    pub fn manager_for(&self, op_uid: u32) -> Result<Arc<LimaManager>, SandboxError> {
         self.registry.get_or_create(op_uid)
     }
 
@@ -195,7 +198,7 @@ impl SessionRuntime for LimaRuntime {
                     .into(),
             )
         })?;
-        let manager = self.registry.get_or_create(op_uid);
+        let manager = self.registry.get_or_create(op_uid)?;
         let session_id_owned = *session_id;
         let template = spec.template.clone();
         let operator_identity = spec.operator_identity;
@@ -233,7 +236,7 @@ impl SessionRuntime for LimaRuntime {
                     .into(),
             )
         })?;
-        let manager = self.registry.get_or_create(op_uid);
+        let manager = self.registry.get_or_create(op_uid)?;
         let bridge = args.lima_bridge.clone();
         let mac = args.lima_mac.clone();
         let config = match &args.lima_config {
@@ -258,7 +261,7 @@ impl SessionRuntime for LimaRuntime {
 
     async fn stop(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
-        let manager = self.registry.get_or_create(operator_uid);
+        let manager = self.registry.get_or_create(operator_uid)?;
 
         tokio::task::spawn_blocking(move || manager.stop_vm(&session_id))
             .await
@@ -268,7 +271,7 @@ impl SessionRuntime for LimaRuntime {
 
     async fn delete(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
-        let manager = self.registry.get_or_create(operator_uid);
+        let manager = self.registry.get_or_create(operator_uid)?;
 
         tokio::task::spawn_blocking(move || manager.delete_vm(&session_id))
             .await
@@ -282,7 +285,7 @@ impl SessionRuntime for LimaRuntime {
         operator_uid: u32,
     ) -> Result<RuntimeStatus, SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
-        let manager = self.registry.get_or_create(operator_uid);
+        let manager = self.registry.get_or_create(operator_uid)?;
 
         let vm_status = tokio::task::spawn_blocking(move || manager.vm_status(&session_id))
             .await
@@ -300,9 +303,8 @@ impl SessionRuntime for LimaRuntime {
         // construct the transport with whichever name the handle
         // carries — `LimaTransport::connect` will surface the failure
         // when the helper rejects the unknown VM name.
-        let manager = self.registry.get_or_create(operator_uid);
         Arc::new(LimaTransport {
-            manager,
+            manager: self.registry.get_or_create(operator_uid),
             vm_name: handle.as_str().to_string(),
             operator_uid,
         })
@@ -334,7 +336,7 @@ impl SessionRuntime for LimaRuntime {
         operator_uid: u32,
     ) -> Result<(), SandboxError> {
         let vm_name = handle.as_str().to_string();
-        let manager = self.registry.get_or_create(operator_uid);
+        let manager = self.registry.get_or_create(operator_uid)?;
 
         tokio::task::spawn_blocking(move || {
             refresh_lima_guest_binary_via_helper(&manager, &vm_name)
@@ -456,7 +458,11 @@ fn refresh_lima_guest_binary_via_helper(
 /// SSH session duration (potentially hours under VS Code Remote-SSH or
 /// JetBrains Gateway) would deadlock the executor under load.
 pub struct LimaTransport {
-    manager: Arc<LimaManager>,
+    /// The per-operator manager, or the error from LIMA_HOME provisioning
+    /// if `get_or_create` failed. Deferred to `connect()` so that
+    /// `guest_transport` (a non-fallible trait method) can return without
+    /// erroring — the error surfaces when the transport is actually used.
+    manager: Result<Arc<LimaManager>, SandboxError>,
     /// VM name (`sandbox-{session_id}`), captured at transport
     /// construction so [`SessionRuntime::guest_transport`] can return
     /// without resolving fallible handle parsing here.
@@ -471,13 +477,22 @@ impl GuestTransport for LimaTransport {
         // Async-I/O carve-out: spawn via tokio::process::Command (NOT
         // spawn_blocking). See LimaTransport doc-comment and CLAUDE.md
         // "Async-I/O carve-out for long-lived child processes."
+        let manager = match &self.manager {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(SandboxError::Internal(format!(
+                    "LimaTransport: LIMA_HOME provisioning failed for operator {}: {e}",
+                    self.operator_uid
+                )));
+            }
+        };
         debug!(
             vm = %self.vm_name,
             op_uid = self.operator_uid,
             "opening sandbox-lima-helper guest-socat transport"
         );
 
-        let mut command = Command::new(self.manager.helper_path());
+        let mut command = Command::new(manager.helper_path());
         command
             .args([
                 "guest-socat",

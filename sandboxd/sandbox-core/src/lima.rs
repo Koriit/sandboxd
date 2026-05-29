@@ -262,6 +262,12 @@ pub struct LimaManagerRegistry {
     helper_path: PathBuf,
     /// Golden-image base VM name shared across all per-operator managers.
     base_vm_name: String,
+    /// In tests only: override the base directory for
+    /// `ensure_operator_lima_home` so registry tests can provision into a
+    /// temporary directory instead of the production `/var/lib/sandboxd/`
+    /// path, keeping unit tests hermetic.
+    #[cfg(test)]
+    state_root_override: Option<PathBuf>,
 }
 
 impl LimaManagerRegistry {
@@ -276,23 +282,65 @@ impl LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
             helper_path,
             base_vm_name,
+            #[cfg(test)]
+            state_root_override: None,
+        }
+    }
+
+    /// Construct a registry that provisions LIMA_HOME directories under
+    /// `state_root` instead of the production `/var/lib/sandboxd/` path.
+    ///
+    /// Only available in tests.  Keeps registry unit tests hermetic by
+    /// redirecting `ensure_operator_lima_home` to a caller-owned tmpdir.
+    #[cfg(test)]
+    pub fn new_for_test(base_vm_name: String, helper_path: PathBuf, state_root: PathBuf) -> Self {
+        Self {
+            managers: Mutex::new(HashMap::new()),
+            helper_path,
+            base_vm_name,
+            state_root_override: Some(state_root),
         }
     }
 
     /// Return the `Arc<LimaManager>` for `op_uid`, creating one if this
     /// is the first call for that operator.
     ///
+    /// On the first call for a given operator uid, this also provisions
+    /// the per-operator LIMA_HOME directory (`/var/lib/sandboxd/<op_uid>/lima/`)
+    /// and applies the POSIX ACL that grants the operator uid write access.
+    /// Without the ACL, limactl (which runs pivoted to the operator uid via
+    /// `sandbox-lima-helper`) cannot create VM directories inside LIMA_HOME.
+    ///
+    /// Returns an error if LIMA_HOME provisioning fails (e.g. `setfacl` is
+    /// missing or the daemon lacks permission to write the state root).
+    ///
     /// The returned `Arc` is reference-counted; callers can hold it across
     /// slow operations without blocking other operators.
-    pub fn get_or_create(&self, op_uid: u32) -> Arc<LimaManager> {
+    pub fn get_or_create(&self, op_uid: u32) -> Result<Arc<LimaManager>, SandboxError> {
         let mut map = self
             .managers
             .lock()
             .expect("LimaManagerRegistry mutex poisoned");
         if let Some(mgr) = map.get(&op_uid) {
-            return Arc::clone(mgr);
+            return Ok(Arc::clone(mgr));
         }
-        let lima_home = operator_lima_home(op_uid);
+        // Provision the LIMA_HOME directory and apply the operator's ACL
+        // before constructing the manager. This must happen before any
+        // limactl invocation so that the operator-uid-pivoted limactl can
+        // write into the directory. `ensure_operator_lima_home` is
+        // idempotent: it applies the ACL even if the dir was already
+        // created by an earlier `create_dir_all` call that skipped the ACL.
+        //
+        // In test builds, `state_root_override` redirects provisioning into
+        // a caller-owned tmpdir so registry unit tests stay hermetic.
+        #[cfg(test)]
+        let lima_home = if let Some(ref base) = self.state_root_override {
+            tests::ensure_operator_lima_home_at(base, op_uid)?
+        } else {
+            ensure_operator_lima_home(op_uid)?
+        };
+        #[cfg(not(test))]
+        let lima_home = ensure_operator_lima_home(op_uid)?;
         let mgr = Arc::new(LimaManager {
             base_dir: lima_home,
             helper_path: self.helper_path.clone(),
@@ -300,7 +348,7 @@ impl LimaManagerRegistry {
             base_vm_name: self.base_vm_name.clone(),
         });
         map.insert(op_uid, Arc::clone(&mgr));
-        mgr
+        Ok(mgr)
     }
 
     /// Return the number of operator entries currently in the registry.
@@ -1802,9 +1850,49 @@ provision:
     /// Lima does not expose a way to pass extra QEMU arguments, so we
     /// interpose a shell wrapper that Lima invokes via the
     /// `QEMU_SYSTEM_X86_64` environment variable.
+    ///
+    /// # Layout
+    ///
+    /// The wrapper is written to the operator **state root** — the parent of
+    /// LIMA_HOME — not inside LIMA_HOME itself.  Lima enumerates every
+    /// subdirectory of LIMA_HOME as a potential instance and fatals when it
+    /// finds one without a `lima.yaml`; placing `libexec/` inside LIMA_HOME
+    /// triggers exactly that fatal.  The production path is:
+    ///
+    /// ```text
+    /// /var/lib/sandboxd/<op_uid>/          ← operator state root
+    ///   lima/                              ← LIMA_HOME  (base_dir)
+    ///     <vm-name>/                       ← Lima instance dirs
+    ///   libexec/                           ← wrapper dir  (base_dir/../libexec)
+    ///     qemu-system-x86_64              ← this wrapper, mode 0755
+    /// ```
+    ///
+    /// The wrapper and its directory are world-readable and world-executable
+    /// (`0755`).  The script contains no secrets; world-exec is required so
+    /// the operator-uid QEMU process (which runs after the helper's
+    /// `setresuid`) can execute the wrapper regardless of which uid owns the
+    /// parent state-root directory.
     pub(crate) fn ensure_qemu_wrapper(&self) -> Result<PathBuf, SandboxError> {
-        let wrapper_dir = self.base_dir.join("libexec");
+        // Place the wrapper OUTSIDE LIMA_HOME so limactl never enumerates it
+        // as a malformed instance.  base_dir == LIMA_HOME, so its parent is
+        // the operator state root (/var/lib/sandboxd/<op_uid>/).
+        let state_root = self.base_dir.parent().ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "base_dir {} has no parent — cannot derive operator state root for QEMU wrapper",
+                self.base_dir.display()
+            ))
+        })?;
+        let wrapper_dir = state_root.join("libexec");
         std::fs::create_dir_all(&wrapper_dir)?;
+
+        // Ensure the directory itself is world-executable so the
+        // operator-uid QEMU process can enter it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper_dir, std::fs::Permissions::from_mode(0o755))?;
+        }
+
         let wrapper_path = wrapper_dir.join("qemu-system-x86_64");
 
         // The wrapper script is idempotent — overwrite if the content changed.
@@ -1822,8 +1910,11 @@ provision:
         Ok(wrapper_path)
     }
 
-    /// Test-only escape hatch: write the QEMU wrapper script to disk
-    /// under the manager's `base_dir/libexec/` and return its path.
+    /// Test-only escape hatch: write the QEMU wrapper script to disk and
+    /// return its path.  The wrapper lands at `base_dir/../libexec/` (the
+    /// operator state root sibling of LIMA_HOME), mirroring the production
+    /// layout where LIMA_HOME == `base_dir`.
+    ///
     /// Used by the workspace's integration tests to drive the wrapper
     /// against a stub QEMU and capture its composed argv. Production
     /// callers go through [`LimaManager::start_vm`], which invokes
@@ -2877,8 +2968,14 @@ mod tests {
     #[test]
     fn test_ensure_qemu_wrapper_creates_file() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
+        // base_dir must be a subdirectory of the TempDir (mirroring the
+        // production layout where base_dir == LIMA_HOME and its parent is
+        // the operator state root).  The wrapper lands at base_dir/../libexec/
+        // which resolves to dir.path()/libexec/ — still inside the TempDir.
+        let lima_home = dir.path().join("lima");
+        std::fs::create_dir_all(&lima_home).expect("create lima_home");
         let mgr = LimaManager::with_helper_path(
-            dir.path().to_path_buf(),
+            lima_home,
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
             nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
@@ -3285,8 +3382,12 @@ mod tests {
     #[test]
     fn test_qemu_wrapper_written_to_filesystem() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
+        // base_dir == lima_home (subdirectory), so wrapper lands at
+        // dir.path()/libexec/ — still inside the TempDir.
+        let lima_home = dir.path().join("lima");
+        std::fs::create_dir_all(&lima_home).expect("create lima_home");
         let mgr = LimaManager::with_helper_path(
-            dir.path().to_path_buf(),
+            lima_home,
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
             nix::unistd::Uid::current().as_raw(),
             DEFAULT_BASE_VM_NAME.to_string(),
@@ -3799,7 +3900,7 @@ mod tests {
     /// Like [`ensure_operator_lima_home`] but with a caller-supplied base
     /// directory.  Used by hermetic tests to avoid writing under
     /// `/var/lib/sandboxd/`.
-    fn ensure_operator_lima_home_at(
+    pub(super) fn ensure_operator_lima_home_at(
         base: &std::path::Path,
         op_uid: u32,
     ) -> Result<PathBuf, SandboxError> {
@@ -3910,13 +4011,14 @@ mod tests {
     fn registry_get_or_create_returns_same_arc_for_same_uid() {
         // The registry must return the same Arc for repeated calls with the
         // same operator uid — not a fresh LimaManager on every call.
-        let registry = LimaManagerRegistry {
-            managers: Mutex::new(HashMap::new()),
-            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            base_vm_name: "sandbox-base".to_string(),
-        };
-        let mgr1 = registry.get_or_create(1000);
-        let mgr2 = registry.get_or_create(1000);
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let registry = LimaManagerRegistry::new_for_test(
+            "sandbox-base".to_string(),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            tmp.path().to_path_buf(),
+        );
+        let mgr1 = registry.get_or_create(1000).expect("get_or_create");
+        let mgr2 = registry.get_or_create(1000).expect("get_or_create");
         assert!(
             Arc::ptr_eq(&mgr1, &mgr2),
             "registry must return the same Arc<LimaManager> for the same operator uid"
@@ -3926,13 +4028,14 @@ mod tests {
 
     #[test]
     fn registry_get_or_create_returns_different_arcs_for_different_uids() {
-        let registry = LimaManagerRegistry {
-            managers: Mutex::new(HashMap::new()),
-            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            base_vm_name: "sandbox-base".to_string(),
-        };
-        let mgr1000 = registry.get_or_create(1000);
-        let mgr1001 = registry.get_or_create(1001);
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let registry = LimaManagerRegistry::new_for_test(
+            "sandbox-base".to_string(),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            tmp.path().to_path_buf(),
+        );
+        let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
+        let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
         assert!(
             !Arc::ptr_eq(&mgr1000, &mgr1001),
             "registry must return distinct Arc<LimaManager> instances for different operator uids"
@@ -3943,14 +4046,15 @@ mod tests {
     #[test]
     fn registry_operators_have_isolated_lima_homes() {
         // Each operator's LimaManager must be rooted at a distinct
-        // LIMA_HOME path under /var/lib/sandboxd/<op_uid>/lima.
-        let registry = LimaManagerRegistry {
-            managers: Mutex::new(HashMap::new()),
-            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            base_vm_name: "sandbox-base".to_string(),
-        };
-        let mgr1000 = registry.get_or_create(1000);
-        let mgr1001 = registry.get_or_create(1001);
+        // LIMA_HOME path under <state_root>/<op_uid>/lima.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let registry = LimaManagerRegistry::new_for_test(
+            "sandbox-base".to_string(),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            tmp.path().to_path_buf(),
+        );
+        let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
+        let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
         assert_ne!(
             mgr1000.base_dir(),
             mgr1001.base_dir(),
@@ -3985,11 +4089,12 @@ mod tests {
         // mutex if they both called `build_base_image`.
         use std::sync::Barrier;
 
-        let registry = Arc::new(LimaManagerRegistry {
-            managers: Mutex::new(HashMap::new()),
-            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            base_vm_name: "sandbox-base".to_string(),
-        });
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let registry = Arc::new(LimaManagerRegistry::new_for_test(
+            "sandbox-base".to_string(),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            tmp.path().to_path_buf(),
+        ));
 
         let barrier = Arc::new(Barrier::new(2));
         let r1 = Arc::clone(&registry);
@@ -4006,8 +4111,14 @@ mod tests {
             r2.get_or_create(1000)
         });
 
-        let arc1 = h1.join().expect("thread 1 must not panic");
-        let arc2 = h2.join().expect("thread 2 must not panic");
+        let arc1 = h1
+            .join()
+            .expect("thread 1 must not panic")
+            .expect("get_or_create");
+        let arc2 = h2
+            .join()
+            .expect("thread 2 must not panic")
+            .expect("get_or_create");
 
         assert!(
             Arc::ptr_eq(&arc1, &arc2),
@@ -4027,11 +4138,12 @@ mod tests {
         // the registry produces two independent entries.
         use std::sync::Barrier;
 
-        let registry = Arc::new(LimaManagerRegistry {
-            managers: Mutex::new(HashMap::new()),
-            helper_path: PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            base_vm_name: "sandbox-base".to_string(),
-        });
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let registry = Arc::new(LimaManagerRegistry::new_for_test(
+            "sandbox-base".to_string(),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            tmp.path().to_path_buf(),
+        ));
 
         let barrier = Arc::new(Barrier::new(2));
         let r1 = Arc::clone(&registry);
@@ -4048,8 +4160,14 @@ mod tests {
             r2.get_or_create(1001)
         });
 
-        let arc1 = h1.join().expect("thread 1 must not panic");
-        let arc2 = h2.join().expect("thread 2 must not panic");
+        let arc1 = h1
+            .join()
+            .expect("thread 1 must not panic")
+            .expect("get_or_create 1000");
+        let arc2 = h2
+            .join()
+            .expect("thread 2 must not panic")
+            .expect("get_or_create 1001");
 
         assert!(
             !Arc::ptr_eq(&arc1, &arc2),
