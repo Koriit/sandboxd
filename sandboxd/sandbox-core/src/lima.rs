@@ -164,8 +164,29 @@ pub enum BaseImageStatus {
 /// use by [`ensure_operator_lima_home`].
 pub const SANDBOXD_STATE_ROOT: &str = "/var/lib/sandboxd";
 
+/// Env-var name that `test-env-override` builds consult to redirect the
+/// sandboxd state root away from `/var/lib/sandboxd`. Integration tests
+/// set this to a tempdir so `operator_lima_home` and
+/// `ensure_operator_lima_home` resolve inside the test sandbox rather than
+/// touching the production state root.
+///
+/// This constant is also used by `sandbox-lima-helper` (as
+/// `SANDBOX_LIMA_HELPER_TEST_STATE_ROOT`) to redirect `read-user-key`'s
+/// key-file path. Both sides must agree on the env var name.
+pub const STATE_ROOT_OVERRIDE_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_STATE_ROOT";
+
 /// Return the LIMA_HOME path for the given operator uid.
+///
+/// In `test-env-override` builds, the `SANDBOX_LIMA_HELPER_TEST_STATE_ROOT`
+/// env var can redirect the state root to a tempdir so integration tests
+/// do not touch `/var/lib/sandboxd/`.
 pub fn operator_lima_home(op_uid: u32) -> PathBuf {
+    #[cfg(feature = "test-env-override")]
+    if let Ok(root) = std::env::var(STATE_ROOT_OVERRIDE_ENV)
+        && !root.is_empty()
+    {
+        return PathBuf::from(format!("{root}/{op_uid}/lima"));
+    }
     PathBuf::from(format!("{SANDBOXD_STATE_ROOT}/{op_uid}/lima"))
 }
 
@@ -2004,6 +2025,48 @@ provision:
 
     fn session_dir(&self, session_id: &SessionId) -> PathBuf {
         self.base_dir.join("sessions").join(session_id.as_str())
+    }
+
+    /// Read the operator's Lima SSH private key by invoking
+    /// `sandbox-lima-helper read-user-key --op-uid <N>`.
+    ///
+    /// The helper pivots to the operator uid via `setresuid` before reading
+    /// `$LIMA_HOME/_config/user` (mode 0600, owned by the operator). The
+    /// daemon (uid 999) cannot read that file directly; the helper is the
+    /// correct cross-user pivot, parallel to how `list-json` and
+    /// `guest-socat` already operate.
+    ///
+    /// Returns the key bytes as a `String` (verbatim PEM/OpenSSH format).
+    /// The daemon serves this through `GET /sessions/{id}/ssh-config` so
+    /// the CLI can authenticate to the operator's VM without reading the
+    /// key file directly.
+    pub fn read_user_key(&self) -> Result<String, SandboxError> {
+        let output = self.run_helper(
+            "read-user-key",
+            &[],
+            Duration::from_secs(10),
+            "sandbox-lima-helper read-user-key",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Internal(format!(
+                "sandbox-lima-helper read-user-key failed for op_uid={}: {stderr}",
+                self.op_uid
+            )));
+        }
+        let key = String::from_utf8(output.stdout).map_err(|e| {
+            SandboxError::Internal(format!(
+                "Lima user key for op_uid={} is not valid UTF-8: {e}",
+                self.op_uid
+            ))
+        })?;
+        if key.is_empty() {
+            return Err(SandboxError::Internal(format!(
+                "Lima user key for op_uid={} is empty; VM may not have been provisioned yet",
+                self.op_uid
+            )));
+        }
+        Ok(key)
     }
 
     /// Run `sandbox-lima-helper list-json` and deserialize the raw entries.
@@ -4033,7 +4096,18 @@ mod tests {
     #[test]
     fn ensure_operator_lima_home_acl_contains_user_entry() {
         // Verify that `getfacl` output on the provisioned directory
-        // contains an access ACL entry for the current user.
+        // contains:
+        //   - an access ACL entry for the current user (rwx on the dir root)
+        //   - default:group::--- (suppress group read on children)
+        //   - default:other::--- (suppress world read on children)
+        //   - NO default named-user ACL for op_uid
+        //
+        // The default named-user ACL was intentionally removed because Linux
+        // ACL semantics force st_mode group bits >= the named-user mask,
+        // turning Lima's `_config/user` key file from 0600 to 0640+, which
+        // OpenSSH's StrictKeyfileMode rejects. The operator owns every file
+        // limactl creates (post-setresuid pivot) and accesses them via owner
+        // bits — no default named-user propagation needed.
         //
         // We use the current uid as the operator uid so the test doesn't
         // need root to set ACLs for an arbitrary uid.
@@ -4056,6 +4130,9 @@ mod tests {
             .ok()
             .flatten()
             .map(|u| u.name);
+
+        // Access ACL: op_uid must have rwx on the dir root so it can
+        // traverse, read, and write the LIMA_HOME directory.
         let user_acl_numeric = format!("user:{op_uid}:rwx");
         let user_acl_named = username
             .as_deref()
@@ -4067,15 +4144,35 @@ mod tests {
              (numeric '{user_acl_numeric}' or named '{user_acl_named}');\n\
              got:\n{acl}"
         );
-        let default_acl_numeric = format!("default:user:{op_uid}:rwx");
+
+        // Default group and other ACLs must suppress group/world read on
+        // all children (belt-and-suspenders against the ACL mask).
+        assert!(
+            acl.contains("default:group::---"),
+            "getfacl output must contain 'default:group::---' to suppress group \
+             read on children (including Lima's _config/user SSH key);\n\
+             got:\n{acl}"
+        );
+        assert!(
+            acl.contains("default:other::---"),
+            "getfacl output must contain 'default:other::---' to suppress world \
+             read on children;\n\
+             got:\n{acl}"
+        );
+
+        // No default named-user ACL for op_uid. Such an entry would force
+        // st_mode group bits >= the ACL mask and turn 0600 files into 0640+,
+        // breaking OpenSSH's StrictKeyfileMode for Lima's _config/user key.
+        let default_acl_numeric = format!("default:user:{op_uid}:");
         let default_acl_named = username
             .as_deref()
-            .map(|n| format!("default:user:{n}:rwx"))
+            .map(|n| format!("default:user:{n}:"))
             .unwrap_or_default();
         assert!(
-            acl.contains(&default_acl_numeric) || acl.contains(&default_acl_named),
-            "getfacl output must contain default ACL for op_uid {op_uid} \
-             (numeric '{default_acl_numeric}' or named '{default_acl_named}');\n\
+            !acl.contains(&default_acl_numeric)
+                && (default_acl_named.is_empty() || !acl.contains(&default_acl_named)),
+            "getfacl output must NOT contain a default named-user ACL for op_uid {op_uid} \
+             — such an entry causes OpenSSH StrictKeyfileMode rejection of _config/user;\n\
              got:\n{acl}"
         );
     }

@@ -242,10 +242,7 @@ fn integration_lima_helper_caller_not_in_sandbox_group_denied() {
         &helper,
         &[
             ("SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER", user.as_str()),
-            (
-                "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP",
-                "root",
-            ),
+            ("SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP", "root"),
         ],
         &["list-json", "--op-uid", "1000"],
     );

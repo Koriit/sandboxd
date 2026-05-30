@@ -48,6 +48,13 @@ use sandbox_core::{SessionConfig, SessionStore, SshKeypair};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 
+fn lima_helper_bin() -> PathBuf {
+    // The test-env-override–capable helper is installed at this path by
+    // `make setup-dev-env` alongside the production helper.  It is the
+    // same binary the Lima proxy integration test uses.
+    PathBuf::from("/usr/local/libexec/sandboxd-test/sandbox-lima-helper")
+}
+
 // ---------------------------------------------------------------------------
 // Binary resolution & users.conf fixture (shape mirrors
 // integration_owner_peercred.rs — see that file for rationale).
@@ -365,30 +372,63 @@ async fn integration_get_ssh_config_container_backend() {
 // Test 2 — Lima backend round-trip
 // ---------------------------------------------------------------------------
 
-/// Seed a Lima-backed session row (no keypair persisted — the
-/// Lima branch reads the key off disk at `~/.lima/_config/user`),
-/// stage a fresh ed25519 key at that path under a redirected
-/// `HOME`, and `GET /sessions/<id>/ssh-config`. Same three
-/// assertions as the container test.
+/// Seed a Lima-backed session row (no keypair persisted — the Lima branch
+/// reads the key by pivoting through `sandbox-lima-helper read-user-key`
+/// to the operator's per-operator LIMA_HOME at
+/// `/var/lib/sandboxd/<op_uid>/lima/_config/user`). We stage a fresh
+/// ed25519 key at that path under a redirected state root and
+/// `GET /sessions/<id>/ssh-config`. Same three assertions as the
+/// container test.
 ///
-/// This is the only integration coverage for the Lima branch of
-/// `read_lima_user_private_key` in `sandboxd/src/main.rs`; without
-/// it, a regression that broke `$HOME` resolution or the file-path
-/// shape would land in CI silently.
+/// ## How the test-environment pivot works
+///
+/// The production path requires `cap_setuid+ep` on `sandbox-lima-helper`.
+/// In the integration test environment we use the same technique the Lima
+/// proxy WebSocket test uses:
+///
+/// * Point the daemon at `/usr/local/libexec/sandboxd-test/sandbox-lima-helper`
+///   (the `test-env-override`–capable build installed by `make setup-dev-env`).
+/// * Set `SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER` / `..._GROUP` to the test
+///   runner's username/group so the helper's identity check (step 1) accepts
+///   the test runner uid as "sandbox".
+/// * Set `SANDBOX_LIMA_HELPER_TEST_STATE_ROOT` to a tempdir so both
+///   `operator_lima_home` (in `sandbox-core`) and the helper's
+///   `read-user-key` path construction resolve the key file inside the
+///   tempdir rather than `/var/lib/sandboxd/`.
+///
+/// The `test-env-override` build of the helper skips the `setresuid` step
+/// when the caller uid already equals `op_uid` (test runner running as its
+/// own uid). The result is that the key file is read directly as the test
+/// user, exercising every daemon-side hop (session-ownership check, DTO
+/// shape, LimaManager routing) without a live setcap binary.
 #[tokio::test]
 async fn integration_get_ssh_config_lima_backend() {
     let tmp = TempDir::new().expect("tempdir");
     let base_dir = tmp.path().join("state");
     std::fs::create_dir_all(&base_dir).expect("mkdir base_dir");
 
-    // Stage a fresh ed25519 keypair under a fake `~/.lima/_config/`
-    // owned by the daemon's redirected HOME. The handler reads the
-    // private half verbatim from that file.
-    let lima_home = tmp.path().join("daemon-home");
-    std::fs::create_dir_all(lima_home.join(".lima/_config"))
-        .expect("mkdir ~/.lima/_config under fake HOME");
+    // Determine current user identity for helper overrides.
+    let owner = current_username();
+    let owner_uid = nix::unistd::Uid::current().as_raw();
+    let gid = nix::unistd::Gid::current();
+    let group_name = nix::unistd::Group::from_gid(gid)
+        .expect("getgrgid succeeded")
+        .expect("gid maps to a group entry")
+        .name;
+
+    // Redirect per-operator LIMA_HOME to a tempdir subtree.
+    // Both sandbox-core's operator_lima_home() and the helper's
+    // read-user-key subcommand consult SANDBOX_LIMA_HELPER_TEST_STATE_ROOT
+    // when the test-env-override feature is active.
+    //
+    // Per-operator path: `<state_root>/<uid>/lima/_config/user`
+    let state_root = tmp.path().join("sandboxd-state");
+    let per_op_config_dir = state_root.join(owner_uid.to_string()).join("lima/_config");
+    std::fs::create_dir_all(&per_op_config_dir).expect("mkdir per-operator _config dir");
+
+    // Stage a fresh ed25519 keypair at the per-operator key path.
     let kp = SshKeypair::generate("integration_ssh_config_lima").expect("keypair generation");
-    let user_key_path = lima_home.join(".lima/_config/user");
+    let user_key_path = per_op_config_dir.join("user");
     {
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
@@ -397,12 +437,13 @@ async fn integration_get_ssh_config_lima_backend() {
             .truncate(true)
             .mode(0o600)
             .open(&user_key_path)
-            .expect("create ~/.lima/_config/user");
+            .expect("create per-operator _config/user");
         f.write_all(kp.private.as_bytes())
-            .expect("write ~/.lima/_config/user");
+            .expect("write per-operator _config/user");
     }
 
-    let owner = current_username();
+    // Seed the session row with `operator_uid = owner_uid` so the daemon's
+    // Lima branch looks up the right per-operator LimaManager.
     let session_id_str = {
         let (store, _orphans) = SessionStore::new(base_dir.clone()).expect("open store pre-spawn");
         let session = store
@@ -411,7 +452,7 @@ async fn integration_get_ssh_config_lima_backend() {
                 Some("ssh-config-lima".to_string()),
                 BackendKind::Lima,
                 &owner,
-                0,
+                owner_uid,
                 "",
                 None,
                 None,
@@ -420,7 +461,25 @@ async fn integration_get_ssh_config_lima_backend() {
         session.id.to_string()
     };
 
-    let daemon = Daemon::spawn_with_env(tmp, base_dir, &[("HOME", lima_home.as_path())]);
+    let daemon = Daemon::spawn_with_env(
+        tmp,
+        base_dir,
+        &[
+            // Point at the test-env-override–capable helper binary.
+            ("SANDBOX_LIMA_HELPER_PATH", lima_helper_bin().as_path()),
+            // Accept the test runner uid as the "sandbox" caller so the
+            // helper's identity check (step 1) passes without a real
+            // uid-999 daemon process.
+            ("SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER", Path::new(&owner)),
+            (
+                "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP",
+                Path::new(&group_name),
+            ),
+            // Redirect the state root so operator_lima_home() and the
+            // helper's read-user-key path both resolve inside the tempdir.
+            ("SANDBOX_LIMA_HELPER_TEST_STATE_ROOT", state_root.as_path()),
+        ],
+    );
     let path = format!("/sessions/{session_id_str}/ssh-config");
     let (status, body) = http_get(&daemon.socket, &path, Duration::from_secs(15)).await;
     assert_eq!(
@@ -439,7 +498,7 @@ async fn integration_get_ssh_config_lima_backend() {
     assert_eq!(
         dto.private_key, kp.private,
         "Lima handler must return the verbatim contents of \
-         $HOME/.lima/_config/user"
+         the per-operator LIMA_HOME/_config/user key file"
     );
     assert_config_text_parses_via_ssh_dash_g(&dto.config, &session_id_str);
 }

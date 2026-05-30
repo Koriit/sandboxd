@@ -6740,10 +6740,14 @@ async fn session_health(
 ///   out of scope — injecting a new `authorized_keys` into a running
 ///   container would require sshd hot-reload that the lite image is
 ///   not designed for.
-/// * Lima sessions: Lima manages per-VM SSH credentials on disk under
-///   the daemon's `~/.lima/_config/user{,.pub}`. The daemon reads the
-///   private half on demand and serves it through the same DTO
-///   shape, so the CLI can dispatch backend-agnostically.
+/// * Lima sessions: Lima manages per-VM SSH credentials in the
+///   operator's per-operator LIMA_HOME under
+///   `/var/lib/sandboxd/<op_uid>/lima/_config/user`. That file is
+///   mode 0600 owned by the operator uid; the daemon reads it by
+///   pivoting through `sandbox-lima-helper read-user-key` (same
+///   cross-user pattern as the proxy WebSocket's `list-json`/
+///   `guest-socat` calls). The key is served through the same DTO
+///   shape so the CLI dispatches backend-agnostically.
 ///
 /// Session ownership is enforced via the existing
 /// `get_session_by_name_or_id(&id, &operator.name)` path — a foreign
@@ -6795,14 +6799,32 @@ async fn get_ssh_config(
             }
         },
         BackendKind::Lima => {
-            // Lima manages its own SSH credentials under
-            // `~/.lima/_config/user` (private) and the matching `.pub`
-            // (public). The daemon (running as `sandbox`) reads its
-            // own home directory; the CLI never sees the file
-            // directly. A `spawn_blocking` is appropriate even for
-            // this small read because the handler dispatches off the
-            // async runtime.
-            let key_result = tokio::task::spawn_blocking(read_lima_user_private_key).await;
+            // Lima manages per-VM SSH credentials under the operator's
+            // per-operator LIMA_HOME (`/var/lib/sandboxd/<op_uid>/lima/
+            // _config/user`). That file is mode 0600 owned by the operator
+            // uid — the daemon (uid 999) cannot read it directly. The helper
+            // binary (`sandbox-lima-helper read-user-key`) pivots to the
+            // operator uid via setresuid, reads the file, and writes the
+            // bytes to stdout. This is the same cross-user pivot pattern
+            // the proxy WebSocket handler already uses for `list-json` and
+            // `guest-socat`. A `spawn_blocking` wraps the one-shot helper
+            // invocation per the project's standard Command convention.
+            let op_uid = match session.operator_uid {
+                Some(uid) => uid,
+                None => {
+                    return error_response(SandboxError::Internal(
+                        "Lima session has no operator_uid (pre-V009 row?); \
+                         cannot locate per-operator SSH key"
+                            .to_string(),
+                    ))
+                    .into_response();
+                }
+            };
+            let lima = match state.lima_runtime.manager_for(op_uid) {
+                Ok(m) => m,
+                Err(e) => return error_response(e).into_response(),
+            };
+            let key_result = tokio::task::spawn_blocking(move || lima.read_user_key()).await;
             match key_result {
                 Ok(Ok(k)) => k,
                 Ok(Err(e)) => return error_response(e).into_response(),
@@ -6861,34 +6883,6 @@ async fn get_proxy(
         Ok(resp) => resp.into_response(),
         Err(e) => e.into_response(),
     }
-}
-
-/// Read the daemon's Lima-managed SSH private key from
-/// `~/.lima/_config/user`. Returns the file contents verbatim as an
-/// OpenSSH-format string.
-///
-/// The daemon runs as the `sandbox` system user under its
-/// systemd-unit launch posture; Lima writes the key under that user's
-/// home directory at `~/.lima/_config/user`. The file mode is 0600 (set
-/// by Lima at write time) so only the daemon process can read it.
-/// This helper is invoked from `get_ssh_config` to serve the private
-/// half to the calling operator over the peercred-authenticated socket.
-fn read_lima_user_private_key() -> Result<String, SandboxError> {
-    // Resolve the daemon's `$HOME` rather than assuming
-    // `/home/sandbox`; integration tests run the daemon under their
-    // own uid + home, and Lima follows `$HOME` for its config dir.
-    let home_dir = std::env::var_os("HOME").ok_or_else(|| {
-        SandboxError::Internal(
-            "HOME environment variable is not set; cannot locate Lima user key".to_string(),
-        )
-    })?;
-    let path = PathBuf::from(home_dir).join(".lima/_config/user");
-    std::fs::read_to_string(&path).map_err(|e| {
-        SandboxError::Internal(format!(
-            "failed to read Lima user key {}: {e}",
-            path.display()
-        ))
-    })
 }
 
 /// JSON body for `POST /rebuild-image`.

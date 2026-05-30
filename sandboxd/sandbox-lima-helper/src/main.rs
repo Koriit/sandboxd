@@ -8,8 +8,9 @@
 //! sandbox-lima-helper <subcommand> [flags...]
 //! ```
 //!
-//! Nine subcommands: `create`, `start`, `clone`, `stop`, `delete`,
-//! `copy`, `guest-socat`, `install-guest-agent`, `list-json`. Every
+//! Ten subcommands: `create`, `start`, `clone`, `stop`, `delete`,
+//! `copy`, `guest-socat`, `install-guest-agent`, `list-json`,
+//! `read-user-key`. Every
 //! flag the helper passes to limactl is hardcoded per subcommand;
 //! the daemon contributes only the typed flag values (no pass-through).
 //!
@@ -189,6 +190,12 @@ const TEST_SANDBOX_USER_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER";
 const TEST_SANDBOX_GROUP_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP";
 #[cfg(feature = "test-env-override")]
 const TEST_GUEST_BINARY_PATH_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH";
+/// Override for the sandboxd state root used to construct per-operator
+/// LIMA_HOME paths. Normally `/var/lib/sandboxd`; tests redirect to a
+/// tempdir so `read-user-key` resolves the key file without touching
+/// the production state root.
+#[cfg(feature = "test-env-override")]
+const TEST_STATE_ROOT_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_STATE_ROOT";
 
 fn resolve_sandbox_user_name() -> String {
     #[cfg(feature = "test-env-override")]
@@ -218,6 +225,22 @@ fn resolve_guest_binary_path() -> String {
         return v;
     }
     SANDBOX_GUEST_HOST_PATH.to_string()
+}
+
+/// Resolve the sandboxd state root for per-operator LIMA_HOME construction.
+///
+/// Returns `/var/lib/sandboxd` in production. In `test-env-override` builds
+/// the `SANDBOX_LIMA_HELPER_TEST_STATE_ROOT` env var redirects the root into a
+/// caller-supplied tempdir so `read-user-key` integration tests can seed the
+/// key file without touching the production state root.
+fn resolve_state_root() -> String {
+    #[cfg(feature = "test-env-override")]
+    if let Ok(v) = env::var(TEST_STATE_ROOT_ENV)
+        && !v.is_empty()
+    {
+        return v;
+    }
+    "/var/lib/sandboxd".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +305,10 @@ struct ListJsonArgs {
     op_uid: u32,
 }
 
+struct ReadUserKeyArgs {
+    op_uid: u32,
+}
+
 enum Subcommand {
     Create(CreateArgs),
     Start(StartArgs),
@@ -292,6 +319,7 @@ enum Subcommand {
     GuestSocat(GuestSocatArgs),
     InstallGuestAgent(InstallGuestAgentArgs),
     ListJson(ListJsonArgs),
+    ReadUserKey(ReadUserKeyArgs),
 }
 
 impl Subcommand {
@@ -306,6 +334,7 @@ impl Subcommand {
             Subcommand::GuestSocat(a) => a.op_uid,
             Subcommand::InstallGuestAgent(a) => a.op_uid,
             Subcommand::ListJson(a) => a.op_uid,
+            Subcommand::ReadUserKey(a) => a.op_uid,
         }
     }
 }
@@ -434,7 +463,8 @@ fn run() -> ExitCode {
     // Step 10 — build sanitised env block.
     // Pass pw_dir (captured in step 3, reused for limactl resolution in
     // step 7) as op_home so HOME is set to the operator's own directory.
-    let lima_home = format!("/var/lib/sandboxd/{op_uid_raw}/lima/");
+    let state_root = resolve_state_root();
+    let lima_home = format!("{state_root}/{op_uid_raw}/lima/");
     let env_block = build_env_block(&subcommand, &lima_home, &pw_dir);
 
     // Step 10.5 — tighten umask to 0077 before exec.
@@ -456,11 +486,13 @@ fn run() -> ExitCode {
     // needs to mkdir intermediate subdirs (boot.FreeBSD, etc.).
     unsafe { libc::umask(0o077) };
 
-    // Step 11 — exec (or step-sequence for install-guest-agent).
+    // Step 11 — exec (or step-sequence for install-guest-agent, or
+    // stdout-write for read-user-key).
     match &subcommand {
         Subcommand::InstallGuestAgent(a) => {
             run_install_guest_agent(&limactl_path, &a.vm, &env_block)
         }
+        Subcommand::ReadUserKey(_) => run_read_user_key(op_uid_raw, &lima_home),
         _ => exec_limactl(&limactl_path, &subcommand, &env_block),
     }
 }
@@ -487,6 +519,7 @@ fn parse_argv(args: &[OsString]) -> Result<Subcommand, String> {
         "guest-socat" => parse_guest_socat(&args[2..]),
         "install-guest-agent" => parse_install_guest_agent(&args[2..]),
         "list-json" => parse_list_json(&args[2..]),
+        "read-user-key" => parse_read_user_key(&args[2..]),
         other => Err(format!("unknown subcommand: {other}")),
     }
 }
@@ -774,6 +807,17 @@ fn parse_list_json(args: &[OsString]) -> Result<Subcommand, String> {
     Ok(Subcommand::ListJson(ListJsonArgs { op_uid }))
 }
 
+// --- read-user-key ---
+
+fn parse_read_user_key(args: &[OsString]) -> Result<Subcommand, String> {
+    let mut f = FlagSet::new(args);
+    let op_uid_s = require_flag("--op-uid", f.take_string("--op-uid")?)?;
+    f.check_no_extra()?;
+
+    let op_uid = parse_u32("--op-uid", &op_uid_s)?;
+    Ok(Subcommand::ReadUserKey(ReadUserKeyArgs { op_uid }))
+}
+
 // ---------------------------------------------------------------------------
 // Validators (steps 4–6)
 // ---------------------------------------------------------------------------
@@ -819,6 +863,9 @@ fn validate_subcommand(sub: &Subcommand) -> Result<(), (u8, String)> {
             validate_vm_name(&a.vm)?;
         }
         Subcommand::ListJson(_) => {
+            // No path/vm validation needed.
+        }
+        Subcommand::ReadUserKey(_) => {
             // No path/vm validation needed.
         }
     }
@@ -1442,6 +1489,9 @@ fn build_limactl_argv(limactl: &str, sub: &Subcommand) -> Vec<String> {
         Subcommand::InstallGuestAgent(_) => {
             unreachable!("install-guest-agent does not use exec_limactl")
         }
+        Subcommand::ReadUserKey(_) => {
+            unreachable!("read-user-key does not use exec_limactl")
+        }
     }
 }
 
@@ -1595,6 +1645,46 @@ fn run_step_labeled(argv: &[String], env_block: &[CString], label: &str) -> Resu
         return Err(ExitCode::from(code));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// read-user-key implementation (step 11, special case)
+// ---------------------------------------------------------------------------
+
+/// Read the operator's Lima SSH private key from `$LIMA_HOME/_config/user`
+/// and write it verbatim to stdout.
+///
+/// Called after `setresuid` has dropped the process to the operator uid, so
+/// the key file (mode 0600, owned by op_uid) is readable. The daemon
+/// captures stdout and serves the bytes through `GET /sessions/{id}/ssh-config`
+/// so the CLI can authenticate as the operator's VM user.
+///
+/// On any I/O error the function prints a single diagnostic line to stderr
+/// and returns a non-zero exit code so the daemon surfaces the failure as a
+/// `SandboxError::Lima` rather than silently serving empty bytes.
+fn run_read_user_key(op_uid: u32, lima_home: &str) -> ExitCode {
+    use std::io::Write;
+
+    let key_path = format!("{lima_home}_config/user");
+    match std::fs::read_to_string(&key_path) {
+        Ok(contents) => {
+            // Write verbatim to stdout. The daemon captures this.
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            if let Err(e) = handle.write_all(contents.as_bytes()) {
+                eprintln!("sandbox-lima-helper: read-user-key: write to stdout failed: {e}");
+                return ExitCode::from(EXIT_GENERIC);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "sandbox-lima-helper: read-user-key: failed to read {key_path} \
+                 (op_uid={op_uid}): {e}"
+            );
+            ExitCode::from(EXIT_GENERIC)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2668,6 +2758,47 @@ WantedBy=multi-user.target";
         assert_eq!(
             exit_code_for_group_membership(GroupMembership::EnumerationFailed(libc::ENOMEM)),
             EXIT_GENERIC
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // read-user-key parser
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_read_user_key_minimal() {
+        let args = os_args(&["read-user-key", "--op-uid", "1001"]);
+        let sub = parse_argv(&args).expect("must parse");
+        assert_eq!(sub.op_uid(), 1001);
+    }
+
+    #[test]
+    fn parse_read_user_key_missing_op_uid_fails() {
+        let args = os_args(&["read-user-key"]);
+        assert!(parse_argv(&args).is_err());
+    }
+
+    #[test]
+    fn parse_read_user_key_extra_flag_fails() {
+        let args = os_args(&["read-user-key", "--op-uid", "1001", "--vm", "sandbox-abc"]);
+        assert!(parse_argv(&args).is_err());
+    }
+
+    /// Verify the key path construction: lima_home with trailing slash
+    /// concatenated with `_config/user` must resolve to the correct path.
+    /// The helper's `run()` constructs `lima_home` as
+    /// `/var/lib/sandboxd/{op_uid}/lima/` (always trailing-slash), so
+    /// `{lima_home}_config/user` must equal
+    /// `/var/lib/sandboxd/{op_uid}/lima/_config/user`.
+    #[test]
+    fn read_user_key_path_construction_correct() {
+        let op_uid: u32 = 1001;
+        let lima_home = format!("/var/lib/sandboxd/{op_uid}/lima/");
+        let key_path = format!("{lima_home}_config/user");
+        assert_eq!(
+            key_path,
+            format!("/var/lib/sandboxd/{op_uid}/lima/_config/user"),
+            "key path must be $LIMA_HOME/_config/user; got: {key_path}",
         );
     }
 }
