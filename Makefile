@@ -14,7 +14,14 @@ RESET :=
 endif
 
 build: fmt-check
-	cd sandboxd && cargo build --workspace
+	# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
+	# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
+	# otherwise emit plain text so captured logs and CI output stay greppable.
+	@if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then \
+	  cd sandboxd && cargo build --workspace; \
+	else \
+	  cd sandboxd && CARGO_TERM_COLOR=never cargo build --workspace; \
+	fi
 
 fmt:
 	cd sandboxd && cargo fmt --all
@@ -27,7 +34,14 @@ fmt-check:
 # every test named `integration_*`, so this target stays fast and
 # deterministic even as the workspace grows more integration tests.
 test:
-	cd sandboxd && cargo nextest run --workspace
+	# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
+	# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
+	# otherwise emit plain text so captured logs stay greppable.
+	@if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then \
+	  cd sandboxd && cargo nextest run --workspace; \
+	else \
+	  cd sandboxd && CARGO_TERM_COLOR=never cargo nextest run --workspace; \
+	fi
 
 # Integration tests: every test named `integration_*` in the workspace.
 # These require out-of-process state — a real `sandbox-gateway`
@@ -48,9 +62,18 @@ test:
 # or the test's checksum check rejects the on-disk cap'd binary as
 # stale.
 test-integration: gateway-image lite-image install-route-helper-test-cap install-lima-helper-test-cap
-	cd sandboxd && \
+	# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
+	# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
+	# otherwise emit plain text so captured logs stay greppable.
+	@if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then \
+	  cd sandboxd && \
 	    cargo build --workspace --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override && \
-	    cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override
+	    cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override; \
+	else \
+	  cd sandboxd && \
+	    CARGO_TERM_COLOR=never cargo build --workspace --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override && \
+	    CARGO_TERM_COLOR=never cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override; \
+	fi
 
 # The stamp filename embeds the host's Python minor version (e.g.
 # `.installed.python3.12`) so a host interpreter upgrade — say
@@ -117,7 +140,8 @@ TEST ?=
 # non-member caller.
 test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
 	cd tests/e2e && \
-	  _pytest='. .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 -m "not lima" -k "not [lima]" $(TEST)'; \
+	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
+	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color -m \"not lima\" -k \"not [lima]\" $(TEST)"; \
 	  if [ "$${SANDBOX_HARNESS:-sandbox-systemd}" = "test-user" ]; then \
 	    sh -c "$$_pytest"; \
 	  else \
@@ -143,7 +167,8 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # non-member caller.
 test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
 	cd tests/e2e && \
-	  _pytest='. .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 $(TEST)'; \
+	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
+	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $(TEST)"; \
 	  if [ "$${SANDBOX_HARNESS:-sandbox-systemd}" = "test-user" ]; then \
 	    sh -c "$$_pytest"; \
 	  else \
