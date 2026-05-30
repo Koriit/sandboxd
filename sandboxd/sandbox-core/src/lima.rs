@@ -64,7 +64,12 @@ const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// Timeout for `limactl start` when booting the base image (cloud-init
 /// provisioning runs on first boot: installs socat, git, Docker via
-/// apt, guest agent).
+/// apt, guest agent). 600 s budget — the cloud-init scripts use
+/// HTTPS apt sources with a 5 s Acquire::http::Timeout + ForceIPv4
+/// (see the base template's `/etc/apt/apt.conf.d/99sandbox` stanza)
+/// so a warm-network provision completes in ~60-120 s. If the build
+/// exceeds this budget, investigate the provisioning steps rather than
+/// raising this constant.
 const BASE_START_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Graceful budget for `limactl stop` of the base image. Healthy
@@ -191,14 +196,39 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
 
     // Step 2: apply POSIX ACLs via setfacl.
     //
-    // setfacl -m u:<op_uid>:rwx,d:u:<op_uid>:rwx <dir>
-    //   - `u:<op_uid>:rwx`   — access ACL: operator gets rwx on the dir.
-    //   - `d:u:<op_uid>:rwx` — default ACL: every child Lima creates
-    //                          inherits operator rwx without a chown step.
+    // setfacl -m u:<op_uid>:rwx,d:g::---,d:o::--- <dir>
+    //
+    //   - `u:<op_uid>:rwx` — access ACL on the top dir only: operator can
+    //                         traverse, read, and write the LIMA_HOME root
+    //                         (e.g. read base-template.yaml written by the
+    //                         daemon, create instance subdirs).
+    //
+    //   - NO `d:u:<op_uid>:rwx` — intentionally omitted. A default
+    //                         named-user ACL would propagate into every
+    //                         child (including `_config/user`, Lima's SSH
+    //                         private key). Linux's ACL mask rule forces
+    //                         st_mode group bits ≥ the mask whenever a
+    //                         named-user entry exists. OpenSSH does NOT
+    //                         understand POSIX ACLs: it calls stat(2) and
+    //                         rejects any key whose st_mode & 077 ≠ 0
+    //                         ("bad permissions"). With a default named-user
+    //                         entry, `_config/user` always shows up as
+    //                         0640 or 0644 to stat, causing the hostagent
+    //                         to loop "bad permissions" for the full 600 s
+    //                         start timeout and never reach SSH.
+    //                         The operator runs limactl via the helper
+    //                         post-setresuid, so it OWNS every file it
+    //                         creates and accesses them via owner bits —
+    //                         no named-user ACL propagation is needed.
+    //
+    //   - `d:g::---`       — default group: suppress group read on all
+    //                         children (belt-and-suspenders for the mask).
+    //   - `d:o::---`       — default other: suppress world read on all
+    //                         children.
     //
     // Numeric uid form avoids an NSS round-trip and matches the spec
     // prescription exactly.
-    let acl_spec = format!("u:{op_uid}:rwx,d:u:{op_uid}:rwx");
+    let acl_spec = format!("u:{op_uid}:rwx,d:g::---,d:o::---");
     let output = run_with_timeout(
         Command::new("setfacl")
             .arg("-m")
@@ -3958,7 +3988,7 @@ mod tests {
                 lima_home.display()
             ))
         })?;
-        let acl_spec = format!("u:{op_uid}:rwx,d:u:{op_uid}:rwx");
+        let acl_spec = format!("u:{op_uid}:rwx,d:g::---,d:o::---");
         let output = run_with_timeout(
             Command::new("setfacl")
                 .arg("-m")
