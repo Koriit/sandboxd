@@ -47,9 +47,10 @@ from conftest import (
 def _guest_path_for(backend: str) -> str:
     """Return a writable guest path appropriate for ``backend``.
 
-    Container backend: ``CONTAINER_HOME/work`` so the bind target lands
-    inside the lite image's writable-volume area (``/home/agent`` is the
-    only writable tree on the read-only container rootfs). Lima backend:
+    Container backend: ``CONTAINER_HOME/work`` (i.e. ``/home/sandbox/work``) so
+    the bind target lands inside the lite image's writable-volume area
+    (``/home/sandbox`` is the only writable tree on the read-only container
+    rootfs). Lima backend:
     ``/srv/work`` to exercise an out-of-home-dir mount and confirm Lima's
     9p materialisation honours operator paths anywhere on the rootfs.
     """

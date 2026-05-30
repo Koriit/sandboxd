@@ -454,11 +454,32 @@ def limactl_cmd(*args: str) -> list[str]:
 #: Files written here persist across stop/start (non-tmpfs, on the VM's disk).
 LIMA_VM_HOME: str = "/home/agent"
 
-#: In-VM home directory for the ``agent`` user inside lite (Docker) containers.
-#: Same username / same path, distinct from Lima (each backend has its own
-#: base image), but identical in practice.  Kept as a named constant so a
-#: future rename is a one-line change here rather than a grep-and-replace.
-CONTAINER_HOME: str = "/home/agent"
+#: In-VM home directory for the ``sandbox`` user inside lite (Docker) containers.
+#: The lite Dockerfile runs ``useradd ... sandbox`` and the container runtime
+#: mounts the home volume at ``/home/sandbox``.  Distinct from Lima's
+#: ``/home/agent`` — the two backends have different base images and different
+#: user names.  Cross-backend tests must use ``guest_home(backend)`` rather
+#: than either constant directly.
+CONTAINER_HOME: str = "/home/sandbox"
+
+
+def guest_home(backend: str) -> str:
+    """Return the in-VM home directory appropriate for ``backend``.
+
+    Lima sessions use ``/home/agent`` (the ``agent`` user created by the Lima
+    base image cloud-init); container (lite) sessions use ``/home/sandbox``
+    (the ``sandbox`` user in the lite Dockerfile).
+
+    Cross-backend tests parametrized via the ``backend`` fixture MUST call
+    this helper rather than referencing either constant directly, so that the
+    ``[lima]`` run resolves to ``/home/agent`` and the ``[container]`` run
+    resolves to ``/home/sandbox``.
+
+    Single-backend tests should use the appropriate constant directly:
+    ``LIMA_VM_HOME`` for Lima-only tests, ``CONTAINER_HOME`` for
+    container-only tests.
+    """
+    return LIMA_VM_HOME if backend == "lima" else CONTAINER_HOME
 
 
 def wait_for_daemon_ready(

@@ -35,8 +35,8 @@ import tempfile
 import pytest
 
 from conftest import (
-    LIMA_VM_HOME,
     gateway_container_name,
+    guest_home,
     lima_vm_name,
     limactl_cmd,
     make_create_args,
@@ -52,16 +52,22 @@ from conftest import (
 def _guest_path_for(backend: str) -> str:
     """Return a writable guest path appropriate for ``backend``.
 
-    The on-create rsync push runs over the shell transport as
-    ``agent`` (uid 1000), so the destination's parent must be
-    writable by that uid. On both backends ``LIMA_VM_HOME`` (``/home/agent``)
-    is ``agent``-owned, so ``/home/agent/work`` works uniformly. Other
-    paths like ``/srv/work`` look attractive on Lima because the
+    The on-create rsync push runs over the shell transport as the
+    in-VM user (uid 1000), so the destination's parent must be
+    writable by that uid.
+
+    * Lima: ``/home/agent/work`` — the ``agent`` user home created by
+      cloud-init.
+    * Container (lite): ``/home/sandbox/work`` — the ``sandbox`` user
+      home from the lite Dockerfile; ``/home/agent`` does not exist in
+      the container image.
+
+    Other paths like ``/srv/work`` look attractive on Lima because the
     rootfs is fully writable, but only by ``root`` — rsync's
     ``--mkpath`` would need to ``mkdir`` under root-owned ``/srv``
     and fails with ``Permission denied (13)``.
     """
-    return f"{LIMA_VM_HOME}/work"
+    return f"{guest_home(backend)}/work"
 
 
 def _no_orphan_lima_vm(session_id: str) -> bool:

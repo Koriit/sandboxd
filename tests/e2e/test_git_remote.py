@@ -33,8 +33,8 @@ import tempfile
 import pytest
 
 from conftest import (
-    LIMA_VM_HOME,
     SandboxBinaries,
+    guest_home,
     make_create_args,
     parse_session_id,
     wait_for_state,
@@ -86,6 +86,7 @@ def test_git_push_to_vm(
     session_id = None
     local_repo = None
     helper_dir = None
+    _home = guest_home(backend)
     try:
         # -- 0. Set up git-remote-sandbox symlink and env ----------------------
         socket_path = sandbox_daemon["socket"]
@@ -108,7 +109,7 @@ def test_git_push_to_vm(
         # -- 2. Initialize a bare repo inside the VM --------------------------
         exec_result = sandbox_cli(
             "exec", "git-push-vm", "--",
-            "git", "init", "--bare", f"{LIMA_VM_HOME}/workspace/repo.git",
+            "git", "init", "--bare", f"{_home}/workspace/repo.git",
             timeout=120,
         )
         assert exec_result.returncode == 0, (
@@ -151,7 +152,7 @@ def test_git_push_to_vm(
         assert branch, "Could not determine local branch name"
 
         # -- 4. Add a git remote using sandbox:: URL ---------------------------
-        remote_url = f"sandbox::git-push-vm{LIMA_VM_HOME}/workspace/repo.git"
+        remote_url = f"sandbox::git-push-vm{_home}/workspace/repo.git"
         subprocess.run(
             ["git", "-C", local_repo, "remote", "add", "sandbox", remote_url],
             check=True, capture_output=True, timeout=10,
@@ -172,7 +173,7 @@ def test_git_push_to_vm(
         # -- 6. Verify the commit arrived inside the VM -----------------------
         log_result = sandbox_cli(
             "exec", "git-push-vm", "--",
-            "git", "-C", f"{LIMA_VM_HOME}/workspace/repo.git",
+            "git", "-C", f"{_home}/workspace/repo.git",
             "log", "--oneline", "-1",
             timeout=120,
         )
@@ -218,6 +219,7 @@ def test_git_fetch_from_vm(
     session_id = None
     local_repo = None
     helper_dir = None
+    _home = guest_home(backend)
     try:
         # -- 0. Set up git-remote-sandbox symlink and env ----------------------
         socket_path = sandbox_daemon["socket"]
@@ -239,8 +241,8 @@ def test_git_fetch_from_vm(
 
         # -- 2. Create a repo with a commit inside the VM ---------------------
         init_script = (
-            f"mkdir -p {LIMA_VM_HOME}/workspace/repo && "
-            f"cd {LIMA_VM_HOME}/workspace/repo && "
+            f"mkdir -p {_home}/workspace/repo && "
+            f"cd {_home}/workspace/repo && "
             "git init && "
             "git config user.email 'test@test.com' && "
             "git config user.name 'Test' && "
@@ -261,7 +263,7 @@ def test_git_fetch_from_vm(
         # Determine the branch name used inside the VM.
         branch_result = sandbox_cli(
             "exec", "git-fetch-vm", "--",
-            "git", "-C", f"{LIMA_VM_HOME}/workspace/repo", "branch", "--show-current",
+            "git", "-C", f"{_home}/workspace/repo", "branch", "--show-current",
             timeout=30,
         )
         assert branch_result.returncode == 0, (
@@ -279,7 +281,7 @@ def test_git_fetch_from_vm(
         )
 
         # -- 4. Add a git remote using sandbox:: URL ---------------------------
-        remote_url = f"sandbox::git-fetch-vm{LIMA_VM_HOME}/workspace/repo"
+        remote_url = f"sandbox::git-fetch-vm{_home}/workspace/repo"
         subprocess.run(
             ["git", "-C", local_repo, "remote", "add", "sandbox", remote_url],
             check=True, capture_output=True, timeout=10,
