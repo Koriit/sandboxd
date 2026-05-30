@@ -87,7 +87,22 @@ The cross-user matrix boots real VMs and runs ~1.5–2h on the 8 GB host. Launch
 - **Isolate failures one at a time** — never two VMs/containers at once (8 GB). A long full run can *cascade* (e.g. the gateway degrading mid-run fails later policy/preset tests); an isolated rerun separates a real bug from load/cascade.
 - **Container-backend failures are independent of the Lima cross-user path** (the container backend never runs `limactl` through `sandbox-lima-helper`) — a fast discriminator for whether a failure involves the helper / cross-user execution at all.
 - Read a background agent's **log/output file**, not its full JSONL transcript, for ground truth.
-- Guard long docker/Lima runs against ENOSPC (VM images + build cache fill `/`).
+- Guard long docker/Lima runs against ENOSPC — see **Disk pressure** below.
+
+### Disk pressure (ENOSPC)
+
+`/` (≈96 GB) holds `/var/lib/docker` (image layers + build cache), the Lima VM disk images under `/var/lib/sandboxd/<uid>/lima/`, and `/tmp`. Long or repeated e2e / integration runs accumulate fast: every `make gateway-image` / `lite-image` rebuild adds build-cache layers (tens of GB over a session), each Lima VM is a multi-GB qcow2, and a crashed run can leave an orphaned QEMU process still holding its disk image. When `/` fills, the failure is usually **confusing rather than an obvious "disk full"** — `cargo` dies mid-link, `docker build` fails, or VM creation hangs.
+
+**Watch it.** `df -h /`. During a long background run, arm a watcher that alerts when free space drops below a threshold (e.g. a poll loop that emits only when free space is under ~10–12 GB) rather than discovering ENOSPC after a wasted hour.
+
+**Reclaim it** (most-reclaimable first; these preserve tagged images):
+
+- `docker builder prune -f` — build cache is usually the largest reclaimable chunk (tens of GB).
+- `docker image prune -f` — dangling/untagged layers only; leaves the tagged `gateway` / `lite` images intact.
+- `pkill -f qemu-system` — reap orphaned/leaked sandbox VMs; a crashed run can leave a multi-GB QEMU holding its disk image.
+- Remove leftover Lima instance dirs under the per-operator LIMA_HOME if a run died before teardown.
+
+Do **not** blanket `docker system prune -a` mid-session — it evicts the tagged `gateway` / `lite` images and forces slow rebuilds.
 
 ## Rust workspace
 
