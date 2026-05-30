@@ -27,6 +27,7 @@ expose.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from typing import Callable
 
@@ -181,7 +182,8 @@ class LiteBackendHarness:
         writability under ``/``).
         """
         result = self.ssh(
-            session_id, "sh", "-c", "echo x > /test-write 2>&1; echo EXIT:$?",
+            session_id, "sh", "-c",
+            shlex.quote("echo x > /test-write 2>&1; echo EXIT:$?"),
         )
         # The shell line should always exit 0 (the inner write returns
         # non-zero, the outer echo runs anyway), so look for EXIT:N
@@ -214,7 +216,8 @@ class LiteBackendHarness:
            socket mount).
         """
         ls_result = self.ssh(
-            session_id, "sh", "-c", "ls /var/run/docker.sock 2>&1; echo EXIT:$?",
+            session_id, "sh", "-c",
+            shlex.quote("ls /var/run/docker.sock 2>&1; echo EXIT:$?"),
         )
         m = re.search(r"EXIT:(\d+)", ls_result.stdout)
         assert m is not None, (
@@ -236,7 +239,7 @@ class LiteBackendHarness:
         """
         result = self.ssh(
             session_id, "sh", "-c",
-            "unshare --user true 2>&1; echo EXIT:$?",
+            shlex.quote("unshare --user true 2>&1; echo EXIT:$?"),
         )
         m = re.search(r"EXIT:(\d+)", result.stdout)
         assert m is not None, (

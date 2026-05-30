@@ -528,8 +528,8 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 
 
 def _grant_traverse_to_sandbox(path: os.PathLike) -> None:
-    """Add the execute (traverse) bit for others on ``path`` and every
-    ancestor up to ``/tmp`` (exclusive).
+    """Add the execute (traverse) bit for group and others on ``path``
+    and every ancestor up to ``/tmp`` (exclusive).
 
     pytest creates its per-test tmp directories under
     ``/tmp/pytest-of-<user>/pytest-<N>/test_<name>/`` with mode 0700,
@@ -540,11 +540,17 @@ def _grant_traverse_to_sandbox(path: os.PathLike) -> None:
     In real usage an operator's home directory is 0755, so this situation
     never occurs in production.  It is purely a pytest-tmp artifact.
 
-    We grant *traverse-only* (``o+x``, not ``o+r``) to the chain:
+    We grant *traverse-only* (``g+x,o+x``, not ``g+r,o+r``) to the chain:
     ``/tmp/pytest-of-<user>/``, each ``pytest-<N>/`` dir, each
     ``test_<name>/`` dir, and the workspace directory itself.
     We do NOT chmod the workspace *contents* — the daemon only needs to
     reach the specific bind-mount path, not list it.
+
+    Both ``g+x`` and ``o+x`` are required because pytest's tmp dirs are
+    group-owned by ``sandbox`` (the operator's supplementary group) and
+    Linux kernel access checks apply group bits before other bits for
+    group members — so ``o+x`` alone does not help a process whose
+    effective group matches the directory's group.
 
     Stops at ``/tmp`` (world-writable already) and ``/`` to avoid
     inadvertently widening permissions outside the pytest tree.
@@ -555,7 +561,7 @@ def _grant_traverse_to_sandbox(path: os.PathLike) -> None:
     stop_at = {"/tmp", "/"}
     visited: list[str] = []
 
-    # Walk upward collecting dirs that need o+x, stop at /tmp or root.
+    # Walk upward collecting dirs that need g+x,o+x, stop at /tmp or root.
     current = p
     while True:
         visited.append(current)
@@ -566,11 +572,12 @@ def _grant_traverse_to_sandbox(path: os.PathLike) -> None:
             break
         current = parent
 
+    _traverse_bits = _stat.S_IXGRP | _stat.S_IXOTH
     for d in visited:
         try:
             st = os.stat(d)
-            if not (st.st_mode & _stat.S_IXOTH):
-                os.chmod(d, st.st_mode | _stat.S_IXOTH)
+            if not (st.st_mode & _traverse_bits == _traverse_bits):
+                os.chmod(d, st.st_mode | _traverse_bits)
         except OSError:
             pass  # best-effort; failure will surface as EACCES on create
 
