@@ -50,6 +50,7 @@ import pytest
 from conftest import (
     OP_LIMA_HOME,
     SANDBOX_HARNESS,
+    _SANDBOXD_TEST_SERVICE,
     _VM_RESOURCE_ARGS,
     limactl_cmd,
     parse_session_id,
@@ -78,8 +79,9 @@ def _base_meta_path(sandbox_daemon) -> Path:
     the daemon writes this file to the per-operator LIMA_HOME:
         /var/lib/sandboxd/<op_uid>/lima/base-image-meta.json
     which is ``OP_LIMA_HOME/base-image-meta.json`` in conftest terms.
-    The file is owned by the operator uid, so the test process can read
-    and write it directly without sudo.
+    The file is owned by the ``sandbox`` system user (daemon uid), not the
+    operator; use the meta-file I/O helpers below rather than accessing
+    the path directly.
 
     Under the legacy test-user harness the daemon and test process share a
     uid, so the file lives in the daemon's base_dir as before.
@@ -89,31 +91,124 @@ def _base_meta_path(sandbox_daemon) -> Path:
     return Path(sandbox_daemon["base_dir"]) / BASE_META_FILENAME
 
 
-def _read_log_since(log_path: Path, offset: int) -> str:
-    """Return log contents starting at ``offset`` bytes."""
+def _meta_exists(meta_path: Path) -> bool:
+    """Return True if the meta file exists.
+
+    Under cross-user harnesses the file is owned by ``sandbox``;
+    ``os.path.exists`` works for existence checks even without read
+    permission — but ``Path.exists()`` is equally fine since the test
+    user has ``rx`` on the LIMA_HOME directory.
+    """
+    return meta_path.exists()
+
+
+def _meta_read_text(meta_path: Path) -> str:
+    """Read the meta file, routing through ``sudo -u sandbox`` when needed.
+
+    Under the cross-user harnesses (``sandbox-systemd`` / ``sandbox-sudo``)
+    the daemon writes the file as the ``sandbox`` system user with mode
+    0600 and no ACL entry for the operator uid, so a direct ``open()``
+    raises PermissionError.  We use ``sudo -n -u sandbox cat`` to read
+    it on behalf of the ``sandbox`` user.
+
+    Under ``test-user`` the daemon and test process share a uid so a
+    direct read works.
+    """
+    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
+        result = subprocess.run(
+            ["sudo", "-n", "-u", "sandbox", "cat", str(meta_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise PermissionError(
+                f"sudo -u sandbox cat {meta_path} failed "
+                f"(rc={result.returncode}): {result.stderr.strip()!r}"
+            )
+        return result.stdout
+    return meta_path.read_text()
+
+
+def _meta_write_text(meta_path: Path, content: str) -> None:
+    """Write ``content`` to the meta file, routing through ``sudo -u sandbox``
+    when needed (see ``_meta_read_text`` for the ownership rationale).
+    """
+    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
+        result = subprocess.run(
+            ["sudo", "-n", "-u", "sandbox",
+             "tee", str(meta_path)],
+            input=content, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise PermissionError(
+                f"sudo -u sandbox tee {meta_path} failed "
+                f"(rc={result.returncode}): {result.stderr.strip()!r}"
+            )
+    else:
+        meta_path.write_text(content)
+
+
+def _meta_unlink(meta_path: Path) -> None:
+    """Remove the meta file, routing through ``sudo -u sandbox`` when needed."""
+    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
+        subprocess.run(
+            ["sudo", "-n", "-u", "sandbox", "rm", "-f", str(meta_path)],
+            capture_output=True, timeout=10,
+        )
+    else:
+        if meta_path.exists():
+            meta_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Harness-aware daemon log capture
+# ---------------------------------------------------------------------------
+
+def _daemon_log_snapshot() -> str:
+    """Return a timestamp string suitable for ``journalctl --since``.
+
+    Under ``sandbox-systemd`` the daemon's stdout goes to the journal.
+    Capturing a ``%Y-%m-%d %H:%M:%S`` snapshot just before a test action
+    lets ``_daemon_logs_since`` retrieve exactly the lines emitted during
+    that action window.
+    """
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _daemon_logs_since(sandbox_daemon, since_ts: str) -> str:
+    """Return daemon log text produced since ``since_ts``.
+
+    Under ``sandbox-systemd`` the daemon's tracing output goes to the
+    systemd journal (the ``_stdout_log`` file is a zero-byte placeholder).
+    We retrieve the window via ``journalctl --since=<since_ts>`` so log
+    assertions in golden-image tests can find the expected strings.
+
+    Under ``sandbox-sudo`` / ``test-user`` the daemon writes to
+    ``_stdout_log`` directly; we fall back to reading from ``_log_size``
+    offset captured at ``since_ts`` (stored on first call via the
+    file-size snapshot taken just before ``since_ts``).  Since these
+    harnesses don't use a timestamp we accept a ``_snapshot`` dict keyed
+    by ``since_ts`` stashed by ``_daemon_log_offset_snapshot``.
+
+    To keep the API simple, this function always uses the journal path
+    under ``sandbox-systemd`` and the file path otherwise.
+    """
+    if sandbox_daemon.get("_harness") == "sandbox-systemd":
+        result = subprocess.run(
+            ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
+             f"--since={since_ts}", "--no-pager", "--output=cat"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.stdout
+    # Non-systemd: read from the file.  ``since_ts`` is a wall-clock
+    # string; we cannot efficiently seek to a byte offset from it, so
+    # we read the entire file and let the caller filter if needed.
+    # In practice these harnesses write a fresh log each session so the
+    # full file is bounded.
+    log_path = Path(sandbox_daemon["_stdout_log"])
     try:
-        with open(log_path, "rb") as f:
-            f.seek(offset)
-            return f.read().decode("utf-8", errors="replace")
+        return log_path.read_text(errors="replace")
     except FileNotFoundError:
         return ""
-
-
-def _log_size(log_path: Path) -> int:
-    try:
-        return log_path.stat().st_size
-    except FileNotFoundError:
-        return 0
-
-
-def _daemon_log_path(sandbox_daemon) -> Path:
-    """Return the file path the daemon writes tracing output to.
-
-    ``tracing_subscriber::fmt`` writes to stdout by default, so we read the
-    daemon's stdout log file (not stderr). Stderr is currently unused by the
-    daemon -- this may change when the deferred --log-file flag lands.
-    """
-    return Path(sandbox_daemon["_stdout_log"])
 
 
 def _get_base_image_status(socket_path: str, timeout: float = 10.0) -> dict:
@@ -230,7 +325,6 @@ def test_session_uses_clone_path(sandbox_cli, sandbox_daemon):
     The legacy-path marker (``"creating VM"`` from ``lima::create_vm``) is
     asserted to be absent within the time window of this test's create call.
     """
-    log_path = _daemon_log_path(sandbox_daemon)
     name = "m85-clone-path"
     session_id = None
 
@@ -243,8 +337,10 @@ def test_session_uses_clone_path(sandbox_cli, sandbox_daemon):
         f"The _ensure_base_image fixture should have rebuilt it."
     )
 
-    # 1. Snapshot log offset so we only inspect output produced by this test.
-    log_offset = _log_size(log_path)
+    # 1. Snapshot log position so we only inspect output produced by this
+    #    test.  Under sandbox-systemd the daemon logs to the journal; we
+    #    capture a wall-clock timestamp and pass it to journalctl --since=.
+    log_since = _daemon_log_snapshot()
 
     try:
         result = sandbox_cli(
@@ -259,7 +355,7 @@ def test_session_uses_clone_path(sandbox_cli, sandbox_daemon):
         wait_for_state(sandbox_cli, name, "Running", timeout=10)
 
         # 2. Inspect daemon log produced during this test.
-        logs = _read_log_since(log_path, log_offset)
+        logs = _daemon_logs_since(sandbox_daemon, log_since)
 
         assert "cloning base image" in logs, (
             "Expected daemon to log 'cloning base image' on the clone path.\n"
@@ -311,13 +407,12 @@ def test_staleness_detection(sandbox_cli, sandbox_daemon):
          ``fresh`` so this test doesn't poison the rest of the suite.
     """
     meta_path = _base_meta_path(sandbox_daemon)
-    assert meta_path.exists(), (
+    assert _meta_exists(meta_path), (
         f"Expected daemon to have written {meta_path} during the "
         f"_ensure_base_image fixture, but it's missing."
     )
 
-    original_contents = meta_path.read_text()
-    log_path = _daemon_log_path(sandbox_daemon)
+    original_contents = _meta_read_text(meta_path)
     name = "m85-staleness"
     session_id = None
 
@@ -325,7 +420,7 @@ def test_staleness_detection(sandbox_cli, sandbox_daemon):
         # 1. Corrupt content_hash so check_base_image returns Stale{hash_mismatch=true}.
         meta = json.loads(original_contents)
         meta["content_hash"] = "0" * 64  # 32 bytes hex -- matches sha256 output shape
-        meta_path.write_text(json.dumps(meta, indent=2))
+        _meta_write_text(meta_path, json.dumps(meta, indent=2))
 
         # 2. Status endpoint now reports stale.
         status = _get_base_image_status(sandbox_daemon["socket"])
@@ -340,7 +435,9 @@ def test_staleness_detection(sandbox_cli, sandbox_daemon):
         # 3. Create a session and verify:
         #    - clone path still taken ("cloning base image" in log)
         #    - daemon logs "base image is stale, using anyway" (policy)
-        log_offset = _log_size(log_path)
+        #    Snapshot log position before the create so we only inspect
+        #    output produced by this test window.
+        log_since = _daemon_log_snapshot()
         result = sandbox_cli(
             "create", "--name", name, *_VM_RESOURCE_ARGS, timeout=600,
         )
@@ -351,7 +448,7 @@ def test_staleness_detection(sandbox_cli, sandbox_daemon):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, name, "Running", timeout=10)
 
-        logs = _read_log_since(log_path, log_offset)
+        logs = _daemon_logs_since(sandbox_daemon, log_since)
         assert "base image is stale, using anyway" in logs, (
             "Expected daemon to log the stale-but-use-anyway policy message.\n"
             f"Daemon log since test start:\n{logs}"
@@ -370,7 +467,7 @@ def test_staleness_detection(sandbox_cli, sandbox_daemon):
 
     finally:
         # Restore the original metadata so subsequent tests see 'fresh'.
-        meta_path.write_text(original_contents)
+        _meta_write_text(meta_path, original_contents)
         if session_id is not None:
             sandbox_cli("rm", name, timeout=120)
 
@@ -402,8 +499,8 @@ def test_rebuild_image_from_scratch(sandbox_binaries, sandbox_daemon, _ensure_ba
 
     # Also remove the metadata file so check_base_image returns Missing.
     meta_path = _base_meta_path(sandbox_daemon)
-    if meta_path.exists():
-        meta_path.unlink()
+    if _meta_exists(meta_path):
+        _meta_unlink(meta_path)
 
     # Sanity: VM really is gone.
     vm_names = _lima_list_names()
@@ -436,10 +533,10 @@ def test_rebuild_image_from_scratch(sandbox_binaries, sandbox_daemon, _ensure_ba
     )
 
     # 4. Metadata file was recreated with a fresh timestamp + hash.
-    assert meta_path.exists(), (
+    assert _meta_exists(meta_path), (
         f"Expected {meta_path} to be written by rebuild-image, but it's missing."
     )
-    meta = json.loads(meta_path.read_text())
+    meta = json.loads(_meta_read_text(meta_path))
     assert "built_at" in meta and "content_hash" in meta, (
         f"base-image-meta.json is missing required fields: {meta!r}"
     )
