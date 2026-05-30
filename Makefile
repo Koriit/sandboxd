@@ -106,7 +106,7 @@ TEST ?=
 # tests and the container-only `test_lite.py` (`@pytest.mark.
 # container`). Zero convention-driven skips on a properly-configured
 # host; runs in ~5-10 min on a warm runner.
-test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
+test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
 	cd tests/e2e && . .venv/bin/activate && \
 	  python -m pytest -v -rs --timeout=600 --durations=20 \
 	  -m "not lima" -k "not [lima]" $(TEST)
@@ -118,7 +118,7 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # tests run twice. Lima-marked tests on a host without limactl /
 # qemu-bridge-helper / bridge.conf emit per-test skips via the
 # `_lima_required_for_lima_tests` fixture; everything else runs.
-test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
+test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
 	cd tests/e2e && . .venv/bin/activate && \
 	  python -m pytest -v -rs --timeout=600 --durations=20 $(TEST)
 
@@ -428,7 +428,7 @@ setup-test-sudoers-fragment:
 	else \
 	  test_binary="$$(pwd)/sandboxd/target/debug/sandboxd"; \
 	  limactl_bin="$$(command -v limactl 2>/dev/null || echo /usr/local/bin/limactl)"; \
-	  fragment_envkeep="Defaults!$$test_binary env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH\""; \
+	  fragment_envkeep="Defaults!$$test_binary env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH\""; \
 	  fragment="$$USER ALL=(sandbox) NOPASSWD: $$test_binary, $$test_binary *, $$limactl_bin list --json, $$limactl_bin delete --force *"; \
 	  tmp=$$(mktemp); \
 	  printf '# Managed by `make setup-test-sudoers-fragment` — do not edit.\n# Allows the e2e harness to launch sandboxd as the `sandbox`\n# system user via the fallback path (sudo -u sandbox <test-binary> …)\n# when systemd is unavailable. The path is the absolute path of the\n# checked-out workspace`s debug build of sandboxd; re-run the make\n# target after moving the workspace to a new location.\n#\n# The env_keep directive is required for the harness to propagate the\n# SANDBOX_USERS_CONF tempfile path and SANDBOX_BASE_VM_NAME through\n# sudo (which strips the environment by default).\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \

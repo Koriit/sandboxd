@@ -233,14 +233,18 @@ fn integration_lima_helper_caller_not_in_sandbox_group_denied() {
     let helper = verify_installed_test_helper();
 
     let user = runner_username();
-    // Use a group that (very likely) doesn't exist so membership fails.
+    // Use "root" — it always exists on any Linux host (gid 0) and no
+    // unprivileged test runner is a member. This reaches the
+    // `caller_is_in_group` check and emits "caller not in sandbox group".
+    // A non-existent group would be caught earlier by the group lookup
+    // step and emit "sandbox group '...' not found on host" instead.
     let output = run_helper(
         &helper,
         &[
             ("SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER", user.as_str()),
             (
                 "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP",
-                "definitely-no-such-group-xyz",
+                "root",
             ),
         ],
         &["list-json", "--op-uid", "1000"],
