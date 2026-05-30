@@ -404,16 +404,23 @@ def gateway_container_name(session_id: str) -> str:
 #   /var/lib/sandboxd/<op_uid>/lima/
 #
 # NOT at the test-runner's ``~/.lima/``.  Any test-side helper that invokes
-# ``limactl`` directly (for inspection or cleanup) must therefore:
-#   1. Pass ``env LIMA_HOME=<OP_LIMA_HOME>`` so limactl queries the right
-#      registry.
-#   2. Run as the ``sandbox`` user (the VM directory is owned
-#      sandbox:sandbox with an ACL granting the operator rwx) via
-#      ``sudo -n -u sandbox``.
+# ``limactl`` directly (for inspection or cleanup) must therefore pass
+# ``env LIMA_HOME=<OP_LIMA_HOME>`` so limactl queries the right registry.
+#
+# IMPORTANT: the per-operator LIMA_HOME and all its contents (lima.yaml,
+# _config/user, VM dirs) are owned by the OPERATOR uid (the test runner)
+# with mode 0600/0700 — they are operator-private.  Running limactl as the
+# ``sandbox`` system user (uid 999) via ``sudo -n -u sandbox`` therefore
+# fails with EACCES ("open .../lima.yaml: permission denied" →
+# "instance has no configuration").  The test process already IS the operator
+# uid, so the correct approach is to run limactl directly (no sudo) with
+# LIMA_HOME set to the per-operator path.  This matches the verified manual
+# path: ``env LIMA_HOME=/var/lib/sandboxd/1000/lima limactl start`` works
+# when run as the operator.
 #
 # Use ``limactl_cmd()`` for the argv prefix and ``OP_LIMA_HOME`` for the path
-# constant in assertions.  Both fall back to bare ``limactl`` (no sudo, no
-# LIMA_HOME override) in the legacy ``test-user`` harness where daemon uid ==
+# constant in assertions.  Both fall back to bare ``limactl`` (no LIMA_HOME
+# override) in the legacy ``test-user`` harness where daemon uid ==
 # operator uid and the global ``~/.lima/`` is the correct registry.
 
 
@@ -426,15 +433,19 @@ def limactl_cmd(*args: str) -> list[str]:
     """Build a limactl argv that queries the correct LIMA_HOME for this harness.
 
     Under ``sandbox-systemd`` / ``sandbox-sudo`` the VM registry lives at
-    ``/var/lib/sandboxd/<op_uid>/lima/`` (owned ``sandbox:sandbox``, ACL
-    grants the operator read access).  Bare ``limactl`` would look in
-    ``~/.lima/`` and see nothing.  This wrapper prefixes the correct
-    ``sudo -n -u sandbox env LIMA_HOME=…`` invocation so every test-side
-    limactl call (list, shell, delete, …) reaches the right registry.
+    ``/var/lib/sandboxd/<op_uid>/lima/`` (the per-operator LIMA_HOME).  Bare
+    ``limactl`` would look in ``~/.lima/`` and see nothing, so this wrapper
+    sets ``LIMA_HOME`` to the per-operator path via ``env``.
 
-    In the legacy ``test-user`` harness the prefix is dropped and bare
-    ``limactl`` is returned — daemon and operator share a uid, so
-    ``~/.lima/`` is the correct registry.
+    Crucially, the per-operator LIMA_HOME and all its files (lima.yaml,
+    _config/user, VM directories) are owned by the OPERATOR uid and are
+    operator-private (0600/0700).  Running limactl as the ``sandbox`` system
+    user via ``sudo -n -u sandbox`` would fail with EACCES.  The test process
+    already runs as the operator uid, so we invoke limactl directly — no sudo
+    prefix — with only the LIMA_HOME override.
+
+    In the legacy ``test-user`` harness the daemon and operator share a uid,
+    so ``~/.lima/`` is the correct registry and no override is needed.
 
     Usage::
 
@@ -442,11 +453,7 @@ def limactl_cmd(*args: str) -> list[str]:
         subprocess.run(limactl_cmd("shell", vm_name, "--", "uname", "-a"), ...)
     """
     if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
-        return [
-            "sudo", "-n", "-u", "sandbox",
-            "env", f"LIMA_HOME={OP_LIMA_HOME}",
-            "limactl", *args,
-        ]
+        return ["env", f"LIMA_HOME={OP_LIMA_HOME}", "limactl", *args]
     return ["limactl", *args]
 
 
@@ -1913,21 +1920,21 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
 
     # Collect any Lima VM names from the daemon's session db so we can
     # clean them up even if the test forgot to `rm`. Under the
-    # production-shaped harnesses (``sandbox-systemd`` / ``sandbox-
-    # sudo``) the daemon owns its Lima registry at
-    # ``/var/lib/sandboxd/<op-uid>/lima/``; bare ``limactl`` runs as the
-    # test operator and only sees ``~/.lima/`` — so we route the probe
-    # and the delete through ``sudo -n -u sandbox`` with the correct
-    # ``LIMA_HOME`` to query the right registry. The ``sandbox`` NOPASSWD sudoers fragment installed by
-    # ``make setup-dev-env`` (see Phase 1 of the 2026-05-24 spec)
-    # authorises the test operator for these specific commands. In the
-    # legacy ``test-user`` harness the daemon and the test operator
-    # share a uid, so the bare ``limactl`` is correct.
+    # production-shaped harnesses (``sandbox-systemd`` / ``sandbox-sudo``)
+    # the daemon owns its Lima registry at
+    # ``/var/lib/sandboxd/<op-uid>/lima/`` (the per-operator LIMA_HOME);
+    # bare ``limactl`` would look in ``~/.lima/`` and see nothing.  We set
+    # LIMA_HOME to the per-operator path so the list/delete calls reach the
+    # right registry.  The per-operator LIMA_HOME is owned by the operator
+    # uid (operator-private, 0600/0700), so we run limactl directly as the
+    # test operator — no ``sudo -n -u sandbox`` prefix, which would hit
+    # EACCES on the operator-owned files.  In the legacy ``test-user``
+    # harness the daemon and the test operator share a uid, so bare
+    # ``limactl`` (with default ~/.lima/) is correct.
     if info.get("_harness") in ("sandbox-systemd", "sandbox-sudo"):
         op_uid = os.getuid()
         op_lima_home = f"/var/lib/sandboxd/{op_uid}/lima"
         limactl_argv_prefix: list[str] = [
-            "sudo", "-n", "-u", "sandbox",
             "env", f"LIMA_HOME={op_lima_home}",
             "limactl",
         ]
