@@ -28,6 +28,7 @@ import pytest
 from conftest import (
     _VM_RESOURCE_ARGS,
     lima_vm_name,
+    limactl_cmd,
     parse_session_id,
     wait_for_state,
 )
@@ -43,9 +44,14 @@ pytestmark = pytest.mark.lima
 
 
 def limactl_list_json() -> list[dict]:
-    """Run ``limactl list --json`` and return parsed entries."""
+    """Run ``limactl list --json`` against the per-operator LIMA_HOME and
+    return parsed entries.
+
+    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
+    cross-user harness (sandbox-systemd / sandbox-sudo).
+    """
     result = subprocess.run(
-        ["limactl", "list", "--json"],
+        limactl_cmd("list", "--json"),
         capture_output=True,
         text=True,
         timeout=30,
@@ -212,7 +218,7 @@ def test_lima_transport_socat_spawn(sandbox_cli):
         #    PermissionError (argument wiring broken).
         try:
             spawn_result = subprocess.run(
-                ["limactl", "shell", vm_name, "--", "socat", "-", "TCP:127.0.0.1:5123"],
+                limactl_cmd("shell", vm_name, "--", "socat", "-", "TCP:127.0.0.1:5123"),
                 capture_output=True,
                 timeout=10,
             )

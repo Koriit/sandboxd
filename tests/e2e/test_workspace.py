@@ -26,6 +26,7 @@ import tempfile
 import pytest
 
 from conftest import (
+    LIMA_VM_HOME,
     cleanup_policy_file,
     make_create_args,
     parse_session_id,
@@ -40,7 +41,7 @@ from conftest import (
 @pytest.mark.timeout(600)
 def test_clone_repo(sandbox_cli, backend):
     """Create a session with --repo pointing to a small public repo.
-    Verify the repository is cloned into /home/agent/workspace/.
+    Verify the repository is cloned into ``{LIMA_VM_HOME}/workspace/``.
 
     Backend-agnostic: both backends advertise
     `WorkspaceModeKind::Clone` and the daemon dispatches `git clone`
@@ -81,28 +82,28 @@ def test_clone_repo(sandbox_cli, backend):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "ws-clone", "Running", timeout=10)
 
-        # Verify /home/agent/workspace/ exists and has expected content.
+        # Verify LIMA_VM_HOME/workspace/ exists and has expected content.
         ls_result = sandbox_cli(
-            "exec", "ws-clone", "--", "ls", "/home/agent/workspace/",
+            "exec", "ws-clone", "--", "ls", f"{LIMA_VM_HOME}/workspace/",
             timeout=120,
         )
         assert ls_result.returncode == 0, (
-            f"ls /home/agent/workspace/ failed.\n"
+            f"ls {LIMA_VM_HOME}/workspace/ failed.\n"
             f"stdout: {ls_result.stdout}\nstderr: {ls_result.stderr}"
         )
         # The Hello-World repo should have a README file.
         assert "README" in ls_result.stdout, (
-            f"Expected README in /home/agent/workspace/, got:\n{ls_result.stdout}"
+            f"Expected README in {LIMA_VM_HOME}/workspace/, got:\n{ls_result.stdout}"
         )
 
         # Verify it's a git repo.
         git_result = sandbox_cli(
             "exec", "ws-clone", "--",
-            "git", "-C", "/home/agent/workspace/", "log", "--oneline", "-1",
+            "git", "-C", f"{LIMA_VM_HOME}/workspace/", "log", "--oneline", "-1",
             timeout=120,
         )
         assert git_result.returncode == 0, (
-            f"git log failed in /home/agent/workspace/.\n"
+            f"git log failed in {LIMA_VM_HOME}/workspace/.\n"
             f"stdout: {git_result.stdout}\nstderr: {git_result.stderr}"
         )
 
@@ -144,7 +145,7 @@ def test_cp_host_to_vm(sandbox_cli, backend):
 
         # Upload the file into the VM.
         cp_result = sandbox_cli(
-            "cp", local_file, "ws-cp-up:/home/agent/uploaded.txt",
+            "cp", local_file, f"ws-cp-up:{LIMA_VM_HOME}/uploaded.txt",
             timeout=120,
         )
         assert cp_result.returncode == 0, (
@@ -154,7 +155,7 @@ def test_cp_host_to_vm(sandbox_cli, backend):
 
         # Verify the file contents in the VM.
         cat_result = sandbox_cli(
-            "exec", "ws-cp-up", "--", "cat", "/home/agent/uploaded.txt",
+            "exec", "ws-cp-up", "--", "cat", f"{LIMA_VM_HOME}/uploaded.txt",
             timeout=120,
         )
         assert cat_result.returncode == 0, (
@@ -203,7 +204,7 @@ def test_cp_vm_to_host(sandbox_cli, backend):
         test_content = "content created inside VM for download test"
         exec_result = sandbox_cli(
             "exec", "ws-cp-down", "--",
-            "bash", "-c", f"echo -n '{test_content}' > /home/agent/vm-file.txt",
+            "bash", "-c", f"echo -n '{test_content}' > {LIMA_VM_HOME}/vm-file.txt",
             timeout=120,
         )
         assert exec_result.returncode == 0, (
@@ -216,7 +217,7 @@ def test_cp_vm_to_host(sandbox_cli, backend):
         os.close(fd)
 
         cp_result = sandbox_cli(
-            "cp", "ws-cp-down:/home/agent/vm-file.txt", local_file,
+            "cp", f"ws-cp-down:{LIMA_VM_HOME}/vm-file.txt", local_file,
             timeout=120,
         )
         assert cp_result.returncode == 0, (
@@ -265,7 +266,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
 
     Path layout:
       host  /tmp/<tmpdir>/sparse.bin   (apparent 10 MB, mode 0700)
-      VM    /home/agent/sparse-uploaded.bin
+      VM    {LIMA_VM_HOME}/sparse-uploaded.bin
       host  /tmp/<tmpdir>/sparse-roundtripped.bin
 
     Backend coverage: parametrised over [lima, container] like the
@@ -301,7 +302,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # Upload via `sandbox cp`. The native tool (limactl cp / docker
         # cp) is what actually crosses the host/VM boundary.
         cp_up = sandbox_cli(
-            "cp", original, "ws-cp-attr:/home/agent/sparse-uploaded.bin",
+            "cp", original, f"ws-cp-attr:{LIMA_VM_HOME}/sparse-uploaded.bin",
             timeout=180,
         )
         assert cp_up.returncode == 0, (
@@ -312,7 +313,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # In-VM mode check: stat -c %a returns the file mode in octal.
         mode_in_vm = sandbox_cli(
             "exec", "ws-cp-attr", "--",
-            "stat", "-c", "%a", "/home/agent/sparse-uploaded.bin",
+            "stat", "-c", "%a", f"{LIMA_VM_HOME}/sparse-uploaded.bin",
             timeout=120,
         )
         assert mode_in_vm.returncode == 0, (
@@ -320,7 +321,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
             f"stdout: {mode_in_vm.stdout}\nstderr: {mode_in_vm.stderr}"
         )
         assert mode_in_vm.stdout.strip() == "700", (
-            f"mode for /home/agent/sparse-uploaded.bin not preserved across upload: "
+            f"mode for {LIMA_VM_HOME}/sparse-uploaded.bin not preserved across upload: "
             f"expected 700, got {mode_in_vm.stdout.strip()!r}"
         )
 
@@ -328,14 +329,14 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # 10 MB exactly. `stat -c %s` returns size in bytes.
         size_in_vm = sandbox_cli(
             "exec", "ws-cp-attr", "--",
-            "stat", "-c", "%s", "/home/agent/sparse-uploaded.bin",
+            "stat", "-c", "%s", f"{LIMA_VM_HOME}/sparse-uploaded.bin",
             timeout=120,
         )
         assert size_in_vm.returncode == 0, (
             f"stat -c %s failed in VM: stderr={size_in_vm.stderr!r}"
         )
         assert int(size_in_vm.stdout.strip()) == 10 * 1024 * 1024, (
-            f"apparent size for /home/agent/sparse-uploaded.bin not preserved: "
+            f"apparent size for {LIMA_VM_HOME}/sparse-uploaded.bin not preserved: "
             f"expected {10 * 1024 * 1024}, got {size_in_vm.stdout.strip()!r}"
         )
 
@@ -347,7 +348,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # crept back in, allocated would equal apparent (10 MB).
         allocated_in_vm = sandbox_cli(
             "exec", "ws-cp-attr", "--",
-            "du", "-B1", "/home/agent/sparse-uploaded.bin",
+            "du", "-B1", f"{LIMA_VM_HOME}/sparse-uploaded.bin",
             timeout=120,
         )
         assert allocated_in_vm.returncode == 0, (
@@ -363,7 +364,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
 
         # Round-trip back to the host via `sandbox cp`.
         cp_down = sandbox_cli(
-            "cp", "ws-cp-attr:/home/agent/sparse-uploaded.bin", roundtrip,
+            "cp", f"ws-cp-attr:{LIMA_VM_HOME}/sparse-uploaded.bin", roundtrip,
             timeout=180,
         )
         assert cp_down.returncode == 0, (
@@ -448,7 +449,7 @@ def test_sync_full_tree(sandbox_cli, backend):
         wait_for_state(sandbox_cli, "ws-sync-full", "Running", timeout=10)
 
         sync_result = sandbox_cli(
-            "sync", host_dir, "ws-sync-full:/home/agent/workspace/synced",
+            "sync", host_dir, f"ws-sync-full:{LIMA_VM_HOME}/workspace/synced",
             timeout=300,
         )
         assert sync_result.returncode == 0, (
@@ -464,7 +465,7 @@ def test_sync_full_tree(sandbox_cli, backend):
         ]:
             cat = sandbox_cli(
                 "exec", "ws-sync-full", "--",
-                "cat", f"/home/agent/workspace/synced/{relpath}",
+                "cat", f"{LIMA_VM_HOME}/workspace/synced/{relpath}",
                 timeout=120,
             )
             assert cat.returncode == 0 and cat.stdout == expected, (
@@ -475,7 +476,7 @@ def test_sync_full_tree(sandbox_cli, backend):
         # Verify mode preservation (`-a` / `--archive`).
         stat = sandbox_cli(
             "exec", "ws-sync-full", "--",
-            "stat", "-c", "%a", "/home/agent/workspace/synced/run.sh",
+            "stat", "-c", "%a", f"{LIMA_VM_HOME}/workspace/synced/run.sh",
             timeout=120,
         )
         assert stat.returncode == 0 and stat.stdout.strip() == "755", (
@@ -486,7 +487,7 @@ def test_sync_full_tree(sandbox_cli, backend):
         # Verify symlink preservation.
         readlink = sandbox_cli(
             "exec", "ws-sync-full", "--",
-            "readlink", "/home/agent/workspace/synced/a.symlink",
+            "readlink", f"{LIMA_VM_HOME}/workspace/synced/a.symlink",
             timeout=120,
         )
         assert readlink.returncode == 0 and readlink.stdout.strip() == "a.txt", (
@@ -535,7 +536,7 @@ def test_sync_incremental_no_op(sandbox_cli, backend):
 
         # First sync: transfers everything.
         first = sandbox_cli(
-            "sync", host_dir, "ws-sync-incr:/home/agent/workspace/incr",
+            "sync", host_dir, f"ws-sync-incr:{LIMA_VM_HOME}/workspace/incr",
             timeout=300,
         )
         assert first.returncode == 0, (
@@ -551,7 +552,7 @@ def test_sync_incremental_no_op(sandbox_cli, backend):
         # flags rsync stays silent on a no-change run, so the second
         # invocation produces empty stdout.
         second = sandbox_cli(
-            "sync", host_dir, "ws-sync-incr:/home/agent/workspace/incr",
+            "sync", host_dir, f"ws-sync-incr:{LIMA_VM_HOME}/workspace/incr",
             timeout=300,
         )
         assert second.returncode == 0, (
@@ -599,14 +600,14 @@ def test_sync_delete_mirroring(sandbox_cli, backend):
 
         # Initial sync — both files present.
         s1 = sandbox_cli(
-            "sync", host_dir, "ws-sync-del:/home/agent/workspace/del",
+            "sync", host_dir, f"ws-sync-del:{LIMA_VM_HOME}/workspace/del",
             timeout=300,
         )
         assert s1.returncode == 0
         for name in ("keep.txt", "obsolete.txt"):
             check = sandbox_cli(
                 "exec", "ws-sync-del", "--",
-                "test", "-f", f"/home/agent/workspace/del/{name}",
+                "test", "-f", f"{LIMA_VM_HOME}/workspace/del/{name}",
                 timeout=120,
             )
             assert check.returncode == 0, f"{name} should exist after first sync"
@@ -614,7 +615,7 @@ def test_sync_delete_mirroring(sandbox_cli, backend):
         # Remove the file on the host, re-sync.
         os.unlink(os.path.join(host_dir, "obsolete.txt"))
         s2 = sandbox_cli(
-            "sync", host_dir, "ws-sync-del:/home/agent/workspace/del",
+            "sync", host_dir, f"ws-sync-del:{LIMA_VM_HOME}/workspace/del",
             timeout=300,
         )
         assert s2.returncode == 0
@@ -622,13 +623,13 @@ def test_sync_delete_mirroring(sandbox_cli, backend):
         # `keep.txt` still there, `obsolete.txt` deleted by --delete.
         keep = sandbox_cli(
             "exec", "ws-sync-del", "--",
-            "test", "-f", "/home/agent/workspace/del/keep.txt",
+            "test", "-f", f"{LIMA_VM_HOME}/workspace/del/keep.txt",
             timeout=120,
         )
         assert keep.returncode == 0, "keep.txt should still exist after second sync"
         gone = sandbox_cli(
             "exec", "ws-sync-del", "--",
-            "test", "-e", "/home/agent/workspace/del/obsolete.txt",
+            "test", "-e", f"{LIMA_VM_HOME}/workspace/del/obsolete.txt",
             timeout=120,
         )
         assert gone.returncode != 0, (
@@ -682,7 +683,7 @@ def test_sync_attribute_preservation(sandbox_cli, backend):
         wait_for_state(sandbox_cli, "ws-sync-attr", "Running", timeout=10)
 
         s = sandbox_cli(
-            "sync", host_dir, "ws-sync-attr:/home/agent/workspace/attr",
+            "sync", host_dir, f"ws-sync-attr:{LIMA_VM_HOME}/workspace/attr",
             timeout=300,
         )
         assert s.returncode == 0, (
@@ -692,7 +693,7 @@ def test_sync_attribute_preservation(sandbox_cli, backend):
         for name, expected_mode in cases:
             stat = sandbox_cli(
                 "exec", "ws-sync-attr", "--",
-                "stat", "-c", "%a", f"/home/agent/workspace/attr/{name}",
+                "stat", "-c", "%a", f"{LIMA_VM_HOME}/workspace/attr/{name}",
                 timeout=120,
             )
             assert stat.returncode == 0, (
@@ -723,7 +724,7 @@ def test_shared_mount(sandbox_cli, backend):
     Verify bidirectional file visibility between host and VM.
 
     Backend-agnostic: the container backend's bind target
-    is unified with Lima's at `/home/agent/workspace/`, so the path
+    is unified with Lima's at ``{LIMA_VM_HOME}/workspace/``, so the path
     assertions below work on both backends.
 
     Rootless-Docker handling lives daemon-side: the daemon
@@ -746,7 +747,7 @@ def test_shared_mount(sandbox_cli, backend):
             "create",
             *make_create_args(
                 backend, "ws-shared",
-                "--workspace", f"shared:{host_dir}:/home/agent/workspace",
+                "--workspace", f"shared:{host_dir}:{LIMA_VM_HOME}/workspace",
             ),
             timeout=600,
         )
@@ -763,10 +764,10 @@ def test_shared_mount(sandbox_cli, backend):
         with open(host_file, "w") as f:
             f.write(host_content)
 
-        # The file should be visible at /home/agent/workspace/from-host.txt
+        # The file should be visible at LIMA_VM_HOME/workspace/from-host.txt
         cat_result = sandbox_cli(
             "exec", "ws-shared", "--",
-            "cat", "/home/agent/workspace/from-host.txt",
+            "cat", f"{LIMA_VM_HOME}/workspace/from-host.txt",
             timeout=120,
         )
         assert cat_result.returncode == 0, (
@@ -783,7 +784,7 @@ def test_shared_mount(sandbox_cli, backend):
         exec_result = sandbox_cli(
             "exec", "ws-shared", "--",
             "bash", "-c",
-            f"echo -n '{vm_content}' > /home/agent/workspace/from-vm.txt",
+            f"echo -n '{vm_content}' > {LIMA_VM_HOME}/workspace/from-vm.txt",
             timeout=120,
         )
         assert exec_result.returncode == 0, (

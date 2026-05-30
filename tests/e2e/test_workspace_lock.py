@@ -46,6 +46,7 @@ import tempfile
 import pytest
 
 from conftest import (
+    LIMA_VM_HOME,
     make_create_args,
     parse_session_id,
     wait_for_state,
@@ -169,7 +170,7 @@ def test_workspace_lock_blocks_stop_during_push(
         with open(os.path.join(host_dir, "placeholder.txt"), "w") as f:
             f.write("ok\n")
 
-        guest_path = "/home/agent/work"
+        guest_path = f"{LIMA_VM_HOME}/work"
         result = sandbox_cli(
             "create",
             *make_create_args(
@@ -260,7 +261,7 @@ def test_workspace_lock_unlock_force_recovery(
         with open(os.path.join(host_dir, "placeholder.txt"), "w") as f:
             f.write("ok\n")
 
-        guest_path = "/home/agent/work"
+        guest_path = f"{LIMA_VM_HOME}/work"
         result = sandbox_cli(
             "create",
             *make_create_args(
@@ -344,7 +345,7 @@ def test_workspace_unlock_idempotent(
         with open(os.path.join(host_dir, "placeholder.txt"), "w") as f:
             f.write("ok\n")
 
-        guest_path = "/home/agent/work"
+        guest_path = f"{LIMA_VM_HOME}/work"
         result = sandbox_cli(
             "create",
             *make_create_args(

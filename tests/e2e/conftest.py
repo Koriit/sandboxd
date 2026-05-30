@@ -391,6 +391,76 @@ def gateway_container_name(session_id: str) -> str:
     return f"sandbox-gw-{session_id}"
 
 
+# ---------------------------------------------------------------------------
+# Cross-user Lima helpers
+# ---------------------------------------------------------------------------
+#
+# Under the production-shaped harnesses (sandbox-systemd / sandbox-sudo) the
+# daemon runs as the ``sandbox`` system user and every Lima control-plane
+# operation goes through ``sandbox-lima-helper``, which pivots to the
+# *operator* uid before exec'ing limactl.  The resulting Lima state lives at
+# the per-operator path:
+#
+#   /var/lib/sandboxd/<op_uid>/lima/
+#
+# NOT at the test-runner's ``~/.lima/``.  Any test-side helper that invokes
+# ``limactl`` directly (for inspection or cleanup) must therefore:
+#   1. Pass ``env LIMA_HOME=<OP_LIMA_HOME>`` so limactl queries the right
+#      registry.
+#   2. Run as the ``sandbox`` user (the VM directory is owned
+#      sandbox:sandbox with an ACL granting the operator rwx) via
+#      ``sudo -n -u sandbox``.
+#
+# Use ``limactl_cmd()`` for the argv prefix and ``OP_LIMA_HOME`` for the path
+# constant in assertions.  Both fall back to bare ``limactl`` (no sudo, no
+# LIMA_HOME override) in the legacy ``test-user`` harness where daemon uid ==
+# operator uid and the global ``~/.lima/`` is the correct registry.
+
+
+#: Absolute path to the per-operator LIMA_HOME under the cross-user harness.
+#: Derived once at import time from the test runner's uid (the operator).
+OP_LIMA_HOME: str = f"/var/lib/sandboxd/{os.getuid()}/lima"
+
+
+def limactl_cmd(*args: str) -> list[str]:
+    """Build a limactl argv that queries the correct LIMA_HOME for this harness.
+
+    Under ``sandbox-systemd`` / ``sandbox-sudo`` the VM registry lives at
+    ``/var/lib/sandboxd/<op_uid>/lima/`` (owned ``sandbox:sandbox``, ACL
+    grants the operator read access).  Bare ``limactl`` would look in
+    ``~/.lima/`` and see nothing.  This wrapper prefixes the correct
+    ``sudo -n -u sandbox env LIMA_HOME=…`` invocation so every test-side
+    limactl call (list, shell, delete, …) reaches the right registry.
+
+    In the legacy ``test-user`` harness the prefix is dropped and bare
+    ``limactl`` is returned — daemon and operator share a uid, so
+    ``~/.lima/`` is the correct registry.
+
+    Usage::
+
+        subprocess.run(limactl_cmd("list", "--json"), ...)
+        subprocess.run(limactl_cmd("shell", vm_name, "--", "uname", "-a"), ...)
+    """
+    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
+        return [
+            "sudo", "-n", "-u", "sandbox",
+            "env", f"LIMA_HOME={OP_LIMA_HOME}",
+            "limactl", *args,
+        ]
+    return ["limactl", *args]
+
+
+#: In-VM home directory for the ``agent`` user inside Lima VMs.
+#: Files written here persist across stop/start (non-tmpfs, on the VM's disk).
+LIMA_VM_HOME: str = "/home/agent"
+
+#: In-VM home directory for the ``agent`` user inside lite (Docker) containers.
+#: Same username / same path, distinct from Lima (each backend has its own
+#: base image), but identical in practice.  Kept as a named constant so a
+#: future rename is a one-line change here rather than a grep-and-replace.
+CONTAINER_HOME: str = "/home/agent"
+
+
 def wait_for_daemon_ready(
     socket_path,
     proc: subprocess.Popen,
@@ -470,20 +540,41 @@ def wait_for_state(
 
 
 def capture_lima_logs(session_id: str) -> str:
-    """Best-effort capture of Lima VM logs for debugging failures."""
+    """Best-effort capture of Lima VM logs for debugging failures.
+
+    Under the cross-user harness (sandbox-systemd / sandbox-sudo) Lima state
+    lives at ``OP_LIMA_HOME`` (``/var/lib/sandboxd/<op_uid>/lima/``), NOT at
+    ``~/.lima/``.  We try the per-operator path first and fall back to the
+    legacy path so this helper works across all three harnesses.
+    """
     vm = lima_vm_name(session_id)
     logs = []
 
-    # ha.stderr.log is the main Lima log
-    ha_log = os.path.expanduser(f"~/.lima/{vm}/ha.stderr.log")
-    try:
-        with open(ha_log) as f:
-            content = f.read()
-            if content:
-                logs.append(f"--- {ha_log} (last 50 lines) ---")
-                logs.extend(content.splitlines()[-50:])
-    except FileNotFoundError:
-        logs.append(f"(no ha.stderr.log found at {ha_log})")
+    # ha.stderr.log is the main Lima log.  Under the cross-user harness the
+    # VM dir is inside OP_LIMA_HOME; under the legacy test-user harness it is
+    # under ~/.lima/.
+    candidate_dirs = [OP_LIMA_HOME]
+    if SANDBOX_HARNESS == "test-user":
+        candidate_dirs.append(os.path.expanduser("~/.lima"))
+
+    found = False
+    for lima_dir in candidate_dirs:
+        ha_log = os.path.join(lima_dir, vm, "ha.stderr.log")
+        try:
+            with open(ha_log) as f:
+                content = f.read()
+                if content:
+                    logs.append(f"--- {ha_log} (last 50 lines) ---")
+                    logs.extend(content.splitlines()[-50:])
+                    found = True
+                    break
+        except FileNotFoundError:
+            pass
+
+    if not found:
+        logs.append(
+            f"(no ha.stderr.log found for {vm} in {candidate_dirs})"
+        )
 
     return "\n".join(logs)
 

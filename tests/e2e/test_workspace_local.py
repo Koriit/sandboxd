@@ -35,8 +35,10 @@ import tempfile
 import pytest
 
 from conftest import (
+    LIMA_VM_HOME,
     gateway_container_name,
     lima_vm_name,
+    limactl_cmd,
     make_create_args,
     parse_session_id,
     wait_for_state,
@@ -52,14 +54,14 @@ def _guest_path_for(backend: str) -> str:
 
     The on-create rsync push runs over the shell transport as
     ``agent`` (uid 1000), so the destination's parent must be
-    writable by that uid. On both backends ``/home/agent`` is
-    ``agent``-owned, so ``/home/agent/work`` works uniformly. Other
+    writable by that uid. On both backends ``LIMA_VM_HOME`` (``/home/agent``)
+    is ``agent``-owned, so ``/home/agent/work`` works uniformly. Other
     paths like ``/srv/work`` look attractive on Lima because the
     rootfs is fully writable, but only by ``root`` — rsync's
     ``--mkpath`` would need to ``mkdir`` under root-owned ``/srv``
     and fails with ``Permission denied (13)``.
     """
-    return "/home/agent/work"
+    return f"{LIMA_VM_HOME}/work"
 
 
 def _no_orphan_lima_vm(session_id: str) -> bool:
@@ -68,10 +70,14 @@ def _no_orphan_lima_vm(session_id: str) -> bool:
     Best-effort: if ``limactl`` is not installed we cannot have left a
     Lima orphan (Lima tests skip when limactl is absent), so the absence
     of the binary itself is a clean state.
+
+    Uses ``limactl_cmd()`` so the correct LIMA_HOME (``OP_LIMA_HOME``) is
+    queried under the cross-user harness — bare ``limactl`` would query
+    ``~/.lima/`` and report no orphan even when one exists.
     """
     try:
         result = subprocess.run(
-            ["limactl", "list", "--json"],
+            limactl_cmd("list", "--json"),
             capture_output=True, text=True, timeout=30,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -517,8 +523,8 @@ def _guest_write(backend: str, session_id: str, guest_path: str, body: str) -> N
                 f"cat > {guest_path}"]
     else:
         vm = lima_vm_name(session_id)
-        argv = ["limactl", "shell", vm, "sh", "-c",
-                f"cat > {guest_path}"]
+        argv = limactl_cmd("shell", vm, "sh", "-c",
+                           f"cat > {guest_path}")
     proc = subprocess.run(
         argv, input=body, text=True,
         capture_output=True, timeout=60,

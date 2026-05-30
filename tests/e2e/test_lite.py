@@ -33,6 +33,7 @@ import time
 import pytest
 
 from conftest import (
+    CONTAINER_HOME,
     SandboxBinaries,
     cleanup_policy_file,
     parse_session_id,
@@ -317,12 +318,12 @@ def test_lite_git_remote_sandbox(
         sid = lite_harness.create("--name", "lite-git-remote")
 
         # Initialise a bare repo inside the lite container so the
-        # remote helper has a destination. /home/agent/workspace/ is
+        # remote helper has a destination. CONTAINER_HOME/workspace/ is
         # writable inside the lite image (rootfs is read-only but
-        # /home/agent is the named home volume).
+        # CONTAINER_HOME is the named home volume).
         exec_result = sandbox_cli(
             "exec", "lite-git-remote", "--",
-            "git", "init", "--bare", "/home/agent/workspace/repo.git",
+            "git", "init", "--bare", f"{CONTAINER_HOME}/workspace/repo.git",
             timeout=120,
         )
         assert exec_result.returncode == 0, (
@@ -363,7 +364,7 @@ def test_lite_git_remote_sandbox(
         assert branch, "could not determine local branch name"
 
         # Add the sandbox:: remote and push through the helper.
-        remote_url = "sandbox::lite-git-remote/home/agent/workspace/repo.git"
+        remote_url = f"sandbox::lite-git-remote{CONTAINER_HOME}/workspace/repo.git"
         subprocess.run(
             ["git", "-C", local_repo, "remote", "add", "sandbox", remote_url],
             check=True, capture_output=True, timeout=10,
@@ -382,7 +383,7 @@ def test_lite_git_remote_sandbox(
         # Verify the commit landed inside the lite container.
         log_result = sandbox_cli(
             "exec", "lite-git-remote", "--",
-            "git", "-C", "/home/agent/workspace/repo.git",
+            "git", "-C", f"{CONTAINER_HOME}/workspace/repo.git",
             "log", "--oneline", "-1",
             timeout=120,
         )
@@ -501,13 +502,13 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     """"Workspace bind": mounting a host directory as
     ``--workspace shared:<path>`` makes it available at
-    ``/home/agent/workspace/`` inside the lite container, and files
+    ``CONTAINER_HOME/workspace/`` inside the lite container, and files
     written from inside the session land on the host with the *host*
     user's uid (not a stale container uid).
     ``ContainerNetwork.workspace_host_path`` is set to
     ``Some(<path>)`` when the request supplies ``WorkspaceMode::Shared``,
     and the container runtime renders it as ``--mount
-    type=bind,src=<path>,dst=/home/agent/workspace/`` (the bind target
+    type=bind,src=<path>,dst=CONTAINER_HOME/workspace/`` (the bind target
     matches Lima's workspace mount; the legacy target ``/workspace``
     has been retired).
 
@@ -528,16 +529,16 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
 
     sid = lite_harness.create(
         "--name", "lite-ws-uid",
-        "--workspace", f"shared:{host_dir}:/home/agent/workspace",
+        "--workspace", f"shared:{host_dir}:{CONTAINER_HOME}/workspace",
     )
     assert sid is not None
 
     # 1. host -> container: write a file on the host, read it from inside.
     host_fixture = host_dir / "from-host.txt"
     host_fixture.write_text("hello from host\n")
-    cat_result = lite_harness.ssh(sid, "cat", "/home/agent/workspace/from-host.txt")
+    cat_result = lite_harness.ssh(sid, "cat", f"{CONTAINER_HOME}/workspace/from-host.txt")
     assert cat_result.returncode == 0, (
-        f"cat /home/agent/workspace/from-host.txt failed inside lite session.\n"
+        f"cat {CONTAINER_HOME}/workspace/from-host.txt failed inside lite session.\n"
         f"stdout: {cat_result.stdout}\nstderr: {cat_result.stderr}"
     )
     assert "hello from host" in cat_result.stdout, (
@@ -547,10 +548,11 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
 
     # 2. container -> host: touch a file from inside, verify host uid.
     touch_result = lite_harness.ssh(
-        sid, "sh", "-c", "echo from-container > /home/agent/workspace/from-container.txt",
+        sid, "sh", "-c",
+        f"echo from-container > {CONTAINER_HOME}/workspace/from-container.txt",
     )
     assert touch_result.returncode == 0, (
-        f"writing /home/agent/workspace/from-container.txt failed inside lite session.\n"
+        f"writing {CONTAINER_HOME}/workspace/from-container.txt failed inside lite session.\n"
         f"stdout: {touch_result.stdout}\nstderr: {touch_result.stderr}"
     )
 
@@ -574,12 +576,12 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
 @pytest.mark.timeout(600)
 def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
     """"Home directory persistence (beta)": the named volume
-    ``sandbox-home-<id>`` is mounted at ``/home/agent`` and survives
+    ``sandbox-home-<id>`` is mounted at ``CONTAINER_HOME`` and survives
     ``stop`` + ``start``; ``rm`` removes the volume.
 
     Three steps:
 
-    1. Create the lite session and write a marker into ``/home/agent``.
+    1. Create the lite session and write a marker into ``CONTAINER_HOME``.
     2. Stop and restart; the marker must survive.
     3. Remove the session; ``docker volume ls`` must not list the
        ``sandbox-home-<id>`` volume.
@@ -587,24 +589,24 @@ def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
     sid = lite_harness.create("--name", "lite-home-volume")
     volume_name = f"sandbox-home-{sid}"
 
-    # 1. Write a marker. /home/agent is the named-volume mount, so
+    # 1. Write a marker. CONTAINER_HOME is the named-volume mount, so
     # writes here persist independently of the read-only rootfs.
     marker_content = "lite-home-volume-survived"
     write_result = lite_harness.ssh(
         sid, "sh", "-c",
-        f"echo {marker_content} > /home/agent/marker && cat /home/agent/marker",
+        f"echo {marker_content} > {CONTAINER_HOME}/marker && cat {CONTAINER_HOME}/marker",
         timeout=60,
     )
     assert write_result.returncode == 0, (
-        f"failed to write marker into /home/agent.\n"
+        f"failed to write marker into {CONTAINER_HOME}.\n"
         f"stdout: {write_result.stdout}\nstderr: {write_result.stderr}"
     )
     assert marker_content in write_result.stdout, (
-        f"marker not echoed back from /home/agent/marker.\n"
+        f"marker not echoed back from {CONTAINER_HOME}/marker.\n"
         f"stdout: {write_result.stdout}"
     )
 
-    # 2. Stop + start; the marker must survive because /home/agent
+    # 2. Stop + start; the marker must survive because CONTAINER_HOME
     # is on the named volume, not the container's writable layer.
     lite_harness.stop(sid)
     lite_harness.start(sid)
@@ -612,10 +614,10 @@ def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
     wait_for_state(sandbox_cli, "lite-home-volume", "Running", timeout=30)
 
     read_result = lite_harness.ssh(
-        sid, "cat", "/home/agent/marker", timeout=60,
+        sid, "cat", f"{CONTAINER_HOME}/marker", timeout=60,
     )
     assert read_result.returncode == 0, (
-        f"failed to read /home/agent/marker after stop+start.\n"
+        f"failed to read {CONTAINER_HOME}/marker after stop+start.\n"
         f"stdout: {read_result.stdout}\nstderr: {read_result.stderr}"
     )
     assert marker_content in read_result.stdout, (

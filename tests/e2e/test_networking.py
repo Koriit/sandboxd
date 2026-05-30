@@ -34,6 +34,7 @@ import time
 import pytest
 
 from conftest import (
+    LIMA_VM_HOME,
     capture_lima_logs,
     cleanup_policy_file,
     gateway_container_name,
@@ -673,8 +674,8 @@ def test_stop_start_with_networking(sandbox_cli, backend):
         )
 
         # 3. Write a file inside VM to verify persistence across stop/start.
-        #    Use home dir, not /tmp (tmpfs, cleared on reboot).
-        test_file = "/home/agent/net-persist-test.txt"
+        #    Use home dir (LIMA_VM_HOME), not /tmp (tmpfs, cleared on reboot).
+        test_file = f"{LIMA_VM_HOME}/net-persist-test.txt"
         write_result = sandbox_cli(
             "exec", "net-restart-test", "--",
             "bash", "-c", f"echo net-persist-marker > {test_file}",

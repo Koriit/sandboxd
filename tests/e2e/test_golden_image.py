@@ -48,7 +48,9 @@ from pathlib import Path
 import pytest
 
 from conftest import (
+    OP_LIMA_HOME,
     _VM_RESOURCE_ARGS,
+    limactl_cmd,
     parse_session_id,
     wait_for_state,
 )
@@ -155,8 +157,13 @@ def _get_base_image_status(socket_path: str, timeout: float = 10.0) -> dict:
 
 
 def _lima_list_names() -> list[str]:
+    """List all Lima VM names from the per-operator LIMA_HOME.
+
+    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
+    cross-user harness (sandbox-systemd / sandbox-sudo).
+    """
     result = subprocess.run(
-        ["limactl", "list", "--json"],
+        limactl_cmd("list", "--json"),
         capture_output=True, text=True, timeout=30,
     )
     names: list[str] = []
@@ -172,14 +179,21 @@ def _lima_list_names() -> list[str]:
 
 
 def _force_delete_base_vm() -> None:
-    """Best-effort: force-delete the Lima base VM and its orphan directory."""
+    """Best-effort: force-delete the Lima base VM and its orphan directory.
+
+    Uses ``limactl_cmd()`` so the correct LIMA_HOME (``OP_LIMA_HOME``) is set
+    under the cross-user harness.  The orphan directory is cleaned from
+    ``OP_LIMA_HOME``, not from the legacy ``~/.lima/``.
+    """
     subprocess.run(
-        ["limactl", "delete", "--force", BASE_VM_NAME],
+        limactl_cmd("delete", "--force", BASE_VM_NAME),
         capture_output=True, timeout=120,
     )
-    # Remove any orphan `~/.lima/<base-vm-name>` directory left behind by
-    # a partial / broken VM (e.g. from a hard crash mid-build).
-    orphan = Path.home() / ".lima" / BASE_VM_NAME
+    # Remove any orphan <base-vm-name> directory left behind by a partial /
+    # broken VM (e.g. from a hard crash mid-build).  Under the cross-user
+    # harness the base VM lives at OP_LIMA_HOME/<name>/; under the legacy
+    # test-user harness it lives at ~/.lima/<name>/.
+    orphan = Path(OP_LIMA_HOME) / BASE_VM_NAME
     if orphan.exists():
         shutil.rmtree(orphan, ignore_errors=True)
 
@@ -423,16 +437,18 @@ def test_rebuild_image_from_scratch(sandbox_binaries, sandbox_daemon, _ensure_ba
         f"Expected 'fresh' after rebuild-image, got {status!r}."
     )
 
-    # 6. The rebuilt image is reachable via limactl shell (it's stopped,
+    # 6. The rebuilt image is reachable via limactl list (it's stopped,
     #    so use `start` probe-free alternative: `limactl list --json` entry
     #    has an `sshLocalPort` only when running, which we don't require.
     #    Asserting presence in the list is sufficient -- a VM that failed
     #    to provision is cleaned up by build_base_image's error path).
+    #    Uses limactl_cmd() so OP_LIMA_HOME is set under the cross-user
+    #    harness.
     entry = next(
         (
             json.loads(line)
             for line in subprocess.run(
-                ["limactl", "list", "--json"],
+                limactl_cmd("list", "--json"),
                 capture_output=True, text=True, timeout=30,
             ).stdout.strip().splitlines()
             if BASE_VM_NAME in line

@@ -24,9 +24,11 @@ import subprocess
 import pytest
 
 from conftest import (
+    LIMA_VM_HOME,
     _VM_RESOURCE_ARGS,
     capture_lima_logs,
     lima_vm_name,
+    limactl_cmd,
     parse_session_id,
     wait_for_state,
 )
@@ -41,9 +43,15 @@ pytestmark = pytest.mark.lima
 
 
 def limactl_list_json() -> list[dict]:
-    """Run `limactl list --json` and return parsed entries."""
+    """Run `limactl list --json` against the per-operator LIMA_HOME and return
+    parsed entries.
+
+    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
+    cross-user harness (sandbox-systemd / sandbox-sudo).  Under the legacy
+    test-user harness bare ``limactl`` is used, which reads ``~/.lima/``.
+    """
     result = subprocess.run(
-        ["limactl", "list", "--json"],
+        limactl_cmd("list", "--json"),
         capture_output=True, text=True, timeout=30,
     )
     entries = []
@@ -58,9 +66,13 @@ def limactl_list_json() -> list[dict]:
 
 
 def limactl_shell(vm_name: str, *cmd: str, timeout: int = 60) -> subprocess.CompletedProcess:
-    """Run a command inside a Lima VM via `limactl shell`."""
+    """Run a command inside a Lima VM via ``limactl shell``.
+
+    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
+    cross-user harness (sandbox-systemd / sandbox-sudo).
+    """
     return subprocess.run(
-        ["limactl", "shell", vm_name, "--", *cmd],
+        limactl_cmd("shell", vm_name, "--", *cmd),
         capture_output=True, text=True, timeout=timeout,
     )
 
@@ -149,7 +161,7 @@ def test_stop_and_start(sandbox_cli):
 
         # 2. Write a file inside the VM (use home dir, not /tmp which is
         #    tmpfs and gets cleared on reboot)
-        test_file = "/home/agent/persist-test.txt"
+        test_file = f"{LIMA_VM_HOME}/persist-test.txt"
         write_result = limactl_shell(
             vm_name, "bash", "-c", f"echo hello > {test_file}",
             timeout=60,

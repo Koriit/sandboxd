@@ -37,6 +37,7 @@ import tempfile
 import pytest
 
 from conftest import (
+    CONTAINER_HOME,
     make_create_args,
     parse_session_id,
     wait_for_state,
@@ -46,13 +47,13 @@ from conftest import (
 def _guest_path_for(backend: str) -> str:
     """Return a writable guest path appropriate for ``backend``.
 
-    Container backend: ``/home/agent/work`` so the 9p/bind target lands
-    inside the lite image's writable-volume area. Lima backend:
-    ``/srv/work`` to exercise an out-of-``/home/agent`` mount and
-    confirm Lima's 9p materialisation honours operator paths anywhere
-    on the rootfs.
+    Container backend: ``CONTAINER_HOME/work`` so the bind target lands
+    inside the lite image's writable-volume area (``/home/agent`` is the
+    only writable tree on the read-only container rootfs). Lima backend:
+    ``/srv/work`` to exercise an out-of-home-dir mount and confirm Lima's
+    9p materialisation honours operator paths anywhere on the rootfs.
     """
-    return "/home/agent/work" if backend == "container" else "/srv/work"
+    return f"{CONTAINER_HOME}/work" if backend == "container" else "/srv/work"
 
 
 @pytest.mark.timeout(600)

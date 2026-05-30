@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 from conftest import (
+    LIMA_VM_HOME,
     SANDBOX_BIN,
     SANDBOX_HARNESS,
     _SANDBOX_PROD_SOCKET,
@@ -220,7 +221,7 @@ class TestHelperPivot9pSharedWorkspace:
         try:
             result = sandbox(
                 "create", "--backend", "lima",
-                "--workspace", f"shared:{shared}:/home/agent/workspace",
+                "--workspace", f"shared:{shared}:{LIMA_VM_HOME}/workspace",
                 *_VM_RESOURCE_ARGS,
             )
             session_id = parse_session_id(result.stdout)
@@ -230,7 +231,7 @@ class TestHelperPivot9pSharedWorkspace:
             # Read the file from inside the VM.
             result = sandbox(
                 "exec", session_id, "--",
-                "cat", "/home/agent/workspace/host_marker.txt",
+                "cat", f"{LIMA_VM_HOME}/workspace/host_marker.txt",
             )
             assert "written-on-host" in result.stdout, (
                 f"host-written file not readable in VM: {result.stdout!r}"
@@ -256,7 +257,7 @@ class TestHelperPivot9pSharedWorkspace:
         try:
             result = sandbox(
                 "create", "--backend", "lima",
-                "--workspace", f"shared:{shared}:/home/agent/workspace",
+                "--workspace", f"shared:{shared}:{LIMA_VM_HOME}/workspace",
                 *_VM_RESOURCE_ARGS,
             )
             session_id = parse_session_id(result.stdout)
@@ -267,7 +268,7 @@ class TestHelperPivot9pSharedWorkspace:
             sandbox(
                 "exec", session_id, "--",
                 "bash", "-c",
-                "echo 'written-in-vm' > /home/agent/workspace/vm_marker.txt",
+                f"echo 'written-in-vm' > {LIMA_VM_HOME}/workspace/vm_marker.txt",
             )
 
             # Allow the 9p flush.
