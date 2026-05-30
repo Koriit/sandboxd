@@ -580,8 +580,11 @@ fi
 /// Manages Lima virtual machines that back sandbox sessions.
 ///
 /// All VMs are named `sandbox-{session_id}` so they can be distinguished from
-/// user-created Lima instances.  Templates and other per-session artefacts are
-/// stored under `{base_dir}/sessions/{session_id}/`.
+/// user-created Lima instances.  Per-session Lima templates are staged as
+/// world-readable files under the operator state root
+/// (`{base_dir}/../sandbox-tmpl-{id}.yaml`) so that `sandbox-lima-helper
+/// create` (running as the operator uid after setresuid) can open them.
+/// Files are cleaned up immediately after `limactl create` returns.
 ///
 /// Each `LimaManager` instance is bound to a single operator uid. Every
 /// `limactl` operation is dispatched through `sandbox-lima-helper` with
@@ -706,6 +709,78 @@ impl LimaManager {
     /// invokes `sandbox-lima-helper create` to run `limactl create` as the
     /// operator uid (so `_config/user` is written as the operator, satisfying
     /// OpenSSH `StrictKeyfileMode`).
+    /// Write `content` to a world-readable (`0o644`) tempfile under the
+    /// operator state root (`{LIMA_HOME}/../`) and return its path.
+    ///
+    /// # Why a tempfile outside LIMA_HOME
+    ///
+    /// `sandbox-lima-helper create` runs as the operator uid (post-`setresuid`)
+    /// and calls `limactl create --yaml <path>`. `limactl` must be able to
+    /// `open()` the template before creating the VM.
+    ///
+    /// Placing the template inside LIMA_HOME is problematic for two reasons:
+    ///
+    /// 1. **No operator read access on LIMA_HOME subdirs.** The per-operator
+    ///    LIMA_HOME is provisioned with `u:<op_uid>:rwx` on the root directory
+    ///    only, deliberately without a `d:u:<op_uid>:rwx` *default* ACL so
+    ///    that the SSH private key (`_config/user`) remains a plain 0600 file
+    ///    with no ACL mask. Any subdirectory the daemon creates inside
+    ///    LIMA_HOME inherits the default `d:g::---,d:o::---` ACEs, meaning
+    ///    the operator cannot enter them and gets EACCES.
+    ///
+    /// 2. **Lima instance enumeration.** Lima enumerates every directory
+    ///    entry under LIMA_HOME when building its instance list. Any
+    ///    daemon-created subdirectory visible to the operator would cause Lima
+    ///    to attempt `open(<dir>/lima.yaml)`, which either produces a fatal
+    ///    "no such file" error (if the dir is readable) or is silently skipped
+    ///    (if the dir is inaccessible). Placing the template *outside*
+    ///    LIMA_HOME sidesteps this entirely — Lima never looks outside its own
+    ///    home directory.
+    ///
+    /// The operator state root (`/var/lib/sandboxd/<op_uid>/`) is a sibling
+    /// of LIMA_HOME and is not scanned by Lima. A `0o644` tempfile there is
+    /// readable by everyone (the template contains non-sensitive Lima YAML
+    /// config — no keys, no secrets). The file is removed on success and on
+    /// all error paths inside the callers (`create_vm`,
+    /// `create_vm_with_custom_template`).
+    fn write_operator_readable_template(
+        &self,
+        session_id: &SessionId,
+        content: &[u8],
+    ) -> Result<std::path::PathBuf, SandboxError> {
+        // Place the file under the operator state root (parent of LIMA_HOME)
+        // so Lima never enumerates it.
+        let state_root = self.base_dir.parent().ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "base_dir {} has no parent — cannot derive operator state root for template",
+                self.base_dir.display()
+            ))
+        })?;
+        let path = state_root.join(format!("sandbox-tmpl-{}.yaml", session_id.as_str()));
+        std::fs::write(&path, content).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to write session template to {}: {e}",
+                path.display()
+            ))
+        })?;
+        // World-readable: the template is non-sensitive Lima YAML config
+        // (no keys, no secrets). The operator-uid limactl process must be
+        // able to open it, and the simplest cross-uid mechanism is 0o644.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).map_err(
+                |e| {
+                    SandboxError::Internal(format!(
+                        "failed to chmod 0644 template {}: {e}",
+                        path.display()
+                    ))
+                },
+            )?;
+        }
+        Ok(path)
+    }
+
     pub fn create_vm(
         &self,
         session_id: &SessionId,
@@ -713,11 +788,11 @@ impl LimaManager {
         operator_identity: Option<(u32, u32)>,
     ) -> Result<(), SandboxError> {
         let template = self.generate_template(session_id, config, operator_identity);
-        let session_dir = self.session_dir(session_id);
-        std::fs::create_dir_all(&session_dir)?;
-
-        let template_path = session_dir.join("template.yaml");
-        std::fs::write(&template_path, &template)?;
+        // Write the template to a world-readable tempfile outside LIMA_HOME
+        // so the operator-uid `limactl create` can open it without touching
+        // the LIMA_HOME subdirectory tree (which Lima enumerates for instances).
+        let template_path =
+            self.write_operator_readable_template(session_id, template.as_bytes())?;
 
         let vm_name = vm_name(session_id);
         let template_str = template_path.to_string_lossy().to_string();
@@ -732,13 +807,17 @@ impl LimaManager {
             "creating VM"
         );
 
-        let output = self.run_helper(
+        let result = self.run_helper(
             "create",
             &["--vm", &vm_name, "--yaml", &template_str],
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create",
-        )?;
+        );
+        // Best-effort cleanup of the tempfile on both success and failure.
+        // Errors here are swallowed — the primary result takes precedence.
+        let _ = std::fs::remove_file(&template_path);
 
+        let output = result?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(parse_limactl_error("create", &stderr));
@@ -750,21 +829,27 @@ impl LimaManager {
 
     /// Create a new VM using a custom Lima template file.
     ///
-    /// The template is copied to the session directory before invoking
-    /// `sandbox-lima-helper create`.
+    /// The template is copied to a world-readable tempfile outside LIMA_HOME
+    /// before invoking `sandbox-lima-helper create`.
     pub fn create_vm_with_custom_template(
         &self,
         session_id: &SessionId,
         template_path: &std::path::Path,
     ) -> Result<(), SandboxError> {
-        let session_dir = self.session_dir(session_id);
-        std::fs::create_dir_all(&session_dir)?;
-
-        let dest = session_dir.join("template.yaml");
-        std::fs::copy(template_path, &dest)?;
+        // Read the caller-supplied template and re-stage it as a
+        // world-readable tempfile outside LIMA_HOME so the operator-uid
+        // limactl process can open it. See write_operator_readable_template
+        // for the full rationale.
+        let content = std::fs::read(template_path).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to read custom template {}: {e}",
+                template_path.display()
+            ))
+        })?;
+        let staged = self.write_operator_readable_template(session_id, &content)?;
 
         let vm_name = vm_name(session_id);
-        let dest_str = dest.to_string_lossy().to_string();
+        let staged_str = staged.to_string_lossy().to_string();
 
         info!(
             session_id = %session_id,
@@ -773,13 +858,16 @@ impl LimaManager {
             "creating VM with custom template"
         );
 
-        let output = self.run_helper(
+        let result = self.run_helper(
             "create",
-            &["--vm", &vm_name, "--yaml", &dest_str],
+            &["--vm", &vm_name, "--yaml", &staged_str],
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create (custom template)",
-        )?;
+        );
+        // Best-effort cleanup on both success and failure.
+        let _ = std::fs::remove_file(&staged);
 
+        let output = result?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(parse_limactl_error("create", &stderr));
@@ -2029,10 +2117,6 @@ provision:
     #[doc(hidden)]
     pub fn ensure_qemu_wrapper_for_test(&self) -> Result<PathBuf, SandboxError> {
         self.ensure_qemu_wrapper()
-    }
-
-    fn session_dir(&self, session_id: &SessionId) -> PathBuf {
-        self.base_dir.join("sessions").join(session_id.as_str())
     }
 
     /// Read the operator's Lima SSH private key by invoking
