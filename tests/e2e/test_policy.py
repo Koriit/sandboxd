@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import socket
 import subprocess
 import time
@@ -220,7 +221,7 @@ def test_level0_denied(sandbox_cli, backend):
         curl_result = sandbox_cli(
             "ssh", "pol-deny-all", "--",
             "bash", "-c",
-            "curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?",
+            shlex.quote("curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?"),
             timeout=120,
         )
         output = curl_result.stdout
@@ -369,7 +370,7 @@ def test_level1_transport_udp(sandbox_cli, backend):
         dns_result = sandbox_cli(
             "ssh", "pol-l1-udp", "--",
             "bash", "-c",
-            "nslookup example.com 8.8.8.8",
+            shlex.quote("nslookup example.com 8.8.8.8"),
             timeout=120,
         )
         assert dns_result.returncode == 0, (
@@ -555,7 +556,7 @@ def _send_udp_packet(
     )
     return sandbox_cli(
         "ssh", session_name, "--",
-        "timeout", str(timeout_s), "bash", "-c", cmd,
+        "timeout", str(timeout_s), "bash", "-c", shlex.quote(cmd),
         timeout=60,
     )
 
@@ -816,7 +817,7 @@ def test_udp_bidirectional_echo(sandbox_cli, backend):
         )
         socat_result = sandbox_cli(
             "ssh", session_name, "--",
-            "bash", "-c", ntp_cmd,
+            "bash", "-c", shlex.quote(ntp_cmd),
             timeout=60,
         )
         # The outer ssh wrapper should always succeed; the inner socat
@@ -1442,7 +1443,7 @@ def test_level2_tls_verified(sandbox_cli, backend):
         cert_result = sandbox_cli(
             "ssh", "pol-l2-tls", "--",
             "bash", "-c",
-            "echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null",
+            shlex.quote("echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null"),
             timeout=120,
         )
         issuer_output = cert_result.stdout.strip()
@@ -1593,7 +1594,7 @@ def test_level3_http_inspected(sandbox_cli, backend):
         cert_result = sandbox_cli(
             "ssh", "pol-l3-inspect", "--",
             "bash", "-c",
-            "echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null",
+            shlex.quote("echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null"),
             timeout=120,
         )
         issuer_output = cert_result.stdout.lower()
@@ -1838,7 +1839,7 @@ def test_level3_host_mismatch(sandbox_cli, backend):
         curl_result = sandbox_cli(
             "ssh", "pol-l3-host", "--",
             "bash", "-c",
-            "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://evil.example.com/ 2>&1",
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://evil.example.com/ 2>&1"),
             timeout=120,
         )
         # curl returns exit code 6 for DNS resolution failure, or 000 as the
@@ -1914,7 +1915,7 @@ def test_level3_method_restriction(sandbox_cli, backend):
         get_result = sandbox_cli(
             "ssh", "pol-l3-method", "--",
             "bash", "-c",
-            "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/get 2>&1",
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/get 2>&1"),
             timeout=120,
         )
         get_code = get_result.stdout.strip()
@@ -1927,7 +1928,7 @@ def test_level3_method_restriction(sandbox_cli, backend):
         post_result = sandbox_cli(
             "ssh", "pol-l3-method", "--",
             "bash", "-c",
-            "curl -s -o /dev/null -w '%{http_code}' -X POST --connect-timeout 15 --max-time 30 https://httpbin.org/post 2>&1",
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' -X POST --connect-timeout 15 --max-time 30 https://httpbin.org/post 2>&1"),
             timeout=120,
         )
         post_code = post_result.stdout.strip()
@@ -1995,7 +1996,7 @@ def test_level3_path_restriction(sandbox_cli, backend):
         bad_path_result = sandbox_cli(
             "ssh", "pol-l3-path", "--",
             "bash", "-c",
-            "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/other/path 2>&1",
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/other/path 2>&1"),
             timeout=120,
         )
         bad_code = bad_path_result.stdout.strip()
@@ -2011,7 +2012,7 @@ def test_level3_path_restriction(sandbox_cli, backend):
         good_path_result = sandbox_cli(
             "ssh", "pol-l3-path", "--",
             "bash", "-c",
-            "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/api/anything 2>&1",
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/api/anything 2>&1"),
             timeout=120,
         )
         good_code = good_path_result.stdout.strip()
@@ -2104,10 +2105,12 @@ def test_l3_fail_closed_before_dns_propagation(sandbox_cli, backend):
         curl_pre = sandbox_cli(
             "ssh", "pol-l3-failclosed", "--",
             "bash", "-c",
-            f"curl -sk --connect-timeout 8 --max-time 12 "
-            f"--resolve example.com:443:{host_ip} "
-            f"https://example.com/ -o /dev/null -w '%{{http_code}}' 2>&1; "
-            f"echo EXIT:$?",
+            shlex.quote(
+                f"curl -sk --connect-timeout 8 --max-time 12 "
+                f"--resolve example.com:443:{host_ip} "
+                f"https://example.com/ -o /dev/null -w '%{{http_code}}' 2>&1; "
+                f"echo EXIT:$?"
+            ),
             timeout=60,
         )
         # Expected failure modes: curl exit != 0 (timeout / connect refused
@@ -2168,9 +2171,11 @@ def test_l3_fail_closed_before_dns_propagation(sandbox_cli, backend):
             curl_retry = sandbox_cli(
                 "ssh", "pol-l3-failclosed", "--",
                 "bash", "-c",
-                f"curl -sk --connect-timeout 5 --max-time 10 "
-                f"--resolve example.com:443:{retry_ip} "
-                f"https://example.com/ 2>&1; echo EXIT:$?",
+                shlex.quote(
+                    f"curl -sk --connect-timeout 5 --max-time 10 "
+                    f"--resolve example.com:443:{retry_ip} "
+                    f"https://example.com/ 2>&1; echo EXIT:$?"
+                ),
                 timeout=30,
             )
             last_stdout = curl_retry.stdout
@@ -2549,7 +2554,7 @@ def test_empty_policy_denies_dns(sandbox_cli, backend):
         curl_result = sandbox_cli(
             "ssh", "pol-empty-default", "--",
             "bash", "-c",
-            "curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?",
+            shlex.quote("curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?"),
             timeout=120,
         )
         assert "EXIT:0" not in curl_result.stdout, (
@@ -2658,7 +2663,7 @@ def test_policy_clear_reverts_to_deny_all(sandbox_cli, backend):
         curl_after = sandbox_cli(
             "ssh", "pol-clear", "--",
             "bash", "-c",
-            "curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?",
+            shlex.quote("curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?"),
             timeout=120,
         )
         assert "EXIT:0" not in curl_after.stdout, (

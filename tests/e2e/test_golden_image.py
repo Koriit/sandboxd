@@ -49,6 +49,7 @@ import pytest
 
 from conftest import (
     OP_LIMA_HOME,
+    SANDBOX_HARNESS,
     _VM_RESOURCE_ARGS,
     limactl_cmd,
     parse_session_id,
@@ -71,7 +72,20 @@ BASE_META_FILENAME = "base-image-meta.json"
 
 
 def _base_meta_path(sandbox_daemon) -> Path:
-    """Return the path to the daemon's base-image-meta.json."""
+    """Return the path to the daemon's base-image-meta.json.
+
+    Under the production-shaped harnesses (sandbox-systemd / sandbox-sudo)
+    the daemon writes this file to the per-operator LIMA_HOME:
+        /var/lib/sandboxd/<op_uid>/lima/base-image-meta.json
+    which is ``OP_LIMA_HOME/base-image-meta.json`` in conftest terms.
+    The file is owned by the operator uid, so the test process can read
+    and write it directly without sudo.
+
+    Under the legacy test-user harness the daemon and test process share a
+    uid, so the file lives in the daemon's base_dir as before.
+    """
+    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
+        return Path(OP_LIMA_HOME) / BASE_META_FILENAME
     return Path(sandbox_daemon["base_dir"]) / BASE_META_FILENAME
 
 

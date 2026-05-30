@@ -524,6 +524,54 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 # ---------------------------------------------------------------------------
 
 
+def _grant_traverse_to_sandbox(path: os.PathLike) -> None:
+    """Add the execute (traverse) bit for others on ``path`` and every
+    ancestor up to ``/tmp`` (exclusive).
+
+    pytest creates its per-test tmp directories under
+    ``/tmp/pytest-of-<user>/pytest-<N>/test_<name>/`` with mode 0700,
+    owner=operator.  When the daemon runs as user ``sandbox`` (uid 999) it
+    must traverse these directories to reach a shared-workspace host path,
+    but mode 0700 gives EACCES to any non-owner.
+
+    In real usage an operator's home directory is 0755, so this situation
+    never occurs in production.  It is purely a pytest-tmp artifact.
+
+    We grant *traverse-only* (``o+x``, not ``o+r``) to the chain:
+    ``/tmp/pytest-of-<user>/``, each ``pytest-<N>/`` dir, each
+    ``test_<name>/`` dir, and the workspace directory itself.
+    We do NOT chmod the workspace *contents* — the daemon only needs to
+    reach the specific bind-mount path, not list it.
+
+    Stops at ``/tmp`` (world-writable already) and ``/`` to avoid
+    inadvertently widening permissions outside the pytest tree.
+    """
+    import stat as _stat
+
+    p = os.path.abspath(path)
+    stop_at = {"/tmp", "/"}
+    visited: list[str] = []
+
+    # Walk upward collecting dirs that need o+x, stop at /tmp or root.
+    current = p
+    while True:
+        visited.append(current)
+        if current in stop_at:
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    for d in visited:
+        try:
+            st = os.stat(d)
+            if not (st.st_mode & _stat.S_IXOTH):
+                os.chmod(d, st.st_mode | _stat.S_IXOTH)
+        except OSError:
+            pass  # best-effort; failure will surface as EACCES on create
+
+
 @pytest.mark.timeout(300)
 def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     """"Workspace bind": mounting a host directory as
@@ -552,6 +600,12 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     host_dir = tmp_path / "lite-workspace"
     host_dir.mkdir()
     host_uid = os.getuid()
+
+    # The daemon (user `sandbox`, uid 999) must traverse the pytest tmp
+    # ancestor directories to reach host_dir.  Pytest creates those dirs
+    # mode 0700, which blocks any non-owner.  Grant o+x up the chain so
+    # the daemon can reach the bind-mount path.  See _grant_traverse_to_sandbox.
+    _grant_traverse_to_sandbox(host_dir)
 
     sid = lite_harness.create(
         "--name", "lite-ws-uid",
@@ -755,22 +809,61 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         #    orphaned (no owning row). `foreign_keys = ON` cascades the
         #    delete through `session_policies` / `policy_rules` /
         #    `policy_rule_http_filters` (V003+V004 schema).
+        #
+        #    Under the production-shaped harnesses (sandbox-systemd /
+        #    sandbox-sudo) the DB is owned by user `sandbox` (uid 999)
+        #    inside a mode-0700 directory — the test-runner process
+        #    (operator uid) gets EACCES on a direct sqlite3.connect().
+        #    Route the mutation through `sudo -n -u sandbox sqlite3` so
+        #    the correct user performs the write.  Under the legacy
+        #    test-user harness the daemon and operator share a uid, so
+        #    a direct connection is fine.
+        from conftest import SANDBOX_HARNESS  # local import to avoid circularity
         assert os.path.exists(db_path), (
             f"sessions.db not found at {db_path}; can't synthesise an orphan."
         )
-        conn = sqlite3.connect(db_path)
-        try:
-            conn.execute("PRAGMA foreign_keys = ON")
-            cur = conn.execute(
-                "DELETE FROM sessions WHERE id = ?", (sid,)
+        if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
+            # Pass the SQL via stdin so the session id doesn't need shell quoting.
+            sql = (
+                "PRAGMA foreign_keys = ON; "
+                f"DELETE FROM sessions WHERE id = '{sid}';"
             )
-            assert cur.rowcount == 1, (
-                f"expected to delete exactly 1 session row for {sid}; "
-                f"DELETE matched {cur.rowcount} rows."
+            db_result = subprocess.run(
+                ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path],
+                input=sql,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
-            conn.commit()
-        finally:
-            conn.close()
+            assert db_result.returncode == 0, (
+                f"sudo sqlite3 DELETE failed (rc={db_result.returncode}).\n"
+                f"stdout: {db_result.stdout}\nstderr: {db_result.stderr}"
+            )
+            # Verify the row is gone by querying count.
+            count_result = subprocess.run(
+                ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path,
+                 f"SELECT COUNT(*) FROM sessions WHERE id = '{sid}';"],
+                capture_output=True, text=True, timeout=15,
+            )
+            remaining = count_result.stdout.strip()
+            assert remaining == "0", (
+                f"expected session row for {sid} to be deleted; "
+                f"SELECT COUNT(*) returned {remaining!r}."
+            )
+        else:
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                cur = conn.execute(
+                    "DELETE FROM sessions WHERE id = ?", (sid,)
+                )
+                assert cur.rowcount == 1, (
+                    f"expected to delete exactly 1 session row for {sid}; "
+                    f"DELETE matched {cur.rowcount} rows."
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
         # 3. Restart the daemon with the same socket and base-dir.
         #    Harness-aware: ``systemctl start`` under sandbox-systemd,
