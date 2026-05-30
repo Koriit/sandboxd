@@ -82,6 +82,7 @@ RUN install -d -o root -g root -m 0755 /etc/sandbox-sshd \
         'PrintLastLog no' \
         'LogLevel ERROR' \
         'AllowUsers sandbox' \
+        'Subsystem sftp /usr/lib/openssh/sftp-server' \
       > /etc/sandbox-sshd/sshd_config
 
 # Launch wrapper: generate the ephemeral ed25519 host key on every
