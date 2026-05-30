@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import time
@@ -495,7 +496,7 @@ def test_denied_traffic(sandbox_cli, backend):
         )
         send_result = sandbox_cli(
             "ssh", "net-deny-test", "--",
-            "timeout", "5", "bash", "-c", send_cmd,
+            "timeout", "5", "bash", "-c", shlex.quote(send_cmd),
             timeout=60,
         )
         assert send_result.returncode == 0, (

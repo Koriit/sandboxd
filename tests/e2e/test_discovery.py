@@ -56,6 +56,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -133,7 +134,7 @@ def _curl_both_targets(sandbox_cli, host_to_ips: dict[str, set[str]]) -> None:
             f"--resolve {host}:{TARGET_PORT}:{ip} "
             f"http://{host}:{TARGET_PORT}/ || true"
         )
-        sandbox_cli("ssh", SESSION_NAME, "--", "bash", "-c", cmd, timeout=60)
+        sandbox_cli("ssh", SESSION_NAME, "--", "bash", "-c", shlex.quote(cmd), timeout=60)
 
 
 def _parse_jsonl(path: Path) -> list[dict]:

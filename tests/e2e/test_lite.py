@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -506,8 +507,10 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
         # explicitly.
         deny_result = lite_harness.ssh(
             sid, "sh", "-c",
-            "curl -s --connect-timeout 10 --max-time 15 "
-            "http://denied.example.org/ 2>&1; echo EXIT:$?",
+            shlex.quote(
+                "curl -s --connect-timeout 10 --max-time 15 "
+                "http://denied.example.org/ 2>&1; echo EXIT:$?"
+            ),
             timeout=120,
         )
         assert "EXIT:0" not in deny_result.stdout, (
@@ -629,7 +632,7 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     # 2. container -> host: touch a file from inside, verify host uid.
     touch_result = lite_harness.ssh(
         sid, "sh", "-c",
-        f"echo from-container > {CONTAINER_HOME}/workspace/from-container.txt",
+        shlex.quote(f"echo from-container > {CONTAINER_HOME}/workspace/from-container.txt"),
     )
     assert touch_result.returncode == 0, (
         f"writing {CONTAINER_HOME}/workspace/from-container.txt failed inside lite session.\n"
@@ -674,7 +677,7 @@ def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
     marker_content = "lite-home-volume-survived"
     write_result = lite_harness.ssh(
         sid, "sh", "-c",
-        f"echo {marker_content} > {CONTAINER_HOME}/marker && cat {CONTAINER_HOME}/marker",
+        shlex.quote(f"echo {marker_content} > {CONTAINER_HOME}/marker && cat {CONTAINER_HOME}/marker"),
         timeout=60,
     )
     assert write_result.returncode == 0, (

@@ -43,6 +43,7 @@ backend kind), so the restart-survival contract is identical.
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -90,8 +91,10 @@ def _curl_denied(sandbox_cli, name: str) -> subprocess.CompletedProcess:
     return sandbox_cli(
         "ssh", name, "--",
         "bash", "-c",
-        "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 "
-        "--max-time 15 http://denied.test/ 2>&1; echo EXIT:$?",
+        shlex.quote(
+            "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 "
+            "--max-time 15 http://denied.test/ 2>&1; echo EXIT:$?"
+        ),
         timeout=120,
     )
 
