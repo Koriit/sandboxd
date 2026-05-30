@@ -71,6 +71,24 @@ python -m pytest -v --timeout=600                           # full suite
 
 If `python -m pytest` reports `ModuleNotFoundError: No module named 'pytest'` despite `pip list` showing it, the host's `python3` was upgraded under the venv since it was built — `tests/e2e/.venv/bin/python` is now ABI-mismatched with the new interpreter. `make test-e2e` (and friends) auto-rebuild the venv via a version-stamped marker (`.installed.pythonX.Y`); for the manual `source .venv/bin/activate` path above, run `rm -rf tests/e2e/.venv && make test-e2e-container` once to rebuild against the current `python3`, then the activate-and-iterate flow works again.
 
+### Cross-user harness (default `sandbox-systemd`)
+
+The suite runs the daemon as the unprivileged `sandbox` system user while the test runner acts as the *operator* (a separate uid), so the daemon's uid differs from the operator's — the real cross-user path. When running or debugging:
+
+- **Sandbox-group membership must be live.** The daemon socket is `0660`, group `sandbox`; the pytest process must carry that group in its credentials. `usermod -aG sandbox <you>` only takes effect at next login, so `make test-e2e-matrix` / `test-e2e-container` self-wrap the pytest step in `sg sandbox -c` (set `SANDBOX_HARNESS=test-user` for the legacy single-uid path, which skips the wrap).
+- **Per-operator LIMA_HOME.** Lima VMs, configs, and the SSH key live under `/var/lib/sandboxd/<operator_uid>/lima/`, owned by the operator uid. The key is a plain `0600` file: OpenSSH StrictKeyfileMode reads `st_mode`, and a POSIX-ACL *named-user* entry surfaces its mask in the group bits (tripping OpenSSH), so the per-operator LIMA_HOME deliberately carries no default named-user ACL. Test-side `limactl` must run **as the operator** with `LIMA_HOME` set (`limactl_cmd()` in conftest), never `sudo -u sandbox` — the daemon uid cannot read the operator-owned files.
+- **In-VM home is backend-specific:** Lima `/home/agent`, container `/home/sandbox`; cross-backend tests select via `guest_home(backend)`.
+- **The test-cap'd `sandbox-lima-helper` can install stale.** Its stamp may report "already configured" without reinstalling a changed binary — `rm sandboxd/target/.dev-env-stamps/lima-helper-test.stamp && make install-lima-helper-test-cap` after any helper change.
+
+### Debugging a red matrix
+
+The cross-user matrix boots real VMs and runs ~1.5–2h on the 8 GB host. Launch it detached (or via a background agent) and poll the log rather than blocking. When triaging:
+
+- **Isolate failures one at a time** — never two VMs/containers at once (8 GB). A long full run can *cascade* (e.g. the gateway degrading mid-run fails later policy/preset tests); an isolated rerun separates a real bug from load/cascade.
+- **Container-backend failures are independent of the Lima cross-user path** (the container backend never runs `limactl` through `sandbox-lima-helper`) — a fast discriminator for whether a failure involves the helper / cross-user execution at all.
+- Read a background agent's **log/output file**, not its full JSONL transcript, for ground truth.
+- Guard long docker/Lima runs against ENOSPC (VM images + build cache fill `/`).
+
 ## Rust workspace
 
 Working directory for cargo commands: `sandboxd/`
