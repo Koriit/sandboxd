@@ -499,7 +499,7 @@ fn run() -> ExitCode {
     // step 7) as op_home so HOME is set to the operator's own directory.
     let state_root = resolve_state_root();
     let lima_home = format!("{state_root}/{op_uid_raw}/lima/");
-    let env_block = build_env_block(&subcommand, &lima_home, &pw_dir);
+    let env_block = build_env_block(&subcommand, &lima_home, &pw_dir, op_uid_raw);
 
     // Step 10.5 — tighten umask to 0077 before exec.
     //
@@ -1387,7 +1387,7 @@ fn clear_all_capabilities() -> Result<(), String> {
 // Environment block construction (step 10)
 // ---------------------------------------------------------------------------
 
-fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str) -> Vec<CString> {
+fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str, op_uid: u32) -> Vec<CString> {
     // Pass through allowlisted parent vars, skipping HOME: HOME is always
     // set explicitly below to the operator's pw_dir (captured in step 3).
     // This prevents the daemon's own HOME=/var/lib/sandbox from leaking
@@ -1416,6 +1416,27 @@ fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str) -> Vec<CStr
 
     // Always set LIMA_HOME to the per-operator path.
     if let Ok(c) = CString::new(format!("LIMA_HOME={lima_home}")) {
+        env.push(c);
+    }
+
+    // Set XDG_RUNTIME_DIR to the operator's runtime directory.
+    //
+    // The QEMU wrapper script probes `systemctl --user show-environment` to
+    // decide whether it can reach the operator's user manager and wrap QEMU
+    // in a transient `systemd-run --user --scope --slice=sandbox.slice` with
+    // MemoryMax/CPUQuota limits. `systemctl --user` connects to the user bus
+    // via `XDG_RUNTIME_DIR` (typically `/run/user/<uid>`). Without this var,
+    // systemd falls back to "No medium found" and the probe fails — QEMU then
+    // boots without any cgroup scope and without resource limits.
+    //
+    // We set it deterministically from op_uid (same derivation pattern as the
+    // Lima convention `/run/user/<uid>`) rather than inheriting from the host
+    // environment, which keeps the env block a from-scratch allowlist. The
+    // path is only useful if the operator has a running user manager at that
+    // location (i.e. an active login session or `loginctl enable-linger`); if
+    // not, the `systemctl --user show-environment` probe still fails gracefully
+    // and the wrapper falls back to starting QEMU without cgroup limits.
+    if let Ok(c) = CString::new(format!("XDG_RUNTIME_DIR=/run/user/{op_uid}")) {
         env.push(c);
     }
 
@@ -2756,7 +2777,12 @@ WantedBy=multi-user.target";
     #[test]
     fn env_block_always_has_lima_home() {
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
+        let env = build_env_block(
+            &sub,
+            "/var/lib/sandboxd/1000/lima/",
+            "/home/operator-1000",
+            1000,
+        );
         let has_lima_home = env
             .iter()
             .any(|c| c.to_string_lossy().starts_with("LIMA_HOME="));
@@ -2770,7 +2796,7 @@ WantedBy=multi-user.target";
     fn env_block_home_is_operator_pw_dir() {
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
         let op_home = "/home/operator-1000";
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", op_home);
+        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", op_home, 1000);
         let map: std::collections::HashMap<String, String> = env
             .iter()
             .map(|c| {
@@ -2807,7 +2833,12 @@ WantedBy=multi-user.target";
             bridge_name: Some("br0".to_string()),
             vm_mac: Some("02:00:00:00:00:01".to_string()),
         });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
+        let env = build_env_block(
+            &sub,
+            "/var/lib/sandboxd/1000/lima/",
+            "/home/operator-1000",
+            1000,
+        );
         let keys: Vec<String> = env
             .iter()
             .map(|c| {
@@ -2843,7 +2874,12 @@ WantedBy=multi-user.target";
             bridge_name: None,
             vm_mac: None,
         });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
+        let env = build_env_block(
+            &sub,
+            "/var/lib/sandboxd/1000/lima/",
+            "/home/operator-1000",
+            1000,
+        );
         let keys: Vec<String> = env
             .iter()
             .map(|c| {
@@ -2897,7 +2933,12 @@ WantedBy=multi-user.target";
             bridge_name: Some("br0".to_string()),
             vm_mac: Some("02:00:00:00:00:01".to_string()),
         });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
+        let env = build_env_block(
+            &sub,
+            "/var/lib/sandboxd/1000/lima/",
+            "/home/operator-1000",
+            1000,
+        );
         let map: std::collections::HashMap<String, String> = env
             .iter()
             .map(|c| {
@@ -2923,7 +2964,12 @@ WantedBy=multi-user.target";
         // SAFETY: single-threaded test, no concurrent env mutation.
         unsafe { std::env::set_var("CANARY_SECRET_TOKEN", "leak-me") };
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
+        let env = build_env_block(
+            &sub,
+            "/var/lib/sandboxd/1000/lima/",
+            "/home/operator-1000",
+            1000,
+        );
         let keys: Vec<String> = env
             .iter()
             .map(|c| {
@@ -2943,7 +2989,12 @@ WantedBy=multi-user.target";
     #[test]
     fn env_block_always_has_xdg_cache_home() {
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", "/home/operator-1000");
+        let env = build_env_block(
+            &sub,
+            "/var/lib/sandboxd/1000/lima/",
+            "/home/operator-1000",
+            1000,
+        );
         let map: std::collections::HashMap<String, String> = env
             .iter()
             .map(|c| {
@@ -2960,6 +3011,37 @@ WantedBy=multi-user.target";
         assert!(
             xdg.unwrap().starts_with("/var/lib/sandboxd/1000/lima/"),
             "XDG_CACHE_HOME must be pinned inside the operator LIMA_HOME tree, got: {xdg:?}"
+        );
+    }
+
+    /// Assert XDG_RUNTIME_DIR is always present and set to /run/user/<op_uid>.
+    ///
+    /// This is load-bearing for the QEMU wrapper's `systemctl --user
+    /// show-environment` probe: without XDG_RUNTIME_DIR, systemd returns
+    /// "No medium found" and the wrapper skips the systemd-run scope entirely,
+    /// leaving QEMU without cgroup memory/CPU limits (M18 regression).
+    #[test]
+    fn env_block_xdg_runtime_dir_is_operator_run_user_uid() {
+        let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
+        let env = build_env_block(
+            &sub,
+            "/var/lib/sandboxd/1000/lima/",
+            "/home/operator-1000",
+            1000,
+        );
+        let map: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|c| {
+                let s = c.to_string_lossy().to_string();
+                let eq = s.find('=').unwrap();
+                (s[..eq].to_string(), s[eq + 1..].to_string())
+            })
+            .collect();
+        assert_eq!(
+            map.get("XDG_RUNTIME_DIR").map(|s| s.as_str()),
+            Some("/run/user/1000"),
+            "XDG_RUNTIME_DIR must be /run/user/<op_uid> so the QEMU wrapper's \
+             systemctl --user probe can reach the operator's user manager"
         );
     }
 
