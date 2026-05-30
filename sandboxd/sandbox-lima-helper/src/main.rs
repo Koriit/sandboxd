@@ -437,6 +437,25 @@ fn run() -> ExitCode {
     let lima_home = format!("/var/lib/sandboxd/{op_uid_raw}/lima/");
     let env_block = build_env_block(&subcommand, &lima_home, &pw_dir);
 
+    // Step 10.5 — tighten umask to 0077 before exec.
+    //
+    // limactl creates `$LIMA_HOME/_config/user` (the SSH private key) with
+    // open(O_CREAT, 0666) in Lima 2.x. The daemon inherits UMask=0022 from
+    // the systemd unit (needed for the unix socket), which passes through
+    // setresuid unchanged and leaves the key at 0644 on disk. OpenSSH
+    // enforces StrictKeyfileMode and refuses to load a private key that is
+    // group- or world-readable, so the hostagent loops with "bad permissions"
+    // for the full 600 s timeout.
+    //
+    // 0o077 strips group+world bits from every file/dir Lima creates:
+    //   files:       0666 & ~0077 = 0600  (SSH key is operator-private)
+    //   directories: 0777 & ~0077 = 0700  (owner can still traverse/create)
+    //
+    // 0o177 would also strip the owner-execute bit, turning directories
+    // into 0600 (no traversal) — that breaks Lima's cidata ISO build which
+    // needs to mkdir intermediate subdirs (boot.FreeBSD, etc.).
+    unsafe { libc::umask(0o077) };
+
     // Step 11 — exec (or step-sequence for install-guest-agent).
     match &subcommand {
         Subcommand::InstallGuestAgent(a) => {

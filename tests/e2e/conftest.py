@@ -1055,6 +1055,12 @@ def _write_systemd_drop_in(
         # Fail-closed under the resolver (a missing
         # or un-cap'd path here is a hard error that prevents startup).
         Environment="SANDBOX_LIMA_HELPER_PATH=/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
+        # Override the guest-agent binary the lima-helper copies into the
+        # VM during ``install-guest-agent``. The test helper is built with
+        # ``--features test-env-override`` which honours this env var;
+        # the release helper ignores it. Points at the workspace debug
+        # build so no separate prod-install step is required for testing.
+        Environment="SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH={sandbox_binaries.sandboxd.parent}/sandbox-guest"
         # Disable Restart= so a daemon that crashes mid-test stays down
         # and the test fails with a clear "daemon exited" diagnostic
         # rather than mysteriously coming back up.
@@ -1404,6 +1410,11 @@ def _launch_daemon_as_sandbox_via_sudo(
             "SANDBOX_BASE_VM_NAME": os.environ["SANDBOX_BASE_VM_NAME"],
             "SANDBOX_LIMA_HELPER_PATH":
                 "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
+            # Override the guest-agent binary path so the test lima-helper
+            # (built with --features test-env-override) copies the workspace
+            # debug build into the VM instead of looking for the prod install.
+            "SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH":
+                str(sandbox_binaries.sandboxd.parent / "sandbox-guest"),
         },
         stdout=stdout_fh,
         stderr=stderr_fh,
