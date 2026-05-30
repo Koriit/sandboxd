@@ -48,6 +48,30 @@ from helpers import HostResources, LiteBackendHarness
 # rather than implicitly via the absence of the ``backend`` fixture.
 pytestmark = pytest.mark.container
 
+# Two-line advisory that `sandbox create --lite` always emits to stderr
+# before any rejection or success output.  Tests that assert on the
+# *rejection* message content must strip this notice first so the
+# advisory does not mask or accidentally satisfy rejection-specific
+# assertions.
+_LITE_ADVISORY_LINES = frozenset([
+    "lite: container-backed session — container-level isolation only (not VM-grade)",
+    "      see guides/lite-mode for the trade-off details",
+])
+
+
+def _strip_lite_advisory(stderr: str) -> str:
+    """Return ``stderr`` with the known lite advisory lines removed.
+
+    The advisory is emitted unconditionally by ``sandbox create --lite``
+    before rejection/success output; tests that inspect the rejection
+    message should call this helper so their assertions target only the
+    product-specific error text.
+    """
+    return "\n".join(
+        line for line in stderr.splitlines()
+        if line not in _LITE_ADVISORY_LINES
+    )
+
 
 # ---------------------------------------------------------------------------
 # File-level skip if Docker is not accessible
@@ -145,10 +169,11 @@ def test_hardened_rejected_for_lite(sandbox_cli):
         f"sandbox create --lite --hardened should exit 2, got "
         f"{result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert "--hardened" in result.stderr, (
+    rejection_stderr = _strip_lite_advisory(result.stderr)
+    assert "--hardened" in rejection_stderr, (
         f"stderr must mention --hardened.\nstderr: {result.stderr}"
     )
-    assert "container backend" in result.stderr or "lite" in result.stderr, (
+    assert "container backend" in rejection_stderr or "lite" in rejection_stderr, (
         f"stderr must reference the container backend or --lite.\n"
         f"stderr: {result.stderr}"
     )
@@ -175,12 +200,13 @@ def test_no_cache_rejected_for_lite(sandbox_cli):
         f"sandbox create --lite --no-cache should exit 2, got "
         f"{result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert "--no-cache" in result.stderr, (
+    rejection_stderr = _strip_lite_advisory(result.stderr)
+    assert "--no-cache" in rejection_stderr, (
         f"stderr must mention --no-cache.\nstderr: {result.stderr}"
     )
     # the documented designwording: "`--no-cache` is not supported with `--lite` /
     # container backend"
-    assert "not supported" in result.stderr, (
+    assert "not supported" in rejection_stderr, (
         f"stderr must say 'not supported'.\nstderr: {result.stderr}"
     )
 

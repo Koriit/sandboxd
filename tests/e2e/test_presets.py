@@ -50,6 +50,7 @@ parametrized.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -257,7 +258,7 @@ def test_npm_preset_allows_npm_install(sandbox_cli, backend):
             "https://registry.npmjs.org/leftpad"
         )
         meta_result = sandbox_cli(
-            "ssh", session_name, "--", "bash", "-c", meta_cmd,
+            "ssh", session_name, "--", "bash", "-c", shlex.quote(meta_cmd),
             timeout=120,
         )
         assert meta_result.returncode == 0, (
@@ -276,7 +277,7 @@ def test_npm_preset_allows_npm_install(sandbox_cli, backend):
             "https://registry.npmjs.org/is-odd/-/is-odd-3.0.1.tgz"
         )
         tgz_result = sandbox_cli(
-            "ssh", session_name, "--", "bash", "-c", tgz_cmd,
+            "ssh", session_name, "--", "bash", "-c", shlex.quote(tgz_cmd),
             timeout=120,
         )
         assert tgz_result.returncode == 0, (
@@ -373,7 +374,7 @@ def test_npm_preset_denies_non_preset_host(sandbox_cli, backend):
             "https://example.com || true"
         )
         curl_result = sandbox_cli(
-            "ssh", session_name, "--", "bash", "-c", curl_cmd,
+            "ssh", session_name, "--", "bash", "-c", shlex.quote(curl_cmd),
             timeout=60,
         )
         # curl(1) documents exit codes 0 = success, non-zero = various
@@ -483,7 +484,7 @@ def test_cargo_preset_allows_cargo_fetch(sandbox_cli, backend):
             "https://index.crates.io/se/rd/serde"
         )
         index_result = sandbox_cli(
-            "ssh", session_name, "--", "bash", "-c", index_cmd,
+            "ssh", session_name, "--", "bash", "-c", shlex.quote(index_cmd),
             timeout=120,
         )
         assert index_result.returncode == 0, (
@@ -501,7 +502,7 @@ def test_cargo_preset_allows_cargo_fetch(sandbox_cli, backend):
             "https://static.crates.io/crates/serde/serde-1.0.0.crate"
         )
         tarball_result = sandbox_cli(
-            "ssh", session_name, "--", "bash", "-c", tarball_cmd,
+            "ssh", session_name, "--", "bash", "-c", shlex.quote(tarball_cmd),
             timeout=120,
         )
         assert tarball_result.returncode == 0, (
@@ -608,7 +609,7 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli, backend):
             "https://github.com/rust-lang/rustlings /tmp/rustlings"
         )
         allowed_result = sandbox_cli(
-            "ssh", session_name, "--", "bash", "-c", allowed_cmd,
+            "ssh", session_name, "--", "bash", "-c", shlex.quote(allowed_cmd),
             timeout=300,
         )
         assert allowed_result.returncode == 0, (
@@ -628,7 +629,7 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli, backend):
             "echo EXIT:$?"
         )
         denied_result = sandbox_cli(
-            "ssh", session_name, "--", "bash", "-c", denied_cmd,
+            "ssh", session_name, "--", "bash", "-c", shlex.quote(denied_cmd),
             timeout=180,
         )
         # ``echo`` runs last so the outer ``bash -c`` always exits 0,
