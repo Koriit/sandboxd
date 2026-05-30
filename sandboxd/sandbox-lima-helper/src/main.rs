@@ -8,9 +8,9 @@
 //! sandbox-lima-helper <subcommand> [flags...]
 //! ```
 //!
-//! Ten subcommands: `create`, `start`, `clone`, `stop`, `delete`,
+//! Eleven subcommands: `create`, `start`, `clone`, `stop`, `delete`,
 //! `copy`, `guest-socat`, `install-guest-agent`, `list-json`,
-//! `read-user-key`. Every
+//! `read-user-key`, `run-rsync`. Every
 //! flag the helper passes to limactl is hardcoded per subcommand;
 //! the daemon contributes only the typed flag values (no pass-through).
 //!
@@ -309,6 +309,26 @@ struct ReadUserKeyArgs {
     op_uid: u32,
 }
 
+/// Arguments for the `run-rsync` subcommand.
+///
+/// The daemon calls this after pivoting to the operator uid so rsync
+/// can read the operator-owned host workspace source directory.  The
+/// helper resolves `rsync` from the operator's PATH-independent
+/// candidate list, builds the argv, and execvpe's it.
+struct RunRsyncArgs {
+    op_uid: u32,
+    /// "lima" or "container" — selects the `-e <transport>` value.
+    backend: String,
+    /// `sandbox-<id>` form expected by the shell transport target.
+    session_name: String,
+    /// Absolute host-side path (the rsync source for a push).
+    host_path: String,
+    /// Absolute guest-side path (the rsync destination for a push).
+    guest_path: String,
+    /// When true the `--filter=:- .gitignore` flag is omitted.
+    no_gitignore: bool,
+}
+
 enum Subcommand {
     Create(CreateArgs),
     Start(StartArgs),
@@ -320,6 +340,7 @@ enum Subcommand {
     InstallGuestAgent(InstallGuestAgentArgs),
     ListJson(ListJsonArgs),
     ReadUserKey(ReadUserKeyArgs),
+    RunRsync(RunRsyncArgs),
 }
 
 impl Subcommand {
@@ -335,6 +356,7 @@ impl Subcommand {
             Subcommand::InstallGuestAgent(a) => a.op_uid,
             Subcommand::ListJson(a) => a.op_uid,
             Subcommand::ReadUserKey(a) => a.op_uid,
+            Subcommand::RunRsync(a) => a.op_uid,
         }
     }
 }
@@ -440,11 +462,23 @@ fn run() -> ExitCode {
     }
 
     // Step 7 — resolve limactl absolute path (uses pw_dir from step 3).
-    let limactl_path = match resolve_limactl_path(&pw_dir) {
-        Some(p) => p,
-        None => {
-            eprintln!("sandbox-lima-helper: limactl not found for operator {op_uid_raw}");
-            return ExitCode::from(EXIT_LIMACTL_NOT_FOUND);
+    //
+    // `read-user-key` reads a file directly; `run-rsync` execs rsync —
+    // neither calls limactl, so we skip the resolution for both and
+    // pass an empty string as a placeholder. All other subcommands
+    // require a usable limactl at this point.
+    let limactl_path = if matches!(
+        subcommand,
+        Subcommand::ReadUserKey(_) | Subcommand::RunRsync(_)
+    ) {
+        String::new()
+    } else {
+        match resolve_limactl_path(&pw_dir) {
+            Some(p) => p,
+            None => {
+                eprintln!("sandbox-lima-helper: limactl not found for operator {op_uid_raw}");
+                return ExitCode::from(EXIT_LIMACTL_NOT_FOUND);
+            }
         }
     };
 
@@ -486,13 +520,14 @@ fn run() -> ExitCode {
     // needs to mkdir intermediate subdirs (boot.FreeBSD, etc.).
     unsafe { libc::umask(0o077) };
 
-    // Step 11 — exec (or step-sequence for install-guest-agent, or
-    // stdout-write for read-user-key).
+    // Step 11 — exec (or step-sequence for install-guest-agent,
+    // stdout-write for read-user-key, or execvpe-rsync for run-rsync).
     match &subcommand {
         Subcommand::InstallGuestAgent(a) => {
             run_install_guest_agent(&limactl_path, &a.vm, &env_block)
         }
         Subcommand::ReadUserKey(_) => run_read_user_key(op_uid_raw, &lima_home),
+        Subcommand::RunRsync(a) => run_rsync(a, &env_block),
         _ => exec_limactl(&limactl_path, &subcommand, &env_block),
     }
 }
@@ -520,6 +555,7 @@ fn parse_argv(args: &[OsString]) -> Result<Subcommand, String> {
         "install-guest-agent" => parse_install_guest_agent(&args[2..]),
         "list-json" => parse_list_json(&args[2..]),
         "read-user-key" => parse_read_user_key(&args[2..]),
+        "run-rsync" => parse_run_rsync(&args[2..]),
         other => Err(format!("unknown subcommand: {other}")),
     }
 }
@@ -818,6 +854,29 @@ fn parse_read_user_key(args: &[OsString]) -> Result<Subcommand, String> {
     Ok(Subcommand::ReadUserKey(ReadUserKeyArgs { op_uid }))
 }
 
+// --- run-rsync ---
+
+fn parse_run_rsync(args: &[OsString]) -> Result<Subcommand, String> {
+    let mut f = FlagSet::new(args);
+    let op_uid_s = require_flag("--op-uid", f.take_string("--op-uid")?)?;
+    let backend = require_flag("--backend", f.take_string("--backend")?)?;
+    let session_name = require_flag("--session-name", f.take_string("--session-name")?)?;
+    let host_path = require_flag("--host-path", f.take_string("--host-path")?)?;
+    let guest_path = require_flag("--guest-path", f.take_string("--guest-path")?)?;
+    let no_gitignore = f.take_bool("--no-gitignore")?;
+    f.check_no_extra()?;
+
+    let op_uid = parse_u32("--op-uid", &op_uid_s)?;
+    Ok(Subcommand::RunRsync(RunRsyncArgs {
+        op_uid,
+        backend,
+        session_name,
+        host_path,
+        guest_path,
+        no_gitignore,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Validators (steps 4–6)
 // ---------------------------------------------------------------------------
@@ -868,6 +927,51 @@ fn validate_subcommand(sub: &Subcommand) -> Result<(), (u8, String)> {
         Subcommand::ReadUserKey(_) => {
             // No path/vm validation needed.
         }
+        Subcommand::RunRsync(a) => {
+            validate_run_rsync_args(a)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate `run-rsync` arguments: backend value, session-name, and
+/// host/guest paths.
+fn validate_run_rsync_args(a: &RunRsyncArgs) -> Result<(), (u8, String)> {
+    // Backend must be exactly "lima" or "container".
+    if a.backend != "lima" && a.backend != "container" {
+        return Err((
+            EXIT_BAD_ARGS,
+            format!(
+                "invalid --backend '{}': must be 'lima' or 'container'",
+                a.backend
+            ),
+        ));
+    }
+    // Session name: same rules as a VM name (no leading dash, alphanumeric
+    // + hyphens + underscores, ≤ 64 chars).  The daemon always supplies
+    // `sandbox-<id>` which is within these bounds.
+    validate_session_name(&a.session_name)?;
+    // Host and guest paths: absolute, no NUL, no `..`, ≤ PATH_MAX.
+    validate_path_arg("--host-path", &a.host_path)?;
+    validate_path_arg("--guest-path", &a.guest_path)?;
+    Ok(())
+}
+
+/// Validate a session name token used as the rsync remote-host spec.
+///
+/// The session name is the `sandbox-<id>` form the shell transports
+/// accept (`limactl shell sandbox-<id>`, `docker exec sandbox-<id>`).
+/// Rules mirror `validate_vm_name`: `^[a-zA-Z0-9_\-]{1,64}$`, no
+/// leading dash.
+fn validate_session_name(name: &str) -> Result<(), (u8, String)> {
+    if name.is_empty() || name.len() > 64 {
+        return Err((EXIT_BAD_ARGS, format!("invalid --session-name: '{name}'")));
+    }
+    if name.starts_with('-') {
+        return Err((EXIT_BAD_ARGS, format!("invalid --session-name: '{name}'")));
+    }
+    if !vm_name_regex().is_match(name) {
+        return Err((EXIT_BAD_ARGS, format!("invalid --session-name: '{name}'")));
     }
     Ok(())
 }
@@ -1492,6 +1596,9 @@ fn build_limactl_argv(limactl: &str, sub: &Subcommand) -> Vec<String> {
         Subcommand::ReadUserKey(_) => {
             unreachable!("read-user-key does not use exec_limactl")
         }
+        Subcommand::RunRsync(_) => {
+            unreachable!("run-rsync does not use exec_limactl")
+        }
     }
 }
 
@@ -1685,6 +1792,137 @@ fn run_read_user_key(op_uid: u32, lima_home: &str) -> ExitCode {
             ExitCode::from(EXIT_GENERIC)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// run-rsync implementation (step 11, special case)
+// ---------------------------------------------------------------------------
+
+/// Build the rsync argv for a create-time host→guest push.
+///
+/// Mirrors `sandbox-core::workspace_rsync::build_workspace_rsync_argv`
+/// for the push/mkpath shape used by the daemon's initial push.  Kept
+/// inline here so the helper's TCB remains free of a sandbox-core
+/// dependency.
+///
+/// Argv shape:
+/// ```text
+/// rsync -aL --delete [--filter=:- .gitignore]
+///   -e <transport> --mkpath <host>/ <session>:<guest>/
+/// ```
+/// where `<transport>` is `limactl shell` (Lima) or `docker exec -i`
+/// (Container).
+fn build_rsync_argv(a: &RunRsyncArgs) -> Vec<String> {
+    let transport = if a.backend == "lima" {
+        "limactl shell"
+    } else {
+        "docker exec -i"
+    };
+
+    let with_slash = |p: &str| -> String {
+        if p.ends_with('/') {
+            p.to_string()
+        } else {
+            format!("{p}/")
+        }
+    };
+
+    let src = with_slash(&a.host_path);
+    let dst = format!("{}:{}", a.session_name, with_slash(&a.guest_path));
+
+    let mut argv: Vec<String> = Vec::with_capacity(9);
+    argv.push("-aL".to_string());
+    argv.push("--delete".to_string());
+    if !a.no_gitignore {
+        argv.push("--filter=:- .gitignore".to_string());
+    }
+    argv.push("-e".to_string());
+    argv.push(transport.to_string());
+    argv.push("--mkpath".to_string());
+    argv.push(src);
+    argv.push(dst);
+    argv
+}
+
+/// Resolve the absolute path to `rsync`.
+///
+/// Checks three candidates in order; returns the first that passes
+/// `access(X_OK)`.  No PATH lookup — fixed candidates only.
+fn resolve_rsync_path() -> Option<String> {
+    let candidates = ["/usr/bin/rsync", "/usr/local/bin/rsync", "/bin/rsync"];
+    for candidate in &candidates {
+        if is_file_executable(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Execute `rsync` as the already-pivoted operator uid.
+///
+/// Called after `setresuid(op_uid)` and `clear_all_capabilities()` in
+/// step 8–9 of `run()`, so rsync inherits the operator's uid and can
+/// `change_dir` into the operator-owned host workspace source.
+///
+/// The helper `execvpe`s rsync with the cleaned env block so no
+/// daemon-process state leaks into the rsync child.  On `execvpe`
+/// success this function does not return.
+fn run_rsync(a: &RunRsyncArgs, env_block: &[CString]) -> ExitCode {
+    let rsync_path = match resolve_rsync_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("sandbox-lima-helper: run-rsync: rsync not found in candidate paths");
+            return ExitCode::from(EXIT_GENERIC);
+        }
+    };
+
+    let argv = build_rsync_argv(a);
+
+    // Prepend the rsync binary path as argv[0].
+    let mut full_argv: Vec<String> = Vec::with_capacity(argv.len() + 1);
+    full_argv.push(rsync_path.clone());
+    full_argv.extend(argv);
+
+    let argv_c: Vec<CString> = match full_argv
+        .iter()
+        .map(|s| CString::new(s.as_str()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("sandbox-lima-helper: run-rsync: argv contains interior NUL byte");
+            return ExitCode::from(EXIT_GENERIC);
+        }
+    };
+
+    let argv_ptrs: Vec<*const libc::c_char> = argv_c
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let envp_ptrs: Vec<*const libc::c_char> = env_block
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+
+    let argv0_c = match CString::new(rsync_path.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("sandbox-lima-helper: run-rsync: rsync path contains NUL byte");
+            return ExitCode::from(EXIT_GENERIC);
+        }
+    };
+
+    // SAFETY: argv0_c, argv_ptrs, envp_ptrs are valid NUL-terminated
+    // pointer arrays that live for the duration of execvpe. execvpe
+    // does not return on success.
+    unsafe {
+        libc::execvpe(argv0_c.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+    }
+    let errno = unsafe { *libc::__errno_location() };
+    eprintln!("sandbox-lima-helper: run-rsync: execvpe({rsync_path}) failed: errno {errno}");
+    ExitCode::from(EXIT_GENERIC)
 }
 
 // ---------------------------------------------------------------------------
@@ -2800,5 +3038,230 @@ WantedBy=multi-user.target";
             format!("/var/lib/sandboxd/{op_uid}/lima/_config/user"),
             "key path must be $LIMA_HOME/_config/user; got: {key_path}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // run-rsync parser
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_run_rsync_minimal_lima() {
+        let args = os_args(&[
+            "run-rsync",
+            "--op-uid",
+            "1000",
+            "--backend",
+            "lima",
+            "--session-name",
+            "sandbox-abc123",
+            "--host-path",
+            "/home/op/work",
+            "--guest-path",
+            "/home/agent/workspace",
+        ]);
+        let sub = parse_argv(&args).expect("valid run-rsync args");
+        let Subcommand::RunRsync(a) = sub else {
+            panic!("expected RunRsync")
+        };
+        assert_eq!(a.op_uid, 1000);
+        assert_eq!(a.backend, "lima");
+        assert_eq!(a.session_name, "sandbox-abc123");
+        assert_eq!(a.host_path, "/home/op/work");
+        assert_eq!(a.guest_path, "/home/agent/workspace");
+        assert!(!a.no_gitignore);
+    }
+
+    #[test]
+    fn parse_run_rsync_container_with_no_gitignore() {
+        let args = os_args(&[
+            "run-rsync",
+            "--op-uid",
+            "1001",
+            "--backend",
+            "container",
+            "--session-name",
+            "sandbox-def456",
+            "--host-path",
+            "/srv/proj",
+            "--guest-path",
+            "/home/agent/workspace",
+            "--no-gitignore",
+        ]);
+        let sub = parse_argv(&args).expect("valid run-rsync args");
+        let Subcommand::RunRsync(a) = sub else {
+            panic!("expected RunRsync")
+        };
+        assert_eq!(a.backend, "container");
+        assert!(a.no_gitignore);
+    }
+
+    #[test]
+    fn parse_run_rsync_missing_backend_fails() {
+        let args = os_args(&[
+            "run-rsync",
+            "--op-uid",
+            "1000",
+            "--session-name",
+            "sandbox-abc",
+            "--host-path",
+            "/home/op/work",
+            "--guest-path",
+            "/home/agent/workspace",
+        ]);
+        assert!(parse_argv(&args).is_err());
+    }
+
+    #[test]
+    fn parse_run_rsync_missing_host_path_fails() {
+        let args = os_args(&[
+            "run-rsync",
+            "--op-uid",
+            "1000",
+            "--backend",
+            "lima",
+            "--session-name",
+            "sandbox-abc",
+            "--guest-path",
+            "/home/agent/workspace",
+        ]);
+        assert!(parse_argv(&args).is_err());
+    }
+
+    #[test]
+    fn parse_run_rsync_invalid_backend_fails_validation() {
+        let args = os_args(&[
+            "run-rsync",
+            "--op-uid",
+            "1000",
+            "--backend",
+            "kvm",
+            "--session-name",
+            "sandbox-abc",
+            "--host-path",
+            "/home/op/work",
+            "--guest-path",
+            "/home/agent/workspace",
+        ]);
+        // Passes argv parse but fails validate_subcommand (EXIT_BAD_ARGS).
+        let sub = parse_argv(&args).expect("argv parse must succeed (validation is separate)");
+        assert!(
+            validate_subcommand(&sub).is_err(),
+            "invalid --backend value must fail validation"
+        );
+    }
+
+    #[test]
+    fn parse_run_rsync_relative_host_path_fails_validation() {
+        let args = os_args(&[
+            "run-rsync",
+            "--op-uid",
+            "1000",
+            "--backend",
+            "lima",
+            "--session-name",
+            "sandbox-abc",
+            "--host-path",
+            "relative/path",
+            "--guest-path",
+            "/home/agent/workspace",
+        ]);
+        let sub = parse_argv(&args).expect("argv parse must succeed");
+        assert!(
+            validate_subcommand(&sub).is_err(),
+            "relative --host-path must fail validation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rsync_argv
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_rsync_argv_lima_default_filter() {
+        let a = RunRsyncArgs {
+            op_uid: 1000,
+            backend: "lima".to_string(),
+            session_name: "sandbox-abc123".to_string(),
+            host_path: "/home/op/work".to_string(),
+            guest_path: "/home/agent/workspace".to_string(),
+            no_gitignore: false,
+        };
+        let argv = build_rsync_argv(&a);
+        assert_eq!(
+            argv,
+            vec![
+                "-aL",
+                "--delete",
+                "--filter=:- .gitignore",
+                "-e",
+                "limactl shell",
+                "--mkpath",
+                "/home/op/work/",
+                "sandbox-abc123:/home/agent/workspace/",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_rsync_argv_container_no_gitignore() {
+        let a = RunRsyncArgs {
+            op_uid: 1001,
+            backend: "container".to_string(),
+            session_name: "sandbox-def456".to_string(),
+            host_path: "/srv/proj".to_string(),
+            guest_path: "/home/agent/workspace".to_string(),
+            no_gitignore: true,
+        };
+        let argv = build_rsync_argv(&a);
+        assert_eq!(
+            argv,
+            vec![
+                "-aL",
+                "--delete",
+                "-e",
+                "docker exec -i",
+                "--mkpath",
+                "/srv/proj/",
+                "sandbox-def456:/home/agent/workspace/",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_rsync_argv_trailing_slash_idempotent() {
+        let a = RunRsyncArgs {
+            op_uid: 1000,
+            backend: "lima".to_string(),
+            session_name: "sandbox-xyz".to_string(),
+            host_path: "/a/b/".to_string(),
+            guest_path: "/c/d/".to_string(),
+            no_gitignore: false,
+        };
+        let argv = build_rsync_argv(&a);
+        let src = argv.iter().rev().nth(1).expect("src arg");
+        let dst = argv.last().expect("dst arg");
+        assert_eq!(src, "/a/b/");
+        assert_eq!(dst, "sandbox-xyz:/c/d/");
+    }
+
+    #[test]
+    fn build_rsync_argv_always_includes_mkpath() {
+        for backend in &["lima", "container"] {
+            for no_gitignore in [false, true] {
+                let a = RunRsyncArgs {
+                    op_uid: 1000,
+                    backend: backend.to_string(),
+                    session_name: "sandbox-mk".to_string(),
+                    host_path: "/x".to_string(),
+                    guest_path: "/y".to_string(),
+                    no_gitignore,
+                };
+                let argv = build_rsync_argv(&a);
+                assert!(
+                    argv.iter().any(|a| a == "--mkpath"),
+                    "--mkpath missing for backend={backend} no_gitignore={no_gitignore}: {argv:?}"
+                );
+            }
+        }
     }
 }

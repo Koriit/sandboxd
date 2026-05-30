@@ -2574,8 +2574,14 @@ async fn create_session(
             guest_path,
         }) = &config.workspace_mode
         {
+            // Cross-user pivot: same rationale as the Lima branch above —
+            // rsync must run as the operator uid to read the
+            // operator-owned host workspace source directory.
             let session_name = format!("sandbox-{session_id}");
-            match sandbox_core::workspace_rsync::run_initial_push(
+            let helper_path = state.lima_runtime.registry().helper_path().to_owned();
+            match sandbox_core::workspace_rsync::run_initial_push_via_helper(
+                &helper_path,
+                operator.uid,
                 backend_kind,
                 &session_name,
                 host_path,
@@ -3224,8 +3230,17 @@ async fn create_session(
         // transport target (`limactl shell sandbox-<id>` /
         // `docker exec sandbox-<id>`) resolves the same way for both
         // create-time push and operator-driven push/pull.
+        //
+        // Cross-user pivot: rsync is invoked via `sandbox-lima-helper
+        // run-rsync` which pivots to the operator uid before exec'ing
+        // rsync.  This lets rsync read the operator-owned host workspace
+        // source (mode 0700) that the daemon uid (999) cannot enter
+        // directly.  Same cross-user rationale as `read-user-key`.
         let session_name = format!("sandbox-{session_id}");
-        match sandbox_core::workspace_rsync::run_initial_push(
+        let helper_path = state.lima_runtime.registry().helper_path().to_owned();
+        match sandbox_core::workspace_rsync::run_initial_push_via_helper(
+            &helper_path,
+            operator.uid,
             backend_kind,
             &session_name,
             host_path,

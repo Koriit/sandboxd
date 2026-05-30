@@ -1,11 +1,14 @@
 //! Daemon-side `rsync` orchestration for `local:` workspace mode.
 //!
-//! Exports [`run_initial_push`], the async function that
+//! Exports [`run_initial_push_via_helper`], the async function that
 //! `sandboxd::create_session` invokes after the VM/container reaches
-//! `Running` to mirror the host workspace into the guest. The module is
-//! deliberately small and free of `sandboxd`-internal types so the
-//! same primitives can later back operator-driven `sandbox workspace
-//! push/pull` from a CLI-side planner.
+//! `Running` to mirror the host workspace into the guest via
+//! `sandbox-lima-helper run-rsync` (which pivots to the operator uid
+//! before exec'ing `rsync`, so it can read operator-owned host
+//! workspace directories). The module is deliberately small and free of
+//! `sandboxd`-internal types so the same primitives can later back
+//! operator-driven `sandbox workspace push/pull` from a CLI-side
+//! planner.
 //!
 //! ## Argv shape
 //!
@@ -40,7 +43,9 @@
 //! captured stderr is decoded lossy (UTF-8 with U+FFFD replacement chars)
 //! so binary noise never panics the error path.
 
+use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -48,6 +53,7 @@ use tracing::info;
 
 use crate::backend::BackendKind;
 use crate::error::SandboxError;
+use crate::process::run_with_timeout;
 
 /// Caller-side rsync `-e` transport token for Lima sessions.
 /// Passed to rsync as the remote-shell argument; rsync (running as the
@@ -333,6 +339,112 @@ pub async fn run_initial_push(
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".to_string());
     let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    Err(SandboxError::Internal(format!(
+        "local-workspace rsync failed (exit {code}): {stderr_text}"
+    )))
+}
+
+/// Timeout for the helper-pivoted rsync push.
+///
+/// Mirrors the CLI's `CLI_HTTP_TIMEOUT`; the daemon-side budget is the
+/// operator's own HTTP request deadline. A generous 10-minute ceiling
+/// covers large repositories on slow connections while still bounding
+/// a stuck rsync child.
+const RSYNC_VIA_HELPER_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Run the create-time `rsync` push pivoted through `sandbox-lima-helper`.
+///
+/// This is the cross-user-correct replacement for direct-spawn rsync.
+/// The daemon (uid 999) cannot `change_dir` into operator-owned host
+/// workspace directories (mode 0700, owned by the operator uid).
+/// `sandbox-lima-helper run-rsync` holds `cap_setuid+ep`, pivots to
+/// `op_uid` via `setresuid`, then `execvpe`s `rsync` — so rsync
+/// inherits the operator's uid and can read the host workspace source.
+/// For the Lima backend this also means the `-e "limactl shell"` transport
+/// runs as the operator uid, which is the uid that owns `limactl`'s SSH
+/// keys.  For the container backend the docker socket is accessible to
+/// any group-docker member; running as the operator uid has no adverse
+/// effect and unblocks the host-path read.
+///
+/// The helper is invoked inside `tokio::task::spawn_blocking` per the
+/// project convention for one-shot `std::process::Command` calls.
+///
+/// On zero exit: returns `Ok(())`. On non-zero exit: returns
+/// [`SandboxError::Internal`] with the captured stderr embedded
+/// verbatim (lossy UTF-8) so the operator sees rsync's own diagnostic.
+/// On timeout: returns [`SandboxError::Timeout`].
+pub async fn run_initial_push_via_helper(
+    helper_path: &Path,
+    op_uid: u32,
+    backend: BackendKind,
+    session_name: &str,
+    host_path: &str,
+    guest_path: &str,
+    no_gitignore: bool,
+) -> Result<(), SandboxError> {
+    info!(
+        backend = ?backend,
+        session = %session_name,
+        host_path = %host_path,
+        guest_path = %guest_path,
+        no_gitignore = no_gitignore,
+        "local-workspace rsync: starting initial push (via helper)"
+    );
+
+    let backend_str = match backend {
+        BackendKind::Lima => "lima",
+        BackendKind::Container => "container",
+    };
+
+    let helper_path = helper_path.to_owned();
+    let op_uid_str = op_uid.to_string();
+    let session_name = session_name.to_owned();
+    let host_path = host_path.to_owned();
+    let guest_path = guest_path.to_owned();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&helper_path);
+        cmd.arg("run-rsync")
+            .arg("--op-uid")
+            .arg(&op_uid_str)
+            .arg("--backend")
+            .arg(backend_str)
+            .arg("--session-name")
+            .arg(&session_name)
+            .arg("--host-path")
+            .arg(&host_path)
+            .arg("--guest-path")
+            .arg(&guest_path);
+        if no_gitignore {
+            cmd.arg("--no-gitignore");
+        }
+        run_with_timeout(
+            &mut cmd,
+            RSYNC_VIA_HELPER_TIMEOUT,
+            "sandbox-lima-helper run-rsync",
+        )
+    })
+    .await
+    .map_err(|e| {
+        SandboxError::Internal(format!("spawn_blocking join failed for run-rsync: {e}"))
+    })?;
+
+    let output = result?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let code = output
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    // The helper execvpe's rsync, so the helper's stderr IS rsync's
+    // stderr once the exec succeeds. If execvpe fails the helper prints
+    // a single diagnostic line instead; both cases are useful to the
+    // operator.
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
     Err(SandboxError::Internal(format!(
         "local-workspace rsync failed (exit {code}): {stderr_text}"
     )))

@@ -421,6 +421,14 @@ impl LimaManagerRegistry {
         Ok(Arc::clone(inserted))
     }
 
+    /// Return the absolute path to `sandbox-lima-helper` held by this
+    /// registry.  Used by call sites that need to invoke the helper
+    /// directly (e.g. the workspace rsync pivot) without going through
+    /// a per-operator [`LimaManager`].
+    pub fn helper_path(&self) -> &std::path::Path {
+        &self.helper_path
+    }
+
     /// Return the number of operator entries currently in the registry.
     /// Exposed for tests.
     #[cfg(test)]
