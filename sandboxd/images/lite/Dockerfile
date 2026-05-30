@@ -83,6 +83,16 @@ RUN install -d -o root -g root -m 0755 /etc/sandbox-sshd \
         'LogLevel ERROR' \
         'AllowUsers sandbox' \
         'Subsystem sftp /usr/lib/openssh/sftp-server' \
+        '# Per-session mitmproxy CA trust: UsePAM no means PAM never' \
+        '# reads /etc/environment, so the CURL_CA_BUNDLE / SSL_CERT_FILE' \
+        '# env vars set by `docker create --env` on PID 1 never reach SSH' \
+        '# sessions. SetEnv injects them unconditionally into every sshd' \
+        '# child shell. The CA cert itself is bind-mounted read-only from' \
+        '# the host at this path by the daemon at `docker create` time.' \
+        'SetEnv CURL_CA_BUNDLE=/etc/ssl/certs/sandbox-ca.pem' \
+        'SetEnv SSL_CERT_FILE=/etc/ssl/certs/sandbox-ca.pem' \
+        'SetEnv REQUESTS_CA_BUNDLE=/etc/ssl/certs/sandbox-ca.pem' \
+        'SetEnv NODE_EXTRA_CA_CERTS=/etc/ssl/certs/sandbox-ca.pem' \
       > /etc/sandbox-sshd/sshd_config
 
 # Launch wrapper: generate the ephemeral ed25519 host key on every
