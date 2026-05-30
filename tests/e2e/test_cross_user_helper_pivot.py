@@ -81,13 +81,17 @@ def sandbox(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedPro
 
 
 def _config_user_path_for_vm(vm_name: str) -> Path | None:
-    """Return the path to _config/user for vm_name inside the per-operator LIMA_HOME.
+    """Return the path to _config/user inside the per-operator LIMA_HOME.
 
-    This lives at /var/lib/sandboxd/<op_uid>/lima/<vm_name>/_config/user.
+    Lima stores the SSH keypair at the LIMA_HOME level, not inside each
+    individual VM instance directory.  The correct path is:
+        /var/lib/sandboxd/<op_uid>/lima/_config/user
     We derive op_uid from os.getuid() (the test runner is the operator).
+    The vm_name parameter is accepted for call-site compatibility but is
+    not used in the path construction.
     """
     op_uid = os.getuid()
-    return Path(f"/var/lib/sandboxd/{op_uid}/lima/{vm_name}/_config/user")
+    return Path(f"/var/lib/sandboxd/{op_uid}/lima/_config/user")
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +111,7 @@ class TestHelperPivotKeyOwnership:
         """After sandbox create, _config/user must be owned by os.getuid()."""
         session_id = None
         try:
-            result = sandbox("create", "--wait", *_VM_RESOURCE_ARGS)
+            result = sandbox("create", "--backend", "lima", *_VM_RESOURCE_ARGS)
             session_id = parse_session_id(result.stdout)
 
             vm_name = f"sandbox-{session_id}"
@@ -147,11 +151,12 @@ class TestHelperPivotSessionReachability:
         """Create a session, verify it reaches Running, and ping the guest agent."""
         session_id = None
         try:
-            result = sandbox("create", "--wait", *_VM_RESOURCE_ARGS)
+            result = sandbox("create", "--backend", "lima", *_VM_RESOURCE_ARGS)
             session_id = parse_session_id(result.stdout)
 
             # Guest agent must respond to a ping (exec an innocuous command).
-            # ``--wait`` on sandbox create already blocks until Running state.
+            # ``sandbox create`` is synchronous: the HTTP handler sets Running
+            # before returning, so no separate polling step is required.
             result = sandbox("exec", session_id, "--", "echo", "hello-from-pivot")
             assert "hello-from-pivot" in result.stdout, (
                 f"guest exec returned unexpected output: {result.stdout!r}"
@@ -164,7 +169,7 @@ class TestHelperPivotSessionReachability:
         """The VM directory must be under /var/lib/sandboxd/<op_uid>/lima/."""
         session_id = None
         try:
-            result = sandbox("create", "--wait", *_VM_RESOURCE_ARGS)
+            result = sandbox("create", "--backend", "lima", *_VM_RESOURCE_ARGS)
             session_id = parse_session_id(result.stdout)
 
             op_uid = os.getuid()
@@ -199,6 +204,11 @@ class TestHelperPivot9pSharedWorkspace:
     def test_host_write_readable_in_vm(self, tmp_path):
         """Write a file on the host shared dir; verify it is readable inside the VM."""
         op_uid = os.getuid()
+        if op_uid == 1000:
+            pytest.skip(
+                "op_uid==1000: base image bakes uid 1000 so the 9p mapped-xattr "
+                "uid translation is a no-op; this test only covers op_uid != 1000"
+            )
 
         # Create a host directory to share.
         shared = tmp_path / "shared"
@@ -209,12 +219,13 @@ class TestHelperPivot9pSharedWorkspace:
         session_id = None
         try:
             result = sandbox(
-                "create", "--wait",
+                "create", "--backend", "lima",
                 "--workspace", f"shared:{shared}:/home/agent/workspace",
                 *_VM_RESOURCE_ARGS,
             )
             session_id = parse_session_id(result.stdout)
-            # ``--wait`` on sandbox create already blocks until Running state.
+            # ``sandbox create`` is synchronous: the HTTP handler sets Running
+            # before returning, so no separate polling step is required.
 
             # Read the file from inside the VM.
             result = sandbox(
@@ -232,6 +243,11 @@ class TestHelperPivot9pSharedWorkspace:
         """Write a file from inside the VM; verify it is readable and correctly
         owned on the host after the 9p mapped-xattr translation."""
         op_uid = os.getuid()
+        if op_uid == 1000:
+            pytest.skip(
+                "op_uid==1000: base image bakes uid 1000 so the 9p mapped-xattr "
+                "uid translation is a no-op; this test only covers op_uid != 1000"
+            )
 
         shared = tmp_path / "shared"
         shared.mkdir(mode=0o755)
@@ -239,12 +255,13 @@ class TestHelperPivot9pSharedWorkspace:
         session_id = None
         try:
             result = sandbox(
-                "create", "--wait",
+                "create", "--backend", "lima",
                 "--workspace", f"shared:{shared}:/home/agent/workspace",
                 *_VM_RESOURCE_ARGS,
             )
             session_id = parse_session_id(result.stdout)
-            # ``--wait`` on sandbox create already blocks until Running state.
+            # ``sandbox create`` is synchronous: the HTTP handler sets Running
+            # before returning, so no separate polling step is required.
 
             # Write a file from inside the VM.
             sandbox(
