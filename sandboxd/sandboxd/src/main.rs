@@ -2605,7 +2605,7 @@ async fn create_session(
         //
         // Mirrors the Lima `--repo` path at the bottom of this handler:
         // pre-warm DNS for the repo host through the guest, then
-        // dispatch `git clone <url> /home/agent/workspace/` via the
+        // dispatch `git clone <url> /home/sandbox/workspace/` via the
         // backend-agnostic `GuestConnector` (which routes through
         // `ContainerTransport`'s `docker exec ... socat` path for
         // container sessions). Failures take the same fail-explicit
@@ -2636,7 +2636,7 @@ async fn create_session(
                 .exec(
                     &session_id,
                     "git",
-                    &["clone", repo_url.as_str(), "/home/agent/workspace/"],
+                    &["clone", repo_url.as_str(), "/home/sandbox/workspace/"],
                 )
                 .await
             {
