@@ -68,7 +68,7 @@ sandbox create [OPTIONS]
 | `--cpus <n>` | backend default | Number of CPU cores. Lima sessions fall back to 2 cores; container ("lite") sessions fall back to the daemon's host-80% ceiling. Accepts a fractional value (`0.8`, `1.5`, `2.0`, …); the container backend rounds to one decimal at request-parse time. Lima sessions truncate the fractional part because QEMU's `-smp` flag pins integer cores. Passing a fractional value with an explicit `--backend lima` (or a Lima resolved default) is rejected; use an integer instead. |
 | `--memory <mb>` | backend default | Memory in megabytes. Lima sessions fall back to 4096 MB; container ("lite") sessions fall back to the daemon's host-80% ceiling. |
 | `--disk <gb>` | `20` | Disk size in gigabytes |
-| `--repo <url>` | | Git repository URL to clone into the session's workspace directory (`/home/sandbox/workspace/` on container sessions, `/home/agent/workspace/` on Lima). |
+| `--repo <url>` | | Git repository URL to clone into the session's workspace directory (`/home/sandbox/workspace/` on both Lima and container sessions). |
 | `--workspace <mode>` | | Workspace mode (e.g., `shared:/path/to/dir`) |
 | `--boot-cmd <cmd>` | | Command to execute after provisioning |
 | `--policy <path>` | | Path to a policy JSON file to apply after creation |
@@ -169,7 +169,7 @@ sandbox create --name project \
 # Shared host directory
 sandbox create --name local-dev \
     --workspace shared:/home/user/my-project \
-    --boot-cmd "cd /home/agent/workspace && npm install"
+    --boot-cmd "cd /home/sandbox/workspace && npm install"
 
 # Custom Lima template
 sandbox create --name custom --template /path/to/template.yaml
@@ -323,7 +323,7 @@ sandbox ssh <session> [-- <command> [args...]]
 - The first invocation per session ensures the managed `~/.ssh/sandbox/sandbox-<id>` config + key files exist and the `Include` block is present at the top of `~/.ssh/config`. Subsequent invocations re-use the on-disk state and the existing ControlMaster multiplex socket if one is live.
 - If the daemon has rotated the per-session key since the local entry was written, the first SSH attempt fails with `Permission denied (publickey)` and the CLI silently re-fetches the config and retries once. The retry is matched **only at the outermost CLI dispatch** — nested invocations through `git-remote-sandbox` cannot stack retries.
 - TTY allocation, terminal resize, and signal forwarding are handled by the standard `ssh` client.
-- The in-session user is `sandbox` on both backends (uid 1000); the home directories differ for historical reasons — `/home/sandbox/` on container sessions, `/home/agent/` on Lima sessions. The SSH config block sets `User sandbox` uniformly.
+- The in-session user is `sandbox` on both backends (uid 1000) with home at `/home/sandbox/`. The SSH config block sets `User sandbox` uniformly.
 
 ### Examples
 
@@ -373,10 +373,10 @@ sandbox exec <session> -- <command> [args...]
 
 ```bash
 # List workspace contents
-sandbox exec my-sandbox -- ls /home/agent/workspace
+sandbox exec my-sandbox -- ls /home/sandbox/workspace
 
 # Run a shell command
-sandbox exec my-sandbox -- bash -c "cd /home/agent/workspace && make test"
+sandbox exec my-sandbox -- bash -c "cd /home/sandbox/workspace && make test"
 
 # Check disk usage
 sandbox exec my-sandbox -- df -h
@@ -415,7 +415,7 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 ### Examples
 
 ```bash
-# Upload a file to a container session (use /home/agent/workspace on Lima)
+# Upload a file to the session
 sandbox cp local/config.toml my-sandbox:/home/sandbox/workspace/config.toml
 
 # Download a file from the session
@@ -463,8 +463,7 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 ### Examples
 
 ```bash
-# Upload a directory tree to the container session, preserving attributes
-# (use /home/agent/workspace on Lima)
+# Upload a directory tree to the session, preserving attributes
 sandbox sync ./src my-sandbox:/home/sandbox/workspace/src
 
 # Pull build artifacts back to the host, deleting host-side files
@@ -623,7 +622,7 @@ The events stream is intended as the operator-facing feedback loop for tightenin
 2. **Run the workload inside the session.** The commands the agent actually wants to execute — `git clone`, `npm install`, a test suite, a curl to an upstream API.
 
    ```bash
-   sandbox exec dev -- bash -c "cd /home/agent/workspace && npm install"
+   sandbox exec dev -- bash -c "cd /home/sandbox/workspace && npm install"
    ```
 
 3. **Inspect what was denied.** `--decision=deny` surfaces the denials from every layer (CoreDNS, Envoy, mitmproxy, and the deny-logger's raw packet observations). `--follow` streams them live while the workload is still running; omitting `--follow` replays whatever is already in the ring buffer.
@@ -1066,7 +1065,7 @@ sandbox::<session>/<repo-path>
 | Part | Description |
 |------|-------------|
 | `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
-| `<repo-path>` | Absolute path to the git repository inside the session (e.g., `/home/sandbox/workspace` for container sessions, `/home/agent/workspace` for Lima). If omitted, defaults to the per-backend workspace path. |
+| `<repo-path>` | Absolute path to the git repository inside the session (e.g., `/home/sandbox/workspace` for both Lima and container sessions). If omitted, defaults to the session's workspace path. |
 
 ### Usage
 

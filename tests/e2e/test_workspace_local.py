@@ -56,11 +56,10 @@ def _guest_path_for(backend: str) -> str:
     in-VM user (uid 1000), so the destination's parent must be
     writable by that uid.
 
-    * Lima: ``/home/agent/work`` — the ``agent`` user home created by
+    * Lima: ``/home/sandbox/work`` — the ``sandbox`` user home created by
       cloud-init.
     * Container (lite): ``/home/sandbox/work`` — the ``sandbox`` user
-      home from the lite Dockerfile; ``/home/agent`` does not exist in
-      the container image.
+      home from the lite Dockerfile.
 
     Other paths like ``/srv/work`` look attractive on Lima because the
     rootfs is fully writable, but only by ``root`` — rsync's

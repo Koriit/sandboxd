@@ -37,7 +37,7 @@ set -euo pipefail
 SESSION_NAME="ci-$(date +%s)-$$"
 WORK_REPO="https://github.com/example/app.git"
 POLICY=/etc/sandbox/policies/ci.json
-ARTIFACT=/home/agent/workspace/target/release/app
+ARTIFACT=/home/sandbox/workspace/target/release/app
 
 cleanup() { sandbox rm "$SESSION_NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -51,7 +51,7 @@ sandbox create \
 
 # Run the build; stdout/stderr stream back, exit code is forwarded.
 sandbox exec "$SESSION_NAME" -- bash -lc \
-    'cd /home/agent/workspace && cargo build --release'
+    'cd /home/sandbox/workspace && cargo build --release'
 
 # Copy the artifact out.
 sandbox cp "$SESSION_NAME:$ARTIFACT" ./app
@@ -72,7 +72,7 @@ Coding agents like Claude Code typically want to keep a session alive across man
 2. **Per tool call**: `sandbox exec claude-$SESSION -- <cmd>` or `sandbox cp ...`.
 3. **At agent exit**: `sandbox stop claude-$SESSION` (fast restart later) or `sandbox rm` (clean slate).
 
-Using `--workspace shared:$PROJECT_DIR` mounts a host directory into the session's workspace path (`/home/agent/workspace` on Lima, `/home/sandbox/workspace` on container/lite) over 9p (Lima) or bind-mount (container), so changes the agent makes inside the session are immediately visible on the host and vice versa. See [Workspaces](/sandboxd/guides/workspaces/) for details.
+Using `--workspace shared:$PROJECT_DIR` mounts a host directory into the session's workspace path (`/home/sandbox/workspace` on both Lima and container/lite) over 9p (Lima) or bind-mount (container), so changes the agent makes inside the session are immediately visible on the host and vice versa. See [Workspaces](/sandboxd/guides/workspaces/) for details.
 
 Example: a Python wrapper that an agent might use.
 
@@ -170,10 +170,9 @@ But note: the command line (including `"$API_TOKEN"`) is visible in `ps` on the 
 ```bash
 echo "$API_TOKEN" > /tmp/token
 # The session-side path uses the in-session user's home: ~ resolves to
-# /home/agent on Lima and /home/sandbox on container/lite. The `~`
-# expansion is performed by the session-side shell (or by scp's
-# remote-side argument handling), so the same command works on either
-# backend without per-backend branching.
+# /home/sandbox on both Lima and container/lite. The `~` expansion is
+# performed by the session-side shell (or by scp's remote-side argument
+# handling), so the same command works on either backend.
 sandbox cp /tmp/token my-session:~/.token
 rm /tmp/token
 sandbox exec my-session -- bash -c 'cat ~/.token | curl -H @- https://api.example.com'

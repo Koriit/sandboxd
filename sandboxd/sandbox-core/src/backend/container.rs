@@ -555,9 +555,9 @@ fn capabilities_for_container() -> Capabilities {
         // the daemon dispatches it via the backend-agnostic
         // `GuestConnector` after the lite container's entrypoint
         // (`sandbox-guest`) is up, mirroring the Lima `--repo` path.
-        // The literal home path diverges by backend (container:
-        // `/home/sandbox`, Lima: `/home/agent`); the shape of the
-        // clone-into-`<home>/workspace` contract does not.
+        // Both backends share `/home/sandbox` as the in-VM user home;
+        // the shape of the clone-into-`<home>/workspace` contract is
+        // identical across Lima and container sessions.
         workspace_modes: EnumSet::all(),
     }
 }

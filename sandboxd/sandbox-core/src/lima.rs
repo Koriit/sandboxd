@@ -1565,7 +1565,7 @@ containerd:
 
 user:
   name: "sandbox"
-  home: "/home/agent"
+  home: "/home/sandbox"
 
 provision:
 - mode: system
@@ -1584,13 +1584,10 @@ provision:
     set -eux -o pipefail
     echo "[sandbox-provision] step=user start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Create the in-VM `sandbox` user (uid 1000) with passwordless sudo.
-    # Home is pinned at /home/agent so existing workspace-path literals
-    # baked into rsync, session bootstrap, and the operator-facing
-    # session API (`/home/agent/workspace`) keep working — the username
-    # change is the minimum needed to make the daemon-emitted
-    # `User sandbox` SSH config line resolve on the Lima backend.
+    # Home is /home/sandbox, unified with the container backend — both
+    # backends now use the same user name and home directory path.
     if ! id sandbox &>/dev/null; then
-      useradd -m -d /home/agent -s /bin/bash sandbox
+      useradd -m -d /home/sandbox -s /bin/bash sandbox
     fi
     echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
     chmod 0440 /etc/sudoers.d/sandbox
@@ -1680,8 +1677,8 @@ provision:
       echo "[sandbox-provision] apt-baseline succeeded after $attempt attempt(s)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by sandbox, not root)
-    mkdir -p /home/agent/workspace
-    chown sandbox:sandbox /home/agent/workspace
+    mkdir -p /home/sandbox/workspace
+    chown sandbox:sandbox /home/sandbox/workspace
     echo "[sandbox-provision] step=apt-baseline done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
@@ -1807,7 +1804,7 @@ mounts:
         // cloud-init runs quick. When the operator is a different uid
         // (multi-user host, NFS-backed home dir at uid 5xxx, CI box at
         // uid 2000), we run `usermod` + `groupmod` + a recursive
-        // chown on `/home/agent` so:
+        // chown on `/home/sandbox` so:
         //
         //   - the in-VM `sandbox` user owns its home dir
         //   - 9p `mapped-xattr` shared workspaces don't trip the
@@ -1816,14 +1813,10 @@ mounts:
         //     = operator's, after setresuid) can `setuid(sandbox)` on
         //     the in-VM side and end up with the expected uid
         //
-        // `/home/agent` itself stays as the home directory regardless
-        // of the new uid — operator-facing paths
-        // (`/home/agent/workspace`, ssh-config snippets, rsync
-        // commands) are name-baked, not uid-baked, so the rename to
-        // `sandbox` (the guest-user rename) is the only naming change. The
-        // chown is recursive because the base image populated the dir
+        // The chown is recursive because the base image populated the dir
         // tree (e.g. `.bash_profile`, sshd authorized_keys staging)
-        // before this step runs.
+        // before this step runs. Both Lima and container backends now
+        // share `/home/sandbox` as the in-VM user home.
         let usermod_section = match operator_identity {
             Some((uid, gid)) if uid != 1000 || gid != 1000 => format!(
                 "- mode: system\n  \
@@ -1844,7 +1837,7 @@ mounts:
                      # the primary group still exists at the new gid.\n    \
                      groupmod -g {gid} sandbox\n    \
                      usermod -u {uid} -g {gid} sandbox\n    \
-                     chown -R {uid}:{gid} /home/agent\n    \
+                     chown -R {uid}:{gid} /home/sandbox\n    \
                    fi\n    \
                  fi\n    \
                  echo \"[sandbox-provision] step=operator-uid done=$(date -u +%Y-%m-%dT%H:%M:%S)\"\n"
@@ -1877,7 +1870,7 @@ containerd:
 
 user:
   name: "sandbox"
-  home: "/home/agent"
+  home: "/home/sandbox"
 
 provision:
 - mode: system
@@ -1898,12 +1891,10 @@ provision:
     set -eux -o pipefail
     echo "[sandbox-provision] step=user start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Create the in-VM `sandbox` user (uid 1000) with passwordless sudo.
-    # Home is pinned at /home/agent so existing workspace-path literals
-    # (rsync, session bootstrap, API DTOs) keep working — the username
-    # change is the minimum needed to make the daemon-emitted
-    # `User sandbox` SSH config line resolve on the Lima backend.
+    # Home is /home/sandbox, unified with the container backend — both
+    # backends now use the same user name and home directory path.
     if ! id sandbox &>/dev/null; then
-      useradd -m -d /home/agent -s /bin/bash sandbox
+      useradd -m -d /home/sandbox -s /bin/bash sandbox
     fi
     echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
     chmod 0440 /etc/sudoers.d/sandbox
@@ -1984,8 +1975,8 @@ provision:
       echo "[sandbox-provision] apt-baseline succeeded after $attempt attempt(s)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by sandbox, not root)
-    mkdir -p /home/agent/workspace
-    chown sandbox:sandbox /home/agent/workspace
+    mkdir -p /home/sandbox/workspace
+    chown sandbox:sandbox /home/sandbox/workspace
     echo "[sandbox-provision] step=apt-baseline done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
@@ -2513,10 +2504,9 @@ mod tests {
             "template should configure the sandbox user"
         );
         assert!(
-            template.contains("home: \"/home/agent\""),
-            "template should pin the sandbox user's home at /home/agent so existing \
-             /home/agent/workspace paths in rsync, session bootstrap, and the API \
-             DTOs keep working"
+            template.contains("home: \"/home/sandbox\""),
+            "template should set the sandbox user's home at /home/sandbox, \
+             unified with the container backend"
         );
 
         // Verify provision scripts
@@ -2525,8 +2515,8 @@ mod tests {
             "template should set hostname"
         );
         assert!(
-            template.contains("useradd -m -d /home/agent -s /bin/bash sandbox"),
-            "template should create the sandbox user with home at /home/agent"
+            template.contains("useradd -m -d /home/sandbox -s /bin/bash sandbox"),
+            "template should create the sandbox user with home at /home/sandbox"
         );
         assert!(
             template.contains("NOPASSWD"),
@@ -3140,14 +3130,11 @@ mod tests {
     ///   - be `mode: system` (root-equivalent inside the VM)
     ///   - call `groupmod -g <gid>` BEFORE `usermod -u <uid>` so the
     ///     primary group still resolves after the renumbering
-    ///   - chown `/home/agent` recursively at the operator's uid:gid
-    ///   - leave the home dir path itself as `/home/agent` (Wave A
-    ///     username-only rename — names not uids are baked in to
-    ///     operator-facing paths)
+    ///   - chown `/home/sandbox` recursively at the operator's uid:gid
     ///
-    /// All four are structural invariants of the cross-user
+    /// All three are structural invariants of the cross-user
     /// supervisor-fork pattern and regressing any of them silently
-    /// would break 9p mapped-xattr workspaces. Pin all four here.
+    /// would break 9p mapped-xattr workspaces. Pin all three here.
     #[test]
     fn generate_template_emits_operator_uid_step_with_correct_shape() {
         let mgr = LimaManager::with_helper_path(
@@ -3184,17 +3171,11 @@ mod tests {
              place before the usermod call validates it; groupmod={groupmod_idx} \
              usermod={usermod_idx}"
         );
-        // Recursive chown on /home/agent (NOT /home/sandbox — the
-        // Wave A rename touched the username, not the home path).
+        // Recursive chown on /home/sandbox (both backends share this home path).
         assert!(
-            template.contains("chown -R 5001:5001 /home/agent"),
-            "template must chown /home/agent recursively to the \
+            template.contains("chown -R 5001:5001 /home/sandbox"),
+            "template must chown /home/sandbox recursively to the \
              operator pair; got: {template}"
-        );
-        assert!(
-            !template.contains("chown -R 5001:5001 /home/sandbox"),
-            "template must NOT chown /home/sandbox — Lima home dir \
-             is /home/agent; got: {template}"
         );
     }
     #[test]
@@ -3708,12 +3689,12 @@ mod tests {
             "base template should configure the sandbox user"
         );
         assert!(
-            template.contains("home: \"/home/agent\""),
-            "base template should pin the sandbox user's home at /home/agent"
+            template.contains("home: \"/home/sandbox\""),
+            "base template should set the sandbox user's home at /home/sandbox"
         );
         assert!(
-            template.contains("useradd -m -d /home/agent -s /bin/bash sandbox"),
-            "base template should create the sandbox user with home at /home/agent"
+            template.contains("useradd -m -d /home/sandbox -s /bin/bash sandbox"),
+            "base template should create the sandbox user with home at /home/sandbox"
         );
         assert!(
             template.contains("NOPASSWD"),

@@ -115,7 +115,7 @@ pub struct CreateSessionRequest {
     pub template: Option<String>,
     /// Optional policy to apply immediately after session creation.
     pub policy: Option<crate::policy::Policy>,
-    /// Optional git repository URL to clone into `/home/agent/workspace/` after setup.
+    /// Optional git repository URL to clone into `/home/sandbox/workspace/` after setup.
     ///
     /// Mutually exclusive with `workspace`. If both are provided, `workspace`
     /// takes precedence.
@@ -125,7 +125,7 @@ pub struct CreateSessionRequest {
     /// Optional workspace mode string, e.g. `"shared:/home/user/project"`.
     ///
     /// Mutually exclusive with `repo`. When set to a `shared:` mode, the
-    /// host directory is mounted into the VM at `/home/agent/workspace`
+    /// host directory is mounted into the VM at `/home/sandbox/workspace`
     /// via 9p.
     pub workspace: Option<String>,
     /// Enable QEMU hardening (device lockdown, cgroup limits).

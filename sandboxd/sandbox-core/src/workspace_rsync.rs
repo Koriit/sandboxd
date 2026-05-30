@@ -486,7 +486,7 @@ mod tests {
             BackendKind::Lima,
             "sandbox-abc123",
             "/home/op/work",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
             false,
         ));
         assert_eq!(
@@ -499,7 +499,7 @@ mod tests {
                 LIMACTL_SHELL_TOKEN,
                 "--mkpath",
                 "/home/op/work/",
-                "sandbox-abc123:/home/agent/workspace/",
+                "sandbox-abc123:/home/sandbox/workspace/",
             ]
         );
     }
@@ -512,7 +512,7 @@ mod tests {
             BackendKind::Container,
             "sandbox-def456",
             "/srv/proj",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
             false,
         ));
         assert_eq!(
@@ -525,7 +525,7 @@ mod tests {
                 "docker exec -i",
                 "--mkpath",
                 "/srv/proj/",
-                "sandbox-def456:/home/agent/workspace/",
+                "sandbox-def456:/home/sandbox/workspace/",
             ]
         );
     }
@@ -540,7 +540,7 @@ mod tests {
             BackendKind::Lima,
             "sandbox-ghi789",
             "/data/x",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
             true,
         ));
         // No `--filter=...` entry anywhere in the argv.
@@ -560,7 +560,7 @@ mod tests {
                 LIMACTL_SHELL_TOKEN,
                 "--mkpath",
                 "/data/x/",
-                "sandbox-ghi789:/home/agent/workspace/",
+                "sandbox-ghi789:/home/sandbox/workspace/",
             ]
         );
     }
@@ -638,7 +638,7 @@ mod tests {
             BackendKind::Lima,
             "sandbox-7f3e9a1b",
             "/home/op/code",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
             false,
         ));
         let dst = argv.last().expect("dst arg");
@@ -647,7 +647,7 @@ mod tests {
             "destination missing sandbox-<id> prefix: {dst}"
         );
         assert!(
-            dst.ends_with(":/home/agent/workspace/"),
+            dst.ends_with(":/home/sandbox/workspace/"),
             "destination missing :<guest>/ tail: {dst}"
         );
     }
@@ -663,7 +663,7 @@ mod tests {
             backend: BackendKind::Lima,
             session_name: "sandbox-pull1".to_string(),
             host_path: "/home/op/work".to_string(),
-            guest_path: "/home/agent/workspace".to_string(),
+            guest_path: "/home/sandbox/workspace".to_string(),
             direction: Direction::Pull,
             no_gitignore: false,
             dry_run: false,
@@ -680,7 +680,7 @@ mod tests {
                 "--filter=:- .gitignore",
                 "-e",
                 LIMACTL_SHELL_TOKEN,
-                "sandbox-pull1:/home/agent/workspace/",
+                "sandbox-pull1:/home/sandbox/workspace/",
                 "/home/op/work/",
             ]
         );

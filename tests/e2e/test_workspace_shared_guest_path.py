@@ -2,10 +2,10 @@
 guest-path branch.
 
 The shared-workspace feature promoted the historical fixed
-``/home/agent/workspace`` mount point into an operator-controllable
+``/home/sandbox/workspace`` mount point into an operator-controllable
 guest path: ``--workspace shared:<host>:<guest>`` lands the host
 directory at the chosen ``<guest>`` inside the session rather than
-the legacy default. The
+the default. The
 runtime-layer integration tests already pin the bind-mount mechanics
 on the container backend (``integration_shared_guest_path_container``);
 the Lima half — which requires a real 9p mount and a booted VM — lives
@@ -20,10 +20,9 @@ parametrized invocation. Run with generous timeouts:
     python -m pytest test_workspace_shared_guest_path.py -v --timeout=600
 
 Backend coverage: parametrized over ``["lima", "container"]`` via the
-``backend`` fixture. The guest path differs per backend because the
-lite container backend is ``--read-only`` with writable areas at
-``/home/agent``, ``/tmp``, ``/run`` only, while Lima sessions have a
-fully writable rootfs. Both arms exercise the same wire surface — the
+``backend`` fixture. The guest path is ``/home/sandbox/work`` on both
+backends — Lima and container sessions now share ``/home/sandbox`` as
+the in-VM user home. Both arms exercise the same wire surface — the
 operator-supplied ``:<guest>`` token traversing CLI → daemon → backend
 bind-mount.
 """

@@ -136,13 +136,13 @@ Plus the system trust store (`update-ca-certificates`) and the in-VM Docker daem
 
 ## Layer 5 — Guest OS
 
-- **Non-root guest user.** Sandbox workloads run as a non-root user, not root. On the Lima backend the user is named `agent`; on the lite (container) backend the user is named `sandbox`. Both pin uid 1000 / gid 1000. The Lima `agent` account has passwordless sudo for operations the guest agent needs (network config, CA injection); the lite-image `sandbox` account has no sudo (the lite container is `--read-only` with `--cap-drop ALL`, so the operations sudo would gate are not reachable to begin with).
+- **Non-root guest user.** Sandbox workloads run as a non-root user, not root. The in-VM user is named `sandbox` on both backends, with uid 1000 / gid 1000 and home at `/home/sandbox/`. The Lima `sandbox` account has passwordless sudo for operations the guest agent needs (network config, CA injection); the lite-image `sandbox` account has no sudo (the lite container is `--read-only` with `--cap-drop ALL`, so the operations sudo would gate are not reachable to begin with).
 - **Minimal cloud image.** Ubuntu 24.04 server cloud image (Lima) or minimal Ubuntu 24.04 userland (lite) — no desktop, no dev tools beyond what provisioning adds.
-- **Path validation.** The guest agent only accepts file operations in allow-listed directories. The home directory varies by backend (`/home/agent/` on Lima, `/home/sandbox/` on lite):
+- **Path validation.** The guest agent only accepts file operations in allow-listed directories. Both backends use `/home/sandbox/` as the guest user home:
 
   | Directory | Purpose |
   |---|---|
-  | `/home/agent/` or `/home/sandbox/` | Guest user home |
+  | `/home/sandbox/` | Guest user home |
   | `/root/` | Legacy workspace path |
   | `/tmp/` | Temporary files |
 

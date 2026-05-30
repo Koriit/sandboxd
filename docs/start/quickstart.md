@@ -81,20 +81,20 @@ For an interactive shell, use `sandbox ssh`:
 sandbox ssh hello
 ```
 
-You land in the VM as the `sandbox` user. The workspace lives at `/home/agent/workspace` on this Lima session (the in-VM user is named `sandbox` uniformly on both backends; Lima's home is pinned at `/home/agent/` for historical workspace-path compatibility — `--lite` sessions use `/home/sandbox/workspace`). Exit the shell with `Ctrl-D` or `exit`.
+You land in the VM as the `sandbox` user. The workspace lives at `/home/sandbox/workspace` (the in-VM user is named `sandbox` on both backends with home at `/home/sandbox/`). Exit the shell with `Ctrl-D` or `exit`.
 
 ## 5. Copy files in and out
 
 ```bash
 echo "hello from host" > note.txt
-sandbox cp note.txt hello:/home/agent/workspace/note.txt
-sandbox exec hello -- cat /home/agent/workspace/note.txt
+sandbox cp note.txt hello:/home/sandbox/workspace/note.txt
+sandbox exec hello -- cat /home/sandbox/workspace/note.txt
 ```
 
 Pull files back with the same command, reversed:
 
 ```bash
-sandbox cp hello:/home/agent/workspace/note.txt ./note-from-vm.txt
+sandbox cp hello:/home/sandbox/workspace/note.txt ./note-from-vm.txt
 ```
 
 ## 6. Clean up

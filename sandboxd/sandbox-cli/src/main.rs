@@ -89,7 +89,7 @@ enum Command {
         /// catalog.
         #[arg(long, action = ArgAction::Append, num_args = 1)]
         preset: Vec<String>,
-        /// Git repository URL to clone into /home/agent/workspace/ after session setup.
+        /// Git repository URL to clone into /home/sandbox/workspace/ after session setup.
         ///
         /// Mutually exclusive with --workspace.
         #[arg(long, conflicts_with = "workspace")]
@@ -857,7 +857,7 @@ fn expand_and_merge_presets(
 ///
 /// Layout of the expected input: `<mode>:<host>[:<guest>][:<security>]`.
 /// Only the host-path token is expanded; the guest-path token (if any)
-/// uses literal `~` → `/home/agent` substitution inside the shared
+/// uses literal `~` → `/home/sandbox` substitution inside the shared
 /// parser and is left untouched here. Inputs that do not contain a `:`
 /// or whose host token does not start with `~` pass through verbatim —
 /// `parse_flag` is the authoritative grammar gate downstream.
@@ -5385,10 +5385,10 @@ fn parse_remote_helper_url(url: &str) -> Result<(String, Option<String>), String
 /// - `Shared { guest_path, .. }` and `Local { guest_path, .. }`
 ///   → use that guest_path (M17 made the guest mount point
 ///   operator-configurable, so we must read it from the DTO rather
-///   than assume `/home/agent/workspace`).
+///   than assume `/home/sandbox/workspace`).
 /// - `Clone { .. }` and `None` (no workspace, or an older daemon
 ///   that doesn't populate the detail field) → fall back to
-///   `/home/agent/workspace`. Clone-mode sessions land the repo at
+///   `/home/sandbox/workspace`. Clone-mode sessions land the repo at
 ///   that path by convention, and an older daemon that omits the
 ///   field could have been a pre-M17 session in shared-mode at the
 ///   historical default — falling back preserves backward
@@ -5397,7 +5397,7 @@ fn resolve_default_repo_path(detail: Option<&WorkspaceModeDetailDto>) -> String 
     match detail {
         Some(WorkspaceModeDetailDto::Shared { guest_path, .. })
         | Some(WorkspaceModeDetailDto::Local { guest_path, .. }) => guest_path.clone(),
-        Some(WorkspaceModeDetailDto::Clone { .. }) | None => "/home/agent/workspace".to_string(),
+        Some(WorkspaceModeDetailDto::Clone { .. }) | None => "/home/sandbox/workspace".to_string(),
     }
 }
 
@@ -5442,7 +5442,7 @@ async fn run_remote_helper() {
     // For slash-less URLs (`sandbox::<session>` with no path), resolve the
     // default repo path from the session's workspace configuration. M17
     // made the guest mount point operator-configurable, so we can no
-    // longer assume `/home/agent/workspace`. On daemon error (404,
+    // longer assume `/home/sandbox/workspace`. On daemon error (404,
     // network, parse) we print a helpful message and exit non-zero —
     // never silently fall back, since that would surface the wrong
     // directory to git.
@@ -5579,7 +5579,7 @@ async fn run_remote_helper() {
             }
         };
 
-        // The guest agent runs as the `agent` user (same as limactl shell),
+        // The guest agent runs as the `sandbox` user (same as limactl shell),
         // so no privilege escalation is needed for workspace operations.
         let status = std::process::Command::new(&sandbox_bin)
             .args([
@@ -7473,11 +7473,11 @@ mod tests {
     #[test]
     fn parse_remote_helper_url_session_and_path() {
         let (session, repo_path) =
-            parse_remote_helper_url("my-session/home/agent/workspace/repo.git").unwrap();
+            parse_remote_helper_url("my-session/home/sandbox/workspace/repo.git").unwrap();
         assert_eq!(session, "my-session");
         assert_eq!(
             repo_path,
-            Some("/home/agent/workspace/repo.git".to_string())
+            Some("/home/sandbox/workspace/repo.git".to_string())
         );
     }
 
@@ -7485,9 +7485,9 @@ mod tests {
     fn parse_remote_helper_url_with_scheme_prefix() {
         // git may pass the full URL including the sandbox:: prefix.
         let (session, repo_path) =
-            parse_remote_helper_url("sandbox::my-session/home/agent/workspace/repo").unwrap();
+            parse_remote_helper_url("sandbox::my-session/home/sandbox/workspace/repo").unwrap();
         assert_eq!(session, "my-session");
-        assert_eq!(repo_path, Some("/home/agent/workspace/repo".to_string()));
+        assert_eq!(repo_path, Some("/home/sandbox/workspace/repo".to_string()));
     }
 
     #[test]
@@ -7496,7 +7496,7 @@ mod tests {
         // can derive the default from the session's workspace
         // configuration via the daemon. M17 made the guest mount point
         // operator-configurable, so the parser must not bake in the
-        // historical `/home/agent/workspace` default.
+        // `/home/sandbox/workspace` default.
         let (session, repo_path) = parse_remote_helper_url("my-session").unwrap();
         assert_eq!(session, "my-session");
         assert_eq!(repo_path, None);
@@ -7519,7 +7519,7 @@ mod tests {
     #[test]
     fn parse_remote_helper_url_empty_session() {
         // Starts with slash — empty session name.
-        assert!(parse_remote_helper_url("/home/agent/workspace").is_err());
+        assert!(parse_remote_helper_url("/home/sandbox/workspace").is_err());
     }
 
     // -- resolve_default_repo_path tests ------------------------------------
@@ -7544,8 +7544,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_default_repo_path_clone_uses_legacy_default() {
-        // Clone-mode sessions land the repo at /home/agent/workspace
+    fn resolve_default_repo_path_clone_uses_workspace_default() {
+        // Clone-mode sessions land the repo at /home/sandbox/workspace
         // by convention; the parser default preserves that for slash-
         // less URLs.
         let detail = WorkspaceModeDetailDto::Clone {
@@ -7553,16 +7553,15 @@ mod tests {
         };
         assert_eq!(
             resolve_default_repo_path(Some(&detail)),
-            "/home/agent/workspace"
+            "/home/sandbox/workspace"
         );
     }
 
     #[test]
-    fn resolve_default_repo_path_none_uses_legacy_default() {
+    fn resolve_default_repo_path_none_uses_workspace_default() {
         // No workspace, or an older daemon that doesn't populate
-        // `workspace_mode_detail` — fall back to the historical
-        // default for backward compatibility.
-        assert_eq!(resolve_default_repo_path(None), "/home/agent/workspace");
+        // `workspace_mode_detail` — fall back to the unified default.
+        assert_eq!(resolve_default_repo_path(None), "/home/sandbox/workspace");
     }
 
     // -- No-cache and yes flag tests ------------------------------------------

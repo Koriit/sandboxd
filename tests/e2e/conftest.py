@@ -457,30 +457,27 @@ def limactl_cmd(*args: str) -> list[str]:
     return ["limactl", *args]
 
 
-#: In-VM home directory for the ``agent`` user inside Lima VMs.
+#: In-VM home directory for the ``sandbox`` user inside Lima VMs.
 #: Files written here persist across stop/start (non-tmpfs, on the VM's disk).
-LIMA_VM_HOME: str = "/home/agent"
+LIMA_VM_HOME: str = "/home/sandbox"
 
 #: In-VM home directory for the ``sandbox`` user inside lite (Docker) containers.
 #: The lite Dockerfile runs ``useradd ... sandbox`` and the container runtime
-#: mounts the home volume at ``/home/sandbox``.  Distinct from Lima's
-#: ``/home/agent`` — the two backends have different base images and different
-#: user names.  Cross-backend tests must use ``guest_home(backend)`` rather
-#: than either constant directly.
+#: mounts the home volume at ``/home/sandbox``.  Both backends now share the
+#: same user name and home directory path.  Cross-backend tests may use
+#: ``guest_home(backend)`` or either constant directly — they resolve to the
+#: same value.
 CONTAINER_HOME: str = "/home/sandbox"
 
 
 def guest_home(backend: str) -> str:
     """Return the in-VM home directory appropriate for ``backend``.
 
-    Lima sessions use ``/home/agent`` (the ``agent`` user created by the Lima
-    base image cloud-init); container (lite) sessions use ``/home/sandbox``
-    (the ``sandbox`` user in the lite Dockerfile).
+    Both Lima and container (lite) sessions now use ``/home/sandbox`` — the
+    ``sandbox`` user is created with that home on both backends.
 
-    Cross-backend tests parametrized via the ``backend`` fixture MUST call
-    this helper rather than referencing either constant directly, so that the
-    ``[lima]`` run resolves to ``/home/agent`` and the ``[container]`` run
-    resolves to ``/home/sandbox``.
+    Cross-backend tests parametrized via the ``backend`` fixture may call
+    this helper for clarity; both arms resolve to ``/home/sandbox``.
 
     Single-backend tests should use the appropriate constant directly:
     ``LIMA_VM_HOME`` for Lima-only tests, ``CONTAINER_HOME`` for

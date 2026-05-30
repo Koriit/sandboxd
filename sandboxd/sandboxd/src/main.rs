@@ -3260,7 +3260,7 @@ async fn create_session(
         }
     }
 
-    // If a repo URL was provided, clone it into /home/agent/workspace/.
+    // If a repo URL was provided, clone it into /home/sandbox/workspace/.
     if let Some(repo_url) = &req.repo {
         // Pre-warm DNS for the repo host so the DNS propagation loop
         // has installed the policy's L1/L3 filter chain (Envoy
@@ -3282,7 +3282,7 @@ async fn create_session(
             .exec(
                 &session_id,
                 "git",
-                &["clone", repo_url.as_str(), "/home/agent/workspace/"],
+                &["clone", repo_url.as_str(), "/home/sandbox/workspace/"],
             )
             .await
         {
@@ -3742,16 +3742,16 @@ fn session_network_info_for(
 /// - `Shared` → the operator-resolved `guest_path` (equals
 ///   `host_path` when no explicit `:<guest>` token was supplied at
 ///   create time).
-/// - `Clone` → the historical `/home/agent/workspace` clone target.
-/// - No workspace mode → the historical default for the empty case.
+/// - `Clone` → the unified `/home/sandbox/workspace` clone target.
+/// - No workspace mode → the unified default for the empty case.
 ///
 /// A trailing `/` is appended so the rendered wire field keeps its
-/// historical shape (e.g. `/home/agent/workspace/`); operator scripts
+/// historical shape (e.g. `/home/sandbox/workspace/`); operator scripts
 /// that grep on the trailing slash stay byte-compatible.
 fn session_mount_info_for(session: &Session) -> SessionMountInfo {
-    // Default workspace target retained for the `Clone` and empty
-    // cases — `Shared` overrides this with the operator's `guest_path`.
-    const CLONE_WORKSPACE_PATH: &str = "/home/agent/workspace";
+    // Default workspace target for the `Clone` and empty cases —
+    // `Shared` overrides this with the operator's `guest_path`.
+    const CLONE_WORKSPACE_PATH: &str = "/home/sandbox/workspace";
 
     let (workspace_path_raw, workspace_host_path) = match &session.config.workspace_mode {
         Some(sandbox_core::WorkspaceMode::Shared {
@@ -3768,9 +3768,9 @@ fn session_mount_info_for(session: &Session) -> SessionMountInfo {
         Some(sandbox_core::WorkspaceMode::Local { guest_path, .. }) => (guest_path.clone(), None),
         None => (CLONE_WORKSPACE_PATH.to_string(), None),
     };
-    // Re-add the trailing `/` that the historical hardcoded constant
-    // carried, so the wire form stays byte-identical for scripts
-    // (e.g. `workspace_path: "/home/agent/workspace/"`). The parser
+    // Re-add the trailing `/` that the hardcoded constant carries, so
+    // the wire form stays byte-identical for scripts
+    // (e.g. `workspace_path: "/home/sandbox/workspace/"`). The parser
     // strips trailing `/` from `guest_path` in normalization, so we
     // reattach exactly one here.
     let workspace_path = if workspace_path_raw.ends_with('/') {
@@ -5678,7 +5678,7 @@ async fn inject_ca_into_vm(
     info!(session_id = %session_id, "injecting CA certificate into VM");
 
     // CA injection writes to /usr/local/share/ca-certificates and /etc/environment,
-    // which requires root. The guest agent runs as unprivileged `agent` user.
+    // which requires root. The guest agent runs as unprivileged `sandbox` user.
     match guest
         .exec(session_id, "sudo", &["bash", "-c", &inject_script])
         .await
@@ -6047,7 +6047,7 @@ async fn fail_explicit_policy_apply(
 ///
 /// Mirrors the shape of [`fail_explicit_policy_apply`]: when the
 /// caller passes `--repo <url>`, the session is supposed to come up
-/// with `/home/agent/workspace/` populated. The four failure branches
+/// with `/home/sandbox/workspace/` populated. The four failure branches
 /// (non-zero exit, `GuestResponse::Error`, unexpected guest response,
 /// transport error) must not be `warn!`-swallowed — returning 201
 /// CREATED with a `Running` session and an empty workspace would
@@ -10525,7 +10525,7 @@ mod tests {
     // Earlier behaviour: the four `git clone` failure branches in
     // `create_session` `warn!`-swallowed the error and returned 201
     // CREATED with a `Running` session and an empty
-    // `/home/agent/workspace/`. The CLI user observed success but
+    // `/home/sandbox/workspace/`. The CLI user observed success but
     // had no usable repo — silently violating the caller's
     // `--repo <url>` intent. The helper flips this to a fatal failure
     // with the same shape as the policy-apply guard above:

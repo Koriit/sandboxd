@@ -576,7 +576,7 @@ Two fields, both required:
     "bridge_name": "sb-a1b2c3d4e5f6"
   },
   "mounts": {
-    "workspace_in_session": "/home/agent/workspace",
+    "workspace_in_session": "/home/sandbox/workspace",
     "workspace_host_source": "/home/you/project",
     "ca_bundle_in_session": null,
     "home_volume": null

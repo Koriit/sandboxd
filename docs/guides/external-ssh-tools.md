@@ -49,13 +49,11 @@ sandbox-<id>` to the daemon-mediated tunnel.
    the one for your session.
 4. VS Code opens a new window connected to the session. The first
    connection installs the VS Code server inside the session's home
-   directory — `/home/sandbox/.vscode-server/` on container sessions,
-   `/home/agent/.vscode-server/` on Lima (both backends run as the
-   `sandbox` user; Lima's home is pinned at `/home/agent/` for
-   historical workspace-path compatibility). Subsequent reconnects
-   reuse the existing server install.
+   directory — `/home/sandbox/.vscode-server/` (both backends run as
+   the `sandbox` user with home at `/home/sandbox/`). Subsequent
+   reconnects reuse the existing server install.
 5. **Open Folder** points at the workspace: `/home/sandbox/workspace`
-   on container sessions, `/home/agent/workspace` on Lima.
+   on both Lima and container sessions.
 
 VS Code's SSH multiplexing pairs with the `ControlMaster auto` /
 `ControlPath ~/.ssh/sandbox/sockets/%C` / `ControlPersist 60`
@@ -77,9 +75,9 @@ paying the WebSocket handshake cost once.
    SSH session, probes the OS, and offers to download a JetBrains IDE
    backend (IntelliJ, PyCharm, GoLand, etc.) into the session.
 4. Pick a project path inside the session
-   (`/home/sandbox/workspace/<repo>` for container, `/home/agent/workspace/<repo>`
-   for Lima) and continue. Gateway pulls the IDE backend into the
-   session's home, then launches the thin client on your host.
+   (`/home/sandbox/workspace/<repo>` for both Lima and container) and
+   continue. Gateway pulls the IDE backend into the session's home,
+   then launches the thin client on your host.
 
 Like VS Code, Gateway leans on SSH multiplexing for its many small
 connections (status probes, file watches, indexing reads). The
@@ -100,13 +98,9 @@ scp sandbox-<id>:/home/sandbox/result ./           # download (container)
 rsync -av --delete ./src/ sandbox-<id>:/home/sandbox/workspace/src/
 ```
 
-A common-case difference between backends is the in-session home
-directory: `/home/sandbox/` on container sessions, `/home/agent/` on
-Lima. Both backends run the in-VM workload as the `sandbox` user
-(uid 1000) — the daemon-generated config sets `User sandbox`
-uniformly — but Lima's home is pinned at `/home/agent/` for
-historical workspace-path compatibility, while the lite container
-uses the conventional `/home/sandbox/`.
+Both backends run the in-VM workload as the `sandbox` user (uid 1000)
+with home at `/home/sandbox/`. The daemon-generated config sets
+`User sandbox` uniformly across Lima and container sessions.
 
 You do not need to remember the session id by heart; `sandbox ls`
 lists every entry the CLI is managing. The 12-character hex id in the

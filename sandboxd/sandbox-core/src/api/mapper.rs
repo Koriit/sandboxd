@@ -777,7 +777,7 @@ mod tests {
             crate::backend::BackendKind::Container,
         );
         let mounts = SessionMountInfo {
-            workspace_path: "/home/agent/workspace/".into(),
+            workspace_path: "/home/sandbox/workspace/".into(),
             workspace_host_path: Some("/home/olek/proj".into()),
             ca_bundle_path: Some("/etc/ssl/certs/sandbox-ca.pem".into()),
             home_volume: Some("sandbox-home-aabbccddeeff".into()),
@@ -786,7 +786,7 @@ mod tests {
 
         let value = serde_json::to_value(&dto).unwrap();
         let block = &value["mounts"];
-        assert_eq!(block["workspace_path"], "/home/agent/workspace/");
+        assert_eq!(block["workspace_path"], "/home/sandbox/workspace/");
         assert_eq!(block["workspace_host_path"], "/home/olek/proj");
         assert_eq!(block["ca_bundle_path"], "/etc/ssl/certs/sandbox-ca.pem");
         assert_eq!(block["home_volume"], "sandbox-home-aabbccddeeff");
@@ -805,7 +805,7 @@ mod tests {
         // simply omits them — operators get a clean per-backend view.
         let session = Session::new(Some("mounts-lima".into()));
         let mounts = SessionMountInfo {
-            workspace_path: "/home/agent/workspace/".into(),
+            workspace_path: "/home/sandbox/workspace/".into(),
             workspace_host_path: None,
             ca_bundle_path: None,
             home_volume: None,
@@ -818,7 +818,7 @@ mod tests {
             .expect("mounts must be an object on the wire");
         assert_eq!(
             block.get("workspace_path").and_then(|v| v.as_str()),
-            Some("/home/agent/workspace/")
+            Some("/home/sandbox/workspace/")
         );
         assert!(
             !block.contains_key("workspace_host_path"),

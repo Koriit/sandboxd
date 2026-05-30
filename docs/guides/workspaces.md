@@ -32,11 +32,10 @@ sandbox create --name dev \
     --repo https://github.com/myorg/private-repo.git
 ```
 
-The repository lands in the session's workspace directory inside the VM — `/home/agent/workspace/` on Lima sessions (the default backend), `/home/sandbox/workspace/` on container/lite sessions. Verify it cloned:
+The repository lands in the session's workspace directory inside the VM — `/home/sandbox/workspace/` on both Lima and container/lite sessions. Verify it cloned:
 
 ```bash
-# Lima (default backend) — adjust path to /home/sandbox/workspace for --lite sessions.
-sandbox exec dev -- ls /home/agent/workspace
+sandbox exec dev -- ls /home/sandbox/workspace
 ```
 
 ### Troubleshooting clone
@@ -87,19 +86,19 @@ sandbox create --workspace "shared:/home/user/proj:/srv/work:none"
 
 > **Footgun: colons in paths.** The parser tokenizes on `:` from right to left. A host path containing a colon (e.g. `/data:archive`) will be misclassified — the rightmost token after the mode prefix is read as the security model or guest path. Avoid colons in host paths, or pass an explicit guest path (e.g. `shared:/data:archive:/srv/work`) to disambiguate. The same applies to a guest path that happens to be literally `/none` or `/mapped-xattr`, either of which would be classified as a security model.
 
-> **Breaking default.** The historical fixed mount point `/home/agent/workspace` is gone. The guest path now defaults to the host path so that build artefacts and tool output that reference absolute host directories survive a host-to-guest round trip without translation. If you relied on the old layout, pass an explicit guest path (e.g. `shared:$(pwd):/home/agent/workspace`).
+> **Breaking default.** The historical fixed mount point `/home/sandbox/workspace` is no longer the implicit default. The guest path now defaults to the host path so that build artefacts and tool output that reference absolute host directories survive a host-to-guest round trip without translation. If you relied on the old layout, pass an explicit guest path (e.g. `shared:$(pwd):/home/sandbox/workspace`).
 
 ### Pick a guest path
 
 Set `<guest>` when:
 
-- You need the in-VM path to differ from the host path — for example, mounting `/Users/alice/proj` (macOS-style) into `/home/agent/proj` so guest-side scripts that assume a Linux home directory still work.
+- You need the in-VM path to differ from the host path — for example, mounting `/Users/alice/proj` (macOS-style) into `/home/sandbox/proj` so guest-side scripts that assume a Linux home directory still work.
 - The host path contains characters that the in-VM toolchain handles poorly (spaces, mixed case on a case-insensitive host).
-- You want to preserve the legacy `/home/agent/workspace` layout for an existing pipeline; pass it explicitly.
+- You want to use the `/home/sandbox/workspace` layout for an existing pipeline; pass it explicitly.
 
 Leave `<guest>` off when the host path is already a valid absolute Linux path and you want the simplest configuration — that is the new default.
 
-A leading `~` in the host token expands against the CLI process's `$HOME` (the same expansion the shell would do for an unquoted argument). A leading `~` in the guest token is a literal substitution to `/home/agent` — it is not a lookup inside the VM.
+A leading `~` in the host token expands against the CLI process's `$HOME` (the same expansion the shell would do for an unquoted argument). A leading `~` in the guest token is a literal substitution to `/home/sandbox` — it is not a lookup inside the VM.
 
 > **Note: shell globs expand before the CLI sees them.** `--workspace shared:~/projects/*` is expanded by your shell, not by sandboxd, so the CLI sees whatever paths the glob produced (often more than one, or none). Quote the value or pass a literal path to keep the parser's view aligned with what you typed.
 
@@ -115,7 +114,7 @@ The 9p models `passthrough` and `mapped-file` are deliberately not exposed by `s
 Constraints:
 
 - The host path must be absolute (after `~` expansion) and must already exist.
-- The guest path must be absolute. A leading `~` on the guest token is rewritten to `/home/agent` literally.
+- The guest path must be absolute. A leading `~` on the guest token is rewritten to `/home/sandbox` literally.
 - `--workspace` and `--repo` are mutually exclusive.
 
 Verify the mount, substituting your chosen guest path:
@@ -155,7 +154,7 @@ sandbox create --workspace "local:/home/user/proj"
 sandbox create --workspace "local:/home/user/proj:/srv/work"
 
 # With the current directory.
-sandbox create --workspace "local:$(pwd):/home/agent/work"
+sandbox create --workspace "local:$(pwd):/home/sandbox/work"
 ```
 
 > **Rollback caveat.** Daemons older than this release cannot read records written with `local:` workspaces — the `WorkspaceMode::Local` variant is not in their schema. Roll forward; do not roll back across a session created with `local:`.
@@ -253,19 +252,19 @@ Daemon restarts also clear orphan locks — the lock state is in-memory only and
 Upload to the session:
 
 ```bash
-sandbox cp ./config.toml dev:/home/agent/workspace/config.toml
+sandbox cp ./config.toml dev:/home/sandbox/workspace/config.toml
 ```
 
 Download from the session:
 
 ```bash
-sandbox cp dev:/home/agent/workspace/output.log ./output.log
+sandbox cp dev:/home/sandbox/workspace/output.log ./output.log
 ```
 
 Copy a directory (recursive by default):
 
 ```bash
-sandbox cp ./dist dev:/home/agent/workspace/dist
+sandbox cp ./dist dev:/home/sandbox/workspace/dist
 ```
 
 Under the hood `sandbox cp` dispatches the standard `scp` client against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), uniformly across both backends. File modes, sparse files, and directory trees are preserved exactly the way `scp` preserves them natively. Errors (missing source, permission denied, unreachable session) come from `scp` verbatim, so they match the diagnostics you would see invoking it directly. The underlying byte transport is the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint, so no extra network exposure is opened on the host or in the gateway path.
@@ -281,7 +280,7 @@ The CLI shape mirrors `cp`: `session:path` for the session side, plain paths for
 Upload a directory tree to the session:
 
 ```bash
-sandbox sync ./src dev:/home/agent/workspace/src
+sandbox sync ./src dev:/home/sandbox/workspace/src
 ```
 
 Re-run the same command after editing a few files. Rsync only retransfers the changed files; an untouched tree finishes in milliseconds.
@@ -289,15 +288,15 @@ Re-run the same command after editing a few files. Rsync only retransfers the ch
 Pull a build directory back to the host:
 
 ```bash
-sandbox sync dev:/home/agent/workspace/dist ./dist
+sandbox sync dev:/home/sandbox/workspace/dist ./dist
 ```
 
 Demonstrate the `--delete` mirror semantics — files removed on the source are removed on the destination on the next sync:
 
 ```bash
 rm ./src/obsolete.go
-sandbox sync ./src dev:/home/agent/workspace/src
-# /home/agent/workspace/src/obsolete.go is now gone in the session too
+sandbox sync ./src dev:/home/sandbox/workspace/src
+# /home/sandbox/workspace/src/obsolete.go is now gone in the session too
 ```
 
 Under the hood `sandbox sync` dispatches the host's `rsync` with standard `ssh` as rsync's remote-shell (`-e`) transport against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), uniformly across both backends. The baseline flag set is `-a --delete`: archive mode (perms, ownership, mtimes, symlinks, recursion) plus mirror semantics. Errors and progress reach you in rsync's native form. Out-of-scope: filter rules, partial transfers, bandwidth limits — operators wanting those can run `rsync` directly with the same `-e ssh sandbox-<id>:...` pattern this command uses.
@@ -325,10 +324,10 @@ Git remote transport lets you use standard git commands against a repository ins
 Add the session as a git remote:
 
 ```bash
-git remote add sandbox sandbox::dev/home/agent/workspace
+git remote add sandbox sandbox::dev/home/sandbox/workspace
 ```
 
-The URL format is `sandbox::<session>/<repo-path>`. If you omit the path, it defaults to `/home/agent/workspace`:
+The URL format is `sandbox::<session>/<repo-path>`. If you omit the path, the default is derived from the session's workspace configuration (typically `/home/sandbox/workspace`):
 
 ```bash
 git remote add sandbox sandbox::dev
@@ -352,16 +351,16 @@ Both `git-upload-pack` (fetch/pull) and `git-receive-pack` (push) are supported.
 
 - **`git-remote-sandbox: command not found`.** The symlink is missing from `PATH`. Install it next to the `sandbox` binary and re-check `which git-remote-sandbox`.
 - **`Permission denied` opening the daemon socket.** Set `SANDBOX_SOCKET` to the socket path you are using, or start the daemon first.
-- **Target path is not a git repository.** Initialise it inside the VM first: `sandbox exec dev -- git -C /home/agent/workspace init`.
+- **Target path is not a git repository.** Initialise it inside the VM first: `sandbox exec dev -- git -C /home/sandbox/workspace init`.
 
 ## Run a command after provisioning
 
-`--boot-cmd` runs an arbitrary shell command after the workspace is in place. It runs as the `agent` user; use `sudo` for root operations.
+`--boot-cmd` runs an arbitrary shell command after the workspace is in place. It runs as the `sandbox` user; use `sudo` for root operations.
 
 ```bash
 sandbox create --name dev \
     --repo https://github.com/example/app.git \
-    --boot-cmd "cd /home/agent/workspace && npm install"
+    --boot-cmd "cd /home/sandbox/workspace && npm install"
 ```
 
 Boot command failure does not block the session from reaching `Running`. Re-run failed steps with `sandbox exec`.
@@ -375,8 +374,8 @@ Share the current directory, install dependencies on boot, run tests via `exec`.
 ```bash
 sandbox create --name dev \
     --workspace "shared:$(pwd)" \
-    --boot-cmd "cd /home/agent/workspace && npm install"
-sandbox exec dev -- bash -c "cd /home/agent/workspace && npm test"
+    --boot-cmd "cd /home/sandbox/workspace && npm install"
+sandbox exec dev -- bash -c "cd /home/sandbox/workspace && npm test"
 sandbox rm dev
 ```
 
@@ -388,8 +387,8 @@ Clone, build, test, pull artifacts back.
 sandbox create --name ci-run \
     --policy ./ci-policy.json \
     --repo https://github.com/myorg/app.git \
-    --boot-cmd "cd /home/agent/workspace && make build && make test"
-sandbox cp ci-run:/home/agent/workspace/dist/app.tar.gz ./app.tar.gz
+    --boot-cmd "cd /home/sandbox/workspace && make build && make test"
+sandbox cp ci-run:/home/sandbox/workspace/dist/app.tar.gz ./app.tar.gz
 sandbox rm ci-run
 ```
 
@@ -399,9 +398,9 @@ Create a blank session, push the local tree, run tests, pull results back.
 
 ```bash
 sandbox create --name review
-git remote add review sandbox::review/home/agent/workspace
+git remote add review sandbox::review/home/sandbox/workspace
 git push review main
-sandbox exec review -- bash -c "cd /home/agent/workspace && make test"
+sandbox exec review -- bash -c "cd /home/sandbox/workspace && make test"
 git pull review main
 sandbox rm review
 ```

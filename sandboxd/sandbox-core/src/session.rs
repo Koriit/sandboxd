@@ -191,7 +191,7 @@ pub enum WorkspaceMode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         security_model: Option<WorkspaceSecurityModel>,
     },
-    /// Clone a git repository into the VM at /home/agent/workspace/.
+    /// Clone a git repository into the VM at /home/sandbox/workspace/.
     Clone {
         /// Git repository URL.
         repo_url: String,
@@ -383,7 +383,7 @@ impl WorkspaceMode {
     /// ```
     ///
     /// Path tokens are absolute (start with `/`); guest-side `~` is a
-    /// literal substitution to `/home/agent`. Host-side `~` must be
+    /// literal substitution to `/home/sandbox`. Host-side `~` must be
     /// expanded by the caller before invoking this function — the
     /// daemon parser explicitly rejects any residual `~` in `host_path`
     /// because the operator's `$HOME` does not match the daemon's.
@@ -609,7 +609,7 @@ fn parse_host_guest_pair_from_tokens(
     mode_label: &str,
 ) -> Result<(String, String), String> {
     // Step B — strip a trailing guest-path token. The classifier accepts
-    // tokens that start with `/` (absolute) or `~` (literal `/home/agent`
+    // tokens that start with `/` (absolute) or `~` (literal `/home/sandbox`
     // substitution per the design).
     let guest_path: Option<String> = if tokens.len() >= 2 {
         let last = tokens.last().expect("len >= 2");
@@ -649,7 +649,7 @@ fn parse_host_guest_pair_from_tokens(
     }
 
     // `guest_path` undergoes `~` expansion on both sides as a literal
-    // string replacement to `/home/agent` — environment-free, so the
+    // string replacement to `/home/sandbox` — environment-free, so the
     // CLI and the daemon arrive at the same result. The substituted
     // value must still be absolute.
     let guest_path = match guest_path {
@@ -697,14 +697,14 @@ fn strip_trailing_slashes(path: &str) -> String {
 }
 
 /// Expand a leading `~` in a guest-side path to the canonical guest user
-/// home (`/home/agent`). The substitution is environment-free and runs
+/// home (`/home/sandbox`). The substitution is environment-free and runs
 /// identically on the CLI and the daemon, per the design.
 fn expand_guest_tilde(path: &str) -> String {
     if path == "~" {
-        return "/home/agent".to_string();
+        return "/home/sandbox".to_string();
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        return format!("/home/agent/{rest}");
+        return format!("/home/sandbox/{rest}");
     }
     path.to_string()
 }
@@ -799,7 +799,7 @@ pub struct SessionConfig {
     /// or when the hardened configuration causes compatibility issues.
     #[serde(default = "default_hardened")]
     pub hardened: bool,
-    /// Git repository URL cloned into `/home/agent/workspace/` at creation.
+    /// Git repository URL cloned into `/home/sandbox/workspace/` at creation.
     ///
     /// Captured so `sandbox inspect`/`sandbox describe` can surface the
     /// original creation input.  `None` on records written by daemons
@@ -1632,17 +1632,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_flag_shared_with_guest_tilde_expands_to_home_agent() {
-        // Guest-side `~` is a literal substitution to `/home/agent`,
+    fn parse_flag_shared_with_guest_tilde_expands_to_home_sandbox() {
+        // Guest-side `~` is a literal substitution to `/home/sandbox`,
         // environment-independent.
         let mode = WorkspaceMode::parse_flag("shared:/tmp:~/work").unwrap();
-        assert_eq!(mode, shared("/tmp", "/home/agent/work", None));
+        assert_eq!(mode, shared("/tmp", "/home/sandbox/work", None));
     }
 
     #[test]
-    fn parse_flag_shared_with_guest_tilde_only_expands_to_home_agent() {
+    fn parse_flag_shared_with_guest_tilde_only_expands_to_home_sandbox() {
         let mode = WorkspaceMode::parse_flag("shared:/tmp:~").unwrap();
-        assert_eq!(mode, shared("/tmp", "/home/agent", None));
+        assert_eq!(mode, shared("/tmp", "/home/sandbox", None));
     }
 
     #[test]
@@ -2039,11 +2039,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_flag_local_with_guest_tilde_expands_to_home_agent() {
+    fn parse_flag_local_with_guest_tilde_expands_to_home_sandbox() {
         // Guest-side `~` is the same environment-free substitution as
         // for `shared:` — the parser arm shares the classifier.
         let mode = WorkspaceMode::parse_flag("local:/tmp:~/work").unwrap();
-        assert_eq!(mode, local("/tmp", "/home/agent/work"));
+        assert_eq!(mode, local("/tmp", "/home/sandbox/work"));
     }
 
     #[test]

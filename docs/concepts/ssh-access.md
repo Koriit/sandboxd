@@ -191,14 +191,10 @@ broader isolation model.
 
 Both backends run their in-VM workload as a `sandbox` user (uid 1000)
 so the daemon-emitted SSH config block's `User sandbox` line resolves
-on either side without per-backend branching. The home directories
-differ for historical compatibility: the Lima `sandbox` user has its
-home pinned at `/home/agent/`, while the lite container uses the
-conventional `/home/sandbox/`. The operator-visible effect is that
-in-session paths under `/home/sandbox/` (container) and `/home/agent/`
-(Lima) are the natural workspace roots respectively — the `~`
-substitution in `sandbox cp`/`sync` arguments resolves to the correct
-home on each backend.
+on either side without per-backend branching. Both backends use
+`/home/sandbox/` as the in-VM home directory — the `~` substitution
+in `sandbox cp`/`sync` arguments resolves to `/home/sandbox` on both
+backends.
 
 ## Next steps
 

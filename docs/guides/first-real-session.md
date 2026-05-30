@@ -85,7 +85,7 @@ What happens, in order:
 
 1. The daemon clones (fast path) or builds (slow path) the VM.
 2. The gateway container starts with the initial policy already loaded.
-3. The VM's cloud-init runs `git clone https://github.com/BurntSushi/ripgrep.git /home/agent/workspace`.
+3. The VM's cloud-init runs `git clone https://github.com/BurntSushi/ripgrep.git /home/sandbox/workspace`.
 4. The guest agent comes up; `sandbox create` returns.
 
 On a warm host this takes under a minute. On first run it can take two to five minutes because Lima downloads the Ubuntu cloud image.
@@ -121,7 +121,7 @@ You should see a 200 (or a redirect).
 `ripgrep` is a Rust project; the base image already has `rustc` and `cargo`. Kick off a release build:
 
 ```bash
-sandbox exec rust-build -- bash -c 'cd /home/agent/workspace && cargo build --release 2>&1 | tail -20'
+sandbox exec rust-build -- bash -c 'cd /home/sandbox/workspace && cargo build --release 2>&1 | tail -20'
 ```
 
 Cargo reaches out to `index.crates.io` and `static.crates.io` for dependencies — both of which your policy allows. You should see crate downloads streaming by, then a normal compile.
@@ -132,14 +132,14 @@ If you need an interactive session to poke around mid-build, `sandbox ssh`:
 sandbox ssh rust-build
 ```
 
-You land as the `sandbox` user with the workspace at `/home/agent/workspace` (the in-VM user is named `sandbox` on both backends; Lima's home is pinned at `/home/agent/` for historical workspace-path compatibility). Exit with `Ctrl-D`.
+You land as the `sandbox` user with the workspace at `/home/sandbox/workspace` (the in-VM user is named `sandbox` on both backends, with home at `/home/sandbox/`). Exit with `Ctrl-D`.
 
 ## 5. Copy the artifact back to your host
 
 Once the build finishes, pull the binary back to the host:
 
 ```bash
-sandbox cp rust-build:/home/agent/workspace/target/release/rg ./rg
+sandbox cp rust-build:/home/sandbox/workspace/target/release/rg ./rg
 chmod +x ./rg
 ./rg --version
 ```

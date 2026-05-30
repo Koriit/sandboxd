@@ -3139,7 +3139,7 @@ WantedBy=multi-user.target";
             "--host-path",
             "/home/op/work",
             "--guest-path",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
         ]);
         let sub = parse_argv(&args).expect("valid run-rsync args");
         let Subcommand::RunRsync(a) = sub else {
@@ -3149,7 +3149,7 @@ WantedBy=multi-user.target";
         assert_eq!(a.backend, "lima");
         assert_eq!(a.session_name, "sandbox-abc123");
         assert_eq!(a.host_path, "/home/op/work");
-        assert_eq!(a.guest_path, "/home/agent/workspace");
+        assert_eq!(a.guest_path, "/home/sandbox/workspace");
         assert!(!a.no_gitignore);
     }
 
@@ -3166,7 +3166,7 @@ WantedBy=multi-user.target";
             "--host-path",
             "/srv/proj",
             "--guest-path",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
             "--no-gitignore",
         ]);
         let sub = parse_argv(&args).expect("valid run-rsync args");
@@ -3188,7 +3188,7 @@ WantedBy=multi-user.target";
             "--host-path",
             "/home/op/work",
             "--guest-path",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
         ]);
         assert!(parse_argv(&args).is_err());
     }
@@ -3204,7 +3204,7 @@ WantedBy=multi-user.target";
             "--session-name",
             "sandbox-abc",
             "--guest-path",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
         ]);
         assert!(parse_argv(&args).is_err());
     }
@@ -3222,7 +3222,7 @@ WantedBy=multi-user.target";
             "--host-path",
             "/home/op/work",
             "--guest-path",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
         ]);
         // Passes argv parse but fails validate_subcommand (EXIT_BAD_ARGS).
         let sub = parse_argv(&args).expect("argv parse must succeed (validation is separate)");
@@ -3245,7 +3245,7 @@ WantedBy=multi-user.target";
             "--host-path",
             "relative/path",
             "--guest-path",
-            "/home/agent/workspace",
+            "/home/sandbox/workspace",
         ]);
         let sub = parse_argv(&args).expect("argv parse must succeed");
         assert!(
@@ -3265,7 +3265,7 @@ WantedBy=multi-user.target";
             backend: "lima".to_string(),
             session_name: "sandbox-abc123".to_string(),
             host_path: "/home/op/work".to_string(),
-            guest_path: "/home/agent/workspace".to_string(),
+            guest_path: "/home/sandbox/workspace".to_string(),
             no_gitignore: false,
         };
         let argv = build_rsync_argv(&a);
@@ -3279,7 +3279,7 @@ WantedBy=multi-user.target";
                 "limactl shell",
                 "--mkpath",
                 "/home/op/work/",
-                "sandbox-abc123:/home/agent/workspace/",
+                "sandbox-abc123:/home/sandbox/workspace/",
             ]
         );
     }
@@ -3291,7 +3291,7 @@ WantedBy=multi-user.target";
             backend: "container".to_string(),
             session_name: "sandbox-def456".to_string(),
             host_path: "/srv/proj".to_string(),
-            guest_path: "/home/agent/workspace".to_string(),
+            guest_path: "/home/sandbox/workspace".to_string(),
             no_gitignore: true,
         };
         let argv = build_rsync_argv(&a);
@@ -3304,7 +3304,7 @@ WantedBy=multi-user.target";
                 "docker exec -i",
                 "--mkpath",
                 "/srv/proj/",
-                "sandbox-def456:/home/agent/workspace/",
+                "sandbox-def456:/home/sandbox/workspace/",
             ]
         );
     }

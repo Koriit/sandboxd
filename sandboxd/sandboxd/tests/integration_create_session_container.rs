@@ -567,7 +567,7 @@ fn integration_create_session_container_rejects_hardened() {
 /// <url> <home>/workspace/` through the backend-agnostic
 /// `GuestConnector`, mirroring the Lima `--repo` path. The literal
 /// home dir diverges by backend (container: `/home/sandbox`, Lima:
-/// `/home/agent`); the shape of the workspace contract does not.
+/// `/home/sandbox`); the shape of the workspace contract does not.
 ///
 /// This test pins three pieces of the public contract:
 ///   1. The capability matrix advertises exactly `{ Shared, Clone }` —

@@ -109,7 +109,7 @@ pub struct SessionSpec {
     /// How the workspace is provided to the session, if at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mode: Option<WorkspaceMode>,
-    /// Optional git URL cloned into `/home/agent/workspace/` on first
+    /// Optional git URL cloned into `/home/sandbox/workspace/` on first
     /// boot. Captured for `sandbox inspect` parity with
     /// [`crate::session::SessionConfig::repo`].
     #[serde(default, skip_serializing_if = "Option::is_none")]

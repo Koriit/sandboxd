@@ -678,8 +678,8 @@ def test_stop_start_with_networking(sandbox_cli, backend):
         # 3. Write a file inside the session to verify persistence across
         #    stop/start. Use the backend's home dir (persistent storage),
         #    not /tmp (tmpfs, cleared on reboot/restart for both backends).
-        #    guest_home(backend) returns /home/agent for Lima and
-        #    /home/sandbox for the container backend (named home volume).
+        #    guest_home(backend) returns /home/sandbox for both Lima and
+        #    the container backend (named home volume).
         test_file = f"{guest_home(backend)}/net-persist-test.txt"
         write_result = sandbox_cli(
             "exec", "net-restart-test", "--",

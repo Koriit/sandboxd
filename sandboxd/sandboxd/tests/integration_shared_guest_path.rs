@@ -1,6 +1,6 @@
 //! Integration tests for `WorkspaceMode::Shared`'s operator-supplied
 //! guest path (the breaking default that replaces the historical
-//! fixed `/home/agent/workspace` mount).
+//! fixed `/home/sandbox/workspace` mount).
 //!
 //! These tests pin the wiring contract that
 //! `WorkspaceMode::Shared { host_path, guest_path, .. }` carries the
@@ -243,23 +243,23 @@ fn docker_exec_capture(container_name: &str, argv: &[&str]) -> String {
 ///
 /// Create a host tempdir with known contents. Boot a container with
 /// `ContainerNetwork.workspace_bind = Some(WorkspaceBind { host_path:
-/// <tempdir>, guest_path: /home/agent/work })`. Verify:
+/// <tempdir>, guest_path: /home/sandbox/work })`. Verify:
 ///
-/// 1. The host file is visible inside the guest at `/home/agent/work/`
+/// 1. The host file is visible inside the guest at `/home/sandbox/work/`
 ///    (the operator-supplied guest path, not the default
-///    `/home/agent/workspace/` from earlier milestones).
+///    `/home/sandbox/workspace/` from earlier milestones).
 /// 2. A file written from the host appears inside the guest at the
 ///    same relative path.
 /// 3. A file written from the guest is visible on the host at the
 ///    bind source — pins the bidirectional mount semantics the
 ///    operator-facing docs guarantee.
 ///
-/// The guest path `/home/agent/work` is chosen because the alpine
+/// The guest path `/home/sandbox/work` is chosen because the alpine
 /// fixture writable area extends across the rootfs (no read-only
 /// mount). The production lite image is `--read-only` with writable
-/// areas at `/home/agent/`, `/tmp/`, and `/run/`; the
+/// areas at `/home/sandbox/`, `/tmp/`, and `/run/`; the
 /// constraint that the container backend requires the guest path
-/// live inside a writable area is honoured by picking a `/home/agent/`
+/// live inside a writable area is honoured by picking a `/home/sandbox/`
 /// child path here.
 #[tokio::test]
 async fn integration_shared_guest_path_container() {
@@ -295,7 +295,7 @@ async fn integration_shared_guest_path_container() {
 
     let workspace_bind = WorkspaceBind {
         host_path: host_root.to_path_buf(),
-        guest_path: PathBuf::from("/home/agent/work"),
+        guest_path: PathBuf::from("/home/sandbox/work"),
     };
     runtime.register_session(session_id, net.to_container_network(Some(workspace_bind)));
 
@@ -309,19 +309,22 @@ async fn integration_shared_guest_path_container() {
         .expect("runtime.start");
 
     // (1) Host file is visible at the operator-supplied guest path.
-    let body = docker_exec_capture(&container_name, &["cat", "/home/agent/work/from_host.txt"]);
+    let body = docker_exec_capture(
+        &container_name,
+        &["cat", "/home/sandbox/work/from_host.txt"],
+    );
     assert_eq!(
         body, "host-bytes",
         "the operator-supplied :<guest_path> must mount the host \
          directory at that exact path inside the container; \
-         expected to read 'host-bytes' from /home/agent/work/from_host.txt"
+         expected to read 'host-bytes' from /home/sandbox/work/from_host.txt"
     );
 
     // (2) Host writes after start are visible to the guest (mount is
     // live, not a snapshot).
     std::fs::write(host_root.join("late.txt"), b"appeared-after-start\n")
         .expect("write late.txt host-side");
-    let late = docker_exec_capture(&container_name, &["cat", "/home/agent/work/late.txt"]);
+    let late = docker_exec_capture(&container_name, &["cat", "/home/sandbox/work/late.txt"]);
     assert_eq!(
         late, "appeared-after-start",
         "host-side writes after container start must be visible in \
@@ -337,7 +340,7 @@ async fn integration_shared_guest_path_container() {
             &container_name,
             "sh",
             "-c",
-            "echo 'guest-bytes' > /home/agent/work/from_guest.txt",
+            "echo 'guest-bytes' > /home/sandbox/work/from_guest.txt",
         ])
         .status()
         .expect("docker exec for guest write");

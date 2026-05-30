@@ -28,7 +28,7 @@ No single mechanism wins on all three. sandboxd exposes six modes so you can pic
 
 ### Clone mode
 
-At session creation, sandboxd runs `git clone` inside the session to pull a repository into the workspace directory (`/home/sandbox/workspace/` on container sessions, `/home/agent/workspace/` on Lima). The clone is a one-shot provisioning step — no ongoing link to the remote exists afterwards. Subsequent updates require either network access (permitted by policy) or one of the other modes.
+At session creation, sandboxd runs `git clone` inside the session to pull a repository into the workspace directory (`/home/sandbox/workspace/` on both Lima and container sessions). The clone is a one-shot provisioning step — no ongoing link to the remote exists afterwards. Subsequent updates require either network access (permitted by policy) or one of the other modes.
 
 Clone is the simplest model for CI-style workloads: the session starts with a known tree, runs some work, and is thrown away.
 

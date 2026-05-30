@@ -229,8 +229,7 @@ pub struct SessionMountInfo {
     /// resolved `guest_path` on the session's `WorkspaceMode::Shared`
     /// (defaults to the `host_path` when the operator did not supply
     /// an explicit guest path). For `WorkspaceMode::Clone` and the
-    /// unset case the daemon falls back to the historical
-    /// `/home/agent/workspace/` value.
+    /// unset case the daemon falls back to `/home/sandbox/workspace/`.
     pub workspace_path: String,
     /// Absolute host path bound into the session at `workspace_path`.
     /// Set only when the session was created with
@@ -249,7 +248,7 @@ pub struct SessionMountInfo {
     /// no daemon-controlled mount path to surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_bundle_path: Option<String>,
-    /// Named Docker volume that backs `/home/agent` for container
+    /// Named Docker volume that backs `/home/sandbox` for container
     /// sessions (`sandbox-home-{session_id}`). Lima: `None` — VM
     /// home semantics are not volume-backed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

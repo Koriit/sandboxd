@@ -146,7 +146,7 @@ A session moves through these states:
 5. **Gateway + Network config.** The gateway container is created on the Docker bridge. The VM's bridge NIC is configured with a static IP via the guest agent. The CA certificate is injected into the VM's trust store.
 6. **State transition.** Session state moves to `Running`.
 7. **Policy.** If `--policy` or `--preset` was provided, the effective policy (preset expansions merged with the file) is compiled and distributed to gateway components. A `policy_applied` lifecycle event is emitted carrying the full effective policy plus the CLI's original `source_presets` invocation strings. A DNS propagation loop is started; once the loop has reconciled nftables allow sets and Envoy L3 filter chains to the applied policy, sandboxd emits `policy_propagated` with the policy's SHA-256 hash.
-8. **Workspace.** If `--repo` was provided, the repository is cloned into the session's workspace directory (`/home/sandbox/workspace/` on container sessions, `/home/agent/workspace/` on Lima). If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
+8. **Workspace.** If `--repo` was provided, the repository is cloned into the session's workspace directory (`/home/sandbox/workspace/` on both Lima and container sessions). If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
 9. **Boot command.** If `--boot-cmd` was provided, it is executed via the guest agent.
 
 ### Stop
