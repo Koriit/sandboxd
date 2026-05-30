@@ -106,10 +106,24 @@ TEST ?=
 # tests and the container-only `test_lite.py` (`@pytest.mark.
 # container`). Zero convention-driven skips on a properly-configured
 # host; runs in ~5-10 min on a warm runner.
+#
+# Under the cross-user harness (SANDBOX_HARNESS=sandbox-systemd /
+# sandbox-sudo), the daemon socket is mode 0660 group=sandbox. A
+# developer added via `usermod -aG sandbox` but not yet re-logged-in
+# does not have the group active in their shell. Wrapping pytest in
+# `sg sandbox` activates the group for the subprocess without
+# requiring a re-login. The test-user harness runs pytest as the
+# sandbox user directly, so sg is unnecessary and would fail for a
+# non-member caller.
 test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
-	cd tests/e2e && . .venv/bin/activate && \
-	  python -m pytest -v -rs --timeout=600 --durations=20 \
-	  -m "not lima" -k "not [lima]" $(TEST)
+	cd tests/e2e && \
+	  _pytest='. .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 -m "not lima" -k "not [lima]" $(TEST)'; \
+	  if [ "$${SANDBOX_HARNESS:-sandbox-systemd}" = "test-user" ]; then \
+	    sh -c "$$_pytest"; \
+	  else \
+	    echo "[make] wrapping pytest in 'sg sandbox' (cross-user harness; socket is group=sandbox)"; \
+	    sg sandbox -c "$$_pytest"; \
+	  fi
 
 # Merge-to-main: full matrix -- Lima + container parametrizations plus
 # the Lima-only and container-only test files. Wall clock ~30-45 min.
@@ -118,9 +132,24 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # tests run twice. Lima-marked tests on a host without limactl /
 # qemu-bridge-helper / bridge.conf emit per-test skips via the
 # `_lima_required_for_lima_tests` fixture; everything else runs.
+#
+# Under the cross-user harness (SANDBOX_HARNESS=sandbox-systemd /
+# sandbox-sudo), the daemon socket is mode 0660 group=sandbox. A
+# developer added via `usermod -aG sandbox` but not yet re-logged-in
+# does not have the group active in their shell. Wrapping pytest in
+# `sg sandbox` activates the group for the subprocess without
+# requiring a re-login. The test-user harness runs pytest as the
+# sandbox user directly, so sg is unnecessary and would fail for a
+# non-member caller.
 test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
-	cd tests/e2e && . .venv/bin/activate && \
-	  python -m pytest -v -rs --timeout=600 --durations=20 $(TEST)
+	cd tests/e2e && \
+	  _pytest='. .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 $(TEST)'; \
+	  if [ "$${SANDBOX_HARNESS:-sandbox-systemd}" = "test-user" ]; then \
+	    sh -c "$$_pytest"; \
+	  else \
+	    echo "[make] wrapping pytest in 'sg sandbox' (cross-user harness; socket is group=sandbox)"; \
+	    sg sandbox -c "$$_pytest"; \
+	  fi
 
 # Back-compat alias. `make test-e2e` continues to run the full matrix.
 test-e2e: test-e2e-matrix
