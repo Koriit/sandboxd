@@ -9,10 +9,11 @@ These tests verify that every daemon limactl invocation goes through
    a. Boot and reach Running state.
    b. Communicate with the guest agent (ping succeeds).
    c. Reach the in-VM sshd through the daemon-mediated proxy endpoint.
-3. A shared: workspace (9p ``mapped-xattr``) created for a non-daemon operator
-   uid allows read+write round-trips from the host *and* the guest, with the
-   correct ownership on the host side (files written by the in-VM ``sandbox``
-   user re-map to the operator's host uid via ``mapped-xattr``).
+3. A session created as the ``sandbox-e2e-test`` operator (uid 4099, provisioned
+   by ``make setup-e2e-test-operator``) verifies that the Lima cloud-init
+   ``usermod -u {op}`` uid-realignment step actually fires and that a 9p
+   shared: workspace correctly maps file ownership to the operator uid on the
+   host.
 
 These tests require the M18 cross-user harness (``SANDBOX_HARNESS`` ≠
 ``"test-user"``): the daemon must run as the ``sandbox`` system user so the
@@ -31,7 +32,9 @@ Run individually before the full matrix:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -45,6 +48,11 @@ from conftest import (
     _VM_RESOURCE_ARGS,
     parse_session_id,
 )
+
+# ---------------------------------------------------------------------------
+# E2E test operator name — must match `make setup-e2e-test-operator`.
+# ---------------------------------------------------------------------------
+_E2E_TEST_OPERATOR_NAME = "sandbox-e2e-test"
 
 pytestmark = pytest.mark.lima
 
@@ -73,6 +81,41 @@ def sandbox(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedPro
     """
     return subprocess.run(
         [str(SANDBOX_BIN), "--socket", str(_SANDBOX_PROD_SOCKET), *args],
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=300,      # cross-user first-boot: limactl start + usermod cloud-init
+        **kwargs,
+    )
+
+
+def sandbox_as(
+    op_uid: int,
+    *args: str,
+    check: bool = True,
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    """Invoke the sandbox CLI as the ``sandbox-e2e-test`` operator.
+
+    Uses ``sudo -n -u sandbox-e2e-test`` to drop to the operator uid
+    without a password (requires the NOPASSWD fragment installed by
+    ``make setup-e2e-test-operator``).  Propagates ``SANDBOX_SOCKET``
+    through ``env`` so the CLI reaches the production-shaped daemon
+    socket at ``_SANDBOX_PROD_SOCKET``; the sudoers fragment's
+    ``env_keep += "SANDBOX_SOCKET"`` directive permits this.
+
+    The ``op_uid`` parameter is accepted for call-site clarity (the
+    caller already has the resolved uid from the ``e2e_test_operator``
+    fixture) but is not used in the argv — the sudo target is always
+    the fixed name ``sandbox-e2e-test``.
+    """
+    return subprocess.run(
+        [
+            "sudo", "-n", "-u", _E2E_TEST_OPERATOR_NAME,
+            "env", f"SANDBOX_SOCKET={_SANDBOX_PROD_SOCKET}",
+            str(SANDBOX_BIN), "--socket", str(_SANDBOX_PROD_SOCKET),
+            *args,
+        ],
         capture_output=True,
         text=True,
         check=check,
@@ -188,118 +231,104 @@ class TestHelperPivotSessionReachability:
                 sandbox("rm", session_id, check=False)
 
 
-class TestHelperPivot9pSharedWorkspace:
-    """9p shared: workspace cross-user read+write round-trip.
+class TestHelperPivotUsermodRealignment:
+    """Verify the Lima cloud-init ``usermod -u {op}`` realignment fires for a
+    distinct non-1000 operator uid.
 
-    The base VM's in-VM sandbox user has its uid/gid aligned with the
-    operator's host uid/gid via a cloud-init usermod step.  9p
-    mapped-xattr then translates host-side file ownership correctly so:
-    - Files written by the operator on the host are readable/writable in the VM.
-    - Files written by the in-VM sandbox user are owned by the operator uid
-      on the host (mapped-xattr re-maps uid 1000→operator uid when != 1000).
+    The ``sandbox-e2e-test`` system user (uid 4099) is provisioned by
+    ``make setup-e2e-test-operator`` (or ``make setup-dev-env``) and is
+    never created inside tests.  Using a real, distinct, non-1000 uid means
+    the match guard in ``sandbox-core::lima`` (``op_uid != 1000``) is
+    satisfied and the realignment actually executes.
 
-    This test is skipped when op_uid == 1000 (base image bakes uid 1000 and
-    the mapping is a no-op; the interesting case is op_uid != 1000).
+    Primary assertion: after ``sandbox create``, running
+    ``sandbox exec <sid> -- id -u sandbox`` as the operator must return the
+    operator uid (4099), proving the in-VM ``sandbox`` user was realigned.
+
+    Secondary assertion: a file written by the in-VM ``sandbox`` user into
+    a ``shared:`` workspace appears on the host owned by the operator uid.
     """
 
-    def test_host_write_readable_in_vm(self, tmp_path):
-        """Write a file on the host shared dir; verify it is readable inside the VM."""
-        op_uid = os.getuid()
-        if op_uid == 1000:
-            pytest.skip(
-                "op_uid==1000: base image bakes uid 1000 so the 9p mapped-xattr "
-                "uid translation is a no-op; this test only covers op_uid != 1000"
-            )
+    def test_usermod_realignment_and_9p_ownership(self, e2e_test_operator, tmp_path):
+        """Create a Lima session as the sandbox-e2e-test operator and verify:
+        1. The in-VM ``sandbox`` uid equals the operator uid (realignment fired).
+        2. A file written from inside the VM into the shared workspace is owned
+           by the operator uid on the host.
+        """
+        op_uid = e2e_test_operator
 
-        # Create a host directory to share.
-        shared = tmp_path / "shared"
-        shared.mkdir(mode=0o755)
-        marker = shared / "host_marker.txt"
-        marker.write_text("written-on-host")
+        # Host directory to mount as a 9p shared: workspace. It must be
+        # reachable and writable by the OPERATOR (sandbox-e2e-test, uid
+        # 4099) — QEMU runs as that uid and serves the share — not just by
+        # the test runner. The runner's pytest tmp tree is 0700 at its
+        # ancestors, so a distinct operator uid cannot traverse into it.
+        # Put the dir directly under /tmp (1777, world-traversable) and
+        # make it world-rwx; it is removed in the `finally` block.
+        shared = Path(tempfile.mkdtemp(prefix="sandbox-e2e-shared-"))
+        os.chmod(shared, 0o777)
 
         session_id = None
         try:
-            result = sandbox(
+            result = sandbox_as(
+                op_uid,
                 "create", "--backend", "lima",
                 "--workspace", f"shared:{shared}:{LIMA_VM_HOME}/workspace",
                 *_VM_RESOURCE_ARGS,
             )
             session_id = parse_session_id(result.stdout)
-            # ``sandbox create`` is synchronous: the HTTP handler sets Running
-            # before returning, so no separate polling step is required.
 
-            # Read the file from inside the VM.
-            result = sandbox(
-                "exec", session_id, "--",
-                "cat", f"{LIMA_VM_HOME}/workspace/host_marker.txt",
+            # --- Primary assertion: uid realignment ---
+            id_result = sandbox_as(
+                op_uid,
+                "exec", session_id, "--", "id", "-u", "sandbox",
             )
-            assert "written-on-host" in result.stdout, (
-                f"host-written file not readable in VM: {result.stdout!r}"
+            in_vm_uid_str = id_result.stdout.strip()
+            assert in_vm_uid_str.isdigit(), (
+                f"'id -u sandbox' returned non-numeric output: {in_vm_uid_str!r}"
             )
-        finally:
-            if session_id:
-                sandbox("rm", session_id, check=False)
-
-    def test_vm_write_readable_on_host(self, tmp_path):
-        """Write a file from inside the VM; verify it is readable and correctly
-        owned on the host after the 9p mapped-xattr translation."""
-        op_uid = os.getuid()
-        if op_uid == 1000:
-            pytest.skip(
-                "op_uid==1000: base image bakes uid 1000 so the 9p mapped-xattr "
-                "uid translation is a no-op; this test only covers op_uid != 1000"
+            in_vm_uid = int(in_vm_uid_str)
+            assert in_vm_uid == op_uid, (
+                f"cloud-init `usermod -u {op_uid}` did not take effect: "
+                f"in-VM sandbox uid is {in_vm_uid}, expected {op_uid}. "
+                "Check that the match guard in sandbox-core::lima fires for "
+                "op_uid != 1000 and that the cloud-init script ran to completion."
             )
 
-        shared = tmp_path / "shared"
-        shared.mkdir(mode=0o755)
-
-        session_id = None
-        try:
-            result = sandbox(
-                "create", "--backend", "lima",
-                "--workspace", f"shared:{shared}:{LIMA_VM_HOME}/workspace",
-                *_VM_RESOURCE_ARGS,
-            )
-            session_id = parse_session_id(result.stdout)
-            # ``sandbox create`` is synchronous: the HTTP handler sets Running
-            # before returning, so no separate polling step is required.
-
-            # Write a file from inside the VM.
-            sandbox(
+            # --- Secondary assertion: 9p ownership ---
+            sandbox_as(
+                op_uid,
                 "exec", session_id, "--",
                 "bash", "-c",
                 f"echo 'written-in-vm' > {LIMA_VM_HOME}/workspace/vm_marker.txt",
             )
 
-            # Allow the 9p flush.
+            # Allow the 9p flush to propagate.
             time.sleep(1)
 
             guest_file = shared / "vm_marker.txt"
             assert guest_file.exists(), (
                 f"VM-written file not visible on host at {guest_file}"
             )
-            assert "written-in-vm" in guest_file.read_text(), (
-                f"VM-written file has unexpected content: {guest_file.read_text()!r}"
-            )
-
-            # Under mapped-xattr, when op_uid != 1000, the file's host-side
-            # owner should be op_uid (9p re-maps uid 1000 → op_uid via the
-            # cloud-init usermod step). When op_uid == 1000 no remapping
-            # occurs (base image bakes uid 1000), so the assertion is a
-            # trivial no-op that proves nothing; skip visibly instead.
-            if op_uid == 1000:
-                pytest.skip(
-                    "ownership remapping assertion skipped: operator uid is 1000 "
-                    "(base image bakes uid 1000; no remapping occurs). "
-                    "Run as a uid != 1000 to exercise mapped-xattr translation."
-                )
+            # The file was written by QEMU running as the operator uid, so
+            # under 9p mapped-xattr it lands on the host owned by that uid
+            # at mode 0600 — the test runner (a different uid) therefore
+            # CANNOT read its contents. That is exactly the ownership
+            # property we want to assert. `stat()` needs only dir-traverse
+            # (the shared dir is 0777), so check ownership + non-emptiness
+            # via stat rather than reading the bytes.
             stat_info = guest_file.stat()
             assert stat_info.st_uid == op_uid, (
                 f"VM-written file on host is owned by uid {stat_info.st_uid}, "
                 f"expected operator uid {op_uid}. "
-                "This suggests the 9p mapped-xattr uid remapping via "
-                "cloud-init usermod did not take effect."
+                "The 9p mapped-xattr uid remapping via cloud-init usermod "
+                "did not take effect — or the realignment ran but the 9p "
+                "xattr mapping did not follow."
+            )
+            assert stat_info.st_size > 0, (
+                f"VM-written file on host is empty ({guest_file}); the in-VM "
+                "write did not propagate content through the 9p share."
             )
         finally:
             if session_id:
-                sandbox("rm", session_id, check=False)
+                sandbox_as(op_uid, "rm", session_id, check=False)
+            shutil.rmtree(shared, ignore_errors=True)
