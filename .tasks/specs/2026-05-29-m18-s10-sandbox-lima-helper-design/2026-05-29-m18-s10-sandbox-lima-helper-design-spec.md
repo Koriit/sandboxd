@@ -178,19 +178,23 @@ Per-operator `LIMA_HOME` at `/var/lib/sandboxd/<op-uid>/lima/`. The
 directory is created by the daemon at first session-create for that
 operator, owned `sandbox:sandbox 0750`, with the following ACLs:
 
-* Access ACL `u:<op>:rwx` — grants the operator dir-level rwx.
-* Default ACL `d:u:<op>:rwx` — every child Lima creates inherits the
-  operator's rwx without the daemon having to touch it again.
+* Access ACL `u:<op>:rwx` — a **non-default** entry on the top dir
+  only, granting the operator dir-level rwx for traversal.
+* No default named-user ACL. The default ACL denies group and other
+  (`d:g::---,d:o::---`); it carries **no** `d:u:<op>:rwx` entry.
 
-Inside this directory, `limactl create` (helper-pivoted, running as
-the operator) writes `_config/user` as the operator uid, mode 0600,
-without any subsequent chown step. The key file itself does **not**
-receive an ACL: it relies on plain `st_mode`/owner match to satisfy
-OpenSSH `StrictKeyfileMode`. The ACL is only on the parent dir for
-traversal. Putting an ACL on the key file would be unnecessary
-(plain unix permissions already match) and would cause `ls -l` to
-display the `+` ACL marker on a file that operators reasonably
-expect to be vanilla.
+A default named-user ACL (`d:u:<op>:rwx`) was deliberately rejected.
+OpenSSH reads `st_mode`, not the ACL — and a default named-user entry
+forces the POSIX ACL **mask** onto every child file, which surfaces
+in the file's group bits. `_config/user` would then `stat(2)` as
+`0640`, and OpenSSH `StrictKeyfileMode` would reject the key
+(`bad permissions`), hanging the hostagent for the full start
+timeout. Instead, the helper sets `umask(0o077)` before `exec`, so
+`limactl create` (helper-pivoted, running as the operator) writes
+`_config/user` as the operator uid at mode 0600 — no ACL, no mask,
+no subsequent chown step. The operator owns the key outright; owner
+bits alone satisfy OpenSSH, and `ls -l` shows a vanilla file with no
+`+` ACL marker.
 
 The helper itself has file caps `cap_setuid+ep` and no others. The
 daemon has zero file caps. Caller authz inside the helper checks
@@ -796,16 +800,22 @@ the correct ACL:
 
 1. `mkdir -p /var/lib/sandboxd/<op-uid>/lima/` (created as
    `sandbox:sandbox 0750`).
-2. Apply access ACL `u:<op>:rwx` and default ACL `d:u:<op>:rwx` via
-   a `setfacl` shell-out wrapped in the daemon's existing
-   `run_with_timeout` envelope. Concrete invocation:
+2. Apply a non-default access ACL `u:<op>:rwx` for operator traversal
+   and a default ACL that denies group and other — but **no** default
+   named-user entry — via a `setfacl` shell-out wrapped in the
+   daemon's existing `run_with_timeout` envelope. Concrete invocation:
 
    ```
-   setfacl -m u:<op-uid>:rwx,d:u:<op-uid>:rwx /var/lib/sandboxd/<op-uid>/lima/
+   setfacl -m u:<op-uid>:rwx,d:g::---,d:o::--- /var/lib/sandboxd/<op-uid>/lima/
    ```
 
    (numeric uid form, no NSS round-trip; the daemon already has the
-   operator's uid from the session row.) The `acl` crate is rejected
+   operator's uid from the session row.) The default named-user entry
+   `d:u:<op-uid>:rwx` is intentionally omitted: it would force the
+   POSIX ACL mask onto `_config/user`, surfacing in the key's group
+   bits so OpenSSH `StrictKeyfileMode` rejects it (see § Privilege
+   model). The operator-pivoted `limactl create` writes the key 0600
+   under the helper's `umask(0o077)`; owner bits alone satisfy OpenSSH. The `acl` crate is rejected
    here — unmaintained since 2021, links against `libacl1`/`acl-dev`
    at build time, and a security-load-bearing operation should not
    depend on an unmaintained crate. `setfacl` is parallel to the
