@@ -283,7 +283,7 @@ clean:
 	rm -rf tests/e2e/.venv/
 	rm -rf site/node_modules site/dist
 	sudo -k rm -f "$(ROUTE_HELPER_TEST_PATH)"
-	sudo -k rm -f "$(SPAWN_HELPER_TEST_PATH)"
+	sudo -k rm -f "$(LIMA_HELPER_TEST_PATH)"
 	sudo -k rmdir --ignore-fail-on-non-empty /usr/local/libexec/sandboxd-test 2>/dev/null || true
 	@echo "[clean] removing e2e test operator '$(E2E_TEST_OPERATOR_NAME)' and its sudoers fragment (if present)"
 	sudo -k userdel $(E2E_TEST_OPERATOR_NAME) 2>/dev/null || true
