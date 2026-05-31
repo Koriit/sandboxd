@@ -574,20 +574,17 @@ install-route-helper-test-cap: sandboxd/target/.dev-env-stamps/route-helper-test
 
 sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/sandbox-route-helper
 	@mkdir -p $(dir $@)
-	@if [ -f "$(ROUTE_HELPER_TEST_PATH)" ] && \
-	    cmp -s "sandboxd/target/debug/sandbox-route-helper" "$(ROUTE_HELPER_TEST_PATH)" && \
-	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_net_admin && \
-	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_admin && \
-	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_ptrace; then \
-	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip, content matches test build)$(RESET)"; \
-	else \
-	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
-	  echo "[sudo] setcap cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip $(ROUTE_HELPER_TEST_PATH)"; \
-	  sudo -k install -D -m 0755 \
-	    sandboxd/target/debug/sandbox-route-helper \
-	    "$(ROUTE_HELPER_TEST_PATH)"; \
-	  sudo -k setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' "$(ROUTE_HELPER_TEST_PATH)"; \
-	fi
+	@# No cmp -s short-circuit here: the debug path is shared between
+	@# feature-gated and non-feature builds, so a plain `cargo build`
+	@# can overwrite it with a non-feature binary between make runs.
+	@# Always reinstall to guarantee the installed test binary matches
+	@# the --features test-env-override artifact built just above.
+	echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
+	echo "[sudo] setcap cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip $(ROUTE_HELPER_TEST_PATH)"; \
+	sudo -k install -D -m 0755 \
+	  sandboxd/target/debug/sandbox-route-helper \
+	  "$(ROUTE_HELPER_TEST_PATH)"; \
+	sudo -k setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' "$(ROUTE_HELPER_TEST_PATH)"
 	@touch $@
 
 # Build the test-feature debug binary into the workspace's default
@@ -668,18 +665,17 @@ install-lima-helper-test-cap: sandboxd/target/.dev-env-stamps/lima-helper-test.s
 
 sandboxd/target/.dev-env-stamps/lima-helper-test.stamp: sandboxd/target/debug/sandbox-lima-helper
 	@mkdir -p $(dir $@)
-	@if [ -f "$(LIMA_HELPER_TEST_PATH)" ] && \
-	    cmp -s "sandboxd/target/debug/sandbox-lima-helper" "$(LIMA_HELPER_TEST_PATH)" && \
-	    getcap "$(LIMA_HELPER_TEST_PATH)" 2>/dev/null | grep -q 'cap_setuid'; then \
-	  echo "$(GREEN)✓ already configured: $(LIMA_HELPER_TEST_PATH) (cap_setuid+ep, content matches test build)$(RESET)"; \
-	else \
-	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-lima-helper $(LIMA_HELPER_TEST_PATH)"; \
-	  echo "[sudo] setcap cap_setuid+ep $(LIMA_HELPER_TEST_PATH)"; \
-	  sudo -k install -D -m 0755 \
-	    sandboxd/target/debug/sandbox-lima-helper \
-	    "$(LIMA_HELPER_TEST_PATH)"; \
-	  sudo -k setcap 'cap_setuid+ep' "$(LIMA_HELPER_TEST_PATH)"; \
-	fi
+	@# No cmp -s short-circuit here: the debug path is shared between
+	@# feature-gated and non-feature builds, so a plain `cargo build`
+	@# can overwrite it with a non-feature binary between make runs.
+	@# Always reinstall to guarantee the installed test binary matches
+	@# the --features test-env-override artifact built just above.
+	echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-lima-helper $(LIMA_HELPER_TEST_PATH)"; \
+	echo "[sudo] setcap cap_setuid+ep $(LIMA_HELPER_TEST_PATH)"; \
+	sudo -k install -D -m 0755 \
+	  sandboxd/target/debug/sandbox-lima-helper \
+	  "$(LIMA_HELPER_TEST_PATH)"; \
+	sudo -k setcap 'cap_setuid+ep' "$(LIMA_HELPER_TEST_PATH)"
 	@touch $@
 
 .PHONY: sandboxd/target/debug/sandbox-lima-helper
