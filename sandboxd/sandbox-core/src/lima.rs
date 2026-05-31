@@ -573,6 +573,16 @@ if [ -n "$SANDBOX_QEMU_MEMORY_MB" ] && [ -n "$SANDBOX_QEMU_CPUS" ] \
         -p TasksMax=256 \
         "$REAL_QEMU" $EXTRA_ARGS "$@"
 else
+    # Cgroup limits are NOT applied to this session.
+    # Either systemd-run is absent or the user-systemd bus is
+    # unreachable (no active login session and loginctl enable-linger
+    # not enabled for the operator).
+    # To enable cgroup enforcement: run
+    #   loginctl enable-linger <operator-user>
+    # so the user manager persists across logouts, then restart the
+    # daemon.  Without an active user manager or enable-linger, every
+    # session VM boots without MemoryMax/CPUQuota/TasksMax limits.
+    echo "WARNING: sandboxd qemu-wrapper: user-systemd bus unreachable or systemd-run absent -- cgroup limits (MemoryMax/CPUQuota/TasksMax) are NOT applied to this VM. Run: loginctl enable-linger <operator-user>" >&2
     exec "$REAL_QEMU" $EXTRA_ARGS "$@"
 fi
 "#;
@@ -2030,8 +2040,11 @@ provision:
     ///    `SANDBOX_QEMU_CPUS` environment variables are set (propagated from
     ///    [`SessionConfig`] in [`start_vm`]), the wrapper uses `systemd-run` to
     ///    place the QEMU process in a scoped cgroup with memory and CPU limits.
-    ///    If `systemd-run` is not available, the wrapper falls back to running
-    ///    QEMU without cgroup limits.
+    ///    If `systemd-run` is absent **or** the operator's user-systemd bus is
+    ///    not reachable (no active login session and `loginctl enable-linger
+    ///    <operator>` not enabled), the wrapper falls back to running QEMU
+    ///    without cgroup limits and emits a warning to stderr. See
+    ///    `docs/guides/hardening.md` § "Prerequisite: `loginctl enable-linger`".
     ///
     /// Lima does not expose a way to pass extra QEMU arguments, so we
     /// interpose a shell wrapper that Lima invokes via the

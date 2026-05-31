@@ -70,7 +70,32 @@ cat /proc/<pid>/cgroup
 systemctl --user status sandbox.slice
 ```
 
-If `systemd-run` is not on `PATH` **or** the daemon's user-systemd bus is not reachable (for example when the daemon runs as the `sandbox` system user via the production systemd unit and `loginctl enable-linger sandbox` has not been issued), the wrapper falls back to running QEMU directly — device lockdown still applies, but resource limits default to the kernel's baseline. To restore the cgroup-limited posture for a system-user daemon, run `loginctl enable-linger <daemon-user>` so the user manager persists across logouts.
+If `systemd-run` is not on `PATH` **or** the daemon's user-systemd bus is not reachable, the wrapper falls back to running QEMU directly — device lockdown still applies, but resource limits default to the kernel's baseline. When this happens the QEMU wrapper prints a warning to stderr:
+
+```
+WARNING: sandboxd qemu-wrapper: user-systemd bus unreachable or systemd-run absent -- cgroup limits (MemoryMax/CPUQuota/TasksMax) are NOT applied to this VM. Run: loginctl enable-linger <operator-user>
+```
+
+#### Prerequisite: `loginctl enable-linger`
+
+**Cgroup enforcement requires a running user manager (`/run/user/<uid>`) for the operator.** A service-account operator that has no active login session and no linger enabled has `systemd-run` on `PATH` but no user bus, so `systemd-run --user --scope` would abort immediately with `Failed to connect to bus: No medium found`. The wrapper's `systemctl --user show-environment` probe catches this before exec'ing `systemd-run`, and falls back to running QEMU without limits.
+
+To permanently enable the user manager for a system-user operator (e.g. the `sandbox` account), run once as root:
+
+```bash
+loginctl enable-linger <operator-user>
+# Example for the sandbox system user:
+loginctl enable-linger sandbox
+```
+
+Without an active login session **or** `enable-linger`, session VMs boot **without** cgroup limits — `MemoryMax`, `CPUQuota`, and `TasksMax` are not enforced. Verify after enabling:
+
+```bash
+loginctl show-user <operator-user> | grep Linger
+# Expected: Linger=yes
+systemctl --user -M <operator-user>@ status
+# Expected: systemd user manager is active
+```
 
 ### Seccomp is deliberately off
 
