@@ -133,6 +133,9 @@ jobs:
               sandboxd/target/${ARCH}/release/sandbox-route-helper \
               "$stage/bin/sandbox-route-helper"
           install -m 0755 \
+              sandboxd/target/${ARCH}/release/sandbox-lima-helper \
+              "$stage/bin/sandbox-lima-helper"
+          install -m 0755 \
               sandboxd/target/${ARCH}/release/sandbox-guest \
               "$stage/bin/sandbox-guest"
           install -m 0644 \
@@ -154,6 +157,7 @@ jobs:
               "sandboxd":               {"path": "bin/sandboxd"},
               "sandbox":                {"path": "bin/sandbox"},
               "sandbox-route-helper":   {"path": "bin/sandbox-route-helper"},
+              "sandbox-lima-helper":    {"path": "bin/sandbox-lima-helper"},
               "sandbox-guest":          {"path": "bin/sandbox-guest"},
               "gateway-image":          {"path": f"images/sandbox-gateway-{ver}.tar",
                                           "docker_tag": f"sandbox-gateway:{ver}"},

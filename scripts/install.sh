@@ -952,6 +952,8 @@ install_binaries() {
     install_binary "$STAGE/bin/sandbox"  /usr/local/bin/sandbox  0755
     install_binary "$STAGE/bin/sandbox-route-helper" \
         /usr/local/libexec/sandboxd/sandbox-route-helper 0755
+    install_binary "$STAGE/bin/sandbox-lima-helper" \
+        /usr/local/libexec/sandboxd/sandbox-lima-helper 0755
     # sandbox-guest is a daemon-internal helper (not operator-facing):
     # the daemon stages it into its base_dir at startup so every
     # container session can bind-mount it read-only at
@@ -981,6 +983,30 @@ setcap_route_helper() {
     new=$(getcap "$helper" 2>/dev/null | awk '{print $NF}')
     [ "$new" = "$expected" ] || die "setcap verification failed: got '$new'"
     log_ok "step=setcap caps=$expected action=set"
+}
+
+# ----------------------------------------------------------------------------
+# Step 15b — Setcap on lima-helper.
+# ----------------------------------------------------------------------------
+
+setcap_lima_helper() {
+    helper=/usr/local/libexec/sandboxd/sandbox-lima-helper
+    setcap_arg="cap_setuid+ep"
+    # `getcap` output format varies by libcap version. Older libcap
+    # ( < ~2.30) emits ``<path> = <caps>+ep``; newer libcap (Ubuntu 22.04+,
+    # Fedora 36+) emits ``<path> <caps>=ep``. Both forms are equivalent; the
+    # kernel stores the bitmask, not the string. Normalise by replacing `+`
+    # with `=` before comparing so both render as ``cap_setuid=ep``.
+    expected="cap_setuid=ep"
+    current=$(getcap "$helper" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
+    if [ "$current" = "$expected" ]; then
+        log_ok "step=setcap caps=$setcap_arg action=skip reason=already-set"
+        return 0
+    fi
+    sudo -k setcap "$setcap_arg" "$helper"
+    new=$(getcap "$helper" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
+    [ "$new" = "$expected" ] || die "setcap verification failed: got '$new'"
+    log_ok "step=setcap caps=$setcap_arg action=set"
 }
 
 # ----------------------------------------------------------------------------
@@ -1248,6 +1274,7 @@ main() {
 
     install_binaries
     setcap_route_helper
+    setcap_lima_helper
     probe_bridge_helper
     setuid_bridge_helper
     install_bridge_conf

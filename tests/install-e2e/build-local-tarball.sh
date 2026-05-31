@@ -400,7 +400,7 @@ else
             --features sandbox-cli/test-env-override )
 fi
 
-for bin in sandboxd sandbox sandbox-route-helper sandbox-guest; do
+for bin in sandboxd sandbox sandbox-route-helper sandbox-lima-helper sandbox-guest; do
     if [ ! -x "$RELEASE_DIR/$bin" ]; then
         printf 'build-local-tarball.sh: missing release binary: %s/%s\n' \
             "$RELEASE_DIR" "$bin" >&2
@@ -477,6 +477,8 @@ install -m 0755 "$RELEASE_DIR/sandbox" \
     "$STAGE_DIR/bin/sandbox"
 install -m 0755 "$RELEASE_DIR/sandbox-route-helper" \
     "$STAGE_DIR/bin/sandbox-route-helper"
+install -m 0755 "$RELEASE_DIR/sandbox-lima-helper" \
+    "$STAGE_DIR/bin/sandbox-lima-helper"
 # sandbox-guest is a daemon-internal helper; install.sh lands it
 # under /usr/local/libexec/sandboxd/ on the host (FHS § 4.7).
 # The tarball uses a flat bin/ layout for simplicity — install.sh
@@ -513,6 +515,7 @@ artifacts = {
     "sandboxd":              {"path": "bin/sandboxd"},
     "sandbox":               {"path": "bin/sandbox"},
     "sandbox-route-helper":  {"path": "bin/sandbox-route-helper"},
+    "sandbox-lima-helper":   {"path": "bin/sandbox-lima-helper"},
     "sandbox-guest":         {"path": "bin/sandbox-guest"},
     "gateway-image":         {"path": f"images/sandbox-gateway-{ver}.tar",
                               "docker_tag": f"sandbox-gateway:{ver}"},

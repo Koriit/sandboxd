@@ -411,7 +411,9 @@ remove_users_conf() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 9 — Note that route-helper caps are removed with the binary.
+# Step 9 — Note that route-helper and lima-helper caps are removed with the
+#           binary (the kernel drops file capabilities when the file is
+#           unlinked, so removing the binary is sufficient).
 # ----------------------------------------------------------------------------
 
 defer_route_helper_caps() {
@@ -431,6 +433,7 @@ remove_binaries() {
     for bin in /usr/local/bin/sandboxd \
                /usr/local/bin/sandbox \
                /usr/local/libexec/sandboxd/sandbox-route-helper \
+               /usr/local/libexec/sandboxd/sandbox-lima-helper \
                /usr/local/libexec/sandboxd/sandbox-guest
     do
         if [ -f "$bin" ]; then
