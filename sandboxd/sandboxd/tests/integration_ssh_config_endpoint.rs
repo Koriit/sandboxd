@@ -452,10 +452,10 @@ async fn integration_get_ssh_config_lima_backend() {
                 Some("ssh-config-lima".to_string()),
                 BackendKind::Lima,
                 &owner,
-                owner_uid,
+                0,
                 "",
-                None,
-                None,
+                Some(owner_uid),
+                Some(gid.as_raw()),
             )
             .expect("create lima session row");
         session.id.to_string()
