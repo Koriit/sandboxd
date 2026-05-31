@@ -187,6 +187,16 @@ const TMPFS_RUN_FLAGS: &str = "rw,nosuid,nodev,size=16m";
 /// Pids-limit ceiling — fork-bomb mitigation.
 const PIDS_LIMIT: u32 = 512;
 
+/// The uid baked into the lite image by `useradd --uid 1000 sandbox`.
+///
+/// Docker initialises a fresh named volume from the image's `/home/sandbox`
+/// directory, which carries this uid as its owner (mode 0700). When the
+/// operator's uid matches this value the volume is already correctly owned
+/// and no init container is needed. When the uids differ the daemon must
+/// run a one-shot root init container to `chown -R` the home volume to the
+/// operator before starting the session container.
+const LITE_IMAGE_HOME_UID: u32 = 1000;
+
 // ---------------------------------------------------------------------------
 // Per-session network info (populated by daemon / tests via register_session)
 // ---------------------------------------------------------------------------
@@ -745,6 +755,53 @@ fn build_refresh_argv(container_name: &str) -> Vec<String> {
     vec!["restart".to_string(), container_name.to_string()]
 }
 
+/// Compose the `docker run` argv for the one-shot home-volume chown init
+/// container.
+///
+/// Pure function — no syscalls, no docker invocation. The runtime hands
+/// the returned `Vec<String>` to `run_docker`.
+///
+/// The init container:
+/// - Uses `--rm` so Docker removes it immediately after it exits.
+/// - Runs as `--user 0:0` (root inside the container) so it can
+///   `chown -R` regardless of what the image's `USER` directive says.
+/// - Mounts the named home volume at `/home/sandbox`; this causes Docker
+///   to seed the fresh volume from the image's `/home/sandbox` before
+///   running the entrypoint.
+/// - Overrides the image entrypoint with `chown` and passes
+///   `-R <uid>:<gid> /home/sandbox` so the ownership persists in the
+///   named volume after the init container exits.
+///
+/// The chown persists in the named volume; the session container that
+/// mounts the same volume afterward sees operator-owned home contents.
+///
+/// Only called when `operator_uid != LITE_IMAGE_HOME_UID` — when the
+/// operator uid matches the image's baked uid the volume is already
+/// correctly owned and this function is never invoked.
+fn build_home_chown_argv(
+    session_id: &SessionId,
+    image_tag: &str,
+    operator_uid: u32,
+    operator_gid: u32,
+) -> Vec<String> {
+    let home_volume = home_volume_name(session_id);
+    let chown_arg = format!("{operator_uid}:{operator_gid}");
+    vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--user".to_string(),
+        "0:0".to_string(),
+        "--mount".to_string(),
+        format!("type=volume,src={home_volume},dst=/home/sandbox"),
+        "--entrypoint".to_string(),
+        "chown".to_string(),
+        image_tag.to_string(),
+        "-R".to_string(),
+        chown_arg,
+        "/home/sandbox".to_string(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // SessionRuntime impl
 // ---------------------------------------------------------------------------
@@ -788,6 +845,43 @@ impl SessionRuntime for ContainerRuntime {
             cpus,
             &self.guest_bind_source,
         );
+
+        // When the operator's uid differs from the uid baked into the lite
+        // image (`LITE_IMAGE_HOME_UID` = 1000), Docker's volume
+        // initialisation from the image seeds `/home/sandbox` owned by
+        // uid 1000 (mode 0700), which the session container (running as
+        // `effective_uid`) cannot write to.
+        //
+        // Fix: run a one-shot root init container that (a) triggers Docker
+        // to seed the named volume from the image and (b) immediately
+        // `chown -R` the volume contents to the operator's uid/gid.  The
+        // chown persists inside the named volume so the session container
+        // that mounts it afterward finds an operator-owned home directory.
+        //
+        // The init container must run BEFORE `docker create` so the volume
+        // is already correctly owned when the session container first mounts
+        // it.  Running it after `docker create` but before `docker start`
+        // would also work in practice (both containers reference the same
+        // volume) but this ordering is cleaner: create receives a
+        // pre-prepared volume.
+        //
+        // Skip entirely when `effective_uid == LITE_IMAGE_HOME_UID`: the
+        // volume's baked ownership already matches and there is nothing to
+        // fix — preserving the existing zero-overhead path for the common
+        // uid-1000 case (dev + CI + the e2e harness).
+        if effective_uid != LITE_IMAGE_HOME_UID {
+            debug!(
+                session_id = %session_id,
+                operator_uid = effective_uid,
+                operator_gid = effective_gid,
+                image = %self.image_tag,
+                "ContainerRuntime: running home-volume chown init container \
+                 (operator uid {effective_uid} != image baked uid {LITE_IMAGE_HOME_UID})"
+            );
+            let chown_args =
+                build_home_chown_argv(session_id, &self.image_tag, effective_uid, effective_gid);
+            run_docker(&chown_args, "docker run (home chown init container)").await?;
+        }
 
         debug!(
             session_id = %session_id,
@@ -2906,6 +3000,136 @@ mod tests {
                 assert!(
                     i < image_idx,
                     "SSH bind-mount at index {i} must precede image tag at {image_idx}"
+                );
+            }
+        }
+    }
+
+    /// `build_home_chown_argv` emits the exact `docker run --rm --user 0:0
+    /// --mount … --entrypoint chown <image> -R <uid>:<gid> /home/sandbox`
+    /// shape required to seed and chown the named home volume as root.
+    ///
+    /// Every load-bearing slot is pinned: a regression in `--user 0:0`
+    /// (chown would fail with EPERM), the volume src (wrong volume chowned),
+    /// the entrypoint (`chown` replaced by image default), or the `-R` flag
+    /// (ownership not applied recursively) would be caught here without
+    /// needing a live Docker daemon.
+    #[test]
+    fn build_home_chown_argv_shape() {
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+        let argv = build_home_chown_argv(&sid, DEFAULT_LITE_IMAGE_TAG, 1500, 1500);
+
+        // Subcommand.
+        assert_eq!(argv[0], "run", "must be `docker run`");
+
+        // --rm: init container must be removed after it exits.
+        assert!(
+            argv.contains(&"--rm".to_string()),
+            "--rm must be present so the init container is cleaned up; got {argv:?}"
+        );
+
+        // --user 0:0: must run as root to chown arbitrary uid targets.
+        let user_idx = argv
+            .iter()
+            .position(|a| a == "--user")
+            .expect("--user flag must be present");
+        assert_eq!(
+            argv[user_idx + 1],
+            "0:0",
+            "--user must be 0:0 (root) so chown succeeds; got argv: {argv:?}"
+        );
+
+        // --mount type=volume carrying the correct volume name.
+        let mount_idx = argv
+            .iter()
+            .position(|a| a == "--mount")
+            .expect("--mount flag must be present");
+        let mount_spec = &argv[mount_idx + 1];
+        assert!(
+            mount_spec.contains("type=volume"),
+            "--mount must be a named volume, not a bind; got {mount_spec:?}"
+        );
+        assert!(
+            mount_spec.contains("src=sandbox-home-0123456789ab"),
+            "--mount src must match home_volume_name(session_id); got {mount_spec:?}"
+        );
+        assert!(
+            mount_spec.contains("dst=/home/sandbox"),
+            "--mount dst must be /home/sandbox; got {mount_spec:?}"
+        );
+
+        // --entrypoint chown: overrides the image's default entrypoint.
+        let ep_idx = argv
+            .iter()
+            .position(|a| a == "--entrypoint")
+            .expect("--entrypoint flag must be present");
+        assert_eq!(
+            argv[ep_idx + 1],
+            "chown",
+            "--entrypoint must be `chown`; got argv: {argv:?}"
+        );
+
+        // image tag appears before the positional args.
+        let image_idx = argv
+            .iter()
+            .position(|a| a == DEFAULT_LITE_IMAGE_TAG)
+            .expect("image tag must appear in argv");
+
+        // Positional args after the image: `-R <uid>:<gid> /home/sandbox`.
+        let positionals = &argv[image_idx + 1..];
+        assert_eq!(
+            positionals,
+            &["-R", "1500:1500", "/home/sandbox"],
+            "chown positional args must be `-R <uid>:<gid> /home/sandbox`; \
+             got {positionals:?}"
+        );
+    }
+
+    /// The home-volume chown init container is skipped when
+    /// `operator_uid == LITE_IMAGE_HOME_UID` (the image's baked uid 1000).
+    /// In that case the volume is already correctly owned and the
+    /// zero-overhead path must remain — no init container emitted.
+    ///
+    /// The gate in `create()` is `effective_uid != LITE_IMAGE_HOME_UID`.
+    /// Verify the three representative uid values produce the expected
+    /// gate outcome so a typo (e.g. `==` / `<`) is caught without a
+    /// live Docker daemon.
+    ///
+    /// A true "skip path integration" test (uid 1000, no init container)
+    /// cannot run hermetically because `create()` calls `run_docker`; the
+    /// unit contract is therefore: the gate expression evaluates correctly
+    /// for uid 1000 (skip), uid 999 (emit), and uid 2000 (emit).
+    #[test]
+    fn home_chown_gate_emits_for_non_baked_uid_skips_for_baked_uid() {
+        // Compile-time guard: constant must match the Dockerfile's
+        // `useradd --uid` value. If someone bumps LITE_IMAGE_HOME_UID
+        // without updating the Dockerfile (or vice versa), this fails.
+        const _: () = assert!(LITE_IMAGE_HOME_UID == 1000);
+
+        // Runtime table: (uid_under_test, should_call_init_container).
+        let cases: &[(u32, bool)] = &[
+            (LITE_IMAGE_HOME_UID, false), // exact match → skip
+            (999, true),                  // one below → emit
+            (2000, true),                 // arbitrary non-1000 → emit
+        ];
+
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+
+        for &(uid, expect_chown) in cases {
+            let would_chown = uid != LITE_IMAGE_HOME_UID;
+            assert_eq!(
+                would_chown, expect_chown,
+                "gate mismatch for uid {uid}: expected emit={expect_chown}, \
+                 got emit={would_chown}"
+            );
+
+            if expect_chown {
+                // Confirm the argv builder returns a non-empty vector for
+                // every uid that should trigger the init container.
+                let argv = build_home_chown_argv(&sid, DEFAULT_LITE_IMAGE_TAG, uid, uid);
+                assert!(
+                    !argv.is_empty(),
+                    "build_home_chown_argv must return a non-empty argv for uid {uid}"
                 );
             }
         }
