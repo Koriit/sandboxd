@@ -41,7 +41,11 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use sandbox_core::SshConfigDto;
+use sandbox_core::backend::BackendKind;
+use sandbox_core::{
+    Direction as CoreDirection, SSH_TRANSPORT_TOKEN, SshConfigDto, WorkspaceRsyncOptions,
+    build_workspace_rsync_argv,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::ssh_config;
@@ -207,8 +211,11 @@ pub enum WorkspaceDirection {
 /// path when supplied).
 ///
 /// Returns argv with `"rsync"` as `argv[0]` so the call site can pass
-/// `argv[1..]` to `Command::args`. Mirrors the convention the
-/// pre-rewrite `plan_workspace_sync_argv` used.
+/// `argv[1..]` to `Command::args`. Argv construction is delegated to
+/// [`sandbox_core::build_workspace_rsync_argv`] with
+/// `custom_transport = Some("ssh")` (the SSH-alias path); this
+/// function owns the CLI-specific gates (`force`/`dry_run` mutex,
+/// `dest_override` resolution) that sit above the pure argv builder.
 pub fn plan_workspace_rsync_argv(plan: &WorkspaceRsyncPlan) -> Result<Vec<String>, String> {
     // Exactly one of `force` / `dry_run` must be set. Clap's
     // `conflicts_with` already catches both-set; the neither-set case
@@ -223,47 +230,45 @@ pub fn plan_workspace_rsync_argv(plan: &WorkspaceRsyncPlan) -> Result<Vec<String
         _ => {}
     }
 
-    let with_slash = |p: &str| -> String {
-        if p.ends_with('/') {
-            p.to_string()
-        } else {
-            format!("{p}/")
-        }
-    };
-
+    // `dest_override` is a CLI-level concept: on a Pull, the operator
+    // can redirect the host destination to a different path.  Resolve
+    // it here before handing off to the core builder.
     let host_path = match (plan.direction, plan.dest_override.as_deref()) {
         (WorkspaceDirection::Pull, Some(dest)) => dest.to_string(),
         _ => plan.host_path.clone(),
     };
 
-    let host_arg = with_slash(&host_path);
-    let remote_arg = format!("{}:{}", plan.alias, with_slash(&plan.guest_path));
-    let (src, dst) = match plan.direction {
-        WorkspaceDirection::Push => (host_arg, remote_arg),
-        WorkspaceDirection::Pull => (remote_arg, host_arg),
+    let core_direction = match plan.direction {
+        WorkspaceDirection::Push => CoreDirection::Push,
+        WorkspaceDirection::Pull => CoreDirection::Pull,
     };
 
-    let mut argv: Vec<String> = Vec::with_capacity(12);
-    argv.push("rsync".to_string());
-    if plan.safe_links {
-        // `--safe-links` does not compose with `-L`; split `-aL` into
-        // `-a --safe-links`.
-        argv.push("-a".to_string());
-        argv.push("--safe-links".to_string());
-    } else {
-        argv.push("-aL".to_string());
-    }
-    argv.push("--delete".to_string());
-    if !plan.no_gitignore {
-        argv.push("--filter=:- .gitignore".to_string());
-    }
-    argv.push("-e".to_string());
-    argv.push("ssh".to_string());
-    if plan.dry_run {
-        argv.push("--dry-run".to_string());
-    }
-    argv.push(src);
-    argv.push(dst);
+    // The CLI uses the SSH-alias transport (`-e ssh`); `custom_transport`
+    // overrides the backend-derived default in the core builder.
+    // `BackendKind` does not affect the argv when `custom_transport` is
+    // set, so `Lima` is used as a harmless placeholder.
+    let core_opts = WorkspaceRsyncOptions {
+        backend: BackendKind::Lima,
+        custom_transport: Some(SSH_TRANSPORT_TOKEN.to_string()),
+        session_name: plan.alias.to_string(),
+        host_path,
+        guest_path: plan.guest_path.clone(),
+        direction: core_direction,
+        no_gitignore: plan.no_gitignore,
+        dry_run: plan.dry_run,
+        safe_links: plan.safe_links,
+        // Operator-driven push/pull does not use `--mkpath`; the
+        // destination already exists (the session is running).
+        mkpath: false,
+    };
+
+    // The core builder returns argv WITHOUT the leading `"rsync"` program
+    // name.  Prepend it here to match the historical convention this
+    // function established (call sites pass `argv[1..]` to
+    // `Command::args`, keeping `argv[0]` as the program name for
+    // diagnostic output).
+    let mut argv = vec!["rsync".to_string()];
+    argv.extend(build_workspace_rsync_argv(&core_opts));
     Ok(argv)
 }
 

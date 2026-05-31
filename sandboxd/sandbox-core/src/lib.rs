@@ -127,4 +127,6 @@ pub use users_conf::{
 };
 pub use vm_network::{attach_vm_to_bridge, detach_vm_from_bridge};
 pub use workspace_lock::{LockState, LockToken, WorkspaceOp};
-pub use workspace_rsync::{Direction, WorkspaceRsyncOptions, build_workspace_rsync_argv};
+pub use workspace_rsync::{
+    Direction, SSH_TRANSPORT_TOKEN, WorkspaceRsyncOptions, build_workspace_rsync_argv,
+};

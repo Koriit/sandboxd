@@ -62,6 +62,14 @@ use crate::process::run_with_timeout;
 /// token in an argv array built for rsync, not a daemon `Command::new`.
 const LIMACTL_SHELL_TOKEN: &str = "limactl shell";
 
+/// Rsync `-e` transport token for the SSH-alias path used by the CLI's
+/// `sandbox workspace push|pull`. The operator's `~/.ssh/config`
+/// (managed by the daemon's ssh-config machinery) resolves
+/// `sandbox-<id>` to the full per-session `ProxyCommand` stanza.
+/// Re-exported so `sandbox-cli::ssh_commands` can use it when
+/// delegating argv construction to [`build_workspace_rsync_argv`].
+pub const SSH_TRANSPORT_TOKEN: &str = "ssh";
+
 /// Direction of a workspace rsync mirror. Push: host → guest; Pull:
 /// guest → host. Carried into [`build_workspace_rsync_argv`] so the
 /// builder emits the correct src/dst ordering. A flat enum rather
@@ -84,9 +92,15 @@ pub enum Direction {
 ///
 /// **Field semantics.**
 ///
-/// - `backend` — picks the rsync shell-transport (`-e <shell>`) value:
-///   `"limactl shell"` for Lima, `"docker exec -i"` for container.
-///   Mirrors the convention `plan_sync_command` uses.
+/// - `backend` — picks the rsync shell-transport (`-e <shell>`) value
+///   when `custom_transport` is `None`: `"limactl shell"` for Lima,
+///   `"docker exec -i"` for container. Mirrors the convention
+///   `plan_sync_command` uses.
+/// - `custom_transport` — when `Some`, overrides the backend-derived
+///   transport. The CLI's SSH-alias path sets this to `"ssh"` (via
+///   [`SSH_TRANSPORT_TOKEN`]) so the operator's `~/.ssh/config`
+///   stanza resolves the full proxy chain. When `None` (the default
+///   for daemon-side calls), `backend` drives the selection.
 /// - `session_name` — the `sandbox-<id>` form the backends accept on
 ///   the shell transport. Concatenated into the
 ///   `sandbox-<name>:<path>/` remote spec.
@@ -110,6 +124,9 @@ pub enum Direction {
 #[derive(Debug, Clone)]
 pub struct WorkspaceRsyncOptions {
     pub backend: BackendKind,
+    /// When `Some`, overrides the backend-derived `-e <transport>`.
+    /// Set to [`SSH_TRANSPORT_TOKEN`] by the CLI's SSH-alias path.
+    pub custom_transport: Option<String>,
     pub session_name: String,
     pub host_path: String,
     pub guest_path: String,
@@ -145,13 +162,19 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
     // Shell-transport: `-e <transport>` slots in as rsync's remote-
     // shell exec, matching the convention `plan_sync_command` uses
     // for operator-driven `sandbox sync` in the CLI.
-    let transport = match opts.backend {
-        BackendKind::Lima => LIMACTL_SHELL_TOKEN,
-        // `-i` forwards stdin into the container so rsync can speak
-        // its binary protocol both ways. No `-t` — a TTY would line-
-        // buffer and corrupt the wire format. Mirrors
-        // `plan_sync_command`.
-        BackendKind::Container => "docker exec -i",
+    //
+    // When `custom_transport` is set (e.g. `"ssh"` for the CLI's
+    // SSH-alias path), it overrides the backend-derived default.
+    let transport: &str = match opts.custom_transport.as_deref() {
+        Some(t) => t,
+        None => match opts.backend {
+            BackendKind::Lima => LIMACTL_SHELL_TOKEN,
+            // `-i` forwards stdin into the container so rsync can speak
+            // its binary protocol both ways. No `-t` — a TTY would line-
+            // buffer and corrupt the wire format. Mirrors
+            // `plan_sync_command`.
+            BackendKind::Container => "docker exec -i",
+        },
     };
 
     // Trailing-slash rule: both
@@ -258,6 +281,7 @@ pub async fn run_initial_push(
     // flags but goes through the same shared builder.
     let argv = build_workspace_rsync_argv(&WorkspaceRsyncOptions {
         backend,
+        custom_transport: None,
         session_name: session_name.to_string(),
         host_path: host_path.to_string(),
         guest_path: guest_path.to_string(),
@@ -466,6 +490,7 @@ mod tests {
     ) -> WorkspaceRsyncOptions {
         WorkspaceRsyncOptions {
             backend,
+            custom_transport: None,
             session_name: session_name.to_string(),
             host_path: host_path.to_string(),
             guest_path: guest_path.to_string(),
@@ -661,6 +686,7 @@ mod tests {
     fn build_argv_pull_swaps_src_and_dst() {
         let argv = build_workspace_rsync_argv(&WorkspaceRsyncOptions {
             backend: BackendKind::Lima,
+            custom_transport: None,
             session_name: "sandbox-pull1".to_string(),
             host_path: "/home/op/work".to_string(),
             guest_path: "/home/sandbox/workspace".to_string(),
