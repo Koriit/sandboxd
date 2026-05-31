@@ -2352,6 +2352,62 @@ async fn create_session(
             }
         }
 
+        // sshd-readiness probe (container backend only).
+        //
+        // Run a one-shot `docker exec <ctr> ss -tlnH "( sport = :22 )"`
+        // after `docker start` returns. The result is persisted as
+        // `sshd_ready` on the session row so the proxy short-circuit
+        // can refuse early with `BACKEND_UNAVAILABLE` (4001) when sshd
+        // did not come up, rather than opening a hang-prone tunnel.
+        //
+        // Best-effort: any probe error (exec failure, docker CLI
+        // unavailable, join error) is logged and the field stays `None`
+        // — the proxy falls back to the legacy "attempt the tunnel"
+        // behaviour so a transient probe failure does not break the
+        // create-session flow.
+        {
+            let container_name = format!("sandbox-{session_id}");
+            let probe_result =
+                tokio::task::spawn_blocking(move || probe_container_sshd_ready(&container_name))
+                    .await;
+            let ready_opt: Option<bool> = match probe_result {
+                Ok(Ok(ready)) => Some(ready),
+                Ok(Err(e)) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "sshd-readiness probe failed; sshd_ready left as None"
+                    );
+                    None
+                }
+                Err(join_err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %join_err,
+                        "sshd-readiness probe task panicked; sshd_ready left as None"
+                    );
+                    None
+                }
+            };
+            if let Some(ready) = ready_opt {
+                if let Err(e) = state.store.set_sshd_ready(&session_id, ready) {
+                    // Non-fatal: log and continue. The proxy falls back to
+                    // the legacy behaviour when sshd_ready is None.
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to persist sshd_ready; proxy will use legacy behaviour"
+                    );
+                } else {
+                    debug!(
+                        session_id = %session_id,
+                        sshd_ready = ready,
+                        "sshd-readiness probe complete"
+                    );
+                }
+            }
+        }
+
         // ---- Per-session gateway + event/DNS-gate wiring ----
         //
         // Mirrors `setup_session_networking` steps 1-8. We do not
@@ -6147,6 +6203,43 @@ fn truncate_for_diagnostic(s: &str, max_chars: usize) -> String {
         out.push_str("…[truncated]");
         out
     }
+}
+
+/// Best-effort sshd-readiness probe for a container session.
+///
+/// Runs `docker exec <container_name> ss -tlnH "( sport = :22 )"` inside
+/// the container and returns `Ok(true)` when sshd is listening on port 22,
+/// `Ok(false)` when the exec succeeds but no listening socket is found.
+///
+/// Errors are caller-classified as "probe failed" and mapped to `None`
+/// (unknown) upstream — session creation does not fail on a probe error.
+/// This is a synchronous `std::process::Command` call; wrap in
+/// `tokio::task::spawn_blocking` at the call site per the
+/// project's standard convention.
+fn probe_container_sshd_ready(container_name: &str) -> Result<bool, SandboxError> {
+    use std::process::Command;
+
+    let output = Command::new("docker")
+        .args(["exec", container_name, "ss", "-tlnH", "( sport = :22 )"])
+        .output()
+        .map_err(|e| {
+            SandboxError::Internal(format!(
+                "sshd-readiness probe: failed to run docker exec for {container_name}: {e}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Internal(format!(
+            "sshd-readiness probe: docker exec exited non-zero for {container_name}: {}",
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `ss -tlnH` outputs one line per listening socket; any non-empty
+    // output means at least one LISTEN socket matched the filter.
+    Ok(!stdout.trim().is_empty())
 }
 
 /// Inner body of [`teardown_session_networking`], parameterised on the

@@ -628,8 +628,8 @@ impl SessionStore {
         let res = conn.execute(
             "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend, \
                  owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
-                 operator_uid, operator_gid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 operator_uid, operator_gid, sshd_ready)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session.id.as_str(),
                 session.name,
@@ -646,6 +646,8 @@ impl SessionStore {
                 // path (no `--user <uid>:<gid>` argv; no Lima cloud-init usermod).
                 session.operator_uid.map(|u| u as i64),
                 session.operator_gid.map(|g| g as i64),
+                // V010: nullable; None = "probe not yet run / Lima / pre-V010 row".
+                session.sshd_ready.map(|b| b as i64),
             ],
         );
 
@@ -680,7 +682,7 @@ impl SessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
                  owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
-                 operator_uid, operator_gid
+                 operator_uid, operator_gid, sshd_ready
              FROM sessions WHERE id = ?1 AND owner_username = ?2",
         )?;
 
@@ -711,7 +713,7 @@ impl SessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
                  owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
-                 operator_uid, operator_gid
+                 operator_uid, operator_gid, sshd_ready
              FROM sessions WHERE id = ?1",
         )?;
 
@@ -743,7 +745,7 @@ impl SessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
                  owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
-                 operator_uid, operator_gid
+                 operator_uid, operator_gid, sshd_ready
              FROM sessions ORDER BY created_at ASC",
         )?;
 
@@ -776,7 +778,7 @@ impl SessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
                  owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
-                 operator_uid, operator_gid
+                 operator_uid, operator_gid, sshd_ready
              FROM sessions WHERE owner_username = ?1 ORDER BY created_at ASC",
         )?;
 
@@ -845,6 +847,34 @@ impl SessionStore {
         if rows_affected == 0 {
             return Err(SandboxError::SessionNotFound(id.to_string()));
         }
+
+        Ok(())
+    }
+
+    /// Persist the sshd-readiness probe outcome for a container session.
+    ///
+    /// Called once after `docker start` returns on the container backend
+    /// create path (daemon `create_session`). Best-effort: the daemon
+    /// calls this after the probe but does not fail session creation if
+    /// the write fails — a transient store error leaves `sshd_ready`
+    /// as `None` (unknown), which the proxy falls back to the legacy
+    /// "attempt the tunnel" behaviour for.
+    ///
+    /// Not filtered on `owner_username` so the daemon-internal create
+    /// path (which has no HTTP caller scope at this point) can write it
+    /// directly. The column is write-once-at-create-time and carries no
+    /// sensitive content, so the omission of the ownership filter is safe
+    /// here.
+    pub fn set_sshd_ready(&self, id: &SessionId, ready: bool) -> Result<(), SandboxError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        conn.execute(
+            "UPDATE sessions SET sshd_ready = ?1 WHERE id = ?2",
+            params![ready as i64, id.as_str()],
+        )?;
 
         Ok(())
     }
@@ -1048,7 +1078,7 @@ impl SessionStore {
             let mut stmt = conn.prepare(
                 "SELECT id, name, state, config, created_at, updated_at, backend, \
                      owner_username, guest_protocol_version, guest_binary_version, \
-                     ssh_keypair_json, operator_uid, operator_gid
+                     ssh_keypair_json, operator_uid, operator_gid, sshd_ready
                  FROM sessions WHERE name = ?1 AND owner_username = ?2",
             )?;
 
@@ -1846,7 +1876,7 @@ enum InsertError {
 /// Column order matches every `SELECT ... FROM sessions` in this module:
 /// `id, name, state, config, created_at, updated_at, backend,
 ///  owner_username, guest_protocol_version, guest_binary_version,
-///  ssh_keypair_json, operator_uid, operator_gid`.
+///  ssh_keypair_json, operator_uid, operator_gid, sshd_ready`.
 fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let id_str: String = row.get(0)?;
     let name: Option<String> = row.get(1)?;
@@ -1884,6 +1914,10 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     // `try_from` to keep the surfaced u32 honest.
     let operator_uid_raw: Option<i64> = row.get(11)?;
     let operator_gid_raw: Option<i64> = row.get(12)?;
+    // Column 13 (`sshd_ready`) was introduced by V010. Nullable: `NULL`
+    // means "probe not yet run / Lima / pre-V010 row". Stored as
+    // INTEGER (0 = false, 1 = true) per SQLite boolean convention.
+    let sshd_ready_raw: Option<i64> = row.get(13)?;
 
     let id = SessionId::parse(&id_str)
         .map_err(|e| SandboxError::Internal(format!("invalid session id in database: {e}")))?;
@@ -1935,6 +1969,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         None => None,
     };
 
+    let sshd_ready = sshd_ready_raw.map(|v| v != 0);
+
     Ok(Session {
         id,
         name,
@@ -1949,6 +1985,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         ssh_keypair,
         operator_uid,
         operator_gid,
+        sshd_ready,
     })
 }
 

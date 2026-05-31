@@ -114,6 +114,30 @@ pub async fn handle_proxy(
         "opening proxy WebSocket",
     );
 
+    // sshd-readiness short-circuit (container backend only).
+    //
+    // When the session's probe recorded `Some(false)` — sshd did not
+    // start inside the container — refuse the tunnel immediately with
+    // `BACKEND_UNAVAILABLE` (4001) rather than connecting a channel
+    // that will hang or return an opaque SSH error. A `None` value
+    // (Lima session, pre-V010 row, or probe error at create time)
+    // falls through to the legacy "attempt the tunnel" path so no
+    // existing behaviour regresses.
+    if session.sshd_ready == Some(false) {
+        warn!(
+            session = %session_id,
+            "proxy: sshd_ready=false; refusing tunnel with BACKEND_UNAVAILABLE"
+        );
+        return Ok(ws.on_upgrade(|socket| async move {
+            close_with_code(
+                socket,
+                close_codes::BACKEND_UNAVAILABLE,
+                "sshd did not start in this session",
+            )
+            .await;
+        }));
+    }
+
     // The upgrade closure may not borrow state captures (it outlives
     // the handler future), so hand it owned clones.
     let lima_registry_for_upgrade = Arc::clone(&state.lima_registry);
@@ -253,11 +277,15 @@ async fn pump_container(socket: WebSocket, session_id: &SessionId) -> Result<(),
         .ok_or_else(|| SandboxError::Internal("docker exec child has no stdout".into()))?;
     let stderr = child.stderr.take();
 
-    // Drive the byte pump. `bidirectional_ferry` consumes the socket
-    // halves; we get a single `Result` covering both directions.
-    let ferry_result = bidirectional_ferry(socket, stdin, stdout).await;
+    // Drive the byte pump. On an early/unexpected backend exit (backend
+    // EOF while the WebSocket is still open), `bidirectional_ferry`
+    // returns `FerryOutcome::BackendExitedEarly` with the reclaimed WS
+    // sink so we can send a structured `BACKEND_ERROR` (4002) close
+    // frame. On a normal client-initiated close it returns
+    // `FerryOutcome::ClientClosed` and we leave the socket alone.
+    let ferry_outcome = bidirectional_ferry(socket, stdin, stdout).await;
 
-    // Capture exit status + any stderr captured before close.
+    // Capture exit status + any stderr produced before close.
     let exit_status = child.wait().await.ok();
     let stderr_bytes = if let Some(mut s) = stderr {
         let mut buf = Vec::with_capacity(256);
@@ -267,21 +295,58 @@ async fn pump_container(socket: WebSocket, session_id: &SessionId) -> Result<(),
         Vec::new()
     };
 
-    match ferry_result {
-        Ok(FerryStats {
-            ws_to_backend,
-            backend_to_ws,
-        }) => debug!(
-            container = %container_name,
-            bytes_ws_to_backend = ws_to_backend,
-            bytes_backend_to_ws = backend_to_ws,
-            "proxy pump finished",
-        ),
-        Err(e) => warn!(
-            container = %container_name,
-            error = %e,
-            "proxy pump errored",
-        ),
+    match ferry_outcome {
+        Ok(FerryOutcome::ClientClosed(stats)) => {
+            debug!(
+                container = %container_name,
+                bytes_ws_to_backend = stats.ws_to_backend,
+                bytes_backend_to_ws = stats.backend_to_ws,
+                "proxy pump finished (client closed)",
+            );
+        }
+        Ok(FerryOutcome::BackendExitedEarly { stats, mut ws_sink }) => {
+            debug!(
+                container = %container_name,
+                bytes_ws_to_backend = stats.ws_to_backend,
+                bytes_backend_to_ws = stats.backend_to_ws,
+                "proxy pump: backend exited while WebSocket still open",
+            );
+            // Backend exited while WS was still open. Check exit status:
+            // non-zero → BACKEND_ERROR (4002) with detail so the CLI
+            // shim can render an actionable diagnostic; zero / unknown
+            // → clean Close(None) (normal sshd session end raced the WS).
+            let is_error = exit_status.as_ref().map(|s| !s.success()).unwrap_or(false);
+            if is_error {
+                let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+                let code = exit_status.as_ref().and_then(|s| s.code()).unwrap_or(-1);
+                let msg = format!(
+                    "docker exec for {container_name} exited with {code}; stderr: {}",
+                    stderr_text.trim()
+                );
+                error!(
+                    container = %container_name,
+                    exit = code,
+                    stderr = %stderr_text.trim(),
+                    "docker exec socat exited non-zero while WebSocket was open"
+                );
+                // Reclaimed sink: send the structured 4002 close frame
+                // that was unreachable before this restructure.
+                close_sink_with_code(ws_sink, close_codes::BACKEND_ERROR, &msg).await;
+                return Err(SandboxError::Gateway(msg));
+            } else {
+                // Normal clean backend exit (socat/sshd finished cleanly).
+                // Send a graceful Close(None) so the operator's SSH client
+                // observes a clean disconnect.
+                let _ = ws_sink.send(Message::Close(None)).await;
+            }
+        }
+        Err(e) => {
+            warn!(
+                container = %container_name,
+                error = %e,
+                "proxy pump errored",
+            );
+        }
     }
 
     if let Some(status) = exit_status {
@@ -291,7 +356,7 @@ async fn pump_container(socket: WebSocket, session_id: &SessionId) -> Result<(),
                 container = %container_name,
                 exit = ?status.code(),
                 stderr = %stderr_text,
-                "docker exec socat exited non-zero",
+                "docker exec socat exited non-zero (client had already closed)",
             );
             return Err(SandboxError::Gateway(format!(
                 "docker exec for {container_name} exited with {:?}; stderr: {}",
@@ -361,15 +426,28 @@ async fn pump_lima(
 
     let (tcp_read, tcp_write) = tcp.into_split();
     match bidirectional_ferry(socket, tcp_write, tcp_read).await {
-        Ok(FerryStats {
-            ws_to_backend,
-            backend_to_ws,
-        }) => debug!(
-            session = %session_id,
-            bytes_ws_to_backend = ws_to_backend,
-            bytes_backend_to_ws = backend_to_ws,
-            "Lima proxy pump finished",
-        ),
+        Ok(FerryOutcome::ClientClosed(stats)) => {
+            debug!(
+                session = %session_id,
+                bytes_ws_to_backend = stats.ws_to_backend,
+                bytes_backend_to_ws = stats.backend_to_ws,
+                "Lima proxy pump finished (client closed)",
+            );
+        }
+        Ok(FerryOutcome::BackendExitedEarly { stats, mut ws_sink }) => {
+            // Lima TCP stream ended while WS was still open. There is no
+            // exit code for a TCP stream — a clean close means sshd exited
+            // normally (operator's SSH session ended). Send a clean
+            // Close(None) so the operator's SSH client observes a
+            // graceful disconnect.
+            debug!(
+                session = %session_id,
+                bytes_ws_to_backend = stats.ws_to_backend,
+                bytes_backend_to_ws = stats.backend_to_ws,
+                "Lima proxy pump: TCP stream ended (backend exited first)",
+            );
+            let _ = ws_sink.send(Message::Close(None)).await;
+        }
         Err(e) => warn!(session = %session_id, error = %e, "Lima proxy pump errored"),
     }
     Ok(())
@@ -385,6 +463,18 @@ async fn close_with_code(mut socket: WebSocket, code: u16, reason: &str) {
     let _ = socket.send(Message::Close(Some(frame))).await;
 }
 
+/// Send a structured close frame on a reclaimed `SplitSink`. Used by
+/// the `BackendExitedEarly` branch of `bidirectional_ferry` callers to
+/// emit `BACKEND_ERROR` (4002) after the ferry has already consumed
+/// the `WebSocket` into its split halves. Best-effort.
+async fn close_sink_with_code(mut ws_sink: SplitSink<WebSocket, Message>, code: u16, reason: &str) {
+    let frame = CloseFrame {
+        code,
+        reason: Utf8Bytes::from(reason),
+    };
+    let _ = ws_sink.send(Message::Close(Some(frame))).await;
+}
+
 // ---------------------------------------------------------------------------
 // Bidirectional byte ferry
 // ---------------------------------------------------------------------------
@@ -395,6 +485,28 @@ async fn close_with_code(mut socket: WebSocket, code: u16, reason: &str) {
 struct FerryStats {
     ws_to_backend: u64,
     backend_to_ws: u64,
+}
+
+/// How the ferry ended.
+///
+/// Distinguishing the two terminal cases lets callers send a structured
+/// `BACKEND_ERROR` (4002) close frame only when the backend exited
+/// unexpectedly while the WebSocket was still alive — not on a normal
+/// client-initiated close, which would produce a spurious 4002.
+enum FerryOutcome {
+    /// The WebSocket-to-backend direction finished first (WS close frame
+    /// received, or the WS stream ended). Normal client-initiated close.
+    /// The WS sink was consumed inside the `ws_to_backend` task and is
+    /// not recoverable; callers must not attempt to send any more frames.
+    ClientClosed(FerryStats),
+    /// The backend-to-WS direction finished first (backend EOF or stream
+    /// end) while the WebSocket was still open. The WS sink is returned
+    /// so callers can send a structured close frame (e.g. `BACKEND_ERROR`
+    /// 4002) before the session is torn down.
+    BackendExitedEarly {
+        stats: FerryStats,
+        ws_sink: SplitSink<WebSocket, Message>,
+    },
 }
 
 /// Ferry bytes between a WebSocket and the backend's
@@ -416,11 +528,20 @@ struct FerryStats {
 /// noticing its stdin closed will close the TCP socket to sshd, which
 /// will then close its stdout — but only after sshd's own draining
 /// completes, which can be slow. We bound that delay by aborting.
+///
+/// **Outcome discrimination:** when the WS-to-backend direction
+/// finishes first (client closed the WS), the function returns
+/// `FerryOutcome::ClientClosed` — the WS sink is gone and the caller
+/// must not send further frames. When the backend-to-WS direction
+/// finishes first (backend exited or stream ended while WS is open),
+/// the function returns `FerryOutcome::BackendExitedEarly` carrying the
+/// reclaimed WS sink so the caller can emit a structured `BACKEND_ERROR`
+/// (4002) close frame.
 async fn bidirectional_ferry<W, R>(
     ws: WebSocket,
     backend_writer: W,
     backend_reader: R,
-) -> Result<FerryStats, std::io::Error>
+) -> Result<FerryOutcome, std::io::Error>
 where
     W: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
@@ -428,8 +549,12 @@ where
     let (ws_sink, ws_stream) = ws.split();
 
     // Direction 1: WebSocket -> backend stdin.
+    // Returns the byte count; the WS stream and backend writer are
+    // consumed inside the task.
     let mut dir1 = tokio::spawn(ws_to_backend(ws_stream, backend_writer));
     // Direction 2: backend stdout -> WebSocket.
+    // Returns (byte_count, ws_sink) so we can reclaim the sink when the
+    // backend exits first.
     let mut dir2 = tokio::spawn(backend_to_ws(backend_reader, ws_sink));
 
     // Wait for either side to finish, then cancel the other. This is
@@ -438,9 +563,10 @@ where
     // task-poll cycle. We `&mut` the join handles so the unfinished
     // task is still awaitable after the select arm completes (for
     // resource teardown via `.abort()` + final `.await`).
-    let (ws_to_backend_bytes, backend_to_ws_bytes) = tokio::select! {
+    tokio::select! {
+        // WS-to-backend direction finished first → ClientClosed.
         r = &mut dir1 => {
-            let bytes = match r {
+            let ws_to_b = match r {
                 Ok(Ok(n)) => n,
                 Ok(Err(e)) => {
                     debug!(error = %e, "ws->backend ferry exited with error");
@@ -453,22 +579,28 @@ where
                 }
             };
             dir2.abort();
-            let backend_bytes = match dir2.await {
-                Ok(Ok(n)) => n,
+            let b_to_ws = match dir2.await {
+                Ok(Ok((n, _sink))) => n,
                 Ok(Err(e)) => {
                     debug!(error = %e, "backend->ws ferry exited with error (after abort)");
                     0
                 }
                 Err(_) => 0, // abort -> JoinError::Cancelled
             };
-            (bytes, backend_bytes)
+            Ok(FerryOutcome::ClientClosed(FerryStats {
+                ws_to_backend: ws_to_b,
+                backend_to_ws: b_to_ws,
+            }))
         }
+        // Backend-to-WS direction finished first → BackendExitedEarly.
+        // Reclaim the WS sink from the task result so the caller can
+        // send a structured close frame.
         r = &mut dir2 => {
-            let bytes = match r {
-                Ok(Ok(n)) => n,
+            let (b_to_ws, reclaimed_sink) = match r {
+                Ok(Ok((n, sink))) => (n, Some(sink)),
                 Ok(Err(e)) => {
                     debug!(error = %e, "backend->ws ferry exited with error");
-                    0
+                    (0, None)
                 }
                 Err(join) => {
                     return Err(std::io::Error::other(format!(
@@ -477,7 +609,7 @@ where
                 }
             };
             dir1.abort();
-            let ws_bytes = match dir1.await {
+            let ws_to_b = match dir1.await {
                 Ok(Ok(n)) => n,
                 Ok(Err(e)) => {
                     debug!(error = %e, "ws->backend ferry exited with error (after abort)");
@@ -485,14 +617,18 @@ where
                 }
                 Err(_) => 0,
             };
-            (ws_bytes, bytes)
+            let stats = FerryStats {
+                ws_to_backend: ws_to_b,
+                backend_to_ws: b_to_ws,
+            };
+            match reclaimed_sink {
+                Some(ws_sink) => Ok(FerryOutcome::BackendExitedEarly { stats, ws_sink }),
+                // Sink was lost due to an error in the task; treat as
+                // ClientClosed so callers don't try to use a None sink.
+                None => Ok(FerryOutcome::ClientClosed(stats)),
+            }
         }
-    };
-
-    Ok(FerryStats {
-        ws_to_backend: ws_to_backend_bytes,
-        backend_to_ws: backend_to_ws_bytes,
-    })
+    }
 }
 
 /// Read binary WebSocket frames; write the payload bytes to the
@@ -536,13 +672,20 @@ where
 }
 
 /// Read bytes from the backend's stdout; pack each read into one
-/// `Message::Binary` frame and send it. On backend EOF, send a clean
-/// `Message::Close(None)` so the operator's SSH client observes the
-/// disconnect.
+/// `Message::Binary` frame and send it. Returns `(bytes_transferred,
+/// ws_sink)` on backend EOF so the caller can reclaim the sink and
+/// send a structured close frame (e.g. `BACKEND_ERROR` 4002) when
+/// the backend exited unexpectedly while the WebSocket was still open.
+///
+/// Unlike `ws_to_backend`, this function does **not** emit a
+/// `Message::Close` internally on EOF — the caller is now responsible
+/// for deciding which close code to send based on context (normal
+/// backend completion vs. unexpected early exit). This is the key
+/// change that makes the 4002 close frame reachable.
 async fn backend_to_ws<R>(
     mut backend_reader: R,
     mut ws_sink: SplitSink<WebSocket, Message>,
-) -> std::io::Result<u64>
+) -> std::io::Result<(u64, SplitSink<WebSocket, Message>)>
 where
     R: AsyncRead + Unpin,
 {
@@ -560,10 +703,10 @@ where
             .map_err(|e| std::io::Error::other(format!("websocket send error: {e}")))?;
         total = total.saturating_add(n as u64);
     }
-    // Best-effort close frame so the CLI sees a clean disconnect even
-    // when the backend half closed first.
-    let _ = ws_sink.send(Message::Close(None)).await;
-    Ok(total)
+    // Return the sink to the caller rather than closing here. The caller
+    // now controls whether to send Close(None) (normal backend EOF) or
+    // Close(Some(BACKEND_ERROR)) (unexpected early exit).
+    Ok((total, ws_sink))
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +835,103 @@ mod tests {
         assert!(
             bob.is_none(),
             "foreign-owner session must be invisible to non-owner; got {bob:?}"
+        );
+    }
+
+    /// `FerryOutcome::BackendExitedEarly` carries the WS sink so the
+    /// caller can send a structured 4002 close frame. Verify the
+    /// discriminant values are correct and that `BackendExitedEarly`
+    /// and `ClientClosed` are distinct so callers can pattern-match
+    /// them without ambiguity.
+    ///
+    /// This is a compile-time/structural test — we cannot construct
+    /// a `WebSocket` (no public ctor) so we verify the `FerryOutcome`
+    /// enum shape and `FerryStats` fields statically.
+    #[test]
+    fn ferry_outcome_variants_are_distinct_and_carry_stats() {
+        // FerryStats must carry both counters.
+        let s = FerryStats {
+            ws_to_backend: 42,
+            backend_to_ws: 17,
+        };
+        assert_eq!(s.ws_to_backend, 42);
+        assert_eq!(s.backend_to_ws, 17);
+
+        // The ClientClosed variant wraps FerryStats directly.
+        let client_closed = FerryOutcome::ClientClosed(FerryStats {
+            ws_to_backend: 100,
+            backend_to_ws: 200,
+        });
+        match client_closed {
+            FerryOutcome::ClientClosed(stats) => {
+                assert_eq!(stats.ws_to_backend, 100);
+                assert_eq!(stats.backend_to_ws, 200);
+            }
+            FerryOutcome::BackendExitedEarly { .. } => {
+                panic!("expected ClientClosed");
+            }
+        }
+    }
+
+    /// `sshd_ready = Some(false)` must round-trip through serde with
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+    /// a record written by a newer daemon with the field set is readable
+    /// by an older daemon (unknown field ignored) and a pre-V010 record
+    /// with no field deserialises to `None`.
+    #[test]
+    fn sshd_ready_serde_forward_compat() {
+        use sandbox_core::Session;
+
+        // A pre-V010 session JSON (no sshd_ready key) must deserialise
+        // with sshd_ready = None.
+        let json_without = r#"{
+            "id": "abcdef012345",
+            "state": "running",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "config": {"cpus": 2, "memory_mb": 4096, "disk_gb": 20},
+            "owner_username": "alice"
+        }"#;
+        let s: Session = serde_json::from_str(json_without).unwrap();
+        assert!(
+            s.sshd_ready.is_none(),
+            "pre-V010 record must deserialise with sshd_ready = None; got {:?}",
+            s.sshd_ready
+        );
+
+        // A record with sshd_ready = false must round-trip.
+        let json_false = r#"{
+            "id": "abcdef012345",
+            "state": "running",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "config": {"cpus": 2, "memory_mb": 4096, "disk_gb": 20},
+            "owner_username": "alice",
+            "sshd_ready": false
+        }"#;
+        let s: Session = serde_json::from_str(json_false).unwrap();
+        assert_eq!(
+            s.sshd_ready,
+            Some(false),
+            "sshd_ready=false must round-trip; got {:?}",
+            s.sshd_ready
+        );
+
+        // sshd_ready=None must be omitted from the wire (skip_serializing_if).
+        let mut session = sandbox_core::Session::new(Some("test".into()));
+        session.sshd_ready = None;
+        let serialised = serde_json::to_string(&session).unwrap();
+        assert!(
+            !serialised.contains("sshd_ready"),
+            "sshd_ready=None must be omitted from wire; got {serialised}"
+        );
+
+        // sshd_ready=Some(true) must appear on the wire.
+        session.sshd_ready = Some(true);
+        let serialised = serde_json::to_string(&session).unwrap();
+        assert!(
+            serialised.contains("\"sshd_ready\":true"),
+            "sshd_ready=Some(true) must be emitted on wire; got {serialised}"
         );
     }
 }

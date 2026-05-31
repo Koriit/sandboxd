@@ -1031,6 +1031,27 @@ pub struct Session {
     /// per the forward-compat convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_gid: Option<u32>,
+    /// Whether sshd came up inside the container after `docker start`.
+    ///
+    /// Probed once at session-create time on the container backend via
+    /// a best-effort `docker exec <ctr> ss -tlnH "( sport = :22 )"`.
+    /// `Some(true)` — sshd is listening on port 22 inside the container.
+    /// `Some(false)` — probe ran; sshd was not listening. The proxy
+    ///   short-circuit refuses the tunnel with `BACKEND_UNAVAILABLE`
+    ///   (4001) rather than opening a hang-prone connection.
+    /// `None` — probe not yet run, probe failed, Lima backend, or a
+    ///   pre-V010 row; the proxy falls back to the legacy "attempt the
+    ///   tunnel" behaviour so no existing sessions regress.
+    ///
+    /// Only set for container-backed sessions. Lima sessions never probe
+    /// this (cloud-init manages sshd on that path) and always read `None`.
+    ///
+    /// Persisted in the `sessions.sshd_ready` column (V010 migration).
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// per the forward-compat convention (CLAUDE.md "On-disk
+    /// compatibility").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sshd_ready: Option<bool>,
 }
 
 impl Session {
@@ -1055,6 +1076,7 @@ impl Session {
             ssh_keypair: None,
             operator_uid: None,
             operator_gid: None,
+            sshd_ready: None,
         }
     }
 
@@ -1088,6 +1110,7 @@ impl Session {
             ssh_keypair: None,
             operator_uid: None,
             operator_gid: None,
+            sshd_ready: None,
         }
     }
 
