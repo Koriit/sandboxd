@@ -347,9 +347,25 @@ def wait_for_socket(vm_name, sock_path, *, timeout=SOCKET_WAIT_TIMEOUT):
         except subprocess.TimeoutExpired as e:
             last_error = f"limactl shell timed out after {e.timeout}s"
         time.sleep(2)
+    # Surface the daemon's own startup log and unit state in the failure,
+    # mirroring `wait_for_systemd_active`. A `Type=simple` unit reports
+    # `active` the instant the process execs, so a missing socket means
+    # the daemon is still pre-bind (or exited) — the journal shows which.
+    status = lima_shell(
+        vm_name,
+        "sudo systemctl status sandboxd --no-pager 2>&1 | head -n 20 || true",
+        timeout=15,
+    ).stdout
+    journal = lima_shell(
+        vm_name,
+        "sudo journalctl -u sandboxd -n 80 --no-pager 2>&1 || true",
+        timeout=15,
+    ).stdout
     raise AssertionError(
         f"{sock_path} did not appear in {vm_name} within {timeout}s; "
-        f"last={last_error}"
+        f"last={last_error}\n"
+        f"--- systemctl status sandboxd ---\n{status}\n"
+        f"--- journalctl -u sandboxd -n 80 ---\n{journal}"
     )
 
 
