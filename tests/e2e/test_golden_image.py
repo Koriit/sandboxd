@@ -141,28 +141,35 @@ def _meta_unlink(meta_path: Path) -> None:
 # Daemon log capture
 # ---------------------------------------------------------------------------
 
-def _daemon_log_snapshot() -> str:
-    """Return a wall-clock timestamp marking the start of a capture window.
+def _daemon_log_snapshot(sandbox_daemon) -> int:
+    """Return the current byte length of the daemon stdout log.
 
-    Retained as a stable marker for callers that snapshot just before a
-    test action; the file-based log reader below returns the whole log,
-    so the timestamp is informational only.
-    """
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _daemon_logs_since(sandbox_daemon, since_ts: str) -> str:
-    """Return daemon log text produced since ``since_ts``.
-
-    The daemon (launched via ``sudo -u sandbox``) writes its tracing
-    output to the ``_stdout_log`` file. ``since_ts`` is a wall-clock
-    string; we cannot efficiently seek to a byte offset from it, so we
-    read the entire file and let the caller filter if needed. The daemon
-    writes a fresh log each session so the full file is bounded.
+    Used as a window start: a later :func:`_daemon_logs_since` reads only
+    the bytes appended after this point. The daemon (launched via
+    ``sudo -u sandbox``) writes its tracing output to a single per-session
+    ``_stdout_log`` file, so capturing the size just before a test action
+    and reading from it afterwards yields exactly that action's log window
+    — excluding session-startup and base-image pre-warm output that would
+    otherwise produce false positives (e.g. the pre-warm's "building golden
+    base image" line). This is the file-based equivalent of the windowing
+    the systemd harness got from ``journalctl --since``.
     """
     log_path = Path(sandbox_daemon["_stdout_log"])
     try:
-        return log_path.read_text(errors="replace")
+        return log_path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _daemon_logs_since(sandbox_daemon, since_offset: int) -> str:
+    """Return daemon log text appended since the byte offset captured by
+    :func:`_daemon_log_snapshot`.
+    """
+    log_path = Path(sandbox_daemon["_stdout_log"])
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            f.seek(since_offset)
+            return f.read()
     except FileNotFoundError:
         return ""
 
@@ -295,7 +302,7 @@ def test_session_uses_clone_path(sandbox_cli, sandbox_daemon):
     # 1. Snapshot log position so we only inspect output produced by this
     #    test.  The daemon writes its log to a per-session file; the
     #    timestamp marks the start of this test's window.
-    log_since = _daemon_log_snapshot()
+    log_since = _daemon_log_snapshot(sandbox_daemon)
 
     try:
         result = sandbox_cli(
@@ -392,7 +399,7 @@ def test_staleness_detection(sandbox_cli, sandbox_daemon):
         #    - daemon logs "base image is stale, using anyway" (policy)
         #    Snapshot log position before the create so we only inspect
         #    output produced by this test window.
-        log_since = _daemon_log_snapshot()
+        log_since = _daemon_log_snapshot(sandbox_daemon)
         result = sandbox_cli(
             "create", "--name", name, *_VM_RESOURCE_ARGS, timeout=600,
         )
