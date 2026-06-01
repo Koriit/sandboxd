@@ -140,11 +140,15 @@ impl Daemon {
                 return;
             }
             if Instant::now() >= deadline {
+                let stderr =
+                    std::fs::read_to_string(self.tmp.path().join("sandboxd.stderr.log")).unwrap_or_default();
+                let stdout =
+                    std::fs::read_to_string(self.tmp.path().join("sandboxd.stdout.log")).unwrap_or_default();
                 panic!(
-                    "sandboxd socket did not appear at {} within {:?}; check {}/sandboxd.stderr.log",
+                    "sandboxd socket did not appear at {} within {:?}\n\
+                     === daemon stdout ===\n{stdout}\n=== daemon stderr ===\n{stderr}",
                     self.socket.display(),
                     timeout,
-                    self.tmp.path().display(),
                 );
             }
             thread::sleep(Duration::from_millis(50));
