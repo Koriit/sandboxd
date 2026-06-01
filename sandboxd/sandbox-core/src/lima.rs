@@ -221,8 +221,12 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
     //
     //   - `u:<op_uid>:rwx` — access ACL on the top dir only: operator can
     //                         traverse, read, and write the LIMA_HOME root
-    //                         (e.g. read base-template.yaml written by the
-    //                         daemon, create instance subdirs).
+    //                         (e.g. the operator-uid limactl creates the
+    //                         per-instance subdirs and writes `_config/user`
+    //                         there). Daemon-written inputs the operator must
+    //                         read (base template, QEMU wrapper) live in the
+    //                         sibling state root, not here — see
+    //                         `write_operator_readable_template`.
     //
     //   - NO `d:u:<op_uid>:rwx` — intentionally omitted. A default
     //                         named-user ACL would propagate into every
@@ -1281,10 +1285,32 @@ impl LimaManager {
         info!(op_uid = self.op_uid, "building golden base image");
 
         // 1. Generate and write the base template.
+        //
+        // Write it OUTSIDE LIMA_HOME (under the operator state root, the
+        // parent of base_dir) and world-readable. `limactl create --yaml`
+        // runs as the operator uid via the helper and must open() this file;
+        // a template written inside LIMA_HOME would be unreadable by the
+        // operator (the per-operator LIMA_HOME's default ACL denies
+        // group/other and omits the named-user entry) and would be
+        // enumerated by Lima as a malformed instance. Mirrors
+        // write_operator_readable_template and ensure_qemu_wrapper. The
+        // template is non-sensitive Lima YAML (no keys, no secrets).
         let template = self.generate_base_template();
         std::fs::create_dir_all(&self.base_dir)?;
-        let template_path = self.base_dir.join("base-template.yaml");
+        let state_root = self.base_dir.parent().ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "base_dir {} has no parent — cannot derive operator state root \
+                 for base template",
+                self.base_dir.display()
+            ))
+        })?;
+        let template_path = state_root.join("base-template.yaml");
         std::fs::write(&template_path, &template)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&template_path, std::fs::Permissions::from_mode(0o644))?;
+        }
         info!(path = %template_path.display(), "wrote base template");
         let template_str = template_path.to_string_lossy().to_string();
 
