@@ -1,6 +1,6 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
-	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-e2e-test-operator
+	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir setup-e2e-test-operator
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -137,24 +137,16 @@ TEST ?=
 # container`). Zero convention-driven skips on a properly-configured
 # host; runs in ~5-10 min on a warm runner.
 #
-# Under the cross-user harness (SANDBOX_HARNESS=sandbox-systemd /
-# sandbox-sudo), the daemon socket is mode 0660 group=sandbox. A
-# developer added via `usermod -aG sandbox` but not yet re-logged-in
-# does not have the group active in their shell. Wrapping pytest in
-# `sg sandbox` activates the group for the subprocess without
-# requiring a re-login. The test-user harness runs pytest as the
-# sandbox user directly, so sg is unnecessary and would fail for a
-# non-member caller.
+# The daemon socket is mode 0660 group=sandbox. A developer added via
+# `usermod -aG sandbox` but not yet re-logged-in does not have the
+# group active in their shell. Wrapping pytest in `sg sandbox`
+# activates the group for the subprocess without requiring a re-login.
 test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color -m \"not lima\" -k \"not [lima]\" $(TEST)"; \
-	  if [ "$${SANDBOX_HARNESS:-sandbox-systemd}" = "test-user" ]; then \
-	    sh -c "$$_pytest"; \
-	  else \
-	    echo "[make] wrapping pytest in 'sg sandbox' (cross-user harness; socket is group=sandbox)"; \
-	    sg sandbox -c "$$_pytest"; \
-	  fi
+	  echo "[make] wrapping pytest in 'sg sandbox' (daemon socket is group=sandbox)"; \
+	  sg sandbox -c "$$_pytest"
 
 # Merge-to-main: full matrix -- Lima + container parametrizations plus
 # the Lima-only and container-only test files. Wall clock ~30-45 min.
@@ -164,24 +156,16 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # qemu-bridge-helper / bridge.conf emit per-test skips via the
 # `_lima_required_for_lima_tests` fixture; everything else runs.
 #
-# Under the cross-user harness (SANDBOX_HARNESS=sandbox-systemd /
-# sandbox-sudo), the daemon socket is mode 0660 group=sandbox. A
-# developer added via `usermod -aG sandbox` but not yet re-logged-in
-# does not have the group active in their shell. Wrapping pytest in
-# `sg sandbox` activates the group for the subprocess without
-# requiring a re-login. The test-user harness runs pytest as the
-# sandbox user directly, so sg is unnecessary and would fail for a
-# non-member caller.
+# The daemon socket is mode 0660 group=sandbox. A developer added via
+# `usermod -aG sandbox` but not yet re-logged-in does not have the
+# group active in their shell. Wrapping pytest in `sg sandbox`
+# activates the group for the subprocess without requiring a re-login.
 test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $(TEST)"; \
-	  if [ "$${SANDBOX_HARNESS:-sandbox-systemd}" = "test-user" ]; then \
-	    sh -c "$$_pytest"; \
-	  else \
-	    echo "[make] wrapping pytest in 'sg sandbox' (cross-user harness; socket is group=sandbox)"; \
-	    sg sandbox -c "$$_pytest"; \
-	  fi
+	  echo "[make] wrapping pytest in 'sg sandbox' (daemon socket is group=sandbox)"; \
+	  sg sandbox -c "$$_pytest"
 
 # Back-compat alias. `make test-e2e` continues to run the full matrix.
 test-e2e: test-e2e-matrix
@@ -343,7 +327,7 @@ E2E_TEST_OPERATOR_NAME        := sandbox-e2e-test
 E2E_TEST_OPERATOR_UID         := 4099
 E2E_TEST_OPERATOR_SUDOERS     := /etc/sudoers.d/sandboxd-e2e-test-operator
 
-setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-e2e-test-operator
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir setup-e2e-test-operator
 	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
 
 # setup-sandboxd-state-dir — create /var/lib/sandboxd/ owned by sandbox:sandbox
@@ -385,6 +369,44 @@ setup-sandboxd-state-dir:
 	@if ! command -v setfacl >/dev/null 2>&1; then \
 	  echo "WARNING: setfacl not found — install the 'acl' package (apt install acl / dnf install acl)."; \
 	  echo "         The daemon uses setfacl to provision per-operator LIMA_HOME ACLs at session-create time."; \
+	fi
+
+# setup-sandbox-prod-base-dir — create /var/lib/sandbox owned by sandbox:sandbox
+# mode 0750. This is the daemon's base directory and home directory
+# (see useradd --home-dir /var/lib/sandbox). The daemon writes all state here,
+# including the unix socket (/var/lib/sandbox/sandboxd.sock); running as the
+# sandbox user it needs no root to create or bind the socket. The 0750 mode
+# (group=sandbox, r-x) lets any operator in the sandbox group connect.
+#
+# Idempotence:
+#   - Directory present with correct ownership and mode → ✓ already configured.
+#   - Directory present but wrong ownership/mode → correct in place.
+#   - Directory absent → create it.
+#
+# Ordering: must run after setup-sandbox-user (the sandbox user/group must exist).
+setup-sandbox-prod-base-dir: setup-sandbox-user
+	@if ! getent passwd sandbox >/dev/null 2>&1; then \
+	  echo "ERROR: system user 'sandbox' does not exist; run 'make setup-sandbox-user' first"; \
+	  exit 1; \
+	fi
+	@if [ ! -d /var/lib/sandbox ]; then \
+	  echo "[sudo] mkdir -p /var/lib/sandbox"; \
+	  sudo -k mkdir -p /var/lib/sandbox; \
+	  echo "[sudo] chown sandbox:sandbox /var/lib/sandbox"; \
+	  sudo -k chown sandbox:sandbox /var/lib/sandbox; \
+	  echo "[sudo] chmod 0750 /var/lib/sandbox"; \
+	  sudo -k chmod 0750 /var/lib/sandbox; \
+	else \
+	  owner=$$(stat -c '%U:%G' /var/lib/sandbox 2>/dev/null || echo "?:?"); \
+	  mode=$$(stat -c '%a' /var/lib/sandbox 2>/dev/null || echo "?"); \
+	  if [ "$$owner" = "sandbox:sandbox" ] && [ "$$mode" = "750" ]; then \
+	    echo "$(GREEN)✓ already configured: /var/lib/sandbox (sandbox:sandbox 0750)$(RESET)"; \
+	  else \
+	    echo "[sudo] chown sandbox:sandbox /var/lib/sandbox (was: $$owner $$mode)"; \
+	    sudo -k chown sandbox:sandbox /var/lib/sandbox; \
+	    echo "[sudo] chmod 0750 /var/lib/sandbox"; \
+	    sudo -k chmod 0750 /var/lib/sandbox; \
+	  fi; \
 	fi
 
 # setup-sandbox-user — create the `sandbox` system user and group
@@ -474,23 +496,18 @@ setup-operator-group-membership:
 	fi
 
 # setup-test-sudoers-fragment — install a NOPASSWD sudoers fragment
-# that authorises the invoking operator ($USER) to run **only** the
-# freshly-built workspace test binary at
-# `sandboxd/target/debug/sandboxd` as the `sandbox` user, without a
-# password prompt. The e2e harness falls back to
-# `sudo -u sandbox <test-binary>` when systemd is not available
-# (`/run/systemd/system` missing); CI hosts without this fragment in
-# place would silently hang on the password prompt and exhaust the
-# wait-for-socket deadline with no actionable error.
+# that grants the invoking operator ($USER) blanket passwordless
+# impersonation of the unprivileged `sandbox` system user. The e2e
+# harness launches the daemon and runs state-reset commands exclusively
+# as the `sandbox` user via `sudo -u sandbox`; runtime sudo is never
+# root. The `sandbox` user is an unprivileged system user (nologin, no
+# sudo of its own, no capabilities), so this grant is not privilege
+# escalation — test/dev hosts only.
 #
-# Scope is intentionally narrow: the fragment whitelists the **one**
-# absolute path of the workspace's debug `sandboxd` binary plus the
-# CLI flags the harness passes (`--socket`, `--base-dir`). It does
-# not authorise running any other binary as `sandbox`, nor any other
-# user as `sandbox`. The fragment is validated via `visudo -c -f` on
-# a tempfile before being installed at the canonical path, so a
-# malformed fragment never lands in `/etc/sudoers.d/` (a broken
-# fragment there can disable sudo system-wide).
+# The fragment is validated via `visudo -c -f` on a tempfile before
+# being installed at the canonical path, so a malformed fragment never
+# lands in `/etc/sudoers.d/` (a broken fragment there can disable sudo
+# system-wide).
 #
 # Idempotence: if the canonical path already contains the exact text
 # we would write, print `✓ already configured` and invoke no sudo.
@@ -498,12 +515,10 @@ setup-test-sudoers-fragment:
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
 	  echo "$(GREEN)✓ already configured: sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
 	else \
-	  test_binary="$$(pwd)/sandboxd/target/debug/sandboxd"; \
-	  limactl_bin="$$(command -v limactl 2>/dev/null || echo /usr/local/bin/limactl)"; \
-	  fragment_envkeep="Defaults!$$test_binary env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH\""; \
-	  fragment="$$USER ALL=(sandbox) NOPASSWD: $$test_binary, $$test_binary *, $$limactl_bin list --json, $$limactl_bin delete --force *"; \
+	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH\""; \
+	  fragment="$$USER ALL=(sandbox) NOPASSWD: ALL"; \
 	  tmp=$$(mktemp); \
-	  printf '# Managed by `make setup-test-sudoers-fragment` — do not edit.\n# Allows the e2e harness to launch sandboxd as the `sandbox`\n# system user via the fallback path (sudo -u sandbox <test-binary> …)\n# when systemd is unavailable. The path is the absolute path of the\n# checked-out workspace`s debug build of sandboxd; re-run the make\n# target after moving the workspace to a new location.\n#\n# The env_keep directive is required for the harness to propagate the\n# SANDBOX_USERS_CONF tempfile path and SANDBOX_BASE_VM_NAME through\n# sudo (which strips the environment by default).\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
+	  printf '# Managed by `make setup-test-sudoers-fragment` — do not edit.\n# Grants the operator passwordless impersonation of the unprivileged\n# `sandbox` system user for the e2e harness. Runtime sudo is\n# exclusively `sudo -u sandbox` (never root). The `sandbox` user is\n# an unprivileged system user (nologin, no sudo of its own, no caps);\n# test/dev hosts only.\n#\n# The env_keep directive propagates test-harness variables through\n# sudo (which strips the environment by default).\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
 	  chmod 0440 "$$tmp"; \
 	  if sudo -k visudo -c -f "$$tmp" >/dev/null 2>&1; then \
 	    : ok; \
@@ -518,7 +533,7 @@ setup-test-sudoers-fragment:
 	    rm -f "$$tmp"; \
 	  else \
 	    echo "[sudo] install -o root -g root -m 0440 <validated-fragment> $(TEST_SUDOERS_FRAGMENT_PATH)"; \
-	    echo "      contents: $$fragment"; \
+	    echo "      contents: $$fragment_envkeep | $$fragment"; \
 	    sudo -k install -o root -g root -m 0440 "$$tmp" $(TEST_SUDOERS_FRAGMENT_PATH); \
 	    rm -f "$$tmp"; \
 	  fi; \

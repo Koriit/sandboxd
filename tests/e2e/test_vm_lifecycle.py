@@ -46,9 +46,8 @@ def limactl_list_json() -> list[dict]:
     """Run `limactl list --json` against the per-operator LIMA_HOME and return
     parsed entries.
 
-    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
-    cross-user harness (sandbox-systemd / sandbox-sudo).  Under the legacy
-    test-user harness bare ``limactl`` is used, which reads ``~/.lima/``.
+    Uses ``limactl_cmd()`` so the correct per-operator LIMA_HOME is set
+    for the cross-user harness.
     """
     result = subprocess.run(
         limactl_cmd("list", "--json"),
@@ -68,8 +67,8 @@ def limactl_list_json() -> list[dict]:
 def limactl_shell(vm_name: str, *cmd: str, timeout: int = 60) -> subprocess.CompletedProcess:
     """Run a command inside a Lima VM via ``limactl shell``.
 
-    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
-    cross-user harness (sandbox-systemd / sandbox-sudo).
+    Uses ``limactl_cmd()`` so the correct per-operator LIMA_HOME is set
+    for the cross-user harness.
     """
     return subprocess.run(
         limactl_cmd("shell", vm_name, "--", *cmd),

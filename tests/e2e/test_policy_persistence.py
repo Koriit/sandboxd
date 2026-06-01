@@ -207,10 +207,8 @@ def test_policy_survives_daemon_restart(
             context="pre-restart denied",
         )
 
-        # 4. SIGTERM the daemon and await graceful exit. The handle's
-        #    ``send_signal`` works uniformly across Popen and
-        #    _SystemdDaemonHandle (the latter routes through
-        #    ``systemctl kill -s SIGTERM``).
+        # 4. SIGTERM the daemon (a ``sudo -u sandbox`` Popen) and await
+        #    graceful exit.
         daemon_proc = sandbox_daemon["process"]
         daemon_proc.send_signal(signal.SIGTERM)
         try:
@@ -233,8 +231,7 @@ def test_policy_survives_daemon_restart(
         #    before reconcile_networking rebuilds the gateway; if it does
         #    not, the gateway will come back with allow-all DNS and step 7
         #    will wrongly observe the denied destination as reachable.
-        #    Harness-aware: ``systemctl start`` under sandbox-systemd,
-        #    ``Popen`` swap under test-user / sandbox-sudo.
+        #    The restart spawns a fresh ``sudo -u sandbox`` Popen.
         restarted_proc = restart_test_daemon(sandbox_daemon, sandbox_binaries)
 
         # 6. Allow reconciliation to finish (gateway restart + DNS

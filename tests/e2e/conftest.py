@@ -140,107 +140,27 @@ QEMU_BRIDGE_HELPER_PATHS = [
 BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 
 # ---------------------------------------------------------------------------
-# Cross-user harness selection
+# Cross-user harness
 # ---------------------------------------------------------------------------
 #
-# Three harness modes, selected at session start by the ``SANDBOX_HARNESS``
-# environment variable:
+# The e2e harness launches the daemon as the ``sandbox`` system user via
+# ``sudo -u sandbox``, the single cross-user path. All sudo is
+# pre-authorized at ``make setup-dev-env`` time via a NOPASSWD sudoers
+# fragment (``/etc/sudoers.d/sandboxd-test``); no runtime root sudo is
+# ever issued.
 #
-# * ``"sandbox-systemd"`` (default) — Launch the daemon as the ``sandbox``
-#   system user via systemd, using the production unit at
-#   ``sandboxd/contrib/systemd/sandboxd.service``. The harness installs a
-#   throw-away copy of the unit as ``sandboxd-test.service`` (to avoid
-#   clobbering any production unit on the host) together with a drop-in
-#   override that points ``ExecStart`` at the workspace's debug binary,
-#   disables ``ProtectHome`` (the unit's hardening blocks reads of the
-#   workspace binary and writes to ``/var/lib/sandboxd/<op-uid>/lima/`` — and the
-#   cross-user Lima setup requires both), and threads through the test
-#   harness's ``SANDBOX_USERS_CONF`` tempfile via ``Environment=``. Falls
-#   back automatically to ``"sandbox-sudo"`` when systemd is not running
-#   on the host (``/run/systemd/system`` missing).
-#
-# * ``"sandbox-sudo"`` — Launch the daemon as the ``sandbox`` system user
-#   via ``sudo -u sandbox <test-binary>``. Used in environments without
-#   systemd (CI containers, the install-e2e suite). Requires the NOPASSWD
-#   sudoers fragment installed by ``make setup-test-sudoers-fragment``
-#   (``/etc/sudoers.d/sandboxd-test``).
-#
-# * ``"test-user"`` — Legacy harness that launches the daemon as the
-#   pytest process's own user with temp paths. Retained for the
-#   diff-the-outcomes baseline run (see Spec § Phase 1 step 4) and as a
-#   one-shot regression check until the harness flip is fully validated;
-#   the production ``sandbox`` group's cross-user bug is invisible under
-#   this harness because the daemon and the CLI share a uid.
-#
-# Both new modes require the operator to be a member of the ``sandbox``
-# group (the daemon socket is mode 0660, group=sandbox). The harness
-# asserts membership at start-up and fails loudly with a remediation
-# message if not — group changes do **not** take effect in the current
-# shell, so adding the operator to the group requires re-login or
-# wrapping the test invocation in ``sg sandbox -c '…'``.
-SANDBOX_HARNESS = os.environ.get("SANDBOX_HARNESS", "sandbox-systemd").strip()
-_VALID_HARNESSES = {"sandbox-systemd", "sandbox-sudo", "test-user"}
-if SANDBOX_HARNESS not in _VALID_HARNESSES:
-    raise RuntimeError(
-        f"SANDBOX_HARNESS={SANDBOX_HARNESS!r} is not one of "
-        f"{sorted(_VALID_HARNESSES)}. Set SANDBOX_HARNESS=test-user for "
-        f"the legacy daemon-as-test-user path; default is sandbox-systemd "
-        f"(auto-falls-back to sandbox-sudo if systemd is unavailable)."
-    )
+# The operator must be a member of the ``sandbox`` group so the pytest
+# process can reach the daemon socket (mode 0660, group=sandbox). Group
+# changes from ``usermod -aG sandbox <operator>`` do not take effect in
+# the current login session; ``make test-e2e`` / ``make test-e2e-container``
+# wrap pytest in ``sg sandbox -c '…'`` to activate the group without
+# requiring a re-login.
 
-# Resolve the systemd→sudo auto-fallback at module-import time so the
-# fixture (and every test that prints the selected harness in its log
-# output) sees a stable value. The check is intentionally narrow — we
-# only require ``/run/systemd/system`` to exist and ``systemctl`` to be
-# executable; we do not also probe ``systemctl is-system-running``
-# because the host being in degraded state is fine as long as we can
-# still issue ``systemctl daemon-reload`` and ``systemctl start``.
-def _systemd_available() -> bool:
-    if not Path("/run/systemd/system").exists():
-        return False
-    try:
-        subprocess.run(
-            ["systemctl", "--version"],
-            capture_output=True, timeout=5, check=True,
-        )
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return False
-
-
-if SANDBOX_HARNESS == "sandbox-systemd" and not _systemd_available():
-    print(
-        "[conftest] SANDBOX_HARNESS=sandbox-systemd requested but systemd "
-        "is not available on this host; falling back to sandbox-sudo.",
-        file=sys.stderr,
-    )
-    SANDBOX_HARNESS = "sandbox-sudo"
-
-# Production-shaped paths used by both ``sandbox-systemd`` and
-# ``sandbox-sudo``. Matches the systemd unit's ``ExecStart`` so the bug
-# the harness is intended to reproduce — daemon-vs-CLI uid mismatch —
-# does not get masked by an idiosyncratic per-test path layout.
-_SANDBOX_PROD_SOCKET = Path("/run/sandbox/sandboxd.sock")
+# Socket lives inside the sandbox base dir so the sandbox-user daemon
+# can create it with no elevated privileges and the operator (group
+# sandbox; base dir 0750 → group r-x) can connect.
+_SANDBOX_PROD_SOCKET = Path("/var/lib/sandbox/sandboxd.sock")
 _SANDBOX_PROD_BASE_DIR = Path("/var/lib/sandbox")
-
-# Test service name used by the sandbox-systemd path. Deliberately
-# distinct from the production ``sandboxd.service`` so installing the
-# harness does not silently overwrite an operator-curated production
-# unit on the same host. The drop-in override lives at
-# ``/etc/systemd/system/sandboxd-test.service.d/99-test.conf``.
-_SANDBOXD_TEST_SERVICE = "sandboxd-test.service"
-_SANDBOXD_TEST_UNIT_PATH = Path("/etc/systemd/system") / _SANDBOXD_TEST_SERVICE
-_SANDBOXD_TEST_DROPIN_DIR = Path(
-    f"/etc/systemd/system/{_SANDBOXD_TEST_SERVICE}.d"
-)
-_SANDBOXD_TEST_DROPIN_PATH = _SANDBOXD_TEST_DROPIN_DIR / "99-test.conf"
-
-# Path of the source unit file in the workspace; the systemd path
-# copies this to ``_SANDBOXD_TEST_UNIT_PATH`` with a single-word rename
-# so the file's hardening and restart-policy stanzas match production.
-_SANDBOXD_SOURCE_UNIT = (
-    PROJECT_ROOT / "sandboxd" / "contrib" / "systemd" / "sandboxd.service"
-)
 
 # The test daemon uses a distinct base VM name so it neither sees nor
 # touches the operator's production `sandbox-base` Lima instance. We
@@ -279,18 +199,14 @@ E2E_TEST_POOL_CIDR = "10.220.0.0/20"
 import atexit  # noqa: E402  -- after module-level setup
 import getpass  # noqa: E402
 if "SANDBOX_USERS_CONF" not in os.environ:
-    # ``allow_users`` lists the operator AND the ``sandbox`` system user
-    # because, depending on SANDBOX_HARNESS, the daemon's effective uid
-    # at startup is either the test operator's (test-user harness) or
-    # the ``sandbox`` system user's (sandbox-systemd / sandbox-sudo).
-    # The daemon's startup-time ``find_subnet_by_uid`` lookup requires
-    # its own uid to appear in some pool's ``allow_users``; listing
-    # both names keeps the same tempfile usable across all three
-    # harnesses without re-rendering the JSON. Names that do not
-    # resolve to a uid on a given host are silently skipped by the
-    # daemon (Spec § users.conf — "unresolvable allow_users entries
-    # are treated as non-matches"), so listing ``sandbox`` is a no-op
-    # on hosts that have not provisioned the system user.
+    # ``allow_users`` lists the operator AND the ``sandbox`` system user.
+    # The daemon runs as the ``sandbox`` system user; its startup-time
+    # ``find_subnet_by_uid`` lookup requires the daemon's own uid to
+    # appear in some pool's ``allow_users``. Names that do not resolve
+    # to a uid on a given host are silently skipped by the daemon
+    # ("unresolvable allow_users entries are treated as non-matches"),
+    # so listing ``sandbox`` is a no-op on hosts that have not
+    # provisioned the system user.
     #
     # ``sandbox-e2e-test`` is the dedicated non-1000 operator account
     # (provisioned by ``make setup-e2e-test-operator``) that
@@ -321,10 +237,9 @@ if "SANDBOX_USERS_CONF" not in os.environ:
     _users_conf_tf.flush()
     _users_conf_tf.close()
     # Mode 0644 (world-readable) is required so the daemon running as
-    # the ``sandbox`` system user under SANDBOX_HARNESS=sandbox-systemd
-    # / sandbox-sudo can read the file (it lives under /tmp owned by
-    # the test operator). The file lists only CIDR pool definitions
-    # for the test daemon — no secrets — so widening to 0644 is safe.
+    # the ``sandbox`` system user can read the file (it lives under
+    # /tmp, owned by the test operator). The file lists only CIDR pool
+    # definitions for the test daemon — no secrets — so 0644 is safe.
     os.chmod(_users_conf_tf.name, 0o644)
     os.environ["SANDBOX_USERS_CONF"] = _users_conf_tf.name
 
@@ -402,8 +317,7 @@ def gateway_container_name(session_id: str) -> str:
 # Cross-user Lima helpers
 # ---------------------------------------------------------------------------
 #
-# Under the production-shaped harnesses (sandbox-systemd / sandbox-sudo) the
-# daemon runs as the ``sandbox`` system user and every Lima control-plane
+# The daemon runs as the ``sandbox`` system user; every Lima control-plane
 # operation goes through ``sandbox-lima-helper``, which pivots to the
 # *operator* uid before exec'ing limactl.  The resulting Lima state lives at
 # the per-operator path:
@@ -421,14 +335,10 @@ def gateway_container_name(session_id: str) -> str:
 # fails with EACCES ("open .../lima.yaml: permission denied" →
 # "instance has no configuration").  The test process already IS the operator
 # uid, so the correct approach is to run limactl directly (no sudo) with
-# LIMA_HOME set to the per-operator path.  This matches the verified manual
-# path: ``env LIMA_HOME=/var/lib/sandboxd/1000/lima limactl start`` works
-# when run as the operator.
+# LIMA_HOME set to the per-operator path.
 #
 # Use ``limactl_cmd()`` for the argv prefix and ``OP_LIMA_HOME`` for the path
-# constant in assertions.  Both fall back to bare ``limactl`` (no LIMA_HOME
-# override) in the legacy ``test-user`` harness where daemon uid ==
-# operator uid and the global ``~/.lima/`` is the correct registry.
+# constant in assertions.
 
 
 #: Absolute path to the per-operator LIMA_HOME under the cross-user harness.
@@ -437,31 +347,26 @@ OP_LIMA_HOME: str = f"/var/lib/sandboxd/{os.getuid()}/lima"
 
 
 def limactl_cmd(*args: str) -> list[str]:
-    """Build a limactl argv that queries the correct LIMA_HOME for this harness.
+    """Build a limactl argv that queries the per-operator LIMA_HOME.
 
-    Under ``sandbox-systemd`` / ``sandbox-sudo`` the VM registry lives at
-    ``/var/lib/sandboxd/<op_uid>/lima/`` (the per-operator LIMA_HOME).  Bare
-    ``limactl`` would look in ``~/.lima/`` and see nothing, so this wrapper
-    sets ``LIMA_HOME`` to the per-operator path via ``env``.
+    The VM registry lives at ``/var/lib/sandboxd/<op_uid>/lima/`` (the
+    per-operator LIMA_HOME).  Bare ``limactl`` would look in ``~/.lima/``
+    and see nothing, so this wrapper sets ``LIMA_HOME`` to the per-operator
+    path via ``env``.
 
-    Crucially, the per-operator LIMA_HOME and all its files (lima.yaml,
-    _config/user, VM directories) are owned by the OPERATOR uid and are
-    operator-private (0600/0700).  Running limactl as the ``sandbox`` system
-    user via ``sudo -n -u sandbox`` would fail with EACCES.  The test process
-    already runs as the operator uid, so we invoke limactl directly — no sudo
-    prefix — with only the LIMA_HOME override.
-
-    In the legacy ``test-user`` harness the daemon and operator share a uid,
-    so ``~/.lima/`` is the correct registry and no override is needed.
+    The per-operator LIMA_HOME and all its files (lima.yaml, _config/user,
+    VM directories) are owned by the OPERATOR uid and are operator-private
+    (0600/0700).  Running limactl as the ``sandbox`` system user via
+    ``sudo -n -u sandbox`` would fail with EACCES.  The test process already
+    runs as the operator uid, so we invoke limactl directly — no sudo prefix
+    — with only the LIMA_HOME override.
 
     Usage::
 
         subprocess.run(limactl_cmd("list", "--json"), ...)
         subprocess.run(limactl_cmd("shell", vm_name, "--", "uname", "-a"), ...)
     """
-    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
-        return ["env", f"LIMA_HOME={OP_LIMA_HOME}", "limactl", *args]
-    return ["limactl", *args]
+    return ["env", f"LIMA_HOME={OP_LIMA_HOME}", "limactl", *args]
 
 
 #: In-VM home directory for the ``sandbox`` user inside Lima VMs.
@@ -574,39 +479,23 @@ def wait_for_state(
 def capture_lima_logs(session_id: str) -> str:
     """Best-effort capture of Lima VM logs for debugging failures.
 
-    Under the cross-user harness (sandbox-systemd / sandbox-sudo) Lima state
-    lives at ``OP_LIMA_HOME`` (``/var/lib/sandboxd/<op_uid>/lima/``), NOT at
-    ``~/.lima/``.  We try the per-operator path first and fall back to the
-    legacy path so this helper works across all three harnesses.
+    Lima state lives at ``OP_LIMA_HOME`` (``/var/lib/sandboxd/<op_uid>/lima/``).
     """
     vm = lima_vm_name(session_id)
     logs = []
 
-    # ha.stderr.log is the main Lima log.  Under the cross-user harness the
-    # VM dir is inside OP_LIMA_HOME; under the legacy test-user harness it is
-    # under ~/.lima/.
-    candidate_dirs = [OP_LIMA_HOME]
-    if SANDBOX_HARNESS == "test-user":
-        candidate_dirs.append(os.path.expanduser("~/.lima"))
-
-    found = False
-    for lima_dir in candidate_dirs:
-        ha_log = os.path.join(lima_dir, vm, "ha.stderr.log")
-        try:
-            with open(ha_log) as f:
-                content = f.read()
-                if content:
-                    logs.append(f"--- {ha_log} (last 50 lines) ---")
-                    logs.extend(content.splitlines()[-50:])
-                    found = True
-                    break
-        except FileNotFoundError:
-            pass
-
-    if not found:
-        logs.append(
-            f"(no ha.stderr.log found for {vm} in {candidate_dirs})"
-        )
+    # ha.stderr.log is the main Lima log.  The VM dir is inside OP_LIMA_HOME.
+    ha_log = os.path.join(OP_LIMA_HOME, vm, "ha.stderr.log")
+    try:
+        with open(ha_log) as f:
+            content = f.read()
+            if content:
+                logs.append(f"--- {ha_log} (last 50 lines) ---")
+                logs.extend(content.splitlines()[-50:])
+            else:
+                logs.append(f"(no ha.stderr.log found for {vm} in {OP_LIMA_HOME})")
+    except FileNotFoundError:
+        logs.append(f"(no ha.stderr.log found for {vm} in {OP_LIMA_HOME})")
 
     return "\n".join(logs)
 
@@ -805,16 +694,13 @@ def sandbox_binaries() -> SandboxBinaries:
 def _assert_operator_in_sandbox_group() -> None:
     """Fail loudly if the calling pytest process is not in the ``sandbox`` group.
 
-    The new harness modes (``sandbox-systemd``, ``sandbox-sudo``) leave
-    the daemon socket at mode 0660 with ``group=sandbox``. A test process
-    whose effective groups do not include ``sandbox`` cannot read or
-    write the socket and every CLI invocation fails with EACCES — which
-    is the symptom the harness is meant to catch, but the cause is a
-    setup gap, not the cross-user bug under test.
+    The daemon socket is mode 0660 with ``group=sandbox``. A test process
+    whose effective groups do not include ``sandbox`` cannot read or write
+    the socket and every CLI invocation fails with EACCES — a setup gap,
+    not the cross-user bug under test.
 
     Group changes from ``usermod -aG sandbox <operator>`` do **not** take
-    effect in the current login session. The remediation depends on
-    context:
+    effect in the current login session. The remediation depends on context:
 
       * Interactive: log out + log back in, or re-launch the shell.
       * Scripted: wrap the invocation in ``sg sandbox -c '…'``.
@@ -826,11 +712,9 @@ def _assert_operator_in_sandbox_group() -> None:
         sandbox_gid = grp.getgrnam("sandbox").gr_gid
     except KeyError:
         pytest.fail(
-            "SANDBOX_HARNESS={harness!r} requires the `sandbox` system "
-            "group to exist on the host. Run `make setup-sandbox-user` "
-            "from the workspace root and re-run the tests.".format(
-                harness=SANDBOX_HARNESS
-            )
+            "The `sandbox` system group does not exist on this host. "
+            "Run `make setup-sandbox-user` from the workspace root and "
+            "re-run the tests."
         )
     # The socket is mode 0660, group=sandbox, so access is granted when the
     # sandbox gid is the process's effective GID *or* in its supplementary
@@ -865,9 +749,9 @@ def _assert_operator_in_sandbox_group() -> None:
             "workspace root, log out and back in, then re-run pytest."
         ).format(op=operator)
     pytest.fail(
-        f"SANDBOX_HARNESS={SANDBOX_HARNESS!r} requires the pytest process "
-        f"to be a member of the 'sandbox' system group (the daemon's "
-        f"unix socket is mode 0660, group=sandbox). {remediation}"
+        "The pytest process must be a member of the 'sandbox' system "
+        "group (the daemon socket is mode 0660, group=sandbox). "
+        f"{remediation}"
     )
 
 
@@ -881,10 +765,9 @@ def _wait_for_daemon_socket(
     Generalisation of :func:`wait_for_daemon_ready` that takes an
     ``is_dead`` callback instead of a ``Popen``. ``is_dead`` returns
     ``(True, "<reason>")`` when the daemon is known to have exited and
-    ``(False, "")`` otherwise. The systemd-launched daemon does not
-    expose a ``Popen`` for the harness to ``poll()`` (the daemon is a
-    grandchild of systemd, not of the test process), so the readiness
-    helper queries ``systemctl is-active`` via the callback instead.
+    ``(False, "")`` otherwise. The callback indirection lets a caller
+    supply its own liveness check; the ``sudo -u sandbox`` launcher
+    passes a closure over ``proc.poll()``.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -916,347 +799,16 @@ def _wait_for_daemon_socket(
     )
 
 
-class _SystemdDaemonHandle:
-    """Stand-in for ``subprocess.Popen`` exposing the daemon process API.
-
-    The systemd-launched daemon is a grandchild of systemd, not of the
-    pytest process, so the harness cannot ``Popen`` it directly. The
-    existing fixture API contract (``process.poll()``,
-    ``process.terminate()``, ``process.wait(timeout=...)``,
-    ``process.kill()``, ``process.returncode``) is implemented here in
-    terms of ``systemctl`` commands so existing test code that pokes
-    ``sandbox_daemon["process"]`` keeps working without change.
-
-    The restart-recovery e2e tests use :func:`restart_test_daemon` to
-    drive a harness-aware "kill the daemon, restart, hand it back to the
-    session-scoped fixture" workflow. Under the systemd harness that
-    routes through ``systemctl kill`` + ``systemctl start`` on this same
-    handle (no ``Popen`` swap); under the test-user / sandbox-sudo
-    harnesses it produces a fresh ``Popen``. Tests should not poke at
-    ``systemctl`` directly — call :func:`restart_test_daemon` and let it
-    dispatch on ``sandbox_daemon["_harness"]``.
-    """
-
-    def __init__(self, service: str):
-        self._service = service
-        self._returncode: int | None = None
-
-    def _is_active(self) -> bool:
-        # ``systemctl is-active`` exits 0 only while the unit is in
-        # state "active"; "activating"/"inactive"/"failed"/"deactivating"
-        # all exit non-zero.
-        rc = subprocess.run(
-            ["systemctl", "is-active", "--quiet", self._service],
-            timeout=10,
-        ).returncode
-        return rc == 0
-
-    def poll(self) -> int | None:
-        if self._returncode is not None:
-            return self._returncode
-        if self._is_active():
-            return None
-        # Daemon stopped on its own (or never started). Best-effort fetch
-        # the unit's exit status via ``systemctl show``; default to 1
-        # when we cannot decode the field.
-        out = subprocess.run(
-            ["systemctl", "show", self._service, "-p", "ExecMainStatus"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
-        try:
-            self._returncode = int(out.split("=", 1)[1]) if "=" in out else 1
-        except (ValueError, IndexError):
-            self._returncode = 1
-        return self._returncode
-
-    def terminate(self) -> None:
-        if self.poll() is None:
-            subprocess.run(
-                ["sudo", "-n", "systemctl", "stop", self._service],
-                capture_output=True, timeout=30,
-            )
-            self._returncode = 0
-
-    def kill(self) -> None:
-        # ``--kill-who=main`` to match :py:meth:`subprocess.Popen.kill`
-        # — only the daemon process receives SIGKILL, not the cgroup
-        # (see send_signal() for the full rationale).
-        if self.poll() is None:
-            subprocess.run(
-                ["sudo", "-n", "systemctl", "kill",
-                 "--kill-who=main", "-s", "SIGKILL",
-                 self._service],
-                capture_output=True, timeout=30,
-            )
-            self._returncode = -9
-
-    def send_signal(self, sig: int) -> None:
-        """Send ``sig`` to the unit's main process via ``systemctl kill``.
-
-        Implements the same surface as :py:meth:`subprocess.Popen.send_signal`
-        so the restart-recovery tests can ``daemon_proc.send_signal(SIGKILL)``
-        on either flavour of handle without branching. ``systemctl kill``
-        accepts the signal name (``SIGKILL``, ``SIGTERM``, ...) or the
-        numeric form; we translate from the Python ``signal.SIG*``
-        integer to a name for clarity in ``journalctl``.
-
-        ``--kill-who=main`` is load-bearing: without it ``systemctl
-        kill`` defaults to ``--kill-who=cgroup``, which delivers the
-        signal to *every* process in the unit's cgroup — including the
-        daemon's children (``limactl``, ``qemu-system-x86_64``, ``ssh``
-        forwarders, ...). The restart-recovery tests are reproducing
-        an abrupt daemon crash where the VM is expected to *survive*
-        the kill and be recovered as Running after the daemon comes
-        back; a cgroup-wide SIGKILL would also tear down QEMU and
-        defeat that contract. ``--kill-who=main`` matches the kernel
-        semantics of :py:meth:`subprocess.Popen.send_signal` — only
-        the parent process receives the signal.
-
-        Does *not* eagerly set ``_returncode`` — we leave that to the
-        next ``poll()`` / ``wait()`` call, which queries ``systemctl
-        show`` for the actual ``ExecMainStatus``. Setting it eagerly
-        here would race with the kernel: ``systemctl kill`` only
-        guarantees the signal has been *delivered* by the time it
-        returns, not that the unit has transitioned to inactive.
-        """
-        if self.poll() is not None:
-            return
-        # Translate the int to its canonical SIG* name when possible;
-        # fall back to the integer for exotic signals.
-        try:
-            import signal as _sig
-            sig_name = _sig.Signals(sig).name
-        except (ValueError, ImportError):
-            sig_name = str(int(sig))
-        subprocess.run(
-            ["sudo", "-n", "systemctl", "kill",
-             "--kill-who=main", "-s", sig_name,
-             self._service],
-            capture_output=True, timeout=30,
-        )
-
-    def wait(self, timeout: float | None = None) -> int:
-        deadline = (
-            None if timeout is None
-            else time.monotonic() + float(timeout)
-        )
-        while self.poll() is None:
-            if deadline is not None and time.monotonic() > deadline:
-                raise subprocess.TimeoutExpired(self._service, timeout)
-            time.sleep(0.1)
-        return self._returncode if self._returncode is not None else 0
-
-    def reset_for_restart(self) -> None:
-        """Forget the cached exit status so the next ``poll()`` re-evaluates
-        the live unit.
-
-        Called by :func:`restart_test_daemon` after re-starting the unit
-        via ``systemctl start``; without this the handle would still
-        report the pre-kill exit code.
-        """
-        self._returncode = None
-
-    @property
-    def returncode(self) -> int | None:
-        return self._returncode
-
-
-def _write_systemd_drop_in(
-    sandbox_binaries: SandboxBinaries,
-    users_conf_path: str,
-    sandbox_base_vm_name: str,
-) -> None:
-    """Install the systemd unit and drop-in override at session start.
-
-    The drop-in overrides three things from the production unit so the
-    test daemon can:
-
-    * Read the workspace's debug binary under ``/home/<operator>/...``
-      (``ProtectHome=no``) — the production unit hardens this away.
-    * Read the test harness's per-session ``SANDBOX_USERS_CONF``
-      tempfile (which lives under ``/tmp`` and is therefore opaque to
-      ``PrivateTmp=yes``) — set ``PrivateTmp=no``.
-    * See the harness's chosen base-VM name and the test users.conf
-      path via ``Environment=`` (the production unit inherits nothing
-      from systemd's caller environment).
-
-    The unit name (``sandboxd-test.service``, not ``sandboxd.service``)
-    is deliberately distinct so a production install on the same host
-    is untouched.
-    """
-    # ``sudo -n install -D`` would refuse the drop-in dir's automatic
-    # creation on some sudoers configs; do it in two explicit steps
-    # so the failure mode is obvious if the operator does not have
-    # passwordless ``sudo install``/``mkdir`` available.
-    subprocess.run(
-        ["sudo", "-n", "install", "-d", "-m", "0755",
-         str(_SANDBOXD_TEST_DROPIN_DIR)],
-        check=True, capture_output=True, timeout=10,
-    )
-
-    # Copy the in-tree production unit verbatim to the test unit path.
-    # The unit's ``User=sandbox``, ``Group=sandbox``,
-    # ``StateDirectory=sandbox``, and ``RuntimeDirectory=sandbox``
-    # stanzas all describe the production posture we want to reproduce;
-    # the drop-in below overrides only the parts that must be relaxed
-    # for the test binary to be readable.
-    if not _SANDBOXD_SOURCE_UNIT.exists():
-        pytest.fail(
-            f"systemd source unit not found at {_SANDBOXD_SOURCE_UNIT}; "
-            f"cannot launch the daemon under SANDBOX_HARNESS=sandbox-systemd."
-        )
-    subprocess.run(
-        ["sudo", "-n", "install", "-m", "0644",
-         str(_SANDBOXD_SOURCE_UNIT), str(_SANDBOXD_TEST_UNIT_PATH)],
-        check=True, capture_output=True, timeout=10,
-    )
-
-    # ``ExecStart=`` (empty) before the new ``ExecStart=`` directive
-    # is required by systemd to clear the inherited value before
-    # appending the new one; otherwise systemd refuses the unit with
-    # "Service has more than one ExecStart= setting".
-    drop_in = textwrap.dedent(
-        f"""\
-        # Managed by tests/e2e/conftest.py (cross-user harness).
-        # Do not edit by hand — `make setup-dev-env` does not touch
-        # this file, but every pytest session re-installs it.
-        [Service]
-        # Clear inherited ExecStart before re-defining; systemd otherwise
-        # rejects the unit for having multiple ExecStart directives.
-        ExecStart=
-        ExecStart={sandbox_binaries.sandboxd} \\
-            --base-dir {_SANDBOX_PROD_BASE_DIR} \\
-            --socket {_SANDBOX_PROD_SOCKET}
-        # Relax ProtectHome so the daemon can read its own binary under
-        # /home/<operator>/Projects/.../sandboxd/target/debug/sandboxd
-        # AND write Lima VMs under /var/lib/sandbox/.lima/ (which is the
-        # sandbox user's home, but treated by systemd as "home-like").
-        ProtectHome=no
-        # Relax PrivateTmp so the daemon can read the harness's
-        # SANDBOX_USERS_CONF tempfile (it lives under /tmp owned by the
-        # test operator).
-        PrivateTmp=no
-        # Reset UMask back to a sane default. The production unit pins
-        # UMask=0117 as defence-in-depth for the unix socket's 0660 mode;
-        # but that same UMask makes Lima's auto-created
-        # ``$HOME/.lima/<vm>/`` directories land at 0660 (no execute bit),
-        # so a follow-up ``limactl create`` call sees ``EACCES`` opening
-        # ``lima.yaml`` inside it and reports the misleading
-        # ``instance "sandbox-test-base" already exists``. The daemon
-        # explicitly chmods the socket to 0660 after bind regardless, so
-        # losing the UMask hardening here is no-op for the socket's
-        # security posture.
-        UMask=0022
-        # Allow privilege elevation in spawned children. The daemon
-        # itself is unprivileged, but it execs ``sandbox-route-helper``
-        # which carries file capabilities (``cap_net_admin,
-        # cap_sys_admin=eip``) to perform per-session ``setns(2)`` and
-        # ``RTM_NEWROUTE`` operations. The production unit pins
-        # ``NoNewPrivileges=yes`` defensively, but that flag blocks the
-        # kernel from honouring file caps on a ``execve(2)`` — the
-        # route helper would then fail with ``EPERM`` on the first
-        # ``setns`` call. The harness reverts to ``no`` so the cap'd
-        # helper still works; the daemon binary itself remains
-        # unprivileged.
-        NoNewPrivileges=no
-        # Reset DeviceAllow back to "allow everything". The production
-        # unit pins ``DeviceAllow=/dev/kvm rw`` so the daemon's cgroup
-        # only sees ``/dev/kvm``; but QEMU (spawned via ``limactl
-        # start``) also needs ``/dev/net/tun`` (TAP for bridged
-        # networking), ``/dev/random``/``/dev/urandom``, and several
-        # other character devices — without them QEMU exits with
-        # status 1 before opening its QMP socket and Lima reports
-        # ``Driver stopped due to error: exit status 1`` with no
-        # actionable detail. Resetting (empty list overrides the
-        # inherited setting; ``DeviceAllow=`` with no arg clears any
-        # previous ``DeviceAllow=`` directives) keeps the harness on
-        # the production-shaped path everywhere except this one knob
-        # that breaks QEMU.
-        DeviceAllow=
-        # Thread test-harness env-vars through to the daemon.
-        Environment="SANDBOX_USERS_CONF={users_conf_path}"
-        Environment="SANDBOX_BASE_VM_NAME={sandbox_base_vm_name}"
-        # Point the daemon's lima-helper resolver at the test-cap'd
-        # binary under ``/usr/local/libexec/sandboxd-test/`` so the
-        # Lima cross-user code path (every limactl call routed through
-        # ``sandbox-lima-helper`` to pivot to the operator's uid) is
-        # exercised by the e2e matrix. sandbox-spawn-helper was removed;
-        # all Lima control-plane operations now go through the lima-helper.
-        # Fail-closed under the resolver (a missing
-        # or un-cap'd path here is a hard error that prevents startup).
-        Environment="SANDBOX_LIMA_HELPER_PATH=/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
-        # Override the guest-agent binary the lima-helper copies into the
-        # VM during ``install-guest-agent``. The test helper is built with
-        # ``--features test-env-override`` which honours this env var;
-        # the release helper ignores it. Points at the workspace debug
-        # build so no separate prod-install step is required for testing.
-        Environment="SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH={sandbox_binaries.sandboxd.parent}/sandbox-guest"
-        # Disable Restart= so a daemon that crashes mid-test stays down
-        # and the test fails with a clear "daemon exited" diagnostic
-        # rather than mysteriously coming back up.
-        Restart=no
-        # ``KillMode=process`` so a ``systemctl kill`` (and the
-        # eventual main-process exit it triggers) leaves the daemon's
-        # children alone — most importantly QEMU and limactl
-        # forwarders that own per-session VMs. The default
-        # ``KillMode=control-group`` would propagate SIGTERM/SIGKILL
-        # to every process in the cgroup once the main process dies,
-        # which the restart-recovery tests cannot tolerate: they
-        # SIGKILL the daemon and then assert the surviving VM is
-        # recovered as Running once the daemon comes back up.
-        # Matches the semantics of ``Popen.send_signal`` /
-        # ``Popen.kill`` from the legacy test-user harness.
-        KillMode=process
-        """
-    )
-    # Stage to a tempfile in /tmp the operator can write, then
-    # ``sudo install`` into place. Skipping the visudo-equivalent
-    # ``systemd-analyze verify`` step here would let a malformed unit
-    # land in /etc/systemd/system/; do not paper over that.
-    tf = tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".conf",
-        prefix="sandboxd-test-dropin-",
-        delete=False,
-    )
-    try:
-        tf.write(drop_in)
-        tf.flush()
-        tf.close()
-        subprocess.run(
-            ["sudo", "-n", "install", "-m", "0644",
-             tf.name, str(_SANDBOXD_TEST_DROPIN_PATH)],
-            check=True, capture_output=True, timeout=10,
-        )
-    finally:
-        try:
-            os.unlink(tf.name)
-        except OSError:
-            pass
-
-    subprocess.run(
-        ["sudo", "-n", "systemd-analyze", "verify", _SANDBOXD_TEST_SERVICE],
-        capture_output=True, timeout=15,
-    )
-    # ``systemd-analyze verify`` exits 0 with warnings, non-zero on
-    # outright load failures. Re-running ``daemon-reload`` after every
-    # drop-in install is required — systemd caches the previous unit
-    # graph in-memory between reloads.
-    subprocess.run(
-        ["sudo", "-n", "systemctl", "daemon-reload"],
-        check=True, capture_output=True, timeout=10,
-    )
-
-
 def _reset_sandbox_state_dir() -> None:
     """Wipe ``/var/lib/sandbox`` between pytest sessions, preserving the
     Lima base-image cache and the golden base VM.
 
-    The systemd unit's ``StateDirectory=sandbox`` re-creates the dir
-    on the next start with the right ownership and mode; we just need
-    the daemon-managed state (``sessions.db``, per-session subdirs,
-    gateway-container artefacts, etc.) gone so a fresh ``sessions.db``
-    lands.
+    The daemon writes all files under ``/var/lib/sandbox`` as the
+    ``sandbox`` user, so deletes are issued as ``sudo -n -u sandbox find
+    … -delete``.  The base dir itself is left intact (owned sandbox:sandbox
+    0750, provisioned by ``make setup-sandbox-prod-base-dir``); we only
+    remove daemon-managed state so a fresh ``sessions.db`` lands on the
+    next session start.
 
     What we explicitly **keep**:
 
@@ -1285,13 +837,14 @@ def _reset_sandbox_state_dir() -> None:
     """
     if not _SANDBOX_PROD_BASE_DIR.exists():
         return
-    # ``find ... -prune`` excludes both kept paths from the delete
-    # sweep. ``-mindepth 1`` keeps the base dir itself intact (its
-    # mode and ownership come from the systemd unit's
-    # ``StateDirectory=`` directive and we do not want to recreate
-    # them on every run). The two pruned trees stay byte-for-byte
-    # identical across reset, which is exactly what the pre-warm
-    # fixture's "is the image fresh?" check needs to short-circuit.
+    # ``find ... -prune`` excludes kept paths from the delete sweep.
+    # ``-mindepth 1`` keeps the base dir itself intact. The two pruned
+    # trees stay byte-for-byte identical across reset, which is exactly
+    # what the pre-warm fixture's "is the image fresh?" check needs to
+    # short-circuit.
+    #
+    # The daemon owns all files under /var/lib/sandbox as the sandbox
+    # user, so run find as sandbox (not root).
     cache_dir = str(_SANDBOX_PROD_BASE_DIR / ".cache" / "lima")
     base_vm_dir = str(
         _SANDBOX_PROD_BASE_DIR / ".lima" /
@@ -1300,7 +853,8 @@ def _reset_sandbox_state_dir() -> None:
     meta_file = str(_SANDBOX_PROD_BASE_DIR / "base-image-meta.json")
     subprocess.run(
         [
-            "sudo", "-n", "find", str(_SANDBOX_PROD_BASE_DIR),
+            "sudo", "-n", "-u", "sandbox",
+            "find", str(_SANDBOX_PROD_BASE_DIR),
             "-mindepth", "1",
             # Order matters: the prunes go first, then the delete
             # branch. ``find`` evaluates left-to-right with implicit
@@ -1325,8 +879,7 @@ def _reset_sandbox_state_dir() -> None:
     # prior session. The download cache is preserved so the ~580 MiB
     # qcow2 is not re-fetched. The directory is owned sandbox:sandbox
     # 0750 (ACL grants the operator rwx), so deletes are routed through
-    # ``sudo -n -u sandbox find … -delete`` — mirroring the pattern
-    # above for /var/lib/sandbox.
+    # ``sudo -n -u sandbox find … -delete``.
     op_uid = os.getuid()
     op_lima_home = Path(f"/var/lib/sandboxd/{op_uid}/lima")
     if op_lima_home.exists():
@@ -1352,132 +905,40 @@ def _reset_sandbox_state_dir() -> None:
         )
 
 
-def _launch_daemon_as_sandbox_via_systemd(
-    sandbox_binaries: SandboxBinaries,
-    tmp_path: Path,
-) -> dict:
-    """Start the daemon as the ``sandbox`` user via systemd.
-
-    The unit and drop-in override are written/refreshed every pytest
-    session — see :func:`_write_systemd_drop_in` for what gets
-    overridden and why. State is wiped before the start so each
-    session begins from a clean DB.
-    """
-    _assert_operator_in_sandbox_group()
-    _write_systemd_drop_in(
-        sandbox_binaries=sandbox_binaries,
-        users_conf_path=os.environ["SANDBOX_USERS_CONF"],
-        sandbox_base_vm_name=os.environ["SANDBOX_BASE_VM_NAME"],
-    )
-    _reset_sandbox_state_dir()
-
-    # Stop any prior instance from a previous (possibly crashed)
-    # pytest session before we daemon-reload + start. ``stop`` on
-    # an inactive unit is a no-op exit 0.
-    subprocess.run(
-        ["sudo", "-n", "systemctl", "stop", _SANDBOXD_TEST_SERVICE],
-        capture_output=True, timeout=30,
-    )
-    subprocess.run(
-        ["sudo", "-n", "systemctl", "reset-failed", _SANDBOXD_TEST_SERVICE],
-        capture_output=True, timeout=10,
-    )
-    start = subprocess.run(
-        ["sudo", "-n", "systemctl", "start", _SANDBOXD_TEST_SERVICE],
-        capture_output=True, text=True, timeout=30,
-    )
-    if start.returncode != 0:
-        # Dump journalctl so the failure is actionable.
-        journal = subprocess.run(
-            ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
-             "--no-pager", "-n", "200"],
-            capture_output=True, text=True, timeout=15,
-        )
-        pytest.fail(
-            "Failed to start sandboxd via systemd "
-            f"(rc={start.returncode}).\n"
-            f"systemctl stdout: {start.stdout}\n"
-            f"systemctl stderr: {start.stderr}\n"
-            f"journalctl tail:\n{journal.stdout}\n{journal.stderr}"
-        )
-
-    handle = _SystemdDaemonHandle(_SANDBOXD_TEST_SERVICE)
-
-    # Per-session log files live under the harness's tmp_path so the
-    # existing _dump_daemon_log_on_failure plumbing keeps working
-    # without touching every test that reads ``_stdout_log``/
-    # ``_stderr_log``. Under systemd the daemon's output goes to the
-    # journal, so the "log file" is the on-disk projection of
-    # journalctl --since=<session start>.
-    stdout_log = tmp_path / "sandboxd.stdout.log"
-    stderr_log = tmp_path / "sandboxd.stderr.log"
-    stdout_log.touch()
-    stderr_log.touch()
-    stdout_fh = open(stdout_log, "a")
-    stderr_fh = open(stderr_log, "a")
-
-    def _is_dead() -> tuple[bool, str]:
-        rc = handle.poll()
-        if rc is None:
-            return (False, "")
-        # Daemon exited; dump the journal so the failure path emits
-        # something actionable.
-        journal = subprocess.run(
-            ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
-             "--no-pager", "-n", "200"],
-            capture_output=True, text=True, timeout=15,
-        ).stdout
-        return (True, f"systemd unit exited rc={rc}; journal tail:\n{journal}")
-
-    try:
-        _wait_for_daemon_socket(
-            _SANDBOX_PROD_SOCKET, _is_dead, DAEMON_STARTUP_TIMEOUT,
-        )
-    except BaseException:
-        # Tear the unit down so a half-started instance does not
-        # leak into the next session.
-        subprocess.run(
-            ["sudo", "-n", "systemctl", "stop", _SANDBOXD_TEST_SERVICE],
-            capture_output=True, timeout=30,
-        )
-        stdout_fh.close()
-        stderr_fh.close()
-        raise
-
-    return {
-        "socket": str(_SANDBOX_PROD_SOCKET),
-        "base_dir": str(_SANDBOX_PROD_BASE_DIR),
-        "process": handle,
-        "_stdout_fh": stdout_fh,
-        "_stderr_fh": stderr_fh,
-        "_stdout_log": stdout_log,
-        "_stderr_log": stderr_log,
-        "_harness": "sandbox-systemd",
-    }
-
-
 def _launch_daemon_as_sandbox_via_sudo(
     sandbox_binaries: SandboxBinaries,
     tmp_path: Path,
 ) -> dict:
     """Start the daemon as the ``sandbox`` user via ``sudo -u sandbox``.
 
-    Used in environments without systemd (CI containers, install-e2e
-    suites that exercise a non-systemd Linux). Requires the NOPASSWD
-    sudoers fragment at ``/etc/sudoers.d/sandboxd-test`` (installed by
-    ``make setup-test-sudoers-fragment``); a missing fragment causes
-    sudo to silently prompt and hang the wait-for-socket deadline, so
-    the harness probes for it up front and fails with a precise error.
+    This is the sole launch path. Requires the NOPASSWD sudoers fragment
+    at ``/etc/sudoers.d/sandboxd-test`` (installed by
+    ``make setup-test-sudoers-fragment``); a missing fragment causes sudo
+    to prompt and hang the wait-for-socket deadline, so the harness probes
+    up front and fails with a precise error.
+
+    The base dir ``/var/lib/sandbox`` must already exist with
+    ``sandbox:sandbox`` ownership and mode 0750 — provisioned once by
+    ``make setup-sandbox-prod-base-dir`` (part of ``make setup-dev-env``).
+    The socket lives inside the base dir so the daemon can create it
+    without root.
     """
     _assert_operator_in_sandbox_group()
 
-    # Probe NOPASSWD authorisation. ``sudo -n -u sandbox true`` returns
-    # rc=1 with "a password is required" on stderr when the fragment
-    # is missing; rc=0 when the fragment grants the operator passwordless
-    # sandbox access. We probe with the binary path (not ``true``)
-    # because the fragment whitelists only the test binary — using a
-    # different command would falsely report "not allowed" when in fact
-    # the fragment is fine.
+    # Assert the base dir is provisioned. The daemon writes the socket
+    # and all state here; if it is missing the daemon will fail to start.
+    if not _SANDBOX_PROD_BASE_DIR.exists():
+        pytest.fail(
+            f"{_SANDBOX_PROD_BASE_DIR} does not exist. "
+            "Run `make setup-sandbox-prod-base-dir` (or `make setup-dev-env`) "
+            "from the workspace root to create it, then re-run."
+        )
+
+    # Probe NOPASSWD authorisation. ``sudo -n -u sandbox <binary> --version``
+    # returns rc=1 with "a password is required" on stderr when the sudoers
+    # fragment is absent or mis-scoped; rc=0 when the fragment grants
+    # passwordless sandbox impersonation. Failing here prevents a silent hang
+    # at the wait-for-socket deadline.
     probe = subprocess.run(
         ["sudo", "-n", "-u", "sandbox",
          str(sandbox_binaries.sandboxd), "--version"],
@@ -1485,9 +946,9 @@ def _launch_daemon_as_sandbox_via_sudo(
     )
     if probe.returncode != 0:
         pytest.fail(
-            "SANDBOX_HARNESS=sandbox-sudo requires a NOPASSWD sudoers "
-            "fragment authorising the test operator to run the "
-            "workspace's debug sandboxd binary as the `sandbox` user. "
+            "The NOPASSWD sudoers fragment at /etc/sudoers.d/sandboxd-test "
+            "is missing or does not authorise the operator to run commands "
+            "as the `sandbox` user. "
             "Run `make setup-test-sudoers-fragment` from the workspace "
             "root and re-run.\n"
             f"sudo probe stderr: {probe.stderr.strip()!r}"
@@ -1495,38 +956,20 @@ def _launch_daemon_as_sandbox_via_sudo(
 
     _reset_sandbox_state_dir()
 
-    # Re-create the production state and runtime dirs owned by sandbox
-    # so the daemon can write into them. ``install -d`` is idempotent
-    # against an already-correct dir; ``-o sandbox -g sandbox`` is the
-    # production ownership the systemd unit's ``StateDirectory=`` and
-    # ``RuntimeDirectory=`` would otherwise create.
-    for d in (_SANDBOX_PROD_BASE_DIR, _SANDBOX_PROD_SOCKET.parent):
-        subprocess.run(
-            ["sudo", "-n", "install", "-d", "-o", "sandbox", "-g", "sandbox",
-             "-m", "0750", str(d)],
-            check=True, capture_output=True, timeout=10,
-        )
-
     stdout_log = tmp_path / "sandboxd.stdout.log"
     stderr_log = tmp_path / "sandboxd.stderr.log"
     stdout_fh = open(stdout_log, "w")
     stderr_fh = open(stderr_log, "w")
 
     daemon_env = os.environ.copy()
-    # The sudoers fragment installed by
-    # ``make setup-test-sudoers-fragment`` declares
-    # ``env_keep += "SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET"``
-    # for this specific binary, so the variables propagate through sudo
-    # without ``--preserve-env`` (which itself would also have to be
-    # whitelisted by sudoers and is more brittle).
+    # The sudoers fragment installed by ``make setup-test-sudoers-fragment``
+    # declares ``Defaults:$USER env_keep += "SANDBOX_USERS_CONF ..."``
+    # so the variables propagate through sudo without ``--preserve-env``
+    # (which is more brittle to whitelist).
     #
-    # ``SANDBOX_LIMA_HELPER_PATH`` is set here for symmetry with the
-    # systemd Environment block above (sandbox-spawn-helper was removed;
-    # all Lima operations now go through sandbox-lima-helper). The sudoers
-    # fragment installed by ``make setup-test-sudoers-fragment`` includes
-    # ``SANDBOX_LIMA_HELPER_PATH`` in ``env_keep`` so the variable
-    # propagates through sudo and the daemon's lima-helper resolver finds
-    # the test-cap'd binary rather than hard-failing at startup.
+    # ``SANDBOX_LIMA_HELPER_PATH`` points the daemon's lima-helper resolver
+    # at the test-cap'd binary so all Lima control-plane operations go
+    # through sandbox-lima-helper and pivot to the operator's uid.
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", "sandbox",
@@ -1584,73 +1027,6 @@ def _launch_daemon_as_sandbox_via_sudo(
         "_stderr_fh": stderr_fh,
         "_stdout_log": stdout_log,
         "_stderr_log": stderr_log,
-        "_harness": "sandbox-sudo",
-    }
-
-
-def _launch_daemon_as_test_user(
-    sandbox_binaries: SandboxBinaries,
-    tmp_path: Path,
-) -> dict:
-    """Legacy harness: launch the daemon as the test process's own user.
-
-    Identical to the historical pre-cross-user-harness path. Retained
-    for the diff-the-outcomes baseline run; the cross-user Lima bug
-    the spec is reproducing is invisible under this harness because
-    the daemon and the operator's CLI share a uid.
-    """
-    socket_path = tmp_path / "sandboxd.sock"
-    base_dir = tmp_path / "state"
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    stdout_log = tmp_path / "sandboxd.stdout.log"
-    stderr_log = tmp_path / "sandboxd.stderr.log"
-    stdout_fh = open(stdout_log, "w")
-    stderr_fh = open(stderr_log, "w")
-
-    proc = subprocess.Popen(
-        [
-            str(sandbox_binaries.sandboxd),
-            "--socket", str(socket_path),
-            "--base-dir", str(base_dir),
-        ],
-        stdout=stdout_fh,
-        stderr=stderr_fh,
-    )
-
-    def _is_dead() -> tuple[bool, str]:
-        rc = proc.poll()
-        if rc is None:
-            return (False, "")
-        return (True, f"sandboxd exited rc={rc}")
-
-    try:
-        _wait_for_daemon_socket(socket_path, _is_dead, DAEMON_STARTUP_TIMEOUT)
-    except BaseException:
-        if proc.poll() is None:
-            proc.kill()
-        stdout_fh.close()
-        stderr_fh.close()
-        try:
-            stderr_text = stderr_log.read_text()
-        except OSError:
-            stderr_text = "(could not read stderr log)"
-        print(
-            f"sandboxd-as-test-user startup failed.\n"
-            f"stderr: {stderr_text}",
-            file=sys.stderr,
-        )
-        raise
-
-    return {
-        "socket": str(socket_path),
-        "base_dir": str(base_dir),
-        "process": proc,
-        "_stdout_fh": stdout_fh,
-        "_stderr_fh": stderr_fh,
-        "_stdout_log": stdout_log,
-        "_stderr_log": stderr_log,
-        "_harness": "test-user",
     }
 
 
@@ -1659,8 +1035,8 @@ def restart_test_daemon(
     sandbox_binaries: SandboxBinaries,
     *,
     ready_timeout: float = 15,
-) -> "subprocess.Popen | _SystemdDaemonHandle":
-    """Harness-aware "restart the daemon mid-test" helper.
+) -> subprocess.Popen:
+    """Restart the daemon mid-test as the ``sandbox`` user via ``sudo -u sandbox``.
 
     Used by the restart-recovery e2e tests (``test_networking::
     test_daemon_restart_recovery``, ``test_lite::
@@ -1671,122 +1047,36 @@ def restart_test_daemon(
     the *restart* leg and the in-place re-registration into
     ``sandbox_daemon`` so the session-scoped fixture stays coherent.
 
-    Dispatch on ``sandbox_daemon["_harness"]``:
+    Re-spawns ``sudo -n -u sandbox sandboxd`` against the same socket
+    and base-dir. Reuses the session-scope log files (the session teardown
+    reads them via the existing ``_stdout_log``/``_stderr_log`` keys);
+    append-mode so the per-test dump fixture's offset book-keeping still
+    works.
 
-    * **sandbox-systemd** — Re-start the unit via ``sudo systemctl
-      start <unit>`` (not ``restart``). ``restart`` on a unit that is
-      already in the ``failed`` state from a SIGKILL does nothing unless
-      ``reset-failed`` is called first; this helper issues
-      ``reset-failed`` then ``start`` so the sequencing is explicit and
-      correct. Reset the cached exit-code on the existing
-      :class:`_SystemdDaemonHandle`, wait for the socket to come back
-      up, and return the *same* handle (no swap). The session-scope
-      fixture's teardown closes ``info["_stdout_fh"]``/``_stderr_fh``
-      so we leave those alone — under systemd the daemon's output
-      goes to the journal anyway, and tests dumping logs on failure
-      should use :func:`journalctl_for_test_window` instead of the
-      log-file path.
-
-    * **sandbox-sudo** — Re-spawn the daemon as the ``sandbox`` user via
-      ``sudo -n -u sandbox sandboxd``, returning the fresh
-      :class:`subprocess.Popen`. Tests re-register it into
-      ``sandbox_daemon["process"]``.
-
-    * **test-user** — Re-spawn the daemon as the test process's own
-      user, returning the fresh ``Popen``. Identical to the legacy
-      Popen-swap pattern.
-
-    Callers are expected to register the returned handle into
-    ``sandbox_daemon["process"]`` before returning, so the session-
-    scoped teardown operates on the live daemon. The helper does not
-    do this automatically because the tests need the returned handle
-    accessible to their per-test cleanup ``finally`` blocks.
+    Callers are expected to register the returned ``Popen`` into
+    ``sandbox_daemon["process"]`` before returning, so the session-scoped
+    teardown operates on the live daemon. The helper does not do this
+    automatically because the tests need the returned handle accessible to
+    their per-test cleanup ``finally`` blocks.
     """
-    harness = sandbox_daemon.get("_harness", "test-user")
     socket_path = sandbox_daemon["socket"]
     base_dir = sandbox_daemon["base_dir"]
-
-    if harness == "sandbox-systemd":
-        handle = sandbox_daemon["process"]
-        if not isinstance(handle, _SystemdDaemonHandle):
-            pytest.fail(
-                "restart_test_daemon: harness=sandbox-systemd but "
-                f"sandbox_daemon['process'] is {type(handle).__name__}, "
-                "expected _SystemdDaemonHandle"
-            )
-        # Best-effort reset of any "failed" state from the SIGKILL the
-        # test issued; ``systemctl start`` on a unit in failed state
-        # without ``reset-failed`` will refuse to re-start.
-        subprocess.run(
-            ["sudo", "-n", "systemctl", "reset-failed",
-             _SANDBOXD_TEST_SERVICE],
-            capture_output=True, timeout=10,
-        )
-        start = subprocess.run(
-            ["sudo", "-n", "systemctl", "start", _SANDBOXD_TEST_SERVICE],
-            capture_output=True, text=True, timeout=30,
-        )
-        if start.returncode != 0:
-            journal = subprocess.run(
-                ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
-                 "--no-pager", "-n", "200"],
-                capture_output=True, text=True, timeout=15,
-            )
-            pytest.fail(
-                "restart_test_daemon: systemctl start failed (rc="
-                f"{start.returncode}).\nstdout: {start.stdout}\n"
-                f"stderr: {start.stderr}\njournal tail:\n{journal.stdout}"
-            )
-        handle.reset_for_restart()
-        # Use a per-handle _is_dead closure so the ready probe can
-        # surface a re-killed unit as a clean failure (mirrors
-        # _launch_daemon_as_sandbox_via_systemd).
-        def _is_dead() -> tuple[bool, str]:
-            rc = handle.poll()
-            if rc is None:
-                return (False, "")
-            journal = subprocess.run(
-                ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
-                 "--no-pager", "-n", "200"],
-                capture_output=True, text=True, timeout=15,
-            ).stdout
-            return (True, f"unit exited rc={rc}; journal:\n{journal}")
-
-        _wait_for_daemon_socket(
-            Path(socket_path), _is_dead, ready_timeout,
-        )
-        return handle
-
-    # Non-systemd harnesses: spawn a fresh subprocess.Popen against the
-    # same socket and base-dir. Re-use the session-scope log files (the
-    # session teardown reads them via the existing `_stdout_log`/
-    # `_stderr_log` keys); append-mode so the per-test dump fixture's
-    # offset book-keeping still works.
     stdout_log = sandbox_daemon["_stdout_log"]
     stderr_log = sandbox_daemon["_stderr_log"]
     new_stdout_fh = open(stdout_log, "a")
     new_stderr_fh = open(stderr_log, "a")
 
-    argv: list[str]
     daemon_env = os.environ.copy()
-    if harness == "sandbox-sudo":
-        argv = [
+    daemon_env["SANDBOX_USERS_CONF"] = os.environ["SANDBOX_USERS_CONF"]
+    daemon_env["SANDBOX_BASE_VM_NAME"] = os.environ["SANDBOX_BASE_VM_NAME"]
+
+    proc = subprocess.Popen(
+        [
             "sudo", "-n", "-u", "sandbox",
             str(sandbox_binaries.sandboxd),
             "--socket", str(socket_path),
             "--base-dir", str(base_dir),
-        ]
-        daemon_env["SANDBOX_USERS_CONF"] = os.environ["SANDBOX_USERS_CONF"]
-        daemon_env["SANDBOX_BASE_VM_NAME"] = os.environ["SANDBOX_BASE_VM_NAME"]
-    else:
-        argv = [
-            str(sandbox_binaries.sandboxd),
-            "--socket", str(socket_path),
-            "--base-dir", str(base_dir),
-        ]
-
-    proc = subprocess.Popen(
-        argv,
+        ],
         env=daemon_env,
         stdout=new_stdout_fh,
         stderr=new_stderr_fh,
@@ -1813,12 +1103,11 @@ def restart_test_daemon(
 def _purge_sessions_via_api(socket_path: str) -> None:
     """Delete every session known to the daemon via the HTTP API.
 
-    Used during teardown of the production-shaped harnesses
-    (``sandbox-systemd`` and ``sandbox-sudo``) where the state dir is
-    not tmp-isolated per pytest run. Sessions left behind would survive
-    a daemon restart and corrupt the next session. Best-effort: any
-    failure is logged but does not block teardown — the dir-wipe below
-    handles the cold-state case.
+    Used during teardown so the next pytest session boots against a clean
+    DB. Sessions left behind would survive a daemon restart and corrupt the
+    next session. Best-effort: any failure is logged but does not block
+    teardown — the dir-wipe at the start of the next session handles the
+    cold-state case.
     """
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -1874,36 +1163,24 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
 
     Session-scoped: all tests share the same daemon process.
 
-    The launch strategy is selected by the ``SANDBOX_HARNESS`` env-var
-    at conftest-import time — see the comment block near the top of
-    the module for the three modes and their respective trade-offs.
+    Launches the daemon as the ``sandbox`` system user via
+    ``sudo -u sandbox``. All sudo is pre-authorized at
+    ``make setup-dev-env`` time via the NOPASSWD fragment at
+    ``/etc/sudoers.d/sandboxd-test``; no runtime root sudo is ever issued.
 
-    Yields a dict shaped identically across all three modes:
+    Yields a dict with:
       - ``socket``       — path to the daemon's unix socket
       - ``base_dir``     — daemon's base directory
-      - ``process``      — process handle (``Popen`` for sudo / test-user,
-                           ``_SystemdDaemonHandle`` shim for systemd)
+      - ``process``      — subprocess.Popen for the running daemon
       - ``_stdout_log``, ``_stderr_log`` — log file paths
       - ``_stdout_fh``,  ``_stderr_fh``  — open writers on the above
-      - ``_harness``     — the resolved harness mode (one of
-                           ``sandbox-systemd``, ``sandbox-sudo``,
-                           ``test-user``)
 
-    Tears down the daemon (SIGTERM / ``systemctl stop``), purges any
-    sessions left behind via the daemon HTTP API in the production-shaped
-    modes, then force-deletes any Lima VMs / Docker containers / networks
-    that leaked during the session as a final safety net.
+    Tears down the daemon (SIGTERM), purges any sessions left behind via
+    the daemon HTTP API, then force-deletes any Lima VMs / Docker containers
+    / networks that leaked during the session as a final safety net.
     """
     tmp_path = tmp_path_factory.mktemp("sandboxd")
-
-    if SANDBOX_HARNESS == "sandbox-systemd":
-        info = _launch_daemon_as_sandbox_via_systemd(sandbox_binaries, tmp_path)
-    elif SANDBOX_HARNESS == "sandbox-sudo":
-        info = _launch_daemon_as_sandbox_via_sudo(sandbox_binaries, tmp_path)
-    elif SANDBOX_HARNESS == "test-user":
-        info = _launch_daemon_as_test_user(sandbox_binaries, tmp_path)
-    else:  # pragma: no cover -- guarded at module import time
-        raise RuntimeError(f"unreachable: SANDBOX_HARNESS={SANDBOX_HARNESS!r}")
+    info = _launch_daemon_as_sandbox_via_sudo(sandbox_binaries, tmp_path)
 
     yield info
 
@@ -1912,14 +1189,13 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
     # Best-effort: purge sessions via API before stopping the daemon so
     # the next pytest session boots against a clean DB. The dir-wipe at
     # the start of the next session catches anything that survives this.
-    if info.get("_harness") in ("sandbox-systemd", "sandbox-sudo"):
-        try:
-            _purge_sessions_via_api(info["socket"])
-        except Exception:
-            pass
+    try:
+        _purge_sessions_via_api(info["socket"])
+    except Exception:
+        pass
 
     # Close daemon log file handles.  Use the current handles from info
-    # because test_daemon_restart_recovery may have swapped them out.
+    # because restart_test_daemon may have swapped them out.
     try:
         info["_stdout_fh"].close()
     except Exception:
@@ -1930,27 +1206,20 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
         pass
 
     # Collect any Lima VM names from the daemon's session db so we can
-    # clean them up even if the test forgot to `rm`. Under the
-    # production-shaped harnesses (``sandbox-systemd`` / ``sandbox-sudo``)
-    # the daemon owns its Lima registry at
-    # ``/var/lib/sandboxd/<op-uid>/lima/`` (the per-operator LIMA_HOME);
-    # bare ``limactl`` would look in ``~/.lima/`` and see nothing.  We set
-    # LIMA_HOME to the per-operator path so the list/delete calls reach the
-    # right registry.  The per-operator LIMA_HOME is owned by the operator
-    # uid (operator-private, 0600/0700), so we run limactl directly as the
-    # test operator — no ``sudo -n -u sandbox`` prefix, which would hit
-    # EACCES on the operator-owned files.  In the legacy ``test-user``
-    # harness the daemon and the test operator share a uid, so bare
-    # ``limactl`` (with default ~/.lima/) is correct.
-    if info.get("_harness") in ("sandbox-systemd", "sandbox-sudo"):
-        op_uid = os.getuid()
-        op_lima_home = f"/var/lib/sandboxd/{op_uid}/lima"
-        limactl_argv_prefix: list[str] = [
-            "env", f"LIMA_HOME={op_lima_home}",
-            "limactl",
-        ]
-    else:
-        limactl_argv_prefix = ["limactl"]
+    # clean them up even if the test forgot to `rm`. The daemon owns its
+    # Lima registry at ``/var/lib/sandboxd/<op-uid>/lima/`` (the
+    # per-operator LIMA_HOME); bare ``limactl`` would look in ``~/.lima/``
+    # and see nothing. We set LIMA_HOME to the per-operator path so the
+    # list/delete calls reach the right registry. The per-operator LIMA_HOME
+    # is owned by the operator uid (operator-private, 0600/0700), so we run
+    # limactl directly as the test operator — no ``sudo -n -u sandbox``
+    # prefix, which would hit EACCES on the operator-owned files.
+    op_uid = os.getuid()
+    op_lima_home = f"/var/lib/sandboxd/{op_uid}/lima"
+    limactl_argv_prefix: list[str] = [
+        "env", f"LIMA_HOME={op_lima_home}",
+        "limactl",
+    ]
 
     vm_names_to_clean: list[str] = []
     try:
@@ -2076,46 +1345,6 @@ def _read_log_window(path: Path, start_offset: int) -> tuple[str, int, int]:
     return ("\n".join(lines), effective_start, end)
 
 
-def _dump_journalctl_for_test_window(
-    service: str, since: str, fallback_lines: int = 200
-) -> str:
-    """Return the ``journalctl -u <service>`` output for a given window.
-
-    Used by the dump-on-failure fixture in ``sandbox-systemd`` mode to
-    extract just the lines logged during the test that just failed,
-    rather than every line since boot. Falls back to the last
-    ``fallback_lines`` lines if ``--since`` produces nothing (e.g. very
-    short tests that didn't emit anything within the window).
-
-    Best-effort: returns a descriptive placeholder if ``journalctl`` is
-    not available or the sudo probe denies access; never raises.
-    """
-    try:
-        cp = subprocess.run(
-            ["sudo", "-n", "journalctl", "-u", service,
-             f"--since={since}", "--no-pager"],
-            capture_output=True, text=True, timeout=15,
-        )
-        text = cp.stdout
-        if not text.strip():
-            # Empty window — fall back to a small tail so we still get
-            # *something* actionable. ``-n N`` is unioned with
-            # ``--since=`` so we explicitly drop the latter for the
-            # fallback.
-            cp_tail = subprocess.run(
-                ["sudo", "-n", "journalctl", "-u", service,
-                 f"-n", str(fallback_lines), "--no-pager"],
-                capture_output=True, text=True, timeout=15,
-            )
-            text = (
-                "(no entries since test start; falling back to last "
-                f"{fallback_lines} lines)\n{cp_tail.stdout}"
-            )
-        return text
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        return f"(journalctl unavailable: {exc!r})"
-
-
 @pytest.fixture(autouse=True)
 def _dump_daemon_log_on_failure(request, sandbox_daemon):
     """Print the per-test window of sandboxd's stderr+stdout on failure.
@@ -2127,15 +1356,9 @@ def _dump_daemon_log_on_failure(request, sandbox_daemon):
     ``test_daemon_restart_recovery``, which deliberately writes to the
     same log paths).
 
-    Under ``SANDBOX_HARNESS=sandbox-systemd`` the daemon's output goes to
-    the systemd journal, *not* the per-session log files: those files
-    exist as zero-byte placeholders just so the offset book-keeping
-    above is uniform across harnesses. To make systemd failures
-    debuggable we additionally dump ``journalctl --since=<test start>``
-    for the test unit on failure. The journal window is anchored to the
-    pre-yield timestamp captured here so the dump shows exactly the
-    lines emitted during the failing test body, mirroring the file-log
-    window behaviour for the other harnesses.
+    The daemon runs as the ``sandbox`` user via ``sudo -u sandbox`` and
+    writes its stdout/stderr to the per-session log files at
+    ``_stdout_log``/``_stderr_log`` in ``sandbox_daemon``.
 
     Driven by the per-phase outcome stashed by ``pytest_runtest_makereport``.
     Only fires when ``rep_call`` (the test body) failed — setup/teardown
@@ -2143,10 +1366,7 @@ def _dump_daemon_log_on_failure(request, sandbox_daemon):
 
     The file window is capped at ``_DUMP_MAX_LINES`` / ``_DUMP_MAX_BYTES``
     from the tail with a ``(truncated)`` marker; if the file shrank
-    during the test (rotation), the dump falls back to reading from
-    offset 0. The journalctl window has no analogous cap because
-    journalctl itself bounds output, but we apply a 15 s subprocess
-    timeout so a stuck journald daemon cannot hang teardown.
+    during the test (rotation), the dump falls back to reading from offset 0.
 
     Depends on ``sandbox_daemon`` (session-scoped) so every test that uses
     a daemon — directly or transitively — gets the dump for free. Tests
@@ -2159,30 +1379,9 @@ def _dump_daemon_log_on_failure(request, sandbox_daemon):
         key: _capture_log_offset(sandbox_daemon[key])
         for _, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log"))
     }
-    # journalctl --since= accepts the "YYYY-MM-DD HH:MM:SS" format
-    # (local time) directly; we snapshot it pre-yield so the post-test
-    # dump targets exactly the test's wall-clock window.
-    journal_since = time.strftime("%Y-%m-%d %H:%M:%S")
     yield
     rep = getattr(request.node, "rep_call", None)
     if rep is None or not rep.failed:
-        return
-    harness = sandbox_daemon.get("_harness", "test-user")
-    if harness == "sandbox-systemd":
-        # The file-log windows under systemd are zero-byte placeholders
-        # (the daemon's output is routed to the journal, not those
-        # files). Emitting them anyway is just noise; jump straight to
-        # the journalctl dump.
-        journal = _dump_journalctl_for_test_window(
-            _SANDBOXD_TEST_SERVICE, journal_since,
-        )
-        print(
-            f"\n=== sandboxd journalctl "
-            f"(unit={_SANDBOXD_TEST_SERVICE}, --since={journal_since!r}) ===\n"
-            f"{journal}\n"
-            f"=== end sandboxd journalctl ===\n",
-            file=sys.stderr,
-        )
         return
     for label, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log")):
         path = sandbox_daemon[key]
@@ -2291,13 +1490,11 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
     ``_lima_required_for_lima_tests``; rebuilding a Lima base image on
     such a host is wasted time. The container rebuild still runs.
 
-    Under the production-shaped harnesses (``sandbox-systemd`` and
-    ``sandbox-sudo``), a Lima rebuild *failure* (as opposed to absent
-    prereqs) is fatal: the pre-warm hoist exists specifically to make
-    Lima-backed tests reliable; if the build fails here, the operator
-    needs to know up front rather than watch every Lima test fail
-    downstream with an opaque per-test timeout. The container rebuild
-    is also fatal-on-failure in every harness.
+    A Lima rebuild *failure* (as opposed to absent prereqs) is fatal: the
+    pre-warm hoist exists specifically to make Lima-backed tests reliable;
+    if the build fails here, the operator needs to know up front rather than
+    watch every Lima test fail downstream with an opaque per-test timeout.
+    The container rebuild is also fatal-on-failure.
     """
     socket_path = sandbox_daemon["socket"]
 
@@ -2309,40 +1506,11 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
         )
         return
 
-    # In the legacy ``test-user`` harness, daemon-uid == operator-uid
-    # and both backend rebuilds are expected to succeed; keep the old
-    # behaviour of a single ``rebuild-image`` (default ``--backend
-    # all``) with a hard fail on non-zero exit.
-    if sandbox_daemon.get("_harness", "test-user") == "test-user":
-        print(
-            "[conftest] pre-warming base image "
-            "(harness=test-user, backend=all) — this can take several "
-            "minutes on a slow mirror",
-            file=sys.stderr,
-        )
-        result = subprocess.run(
-            [str(sandbox_binaries.sandbox), "--socket", socket_path,
-             "rebuild-image"],
-            capture_output=True,
-            text=True,
-            timeout=2000,
-        )
-        if result.returncode != 0:
-            pytest.fail(
-                f"Failed to build base image (exit {result.returncode}).\n"
-                f"stdout: {result.stdout}\n"
-                f"stderr: {result.stderr}"
-            )
-        return
-
-    # Production-shaped harnesses (``sandbox-systemd`` and
-    # ``sandbox-sudo``): run the two backend rebuilds separately. The
-    # container rebuild is fast (~30 s) and required; the Lima rebuild
-    # downloads a 580 MiB qcow2 on first use and is required when Lima
-    # prereqs are present.
+    # Run the two backend rebuilds separately. The container rebuild is fast
+    # (~30 s) and required; the Lima rebuild downloads a 580 MiB qcow2 on
+    # first use and is required when Lima prereqs are present.
     print(
-        "[conftest] pre-warming container base image "
-        f"(harness={SANDBOX_HARNESS})",
+        "[conftest] pre-warming container base image",
         file=sys.stderr,
     )
     container_result = subprocess.run(
@@ -2372,9 +1540,9 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
 
     print(
         "[conftest] pre-warming Lima base image "
-        f"(harness={SANDBOX_HARNESS}) — downloads ~580 MiB cloud-image "
-        "qcow2 on first use; this can take 1-10+ minutes depending on "
-        "network throughput. Subsequent sessions reuse the cached image.",
+        "— downloads ~580 MiB cloud-image qcow2 on first use; this can "
+        "take 1-10+ minutes depending on network throughput. Subsequent "
+        "sessions reuse the cached image.",
         file=sys.stderr,
     )
     lima_result = subprocess.run(

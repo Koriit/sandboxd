@@ -802,8 +802,6 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         # 1. SIGKILL the daemon. Abrupt — no graceful shutdown, so the
         #    daemon has no chance to remove the container/volume on the
         #    way out. This is the regime the orphan reaper exists for.
-        #    ``send_signal``/``wait``/``poll`` work uniformly across
-        #    Popen and _SystemdDaemonHandle.
         daemon_proc.send_signal(signal.SIGKILL)
         daemon_proc.wait(timeout=10)
         assert daemon_proc.poll() is not None, (
@@ -820,64 +818,44 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         #    delete through `session_policies` / `policy_rules` /
         #    `policy_rule_http_filters` (V003+V004 schema).
         #
-        #    Under the production-shaped harnesses (sandbox-systemd /
-        #    sandbox-sudo) the DB is owned by user `sandbox` (uid 999)
-        #    inside a mode-0700 directory — the test-runner process
-        #    (operator uid) gets EACCES on a direct sqlite3.connect().
-        #    Route the mutation through `sudo -n -u sandbox sqlite3` so
-        #    the correct user performs the write.  Under the legacy
-        #    test-user harness the daemon and operator share a uid, so
-        #    a direct connection is fine.
-        from conftest import SANDBOX_HARNESS  # local import to avoid circularity
+        #    The DB is owned by user `sandbox` (uid 999) inside a
+        #    mode-0700 directory — the test-runner process (operator uid)
+        #    gets EACCES on a direct sqlite3.connect(). Route the mutation
+        #    through `sudo -n -u sandbox sqlite3` so the correct user
+        #    performs the write.
         assert os.path.exists(db_path), (
             f"sessions.db not found at {db_path}; can't synthesise an orphan."
         )
-        if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
-            # Pass the SQL via stdin so the session id doesn't need shell quoting.
-            sql = (
-                "PRAGMA foreign_keys = ON; "
-                f"DELETE FROM sessions WHERE id = '{sid}';"
-            )
-            db_result = subprocess.run(
-                ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path],
-                input=sql,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            assert db_result.returncode == 0, (
-                f"sudo sqlite3 DELETE failed (rc={db_result.returncode}).\n"
-                f"stdout: {db_result.stdout}\nstderr: {db_result.stderr}"
-            )
-            # Verify the row is gone by querying count.
-            count_result = subprocess.run(
-                ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path,
-                 f"SELECT COUNT(*) FROM sessions WHERE id = '{sid}';"],
-                capture_output=True, text=True, timeout=15,
-            )
-            remaining = count_result.stdout.strip()
-            assert remaining == "0", (
-                f"expected session row for {sid} to be deleted; "
-                f"SELECT COUNT(*) returned {remaining!r}."
-            )
-        else:
-            conn = sqlite3.connect(db_path)
-            try:
-                conn.execute("PRAGMA foreign_keys = ON")
-                cur = conn.execute(
-                    "DELETE FROM sessions WHERE id = ?", (sid,)
-                )
-                assert cur.rowcount == 1, (
-                    f"expected to delete exactly 1 session row for {sid}; "
-                    f"DELETE matched {cur.rowcount} rows."
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        # Pass the SQL via stdin so the session id doesn't need shell quoting.
+        sql = (
+            "PRAGMA foreign_keys = ON; "
+            f"DELETE FROM sessions WHERE id = '{sid}';"
+        )
+        db_result = subprocess.run(
+            ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path],
+            input=sql,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert db_result.returncode == 0, (
+            f"sudo sqlite3 DELETE failed (rc={db_result.returncode}).\n"
+            f"stdout: {db_result.stdout}\nstderr: {db_result.stderr}"
+        )
+        # Verify the row is gone by querying count.
+        count_result = subprocess.run(
+            ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path,
+             f"SELECT COUNT(*) FROM sessions WHERE id = '{sid}';"],
+            capture_output=True, text=True, timeout=15,
+        )
+        remaining = count_result.stdout.strip()
+        assert remaining == "0", (
+            f"expected session row for {sid} to be deleted; "
+            f"SELECT COUNT(*) returned {remaining!r}."
+        )
 
-        # 3. Restart the daemon with the same socket and base-dir.
-        #    Harness-aware: ``systemctl start`` under sandbox-systemd,
-        #    ``Popen`` swap under test-user / sandbox-sudo.
+        # 3. Restart the daemon with the same socket and base-dir
+        #    (a fresh ``sudo -u sandbox`` Popen).
         restarted_handle = restart_test_daemon(sandbox_daemon, sandbox_binaries)
 
         # 4. Allow the boot-time orphan reaper to run. The reaper is

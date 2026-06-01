@@ -15,11 +15,10 @@ These tests verify that every daemon limactl invocation goes through
    shared: workspace correctly maps file ownership to the operator uid on the
    host.
 
-These tests require the M18 cross-user harness (``SANDBOX_HARNESS`` ≠
-``"test-user"``): the daemon must run as the ``sandbox`` system user so the
-``SO_PEERCRED`` uid captured on session-create differs from the operator
-invoking the CLI.  They are marked ``lima`` (Lima/QEMU only) and skipped
-when the harness is ``"test-user"`` (daemon = operator, no cross-user pivot).
+These tests exercise the cross-user path: the daemon runs as the ``sandbox``
+system user (via ``sudo -u sandbox``) so the ``SO_PEERCRED`` uid captured on
+session-create differs from the operator invoking the CLI.  They are marked
+``lima`` (Lima/QEMU only).
 
 Runtime: 5–15 minutes depending on whether the base image needs building.
 Run individually before the full matrix:
@@ -43,7 +42,6 @@ import pytest
 from conftest import (
     LIMA_VM_HOME,
     SANDBOX_BIN,
-    SANDBOX_HARNESS,
     _SANDBOX_PROD_SOCKET,
     _VM_RESOURCE_ARGS,
     parse_session_id,
@@ -55,17 +53,6 @@ from conftest import (
 _E2E_TEST_OPERATOR_NAME = "sandbox-e2e-test"
 
 pytestmark = pytest.mark.lima
-
-# ---------------------------------------------------------------------------
-# Skip guard: cross-user only meaningful when daemon ≠ operator.
-# ---------------------------------------------------------------------------
-
-if SANDBOX_HARNESS == "test-user":
-    pytest.skip(
-        "cross-user helper-pivot tests require SANDBOX_HARNESS != test-user "
-        "(daemon must run as sandbox uid, operator as test-runner uid)",
-        allow_module_level=True,
-    )
 
 
 # ---------------------------------------------------------------------------

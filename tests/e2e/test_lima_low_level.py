@@ -47,8 +47,8 @@ def limactl_list_json() -> list[dict]:
     """Run ``limactl list --json`` against the per-operator LIMA_HOME and
     return parsed entries.
 
-    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
-    cross-user harness (sandbox-systemd / sandbox-sudo).
+    Uses ``limactl_cmd()`` so the correct per-operator LIMA_HOME is set
+    for the cross-user harness.
     """
     result = subprocess.run(
         limactl_cmd("list", "--json"),

@@ -16,9 +16,8 @@ Per-session entry removal / Lazy cleanup / Reconcile on listing):
   alias does not point at a defunct ``ProxyCommand``.
 
 These E2E tests pin each mechanism end-to-end against a real
-container-backend session. They run under the new cross-user harness
-(``SANDBOX_HARNESS=sandbox-systemd``); the daemon-as-test-user
-fallback is exercised in CI by the same harness env var.
+container-backend session. They run under the cross-user harness
+(daemon launched as the ``sandbox`` system user via ``sudo -u sandbox``).
 
 **Hermetic `$HOME` redirect.** The CLI's ``ssh_config`` module
 mutates ``~/.ssh/config`` and ``~/.ssh/sandbox/`` directly; without

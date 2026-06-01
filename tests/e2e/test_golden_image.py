@@ -49,8 +49,6 @@ import pytest
 
 from conftest import (
     OP_LIMA_HOME,
-    SANDBOX_HARNESS,
-    _SANDBOXD_TEST_SERVICE,
     _VM_RESOURCE_ARGS,
     limactl_cmd,
     parse_session_id,
@@ -75,101 +73,80 @@ BASE_META_FILENAME = "base-image-meta.json"
 def _base_meta_path(sandbox_daemon) -> Path:
     """Return the path to the daemon's base-image-meta.json.
 
-    Under the production-shaped harnesses (sandbox-systemd / sandbox-sudo)
-    the daemon writes this file to the per-operator LIMA_HOME:
+    The daemon (running as the ``sandbox`` system user) writes this file to
+    the per-operator LIMA_HOME:
         /var/lib/sandboxd/<op_uid>/lima/base-image-meta.json
     which is ``OP_LIMA_HOME/base-image-meta.json`` in conftest terms.
     The file is owned by the ``sandbox`` system user (daemon uid), not the
     operator; use the meta-file I/O helpers below rather than accessing
     the path directly.
-
-    Under the legacy test-user harness the daemon and test process share a
-    uid, so the file lives in the daemon's base_dir as before.
     """
-    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
-        return Path(OP_LIMA_HOME) / BASE_META_FILENAME
-    return Path(sandbox_daemon["base_dir"]) / BASE_META_FILENAME
+    return Path(OP_LIMA_HOME) / BASE_META_FILENAME
 
 
 def _meta_exists(meta_path: Path) -> bool:
     """Return True if the meta file exists.
 
-    Under cross-user harnesses the file is owned by ``sandbox``;
-    ``os.path.exists`` works for existence checks even without read
-    permission — but ``Path.exists()`` is equally fine since the test
-    user has ``rx`` on the LIMA_HOME directory.
+    The file is owned by ``sandbox``; ``Path.exists()`` works for existence
+    checks since the test user has ``rx`` on the LIMA_HOME directory.
     """
     return meta_path.exists()
 
 
 def _meta_read_text(meta_path: Path) -> str:
-    """Read the meta file, routing through ``sudo -u sandbox`` when needed.
+    """Read the meta file, routing through ``sudo -u sandbox``.
 
-    Under the cross-user harnesses (``sandbox-systemd`` / ``sandbox-sudo``)
-    the daemon writes the file as the ``sandbox`` system user with mode
+    The daemon writes the file as the ``sandbox`` system user with mode
     0600 and no ACL entry for the operator uid, so a direct ``open()``
     raises PermissionError.  We use ``sudo -n -u sandbox cat`` to read
     it on behalf of the ``sandbox`` user.
-
-    Under ``test-user`` the daemon and test process share a uid so a
-    direct read works.
     """
-    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
-        result = subprocess.run(
-            ["sudo", "-n", "-u", "sandbox", "cat", str(meta_path)],
-            capture_output=True, text=True, timeout=10,
+    result = subprocess.run(
+        ["sudo", "-n", "-u", "sandbox", "cat", str(meta_path)],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise PermissionError(
+            f"sudo -u sandbox cat {meta_path} failed "
+            f"(rc={result.returncode}): {result.stderr.strip()!r}"
         )
-        if result.returncode != 0:
-            raise PermissionError(
-                f"sudo -u sandbox cat {meta_path} failed "
-                f"(rc={result.returncode}): {result.stderr.strip()!r}"
-            )
-        return result.stdout
-    return meta_path.read_text()
+    return result.stdout
 
 
 def _meta_write_text(meta_path: Path, content: str) -> None:
     """Write ``content`` to the meta file, routing through ``sudo -u sandbox``
-    when needed (see ``_meta_read_text`` for the ownership rationale).
+    (see ``_meta_read_text`` for the ownership rationale).
     """
-    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
-        result = subprocess.run(
-            ["sudo", "-n", "-u", "sandbox",
-             "tee", str(meta_path)],
-            input=content, capture_output=True, text=True, timeout=10,
+    result = subprocess.run(
+        ["sudo", "-n", "-u", "sandbox",
+         "tee", str(meta_path)],
+        input=content, capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise PermissionError(
+            f"sudo -u sandbox tee {meta_path} failed "
+            f"(rc={result.returncode}): {result.stderr.strip()!r}"
         )
-        if result.returncode != 0:
-            raise PermissionError(
-                f"sudo -u sandbox tee {meta_path} failed "
-                f"(rc={result.returncode}): {result.stderr.strip()!r}"
-            )
-    else:
-        meta_path.write_text(content)
 
 
 def _meta_unlink(meta_path: Path) -> None:
-    """Remove the meta file, routing through ``sudo -u sandbox`` when needed."""
-    if SANDBOX_HARNESS in ("sandbox-systemd", "sandbox-sudo"):
-        subprocess.run(
-            ["sudo", "-n", "-u", "sandbox", "rm", "-f", str(meta_path)],
-            capture_output=True, timeout=10,
-        )
-    else:
-        if meta_path.exists():
-            meta_path.unlink()
+    """Remove the meta file, routing through ``sudo -u sandbox``."""
+    subprocess.run(
+        ["sudo", "-n", "-u", "sandbox", "rm", "-f", str(meta_path)],
+        capture_output=True, timeout=10,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Harness-aware daemon log capture
+# Daemon log capture
 # ---------------------------------------------------------------------------
 
 def _daemon_log_snapshot() -> str:
-    """Return a timestamp string suitable for ``journalctl --since``.
+    """Return a wall-clock timestamp marking the start of a capture window.
 
-    Under ``sandbox-systemd`` the daemon's stdout goes to the journal.
-    Capturing a ``%Y-%m-%d %H:%M:%S`` snapshot just before a test action
-    lets ``_daemon_logs_since`` retrieve exactly the lines emitted during
-    that action window.
+    Retained as a stable marker for callers that snapshot just before a
+    test action; the file-based log reader below returns the whole log,
+    so the timestamp is informational only.
     """
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -177,33 +154,12 @@ def _daemon_log_snapshot() -> str:
 def _daemon_logs_since(sandbox_daemon, since_ts: str) -> str:
     """Return daemon log text produced since ``since_ts``.
 
-    Under ``sandbox-systemd`` the daemon's tracing output goes to the
-    systemd journal (the ``_stdout_log`` file is a zero-byte placeholder).
-    We retrieve the window via ``journalctl --since=<since_ts>`` so log
-    assertions in golden-image tests can find the expected strings.
-
-    Under ``sandbox-sudo`` / ``test-user`` the daemon writes to
-    ``_stdout_log`` directly; we fall back to reading from ``_log_size``
-    offset captured at ``since_ts`` (stored on first call via the
-    file-size snapshot taken just before ``since_ts``).  Since these
-    harnesses don't use a timestamp we accept a ``_snapshot`` dict keyed
-    by ``since_ts`` stashed by ``_daemon_log_offset_snapshot``.
-
-    To keep the API simple, this function always uses the journal path
-    under ``sandbox-systemd`` and the file path otherwise.
+    The daemon (launched via ``sudo -u sandbox``) writes its tracing
+    output to the ``_stdout_log`` file. ``since_ts`` is a wall-clock
+    string; we cannot efficiently seek to a byte offset from it, so we
+    read the entire file and let the caller filter if needed. The daemon
+    writes a fresh log each session so the full file is bounded.
     """
-    if sandbox_daemon.get("_harness") == "sandbox-systemd":
-        result = subprocess.run(
-            ["sudo", "-n", "journalctl", "-u", _SANDBOXD_TEST_SERVICE,
-             f"--since={since_ts}", "--no-pager", "--output=cat"],
-            capture_output=True, text=True, timeout=30,
-        )
-        return result.stdout
-    # Non-systemd: read from the file.  ``since_ts`` is a wall-clock
-    # string; we cannot efficiently seek to a byte offset from it, so
-    # we read the entire file and let the caller filter if needed.
-    # In practice these harnesses write a fresh log each session so the
-    # full file is bounded.
     log_path = Path(sandbox_daemon["_stdout_log"])
     try:
         return log_path.read_text(errors="replace")
@@ -268,8 +224,8 @@ def _get_base_image_status(socket_path: str, timeout: float = 10.0) -> dict:
 def _lima_list_names() -> list[str]:
     """List all Lima VM names from the per-operator LIMA_HOME.
 
-    Uses ``limactl_cmd()`` so the correct LIMA_HOME is set under the
-    cross-user harness (sandbox-systemd / sandbox-sudo).
+    Uses ``limactl_cmd()`` so the correct per-operator LIMA_HOME is set
+    for the cross-user harness.
     """
     result = subprocess.run(
         limactl_cmd("list", "--json"),
@@ -299,9 +255,8 @@ def _force_delete_base_vm() -> None:
         capture_output=True, timeout=120,
     )
     # Remove any orphan <base-vm-name> directory left behind by a partial /
-    # broken VM (e.g. from a hard crash mid-build).  Under the cross-user
-    # harness the base VM lives at OP_LIMA_HOME/<name>/; under the legacy
-    # test-user harness it lives at ~/.lima/<name>/.
+    # broken VM (e.g. from a hard crash mid-build).  The base VM lives at
+    # OP_LIMA_HOME/<name>/.
     orphan = Path(OP_LIMA_HOME) / BASE_VM_NAME
     if orphan.exists():
         shutil.rmtree(orphan, ignore_errors=True)
@@ -338,8 +293,8 @@ def test_session_uses_clone_path(sandbox_cli, sandbox_daemon):
     )
 
     # 1. Snapshot log position so we only inspect output produced by this
-    #    test.  Under sandbox-systemd the daemon logs to the journal; we
-    #    capture a wall-clock timestamp and pass it to journalctl --since=.
+    #    test.  The daemon writes its log to a per-session file; the
+    #    timestamp marks the start of this test's window.
     log_since = _daemon_log_snapshot()
 
     try:

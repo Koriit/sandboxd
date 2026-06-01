@@ -934,12 +934,9 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
     """Create a session, kill the daemon, restart it, verify the session
     is recovered and functional.
 
-    Restart mechanics are harness-aware via :func:`restart_test_daemon`:
-    under ``sandbox-systemd`` the restart routes through ``systemctl
-    start`` and re-uses the existing :class:`_SystemdDaemonHandle`;
-    under ``test-user`` / ``sandbox-sudo`` the restart spawns a fresh
-    ``subprocess.Popen`` and we swap it into ``sandbox_daemon["process"]``
-    on the way out.
+    Restart mechanics go through :func:`restart_test_daemon`, which spawns
+    a fresh ``sudo -u sandbox`` ``subprocess.Popen`` and we swap it into
+    ``sandbox_daemon["process"]`` on the way out.
     """
     session_id = None
     restarted_handle = None
@@ -957,9 +954,7 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "net-daemon-test", "Running", timeout=10)
 
-        # 2. Kill the daemon process. Works on both Popen and
-        #    _SystemdDaemonHandle (the latter routes the signal through
-        #    ``systemctl kill -s SIGKILL``).
+        # 2. Kill the daemon process (a ``sudo -u sandbox`` Popen).
         daemon_proc = sandbox_daemon["process"]
         daemon_proc.send_signal(signal.SIGKILL)
         daemon_proc.wait(timeout=10)
