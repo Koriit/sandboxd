@@ -1426,9 +1426,11 @@ fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str, op_uid: u32
     // This prevents the daemon's own HOME=/var/lib/sandbox from leaking
     // into the pivoted process, which runs as the operator uid and would
     // have no write access to /var/lib/sandbox anyway.
+    // PATH is handled explicitly below (we prepend the operator's limactl
+    // candidate dirs), so drop the inherited entry here alongside HOME.
     let mut env: Vec<CString> = ENV_ALLOWLIST
         .iter()
-        .filter(|key| **key != "HOME")
+        .filter(|key| **key != "HOME" && **key != "PATH")
         .filter_map(|key| {
             let value = env::var_os(key)?;
             let mut buf = OsString::from(*key);
@@ -1444,6 +1446,28 @@ fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str, op_uid: u32
     // operator uid; limactl auxiliary lookups ($HOME/.ssh/config, etc.)
     // must resolve against the operator's own home, not the daemon's.
     if let Ok(c) = CString::new(format!("HOME={op_home}")) {
+        env.push(c);
+    }
+
+    // PATH: prepend the operator's limactl candidate directories (mirroring
+    // resolve_limactl_path's probe order) to the daemon's inherited PATH.
+    //
+    // Direct-limactl subcommands exec limactl by absolute path, so they
+    // don't need this. But `run-rsync` execs `rsync`, whose remote-shell
+    // transport is `-e "limactl shell"` — rsync resolves that bare
+    // `limactl` against PATH. The daemon's inherited PATH is sudo's
+    // secure_path (no `~/.local/bin`), so a Lima installed under the
+    // operator's home (the common non-root install) would be invisible and
+    // rsync fails with "Failed to exec limactl". Prepending the candidates
+    // here — running as the operator with caps already dropped — makes the
+    // transport resolve limactl exactly where the helper itself would.
+    let inherited_path = env::var("PATH").unwrap_or_default();
+    let path_value = if inherited_path.is_empty() {
+        format!("{op_home}/.local/bin:/usr/local/bin:/usr/bin")
+    } else {
+        format!("{op_home}/.local/bin:/usr/local/bin:/usr/bin:{inherited_path}")
+    };
+    if let Ok(c) = CString::new(format!("PATH={path_value}")) {
         env.push(c);
     }
 
