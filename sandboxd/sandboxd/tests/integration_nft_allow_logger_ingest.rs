@@ -32,7 +32,9 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
-const DEADLINE: Duration = Duration::from_secs(5);
+// Generous so heavy parallel-suite CPU contention (not delivery latency —
+// inotify plus a 2s fallback poll) can't starve the receiver into a timeout.
+const DEADLINE: Duration = Duration::from_secs(30);
 const VM_IP_STR: &str = "10.0.0.42";
 
 async fn append_jsonl_line(path: &std::path::Path, line: &str) {
