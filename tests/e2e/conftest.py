@@ -832,7 +832,14 @@ def _assert_operator_in_sandbox_group() -> None:
                 harness=SANDBOX_HARNESS
             )
         )
-    if sandbox_gid in os.getgroups():
+    # The socket is mode 0660, group=sandbox, so access is granted when the
+    # sandbox gid is the process's effective GID *or* in its supplementary
+    # set. `sg sandbox -c …` (how the make targets wrap pytest) sets sandbox
+    # as the *primary/effective* GID and does not add it to the supplementary
+    # list — and Linux `getgroups()` does not report the effective GID — so
+    # checking `os.getgroups()` alone spuriously fails under the sg wrap even
+    # though the process can read the socket. Accept either.
+    if sandbox_gid == os.getegid() or sandbox_gid in os.getgroups():
         return
     # Membership exists in /etc/group but is not yet active in this
     # process — most likely the operator was just added and has not
