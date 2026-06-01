@@ -472,7 +472,27 @@ fn run() -> ExitCode {
         return ExitCode::from(code);
     }
 
-    // Step 7 — resolve limactl absolute path (uses pw_dir from step 3).
+    // Step 8 — drop to operator uid.
+    if let Err(errno) = setresuid_strict(op_uid_raw) {
+        eprintln!("sandbox-lima-helper: setresuid({op_uid_raw}) failed: errno {errno}");
+        return ExitCode::from(EXIT_SETRESUID_FAILED);
+    }
+
+    // Step 9 — capability self-clear (hard deny on partial failure).
+    if let Err(e) = clear_all_capabilities() {
+        eprintln!("sandbox-lima-helper: capset clear failed: {e}");
+        return ExitCode::from(EXIT_CAPSET_FAILED);
+    }
+
+    // Step 9.5 — resolve limactl absolute path (uses pw_dir from step 3).
+    //
+    // Resolved *after* the uid pivot so the `access(2)` probes in
+    // resolve_limactl_path run with the operator's real uid. The candidate
+    // `{pw_dir}/.local/bin/limactl` lives under the operator's home (often
+    // mode 0750): the pre-pivot daemon uid (`sandbox`) cannot traverse it,
+    // so resolving before the pivot would never find an operator-local
+    // limactl. The system candidates (/usr/local/bin, /usr/bin) still
+    // resolve identically as the operator.
     //
     // `read-user-key` reads a file directly; `run-rsync` execs rsync —
     // neither calls limactl, so we skip the resolution for both and
@@ -493,21 +513,9 @@ fn run() -> ExitCode {
         }
     };
 
-    // Step 8 — drop to operator uid.
-    if let Err(errno) = setresuid_strict(op_uid_raw) {
-        eprintln!("sandbox-lima-helper: setresuid({op_uid_raw}) failed: errno {errno}");
-        return ExitCode::from(EXIT_SETRESUID_FAILED);
-    }
-
-    // Step 9 — capability self-clear (hard deny on partial failure).
-    if let Err(e) = clear_all_capabilities() {
-        eprintln!("sandbox-lima-helper: capset clear failed: {e}");
-        return ExitCode::from(EXIT_CAPSET_FAILED);
-    }
-
     // Step 10 — build sanitised env block.
     // Pass pw_dir (captured in step 3, reused for limactl resolution in
-    // step 7) as op_home so HOME is set to the operator's own directory.
+    // step 9.5) as op_home so HOME is set to the operator's own directory.
     let state_root = resolve_state_root();
     let lima_home = format!("{state_root}/{op_uid_raw}/lima/");
     let env_block = build_env_block(&subcommand, &lima_home, &pw_dir, op_uid_raw);
@@ -1206,7 +1214,7 @@ pub fn resolve_user_uid(name: &str) -> Result<Option<u32>, String> {
 }
 
 /// Resolve an op-uid via `getpwuid_r`, returning the `pw_dir` home
-/// directory on success (needed for step 7's limactl resolver).
+/// directory on success (needed for step 9.5's limactl resolver).
 pub fn resolve_op_uid(uid: u32) -> Result<Option<String>, String> {
     match User::from_uid(Uid::from_raw(uid)) {
         Ok(Some(u)) => Ok(Some(u.dir.to_string_lossy().to_string())),
@@ -1326,7 +1334,7 @@ pub fn op_uid_in_sandbox_group(op_uid: u32, sandbox_gid: u32) -> GroupMembership
 }
 
 // ---------------------------------------------------------------------------
-// limactl path resolver (step 7)
+// limactl path resolver (step 9.5)
 // ---------------------------------------------------------------------------
 
 /// Resolve the absolute path to `limactl` using the three-candidate
@@ -1432,7 +1440,7 @@ fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str, op_uid: u32
 
     // Set HOME to the operator's home directory (pw_dir from getpwuid_r in
     // step 3). Reuses the same value used for limactl path resolution in
-    // step 7 — no re-resolution. Post-setresuid the process runs as the
+    // step 9.5 — no re-resolution. Post-setresuid the process runs as the
     // operator uid; limactl auxiliary lookups ($HOME/.ssh/config, etc.)
     // must resolve against the operator's own home, not the daemon's.
     if let Ok(c) = CString::new(format!("HOME={op_home}")) {

@@ -807,7 +807,7 @@ fn integration_lima_helper_missing_flag_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Step 7: limactl-not-found deny
+// Step 9.5: limactl-not-found deny
 // ---------------------------------------------------------------------------
 
 /// After all validation passes, if limactl is not found at any of the three
