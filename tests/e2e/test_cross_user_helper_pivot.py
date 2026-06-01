@@ -30,6 +30,7 @@ Run individually before the full matrix:
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import subprocess
@@ -76,6 +77,35 @@ def sandbox(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedPro
     )
 
 
+_STAGED_CLI: Path | None = None
+
+
+def _staged_sandbox_cli() -> Path:
+    """Return a path to the ``sandbox`` CLI that the ``sandbox-e2e-test``
+    operator (uid 4099) can actually exec.
+
+    The workspace binary lives under the invoking operator's home (mode
+    0750), which sandbox-e2e-test cannot traverse — ``sudo -u
+    sandbox-e2e-test env … <workspace>/target/debug/sandbox`` fails the
+    post-setuid execve check with EACCES ("Permission denied", rc 126).
+    We copy the CLI into a fresh /tmp dir (mode 1777, traversable by every
+    uid) owned by the operator at 0755 and run that. Mirrors conftest's
+    ``_stage_binaries_for_sandbox_user`` for the daemon. Cached for the
+    process and removed at exit.
+    """
+    global _STAGED_CLI
+    if _STAGED_CLI is not None and _STAGED_CLI.exists():
+        return _STAGED_CLI
+    stage_dir = Path(tempfile.mkdtemp(prefix="sandbox-e2e-cli-", dir="/tmp"))
+    os.chmod(stage_dir, 0o755)
+    staged = stage_dir / "sandbox"
+    shutil.copy2(SANDBOX_BIN, staged)
+    os.chmod(staged, 0o755)
+    atexit.register(lambda: shutil.rmtree(stage_dir, ignore_errors=True))
+    _STAGED_CLI = staged
+    return staged
+
+
 def sandbox_as(
     op_uid: int,
     *args: str,
@@ -100,7 +130,7 @@ def sandbox_as(
         [
             "sudo", "-n", "-u", _E2E_TEST_OPERATOR_NAME,
             "env", f"SANDBOX_SOCKET={_SANDBOX_PROD_SOCKET}",
-            str(SANDBOX_BIN), "--socket", str(_SANDBOX_PROD_SOCKET),
+            str(_staged_sandbox_cli()), "--socket", str(_SANDBOX_PROD_SOCKET),
             *args,
         ],
         capture_output=True,
