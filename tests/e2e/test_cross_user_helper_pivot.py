@@ -106,6 +106,24 @@ def _staged_sandbox_cli() -> Path:
     return staged
 
 
+def _system_limactl_available() -> bool:
+    """True if ``limactl`` is installed at a system path any uid can exec.
+
+    The cross-user-operator test runs ``limactl`` as a *distinct* operator
+    (``sandbox-e2e-test``, uid 4099) via the lima-helper pivot, which
+    resolves limactl from ``/usr/local/bin`` or ``/usr/bin`` (that
+    operator's own ``~/.local/bin`` does not exist). A limactl installed
+    only under the *primary* operator's home (the common non-root install)
+    is unreachable by the distinct uid, so this test can run only with a
+    system-wide Lima install. The other pivot tests don't create a session
+    as the distinct operator, so they are unaffected.
+    """
+    return any(
+        os.access(p, os.X_OK)
+        for p in ("/usr/local/bin/limactl", "/usr/bin/limactl")
+    )
+
+
 def sandbox_as(
     op_uid: int,
     *args: str,
@@ -272,6 +290,14 @@ class TestHelperPivotUsermodRealignment:
         2. A file written from inside the VM into the shared workspace is owned
            by the operator uid on the host.
         """
+        if not _system_limactl_available():
+            pytest.skip(
+                "cross-user-operator test needs a system-wide limactl "
+                "(/usr/local/bin or /usr/bin) reachable by the distinct test "
+                "operator uid 4099; this host has only a user-local install "
+                "(~/.local/bin), which that uid cannot reach. Install Lima "
+                "system-wide to exercise this test."
+            )
         op_uid = e2e_test_operator
 
         # Host directory to mount as a 9p shared: workspace. It must be
