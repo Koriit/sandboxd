@@ -453,12 +453,32 @@ async fn pump_lima(
     Ok(())
 }
 
+/// WebSocket close frames are control frames: RFC 6455 caps the total
+/// payload at 125 bytes, 2 of which are the status code — leaving 123
+/// bytes for the reason. Backend error strings (e.g. a docker/limactl
+/// failure) can exceed that; an oversized control frame is rejected
+/// outright by a compliant client (`ControlFrameTooBig`), which also
+/// discards the close code. Truncate on a UTF-8 char boundary so the
+/// frame stays spec-compliant and the code/reason survive.
+const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+fn truncate_close_reason(reason: &str) -> &str {
+    if reason.len() <= MAX_CLOSE_REASON_BYTES {
+        return reason;
+    }
+    let mut end = MAX_CLOSE_REASON_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
+
 /// Close the WebSocket with a structured close code + human-readable
 /// reason. Best-effort: a closed socket is the failure-mode floor.
 async fn close_with_code(mut socket: WebSocket, code: u16, reason: &str) {
     let frame = CloseFrame {
         code,
-        reason: Utf8Bytes::from(reason),
+        reason: Utf8Bytes::from(truncate_close_reason(reason)),
     };
     let _ = socket.send(Message::Close(Some(frame))).await;
 }
@@ -470,7 +490,7 @@ async fn close_with_code(mut socket: WebSocket, code: u16, reason: &str) {
 async fn close_sink_with_code(mut ws_sink: SplitSink<WebSocket, Message>, code: u16, reason: &str) {
     let frame = CloseFrame {
         code,
-        reason: Utf8Bytes::from(reason),
+        reason: Utf8Bytes::from(truncate_close_reason(reason)),
     };
     let _ = ws_sink.send(Message::Close(Some(frame))).await;
 }
@@ -724,6 +744,29 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn truncate_close_reason_caps_at_123_bytes_on_char_boundary() {
+        // Short reasons pass through untouched.
+        let short = "backend unavailable";
+        assert_eq!(truncate_close_reason(short), short);
+
+        // An over-long ASCII reason is capped to <= 123 bytes (the RFC 6455
+        // control-frame budget after the 2-byte close code).
+        let long = "x".repeat(500);
+        let t = truncate_close_reason(&long);
+        assert_eq!(t.len(), MAX_CLOSE_REASON_BYTES);
+
+        // Truncation never splits a multi-byte char: a string of 'é' (2 bytes
+        // each) truncated at the 123-byte budget lands on a char boundary, so
+        // the result stays valid UTF-8 and is <= 123 bytes (122 here).
+        let multibyte = "é".repeat(200);
+        let t = truncate_close_reason(&multibyte);
+        assert!(t.len() <= MAX_CLOSE_REASON_BYTES);
+        assert!(multibyte.starts_with(t));
+        // Round-trips as valid UTF-8 (would panic on a mid-char split).
+        let _ = Utf8Bytes::from(t);
+    }
 
     /// `ProxyHttpError::NotFound` maps to `404` via the shared
     /// `error_response` helper. Pins the contract the CLI shim

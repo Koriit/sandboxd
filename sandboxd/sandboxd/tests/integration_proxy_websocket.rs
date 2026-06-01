@@ -469,7 +469,7 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
     // fragmented across multiple WebSocket frames so we keep reading
     // until either we see the marker or the deadline expires.
     let banner_deadline = Duration::from_secs(10);
-    let banner = tokio::time::timeout(banner_deadline, async {
+    let (banner, close_desc) = tokio::time::timeout(banner_deadline, async {
         let mut acc: Vec<u8> = Vec::new();
         while let Some(msg) = ws.next().await {
             match msg.expect("ws recv") {
@@ -479,17 +479,21 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
                         // Read a little further so we capture the
                         // newline-terminated banner line.
                         if acc[idx..].contains(&b'\n') {
-                            return acc;
+                            return (acc, None);
                         }
                     }
                 }
-                ClientMessage::Close(_) => {
-                    return acc;
+                // Capture the close code+reason so a proxy that bails
+                // (BACKEND_UNAVAILABLE / BACKEND_ERROR) is diagnosable
+                // from the assertion instead of an empty banner.
+                ClientMessage::Close(frame) => {
+                    let desc = frame.map(|f| format!("code={} reason={:?}", f.code, f.reason));
+                    return (acc, desc);
                 }
                 _ => {}
             }
         }
-        acc
+        (acc, None)
     })
     .await
     .unwrap_or_else(|_| panic!("did not receive SSH banner within {banner_deadline:?}"));
@@ -497,7 +501,7 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
     let banner_str = String::from_utf8_lossy(&banner);
     assert!(
         banner_str.contains("SSH-2.0-"),
-        "expected SSH-2.0- banner in proxy output; got {banner_str:?}",
+        "expected SSH-2.0- banner in proxy output; got {banner_str:?}; proxy close: {close_desc:?}",
     );
 
     // Send a courtesy client banner so sshd does not log a banner
