@@ -15,17 +15,19 @@
 //!
 //! After the helper pivot, `sandbox-lima-helper list-json --op-uid N`
 //! is what resolves `sshLocalPort` — not a direct `limactl` call.  The
-//! helper resolves `limactl` via three hardcoded absolute paths, first
-//! checking `<pw_dir>/.local/bin/limactl` for the operator's home.
+//! helper resolves `limactl` via the `SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH`
+//! env-var override (compiled in under the `test-env-override` feature) when
+//! that var is set.
 //!
-//! The test stages a fake shell-script at `~/.local/bin/limactl` (the
-//! home of the test runner's uid), configures the daemon with the
-//! test-cap'd helper (`SANDBOX_LIMA_HELPER_PATH`) and the
-//! `test-env-override` seams (`SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER`,
+//! The test stages a fake shell-script under the per-test `TempDir`, then
+//! passes its path to `Daemon::spawn` which forwards it to the helper via
+//! `SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH`. The operator's real
+//! `~/.local/bin/limactl` (if any) is never touched. Additionally, the
+//! daemon is configured with the test-cap'd helper (`SANDBOX_LIMA_HELPER_PATH`)
+//! and the `test-env-override` seams (`SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER`,
 //! `SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP`) so the helper accepts the
-//! test runner uid as the "sandbox" caller, seeds the session row with
-//! `operator_uid = test_runner_uid`, and restores any prior
-//! `~/.local/bin/limactl` on drop.
+//! test runner uid as the "sandbox" caller, and the session row carries
+//! `operator_uid = test_runner_uid`.
 //!
 //! Bytes flow:
 //!
@@ -34,7 +36,7 @@
 //!   → daemon's /sessions/{id}/proxy handler
 //!   → pump_lima: spawn_blocking → ssh_local_port_for_session
 //!   → sandbox-lima-helper list-json --op-uid N
-//!   → helper execs ~/.local/bin/limactl list --json (fake script)
+//!   → helper execs <tempdir>/limactl list --json (fake script, via env-var override)
 //!   → pump_lima: TcpStream::connect("127.0.0.1", <port>)
 //!   → test's TcpListener
 //!   → fake sshd substitute (writes the SSH-2.0- banner)
@@ -101,50 +103,18 @@ fn write_users_conf(dir: &Path, user: &str) -> PathBuf {
     path
 }
 
-/// RAII guard that restores `~/.local/bin/limactl` on drop.
+/// Stage a fake `limactl` shell script under `dir` and return its path.
 ///
-/// After the flip, `sandbox-lima-helper` resolves `limactl` via three
-/// hardcoded absolute paths — `<pw_dir>/.local/bin/limactl` first — so
-/// the PATH-prefix trick no longer intercepts the helper's exec.  We
-/// stage the fake script at the first candidate path and restore on drop.
-struct FakeLimactlGuard {
-    /// The path we installed the fake script at.
-    installed_at: PathBuf,
-    /// Previous content at that path, if any.
-    previous: Option<Vec<u8>>,
-}
-
-impl Drop for FakeLimactlGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(bytes) => {
-                let _ = std::fs::write(&self.installed_at, bytes);
-            }
-            None => {
-                let _ = std::fs::remove_file(&self.installed_at);
-            }
-        }
-    }
-}
-
-/// Stage a shell-script fake `limactl` at `~/.local/bin/limactl` (the
-/// first candidate path `sandbox-lima-helper`'s limactl resolver checks
-/// for the operator's uid) so the helper's port-lookup exec lands on
-/// our script rather than the real `limactl`.
+/// The script responds to `list --json` (the form `sandbox-lima-helper`
+/// passes after `execvpe`) with a single sandbox VM entry whose
+/// `sshLocalPort` is `port`.  All other verbs exit zero with empty output.
 ///
-/// The script responds to `list --json` (the form the helper passes
-/// after `execvpe`) with a single sandbox VM entry whose `sshLocalPort`
-/// is `port`.  All other verbs exit zero with empty output.
-///
-/// Returns a `FakeLimactlGuard` that restores the original state on drop.
-fn stage_fake_limactl(vm_name: &str, port: u16) -> FakeLimactlGuard {
-    let home = std::env::var("HOME").expect("HOME is set");
-    let bin_dir = PathBuf::from(&home).join(".local").join("bin");
-    std::fs::create_dir_all(&bin_dir).expect("mkdir ~/.local/bin");
-    let script_path = bin_dir.join("limactl");
-
-    // Save previous content if present.
-    let previous = std::fs::read(&script_path).ok();
+/// The caller passes the returned path to `Daemon::spawn` which sets
+/// `SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH` in the daemon's env so the
+/// helper resolves the override instead of probing the operator's real
+/// `~/.local/bin/limactl`.  Cleanup is handled by the caller's `TempDir`.
+fn stage_fake_limactl(dir: &Path, vm_name: &str, port: u16) -> PathBuf {
+    let script_path = dir.join("limactl");
 
     // The helper passes `list --json --tty=false` to limactl (from
     // build_limactl_argv / Subcommand::ListJson).  Accept that exact
@@ -170,10 +140,7 @@ exit 0
     perm.set_mode(0o755);
     std::fs::set_permissions(&script_path, perm).expect("chmod fake limactl");
 
-    FakeLimactlGuard {
-        installed_at: script_path,
-        previous,
-    }
+    script_path
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +158,13 @@ impl Daemon {
     /// with the `test-env-override` feature seams set to accept the test user
     /// as the "sandbox" user.  This lets `sandbox-lima-helper list-json`
     /// succeed under the test runner uid so the Lima proxy path works.
-    fn spawn(tmp: TempDir, base_dir: PathBuf) -> Self {
+    ///
+    /// `fake_limactl` must be the path to an executable shell script that the
+    /// helper should use in place of the operator's real `limactl`.  It is
+    /// forwarded to the helper via `SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH`
+    /// so the helper's env-var override fires instead of probing the three
+    /// hardcoded candidate paths.
+    fn spawn(tmp: TempDir, base_dir: PathBuf, fake_limactl: &Path) -> Self {
         let user = current_username();
         let socket = tmp.path().join("sandboxd.sock");
         let users_conf = write_users_conf(tmp.path(), &user);
@@ -220,7 +193,7 @@ impl Daemon {
             .env("SANDBOX_USERS_CONF", &users_conf)
             .env("RUST_LOG", "info")
             // Point the daemon at the test-cap'd helper (built with
-            // test-env-override so it honours the next two env vars).
+            // test-env-override so it honours the next three env vars).
             .env(
                 "SANDBOX_LIMA_HELPER_PATH",
                 "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
@@ -230,6 +203,14 @@ impl Daemon {
             // group-membership check (step 3) both pass.
             .env("SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER", &user)
             .env("SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP", &group_name)
+            // Direct the helper at the per-test fake limactl script so
+            // it never touches the operator's real ~/.local/bin/limactl.
+            .env("SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH", fake_limactl)
+            // Redirect the per-operator LIMA_HOME state root into the test
+            // tempdir so the daemon provisions `<root>/<uid>/lima` somewhere
+            // the test runner can write, instead of the production
+            // `/var/lib/sandboxd` (which needs root/dev-env setup to exist).
+            .env("SANDBOX_LIMA_HELPER_TEST_STATE_ROOT", tmp.path())
             .stdout(Stdio::from(stdout_fh))
             .stderr(Stdio::from(stderr_fh));
         let proc = cmd.spawn().expect("spawn sandboxd");
@@ -423,15 +404,17 @@ async fn integration_proxy_websocket_round_trip_lima_backend() {
         session.id.to_string()
     };
 
-    // Step 3: stage the fake `limactl` at `~/.local/bin/limactl` — the
-    // first candidate path `sandbox-lima-helper` checks for the operator's
-    // home dir.  The guard restores any previous binary on drop.
+    // Step 3: stage the fake `limactl` under the per-test tempdir.  The
+    // path is passed to `Daemon::spawn` which forwards it to the helper
+    // via `SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH`.  The operator's real
+    // `~/.local/bin/limactl` (if any) is never touched.
     let vm_name = format!("sandbox-{session_id_str}");
-    let _fake_limactl_guard = stage_fake_limactl(&vm_name, port);
+    let fake_limactl_path = stage_fake_limactl(tmp.path(), &vm_name, port);
 
     // Step 4: spawn the daemon with the test-cap'd lima helper configured
-    // to accept the test user as the "sandbox" user.
-    let daemon = Daemon::spawn(tmp, base_dir);
+    // to accept the test user as the "sandbox" user, pointing it at the
+    // isolated per-test fake limactl.
+    let daemon = Daemon::spawn(tmp, base_dir, &fake_limactl_path);
     let socket = daemon.socket.clone();
 
     // Step 5: open the WebSocket and read until we see the SSH banner.
@@ -469,6 +452,9 @@ async fn integration_proxy_websocket_round_trip_lima_backend() {
     let banner_str = String::from_utf8_lossy(&banner);
     assert!(
         banner_str.contains("SSH-2.0-"),
-        "expected SSH-2.0- banner in proxy output; got: {banner_str:?}",
+        "expected SSH-2.0- banner in proxy output; got: {banner_str:?}\n\
+         === daemon stdout ===\n{}\n=== daemon stderr ===\n{}",
+        std::fs::read_to_string(daemon.tmp.path().join("sandboxd.stdout.log")).unwrap_or_default(),
+        std::fs::read_to_string(daemon.tmp.path().join("sandboxd.stderr.log")).unwrap_or_default(),
     );
 }

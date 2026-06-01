@@ -196,6 +196,11 @@ const TEST_GUEST_BINARY_PATH_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_
 /// the production state root.
 #[cfg(feature = "test-env-override")]
 const TEST_STATE_ROOT_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_STATE_ROOT";
+/// Override for the `limactl` binary path. Tests set this to a per-test
+/// temporary script so the helper can be pointed at a fake `limactl`
+/// without touching the operator's real `~/.local/bin/limactl`.
+#[cfg(feature = "test-env-override")]
+const TEST_LIMACTL_PATH_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH";
 
 fn resolve_sandbox_user_name() -> String {
     #[cfg(feature = "test-env-override")]
@@ -373,6 +378,12 @@ fn run() -> ExitCode {
     let args: Vec<OsString> = env::args_os().collect();
 
     // Step 1 — daemon identity check (before argv parse so we bail fast).
+    //
+    // The caller-uid check runs first, before the sandbox-group is resolved, so
+    // an unauthorized caller is denied on its own merits. Resolving the group
+    // first would let an unrelated group-lookup failure (e.g. the sandbox group
+    // absent on a misconfigured host) mask the real reason a caller is rejected,
+    // turning a clean "not sandbox" denial into a confusing "group lookup failed".
     let user_name = resolve_sandbox_user_name();
     let group_name = resolve_sandbox_group_name();
 
@@ -388,6 +399,14 @@ fn run() -> ExitCode {
         }
     };
 
+    let caller_uid = unsafe { libc::getuid() };
+    if caller_uid != sandbox_uid {
+        eprintln!(
+            "sandbox-lima-helper: caller not sandbox (uid={caller_uid}, expected={sandbox_uid})"
+        );
+        return ExitCode::from(EXIT_NOT_SANDBOX);
+    }
+
     let sandbox_gid = match resolve_group_gid(&group_name) {
         Ok(Some(gid)) => gid,
         Ok(None) => {
@@ -399,14 +418,6 @@ fn run() -> ExitCode {
             return ExitCode::from(EXIT_NOT_SANDBOX);
         }
     };
-
-    let caller_uid = unsafe { libc::getuid() };
-    if caller_uid != sandbox_uid {
-        eprintln!(
-            "sandbox-lima-helper: caller not sandbox (uid={caller_uid}, expected={sandbox_uid})"
-        );
-        return ExitCode::from(EXIT_NOT_SANDBOX);
-    }
 
     if !caller_is_in_group(sandbox_gid) {
         eprintln!("sandbox-lima-helper: caller not in sandbox group");
@@ -1323,7 +1334,21 @@ pub fn op_uid_in_sandbox_group(op_uid: u32, sandbox_gid: u32) -> GroupMembership
 ///
 /// For unit tests an `is_executable` callback is injected instead of
 /// the real `access(2)` probe, mirroring route-helper's resolver shape.
+///
+/// When the `test-env-override` feature is enabled and the
+/// `SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH` env var is set to a non-empty
+/// executable path, that path is returned directly. This lets tests point
+/// the helper at a per-test temporary script without touching the
+/// operator's real `~/.local/bin/limactl`. If the override path is set but
+/// not executable, the function falls through to normal candidate probing.
 pub fn resolve_limactl_path(pw_dir: &str) -> Option<String> {
+    #[cfg(feature = "test-env-override")]
+    if let Ok(v) = env::var(TEST_LIMACTL_PATH_ENV)
+        && !v.is_empty()
+        && is_file_executable(&v)
+    {
+        return Some(v);
+    }
     resolve_limactl_path_with(pw_dir, is_file_executable)
 }
 

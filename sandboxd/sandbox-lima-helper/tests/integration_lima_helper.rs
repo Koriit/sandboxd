@@ -225,6 +225,50 @@ fn integration_lima_helper_caller_not_sandbox_denied() {
     );
 }
 
+/// The uid check fires before group resolution: even when the sandbox group
+/// name is set to a deliberately non-existent value, the helper still exits
+/// EXIT_NOT_SANDBOX (2) with "caller not sandbox" when the caller uid does not
+/// match the sandbox user uid.
+///
+/// This is the regression test for the reorder fix. Before the fix, the group
+/// lookup ran first, so on a host where the sandbox group does not exist the
+/// helper aborted with "sandbox group lookup failed" instead of reaching the
+/// uid check and reporting the real reason the caller was rejected.
+#[test]
+fn integration_lima_helper_caller_uid_checked_before_group_lookup() {
+    let helper = verify_installed_test_helper();
+
+    // "root" as sandbox user → uid mismatch for a non-root runner.
+    // A UUID-like string as sandbox group → guaranteed non-existent.
+    // The uid check must fire first and return EXIT_NOT_SANDBOX (2) with
+    // "caller not sandbox", without ever attempting the group lookup.
+    let output = run_helper(
+        &helper,
+        &[
+            ("SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER", "root"),
+            (
+                "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP",
+                "nonexistent-group-d3f4a8b2c1e5",
+            ),
+        ],
+        &["list-json", "--op-uid", "1000"],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected EXIT_NOT_SANDBOX (2), got {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("caller not sandbox"),
+        "expected 'caller not sandbox' in stderr (uid check must fire before group lookup): \
+         {stderr}"
+    );
+}
+
 /// When `SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER` points to the runner but
 /// `SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP` points to a group the runner
 /// does NOT belong to, the helper exits EXIT_NOT_SANDBOX (2).
@@ -721,12 +765,10 @@ fn integration_lima_helper_start_multicast_mac_rejected() {
 fn integration_lima_helper_unknown_subcommand_rejected() {
     let helper = verify_installed_test_helper();
 
-    let user = runner_username();
-    let output = run_helper(
-        &helper,
-        &[("SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER", user.as_str())],
-        &["frobnicate"],
-    );
+    // Inject the runner's own user+group as the synthetic sandbox identity so
+    // the test reaches argv parsing without depending on a real `sandbox`
+    // group existing on the host.
+    let output = run_helper_as_sandbox(&helper, &[], &["frobnicate"]);
 
     // Unknown subcommand → EXIT_BAD_ARGS (7).
     assert_eq!(
