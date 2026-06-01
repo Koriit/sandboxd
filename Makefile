@@ -590,11 +590,10 @@ setup-e2e-test-operator: setup-sandbox-user
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
 	  echo "$(GREEN)✓ already configured: e2e-test-operator sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
 	else \
-	  cli_binary="$$(pwd)/sandboxd/target/debug/sandbox"; \
-	  fragment_envkeep="Defaults!$$cli_binary env_keep += \"SANDBOX_SOCKET\""; \
-	  fragment="$$USER ALL=($(E2E_TEST_OPERATOR_NAME)) NOPASSWD: $$cli_binary, $$cli_binary *"; \
+	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_SOCKET\""; \
+	  fragment="$$USER ALL=($(E2E_TEST_OPERATOR_NAME)) NOPASSWD: ALL"; \
 	  tmp=$$(mktemp); \
-	  printf '# Managed by `make setup-e2e-test-operator` — do not edit.\n# Allows the e2e harness to invoke the sandbox CLI as the\n# `sandbox-e2e-test` system user (uid 4099) without a password\n# prompt.  Used by TestHelperPivotUsermodRealignment to run a\n# session as a distinct non-1000 operator uid so the Lima\n# cloud-init `usermod -u {op}` realignment actually fires.\n# The path is the absolute path of the workspace debug sandbox\n# binary; re-run the make target after moving the workspace.\n#\n# env_keep preserves SANDBOX_SOCKET through sudo so the CLI\n# reaches the production-shaped daemon socket.\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
+	  printf '# Managed by `make setup-e2e-test-operator` — do not edit.\n# Grants the operator passwordless impersonation of the unprivileged\n# `sandbox-e2e-test` system user (uid 4099). Used by\n# TestHelperPivotUsermodRealignment to run a session as a distinct\n# non-1000 operator uid so the Lima cloud-init `usermod -u {op}`\n# realignment actually fires. The harness invokes the CLI via\n# `sudo -u sandbox-e2e-test env SANDBOX_SOCKET=... <binary> ...`, so a\n# narrow per-binary grant would not match the `env` wrapper; blanket\n# impersonation of this unprivileged nologin account is not privilege\n# escalation. Test/dev hosts only.\n#\n# env_keep preserves SANDBOX_SOCKET through sudo so the CLI\n# reaches the production-shaped daemon socket.\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
 	  chmod 0440 "$$tmp"; \
 	  if sudo -k visudo -c -f "$$tmp" >/dev/null 2>&1; then \
 	    : ok; \
