@@ -32,6 +32,14 @@ make lite-image             # docker build for the lite-mode container image
 make setup-dev-env          # one-shot per-host install/configure (route-helper cap'd install, qemu bridge.conf, users.conf, qemu-bridge-helper setuid)
 ```
 
+### `make setup-dev-env` is assumed by the integration & e2e suites
+
+Run `make setup-dev-env` once per host before `make test-integration` /
+e2e (it's deliberately not a make dep — it mutates the host). Re-run it
+after `make clean` or after changing a cap'd helper. If skipped, the
+daemon can't find its prod-cap helper and aborts at startup, surfacing
+as a cryptic 30 s *"sandboxd socket did not appear"* timeout.
+
 ### Integration-test convention
 
 Any test that needs out-of-process state (real gateway container,
