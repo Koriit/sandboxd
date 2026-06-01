@@ -316,9 +316,13 @@ mod tests {
 
         // Connect on a blocking std socket so we can observe the
         // RST-as-ECONNRESET without tokio swallowing it.
-        let client = tokio::task::spawn_blocking(move || {
-            let mut s = StdTcpStream::connect(local).expect("connect");
-            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let client = tokio::task::spawn_blocking(move || -> io::Result<usize> {
+            // The deny-logger accepts, emits, and RST-closes immediately, so
+            // the reset can land during connect (ECONNRESET) or on the first
+            // read. Both satisfy the RST-close contract — surface either as
+            // the returned io::Result rather than panicking on connect.
+            let mut s = StdTcpStream::connect(local)?;
+            s.set_read_timeout(Some(Duration::from_secs(2)))?;
             let mut buf = [0u8; 16];
             s.read(&mut buf)
         })
