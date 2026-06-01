@@ -110,6 +110,14 @@ default-filter = 'test(/(^|::)integration_/)'
 # group closes the race by construction. The `binary(...)` clauses
 # below enumerate the daemon-spawning test crates currently in the
 # workspace; new daemon-spawning binaries must be added here.
+#
+# Note: `integration_proxy_websocket` runs its daemon in-process (no
+# spawned binary, so it never runs the reaper itself) but still creates
+# a real `sandbox-{12hex}` container for the container-backend round
+# trip — it's a reaping *victim* and must be serialised against the
+# reaper-running binaries above. `integration_ssh_config_endpoint` and
+# `integration_proxy_websocket_lima` spawn the daemon (whose startup
+# reaper sweeps the namespace), so they belong here too.
 filter = '''
     test(/^integration_orphan_reaper/)
   | test(/^integration_reaper_/)
@@ -131,6 +139,9 @@ filter = '''
   | binary(integration_local_workspace)
   | binary(integration_shared_guest_path)
   | binary(integration_workspace_lock)
+  | binary(integration_ssh_config_endpoint)
+  | binary(integration_proxy_websocket)
+  | binary(integration_proxy_websocket_lima)
 '''
 test-group = 'docker-sandbox-namespace'
 
