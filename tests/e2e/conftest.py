@@ -800,16 +800,49 @@ def _wait_for_daemon_socket(
     )
 
 
+def _sudo_rm_children_except(directory: Path, keep: list[str]) -> None:
+    """As the ``sandbox`` user, remove every direct child of ``directory``
+    whose name is not in ``keep``.
+
+    Implementation-independent on purpose: it uses
+    ``find -maxdepth 1 … -exec rm -rf {} +`` rather than ``find … -delete``.
+    ``-delete`` silently turns on ``-depth``, which in turn neuters
+    ``-prune`` (GNU find documents this) — so the previous
+    ``( -path … ) -prune -o -delete`` idiom both failed to reliably remove
+    top-level state like ``sessions.db`` *and* over-deleted the preserved
+    cache directories' contents. ``-maxdepth 1`` + ``rm -rf`` sidesteps the
+    whole ``-depth``/``-prune`` interaction and behaves identically across
+    GNU find and other implementations.
+
+    Skipped silently when ``directory`` does not exist.
+    """
+    if not directory.exists():
+        return
+    argv = [
+        "sudo", "-n", "-u", "sandbox",
+        "find", str(directory), "-mindepth", "1", "-maxdepth", "1",
+    ]
+    for name in keep:
+        argv += ["!", "-name", name]
+    argv += ["-exec", "rm", "-rf", "{}", "+"]
+    subprocess.run(argv, capture_output=True, timeout=120)
+
+
 def _reset_sandbox_state_dir() -> None:
     """Wipe ``/var/lib/sandbox`` between pytest sessions, preserving the
     Lima base-image cache and the golden base VM.
 
     The daemon writes all files under ``/var/lib/sandbox`` as the
-    ``sandbox`` user, so deletes are issued as ``sudo -n -u sandbox find
-    … -delete``.  The base dir itself is left intact (owned sandbox:sandbox
-    0750, provisioned by ``make setup-sandbox-prod-base-dir``); we only
-    remove daemon-managed state so a fresh ``sessions.db`` lands on the
-    next session start.
+    ``sandbox`` user, so deletes are issued as the ``sandbox`` user via
+    :func:`_sudo_rm_children_except`.  The base dir itself is left intact
+    (owned sandbox:sandbox 0750, provisioned by
+    ``make setup-sandbox-prod-base-dir``); we only remove daemon-managed
+    state so a fresh ``sessions.db`` lands on the next session start.
+
+    This is the safety net that keeps a crashed run (which never reached
+    its teardown) from leaking its sessions into the *next* run's daemon —
+    where a stale, same-named session would shadow the freshly created one
+    and route ``ssh``/``proxy`` at a long-gone container.
 
     What we explicitly **keep**:
 
@@ -836,74 +869,28 @@ def _reset_sandbox_state_dir() -> None:
 
     Skipped silently when the dir does not exist (first-ever run).
     """
-    if not _SANDBOX_PROD_BASE_DIR.exists():
-        return
-    # ``find ... -prune`` excludes kept paths from the delete sweep.
-    # ``-mindepth 1`` keeps the base dir itself intact. The two pruned
-    # trees stay byte-for-byte identical across reset, which is exactly
-    # what the pre-warm fixture's "is the image fresh?" check needs to
-    # short-circuit.
-    #
-    # The daemon owns all files under /var/lib/sandbox as the sandbox
-    # user, so run find as sandbox (not root).
-    cache_dir = str(_SANDBOX_PROD_BASE_DIR / ".cache" / "lima")
-    base_vm_dir = str(
-        _SANDBOX_PROD_BASE_DIR / ".lima" /
-        os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
-    )
-    meta_file = str(_SANDBOX_PROD_BASE_DIR / "base-image-meta.json")
-    subprocess.run(
-        [
-            "sudo", "-n", "-u", "sandbox",
-            "find", str(_SANDBOX_PROD_BASE_DIR),
-            "-mindepth", "1",
-            # Order matters: the prunes go first, then the delete
-            # branch. ``find`` evaluates left-to-right with implicit
-            # ``-and``; once ``-prune`` succeeds it short-circuits
-            # the rest, so the pruned subtree is never visited for
-            # deletion.
-            "(",
-            "-path", cache_dir,
-            "-o", "-path", base_vm_dir,
-            "-o", "-path", meta_file,
-            ")",
-            "-prune",
-            "-o", "-delete",
-        ],
-        capture_output=True, timeout=30,
-    )
+    base_vm = os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
 
-    # Per-operator LIMA_HOME: wipe the base VM directory and freshness
-    # metadata so each test session rebuilds from scratch. This prevents
-    # a partially-initialised base VM (e.g. killed mid-cloud-init) from
-    # being reused via a stale base-image-meta.json left over from a
-    # prior session. The download cache is preserved so the ~580 MiB
-    # qcow2 is not re-fetched. The directory is owned sandbox:sandbox
-    # 0750 (ACL grants the operator rwx), so deletes are routed through
-    # ``sudo -n -u sandbox find … -delete``.
+    # Prod base dir: remove every top-level entry — sessions.db,
+    # per-session dirs, listeners, events, the socket — except the Lima
+    # cache, the .lima tree, and the freshness metadata. Then prune the
+    # .lima tree down to the golden base VM (dropping per-session clones).
+    _sudo_rm_children_except(
+        _SANDBOX_PROD_BASE_DIR, [".cache", ".lima", "base-image-meta.json"]
+    )
+    _sudo_rm_children_except(_SANDBOX_PROD_BASE_DIR / ".lima", [base_vm])
+
+    # Per-operator LIMA_HOME (``/var/lib/sandboxd/<op_uid>/lima``): keep the
+    # download cache, the golden base VM, and the freshness metadata; remove
+    # per-session VM clones and any stale config so a partially-initialised
+    # base VM left by a killed run is not reused via a stale meta file. The
+    # base VM lives directly under LIMA_HOME here (LIMA_HOME *is* the Lima
+    # home), not under a .lima subdir.
     op_uid = os.getuid()
     op_lima_home = Path(f"/var/lib/sandboxd/{op_uid}/lima")
-    if op_lima_home.exists():
-        op_cache_dir = str(op_lima_home / ".cache" / "lima")
-        op_base_vm_dir = str(
-            op_lima_home / os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
-        )
-        op_meta_file = str(op_lima_home / "base-image-meta.json")
-        subprocess.run(
-            [
-                "sudo", "-n", "-u", "sandbox",
-                "find", str(op_lima_home),
-                "-mindepth", "1",
-                "(",
-                "-path", op_cache_dir,
-                "-o", "-path", op_base_vm_dir,
-                "-o", "-path", op_meta_file,
-                ")",
-                "-prune",
-                "-o", "-delete",
-            ],
-            capture_output=True, timeout=30,
-        )
+    _sudo_rm_children_except(
+        op_lima_home, [".cache", base_vm, "base-image-meta.json"]
+    )
 
 
 def _stage_binaries_for_sandbox_user(sandbox_binaries: SandboxBinaries) -> dict:
