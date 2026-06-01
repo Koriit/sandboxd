@@ -864,25 +864,7 @@ setup-bridge-conf:
 # round-trip rather than regex/sed so we cannot corrupt the file's
 # JSON shape.
 setup-users-conf:
-	@if [ -f "$(USERS_CONF_PATH)" ]; then \
-	  rendered_test_entry=$$(python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({"comment":"E2E test pool — used by the e2e test daemon launched with SANDBOX_USERS_CONF pointing at a tempfile that contains only this entry. The production route helper continues reading this canonical file, so authorization for this pool'"'"'s gateway IP succeeds.","cidr":"10.220.0.0/20","allow_users":[os.environ["USER"]]}, indent=2))'); \
-	  status=$$(python3 -c 'import json,sys; cfg=json.load(open(sys.argv[1])); print("present" if any(s.get("cidr")=="10.220.0.0/20" for s in cfg.get("subnets",[])) else "absent")' "$(USERS_CONF_PATH)" 2>/dev/null) || { \
-	    echo "ERROR: $(USERS_CONF_PATH) exists but is not parseable as JSON."; \
-	    echo "Refusing to mutate. Inspect the file and re-run after fixing."; \
-	    exit 1; \
-	  }; \
-	  if [ "$$status" = "present" ]; then \
-	    echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (test pool 10.220.0.0/20 present)$(RESET)"; \
-	  else \
-	    tmp=$$(mktemp); \
-	    USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); cfg.setdefault("subnets", []).append({"comment":"E2E test pool — used by the e2e test daemon launched with SANDBOX_USERS_CONF pointing at a tempfile that contains only this entry. The production route helper continues reading this canonical file, so authorization for this pool'"'"'s gateway IP succeeds.","cidr":"10.220.0.0/20","allow_users":[os.environ["USER"]]}); json.dump(cfg, open(sys.argv[2], "w"), indent=2); open(sys.argv[2], "a").write("\n")' "$(USERS_CONF_PATH)" "$$tmp"; \
-	    echo "[sudo] append test pool entry to $(USERS_CONF_PATH):"; \
-	    echo "$$rendered_test_entry" | sed 's/^/    /'; \
-	    echo "[sudo] install -o root -g root -m 0644 <updated> $(USERS_CONF_PATH)"; \
-	    sudo -k install -o root -g root -m 0644 "$$tmp" "$(USERS_CONF_PATH)"; \
-	    rm -f "$$tmp"; \
-	  fi; \
-	else \
+	@if [ ! -f "$(USERS_CONF_PATH)" ]; then \
 	  rendered=$$(sed 's/$$USER/'"$$USER"'/g' contrib/users.conf.example); \
 	  echo "[sudo] mkdir -p /etc/sandboxd  (creating sandboxd config directory)"; \
 	  echo "[sudo] write to $(USERS_CONF_PATH):"; \
@@ -892,6 +874,31 @@ setup-users-conf:
 	  printf '%s\n' "$$rendered" | sudo -k tee "$(USERS_CONF_PATH)" > /dev/null; \
 	  sudo -k chown root:root "$(USERS_CONF_PATH)"; \
 	  sudo -k chmod 0644 "$(USERS_CONF_PATH)"; \
+	fi
+	@# Ensure the e2e test pool (10.220.0.0/20) lists the daemon's caller
+	@# uid (`sandbox`) alongside the operator accounts. The route helper's
+	@# pair-check requires BOTH the caller uid (the daemon, `sandbox`) AND
+	@# the `--for-user` uid to appear in the matched pool's `allow_users`,
+	@# so a test pool listing only the operator is denied for cross-user
+	@# sessions. `sandbox-e2e-test` is the distinct operator used by the
+	@# cross-user-operator Lima test; unresolvable names are harmless
+	@# (the helper treats them as non-matches). Idempotent: rewrites only
+	@# when allow_users differs, and only ever touches this managed
+	@# test-pool entry — never reorders or removes other entries.
+	@tmp=$$(mktemp); \
+	result=$$(USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); want=[os.environ["USER"],"sandbox","sandbox-e2e-test"]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")=="10.220.0.0/20"),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":"E2E test pool (cross-user e2e harness): sandbox daemon caller plus operator accounts for the route-helper pair-check","cidr":"10.220.0.0/20","allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$(USERS_CONF_PATH)" "$$tmp" 2>/dev/null) || { \
+	  echo "ERROR: $(USERS_CONF_PATH) exists but is not parseable as JSON."; \
+	  echo "Refusing to mutate. Inspect the file and re-run after fixing."; \
+	  rm -f "$$tmp"; exit 1; \
+	}; \
+	if [ "$$result" = "unchanged" ]; then \
+	  echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (test pool 10.220.0.0/20 lists sandbox + operators)$(RESET)"; \
+	  rm -f "$$tmp"; \
+	else \
+	  echo "[sudo] set test pool 10.220.0.0/20 allow_users = [$$USER, sandbox, sandbox-e2e-test] in $(USERS_CONF_PATH)"; \
+	  echo "[sudo] install -o root -g root -m 0644 <updated> $(USERS_CONF_PATH)"; \
+	  sudo -k install -o root -g root -m 0644 "$$tmp" "$(USERS_CONF_PATH)"; \
+	  rm -f "$$tmp"; \
 	fi
 
 # setup-bridge-helper-setuid — `qemu-bridge-helper` must be setuid
