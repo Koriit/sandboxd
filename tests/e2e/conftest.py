@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -905,6 +906,44 @@ def _reset_sandbox_state_dir() -> None:
         )
 
 
+def _stage_binaries_for_sandbox_user(sandbox_binaries: SandboxBinaries) -> dict:
+    """Copy the freshly-built ``sandboxd`` and ``sandbox-guest`` binaries into
+    a world-traversable directory the ``sandbox`` system user can reach.
+
+    The workspace lives under the operator's home directory (commonly mode
+    0750), which the unprivileged ``sandbox`` user cannot search.  So
+    ``sudo -u sandbox <workspace>/target/debug/sandboxd`` fails the
+    post-setuid ``execve`` permission check with EACCES ("Permission
+    denied") — the kernel resolves the path *as the sandbox user*, which
+    needs search (``x``) on every ancestor directory.  We stage the
+    binaries into a fresh ``/tmp`` subdirectory (``/tmp`` is mode 1777, so
+    every user can traverse it) owned by the operator at mode 0755, and run
+    the daemon from there.  No host-permission changes and no root required.
+
+    Returns a dict with ``dir`` (the staging directory, removed at session
+    teardown), ``sandboxd`` and ``sandbox_guest`` (the staged paths).
+    """
+    # ``mkdtemp`` yields a unique dir each session, so a still-running daemon
+    # from a prior session can never collide here (no ETXTBSY on copy).
+    stage_dir = Path(tempfile.mkdtemp(prefix="sandboxd-e2e-", dir="/tmp"))
+    # mkdtemp creates the dir 0700; widen to 0755 so `sandbox` can traverse.
+    os.chmod(stage_dir, 0o755)
+
+    src_sandboxd = Path(sandbox_binaries.sandboxd)
+    src_guest = src_sandboxd.parent / "sandbox-guest"
+    staged_sandboxd = stage_dir / "sandboxd"
+    staged_guest = stage_dir / "sandbox-guest"
+    shutil.copy2(src_sandboxd, staged_sandboxd)
+    shutil.copy2(src_guest, staged_guest)
+    os.chmod(staged_sandboxd, 0o755)
+    os.chmod(staged_guest, 0o755)
+    return {
+        "dir": stage_dir,
+        "sandboxd": staged_sandboxd,
+        "sandbox_guest": staged_guest,
+    }
+
+
 def _launch_daemon_as_sandbox_via_sudo(
     sandbox_binaries: SandboxBinaries,
     tmp_path: Path,
@@ -921,7 +960,10 @@ def _launch_daemon_as_sandbox_via_sudo(
     ``sandbox:sandbox`` ownership and mode 0750 — provisioned once by
     ``make setup-sandbox-prod-base-dir`` (part of ``make setup-dev-env``).
     The socket lives inside the base dir so the daemon can create it
-    without root.
+    without root.  The daemon (and guest) binaries are staged into a
+    world-traversable ``/tmp`` dir so the ``sandbox`` user can exec them
+    despite the workspace living under the operator's 0750 home — see
+    :func:`_stage_binaries_for_sandbox_user`.
     """
     _assert_operator_in_sandbox_group()
 
@@ -934,17 +976,21 @@ def _launch_daemon_as_sandbox_via_sudo(
             "from the workspace root to create it, then re-run."
         )
 
-    # Probe NOPASSWD authorisation. ``sudo -n -u sandbox <binary> --version``
-    # returns rc=1 with "a password is required" on stderr when the sudoers
-    # fragment is absent or mis-scoped; rc=0 when the fragment grants
-    # passwordless sandbox impersonation. Failing here prevents a silent hang
-    # at the wait-for-socket deadline.
+    staged = _stage_binaries_for_sandbox_user(sandbox_binaries)
+
+    # Probe NOPASSWD authorisation *and* binary reachability in one shot.
+    # ``sudo -n -u sandbox <staged-binary> --version`` returns rc=1 with
+    # "a password is required" on stderr when the sudoers fragment is
+    # absent/mis-scoped, or "Permission denied" if the sandbox user cannot
+    # exec the staged binary. rc=0 confirms the full chain works. Failing
+    # here prevents a silent hang at the wait-for-socket deadline.
     probe = subprocess.run(
         ["sudo", "-n", "-u", "sandbox",
-         str(sandbox_binaries.sandboxd), "--version"],
+         str(staged["sandboxd"]), "--version"],
         capture_output=True, text=True, timeout=10,
     )
     if probe.returncode != 0:
+        shutil.rmtree(staged["dir"], ignore_errors=True)
         pytest.fail(
             "The NOPASSWD sudoers fragment at /etc/sudoers.d/sandboxd-test "
             "is missing or does not authorise the operator to run commands "
@@ -973,7 +1019,7 @@ def _launch_daemon_as_sandbox_via_sudo(
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", "sandbox",
-            str(sandbox_binaries.sandboxd),
+            str(staged["sandboxd"]),
             "--socket", str(_SANDBOX_PROD_SOCKET),
             "--base-dir", str(_SANDBOX_PROD_BASE_DIR),
         ],
@@ -984,10 +1030,12 @@ def _launch_daemon_as_sandbox_via_sudo(
             "SANDBOX_LIMA_HELPER_PATH":
                 "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
             # Override the guest-agent binary path so the test lima-helper
-            # (built with --features test-env-override) copies the workspace
+            # (built with --features test-env-override) copies the staged
             # debug build into the VM instead of looking for the prod install.
+            # Staged alongside sandboxd so the sandbox user / lima-helper can
+            # read it without traversing the operator's 0750 home.
             "SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH":
-                str(sandbox_binaries.sandboxd.parent / "sandbox-guest"),
+                str(staged["sandbox_guest"]),
         },
         stdout=stdout_fh,
         stderr=stderr_fh,
@@ -1008,6 +1056,7 @@ def _launch_daemon_as_sandbox_via_sudo(
             proc.kill()
         stdout_fh.close()
         stderr_fh.close()
+        shutil.rmtree(staged["dir"], ignore_errors=True)
         try:
             stderr_text = stderr_log.read_text()
         except OSError:
@@ -1027,6 +1076,8 @@ def _launch_daemon_as_sandbox_via_sudo(
         "_stderr_fh": stderr_fh,
         "_stdout_log": stdout_log,
         "_stderr_log": stderr_log,
+        "_stage_dir": staged["dir"],
+        "_staged_sandboxd": staged["sandboxd"],
     }
 
 
@@ -1066,14 +1117,24 @@ def restart_test_daemon(
     new_stdout_fh = open(stdout_log, "a")
     new_stderr_fh = open(stderr_log, "a")
 
+    # Relaunch from the same staged binary the session launcher used (the
+    # sandbox user cannot exec the workspace build under the operator's
+    # 0750 home — see _stage_binaries_for_sandbox_user). Mirror the
+    # launcher's lima-helper env so the restarted daemon is configured
+    # identically to the one it replaces.
+    staged_sandboxd = sandbox_daemon["_staged_sandboxd"]
+    staged_guest = Path(staged_sandboxd).parent / "sandbox-guest"
     daemon_env = os.environ.copy()
     daemon_env["SANDBOX_USERS_CONF"] = os.environ["SANDBOX_USERS_CONF"]
     daemon_env["SANDBOX_BASE_VM_NAME"] = os.environ["SANDBOX_BASE_VM_NAME"]
+    daemon_env["SANDBOX_LIMA_HELPER_PATH"] = \
+        "/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
+    daemon_env["SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH"] = str(staged_guest)
 
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", "sandbox",
-            str(sandbox_binaries.sandboxd),
+            str(staged_sandboxd),
             "--socket", str(socket_path),
             "--base-dir", str(base_dir),
         ],
@@ -1202,6 +1263,12 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
         pass
     try:
         info["_stderr_fh"].close()
+    except Exception:
+        pass
+
+    # Remove the /tmp staging dir holding the daemon/guest binaries.
+    try:
+        shutil.rmtree(info["_stage_dir"], ignore_errors=True)
     except Exception:
         pass
 
