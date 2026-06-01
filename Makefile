@@ -37,10 +37,17 @@ test:
 	# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
 	# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
 	# otherwise emit plain text so captured logs stay greppable.
+	@# Build with the same `test-env-override` features as `test-integration`
+	@# so both targets compile the identical test universe and differ only in
+	@# which nextest profile selects. Without this, `#[cfg(feature =
+	@# "test-env-override")]` unit tests (e.g. the *_honors_env_* path-resolution
+	@# tests) compile only under test-integration's features but are then skipped
+	@# by its `integration_*`-only profile — so they would run in neither target.
+	@# These are hermetic unit tests (env-var seam resolution); no Docker/Lima.
 	@if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then \
-	  cd sandboxd && cargo nextest run --workspace; \
+	  cd sandboxd && cargo nextest run --workspace --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override; \
 	else \
-	  cd sandboxd && CARGO_TERM_COLOR=never cargo nextest run --workspace; \
+	  cd sandboxd && CARGO_TERM_COLOR=never cargo nextest run --workspace --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override; \
 	fi
 
 # Integration tests: every test named `integration_*` in the workspace.
