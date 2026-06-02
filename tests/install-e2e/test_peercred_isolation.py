@@ -230,7 +230,8 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
     #   * Clears all supplementary groups so the kernel sees a process
     #     whose entire credential set is uid:gid:groups = 7777:7777:{}.
     #
-    # The route-helper has file caps ``cap_net_admin,cap_sys_admin=eip``
+    # The route-helper has file caps
+    # ``cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip``
     # set at install time; setpriv's reuid does NOT strip them
     # (caps are file caps, not setuid). The helper still receives its
     # caps, runs its argv parser, then short-circuits at the

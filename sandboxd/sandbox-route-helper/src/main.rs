@@ -49,13 +49,27 @@
 //!
 //! # Privilege model
 //!
-//! The helper requires `CAP_SYS_ADMIN` to call `setns(2)` on a foreign
-//! netns and `CAP_NET_ADMIN` to issue `RTM_NEWROUTE` (which the spawned
-//! `ip(8)` needs to inherit via the ambient set — see step 7 below).
+//! The helper requires three capabilities:
+//!
+//! - `CAP_SYS_ADMIN` to call `setns(2)` on a foreign netns.
+//! - `CAP_NET_ADMIN` to issue `RTM_NEWROUTE` (which the spawned `ip(8)`
+//!   needs to inherit via the ambient set — see step 7 below).
+//! - `CAP_SYS_PTRACE` because the container's PID 1 runs as the
+//!   operator's uid (`docker run --user <op>:<op>`), distinct from the
+//!   helper's own `sandbox` uid. The pidfd `setns` path (step 5) makes
+//!   the kernel run `ptrace_may_access(target, PTRACE_MODE_READ)` on the
+//!   container leader; across the uid boundary that check is satisfied
+//!   only with `CAP_SYS_PTRACE`, and without it the cross-uid `setns`
+//!   fails with `EPERM`. A same-uid container would not need it, but
+//!   that does not occur in a real multi-user deployment. Only
+//!   `CAP_NET_ADMIN` is promoted to the ambient set for `ip(8)`;
+//!   `CAP_SYS_PTRACE` stays with the helper and is not inherited by the
+//!   child.
+//!
 //! Operators install it with:
 //!
 //! ```text
-//! sudo setcap 'cap_net_admin,cap_sys_admin=eip' /usr/local/libexec/sandboxd/sandbox-route-helper
+//! sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' /usr/local/libexec/sandboxd/sandbox-route-helper
 //! ```
 //!
 //! The `=eip` flags put both caps in the file's Permitted, Inheritable,
@@ -731,7 +745,8 @@ fn enforce_netns_addresses_in_subnet(subnet: &SubnetEntry) -> Result<(), String>
 ///
 /// Before exec we raise `CAP_NET_ADMIN` to the ambient set so the
 /// `ip(8)` child inherits permitted+effective `CAP_NET_ADMIN` and can
-/// issue `RTM_NEWROUTE`. The file caps `cap_net_admin,cap_sys_admin=eip`
+/// issue `RTM_NEWROUTE`. The file caps
+/// `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`
 /// place `CAP_NET_ADMIN` in the file's permitted+inheritable+effective
 /// sets, but on exec a process's *thread* inheritable set is taken from
 /// the parent — which is the unprivileged caller, so inheritable is

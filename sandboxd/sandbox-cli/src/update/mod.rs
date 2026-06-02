@@ -1945,9 +1945,16 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     }
 
     // Setcap on route-helper (capabilities stripped by the overwrite
-    // in the install-binaries step).
+    // in the install-binaries step). cap_sys_ptrace is required because
+    // the container's PID 1 runs as the operator's uid, so the helper
+    // (sandbox uid) enters a foreign-uid netns; the pidfd setns path
+    // runs ptrace_may_access(PTRACE_MODE_READ) on the target, satisfied
+    // across the uid boundary only with CAP_SYS_PTRACE. The cap order
+    // must match `getcap`'s output (sorted by capability number:
+    // net_admin=12, sys_ptrace=19, sys_admin=21) because `already_set`
+    // is a substring check against `getcap` below.
     let helper = backup::ROUTE_HELPER_BIN_PATH;
-    let expected = "cap_net_admin,cap_sys_admin=eip";
+    let expected = "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip";
     let cur_out = Command::new("getcap").arg(helper).output();
     let current = cur_out
         .ok()
@@ -2486,6 +2493,12 @@ fn install_binary_if_changed(
     if files_byte_equal(src, Path::new(dst))? {
         return Ok("skip");
     }
+    // INVARIANT: install with a FRESH mtime — `install(1)` WITHOUT `-p`, never
+    // preserving the source mtime. The dev workspace's `make` time-shares the
+    // libexec helper paths with a co-resident dev install and decides on
+    // `make clean` whether to restore a stashed prod binary by comparing
+    // mtimes; an update that wrote a stale mtime could let clean silently
+    // downgrade this install. See scripts/dev/canonical-binary.sh.
     let status = std::process::Command::new("sudo")
         .args([
             "-k",

@@ -157,11 +157,18 @@ BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 # wrap pytest in ``sg sandbox -c '…'`` to activate the group without
 # requiring a re-login.
 
-# Socket lives inside the sandbox base dir so the sandbox-user daemon
-# can create it with no elevated privileges and the operator (group
-# sandbox; base dir 0750 → group r-x) can connect.
-_SANDBOX_PROD_SOCKET = Path("/var/lib/sandbox/sandboxd.sock")
-_SANDBOX_PROD_BASE_DIR = Path("/var/lib/sandbox")
+# Socket lives inside the test base dir so the sandbox-user daemon can
+# create it with no elevated privileges and the operator (group sandbox;
+# base dir 0750 → group r-x) can connect.
+#
+# DELIBERATELY /var/lib/sandbox-test, NOT the production /var/lib/sandbox:
+# a real prod install (install.sh) owns /var/lib/sandbox, and the harness
+# must never share that base dir — otherwise the state-dir reset below
+# would wipe the prod daemon's sessions.db/.install-state.json, and two
+# daemons could write one sessions.db. Created by `make
+# setup-sandbox-test-base-dir` (part of `make setup-dev-env`).
+_SANDBOX_E2E_SOCKET = Path("/var/lib/sandbox-test/sandboxd.sock")
+_SANDBOX_E2E_BASE_DIR = Path("/var/lib/sandbox-test")
 
 # The test daemon uses a distinct base VM name so it neither sees nor
 # touches the operator's production `sandbox-base` Lima instance. We
@@ -822,15 +829,19 @@ def _sudo_rm_children_except(directory: Path, keep: list[str]) -> None:
 
 
 def _reset_sandbox_state_dir() -> None:
-    """Wipe ``/var/lib/sandbox`` between pytest sessions, preserving the
-    Lima base-image cache and the golden base VM.
+    """Wipe ``/var/lib/sandbox-test`` between pytest sessions, preserving
+    the Lima base-image cache and the golden base VM.
 
-    The daemon writes all files under ``/var/lib/sandbox`` as the
+    The daemon writes all files under ``/var/lib/sandbox-test`` as the
     ``sandbox`` user, so deletes are issued as the ``sandbox`` user via
     :func:`_sudo_rm_children_except`.  The base dir itself is left intact
     (owned sandbox:sandbox 0750, provisioned by
-    ``make setup-sandbox-prod-base-dir``); we only remove daemon-managed
+    ``make setup-sandbox-test-base-dir``); we only remove daemon-managed
     state so a fresh ``sessions.db`` lands on the next session start.
+
+    This wipes the *test* base dir, never the production ``/var/lib/sandbox``
+    that a real install.sh owns — the two are deliberately separate so this
+    reset can never destroy a co-resident prod install's state.
 
     This is the safety net that keeps a crashed run (which never reached
     its teardown) from leaking its sessions into the *next* run's daemon —
@@ -869,9 +880,9 @@ def _reset_sandbox_state_dir() -> None:
     # cache, the .lima tree, and the freshness metadata. Then prune the
     # .lima tree down to the golden base VM (dropping per-session clones).
     _sudo_rm_children_except(
-        _SANDBOX_PROD_BASE_DIR, [".cache", ".lima", "base-image-meta.json"]
+        _SANDBOX_E2E_BASE_DIR, [".cache", ".lima", "base-image-meta.json"]
     )
-    _sudo_rm_children_except(_SANDBOX_PROD_BASE_DIR / ".lima", [base_vm])
+    _sudo_rm_children_except(_SANDBOX_E2E_BASE_DIR / ".lima", [base_vm])
 
     # Per-operator LIMA_HOME (``/var/lib/sandboxd/<op_uid>/lima``): keep the
     # download cache, the golden base VM, and the freshness metadata; remove
@@ -887,8 +898,8 @@ def _reset_sandbox_state_dir() -> None:
 
 
 def _stage_binaries_for_sandbox_user(sandbox_binaries: SandboxBinaries) -> dict:
-    """Copy the freshly-built ``sandboxd`` and ``sandbox-guest`` binaries into
-    a world-traversable directory the ``sandbox`` system user can reach.
+    """Copy the freshly-built ``sandboxd`` binary into a world-traversable
+    directory the ``sandbox`` system user can reach.
 
     The workspace lives under the operator's home directory (commonly mode
     0750), which the unprivileged ``sandbox`` user cannot search.  So
@@ -896,12 +907,16 @@ def _stage_binaries_for_sandbox_user(sandbox_binaries: SandboxBinaries) -> dict:
     post-setuid ``execve`` permission check with EACCES ("Permission
     denied") — the kernel resolves the path *as the sandbox user*, which
     needs search (``x``) on every ancestor directory.  We stage the
-    binaries into a fresh ``/tmp`` subdirectory (``/tmp`` is mode 1777, so
+    binary into a fresh ``/tmp`` subdirectory (``/tmp`` is mode 1777, so
     every user can traverse it) owned by the operator at mode 0755, and run
     the daemon from there.  No host-permission changes and no root required.
 
+    Only ``sandboxd`` is staged: the guest agent is installed at the canonical
+    ``/usr/local/libexec/sandboxd/sandbox-guest`` by ``make install-guest-prod``
+    and read from there by the prod lima-helper, so it no longer needs staging.
+
     Returns a dict with ``dir`` (the staging directory, removed at session
-    teardown), ``sandboxd`` and ``sandbox_guest`` (the staged paths).
+    teardown) and ``sandboxd`` (the staged path).
     """
     # ``mkdtemp`` yields a unique dir each session, so a still-running daemon
     # from a prior session can never collide here (no ETXTBSY on copy).
@@ -910,17 +925,12 @@ def _stage_binaries_for_sandbox_user(sandbox_binaries: SandboxBinaries) -> dict:
     os.chmod(stage_dir, 0o755)
 
     src_sandboxd = Path(sandbox_binaries.sandboxd)
-    src_guest = src_sandboxd.parent / "sandbox-guest"
     staged_sandboxd = stage_dir / "sandboxd"
-    staged_guest = stage_dir / "sandbox-guest"
     shutil.copy2(src_sandboxd, staged_sandboxd)
-    shutil.copy2(src_guest, staged_guest)
     os.chmod(staged_sandboxd, 0o755)
-    os.chmod(staged_guest, 0o755)
     return {
         "dir": stage_dir,
         "sandboxd": staged_sandboxd,
-        "sandbox_guest": staged_guest,
     }
 
 
@@ -936,9 +946,9 @@ def _launch_daemon_as_sandbox_via_sudo(
     to prompt and hang the wait-for-socket deadline, so the harness probes
     up front and fails with a precise error.
 
-    The base dir ``/var/lib/sandbox`` must already exist with
+    The base dir ``/var/lib/sandbox-test`` must already exist with
     ``sandbox:sandbox`` ownership and mode 0750 — provisioned once by
-    ``make setup-sandbox-prod-base-dir`` (part of ``make setup-dev-env``).
+    ``make setup-sandbox-test-base-dir`` (part of ``make setup-dev-env``).
     The socket lives inside the base dir so the daemon can create it
     without root.  The daemon (and guest) binaries are staged into a
     world-traversable ``/tmp`` dir so the ``sandbox`` user can exec them
@@ -949,10 +959,10 @@ def _launch_daemon_as_sandbox_via_sudo(
 
     # Assert the base dir is provisioned. The daemon writes the socket
     # and all state here; if it is missing the daemon will fail to start.
-    if not _SANDBOX_PROD_BASE_DIR.exists():
+    if not _SANDBOX_E2E_BASE_DIR.exists():
         pytest.fail(
-            f"{_SANDBOX_PROD_BASE_DIR} does not exist. "
-            "Run `make setup-sandbox-prod-base-dir` (or `make setup-dev-env`) "
+            f"{_SANDBOX_E2E_BASE_DIR} does not exist. "
+            "Run `make setup-sandbox-test-base-dir` (or `make setup-dev-env`) "
             "from the workspace root to create it, then re-run."
         )
 
@@ -993,29 +1003,35 @@ def _launch_daemon_as_sandbox_via_sudo(
     # so the variables propagate through sudo without ``--preserve-env``
     # (which is more brittle to whitelist).
     #
-    # ``SANDBOX_LIMA_HELPER_PATH`` points the daemon's lima-helper resolver
-    # at the test-cap'd binary so all Lima control-plane operations go
-    # through sandbox-lima-helper and pivot to the operator's uid.
+    # The daemon's lima-helper resolver is intentionally left at its default:
+    # it resolves the canonical /usr/local/libexec/sandboxd/sandbox-lima-helper
+    # (the prod build, installed by ``make install-lima-helper-prod-cap``), so
+    # the e2e suite exercises the REAL production lima-helper rather than a
+    # test-cap variant. That helper reads the guest agent from the canonical
+    # /usr/local/libexec/sandboxd/sandbox-guest (installed by
+    # ``make install-guest-prod``), so no ``SANDBOX_LIMA_HELPER_PATH`` or
+    # ``SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH`` override is set. Both
+    # canonical binaries survive a co-resident prod install via the
+    # stash/restore scheme in ``scripts/dev/canonical-binary.sh``.
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", "sandbox",
             str(staged["sandboxd"]),
-            "--socket", str(_SANDBOX_PROD_SOCKET),
-            "--base-dir", str(_SANDBOX_PROD_BASE_DIR),
+            "--socket", str(_SANDBOX_E2E_SOCKET),
+            "--base-dir", str(_SANDBOX_E2E_BASE_DIR),
         ],
         env={
             **daemon_env,
             "SANDBOX_USERS_CONF": os.environ["SANDBOX_USERS_CONF"],
             "SANDBOX_BASE_VM_NAME": os.environ["SANDBOX_BASE_VM_NAME"],
-            "SANDBOX_LIMA_HELPER_PATH":
-                "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
-            # Override the guest-agent binary path so the test lima-helper
-            # (built with --features test-env-override) copies the staged
-            # debug build into the VM instead of looking for the prod install.
-            # Staged alongside sandboxd so the sandbox user / lima-helper can
-            # read it without traversing the operator's 0750 home.
-            "SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH":
-                str(staged["sandbox_guest"]),
+            # Pin the ephemeral runtime dirs under the test base dir. The
+            # daemon runs via `sudo -u sandbox` with no XDG_RUNTIME_DIR, so
+            # without these they fall back to $HOME (/var/lib/sandbox) and leak
+            # into the *production* base dir instead of /var/lib/sandbox-test.
+            # The state-dir reset wipes these along with the rest of the test
+            # base dir. (Prod pins them to /run/sandbox via the systemd unit.)
+            "SANDBOX_LISTENER_DIR": str(_SANDBOX_E2E_BASE_DIR / "listeners"),
+            "SANDBOX_EVENTS_DIR": str(_SANDBOX_E2E_BASE_DIR / "events"),
         },
         stdout=stdout_fh,
         stderr=stderr_fh,
@@ -1029,7 +1045,7 @@ def _launch_daemon_as_sandbox_via_sudo(
 
     try:
         _wait_for_daemon_socket(
-            _SANDBOX_PROD_SOCKET, _is_dead, DAEMON_STARTUP_TIMEOUT,
+            _SANDBOX_E2E_SOCKET, _is_dead, DAEMON_STARTUP_TIMEOUT,
         )
     except BaseException:
         if proc.poll() is None:
@@ -1049,8 +1065,8 @@ def _launch_daemon_as_sandbox_via_sudo(
         raise
 
     return {
-        "socket": str(_SANDBOX_PROD_SOCKET),
-        "base_dir": str(_SANDBOX_PROD_BASE_DIR),
+        "socket": str(_SANDBOX_E2E_SOCKET),
+        "base_dir": str(_SANDBOX_E2E_BASE_DIR),
         "process": proc,
         "_stdout_fh": stdout_fh,
         "_stderr_fh": stderr_fh,
@@ -1100,16 +1116,16 @@ def restart_test_daemon(
     # Relaunch from the same staged binary the session launcher used (the
     # sandbox user cannot exec the workspace build under the operator's
     # 0750 home — see _stage_binaries_for_sandbox_user). Mirror the
-    # launcher's lima-helper env so the restarted daemon is configured
-    # identically to the one it replaces.
+    # launcher's env so the restarted daemon is configured identically to the
+    # one it replaces: it too resolves the canonical prod lima-helper + guest
+    # (no SANDBOX_LIMA_HELPER_PATH / TEST_GUEST_BINARY_PATH override).
     staged_sandboxd = sandbox_daemon["_staged_sandboxd"]
-    staged_guest = Path(staged_sandboxd).parent / "sandbox-guest"
     daemon_env = os.environ.copy()
     daemon_env["SANDBOX_USERS_CONF"] = os.environ["SANDBOX_USERS_CONF"]
     daemon_env["SANDBOX_BASE_VM_NAME"] = os.environ["SANDBOX_BASE_VM_NAME"]
-    daemon_env["SANDBOX_LIMA_HELPER_PATH"] = \
-        "/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
-    daemon_env["SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH"] = str(staged_guest)
+    # Pin the ephemeral runtime dirs under the test base dir (see launcher).
+    daemon_env["SANDBOX_LISTENER_DIR"] = str(_SANDBOX_E2E_BASE_DIR / "listeners")
+    daemon_env["SANDBOX_EVENTS_DIR"] = str(_SANDBOX_E2E_BASE_DIR / "events")
 
     proc = subprocess.Popen(
         [

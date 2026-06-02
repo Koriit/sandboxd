@@ -1121,7 +1121,7 @@ def assert_full_install_landed(vm):
     caps = vm.shell(
         "getcap /usr/local/libexec/sandboxd/sandbox-route-helper",
     ).stdout
-    assert "cap_net_admin,cap_sys_admin=eip" in caps, (
+    assert "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" in caps, (
         f"unexpected route-helper caps: {caps!r}"
     )
 

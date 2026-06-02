@@ -541,7 +541,8 @@ const VFS_CAP_REVISION_MASK: u32 = 0xFF00_0000;
 const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
 const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
 /// `magic_etc` low bit set ⇔ caps are *effective* on exec (the only
-/// flavor the route helper is shipped with — `cap_sys_admin+ep`).
+/// flavor the route helper is shipped with — e.g.
+/// `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`).
 const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x0000_0001;
 
 /// On-disk size (bytes) of `vfs_cap_data` for revisions 2 and 3. We
@@ -599,8 +600,9 @@ where
         return Err(SandboxError::Internal(format!(
             "sandbox-route-helper not usable at {env_path} (set via \
              ${ROUTE_HELPER_PATH_ENV}); the file must exist as a regular \
-             file AND carry the CAP_SYS_ADMIN file capability (effective): \
-             `sudo setcap cap_sys_admin+ep {env_path}`. To use the canonical \
+             file AND carry the route-helper's file capabilities (effective): \
+             `sudo setcap cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip {env_path}`. \
+             To use the canonical \
              install instead, unset {env}; the resolver then looks up \
              {install} (installed by `make install-route-helper-prod-cap`). \
              See docs/start/installation.md § \"sandbox-route-helper\".",

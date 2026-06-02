@@ -62,7 +62,7 @@ The 18 stateful steps, condensed:
 | 19 | `write_backup_manifest` | Drop `manifest.json` with `completed_ok: false` into the set. The "in progress" marker. |
 | 20 | `docker_load_gateway` | Load the new release's gateway image. Image load runs **before** binary swap so an interrupted upgrade is never left running new binaries against an old gateway image. |
 | 21 | `install_binaries` | Install new `sandboxd`, `sandbox`, `sandbox-route-helper`. Each binary is sha256-compared first; identical binaries skip. |
-| 22 | `setcap` | Re-apply `cap_net_admin,cap_sys_admin=eip` on the new `sandbox-route-helper`. |
+| 22 | `setcap` | Re-apply `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip` on the new `sandbox-route-helper`. |
 | 23 | `install_systemd_unit` | Install the new unit file (replaces `/etc/systemd/system/sandboxd.service`). Identical content skips. |
 | 24 | `apply_config_migration` | Run each pending config migration (e.g. V001 `add_sandbox_to_allow_users`). Each runs in-memory + atomic-rename; mid-flight failure never leaves a half-written file. |
 | 25 | `prune_backups` | Delete backup sets older than the last 2 with `completed_ok: true`. Forensic sets (`completed_ok: false`) are **never** auto-pruned. |

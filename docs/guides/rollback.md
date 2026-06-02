@@ -68,7 +68,7 @@ sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox.bak"              /usr
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox-route-helper.bak" /usr/local/libexec/sandboxd/sandbox-route-helper
 
 # 5. Re-apply route-helper file caps.
-sudo setcap cap_net_admin,cap_sys_admin=eip /usr/local/libexec/sandboxd/sandbox-route-helper
+sudo setcap cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip /usr/local/libexec/sandboxd/sandbox-route-helper
 
 # 6. Restore /etc files.
 sudo install -m 0644 -o root -g root "$BACKUP_DIR/users.conf.bak"  /etc/sandboxd/users.conf

@@ -1,6 +1,6 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
-	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
-	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir
+	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
+	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-test-base-dir
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -141,7 +141,7 @@ TEST ?=
 # `usermod -aG sandbox` but not yet re-logged-in does not have the
 # group active in their shell. Wrapping pytest in `sg sandbox`
 # activates the group for the subprocess without requiring a re-login.
-test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
+test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-prod-cap install-guest-prod
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color -m \"not lima\" -k \"not [lima]\" $(TEST)"; \
@@ -160,7 +160,7 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # `usermod -aG sandbox` but not yet re-logged-in does not have the
 # group active in their shell. Wrapping pytest in `sg sandbox`
 # activates the group for the subprocess without requiring a re-login.
-test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap
+test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-prod-cap install-guest-prod
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $(TEST)"; \
@@ -276,6 +276,14 @@ clean:
 	sudo -k rm -f "$(ROUTE_HELPER_TEST_PATH)"
 	sudo -k rm -f "$(LIMA_HELPER_TEST_PATH)"
 	sudo -k rmdir --ignore-fail-on-non-empty /usr/local/libexec/sandboxd-test 2>/dev/null || true
+	@# Restore any production binaries dev-env stashed at the canonical
+	@# libexec path (no-op on a pure dev host with no *.prod stash). Each
+	@# call restores the stash iff it is newer-or-equal than the current
+	@# canonical binary (a fresh prod install would be newer → kept), and
+	@# always clears the stash. See scripts/dev/canonical-binary.sh.
+	scripts/dev/canonical-binary.sh restore "$(ROUTE_HELPER_PROD_PATH)"
+	scripts/dev/canonical-binary.sh restore "$(LIMA_HELPER_PROD_PATH)"
+	scripts/dev/canonical-binary.sh restore "$(GUEST_PROD_PATH)"
 
 # ---------------------------------------------------------------------------
 # Dev-environment setup
@@ -304,6 +312,7 @@ ROUTE_HELPER_PROD_PATH      := /usr/local/libexec/sandboxd/sandbox-route-helper
 ROUTE_HELPER_TEST_PATH      := /usr/local/libexec/sandboxd-test/sandbox-route-helper
 LIMA_HELPER_PROD_PATH       := /usr/local/libexec/sandboxd/sandbox-lima-helper
 LIMA_HELPER_TEST_PATH       := /usr/local/libexec/sandboxd-test/sandbox-lima-helper
+GUEST_PROD_PATH             := /usr/local/libexec/sandboxd/sandbox-guest
 USERS_CONF_PATH             := /etc/sandboxd/users.conf
 BRIDGE_CONF_PATH            := /etc/qemu/bridge.conf
 QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
@@ -316,7 +325,7 @@ QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 # keeping it as a Makefile-local constant is enough).
 TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
 
-setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-test-base-dir
 	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
 
 # setup-sandboxd-state-dir — create /var/lib/sandboxd/ owned by sandbox:sandbox
@@ -360,12 +369,20 @@ setup-sandboxd-state-dir:
 	  echo "         The daemon uses setfacl to provision per-operator LIMA_HOME ACLs at session-create time."; \
 	fi
 
-# setup-sandbox-prod-base-dir — create /var/lib/sandbox owned by sandbox:sandbox
-# mode 0750. This is the daemon's base directory and home directory
-# (see useradd --home-dir /var/lib/sandbox). The daemon writes all state here,
-# including the unix socket (/var/lib/sandbox/sandboxd.sock); running as the
-# sandbox user it needs no root to create or bind the socket. The 0750 mode
-# (group=sandbox, r-x) lets any operator in the sandbox group connect.
+# setup-sandbox-test-base-dir — create /var/lib/sandbox-test owned by
+# sandbox:sandbox mode 0750. This is the base directory the e2e and
+# integration harnesses point the daemon at (via --base-dir), holding
+# sessions.db, per-session state, and the unix socket
+# (/var/lib/sandbox-test/sandboxd.sock).
+#
+# DELIBERATELY SEPARATE from the production base dir /var/lib/sandbox
+# (which install.sh creates and owns) and from the sandbox user's home
+# (useradd --home-dir /var/lib/sandbox, also prod). A real prod install
+# and the test harness can therefore coexist on one host without the
+# harness's state-dir reset wiping the prod daemon's sessions.db /
+# .install-state.json, and without two daemons sharing one sessions.db.
+# The 0750 mode (group=sandbox, r-x) lets any operator in the sandbox
+# group connect to the socket.
 #
 # Idempotence:
 #   - Directory present with correct ownership and mode → ✓ already configured.
@@ -373,28 +390,28 @@ setup-sandboxd-state-dir:
 #   - Directory absent → create it.
 #
 # Ordering: must run after setup-sandbox-user (the sandbox user/group must exist).
-setup-sandbox-prod-base-dir: setup-sandbox-user
+setup-sandbox-test-base-dir: setup-sandbox-user
 	@if ! getent passwd sandbox >/dev/null 2>&1; then \
 	  echo "ERROR: system user 'sandbox' does not exist; run 'make setup-sandbox-user' first"; \
 	  exit 1; \
 	fi
-	@if [ ! -d /var/lib/sandbox ]; then \
-	  echo "[sudo] mkdir -p /var/lib/sandbox"; \
-	  sudo -k mkdir -p /var/lib/sandbox; \
-	  echo "[sudo] chown sandbox:sandbox /var/lib/sandbox"; \
-	  sudo -k chown sandbox:sandbox /var/lib/sandbox; \
-	  echo "[sudo] chmod 0750 /var/lib/sandbox"; \
-	  sudo -k chmod 0750 /var/lib/sandbox; \
+	@if [ ! -d /var/lib/sandbox-test ]; then \
+	  echo "[sudo] mkdir -p /var/lib/sandbox-test"; \
+	  sudo -k mkdir -p /var/lib/sandbox-test; \
+	  echo "[sudo] chown sandbox:sandbox /var/lib/sandbox-test"; \
+	  sudo -k chown sandbox:sandbox /var/lib/sandbox-test; \
+	  echo "[sudo] chmod 0750 /var/lib/sandbox-test"; \
+	  sudo -k chmod 0750 /var/lib/sandbox-test; \
 	else \
-	  owner=$$(stat -c '%U:%G' /var/lib/sandbox 2>/dev/null || echo "?:?"); \
-	  mode=$$(stat -c '%a' /var/lib/sandbox 2>/dev/null || echo "?"); \
+	  owner=$$(stat -c '%U:%G' /var/lib/sandbox-test 2>/dev/null || echo "?:?"); \
+	  mode=$$(stat -c '%a' /var/lib/sandbox-test 2>/dev/null || echo "?"); \
 	  if [ "$$owner" = "sandbox:sandbox" ] && [ "$$mode" = "750" ]; then \
-	    echo "$(GREEN)✓ already configured: /var/lib/sandbox (sandbox:sandbox 0750)$(RESET)"; \
+	    echo "$(GREEN)✓ already configured: /var/lib/sandbox-test (sandbox:sandbox 0750)$(RESET)"; \
 	  else \
-	    echo "[sudo] chown sandbox:sandbox /var/lib/sandbox (was: $$owner $$mode)"; \
-	    sudo -k chown sandbox:sandbox /var/lib/sandbox; \
-	    echo "[sudo] chmod 0750 /var/lib/sandbox"; \
-	    sudo -k chmod 0750 /var/lib/sandbox; \
+	    echo "[sudo] chown sandbox:sandbox /var/lib/sandbox-test (was: $$owner $$mode)"; \
+	    sudo -k chown sandbox:sandbox /var/lib/sandbox-test; \
+	    echo "[sudo] chmod 0750 /var/lib/sandbox-test"; \
+	    sudo -k chmod 0750 /var/lib/sandbox-test; \
 	  fi; \
 	fi
 
@@ -543,20 +560,11 @@ install-route-helper-prod-cap: sandboxd/target/.dev-env-stamps/route-helper-prod
 
 sandboxd/target/.dev-env-stamps/route-helper-prod.stamp: sandboxd/target/release/sandbox-route-helper
 	@mkdir -p $(dir $@)
-	@if [ -f "$(ROUTE_HELPER_PROD_PATH)" ] && \
-	    cmp -s "sandboxd/target/release/sandbox-route-helper" "$(ROUTE_HELPER_PROD_PATH)" && \
-	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_net_admin && \
-	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_admin && \
-	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_ptrace; then \
-	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip, content matches build)$(RESET)"; \
-	else \
-	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-route-helper $(ROUTE_HELPER_PROD_PATH)"; \
-	  echo "[sudo] setcap cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip $(ROUTE_HELPER_PROD_PATH)"; \
-	  sudo -k install -D -m 0755 \
-	    sandboxd/target/release/sandbox-route-helper \
-	    "$(ROUTE_HELPER_PROD_PATH)"; \
-	  sudo -k setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' "$(ROUTE_HELPER_PROD_PATH)"; \
-	fi
+	scripts/dev/canonical-binary.sh install \
+	  sandboxd/target/release/sandbox-route-helper \
+	  "$(ROUTE_HELPER_PROD_PATH)" 0755 \
+	  'cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip' \
+	  'cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip'
 	@touch $@
 
 # Mark `.PHONY`-equivalent (always-rebuild) so cargo's own up-to-date
@@ -648,18 +656,10 @@ install-lima-helper-prod-cap: sandboxd/target/.dev-env-stamps/lima-helper-prod.s
 
 sandboxd/target/.dev-env-stamps/lima-helper-prod.stamp: sandboxd/target/release/sandbox-lima-helper
 	@mkdir -p $(dir $@)
-	@if [ -f "$(LIMA_HELPER_PROD_PATH)" ] && \
-	    cmp -s "sandboxd/target/release/sandbox-lima-helper" "$(LIMA_HELPER_PROD_PATH)" && \
-	    getcap "$(LIMA_HELPER_PROD_PATH)" 2>/dev/null | grep -q 'cap_setuid'; then \
-	  echo "$(GREEN)✓ already configured: $(LIMA_HELPER_PROD_PATH) (cap_setuid+ep, content matches build)$(RESET)"; \
-	else \
-	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-lima-helper $(LIMA_HELPER_PROD_PATH)"; \
-	  echo "[sudo] setcap cap_setuid+ep $(LIMA_HELPER_PROD_PATH)"; \
-	  sudo -k install -D -m 0755 \
-	    sandboxd/target/release/sandbox-lima-helper \
-	    "$(LIMA_HELPER_PROD_PATH)"; \
-	  sudo -k setcap 'cap_setuid+ep' "$(LIMA_HELPER_PROD_PATH)"; \
-	fi
+	scripts/dev/canonical-binary.sh install \
+	  sandboxd/target/release/sandbox-lima-helper \
+	  "$(LIMA_HELPER_PROD_PATH)" 0755 \
+	  'cap_setuid+ep' 'cap_setuid=ep'
 	@touch $@
 
 # See `install-route-helper-prod-cap` for the `.PHONY` rationale —
@@ -704,6 +704,30 @@ sandboxd/target/.dev-env-stamps/lima-helper-test.stamp: sandboxd/target/debug/sa
 sandboxd/target/debug/sandbox-lima-helper:
 	cd sandboxd && cargo build --workspace --tests \
 	  --features sandbox-lima-helper/test-env-override
+
+# install-guest-prod — install the workspace `sandbox-guest` release build at
+# the canonical libexec path /usr/local/libexec/sandboxd/sandbox-guest. Unlike
+# the helpers it carries NO file caps. The Lima helper installs this binary
+# into each VM; in production builds the helper resolves it from exactly this
+# path (SANDBOX_GUEST_HOST_PATH / resolve_guest_binary_path). Installing it
+# here lets the e2e suite run the real prod lima-helper reading the real guest
+# path, instead of redirecting the guest path through the test-cap helper's
+# SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH seam. Shares the canonical path
+# with a co-resident prod install via the stash/restore scheme in
+# scripts/dev/canonical-binary.sh (see `clean`).
+install-guest-prod: sandboxd/target/.dev-env-stamps/guest-prod.stamp
+	@true
+
+sandboxd/target/.dev-env-stamps/guest-prod.stamp: sandboxd/target/release/sandbox-guest
+	@mkdir -p $(dir $@)
+	scripts/dev/canonical-binary.sh install \
+	  sandboxd/target/release/sandbox-guest \
+	  "$(GUEST_PROD_PATH)" 0755
+	@touch $@
+
+.PHONY: sandboxd/target/release/sandbox-guest
+sandboxd/target/release/sandbox-guest:
+	cd sandboxd && cargo build --release -p sandbox-guest
 
 # setup-bridge-conf — `/etc/qemu/bridge.conf`. The QEMU bridge helper
 # (qemu-bridge-helper) reads this file to decide which bridges
@@ -788,28 +812,42 @@ setup-users-conf:
 	  sudo -k chown root:root "$(USERS_CONF_PATH)"; \
 	  sudo -k chmod 0644 "$(USERS_CONF_PATH)"; \
 	fi
-	@# Ensure the e2e test pool (10.220.0.0/20) lists the daemon's caller
-	@# uid (`sandbox`) alongside the operator account. The route helper's
-	@# pair-check requires BOTH the caller uid (the daemon, `sandbox`) AND
-	@# the `--for-user` uid to appear in the matched pool's `allow_users`,
-	@# so a test pool listing only the operator is denied for cross-user
-	@# sessions. Idempotent: rewrites only when allow_users differs, and
-	@# only ever touches this managed test-pool entry — never reorders or
-	@# removes other entries.
-	@tmp=$$(mktemp); \
-	result=$$(USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); want=[os.environ["USER"],"sandbox"]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")=="10.220.0.0/20"),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":"E2E test pool (cross-user e2e harness): sandbox daemon caller plus operator accounts for the route-helper pair-check","cidr":"10.220.0.0/20","allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$(USERS_CONF_PATH)" "$$tmp" 2>/dev/null) || { \
+	@# Ensure BOTH managed pools list the daemon's caller uid (`sandbox`)
+	@# alongside the operator account, so the created/managed users.conf is
+	@# production-ready, not just test-ready:
+	@#   - Production pool 10.209.0.0/20 — the pool the installed prod daemon
+	@#     uses. install.sh skips writing users.conf when the file already
+	@#     exists, so on a dev-env host the prod daemon inherits THIS file;
+	@#     it must already carry a correct prod pool (matching install.sh's
+	@#     10.209.0.0/20, NOT a narrower legacy /24).
+	@#   - E2E test pool 10.220.0.0/20 — used by the e2e harness.
+	@# The route helper's pair-check requires BOTH the caller uid (the
+	@# daemon, `sandbox`) AND the `--for-user` uid in the matched pool's
+	@# `allow_users`, so each managed pool lists both. Idempotent: rewrites
+	@# only when a managed pool's allow_users differs or is missing, and only
+	@# ever touches these two managed entries — never reorders or removes
+	@# other (operator-authored) entries. A pre-existing non-canonical entry
+	@# (e.g. a legacy 10.209.0.0/24) is left in place; remove it by hand or
+	@# `sudo rm $(USERS_CONF_PATH) && make setup-users-conf` to regenerate.
+	@tmp1=$$(mktemp); tmp2=$$(mktemp); \
+	ensure_pool() { USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); cidr=sys.argv[3]; comment=sys.argv[4]; want=[os.environ["USER"],"sandbox"]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")==cidr),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":comment,"cidr":cidr,"allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$$1" "$$2" "$$3" "$$4" 2>/dev/null; }; \
+	r1=$$(ensure_pool "$(USERS_CONF_PATH)" "$$tmp1" "10.209.0.0/20" "Production pool: sandbox daemon caller plus operator for the route-helper pair-check") || { \
 	  echo "ERROR: $(USERS_CONF_PATH) exists but is not parseable as JSON."; \
 	  echo "Refusing to mutate. Inspect the file and re-run after fixing."; \
-	  rm -f "$$tmp"; exit 1; \
+	  rm -f "$$tmp1" "$$tmp2"; exit 1; \
 	}; \
-	if [ "$$result" = "unchanged" ]; then \
-	  echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (test pool 10.220.0.0/20 lists sandbox + operators)$(RESET)"; \
-	  rm -f "$$tmp"; \
+	r2=$$(ensure_pool "$$tmp1" "$$tmp2" "10.220.0.0/20" "E2E test pool (cross-user e2e harness): sandbox daemon caller plus operator accounts for the route-helper pair-check") || { \
+	  echo "ERROR: failed to update test pool in $(USERS_CONF_PATH)."; \
+	  rm -f "$$tmp1" "$$tmp2"; exit 1; \
+	}; \
+	if [ "$$r1" = "unchanged" ] && [ "$$r2" = "unchanged" ]; then \
+	  echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (prod pool 10.209.0.0/20 + test pool 10.220.0.0/20 list sandbox + operator)$(RESET)"; \
+	  rm -f "$$tmp1" "$$tmp2"; \
 	else \
-	  echo "[sudo] set test pool 10.220.0.0/20 allow_users = [$$USER, sandbox] in $(USERS_CONF_PATH)"; \
+	  echo "[sudo] ensure prod pool 10.209.0.0/20 and test pool 10.220.0.0/20 allow_users = [$$USER, sandbox] in $(USERS_CONF_PATH)"; \
 	  echo "[sudo] install -o root -g root -m 0644 <updated> $(USERS_CONF_PATH)"; \
-	  sudo -k install -o root -g root -m 0644 "$$tmp" "$(USERS_CONF_PATH)"; \
-	  rm -f "$$tmp"; \
+	  sudo -k install -o root -g root -m 0644 "$$tmp2" "$(USERS_CONF_PATH)"; \
+	  rm -f "$$tmp1" "$$tmp2"; \
 	fi
 
 # setup-bridge-helper-setuid — `qemu-bridge-helper` must be setuid

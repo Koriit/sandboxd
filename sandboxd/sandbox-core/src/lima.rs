@@ -2255,13 +2255,21 @@ pub const GUEST_BINARY_PATH_OVERRIDE_ENV: &str = "SANDBOXD_GUEST_BINARY_PATH";
 ///    untrusted on a daemon that may have CAP_NET_ADMIN / read access
 ///    to private state.
 /// 2. **Production install path** [`PRODUCTION_GUEST_BINARY_PATH`].
-/// 3. **Dev sibling**: `current_exe().parent() / "sandbox-guest"` —
-///    catches `cargo run -p sandboxd` where both binaries live in
-///    `target/{debug,release}/`.
-/// 4. **Dev grandparent**: `current_exe().parent().parent() /
-///    "sandbox-guest"` — catches `cargo nextest run`, where the test
-///    binary lives in `target/debug/deps/<hash>` while `cargo build
-///    --bin sandbox-guest` writes to `target/debug/sandbox-guest`.
+/// 3. **`test-env-override`-only — dev sibling**:
+///    `current_exe().parent() / "sandbox-guest"` — catches `cargo run
+///    -p sandboxd` where both binaries live in `target/{debug,release}/`.
+/// 4. **`test-env-override`-only — dev grandparent**:
+///    `current_exe().parent().parent() / "sandbox-guest"` — catches
+///    `cargo nextest run`, where the test binary lives in
+///    `target/debug/deps/<hash>` while `cargo build --bin sandbox-guest`
+///    writes to `target/debug/sandbox-guest`.
+///
+/// **A production daemon resolves the guest from the canonical install
+/// path ONLY** (branch 2): the `current_exe`-relative dev fallbacks are
+/// compiled out of default-feature builds, mirroring the lima-helper's
+/// canonical-only guest resolution. A privileged daemon should not resolve
+/// a binary it copies into sessions from a path derived from its own
+/// executable location.
 ///
 /// On miss, returns an error naming every path tried so the operator
 /// log surfaces exactly which locations the daemon checked.
@@ -2287,22 +2295,31 @@ pub fn guest_agent_path() -> Result<PathBuf, SandboxError> {
     }
     tried.push(production);
 
-    // 3-4. Dev fallbacks (sibling and grandparent of current_exe).
-    let exe = std::env::current_exe().map_err(|e| {
-        SandboxError::Internal(format!("failed to determine current executable path: {e}"))
-    })?;
-    if let Some(dir) = exe.parent() {
-        let sibling = dir.join("sandbox-guest");
-        if sibling.exists() {
-            return Ok(sibling);
-        }
-        tried.push(sibling);
-        if let Some(parent) = dir.parent() {
-            let grandparent_sibling = parent.join("sandbox-guest");
-            if grandparent_sibling.exists() {
-                return Ok(grandparent_sibling);
+    // 3-4. Dev fallbacks (sibling and grandparent of current_exe). Compiled in
+    // ONLY for `test-env-override` builds — a production daemon must not
+    // resolve the guest binary from a `current_exe`-relative path; it uses the
+    // canonical install path only (branch 2 above), mirroring the lima-helper.
+    // The integration suite builds with this feature (via
+    // `sandbox-route-helper/test-env-override` → `sandbox-core/test-env-override`),
+    // so `cargo nextest` still finds `target/debug/sandbox-guest` here.
+    #[cfg(feature = "test-env-override")]
+    {
+        let exe = std::env::current_exe().map_err(|e| {
+            SandboxError::Internal(format!("failed to determine current executable path: {e}"))
+        })?;
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("sandbox-guest");
+            if sibling.exists() {
+                return Ok(sibling);
             }
-            tried.push(grandparent_sibling);
+            tried.push(sibling);
+            if let Some(parent) = dir.parent() {
+                let grandparent_sibling = parent.join("sandbox-guest");
+                if grandparent_sibling.exists() {
+                    return Ok(grandparent_sibling);
+                }
+                tried.push(grandparent_sibling);
+            }
         }
     }
 

@@ -19,3 +19,14 @@ pub mod proxy;
 pub mod ssh_commands;
 pub mod ssh_config;
 pub mod update;
+
+/// Canonical socket path of a system-service install — the path the systemd
+/// unit pins via `--socket` (`/run/sandbox/sandboxd.sock`).
+///
+/// The operator CLI probes this FIRST when neither `--socket` nor
+/// `SANDBOX_SOCKET` is set, so a deployed host's CLI reaches the system daemon
+/// out of the box (the daemon listens here, but the CLI's XDG/HOME default
+/// would otherwise never look here). Shared between `main`'s
+/// `default_socket_path` and `doctor::resolve_socket_path_strict` so the CLI
+/// and its self-diagnosis probe the same location.
+pub const SYSTEM_SOCKET_PATH: &str = "/run/sandbox/sandboxd.sock";

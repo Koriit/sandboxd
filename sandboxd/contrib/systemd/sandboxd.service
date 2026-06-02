@@ -26,6 +26,16 @@ StateDirectoryMode=0750
 RuntimeDirectory=sandbox
 RuntimeDirectoryMode=0750
 
+# Pin the daemon's ephemeral per-session runtime dirs (listener + event
+# sockets) under the systemd RuntimeDirectory (/run/sandbox — tmpfs). Without
+# these they default to $XDG_RUNTIME_DIR — UNSET for a system service — and
+# silently fall back to $HOME (/var/lib/sandbox, persistent disk), so
+# ephemeral session artifacts would accumulate on disk across reboots. The
+# socket and base-dir are pinned via --socket/--base-dir on ExecStart; these
+# env vars pin the remaining XDG-derived runtime paths to the runtime tmpfs.
+Environment=SANDBOX_LISTENER_DIR=/run/sandbox/listeners
+Environment=SANDBOX_EVENTS_DIR=/run/sandbox/events
+
 # Operators customize via `systemctl edit sandboxd` (drop-in override),
 # not by editing this file. See § 4.3.
 ExecStart=/usr/local/bin/sandboxd \

@@ -765,14 +765,44 @@ enum LogComponent {
 }
 
 fn default_socket_path() -> String {
-    // Returns the XDG/HOME-derived fallback path. SANDBOX_SOCKET is handled
-    // by clap's `env = "SANDBOX_SOCKET"` on the `--socket` arg (which is
-    // evaluated per-parse and takes precedence over this default). An
-    // explicit `--socket` flag takes precedence over the env var.
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+    default_socket_path_with(
+        |p| std::path::Path::new(p).exists(),
+        |k| std::env::var(k).ok(),
+    )
+}
+
+/// Pure inner of [`default_socket_path`], parameterised over an existence
+/// check and an env lookup so unit tests stay hermetic (no real filesystem or
+/// process-env mutation, which would race under cargo's threaded runner).
+///
+/// `SANDBOX_SOCKET` / `--socket` take precedence via clap; this is the
+/// "discover the daemon" fallback used only when neither is given. Order:
+///
+/// 1. `/run/sandbox/sandboxd.sock` **if it exists** — the system-service
+///    daemon (systemd unit's `--socket`). Checked first so an operator on a
+///    deployed host reaches the system daemon out of the box. A developer
+///    running their own daemon on a host that also has a system install sets
+///    `SANDBOX_SOCKET` explicitly to override.
+/// 2. `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` — the dev / user-run daemon
+///    default. Returned as the path even if the socket does not yet exist, so
+///    a connect error names the dev location (the common interactive case).
+/// 3. `$HOME/.local/share/sandboxd/sandboxd.sock` — fallback when XDG is unset.
+///
+/// Only #1 is existence-probed; #2/#3 stay the unconditional default so the
+/// error path names a sensible dev location when no daemon is running anywhere.
+fn default_socket_path_with(
+    exists: impl Fn(&str) -> bool,
+    get: impl Fn(&str) -> Option<String>,
+) -> String {
+    if exists(sandbox_cli::SYSTEM_SOCKET_PATH) {
+        return sandbox_cli::SYSTEM_SOCKET_PATH.to_string();
+    }
+    if let Some(runtime_dir) = get("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
         return format!("{runtime_dir}/sandboxd/sandboxd.sock");
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let home = get("HOME")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/tmp".into());
     format!("{home}/.local/share/sandboxd/sandboxd.sock")
 }
 
@@ -6779,6 +6809,46 @@ mod tests {
     fn custom_socket_path() {
         let cli = Cli::parse_from(["sandbox", "--socket", "/tmp/custom.sock", "ps"]);
         assert_eq!(cli.socket, "/tmp/custom.sock");
+    }
+
+    #[test]
+    fn default_socket_prefers_system_when_present() {
+        // System socket exists → wins over XDG, so a deployed-host operator
+        // reaches the system daemon without setting SANDBOX_SOCKET.
+        let got = default_socket_path_with(
+            |p| p == sandbox_cli::SYSTEM_SOCKET_PATH,
+            |k| match k {
+                "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+                _ => None,
+            },
+        );
+        assert_eq!(got, sandbox_cli::SYSTEM_SOCKET_PATH);
+    }
+
+    #[test]
+    fn default_socket_falls_to_xdg_when_no_system() {
+        // No system socket → dev / user-run daemon default under XDG.
+        let got = default_socket_path_with(
+            |_| false,
+            |k| match k {
+                "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+                "HOME" => Some("/home/op".to_string()),
+                _ => None,
+            },
+        );
+        assert_eq!(got, "/run/user/1000/sandboxd/sandboxd.sock");
+    }
+
+    #[test]
+    fn default_socket_falls_to_home_when_no_system_no_xdg() {
+        let got = default_socket_path_with(
+            |_| false,
+            |k| match k {
+                "HOME" => Some("/home/op".to_string()),
+                _ => None,
+            },
+        );
+        assert_eq!(got, "/home/op/.local/share/sandboxd/sandboxd.sock");
     }
 
     #[test]

@@ -116,24 +116,38 @@ impl std::error::Error for DoctorInternalError {}
 /// doctor's job is to diagnose deployments — guessing a path here
 /// would mask the actual misconfiguration.
 ///
-/// Precedence: `SANDBOX_SOCKET` (any non-empty value) > `XDG_RUNTIME_DIR`
-/// > `HOME`. With none of these set, returns `Err`.
+/// Precedence: `SANDBOX_SOCKET` (any non-empty value) >
+/// `/run/sandbox/sandboxd.sock` (the system-service daemon, if present) >
+/// `XDG_RUNTIME_DIR` > `HOME`. With none set/present, returns `Err`.
 pub fn resolve_socket_path_strict() -> Result<String, DoctorInternalError> {
-    resolve_socket_path_strict_with(|name| std::env::var(name).ok())
+    resolve_socket_path_strict_with(
+        |name| std::env::var(name).ok(),
+        |p| std::path::Path::new(p).exists(),
+    )
 }
 
-/// Pure inner of [`resolve_socket_path_strict`], parameterised over
-/// the env-var lookup so unit tests can drive the predicate without
-/// mutating real process env state (which would race with other
-/// concurrent tests under cargo's threaded runner).
-pub(crate) fn resolve_socket_path_strict_with<F>(get: F) -> Result<String, DoctorInternalError>
+/// Pure inner of [`resolve_socket_path_strict`], parameterised over the
+/// env-var lookup AND an existence predicate so unit tests can drive both
+/// without mutating real process env state or touching the filesystem (which
+/// would race with other concurrent tests under cargo's threaded runner).
+pub(crate) fn resolve_socket_path_strict_with<F, G>(
+    get: F,
+    exists: G,
+) -> Result<String, DoctorInternalError>
 where
     F: Fn(&str) -> Option<String>,
+    G: Fn(&str) -> bool,
 {
     if let Some(sock) = get("SANDBOX_SOCKET")
         && !sock.is_empty()
     {
         return Ok(sock);
+    }
+    // System-service daemon, probed first (mirrors `default_socket_path` in
+    // main.rs) so doctor diagnoses the deployed daemon rather than a stale
+    // XDG path that the system daemon never binds.
+    if exists(crate::SYSTEM_SOCKET_PATH) {
+        return Ok(crate::SYSTEM_SOCKET_PATH.to_string());
     }
     if let Some(runtime_dir) = get("XDG_RUNTIME_DIR")
         && !runtime_dir.is_empty()
@@ -146,7 +160,9 @@ where
         return Ok(format!("{home}/.local/share/sandboxd/sandboxd.sock"));
     }
     Err(DoctorInternalError::SocketPathUnresolvable {
-        reason: "neither SANDBOX_SOCKET, XDG_RUNTIME_DIR, nor HOME is set".to_string(),
+        reason: "neither SANDBOX_SOCKET, /run/sandbox/sandboxd.sock, \
+                 XDG_RUNTIME_DIR, nor HOME yielded a path"
+            .to_string(),
     })
 }
 
@@ -1008,12 +1024,20 @@ fn check_lite_image(diagnostics: Option<&DiagnosticsPayload>, socket_reachable: 
 // Individual checks — C9 (route-helper caps)
 // ---------------------------------------------------------------------------
 
-/// C9 — route-helper has `cap_net_admin,cap_sys_admin=eip`.
+/// C9 — route-helper has `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`.
 ///
 /// Calls `getcap` on `/usr/local/libexec/sandboxd/sandbox-route-helper`.
 /// The daemon refuses to start without this so a passing daemon
 /// implies a passing check; we still run it explicitly so a
 /// not-yet-up daemon doesn't hide the misconfiguration.
+///
+/// `cap_sys_ptrace` is load-bearing, not optional: the container's PID 1
+/// runs as the operator's uid, so the helper (sandbox uid) enters a
+/// foreign-uid netns and the `pidfd`+`setns` path hits a cross-uid
+/// `ptrace_may_access` check that only `CAP_SYS_PTRACE` satisfies.
+/// Without it, container-session egress routing fails — so a helper
+/// carrying only the older two-cap set is reported as a hard failure
+/// even though that set once sufficed (pre operator-uid alignment).
 fn check_route_helper_caps() -> CheckRow {
     const HELPER_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-route-helper";
     if !std::path::Path::new(HELPER_PATH).exists() {
@@ -1050,29 +1074,47 @@ fn check_route_helper_caps() -> CheckRow {
         }
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // `getcap` output shape: `<path> cap_net_admin,cap_sys_admin=eip`
-    // (or `cap_sys_admin+ep` on older libcap; we accept either).
+    // `getcap` output shape:
+    // `<path> cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`
+    // (the effective bit may render `+ep`/`=ep` on older libcap; we
+    // accept any form. Cap order is getcap's own, sorted by capability
+    // number, but we only test for substrings so order is irrelevant.)
     let has_sys_admin = stdout.contains("cap_sys_admin");
     let has_net_admin = stdout.contains("cap_net_admin");
+    let has_sys_ptrace = stdout.contains("cap_sys_ptrace");
     let effective = stdout.contains("=eip")
         || stdout.contains("+ep")
         || stdout.contains("=ep")
         || stdout.contains("+eip");
-    if has_sys_admin && has_net_admin && effective {
+    if has_sys_admin && has_net_admin && has_sys_ptrace && effective {
         CheckRow {
             id: "C9",
             name: "route-helper caps",
             outcome: CheckOutcome::Pass {
-                detail: "cap_net_admin,cap_sys_admin=eip".to_string(),
+                detail: "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip".to_string(),
             },
         }
-    } else if has_sys_admin && effective {
-        // Legacy install: cap_sys_admin only, no cap_net_admin yet.
+    } else if has_sys_admin && has_net_admin && effective {
+        // The two older caps are present but cap_sys_ptrace is missing —
+        // the exact state an install/update predating the cap widening
+        // leaves behind. The container runs as the operator's uid, so
+        // the cross-uid pidfd+setns ptrace_may_access check fails and
+        // container-session egress routing breaks. Hard failure with a
+        // targeted hint.
         CheckRow {
             id: "C9",
             name: "route-helper caps",
-            outcome: CheckOutcome::Pass {
-                detail: "cap_sys_admin=eip".to_string(),
+            outcome: CheckOutcome::Fail {
+                detail: format!(
+                    "missing cap_sys_ptrace — cross-uid container egress will fail; \
+                     getcap reported: {}",
+                    stdout.trim()
+                ),
+                hint: Some(
+                    "sandbox update re-runs setcap with the current cap set; \
+                     or `make install-route-helper-prod-cap` in dev"
+                        .to_string(),
+                ),
             },
         }
     } else {
@@ -2172,8 +2214,8 @@ mod tests {
     /// `integration_doctor_*` tests.
     #[test]
     fn doctor_returns_internal_error_when_socket_path_unresolvable() {
-        // No env vars set → strict resolver must error.
-        let res = resolve_socket_path_strict_with(|_| None);
+        // No env vars set, no system socket → strict resolver must error.
+        let res = resolve_socket_path_strict_with(|_| None, |_| false);
         match res {
             Err(DoctorInternalError::SocketPathUnresolvable { reason }) => {
                 assert!(
@@ -2185,28 +2227,47 @@ mod tests {
         }
 
         // Empty-string env vars are treated as unset — fall through
-        // the full chain, then error.
-        let res = resolve_socket_path_strict_with(|_| Some(String::new()));
+        // the full chain (no system socket), then error.
+        let res = resolve_socket_path_strict_with(|_| Some(String::new()), |_| false);
         assert!(
             matches!(res, Err(DoctorInternalError::SocketPathUnresolvable { .. })),
             "empty-string env vars must not satisfy the resolver"
         );
 
-        // Precedence: SANDBOX_SOCKET wins outright when populated.
-        let res = resolve_socket_path_strict_with(|name| match name {
-            "SANDBOX_SOCKET" => Some("/tmp/explicit.sock".to_string()),
-            "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
-            "HOME" => Some("/home/alice".to_string()),
-            _ => None,
-        });
+        // Precedence: SANDBOX_SOCKET wins outright when populated — even when
+        // the system socket exists (exists → true).
+        let res = resolve_socket_path_strict_with(
+            |name| match name {
+                "SANDBOX_SOCKET" => Some("/tmp/explicit.sock".to_string()),
+                "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+                "HOME" => Some("/home/alice".to_string()),
+                _ => None,
+            },
+            |_| true,
+        );
         assert_eq!(res.ok().as_deref(), Some("/tmp/explicit.sock"));
 
-        // XDG_RUNTIME_DIR wins over HOME when SANDBOX_SOCKET is unset.
-        let res = resolve_socket_path_strict_with(|name| match name {
-            "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
-            "HOME" => Some("/home/alice".to_string()),
-            _ => None,
-        });
+        // System socket (if present) wins over XDG/HOME when SANDBOX_SOCKET is unset.
+        let res = resolve_socket_path_strict_with(
+            |name| match name {
+                "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+                "HOME" => Some("/home/alice".to_string()),
+                _ => None,
+            },
+            |p| p == crate::SYSTEM_SOCKET_PATH,
+        );
+        assert_eq!(res.ok().as_deref(), Some(crate::SYSTEM_SOCKET_PATH));
+
+        // XDG_RUNTIME_DIR wins over HOME when neither SANDBOX_SOCKET nor a
+        // system socket is present.
+        let res = resolve_socket_path_strict_with(
+            |name| match name {
+                "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+                "HOME" => Some("/home/alice".to_string()),
+                _ => None,
+            },
+            |_| false,
+        );
         assert_eq!(
             res.ok().as_deref(),
             Some("/run/user/1000/sandboxd/sandboxd.sock")

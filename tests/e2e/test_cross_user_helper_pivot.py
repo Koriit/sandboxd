@@ -33,7 +33,7 @@ import pytest
 
 from conftest import (
     SANDBOX_BIN,
-    _SANDBOX_PROD_SOCKET,
+    _SANDBOX_E2E_SOCKET,
     _VM_RESOURCE_ARGS,
     parse_session_id,
 )
@@ -50,10 +50,10 @@ def sandbox(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedPro
     """Invoke the sandbox CLI against the cross-user test daemon and return the result.
 
     Passes ``--socket`` explicitly so the CLI reaches the production-shaped
-    daemon socket at ``_SANDBOX_PROD_SOCKET`` rather than the XDG default.
+    daemon socket at ``_SANDBOX_E2E_SOCKET`` rather than the XDG default.
     """
     return subprocess.run(
-        [str(SANDBOX_BIN), "--socket", str(_SANDBOX_PROD_SOCKET), *args],
+        [str(SANDBOX_BIN), "--socket", str(_SANDBOX_E2E_SOCKET), *args],
         capture_output=True,
         text=True,
         check=check,

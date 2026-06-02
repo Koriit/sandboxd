@@ -78,7 +78,7 @@ Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes
 |---|---|
 | `sandboxd` binary | `/usr/local/bin/sandboxd` |
 | `sandbox` CLI | `/usr/local/bin/sandbox` |
-| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` (with `cap_net_admin,cap_sys_admin=eip`) |
+| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` (with `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`) |
 | `sandbox-lima-helper` | `/usr/local/libexec/sandboxd/sandbox-lima-helper` (with `cap_setuid+ep`; Lima backend only) |
 | systemd unit | `/etc/systemd/system/sandboxd.service` |
 | `users.conf` | `/etc/sandboxd/users.conf` |
@@ -568,13 +568,13 @@ The daemon honors a `SANDBOX_USERS_CONF` environment variable that overrides the
 
 ### sandbox-route-helper
 
-`sandbox-route-helper` is a small privileged binary, built alongside the daemon, that installs the per-session default route inside container netns'es on the daemon's behalf. The production install path is `/usr/local/libexec/sandboxd/sandbox-route-helper` (per FHS § 4.7: libexec is for non-user-facing helper binaries that other binaries invoke directly). The binary must carry both `cap_sys_admin` (for `setns(2)` into the container netns) and `cap_net_admin` (for `RTM_NEWROUTE`, raised to the ambient set before the helper execs `ip(8)`):
+`sandbox-route-helper` is a small privileged binary, built alongside the daemon, that installs the per-session default route inside container netns'es on the daemon's behalf. The production install path is `/usr/local/libexec/sandboxd/sandbox-route-helper` (per FHS § 4.7: libexec is for non-user-facing helper binaries that other binaries invoke directly). The binary must carry three capabilities: `cap_sys_admin` (for `setns(2)` into the container netns), `cap_net_admin` (for `RTM_NEWROUTE`, raised to the ambient set before the helper execs `ip(8)`), and `cap_sys_ptrace` (because the container's PID 1 runs as the operator's uid — distinct from the helper's `sandbox` uid — so the `pidfd` + `setns(2)` path triggers a `ptrace_may_access` check across the uid boundary that is only satisfied with `CAP_SYS_PTRACE`):
 
 ```bash
 sudo install -D -m 0755 \
     sandboxd/target/release/sandbox-route-helper \
     /usr/local/libexec/sandboxd/sandbox-route-helper
-sudo setcap 'cap_net_admin,cap_sys_admin=eip' /usr/local/libexec/sandboxd/sandbox-route-helper
+sudo setcap 'cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip' /usr/local/libexec/sandboxd/sandbox-route-helper
 ```
 
 The `=eip` flags put both caps in Permitted **and** Inheritable; the Inheritable bit is what lets the helper raise `CAP_NET_ADMIN` to the ambient set so the spawned `ip(8)` inherits it. Under rootless Docker the previous `cap_sys_admin+ep`-only install also worked because `CAP_SYS_ADMIN` in the parent userns implicitly grants every cap inside child userns'es; under rootful Docker the netns is in init userns directly and that promotion does not happen, so `CAP_NET_ADMIN` must be wired through explicitly.
@@ -585,7 +585,7 @@ Verify the capabilities are set:
 
 ```bash
 getcap /usr/local/libexec/sandboxd/sandbox-route-helper
-# Expected: /usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin,cap_sys_admin=eip
+# Expected: /usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip
 ```
 
 Do **not** make this binary setuid root. The capability approach is intentional: the daemon stays unprivileged, and the helper acquires only the kernel permissions it needs (joining a container's network namespace via `pidfd_open(2)` + `setns(2)`, and installing the default route inside it). The helper is invoked by sandboxd, not by operators directly, and it enforces a **pair-membership check** against `users.conf` before any namespace mutation: both the calling process's uid (the daemon, via `getuid`) and the operator name passed in `--for-user` (which the daemon reads from `SO_PEERCRED` on its accepted Unix socket) must appear in the same pool's `allow_users`. Operators with no `allow_users` entry cannot run sessions even if they can execute the helper, and a compromised daemon cannot invent operator names that are not already paired with its own runtime uid. See [Audit log](#audit-log) below for where every allow/deny decision is recorded.
@@ -629,7 +629,7 @@ Example lines:
 
 #### Privilege boundary: `SANDBOX_USERS_CONF` is feature-gated
 
-The route helper runs with `cap_net_admin,cap_sys_admin=eip`. Honoring an attacker-controlled environment variable to redirect its authorization-config read inside that privileged binary would be a local privilege escalation: any user who can exec the helper could point it at a `users.conf` they own, granting themselves arbitrary `allow_users` entries. The production build (no Cargo features) therefore **cannot consult `SANDBOX_USERS_CONF`** — it always reads `/etc/sandboxd/users.conf`. The route-helper integration tests use a separate test-feature build (`cargo build --features test-env-override`) installed at `/usr/local/libexec/sandboxd-test/`, which the daemon never invokes; this build does honor the env var so tests can drive a tempfile config they own.
+The route helper runs with `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`. Honoring an attacker-controlled environment variable to redirect its authorization-config read inside that privileged binary would be a local privilege escalation: any user who can exec the helper could point it at a `users.conf` they own, granting themselves arbitrary `allow_users` entries. The production build (no Cargo features) therefore **cannot consult `SANDBOX_USERS_CONF`** — it always reads `/etc/sandboxd/users.conf`. The route-helper integration tests use a separate test-feature build (`cargo build --features test-env-override`) installed at `/usr/local/libexec/sandboxd-test/`, which the daemon never invokes; this build does honor the env var so tests can drive a tempfile config they own.
 
 The daemon itself continues to honor `SANDBOX_USERS_CONF` unconditionally because the daemon is not the privilege boundary — only the cap'd helper is.
 

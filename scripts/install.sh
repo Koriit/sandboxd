@@ -942,6 +942,13 @@ install_binary() {
         log_ok "step=install_binary path=$dst action=skip reason=identical"
         return 0
     fi
+    # INVARIANT: install with a FRESH mtime (install(1) WITHOUT -p; never
+    # preserve the source/tarball mtime, and never extract these binaries via
+    # `tar -p`). The dev workspace's `make` time-shares the libexec helper
+    # paths with a co-resident dev install and decides on `make clean` whether
+    # to restore a stashed prod binary by comparing mtimes: a real install must
+    # bump the canonical binary's mtime past any stale dev stash, or clean could
+    # silently downgrade this install. See scripts/dev/canonical-binary.sh.
     sudo -k install -D -m "$mode" -o root -g root "$src" "$dst"
     sha=$(sha256sum "$dst" | awk '{print $1}')
     log_ok "step=install_binary path=$dst sha256=$sha action=install"
@@ -969,7 +976,16 @@ install_binaries() {
 
 setcap_route_helper() {
     helper=/usr/local/libexec/sandboxd/sandbox-route-helper
-    expected="cap_net_admin,cap_sys_admin=eip"
+    # cap_sys_ptrace is required in addition to net_admin/sys_admin: the
+    # container's PID 1 runs as the operator's uid (docker --user), so
+    # the helper (sandbox uid) enters a foreign-uid netns. The pidfd
+    # setns path runs ptrace_may_access(PTRACE_MODE_READ) on the target,
+    # which across the uid boundary is only satisfied with CAP_SYS_PTRACE
+    # — without it the cross-uid setns fails EPERM. The cap order below
+    # must match `getcap`'s output (sorted by capability number:
+    # net_admin=12, sys_ptrace=19, sys_admin=21), because the compare
+    # below is an exact string match against `getcap`.
+    expected="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
     # `getcap` output format varies by libcap version. Older libcap
     # ( < ~2.30) emits ``<path> = <caps>+ep``; newer libcap emits
     # ``<path> <caps>=eip`` (Ubuntu 22.04+, Fedora 36+). Use awk to
