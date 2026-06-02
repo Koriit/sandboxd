@@ -208,13 +208,6 @@ if "SANDBOX_USERS_CONF" not in os.environ:
     # ("unresolvable allow_users entries are treated as non-matches"),
     # so listing ``sandbox`` is a no-op on hosts that have not
     # provisioned the system user.
-    #
-    # ``sandbox-e2e-test`` is the dedicated non-1000 operator account
-    # (provisioned by ``make setup-e2e-test-operator``) that
-    # ``TestHelperPivotUsermodRealignment`` runs as. It must appear in a
-    # pool's ``allow_users`` so the daemon can allocate a session subnet
-    # for it; like ``sandbox`` it is silently skipped on hosts where the
-    # account has not been provisioned.
     _users_conf_payload = {
         "_schema_version": _read_min_supported_users_conf_schema(),
         "subnets": [
@@ -224,7 +217,7 @@ if "SANDBOX_USERS_CONF" not in os.environ:
                     "docs/internal/milestones/M12.md S13."
                 ),
                 "cidr": E2E_TEST_POOL_CIDR,
-                "allow_users": [getpass.getuser(), "sandbox", "sandbox-e2e-test"],
+                "allow_users": [getpass.getuser(), "sandbox"],
             }
         ]
     }
@@ -1697,43 +1690,3 @@ def backend(request) -> str:
     fixture value directly.
     """
     return request.param
-
-
-# ---------------------------------------------------------------------------
-# Cross-user e2e test operator
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def e2e_test_operator() -> int:
-    """Resolve the ``sandbox-e2e-test`` operator and return its uid.
-
-    The operator account is provisioned by ``make setup-e2e-test-operator``
-    (or ``make setup-dev-env``) and is never created inside tests.  If the
-    account does not exist on the host this fixture skips the test with an
-    actionable missing-prerequisite message — not an unconditional skip.
-
-    The uid is read from the system (via ``id -u``), not hardcoded, so the
-    assertion in the test is robust against a host that legitimately
-    assigned a different uid (though the Makefile targets uid 4099).
-
-    Returns the resolved integer uid of ``sandbox-e2e-test``.
-    """
-    result = subprocess.run(
-        ["id", "-u", "sandbox-e2e-test"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if result.returncode != 0:
-        pytest.skip(
-            "sandbox-e2e-test operator not provisioned; run "
-            "`make setup-e2e-test-operator` (or `make setup-dev-env`) "
-            "to create the persistent host account required for the "
-            "cross-user usermod-realignment test."
-        )
-    uid_str = result.stdout.strip()
-    if not uid_str.isdigit():
-        pytest.fail(
-            f"`id -u sandbox-e2e-test` returned non-numeric output: {uid_str!r}"
-        )
-    return int(uid_str)

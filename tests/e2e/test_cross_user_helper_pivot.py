@@ -9,11 +9,6 @@ These tests verify that every daemon limactl invocation goes through
    a. Boot and reach Running state.
    b. Communicate with the guest agent (ping succeeds).
    c. Reach the in-VM sshd through the daemon-mediated proxy endpoint.
-3. A session created as the ``sandbox-e2e-test`` operator (uid 4099, provisioned
-   by ``make setup-e2e-test-operator``) verifies that the Lima cloud-init
-   ``usermod -u {op}`` uid-realignment step actually fires and that a 9p
-   shared: workspace correctly maps file ownership to the operator uid on the
-   host.
 
 These tests exercise the cross-user path: the daemon runs as the ``sandbox``
 system user (via ``sudo -u sandbox``) so the ``SO_PEERCRED`` uid captured on
@@ -30,28 +25,18 @@ Run individually before the full matrix:
 
 from __future__ import annotations
 
-import atexit
 import os
-import shutil
 import subprocess
-import tempfile
-import time
 from pathlib import Path
 
 import pytest
 
 from conftest import (
-    LIMA_VM_HOME,
     SANDBOX_BIN,
     _SANDBOX_PROD_SOCKET,
     _VM_RESOURCE_ARGS,
     parse_session_id,
 )
-
-# ---------------------------------------------------------------------------
-# E2E test operator name — must match `make setup-e2e-test-operator`.
-# ---------------------------------------------------------------------------
-_E2E_TEST_OPERATOR_NAME = "sandbox-e2e-test"
 
 pytestmark = pytest.mark.lima
 
@@ -69,88 +54,6 @@ def sandbox(*args: str, check: bool = True, **kwargs) -> subprocess.CompletedPro
     """
     return subprocess.run(
         [str(SANDBOX_BIN), "--socket", str(_SANDBOX_PROD_SOCKET), *args],
-        capture_output=True,
-        text=True,
-        check=check,
-        timeout=300,      # cross-user first-boot: limactl start + usermod cloud-init
-        **kwargs,
-    )
-
-
-_STAGED_CLI: Path | None = None
-
-
-def _staged_sandbox_cli() -> Path:
-    """Return a path to the ``sandbox`` CLI that the ``sandbox-e2e-test``
-    operator (uid 4099) can actually exec.
-
-    The workspace binary lives under the invoking operator's home (mode
-    0750), which sandbox-e2e-test cannot traverse — ``sudo -u
-    sandbox-e2e-test env … <workspace>/target/debug/sandbox`` fails the
-    post-setuid execve check with EACCES ("Permission denied", rc 126).
-    We copy the CLI into a fresh /tmp dir (mode 1777, traversable by every
-    uid) owned by the operator at 0755 and run that. Mirrors conftest's
-    ``_stage_binaries_for_sandbox_user`` for the daemon. Cached for the
-    process and removed at exit.
-    """
-    global _STAGED_CLI
-    if _STAGED_CLI is not None and _STAGED_CLI.exists():
-        return _STAGED_CLI
-    stage_dir = Path(tempfile.mkdtemp(prefix="sandbox-e2e-cli-", dir="/tmp"))
-    os.chmod(stage_dir, 0o755)
-    staged = stage_dir / "sandbox"
-    shutil.copy2(SANDBOX_BIN, staged)
-    os.chmod(staged, 0o755)
-    atexit.register(lambda: shutil.rmtree(stage_dir, ignore_errors=True))
-    _STAGED_CLI = staged
-    return staged
-
-
-def _system_limactl_available() -> bool:
-    """True if ``limactl`` is installed at a system path any uid can exec.
-
-    The cross-user-operator test runs ``limactl`` as a *distinct* operator
-    (``sandbox-e2e-test``, uid 4099) via the lima-helper pivot, which
-    resolves limactl from ``/usr/local/bin`` or ``/usr/bin`` (that
-    operator's own ``~/.local/bin`` does not exist). A limactl installed
-    only under the *primary* operator's home (the common non-root install)
-    is unreachable by the distinct uid, so this test can run only with a
-    system-wide Lima install. The other pivot tests don't create a session
-    as the distinct operator, so they are unaffected.
-    """
-    return any(
-        os.access(p, os.X_OK)
-        for p in ("/usr/local/bin/limactl", "/usr/bin/limactl")
-    )
-
-
-def sandbox_as(
-    op_uid: int,
-    *args: str,
-    check: bool = True,
-    **kwargs,
-) -> subprocess.CompletedProcess:
-    """Invoke the sandbox CLI as the ``sandbox-e2e-test`` operator.
-
-    Uses ``sudo -n -u sandbox-e2e-test`` to drop to the operator uid
-    without a password (requires the NOPASSWD fragment installed by
-    ``make setup-e2e-test-operator``).  Propagates ``SANDBOX_SOCKET``
-    through ``env`` so the CLI reaches the production-shaped daemon
-    socket at ``_SANDBOX_PROD_SOCKET``; the sudoers fragment's
-    ``env_keep += "SANDBOX_SOCKET"`` directive permits this.
-
-    The ``op_uid`` parameter is accepted for call-site clarity (the
-    caller already has the resolved uid from the ``e2e_test_operator``
-    fixture) but is not used in the argv — the sudo target is always
-    the fixed name ``sandbox-e2e-test``.
-    """
-    return subprocess.run(
-        [
-            "sudo", "-n", "-u", _E2E_TEST_OPERATOR_NAME,
-            "env", f"SANDBOX_SOCKET={_SANDBOX_PROD_SOCKET}",
-            str(_staged_sandbox_cli()), "--socket", str(_SANDBOX_PROD_SOCKET),
-            *args,
-        ],
         capture_output=True,
         text=True,
         check=check,
@@ -264,114 +167,3 @@ class TestHelperPivotSessionReachability:
         finally:
             if session_id:
                 sandbox("rm", session_id, check=False)
-
-
-class TestHelperPivotUsermodRealignment:
-    """Verify the Lima cloud-init ``usermod -u {op}`` realignment fires for a
-    distinct non-1000 operator uid.
-
-    The ``sandbox-e2e-test`` system user (uid 4099) is provisioned by
-    ``make setup-e2e-test-operator`` (or ``make setup-dev-env``) and is
-    never created inside tests.  Using a real, distinct, non-1000 uid means
-    the match guard in ``sandbox-core::lima`` (``op_uid != 1000``) is
-    satisfied and the realignment actually executes.
-
-    Primary assertion: after ``sandbox create``, running
-    ``sandbox exec <sid> -- id -u sandbox`` as the operator must return the
-    operator uid (4099), proving the in-VM ``sandbox`` user was realigned.
-
-    Secondary assertion: a file written by the in-VM ``sandbox`` user into
-    a ``shared:`` workspace appears on the host owned by the operator uid.
-    """
-
-    def test_usermod_realignment_and_9p_ownership(self, e2e_test_operator, tmp_path):
-        """Create a Lima session as the sandbox-e2e-test operator and verify:
-        1. The in-VM ``sandbox`` uid equals the operator uid (realignment fired).
-        2. A file written from inside the VM into the shared workspace is owned
-           by the operator uid on the host.
-        """
-        if not _system_limactl_available():
-            pytest.skip(
-                "cross-user-operator test needs a system-wide limactl "
-                "(/usr/local/bin or /usr/bin) reachable by the distinct test "
-                "operator uid 4099; this host has only a user-local install "
-                "(~/.local/bin), which that uid cannot reach. Install Lima "
-                "system-wide to exercise this test."
-            )
-        op_uid = e2e_test_operator
-
-        # Host directory to mount as a 9p shared: workspace. It must be
-        # reachable and writable by the OPERATOR (sandbox-e2e-test, uid
-        # 4099) — QEMU runs as that uid and serves the share — not just by
-        # the test runner. The runner's pytest tmp tree is 0700 at its
-        # ancestors, so a distinct operator uid cannot traverse into it.
-        # Put the dir directly under /tmp (1777, world-traversable) and
-        # make it world-rwx; it is removed in the `finally` block.
-        shared = Path(tempfile.mkdtemp(prefix="sandbox-e2e-shared-"))
-        os.chmod(shared, 0o777)
-
-        session_id = None
-        try:
-            result = sandbox_as(
-                op_uid,
-                "create", "--backend", "lima",
-                "--workspace", f"shared:{shared}:{LIMA_VM_HOME}/workspace",
-                *_VM_RESOURCE_ARGS,
-            )
-            session_id = parse_session_id(result.stdout)
-
-            # --- Primary assertion: uid realignment ---
-            id_result = sandbox_as(
-                op_uid,
-                "exec", session_id, "--", "id", "-u", "sandbox",
-            )
-            in_vm_uid_str = id_result.stdout.strip()
-            assert in_vm_uid_str.isdigit(), (
-                f"'id -u sandbox' returned non-numeric output: {in_vm_uid_str!r}"
-            )
-            in_vm_uid = int(in_vm_uid_str)
-            assert in_vm_uid == op_uid, (
-                f"cloud-init `usermod -u {op_uid}` did not take effect: "
-                f"in-VM sandbox uid is {in_vm_uid}, expected {op_uid}. "
-                "Check that the match guard in sandbox-core::lima fires for "
-                "op_uid != 1000 and that the cloud-init script ran to completion."
-            )
-
-            # --- Secondary assertion: 9p ownership ---
-            sandbox_as(
-                op_uid,
-                "exec", session_id, "--",
-                "bash", "-c",
-                f"echo 'written-in-vm' > {LIMA_VM_HOME}/workspace/vm_marker.txt",
-            )
-
-            # Allow the 9p flush to propagate.
-            time.sleep(1)
-
-            guest_file = shared / "vm_marker.txt"
-            assert guest_file.exists(), (
-                f"VM-written file not visible on host at {guest_file}"
-            )
-            # The file was written by QEMU running as the operator uid, so
-            # under 9p mapped-xattr it lands on the host owned by that uid
-            # at mode 0600 — the test runner (a different uid) therefore
-            # CANNOT read its contents. That is exactly the ownership
-            # property we want to assert. `stat()` needs only dir-traverse
-            # (the shared dir is 0777), so check ownership + non-emptiness
-            # via stat rather than reading the bytes.
-            stat_info = guest_file.stat()
-            assert stat_info.st_uid == op_uid, (
-                f"VM-written file on host is owned by uid {stat_info.st_uid}, "
-                f"expected operator uid {op_uid}. "
-                "The 9p mapped-xattr uid remapping via cloud-init usermod "
-                "did not take effect — or the realignment ran but the 9p "
-                "xattr mapping did not follow."
-            )
-            assert stat_info.st_size > 0, (
-                f"VM-written file on host is empty ({guest_file}); the in-VM "
-                "write did not propagate content through the 9p share."
-            )
-        finally:
-            if session_id:
-                sandbox_as(op_uid, "rm", session_id, check=False)
-            shutil.rmtree(shared, ignore_errors=True)

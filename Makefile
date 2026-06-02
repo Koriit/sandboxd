@@ -1,6 +1,6 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
-	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir setup-e2e-test-operator
+	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -276,9 +276,6 @@ clean:
 	sudo -k rm -f "$(ROUTE_HELPER_TEST_PATH)"
 	sudo -k rm -f "$(LIMA_HELPER_TEST_PATH)"
 	sudo -k rmdir --ignore-fail-on-non-empty /usr/local/libexec/sandboxd-test 2>/dev/null || true
-	@echo "[clean] removing e2e test operator '$(E2E_TEST_OPERATOR_NAME)' and its sudoers fragment (if present)"
-	sudo -k userdel $(E2E_TEST_OPERATOR_NAME) 2>/dev/null || true
-	sudo -k rm -f "$(E2E_TEST_OPERATOR_SUDOERS)"
 
 # ---------------------------------------------------------------------------
 # Dev-environment setup
@@ -319,15 +316,7 @@ QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 # keeping it as a Makefile-local constant is enough).
 TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
 
-# Constants for the persistent cross-user e2e test operator account.
-# uid 4099: distinct from the daemon (999) and the typical dev (1000),
-# in the install-e2e test-uid range, and unlikely to collide on a fresh
-# dev host.
-E2E_TEST_OPERATOR_NAME        := sandbox-e2e-test
-E2E_TEST_OPERATOR_UID         := 4099
-E2E_TEST_OPERATOR_SUDOERS     := /etc/sudoers.d/sandboxd-e2e-test-operator
-
-setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir setup-e2e-test-operator
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-prod-base-dir
 	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
 
 # setup-sandboxd-state-dir — create /var/lib/sandboxd/ owned by sandbox:sandbox
@@ -535,81 +524,6 @@ setup-test-sudoers-fragment:
 	    echo "[sudo] install -o root -g root -m 0440 <validated-fragment> $(TEST_SUDOERS_FRAGMENT_PATH)"; \
 	    echo "      contents: $$fragment_envkeep | $$fragment"; \
 	    sudo -k install -o root -g root -m 0440 "$$tmp" $(TEST_SUDOERS_FRAGMENT_PATH); \
-	    rm -f "$$tmp"; \
-	  fi; \
-	fi
-
-# setup-e2e-test-operator — create a persistent host system user
-# `sandbox-e2e-test` (uid 4099) used as the *distinct* operator uid in
-# cross-user e2e tests.  Using a real non-1000 uid means the Lima
-# cloud-init `usermod -u {op}` realignment actually fires and can be
-# verified by the test.
-#
-# WARNING: this creates a permanent host account.  It is printed on
-# every `make setup-e2e-test-operator` (and on `make setup-dev-env`)
-# run regardless of whether the account already exists, so the operator
-# always knows the account is present.  Run `make clean` to remove it.
-#
-# Idempotency contract:
-#   - If `sandbox-e2e-test` already exists      → skip useradd (no-op).
-#   - If uid 4099 is taken by a DIFFERENT user  → fail loudly.
-#   - Group add (`usermod -aG sandbox`)         → idempotent (already-member is exit 0).
-#   - Sudoers fragment                          → install if absent or stale; validated
-#                                                 via `visudo -cf` before landing.
-#
-# Ordering: must run after `setup-sandbox-user` (the `sandbox` group
-# must exist before we can add the test operator to it).
-setup-e2e-test-operator: setup-sandbox-user
-	@echo "WARNING: host system user '$(E2E_TEST_OPERATOR_NAME)' (uid $(E2E_TEST_OPERATOR_UID)) is used for cross-user e2e operator tests. This is a persistent host account; remove it with 'make clean'."
-	@# Check whether uid 4099 is already taken by a different user.
-	@if getent passwd "$(E2E_TEST_OPERATOR_UID)" >/dev/null 2>&1; then \
-	  existing=$$(getent passwd "$(E2E_TEST_OPERATOR_UID)" | cut -d: -f1); \
-	  if [ "$$existing" != "$(E2E_TEST_OPERATOR_NAME)" ]; then \
-	    echo "ERROR: uid $(E2E_TEST_OPERATOR_UID) is already taken by user '$$existing' (expected '$(E2E_TEST_OPERATOR_NAME)')."; \
-	    echo "Choose a different uid in setup-e2e-test-operator or remove the conflicting account."; \
-	    exit 1; \
-	  fi; \
-	fi
-	@if getent passwd "$(E2E_TEST_OPERATOR_NAME)" >/dev/null 2>&1; then \
-	  echo "$(GREEN)✓ already configured: system user '$(E2E_TEST_OPERATOR_NAME)' exists$(RESET)"; \
-	else \
-	  echo "[sudo] useradd -M -u $(E2E_TEST_OPERATOR_UID) -s /usr/sbin/nologin -c 'sandboxd cross-user e2e test operator' $(E2E_TEST_OPERATOR_NAME)"; \
-	  sudo -k useradd \
-	      -M \
-	      -u "$(E2E_TEST_OPERATOR_UID)" \
-	      -s /usr/sbin/nologin \
-	      -c "sandboxd cross-user e2e test operator" \
-	      "$(E2E_TEST_OPERATOR_NAME)"; \
-	fi
-	@if id -nG "$(E2E_TEST_OPERATOR_NAME)" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then \
-	  echo "$(GREEN)✓ already configured: '$(E2E_TEST_OPERATOR_NAME)' is in group 'sandbox'$(RESET)"; \
-	else \
-	  echo "[sudo] usermod -aG sandbox $(E2E_TEST_OPERATOR_NAME)"; \
-	  sudo -k usermod -aG sandbox "$(E2E_TEST_OPERATOR_NAME)"; \
-	fi
-	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
-	  echo "$(GREEN)✓ already configured: e2e-test-operator sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
-	else \
-	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_SOCKET\""; \
-	  fragment="$$USER ALL=($(E2E_TEST_OPERATOR_NAME)) NOPASSWD: ALL"; \
-	  tmp=$$(mktemp); \
-	  printf '# Managed by `make setup-e2e-test-operator` — do not edit.\n# Grants the operator passwordless impersonation of the unprivileged\n# `sandbox-e2e-test` system user (uid 4099). Used by\n# TestHelperPivotUsermodRealignment to run a session as a distinct\n# non-1000 operator uid so the Lima cloud-init `usermod -u {op}`\n# realignment actually fires. The harness invokes the CLI via\n# `sudo -u sandbox-e2e-test env SANDBOX_SOCKET=... <binary> ...`, so a\n# narrow per-binary grant would not match the `env` wrapper; blanket\n# impersonation of this unprivileged nologin account is not privilege\n# escalation. Test/dev hosts only.\n#\n# env_keep preserves SANDBOX_SOCKET through sudo so the CLI\n# reaches the production-shaped daemon socket.\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
-	  chmod 0440 "$$tmp"; \
-	  if sudo -k visudo -c -f "$$tmp" >/dev/null 2>&1; then \
-	    : ok; \
-	  else \
-	    echo "ERROR: generated sudoers fragment failed visudo validation. Contents:"; \
-	    cat "$$tmp"; \
-	    rm -f "$$tmp"; \
-	    exit 1; \
-	  fi; \
-	  if sudo -k test -f $(E2E_TEST_OPERATOR_SUDOERS) && sudo -k cmp -s "$$tmp" $(E2E_TEST_OPERATOR_SUDOERS); then \
-	    echo "$(GREEN)✓ already configured: $(E2E_TEST_OPERATOR_SUDOERS) matches expected NOPASSWD fragment$(RESET)"; \
-	    rm -f "$$tmp"; \
-	  else \
-	    echo "[sudo] install -o root -g root -m 0440 <validated-fragment> $(E2E_TEST_OPERATOR_SUDOERS)"; \
-	    echo "      contents: $$fragment"; \
-	    sudo -k install -o root -g root -m 0440 "$$tmp" "$(E2E_TEST_OPERATOR_SUDOERS)"; \
 	    rm -f "$$tmp"; \
 	  fi; \
 	fi
@@ -875,17 +789,15 @@ setup-users-conf:
 	  sudo -k chmod 0644 "$(USERS_CONF_PATH)"; \
 	fi
 	@# Ensure the e2e test pool (10.220.0.0/20) lists the daemon's caller
-	@# uid (`sandbox`) alongside the operator accounts. The route helper's
+	@# uid (`sandbox`) alongside the operator account. The route helper's
 	@# pair-check requires BOTH the caller uid (the daemon, `sandbox`) AND
 	@# the `--for-user` uid to appear in the matched pool's `allow_users`,
 	@# so a test pool listing only the operator is denied for cross-user
-	@# sessions. `sandbox-e2e-test` is the distinct operator used by the
-	@# cross-user-operator Lima test; unresolvable names are harmless
-	@# (the helper treats them as non-matches). Idempotent: rewrites only
-	@# when allow_users differs, and only ever touches this managed
-	@# test-pool entry — never reorders or removes other entries.
+	@# sessions. Idempotent: rewrites only when allow_users differs, and
+	@# only ever touches this managed test-pool entry — never reorders or
+	@# removes other entries.
 	@tmp=$$(mktemp); \
-	result=$$(USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); want=[os.environ["USER"],"sandbox","sandbox-e2e-test"]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")=="10.220.0.0/20"),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":"E2E test pool (cross-user e2e harness): sandbox daemon caller plus operator accounts for the route-helper pair-check","cidr":"10.220.0.0/20","allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$(USERS_CONF_PATH)" "$$tmp" 2>/dev/null) || { \
+	result=$$(USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); want=[os.environ["USER"],"sandbox"]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")=="10.220.0.0/20"),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":"E2E test pool (cross-user e2e harness): sandbox daemon caller plus operator accounts for the route-helper pair-check","cidr":"10.220.0.0/20","allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$(USERS_CONF_PATH)" "$$tmp" 2>/dev/null) || { \
 	  echo "ERROR: $(USERS_CONF_PATH) exists but is not parseable as JSON."; \
 	  echo "Refusing to mutate. Inspect the file and re-run after fixing."; \
 	  rm -f "$$tmp"; exit 1; \
@@ -894,7 +806,7 @@ setup-users-conf:
 	  echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (test pool 10.220.0.0/20 lists sandbox + operators)$(RESET)"; \
 	  rm -f "$$tmp"; \
 	else \
-	  echo "[sudo] set test pool 10.220.0.0/20 allow_users = [$$USER, sandbox, sandbox-e2e-test] in $(USERS_CONF_PATH)"; \
+	  echo "[sudo] set test pool 10.220.0.0/20 allow_users = [$$USER, sandbox] in $(USERS_CONF_PATH)"; \
 	  echo "[sudo] install -o root -g root -m 0644 <updated> $(USERS_CONF_PATH)"; \
 	  sudo -k install -o root -g root -m 0644 "$$tmp" "$(USERS_CONF_PATH)"; \
 	  rm -f "$$tmp"; \
