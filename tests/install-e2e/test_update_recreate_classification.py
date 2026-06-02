@@ -93,7 +93,7 @@ def _inject_synthetic_stopped_session(
         f"{guest_protocol_version}, '0.0.0');"
     )
     vm.shell(
-        f"sudo sqlite3 /var/lib/sandbox/sessions.db <<'SQL'\n{sql}\nSQL",
+        f"SUID=$(id -u sandbox); sudo sqlite3 /var/lib/sandboxd/$SUID/sessions.db <<'SQL'\n{sql}\nSQL",
         check=True,
         timeout=10,
     )
@@ -228,7 +228,7 @@ def test_update_classifies_stopped_session_with_zero_proto_as_recreate(
     # The prompt-abort path runs entirely in the read-only pre-flight
     # ; no lock acquisition, no install-state write.
     post_state = vm.shell(
-        "sudo cat /var/lib/sandbox/.install-state.json",
+        "SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json",
         check=True, timeout=10,
     ).stdout
     assert f'"installed_version": "{base_ver}"' in post_state or \

@@ -1,9 +1,10 @@
 //! Backup-set management for `sandbox update`.
 //!
-//! A "backup set" is one subdirectory under `/var/lib/sandbox/backups/`
-//! capturing every artefact `sandbox update` mutates: the daemon
-//! binary, the CLI binary, the route-helper, `sessions.db`, and the
-//! managed `/etc` files. Each set carries a `manifest.json` recording
+//! A "backup set" is one subdirectory under the runtime-resolved backups root
+//! (`/var/lib/sandboxd/<daemon-uid>/backups/` on a migrated host,
+//! `/var/lib/sandbox/backups/` on a pre-migration host) capturing every
+//! artefact `sandbox update` mutates: the daemon binary, the CLI binary,
+//! the route-helper, `sessions.db`, and the managed `/etc` files. Each set carries a `manifest.json` recording
 //! the from/to versions, timestamps, and per-file sha256 hashes —
 //! that manifest is what the retention prune reads to
 //! decide which sets are eligible for removal (`completed_ok: true`
@@ -44,31 +45,42 @@ use ring::digest;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Constants
+// Runtime path resolution (per-uid-first, legacy fallback)
 // ---------------------------------------------------------------------------
 
-/// Parent directory for every backup set. Created by the
-/// daemon at first start (mode `0700 sandbox:sandbox`).
-pub const BACKUPS_ROOT: &str = "/var/lib/sandbox/backups";
+/// Return the runtime-resolved backups root path.
+///
+/// Per-uid path (`/var/lib/sandboxd/<uid>/backups`) takes precedence when
+/// the `sandbox` user is resolvable. Falls back to `/var/lib/sandbox/backups`
+/// for a pre-migration host. See [`crate::update::resolve_state_path`].
+pub fn backups_root_path() -> PathBuf {
+    crate::update::resolve_state_path("backups")
+}
+
+/// Return the runtime-resolved `sessions.db` path.
+pub fn sessions_db_path() -> PathBuf {
+    crate::update::resolve_state_path("sessions.db")
+}
+
+/// Return the runtime-resolved `sessions.db-wal` path.
+pub fn sessions_db_wal_path() -> PathBuf {
+    crate::update::resolve_state_path("sessions.db-wal")
+}
+
+/// Return the runtime-resolved `sessions.db-shm` path.
+pub fn sessions_db_shm_path() -> PathBuf {
+    crate::update::resolve_state_path("sessions.db-shm")
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 /// Number of `completed_ok: true` backup sets to keep around.
 /// Sets with `completed_ok: false` (in-progress / failed) are
 /// **never** auto-pruned — they preserve forensic evidence until the
 /// operator removes them manually.
 pub const RETENTION_KEEP: usize = 2;
-
-/// The sandbox-owned production paths the backup set captures.
-pub const SESSIONS_DB_PATH: &str = "/var/lib/sandbox/sessions.db";
-/// SQLite WAL companion file. The daemon runs in WAL journal mode
-/// (`store.rs:117`), so uncommitted-on-disk-but-committed-in-WAL
-/// transactions live in `sessions.db-wal` between checkpoints. Backing
-/// up only `sessions.db` would lose those records if the daemon was
-/// not cleanly stopped before the snapshot.
-pub const SESSIONS_DB_WAL_PATH: &str = "/var/lib/sandbox/sessions.db-wal";
-/// SQLite shared-memory index file. The WAL header references offsets
-/// stored here; SQLite recovers cleanly from a bundle containing
-/// (.db, -wal, -shm) without manual checkpoint orchestration.
-pub const SESSIONS_DB_SHM_PATH: &str = "/var/lib/sandbox/sessions.db-shm";
 pub const USERS_CONF_PATH: &str = "/etc/sandboxd/users.conf";
 pub const BRIDGE_CONF_PATH: &str = "/etc/qemu/bridge.conf";
 pub const SANDBOXD_BIN_PATH: &str = "/usr/local/bin/sandboxd";
@@ -139,15 +151,15 @@ pub fn backup_set_name(started_at: &str, from_version: &str, to_version: &str) -
     format!("{started_at}-from-{from_version}-to-{to_version}")
 }
 
-/// Create the backup-set directory under `BACKUPS_ROOT` (or under the
-/// given override for tests). Idempotent — re-running on an existing
+/// Create the backup-set directory under the runtime-resolved backups root
+/// (see [`backups_root_path`]). Idempotent — re-running on an existing
 /// directory is a no-op. Mode `0700 sandbox:sandbox`.
 ///
 /// In production this shells out to `sudo -k -u sandbox mkdir -p`; for
 /// tests we expose [`create_backup_set_dir_at`] which uses plain
 /// `std::fs` against a test-owned parent dir.
 pub fn create_backup_set_dir(set_name: &str) -> Result<PathBuf, BackupError> {
-    let target = Path::new(BACKUPS_ROOT).join(set_name);
+    let target = backups_root_path().join(set_name);
     run_sudo(&[
         "-k",
         "-u",
@@ -349,7 +361,7 @@ pub struct PruneOutcome {
     pub preserved_forensic: Vec<String>,
 }
 
-/// Apply the retention policy to every set under `BACKUPS_ROOT`.
+/// Apply the retention policy to every set under the runtime-resolved backups root.
 ///
 /// Algorithm:
 /// 1. Enumerate every subdirectory of the backups root.
@@ -367,7 +379,7 @@ pub struct PruneOutcome {
 /// into the "preserved" bucket, and drift the on-disk count to
 /// `RETENTION_KEEP + 1` in steady state.
 pub fn prune_old_backup_sets() -> Result<PruneOutcome, BackupError> {
-    prune_old_backup_sets_at(Path::new(BACKUPS_ROOT))
+    prune_old_backup_sets_at(&backups_root_path())
 }
 
 /// Path-explicit variant of [`prune_old_backup_sets`] for tests that
@@ -626,7 +638,7 @@ fn read_sandbox_owned_file(path: &Path) -> Result<Vec<u8>, BackupError> {
 }
 
 /// List the basenames of every entry under `dir`. Uses `sudo -k ls -1`
-/// because `/var/lib/sandbox/backups/` is mode `0700 sandbox:sandbox`.
+/// because the backups root is mode `0700 sandbox:sandbox`.
 fn list_dir_sudo(dir: &Path) -> Result<Vec<String>, BackupError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -932,7 +944,7 @@ mod tests {
         // Phase 3 — stage the backup as a recoverable triple under
         // a fresh tempdir, restoring the canonical filenames SQLite
         // expects. The rollback recipe documents this same step
-        // (`sudo install -m 0600 sessions.db.bak /var/lib/sandbox/sessions.db`
+        // (`sudo install -m 0600 sessions.db.bak <base-dir>/sessions.db`
         // and the matching `.db-wal` / `.db-shm` copies).
         let restore_tmp = tempfile::tempdir().expect("restore tempdir");
         let restore_db = restore_tmp.path().join("sessions.db");

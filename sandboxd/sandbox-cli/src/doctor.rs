@@ -347,7 +347,7 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
     }
     // C9 — sync (forks `getcap`).
     set.spawn_blocking(check_route_helper_caps);
-    // C10 — sync (stat on /var/lib/sandbox).
+    // C10 — sync (stat on per-uid base-dir, legacy fallback).
     set.spawn_blocking(check_state_dir_mode);
     // C11
     {
@@ -697,15 +697,15 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
 // ---------------------------------------------------------------------------
 
 /// Canonical signal for "this host was provisioned by install.sh" —
-/// the install-state file at `/var/lib/sandbox/.install-state.json`
-/// (the documented contract). When the file is present the install is a
-/// system-service install and doctor's environment-aware checks
-/// (C5, C10) run their strict-mode comparisons; when it is absent
-/// the install is dev mode (or corrupted, same disposition) and the
-/// strict-mode comparisons are skipped per the documented contract.
+/// the install-state file at its runtime-resolved path (per-uid first,
+/// legacy fallback; see `crate::update::resolve_state_path`). When the
+/// file is present the install is a system-service install and doctor's
+/// environment-aware checks (C5, C10) run their strict-mode comparisons;
+/// when it is absent the install is dev mode (or corrupted, same
+/// disposition) and the strict-mode comparisons are skipped.
 ///
 /// Pulled into a pure function so it can be unit-tested against
-/// synthetic paths; the production callers pass [`INSTALL_STATE_PATH`].
+/// synthetic paths; production callers use `resolve_state_path`.
 ///
 /// Earlier revisions of the doctor used `nix::unistd::User::from_name("sandbox")`
 /// as the dev-vs-prod heuristic. That signal conflates two
@@ -761,11 +761,10 @@ fn check_socket_perms(socket_path: &str, socket_reachable: bool) -> CheckRow {
         }
     };
 
-    // Dev-mode signal: absence of the install-state file at
-    // `/var/lib/sandbox/.install-state.json` (the documented contract) means
-    // there is no system install of sandboxd, so there is no
-    // `0660 sandbox:sandbox` invariant to require.
-    if !is_prod_install_signal(Path::new(crate::update::INSTALL_STATE_PATH)) {
+    // Dev-mode signal: absence of the install-state file means there is no
+    // system install of sandboxd, so there is no `0660 sandbox:sandbox`
+    // invariant to require. The path is runtime-resolved (per-uid or legacy).
+    if !is_prod_install_signal(&crate::update::resolve_state_path(".install-state.json")) {
         let mode = metadata.permissions().mode() & 0o777;
         return CheckRow {
             id: "C5",
@@ -1139,16 +1138,19 @@ fn check_route_helper_caps() -> CheckRow {
 
 /// C10 — state dir mode.
 ///
-/// Production: `/var/lib/sandbox/` is `0750 sandbox:sandbox` (the
-/// systemd unit's `StateDirectory` invariant). Dev: the operator's
-/// own `~/.local/share/sandboxd/` lives at the developer's umask;
-/// we skip the strict-mode comparison with the dev-mode annotation. Dev-vs-prod
-/// classification consults the
-/// install-state file (the documented contract) via [`is_prod_install_signal`].
+/// Production: `/var/lib/sandboxd/<daemon-uid>/` is `0750 sandbox:sandbox`.
+/// Dev: the operator's own `~/.local/share/sandboxd/` lives at the
+/// developer's umask; we skip the strict-mode comparison. Dev-vs-prod
+/// classification consults the install-state file via
+/// [`is_prod_install_signal`].
+///
+/// Path resolution: per-uid path first; legacy `/var/lib/sandbox` fallback
+/// when only the legacy dir exists (pre-migration host). When only the legacy
+/// dir is found, a hint to run install.sh to migrate is emitted alongside
+/// the check result.
 fn check_state_dir_mode() -> CheckRow {
-    const PROD_PATH: &str = "/var/lib/sandbox";
-    let path = Path::new(PROD_PATH);
-    if !is_prod_install_signal(Path::new(crate::update::INSTALL_STATE_PATH)) {
+    // Dev-mode gate: skip all strict checks when no install-state exists.
+    if !is_prod_install_signal(&crate::update::resolve_state_path(".install-state.json")) {
         return CheckRow {
             id: "C10",
             name: "state dir mode",
@@ -1159,21 +1161,49 @@ fn check_state_dir_mode() -> CheckRow {
             },
         };
     }
-    if !path.exists() {
-        return CheckRow {
-            id: "C10",
-            name: "state dir mode",
-            outcome: CheckOutcome::Fail {
-                detail: format!("missing: {PROD_PATH}"),
-                hint: Some(
-                    "sudo install -d -o sandbox -g sandbox -m 0750 /var/lib/sandbox \
-                     (the daemon corrects subdir modes on next start)"
-                        .to_string(),
-                ),
-            },
-        };
-    }
-    match std::fs::metadata(path) {
+
+    // Resolve the expected prod path (per-uid), with legacy fallback.
+    // The third tuple element carries the per-uid path when the legacy dir is
+    // in use, so the hint below can name the migration target exactly.
+    let (path, is_legacy, migrate_to) = match crate::update::prod_base_dir() {
+        Some(per_uid) if per_uid.exists() => (per_uid, false, None),
+        Some(per_uid) => {
+            // Per-uid dir absent: check if legacy dir exists (pre-migration).
+            let legacy = PathBuf::from("/var/lib/sandbox");
+            if legacy.exists() {
+                let target = per_uid.display().to_string();
+                (legacy, true, Some(target))
+            } else {
+                // Neither exists — report the per-uid path as the expected one.
+                return CheckRow {
+                    id: "C10",
+                    name: "state dir mode",
+                    outcome: CheckOutcome::Fail {
+                        detail: format!("missing: {}", per_uid.display()),
+                        hint: Some(format!(
+                            "sudo install -d -o sandbox -g sandbox -m 0750 {} \
+                             (the daemon corrects subdir modes on next start)",
+                            per_uid.display()
+                        )),
+                    },
+                };
+            }
+        }
+        None => {
+            // No sandbox user — degrade gracefully (dev host).
+            return CheckRow {
+                id: "C10",
+                name: "state dir mode",
+                outcome: CheckOutcome::Skip {
+                    detail: "dev mode \u{2014} sandbox user not found".to_string(),
+                    hint: None,
+                },
+            };
+        }
+    };
+
+    let path_display = path.display().to_string();
+    match std::fs::metadata(&path) {
         Ok(md) => {
             let mode = md.permissions().mode() & 0o777;
             let owner = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(
@@ -1191,24 +1221,34 @@ fn check_state_dir_mode() -> CheckRow {
             .map(|g| g.name)
             .unwrap_or_else(|| "?".to_string());
             if mode == 0o750 && owner == "sandbox" && group == "sandbox" {
+                let detail = if is_legacy {
+                    let target = migrate_to.as_deref().unwrap_or("/var/lib/sandboxd/<uid>/");
+                    format!(
+                        "{path_display} {mode:04o} {owner}:{group} \
+                         (legacy path — run install.sh to migrate to {target})"
+                    )
+                } else {
+                    format!("{path_display} {mode:04o} {owner}:{group}")
+                };
                 CheckRow {
                     id: "C10",
                     name: "state dir mode",
-                    outcome: CheckOutcome::Pass {
-                        detail: format!("{PROD_PATH} {mode:04o} {owner}:{group}"),
-                    },
+                    outcome: CheckOutcome::Pass { detail },
                 }
             } else {
                 CheckRow {
                     id: "C10",
                     name: "state dir mode",
                     outcome: CheckOutcome::Fail {
-                        detail: format!("{PROD_PATH} {mode:04o} {owner}:{group} (expected 0750 sandbox:sandbox)"),
-                        hint: Some(
-                            "sudo chmod 0750 /var/lib/sandbox; sudo chown sandbox:sandbox /var/lib/sandbox \
-                             (the daemon corrects subdirs at next start)"
-                                .to_string(),
+                        detail: format!(
+                            "{path_display} {mode:04o} {owner}:{group} \
+                             (expected 0750 sandbox:sandbox)"
                         ),
+                        hint: Some(format!(
+                            "sudo chmod 0750 {path_display}; \
+                             sudo chown sandbox:sandbox {path_display} \
+                             (the daemon corrects subdirs at next start)"
+                        )),
                     },
                 }
             }
@@ -1217,8 +1257,8 @@ fn check_state_dir_mode() -> CheckRow {
             id: "C10",
             name: "state dir mode",
             outcome: CheckOutcome::Fail {
-                detail: format!("stat({PROD_PATH}): {e}"),
-                hint: Some("ensure /var/lib/sandbox exists and is readable".to_string()),
+                detail: format!("stat({}): {e}", path_display),
+                hint: Some(format!("ensure {path_display} exists and is readable")),
             },
         },
     }
@@ -2114,10 +2154,9 @@ mod tests {
     }
 
     /// `is_prod_install_signal` flips on the presence of the
-    /// install-state file at `/var/lib/sandbox/.install-state.json`
-    /// (the documented contract). Pinned here so a future refactor can't
-    /// silently widen the predicate to consult system-user existence
-    /// again — that's the conflation #156 fixed.
+    /// install-state file (runtime-resolved path). Pinned here so a future
+    /// refactor can't silently widen the predicate to consult system-user
+    /// existence again — that's the conflation #156 fixed.
     #[test]
     fn prod_install_signal_returns_true_when_install_state_file_present() {
         let tmp = tempfile::tempdir().expect("tempdir");

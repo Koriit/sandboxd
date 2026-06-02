@@ -84,8 +84,8 @@ Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes
 | `users.conf` | `/etc/sandboxd/users.conf` |
 | Bridge authorization | `allow sb-*` appended to `/etc/qemu/bridge.conf` |
 | Gateway image | `sandbox-gateway:<version>` loaded into Docker |
-| Daemon state dir | `/var/lib/sandbox/` (owner `sandbox:sandbox`, mode `0750`) |
-| Install state record | `/var/lib/sandbox/.install-state.json` |
+| Daemon state dir | `/var/lib/sandboxd/<sandbox-uid>/` (owner `sandbox:sandbox`, mode `0750`; uid resolved at install time via `id -u sandbox`) |
+| Install state record | `/var/lib/sandboxd/<sandbox-uid>/.install-state.json` |
 | Install log | `/var/log/sandbox-install.log` |
 
 The `sandbox` system user is created (if not already present); the invoking operator (from `$SUDO_USER`) is added to the `sandbox` group.
@@ -134,7 +134,7 @@ curl -fsSL https://Koriit.github.io/sandboxd/install.sh | less
 curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --yes
 ```
 
-This removes the binaries, systemd unit, and any install-time changes recorded in `/var/lib/sandbox/.install-state.json` (only reverts changes the installer made). State at `/var/lib/sandbox/` and the `sandbox` user are preserved; add `--purge` to also remove them.
+This removes the binaries, systemd unit, and any install-time changes recorded in `/var/lib/sandboxd/<sandbox-uid>/.install-state.json` (only reverts changes the installer made). The per-uid state tree at `/var/lib/sandboxd/<sandbox-uid>/` and the `sandbox` user are preserved; add `--purge` to also remove them. `--purge` removes only the production daemon's per-uid subtree — a co-resident e2e or dev daemon's subtree under `/var/lib/sandboxd/` is never touched.
 
 ```bash
 curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --purge --yes
@@ -183,7 +183,7 @@ sandbox update --check; rc=$?
 [ $rc -eq 3 ] && sudo sandbox update --yes
 ```
 
-A full upgrade keeps a versioned backup of every file the installer wrote under `/var/lib/sandbox/backups/<timestamp>-from-<v>-to-<v>/`. The last two successful sets are kept; older ones are pruned automatically. Sets from interrupted or failed upgrades carry `completed_ok: false` and are preserved forensically — they are never auto-pruned.
+A full upgrade keeps a versioned backup of every file the installer wrote under `/var/lib/sandboxd/<sandbox-uid>/backups/<timestamp>-from-<v>-to-<v>/`. The last two successful sets are kept; older ones are pruned automatically. Sets from interrupted or failed upgrades carry `completed_ok: false` and are preserved forensically — they are never auto-pruned.
 
 If something goes wrong: the upgrade is auto-recoverable (re-run `sudo sandbox update`); for manual rollback to an earlier version, follow the [rollback recipe](/sandboxd/guides/rollback/).
 
@@ -466,7 +466,7 @@ This composes the sub-targets below. Each is independently runnable if you only 
 | `make install-route-helper-prod-cap` | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-route-helper` |
 | `make install-route-helper-test-cap` | Installs the cap'd `test-env-override`-feature helper at `/usr/local/libexec/sandboxd-test/sandbox-route-helper` (used by `make test-integration`) |
 | `make install-lima-helper-prod-cap` | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-lima-helper` with `cap_setuid+ep`; required for the Lima backend |
-| `make setup-sandboxd-state-dir` | Creates `/var/lib/sandboxd/` owned `sandbox:sandbox` mode `0750`; checks that `setfacl` (`acl` package) is installed, as it is required for per-operator LIMA_HOME provisioning |
+| `make setup-sandboxd-state-dir` | Creates `/var/lib/sandboxd/` (`root:root 0755`, world-traversable so multiple daemon users can each reach their own subtree); checks that `setfacl` (`acl` package) is installed, as it is required for per-operator LIMA_HOME provisioning |
 | `make setup-bridge-conf` | Ensures `/etc/qemu/bridge.conf` authorizes sandbox bridges (`sb-*`); refuses to silently mutate an existing file with conflicting content |
 | `make setup-users-conf` | Installs `/etc/sandboxd/users.conf` from `contrib/users.conf.example` with `$USER` substituted; leaves an existing file alone |
 | `make setup-bridge-helper-setuid` | `chmod u+s /usr/lib/qemu/qemu-bridge-helper` if not already setuid |
@@ -478,7 +478,7 @@ The sections below explain what each prerequisite does and document the manual i
 
 #### `sandbox` system user and operator group membership
 
-The e2e harness launches sandboxd as the dedicated `sandbox` system user — mirroring how the production systemd unit at `sandboxd/contrib/systemd/sandboxd.service` runs the daemon — so cross-user CLI paths (`sandbox ssh`, `sandbox cp`, `git-remote-sandbox`, etc.) are exercised against a daemon that does **not** share a uid with the test operator. `make setup-sandbox-user` creates the user with `--system --no-create-home --home-dir /var/lib/sandbox --shell /usr/sbin/nologin` and binds it to the `docker` and `kvm` groups when present, matching `install.sh`'s production path.
+The e2e harness launches sandboxd as the dedicated `sandbox-test` system user — a uid distinct from the production `sandbox` user — so cross-user CLI paths (`sandbox ssh`, `sandbox cp`, `git-remote-sandbox`, etc.) are exercised against a daemon that does **not** share a uid with the test operator. `make setup-sandbox-user` creates the `sandbox` production user with `--system --no-create-home --shell /usr/sbin/nologin` and binds it to the `docker` and `kvm` groups when present, matching `install.sh`'s production path. `make setup-sandbox-test-user` creates the analogous `sandbox-test` user used by the e2e harness.
 
 The operator's CLI talks to the daemon through a unix-domain socket at `/run/sandbox/sandboxd.sock` (mode `0660`, group `sandbox`). The operator must therefore be a member of the `sandbox` group; `make setup-operator-group-membership` adds them.
 
@@ -643,13 +643,13 @@ The two install paths produce different layouts:
 | `sandbox` CLI | Run from `sandboxd/target/release/sandbox` | `/usr/local/bin/sandbox` |
 | `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` | Same path |
 | systemd unit | Not installed (run by hand) | `/etc/systemd/system/sandboxd.service` |
-| State dir | `~/.local/share/sandboxd/` | `/var/lib/sandbox/` |
+| State dir | `~/.local/share/sandboxd/` | `/var/lib/sandboxd/<sandbox-uid>/` |
 | Socket | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` | `/run/sandbox/sandboxd.sock` |
 | `sandbox` user | Not created | Created |
 | `users.conf` | `["sandbox", "$USER"]` | `["sandbox", "<invoking-operator>"]` |
 | `bridge.conf` | `allow all` (dev convenience) | `allow sb-*` (production scope) |
 
-`install.sh`'s pre-existing-install detection refuses if `/usr/local/bin/sandboxd` exists. The developer's daemon under `sandboxd/target/release/sandboxd` is not detected by that check, so `install.sh` runs successfully on a dev box — but the two daemons should not run at the same time. To migrate from the developer path to the operator install: stop the dev daemon, optionally copy `~/.local/share/sandboxd/sessions.db` to `/var/lib/sandbox/sessions.db` (manual operation, no automated migration yet), then run `install.sh` and `sudo systemctl enable --now sandboxd`.
+`install.sh`'s pre-existing-install detection refuses if `/usr/local/bin/sandboxd` exists. The developer's daemon under `sandboxd/target/release/sandboxd` is not detected by that check, so `install.sh` runs successfully on a dev box — but the two daemons should not run at the same time. To migrate from the developer path to the operator install: stop the dev daemon, optionally copy `~/.local/share/sandboxd/sessions.db` to `/var/lib/sandboxd/<sandbox-uid>/sessions.db` (manual operation, no automated migration yet), then run `install.sh` and `sudo systemctl enable --now sandboxd`.
 
 ## First run
 

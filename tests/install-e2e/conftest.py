@@ -857,7 +857,15 @@ def _harvest_logs(vm, dest_dir):
 
     targets = [
         ("install.log",     "sudo cat /var/log/sandbox-install.log 2>/dev/null || true"),
-        ("install-state",   "sudo cat /var/lib/sandbox/.install-state.json 2>/dev/null || true"),
+        # Install-state is under the per-uid path; fall back to legacy location
+        # for hosts that have not yet migrated.
+        ("install-state",
+         "SUID=$(id -u sandbox 2>/dev/null || echo ''); "
+         "if [ -n \"$SUID\" ] && sudo test -r \"/var/lib/sandboxd/$SUID/.install-state.json\" 2>/dev/null; then "
+         "  sudo cat \"/var/lib/sandboxd/$SUID/.install-state.json\"; "
+         "else "
+         "  sudo cat /var/lib/sandbox/.install-state.json 2>/dev/null || true; "
+         "fi"),
         ("journal-sandboxd", "sudo journalctl -u sandboxd --no-pager 2>/dev/null || true"),
         ("getcap",          "getcap /usr/local/libexec/sandboxd/sandbox-route-helper 2>/dev/null || true"),
         ("ls-bin",          "ls -la /usr/local/bin/sandboxd /usr/local/bin/sandbox /etc/systemd/system/sandboxd.service /etc/sandboxd/users.conf 2>&1 || true"),
@@ -1089,6 +1097,22 @@ def assert_doctor_passes(vm, *, user=None, timeout=60, sock_path=None):
     return text
 
 
+def sandbox_base_dir_in_vm(vm) -> str:
+    """Return the per-uid base-dir path for the sandbox user inside the VM.
+
+    Resolves /var/lib/sandboxd/<sandbox-uid> by querying `id -u sandbox`
+    inside the VM. The sandbox user must exist before this is called
+    (i.e. after install.sh has run).
+    """
+    r = vm.shell("id -u sandbox", check=True, timeout=10)
+    sandbox_uid = r.stdout.strip()
+    if not sandbox_uid.isdigit():
+        raise AssertionError(
+            f"sandbox_base_dir_in_vm: unexpected output from `id -u sandbox`: {r.stdout!r}"
+        )
+    return f"/var/lib/sandboxd/{sandbox_uid}"
+
+
 def assert_full_install_landed(vm):
     """Shared post-install filesystem-state asserts.
 
@@ -1125,9 +1149,12 @@ def assert_full_install_landed(vm):
         f"unexpected route-helper caps: {caps!r}"
     )
 
-    # State file exists and is valid JSON.
+    # Resolve the per-uid base-dir and verify state file is present.
+    base_dir = sandbox_base_dir_in_vm(vm)
+    install_state_path = f"{base_dir}/.install-state.json"
+
     state_check = vm.shell(
-        "sudo cat /var/lib/sandbox/.install-state.json",
+        f"sudo cat {install_state_path}",
         check=True, timeout=10,
     )
     state = json.loads(state_check.stdout)
@@ -1138,9 +1165,23 @@ def assert_full_install_landed(vm):
     # check that the same file parses under jq inside the VM (json.loads
     # above runs on the host).
     assert vm.shell(
-        "sudo jq -e . /var/lib/sandbox/.install-state.json",
+        f"sudo jq -e . {install_state_path}",
         timeout=10,
-    ).returncode == 0, "install-state.json not parseable by jq inside the VM"
+    ).returncode == 0, f"install-state.json not parseable by jq inside the VM (path={install_state_path})"
+
+    # The unit's --base-dir must be the per-uid path (no legacy /var/lib/sandbox).
+    unit_base_dir = vm.shell(
+        "grep -- '--base-dir' /etc/systemd/system/sandboxd.service || true",
+        timeout=10,
+    ).stdout
+    assert base_dir in unit_base_dir, (
+        f"systemd unit --base-dir does not match per-uid path {base_dir!r}: {unit_base_dir!r}"
+    )
+
+    # No legacy /var/lib/sandbox directory should exist on a fresh install.
+    assert vm.shell("sudo test -d /var/lib/sandbox").returncode != 0, (
+        "/var/lib/sandbox exists after a fresh install — expected it to be absent"
+    )
 
     # `getent passwd sandbox` returns a row; the daemon runs as this user.
     r = vm.shell("getent passwd sandbox")

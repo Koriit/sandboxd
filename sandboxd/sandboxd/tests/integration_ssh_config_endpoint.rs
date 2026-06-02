@@ -385,8 +385,8 @@ async fn integration_get_ssh_config_container_backend() {
 /// Seed a Lima-backed session row (no keypair persisted — the Lima branch
 /// reads the key by pivoting through `sandbox-lima-helper read-user-key`
 /// to the operator's per-operator LIMA_HOME at
-/// `/var/lib/sandboxd/<op_uid>/lima/_config/user`). We stage a fresh
-/// ed25519 key at that path under a redirected state root and
+/// `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/_config/user`). We stage
+/// a fresh ed25519 key at that path under a redirected state root and
 /// `GET /sessions/<id>/ssh-config`. Same three assertions as the
 /// container test.
 ///
@@ -431,9 +431,16 @@ async fn integration_get_ssh_config_lima_backend() {
     // read-user-key subcommand consult SANDBOX_LIMA_HELPER_TEST_STATE_ROOT
     // when the test-env-override feature is active.
     //
-    // Per-operator path: `<state_root>/<uid>/lima/_config/user`
+    // Path scheme: `<state_root>/<daemon_uid>/<op_uid>/lima/_config/user`
+    //
+    // In the integration test the daemon process IS the test runner, so
+    // caller_uid (the pre-pivot uid the helper sees) == owner_uid. Both
+    // the daemon-uid segment and the op-uid segment are therefore owner_uid.
     let state_root = tmp.path().join("sandboxd-state");
-    let per_op_config_dir = state_root.join(owner_uid.to_string()).join("lima/_config");
+    let per_op_config_dir = state_root
+        .join(owner_uid.to_string())
+        .join(owner_uid.to_string())
+        .join("lima/_config");
     std::fs::create_dir_all(&per_op_config_dir).expect("mkdir per-operator _config dir");
 
     // Stage a fresh ed25519 keypair at the per-operator key path.

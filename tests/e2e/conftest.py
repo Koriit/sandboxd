@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shutil
 import socket
@@ -144,31 +145,32 @@ BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 # Cross-user harness
 # ---------------------------------------------------------------------------
 #
-# The e2e harness launches the daemon as the ``sandbox`` system user via
-# ``sudo -u sandbox``, the single cross-user path. All sudo is
+# The e2e harness launches the daemon as the ``sandbox-test`` system user via
+# ``sudo -u sandbox-test``, the single cross-user path. All sudo is
 # pre-authorized at ``make setup-dev-env`` time via a NOPASSWD sudoers
 # fragment (``/etc/sudoers.d/sandboxd-test``); no runtime root sudo is
 # ever issued.
 #
-# The operator must be a member of the ``sandbox`` group so the pytest
-# process can reach the daemon socket (mode 0660, group=sandbox). Group
-# changes from ``usermod -aG sandbox <operator>`` do not take effect in
-# the current login session; ``make test-e2e`` / ``make test-e2e-container``
-# wrap pytest in ``sg sandbox -c '…'`` to activate the group without
-# requiring a re-login.
+# The operator must be a member of the ``sandbox-test`` group so the pytest
+# process can reach the e2e daemon socket (mode 0660, group=sandbox-test).
+# Group changes from ``usermod -aG sandbox-test <operator>`` do not take
+# effect in the current login session; ``make test-e2e`` /
+# ``make test-e2e-container`` wrap pytest in ``sg sandbox-test -c '…'`` to
+# activate the group without requiring a re-login.
 
-# Socket lives inside the test base dir so the sandbox-user daemon can
-# create it with no elevated privileges and the operator (group sandbox;
-# base dir 0750 → group r-x) can connect.
+# The e2e daemon runs as the dedicated `sandbox-test` system user so its
+# per-uid state tree is structurally disjoint from the prod daemon's tree
+# (/var/lib/sandboxd/<sandbox-uid>/). Base-dir and socket are keyed on the
+# sandbox-test uid: /var/lib/sandboxd/<sandbox-test-uid>/.
 #
-# DELIBERATELY /var/lib/sandbox-test, NOT the production /var/lib/sandbox:
-# a real prod install (install.sh) owns /var/lib/sandbox, and the harness
-# must never share that base dir — otherwise the state-dir reset below
-# would wipe the prod daemon's sessions.db/.install-state.json, and two
-# daemons could write one sessions.db. Created by `make
-# setup-sandbox-test-base-dir` (part of `make setup-dev-env`).
-_SANDBOX_E2E_SOCKET = Path("/var/lib/sandbox-test/sandboxd.sock")
-_SANDBOX_E2E_BASE_DIR = Path("/var/lib/sandbox-test")
+# Isolation guarantee: the state-dir reset operates only within
+# /var/lib/sandboxd/<_SANDBOX_TEST_UID>/ and can never name a path
+# inside the prod daemon's /var/lib/sandboxd/<sandbox-uid>/ tree or the
+# legacy /var/lib/sandbox/. Created by `make setup-sandboxd-per-uid-state-dir`
+# (part of `make setup-dev-env`).
+_SANDBOX_TEST_UID: int = pwd.getpwnam("sandbox-test").pw_uid
+_SANDBOX_E2E_BASE_DIR = Path(f"/var/lib/sandboxd/{_SANDBOX_TEST_UID}")
+_SANDBOX_E2E_SOCKET = _SANDBOX_E2E_BASE_DIR / "sandboxd.sock"
 
 # The test daemon uses a distinct base VM name so it neither sees nor
 # touches the operator's production `sandbox-base` Lima instance. We
@@ -332,7 +334,7 @@ def gateway_container_name(session_id: str) -> str:
 # IMPORTANT: the per-operator LIMA_HOME and all its contents (lima.yaml,
 # _config/user, VM dirs) are owned by the OPERATOR uid (the test runner)
 # with mode 0600/0700 — they are operator-private.  Running limactl as the
-# ``sandbox`` system user (uid 999) via ``sudo -n -u sandbox`` therefore
+# ``sandbox-test`` system user via ``sudo -n -u sandbox-test`` therefore
 # fails with EACCES ("open .../lima.yaml: permission denied" →
 # "instance has no configuration").  The test process already IS the operator
 # uid, so the correct approach is to run limactl directly (no sudo) with
@@ -343,24 +345,26 @@ def gateway_container_name(session_id: str) -> str:
 
 
 #: Absolute path to the per-operator LIMA_HOME under the cross-user harness.
-#: Derived once at import time from the test runner's uid (the operator).
-OP_LIMA_HOME: str = f"/var/lib/sandboxd/{os.getuid()}/lima"
+#: 3-level path: /var/lib/sandboxd/<daemon_uid>/<operator_uid>/lima, where
+#: daemon_uid is the sandbox-test uid and operator_uid is the test runner's uid.
+OP_LIMA_HOME: str = f"/var/lib/sandboxd/{_SANDBOX_TEST_UID}/{os.getuid()}/lima"
 
 
 def limactl_cmd(*args: str) -> list[str]:
     """Build a limactl argv that queries the per-operator LIMA_HOME.
 
-    The VM registry lives at ``/var/lib/sandboxd/<op_uid>/lima/`` (the
-    per-operator LIMA_HOME).  Bare ``limactl`` would look in ``~/.lima/``
-    and see nothing, so this wrapper sets ``LIMA_HOME`` to the per-operator
-    path via ``env``.
+    The VM registry lives at
+    ``/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/`` (the 3-level
+    per-operator LIMA_HOME, where daemon_uid = sandbox-test uid).  Bare
+    ``limactl`` would look in ``~/.lima/`` and see nothing, so this wrapper
+    sets ``LIMA_HOME`` to the per-operator path via ``env``.
 
     The per-operator LIMA_HOME and all its files (lima.yaml, _config/user,
     VM directories) are owned by the OPERATOR uid and are operator-private
-    (0600/0700).  Running limactl as the ``sandbox`` system user via
-    ``sudo -n -u sandbox`` would fail with EACCES.  The test process already
-    runs as the operator uid, so we invoke limactl directly — no sudo prefix
-    — with only the LIMA_HOME override.
+    (0600/0700).  Running limactl as the ``sandbox-test`` system user via
+    ``sudo -n -u sandbox-test`` would fail with EACCES.  The test process
+    already runs as the operator uid, so we invoke limactl directly — no
+    sudo prefix — with only the LIMA_HOME override.
 
     Usage::
 
@@ -693,37 +697,38 @@ def sandbox_binaries() -> SandboxBinaries:
 
 
 def _assert_operator_in_sandbox_group() -> None:
-    """Fail loudly if the calling pytest process is not in the ``sandbox`` group.
+    """Fail loudly if the calling pytest process is not in the ``sandbox-test`` group.
 
-    The daemon socket is mode 0660 with ``group=sandbox``. A test process
-    whose effective groups do not include ``sandbox`` cannot read or write
-    the socket and every CLI invocation fails with EACCES — a setup gap,
-    not the cross-user bug under test.
+    The e2e daemon socket is mode 0660 with ``group=sandbox-test``. A test
+    process whose effective groups do not include ``sandbox-test`` cannot read
+    or write the socket and every CLI invocation fails with EACCES — a setup
+    gap, not the cross-user bug under test.
 
-    Group changes from ``usermod -aG sandbox <operator>`` do **not** take
+    Group changes from ``usermod -aG sandbox-test <operator>`` do **not** take
     effect in the current login session. The remediation depends on context:
 
       * Interactive: log out + log back in, or re-launch the shell.
-      * Scripted: wrap the invocation in ``sg sandbox -c '…'``.
+      * Scripted: wrap the invocation in ``sg sandbox-test -c '…'``.
       * CI: ensure the user that runs pytest was added to the group at
         image-build time (before the session starts).
     """
     import grp
     try:
-        sandbox_gid = grp.getgrnam("sandbox").gr_gid
+        sandbox_gid = grp.getgrnam("sandbox-test").gr_gid
     except KeyError:
         pytest.fail(
-            "The `sandbox` system group does not exist on this host. "
-            "Run `make setup-sandbox-user` from the workspace root and "
+            "The `sandbox-test` system group does not exist on this host. "
+            "Run `make setup-sandbox-test-user` from the workspace root and "
             "re-run the tests."
         )
-    # The socket is mode 0660, group=sandbox, so access is granted when the
-    # sandbox gid is the process's effective GID *or* in its supplementary
-    # set. `sg sandbox -c …` (how the make targets wrap pytest) sets sandbox
-    # as the *primary/effective* GID and does not add it to the supplementary
-    # list — and Linux `getgroups()` does not report the effective GID — so
-    # checking `os.getgroups()` alone spuriously fails under the sg wrap even
-    # though the process can read the socket. Accept either.
+    # The socket is mode 0660, group=sandbox-test, so access is granted when
+    # the sandbox-test gid is the process's effective GID *or* in its
+    # supplementary set. `sg sandbox-test -c …` (how the make targets wrap
+    # pytest) sets sandbox-test as the *primary/effective* GID and does not
+    # add it to the supplementary list — and Linux `getgroups()` does not
+    # report the effective GID — so checking `os.getgroups()` alone spuriously
+    # fails under the sg wrap even though the process can read the socket.
+    # Accept either.
     if sandbox_gid == os.getegid() or sandbox_gid in os.getgroups():
         return
     # Membership exists in /etc/group but is not yet active in this
@@ -735,23 +740,23 @@ def _assert_operator_in_sandbox_group() -> None:
         ["id", "-nG", operator],
         capture_output=True, text=True, timeout=5,
     ).stdout.split()
-    if "sandbox" in static_groups:
+    if "sandbox-test" in static_groups:
         remediation = (
             "Operator '{op}' is listed in /etc/group as a member of "
-            "'sandbox' but the group is not active in the current "
+            "'sandbox-test' but the group is not active in the current "
             "process. Log out and back in, or re-run pytest under "
-            "`sg sandbox -c 'python -m pytest …'` so the new group "
+            "`sg sandbox-test -c 'python -m pytest …'` so the new group "
             "is visible to the test process."
         ).format(op=operator)
     else:
         remediation = (
-            "Operator '{op}' is not a member of the 'sandbox' group. "
-            "Run `make setup-operator-group-membership` from the "
-            "workspace root, log out and back in, then re-run pytest."
+            "Operator '{op}' is not a member of the 'sandbox-test' group. "
+            "Run `make setup-sandbox-test-user` from the workspace root, "
+            "log out and back in, then re-run pytest."
         ).format(op=operator)
     pytest.fail(
-        "The pytest process must be a member of the 'sandbox' system "
-        "group (the daemon socket is mode 0660, group=sandbox). "
+        "The pytest process must be a member of the 'sandbox-test' system "
+        "group (the e2e daemon socket is mode 0660, group=sandbox-test). "
         f"{remediation}"
     )
 
@@ -767,7 +772,7 @@ def _wait_for_daemon_socket(
     ``is_dead`` callback instead of a ``Popen``. ``is_dead`` returns
     ``(True, "<reason>")`` when the daemon is known to have exited and
     ``(False, "")`` otherwise. The callback indirection lets a caller
-    supply its own liveness check; the ``sudo -u sandbox`` launcher
+    supply its own liveness check; the ``sudo -u sandbox-test`` launcher
     passes a closure over ``proc.poll()``.
     """
     deadline = time.monotonic() + timeout
@@ -819,7 +824,7 @@ def _sudo_rm_children_except(directory: Path, keep: list[str]) -> None:
     if not directory.exists():
         return
     argv = [
-        "sudo", "-n", "-u", "sandbox",
+        "sudo", "-n", "-u", "sandbox-test",
         "find", str(directory), "-mindepth", "1", "-maxdepth", "1",
     ]
     for name in keep:
@@ -829,19 +834,21 @@ def _sudo_rm_children_except(directory: Path, keep: list[str]) -> None:
 
 
 def _reset_sandbox_state_dir() -> None:
-    """Wipe ``/var/lib/sandbox-test`` between pytest sessions, preserving
-    the Lima base-image cache and the golden base VM.
+    """Wipe the e2e daemon's per-uid state tree between pytest sessions,
+    preserving the Lima base-image cache and the golden base VM.
 
-    The daemon writes all files under ``/var/lib/sandbox-test`` as the
-    ``sandbox`` user, so deletes are issued as the ``sandbox`` user via
-    :func:`_sudo_rm_children_except`.  The base dir itself is left intact
-    (owned sandbox:sandbox 0750, provisioned by
-    ``make setup-sandbox-test-base-dir``); we only remove daemon-managed
-    state so a fresh ``sessions.db`` lands on the next session start.
+    The daemon writes all files under ``/var/lib/sandboxd/<_SANDBOX_TEST_UID>/``
+    as the ``sandbox-test`` user, so deletes are issued as the
+    ``sandbox-test`` user via :func:`_sudo_rm_children_except`.  The base
+    dir itself is left intact (owned sandbox-test:sandbox-test 0750,
+    provisioned by ``make setup-sandboxd-per-uid-state-dir``); we only
+    remove daemon-managed state so a fresh ``sessions.db`` lands on the
+    next session start.
 
-    This wipes the *test* base dir, never the production ``/var/lib/sandbox``
-    that a real install.sh owns — the two are deliberately separate so this
-    reset can never destroy a co-resident prod install's state.
+    Safety: this function asserts that ``_SANDBOX_TEST_UID`` is distinct
+    from both the operator uid and the prod daemon uid before any deletion,
+    so a misconfigured host cannot accidentally wipe the prod daemon's tree
+    (``/var/lib/sandboxd/<sandbox-uid>/``) or the operator's home.
 
     This is the safety net that keeps a crashed run (which never reached
     its teardown) from leaking its sessions into the *next* run's daemon —
@@ -873,9 +880,30 @@ def _reset_sandbox_state_dir() -> None:
 
     Skipped silently when the dir does not exist (first-ever run).
     """
+    # Safety assertion: _SANDBOX_TEST_UID must be distinct from BOTH the
+    # operator uid and the prod daemon's uid. A collision would mean the
+    # delete loop below could reach into the wrong tree.
+    operator_uid = os.getuid()
+    try:
+        prod_uid = pwd.getpwnam("sandbox").pw_uid
+    except KeyError:
+        prod_uid = None  # dev host without prod daemon user — no collision risk
+
+    assert _SANDBOX_TEST_UID != operator_uid, (
+        f"FATAL: sandbox-test uid ({_SANDBOX_TEST_UID}) equals the operator uid "
+        f"({operator_uid}). This would allow the state reset to wipe operator "
+        "files. Aborting to prevent data loss."
+    )
+    if prod_uid is not None:
+        assert _SANDBOX_TEST_UID != prod_uid, (
+            f"FATAL: sandbox-test uid ({_SANDBOX_TEST_UID}) equals the prod daemon "
+            f"uid ({prod_uid}). This would allow the state reset to wipe the prod "
+            "daemon's /var/lib/sandboxd tree. Aborting to prevent data loss."
+        )
+
     base_vm = os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
 
-    # Prod base dir: remove every top-level entry — sessions.db,
+    # E2E base dir: remove every top-level entry — sessions.db,
     # per-session dirs, listeners, events, the socket — except the Lima
     # cache, the .lima tree, and the freshness metadata. Then prune the
     # .lima tree down to the golden base VM (dropping per-session clones).
@@ -884,14 +912,17 @@ def _reset_sandbox_state_dir() -> None:
     )
     _sudo_rm_children_except(_SANDBOX_E2E_BASE_DIR / ".lima", [base_vm])
 
-    # Per-operator LIMA_HOME (``/var/lib/sandboxd/<op_uid>/lima``): keep the
-    # download cache, the golden base VM, and the freshness metadata; remove
+    # Per-operator LIMA_HOME under the 3-level path
+    # (``/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima``): keep the download
+    # cache, the golden base VM, and the freshness metadata; remove
     # per-session VM clones and any stale config so a partially-initialised
     # base VM left by a killed run is not reused via a stale meta file. The
     # base VM lives directly under LIMA_HOME here (LIMA_HOME *is* the Lima
     # home), not under a .lima subdir.
-    op_uid = os.getuid()
-    op_lima_home = Path(f"/var/lib/sandboxd/{op_uid}/lima")
+    # The LIMA_HOME root is sandbox-test-owned (provisioned by the daemon via
+    # ensure_operator_lima_home); delete via the sandbox-test pivot so rm has
+    # write+exec on the parent dir even when child files are operator-owned.
+    op_lima_home = Path(OP_LIMA_HOME)
     _sudo_rm_children_except(
         op_lima_home, [".cache", base_vm, "base-image-meta.json"]
     )
@@ -899,13 +930,13 @@ def _reset_sandbox_state_dir() -> None:
 
 def _stage_binaries_for_sandbox_user(sandbox_binaries: SandboxBinaries) -> dict:
     """Copy the freshly-built ``sandboxd`` binary into a world-traversable
-    directory the ``sandbox`` system user can reach.
+    directory the ``sandbox-test`` system user can reach.
 
     The workspace lives under the operator's home directory (commonly mode
-    0750), which the unprivileged ``sandbox`` user cannot search.  So
-    ``sudo -u sandbox <workspace>/target/debug/sandboxd`` fails the
+    0750), which the unprivileged ``sandbox-test`` user cannot search.  So
+    ``sudo -u sandbox-test <workspace>/target/debug/sandboxd`` fails the
     post-setuid ``execve`` permission check with EACCES ("Permission
-    denied") — the kernel resolves the path *as the sandbox user*, which
+    denied") — the kernel resolves the path *as the sandbox-test user*, which
     needs search (``x``) on every ancestor directory.  We stage the
     binary into a fresh ``/tmp`` subdirectory (``/tmp`` is mode 1777, so
     every user can traverse it) owned by the operator at mode 0755, and run
@@ -938,7 +969,7 @@ def _launch_daemon_as_sandbox_via_sudo(
     sandbox_binaries: SandboxBinaries,
     tmp_path: Path,
 ) -> dict:
-    """Start the daemon as the ``sandbox`` user via ``sudo -u sandbox``.
+    """Start the daemon as the ``sandbox-test`` user via ``sudo -u sandbox-test``.
 
     This is the sole launch path. Requires the NOPASSWD sudoers fragment
     at ``/etc/sudoers.d/sandboxd-test`` (installed by
@@ -946,14 +977,14 @@ def _launch_daemon_as_sandbox_via_sudo(
     to prompt and hang the wait-for-socket deadline, so the harness probes
     up front and fails with a precise error.
 
-    The base dir ``/var/lib/sandbox-test`` must already exist with
-    ``sandbox:sandbox`` ownership and mode 0750 — provisioned once by
-    ``make setup-sandbox-test-base-dir`` (part of ``make setup-dev-env``).
-    The socket lives inside the base dir so the daemon can create it
-    without root.  The daemon (and guest) binaries are staged into a
-    world-traversable ``/tmp`` dir so the ``sandbox`` user can exec them
-    despite the workspace living under the operator's 0750 home — see
-    :func:`_stage_binaries_for_sandbox_user`.
+    The base dir ``/var/lib/sandboxd/<_SANDBOX_TEST_UID>`` must already exist
+    with ``sandbox-test:sandbox-test`` ownership and mode 0750 — provisioned
+    once by ``make setup-sandboxd-per-uid-state-dir`` (part of
+    ``make setup-dev-env``).  The socket lives inside the base dir so the
+    daemon can create it without root.  The daemon (and guest) binaries are
+    staged into a world-traversable ``/tmp`` dir so the ``sandbox-test`` user
+    can exec them despite the workspace living under the operator's 0750 home
+    — see :func:`_stage_binaries_for_sandbox_user`.
     """
     _assert_operator_in_sandbox_group()
 
@@ -962,20 +993,20 @@ def _launch_daemon_as_sandbox_via_sudo(
     if not _SANDBOX_E2E_BASE_DIR.exists():
         pytest.fail(
             f"{_SANDBOX_E2E_BASE_DIR} does not exist. "
-            "Run `make setup-sandbox-test-base-dir` (or `make setup-dev-env`) "
+            "Run `make setup-sandboxd-per-uid-state-dir` (or `make setup-dev-env`) "
             "from the workspace root to create it, then re-run."
         )
 
     staged = _stage_binaries_for_sandbox_user(sandbox_binaries)
 
     # Probe NOPASSWD authorisation *and* binary reachability in one shot.
-    # ``sudo -n -u sandbox <staged-binary> --version`` returns rc=1 with
+    # ``sudo -n -u sandbox-test <staged-binary> --version`` returns rc=1 with
     # "a password is required" on stderr when the sudoers fragment is
-    # absent/mis-scoped, or "Permission denied" if the sandbox user cannot
+    # absent/mis-scoped, or "Permission denied" if the sandbox-test user cannot
     # exec the staged binary. rc=0 confirms the full chain works. Failing
     # here prevents a silent hang at the wait-for-socket deadline.
     probe = subprocess.run(
-        ["sudo", "-n", "-u", "sandbox",
+        ["sudo", "-n", "-u", "sandbox-test",
          str(staged["sandboxd"]), "--version"],
         capture_output=True, text=True, timeout=10,
     )
@@ -984,7 +1015,7 @@ def _launch_daemon_as_sandbox_via_sudo(
         pytest.fail(
             "The NOPASSWD sudoers fragment at /etc/sudoers.d/sandboxd-test "
             "is missing or does not authorise the operator to run commands "
-            "as the `sandbox` user. "
+            "as the `sandbox-test` user. "
             "Run `make setup-test-sudoers-fragment` from the workspace "
             "root and re-run.\n"
             f"sudo probe stderr: {probe.stderr.strip()!r}"
@@ -1003,19 +1034,19 @@ def _launch_daemon_as_sandbox_via_sudo(
     # so the variables propagate through sudo without ``--preserve-env``
     # (which is more brittle to whitelist).
     #
-    # The daemon's lima-helper resolver is intentionally left at its default:
-    # it resolves the canonical /usr/local/libexec/sandboxd/sandbox-lima-helper
-    # (the prod build, installed by ``make install-lima-helper-prod-cap``), so
-    # the e2e suite exercises the REAL production lima-helper rather than a
-    # test-cap variant. That helper reads the guest agent from the canonical
-    # /usr/local/libexec/sandboxd/sandbox-guest (installed by
-    # ``make install-guest-prod``), so no ``SANDBOX_LIMA_HELPER_PATH`` or
-    # ``SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH`` override is set. Both
-    # canonical binaries survive a co-resident prod install via the
-    # stash/restore scheme in ``scripts/dev/canonical-binary.sh``.
+    # The e2e suite uses the TEST-cap lima-helper
+    # (/usr/local/libexec/sandboxd-test/sandbox-lima-helper, installed by
+    # ``make install-lima-helper-test-cap``) with ``SANDBOX_LIMA_HELPER_PATH``
+    # pointing at it. This helper is built with ``--features test-env-override``
+    # and resolves its sandbox-user name via the
+    # ``SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER`` seam, which we set to
+    # ``sandbox-test`` so the caller-uid gate accepts the e2e daemon's uid.
+    # ``SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP`` is set identically so the
+    # helper's group gate matches.  Both env vars are in the sudoers env_keep
+    # list so they propagate through ``sudo -u sandbox-test``.
     proc = subprocess.Popen(
         [
-            "sudo", "-n", "-u", "sandbox",
+            "sudo", "-n", "-u", "sandbox-test",
             str(staged["sandboxd"]),
             "--socket", str(_SANDBOX_E2E_SOCKET),
             "--base-dir", str(_SANDBOX_E2E_BASE_DIR),
@@ -1025,13 +1056,18 @@ def _launch_daemon_as_sandbox_via_sudo(
             "SANDBOX_USERS_CONF": os.environ["SANDBOX_USERS_CONF"],
             "SANDBOX_BASE_VM_NAME": os.environ["SANDBOX_BASE_VM_NAME"],
             # Pin the ephemeral runtime dirs under the test base dir. The
-            # daemon runs via `sudo -u sandbox` with no XDG_RUNTIME_DIR, so
-            # without these they fall back to $HOME (/var/lib/sandbox) and leak
-            # into the *production* base dir instead of /var/lib/sandbox-test.
+            # daemon runs via `sudo -u sandbox-test` with no XDG_RUNTIME_DIR,
+            # so without these they fall back to $HOME (/nonexistent) and fail.
             # The state-dir reset wipes these along with the rest of the test
             # base dir. (Prod pins them to /run/sandbox via the systemd unit.)
             "SANDBOX_LISTENER_DIR": str(_SANDBOX_E2E_BASE_DIR / "listeners"),
             "SANDBOX_EVENTS_DIR": str(_SANDBOX_E2E_BASE_DIR / "events"),
+            # Point at the TEST-cap lima-helper; the helper resolves the
+            # sandbox-user name to sandbox-test via these seams so the
+            # caller-uid gate accepts the e2e daemon (running as sandbox-test).
+            "SANDBOX_LIMA_HELPER_PATH": "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
+            "SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER": "sandbox-test",
+            "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP": "sandbox-test",
         },
         stdout=stdout_fh,
         stderr=stderr_fh,
@@ -1083,7 +1119,8 @@ def restart_test_daemon(
     *,
     ready_timeout: float = 15,
 ) -> subprocess.Popen:
-    """Restart the daemon mid-test as the ``sandbox`` user via ``sudo -u sandbox``.
+    """Restart the daemon mid-test as the ``sandbox-test`` user via
+    ``sudo -u sandbox-test``.
 
     Used by the restart-recovery e2e tests (``test_networking::
     test_daemon_restart_recovery``, ``test_lite::
@@ -1094,7 +1131,7 @@ def restart_test_daemon(
     the *restart* leg and the in-place re-registration into
     ``sandbox_daemon`` so the session-scoped fixture stays coherent.
 
-    Re-spawns ``sudo -n -u sandbox sandboxd`` against the same socket
+    Re-spawns ``sudo -n -u sandbox-test sandboxd`` against the same socket
     and base-dir. Reuses the session-scope log files (the session teardown
     reads them via the existing ``_stdout_log``/``_stderr_log`` keys);
     append-mode so the per-test dump fixture's offset book-keeping still
@@ -1114,11 +1151,10 @@ def restart_test_daemon(
     new_stderr_fh = open(stderr_log, "a")
 
     # Relaunch from the same staged binary the session launcher used (the
-    # sandbox user cannot exec the workspace build under the operator's
+    # sandbox-test user cannot exec the workspace build under the operator's
     # 0750 home — see _stage_binaries_for_sandbox_user). Mirror the
     # launcher's env so the restarted daemon is configured identically to the
-    # one it replaces: it too resolves the canonical prod lima-helper + guest
-    # (no SANDBOX_LIMA_HELPER_PATH / TEST_GUEST_BINARY_PATH override).
+    # one it replaces, including the TEST-cap helper path and sandbox-user seams.
     staged_sandboxd = sandbox_daemon["_staged_sandboxd"]
     daemon_env = os.environ.copy()
     daemon_env["SANDBOX_USERS_CONF"] = os.environ["SANDBOX_USERS_CONF"]
@@ -1126,10 +1162,14 @@ def restart_test_daemon(
     # Pin the ephemeral runtime dirs under the test base dir (see launcher).
     daemon_env["SANDBOX_LISTENER_DIR"] = str(_SANDBOX_E2E_BASE_DIR / "listeners")
     daemon_env["SANDBOX_EVENTS_DIR"] = str(_SANDBOX_E2E_BASE_DIR / "events")
+    # Mirror the TEST-cap helper env from the initial launcher.
+    daemon_env["SANDBOX_LIMA_HELPER_PATH"] = "/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
+    daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER"] = "sandbox-test"
+    daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP"] = "sandbox-test"
 
     proc = subprocess.Popen(
         [
-            "sudo", "-n", "-u", "sandbox",
+            "sudo", "-n", "-u", "sandbox-test",
             str(staged_sandboxd),
             "--socket", str(socket_path),
             "--base-dir", str(base_dir),
@@ -1220,8 +1260,8 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
 
     Session-scoped: all tests share the same daemon process.
 
-    Launches the daemon as the ``sandbox`` system user via
-    ``sudo -u sandbox``. All sudo is pre-authorized at
+    Launches the daemon as the ``sandbox-test`` system user via
+    ``sudo -u sandbox-test``. All sudo is pre-authorized at
     ``make setup-dev-env`` time via the NOPASSWD fragment at
     ``/etc/sudoers.d/sandboxd-test``; no runtime root sudo is ever issued.
 
@@ -1270,17 +1310,17 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
 
     # Collect any Lima VM names from the daemon's session db so we can
     # clean them up even if the test forgot to `rm`. The daemon owns its
-    # Lima registry at ``/var/lib/sandboxd/<op-uid>/lima/`` (the
-    # per-operator LIMA_HOME); bare ``limactl`` would look in ``~/.lima/``
-    # and see nothing. We set LIMA_HOME to the per-operator path so the
-    # list/delete calls reach the right registry. The per-operator LIMA_HOME
-    # is owned by the operator uid (operator-private, 0600/0700), so we run
-    # limactl directly as the test operator — no ``sudo -n -u sandbox``
-    # prefix, which would hit EACCES on the operator-owned files.
-    op_uid = os.getuid()
-    op_lima_home = f"/var/lib/sandboxd/{op_uid}/lima"
+    # Lima registry at the 3-level path
+    # ``/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/`` (the per-operator
+    # LIMA_HOME, where daemon_uid = sandbox-test uid); bare ``limactl``
+    # would look in ``~/.lima/`` and see nothing. We set LIMA_HOME to
+    # ``OP_LIMA_HOME`` so the list/delete calls reach the right registry.
+    # The per-operator LIMA_HOME is owned by the operator uid
+    # (operator-private, 0600/0700), so we run limactl directly as the
+    # test operator — no ``sudo -n -u sandbox-test`` prefix, which would
+    # hit EACCES on the operator-owned files.
     limactl_argv_prefix: list[str] = [
-        "env", f"LIMA_HOME={op_lima_home}",
+        "env", f"LIMA_HOME={OP_LIMA_HOME}",
         "limactl",
     ]
 
@@ -1419,8 +1459,8 @@ def _dump_daemon_log_on_failure(request, sandbox_daemon):
     ``test_daemon_restart_recovery``, which deliberately writes to the
     same log paths).
 
-    The daemon runs as the ``sandbox`` user via ``sudo -u sandbox`` and
-    writes its stdout/stderr to the per-session log files at
+    The daemon runs as the ``sandbox-test`` user via ``sudo -u sandbox-test``
+    and writes its stdout/stderr to the per-session log files at
     ``_stdout_log``/``_stderr_log`` in ``sandbox_daemon``.
 
     Driven by the per-phase outcome stashed by ``pytest_runtest_makereport``.

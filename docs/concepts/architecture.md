@@ -276,4 +276,4 @@ Each session has a directory at `<base-dir>/sessions/<session-id>/` containing:
 
 ### Lima data
 
-Lima stores its own VM data under `/var/lib/sandboxd/<op_uid>/lima/sandbox-<session-id>/` — one LIMA_HOME per operator uid. The daemon never accesses this directory directly; all Lima control-plane operations go through `sandbox-lima-helper` (see [Per-operator LIMA_HOME](/sandboxd/guides/per-operator-lima-home/)). The per-operator directory includes the VM disk image, configuration, and SSH keys.
+Lima stores its own VM data under `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/sandbox-<session-id>/` — a 3-level path isolating state by daemon uid first, then by operator uid. The daemon never accesses this directory directly; all Lima control-plane operations go through `sandbox-lima-helper` (see [Per-operator LIMA_HOME](/sandboxd/guides/per-operator-lima-home/)). The per-operator directory includes the VM disk image, configuration, and SSH keys.

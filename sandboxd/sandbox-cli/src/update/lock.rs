@@ -1,8 +1,10 @@
 //! `sandbox update` lock file.
 //!
-//! Path: `/var/lib/sandbox/.update.lock`. Mode `0664 sandbox:sandbox`.
-//! Persistent across reboots (under `/var/lib/`, not `/run/`) so re-runs
-//! can detect and adopt a dead-PID predecessor.
+//! Path: `/var/lib/sandboxd/<daemon-uid>/.update.lock` (resolved at runtime
+//! via [`lock_path`]; falls back to `/var/lib/sandbox/.update.lock` on a
+//! pre-migration host). Mode `0664 sandbox:sandbox`. Persistent across
+//! reboots (under `/var/lib/`, not `/run/`) so re-runs can detect and adopt
+//! a dead-PID predecessor.
 //!
 //! The acquisition strategy: take a non-blocking advisory `flock` via
 //! `flock(2)` on a file descriptor we keep open in-process, *then* read
@@ -37,8 +39,14 @@ use nix::fcntl::flock;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
-/// Canonical lock-file path.
-pub const LOCK_PATH: &str = "/var/lib/sandbox/.update.lock";
+/// Return the runtime-resolved lock-file path.
+///
+/// Per-uid path (`/var/lib/sandboxd/<uid>/.update.lock`) takes precedence
+/// when the `sandbox` user is resolvable. Falls back to
+/// `/var/lib/sandbox/.update.lock` on a pre-migration host.
+pub fn lock_path() -> std::path::PathBuf {
+    crate::update::resolve_state_path(".update.lock")
+}
 
 /// Stale-payload threshold: a payload older than this
 /// triggers an `adopt-stale` log line but is otherwise treated like a
@@ -500,7 +508,7 @@ mod tests {
         // second acquisition attempts to touch the file. The refuse
         // path must NOT mutate the lock file — the on-disk payload
         // must continue to point at the live holder so a subsequent
-        // operator inspection (`cat /var/lib/sandbox/.update.lock`)
+        // operator inspection (`cat $(sandbox-cli lock-path)`)
         // still names the right pid.
         let on_disk_before = std::fs::read(&path).expect("read on-disk payload");
 

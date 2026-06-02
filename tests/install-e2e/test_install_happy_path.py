@@ -85,8 +85,10 @@ def test_install_fresh_then_doctor_passes(
     assert vm.shell(
         "test -f /etc/systemd/system/sandboxd.service"
     ).returncode != 0
-    # /var/lib/sandbox/ kept (no --purge).
-    assert vm.shell("sudo test -d /var/lib/sandbox").returncode == 0
+    # Per-uid state dir kept (no --purge).
+    assert vm.shell(
+        "SUID=$(id -u sandbox); sudo test -d /var/lib/sandboxd/$SUID"
+    ).returncode == 0, "per-uid state dir should be kept without --purge"
 
 
 @pytest.mark.parametrize("distro_template", [DEFAULT_FEDORA])

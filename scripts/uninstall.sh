@@ -8,11 +8,13 @@
 # Source of truth: scripts/uninstall.sh in the Koriit/sandboxd repo. The site
 # build copies this file into site/public/ before the docs deploy.
 #
-# uninstall.sh reads /var/lib/sandbox/.install-state.json (created by
-# install.sh) and removes only the artifacts install.sh recorded as its own.
-# Without the state file, the script runs in best-effort mode: it removes
-# the binaries, systemd unit, and route-helper, but leaves anything
-# ambiguous (the sandbox user, bridge.conf rules, bridge-helper setuid).
+# uninstall.sh reads the install-state file created by install.sh
+# (/var/lib/sandboxd/<sandbox-uid>/.install-state.json on a post-migration
+# host; /var/lib/sandbox/.install-state.json on a legacy host) and removes
+# only the artifacts install.sh recorded as its own. Without the state file,
+# the script runs in best-effort mode: it removes the binaries, systemd unit,
+# and route-helper, but leaves anything ambiguous (the sandbox user,
+# bridge.conf rules, bridge-helper setuid).
 
 set -eu
 
@@ -25,9 +27,13 @@ set -eu
 # when set; unset / empty falls back to the canonical
 # `/var/log/sandbox-install.log`.
 INSTALL_LOG="${SANDBOXD_INSTALL_LOG:-/var/log/sandbox-install.log}"
-STATE_PATH="/var/lib/sandbox/.install-state.json"
+# STATE_PATH is resolved at runtime: per-uid path with legacy fallback.
+# Computed by resolve_state_path() after argument parsing.
+STATE_PATH=""
 SCRIPT_NAME="uninstall.sh"
 SOCK_PATH="/run/sandbox/sandboxd.sock"
+# SANDBOX_UID is resolved before any userdel so the uid is still known.
+SANDBOX_UID=""
 
 PURGE=0
 FORCE=0
@@ -64,10 +70,12 @@ Usage: uninstall.sh [OPTIONS]
 Uninstall sandboxd, reversing the changes recorded by install.sh.
 
 Options:
-  --purge       Also delete /var/lib/sandbox/, the sandbox user, operator
-                group memberships, and the gateway docker image. Prompts
-                unless --yes. (Does not touch /etc/systemd/system/
-                sandboxd.service.d/, which is operator-owned.)
+  --purge       Also delete the sandbox daemon's per-uid state directory
+                (/var/lib/sandboxd/<sandbox-uid>/), the sandbox user,
+                operator group memberships, and the gateway docker image.
+                Prompts unless --yes. (Does not touch
+                /etc/systemd/system/sandboxd.service.d/, which is
+                operator-owned.)
   --force       Proceed even if sandboxd is running (default: refuse).
                 A per-session active-session probe lands with
                 'sandbox update' in a future release; for now the check
@@ -85,9 +93,9 @@ Environment variables:
                             same file under an operator override.
 
 By default uninstall.sh removes only binaries, the systemd unit, the
-route-helper, and any tracked install-time changes recorded in
-${STATE_PATH}. State at /var/lib/sandbox/ and the sandbox user are
-preserved; pass --purge to remove them.
+route-helper, and any tracked install-time changes recorded in the
+install-state file. The per-uid state directory and the sandbox user
+are preserved; pass --purge to remove them.
 EOF
 }
 
@@ -139,6 +147,43 @@ record_removed() {
         REMOVED_ITEMS="$REMOVED_ITEMS
 $1"
     fi
+}
+
+# ----------------------------------------------------------------------------
+# Resolve the install-state path.
+#
+# The install-state marker lives at /var/lib/sandboxd/<sandbox-uid>/.install-state.json
+# on a post-migration host. For hosts that ran install.sh before the migration
+# landed, it may still be at /var/lib/sandbox/.install-state.json (legacy).
+#
+# SANDBOX_UID must be resolved BEFORE userdel removes the user — once the
+# user is deleted, `id -u sandbox` fails. This function is called from main()
+# early (before purge_step's userdel).
+#
+# POSIX sh only; no bashisms.
+# ----------------------------------------------------------------------------
+
+resolve_state_path() {
+    if getent passwd sandbox >/dev/null 2>&1; then
+        SANDBOX_UID=$(id -u sandbox)
+        per_uid_path="/var/lib/sandboxd/$SANDBOX_UID/.install-state.json"
+        if [ -r "$per_uid_path" ]; then
+            STATE_PATH="$per_uid_path"
+            log_ok "step=resolve_state_path path=$STATE_PATH reason=per-uid"
+            return 0
+        fi
+    fi
+    # Legacy fallback: pre-migration install.
+    legacy_path="/var/lib/sandbox/.install-state.json"
+    if [ -r "$legacy_path" ]; then
+        STATE_PATH="$legacy_path"
+        log_ok "step=resolve_state_path path=$STATE_PATH reason=legacy-fallback"
+        return 0
+    fi
+    # Neither exists — best-effort mode (STATE_PATH stays empty; read_install_state
+    # will set HAVE_STATE=0 and continue).
+    STATE_PATH=""
+    log_warn "step=resolve_state_path reason=not-found fallback=best-effort"
 }
 
 # ----------------------------------------------------------------------------
@@ -220,8 +265,8 @@ check_daemon_running() {
 # ----------------------------------------------------------------------------
 
 read_install_state() {
-    if [ ! -r "$STATE_PATH" ]; then
-        log_warn "step=read_state path=$STATE_PATH reason=missing fallback=best-effort"
+    if [ -z "$STATE_PATH" ] || [ ! -r "$STATE_PATH" ]; then
+        log_warn "step=read_state path=${STATE_PATH:-(unresolved)} reason=missing fallback=best-effort"
         HAVE_STATE=0
         return 0
     fi
@@ -463,9 +508,23 @@ purge_step() {
         return 0
     fi
 
+    # Compute the per-uid state dir. SANDBOX_UID was resolved early (before
+    # userdel) by resolve_state_path(); use it here. Fall back to the resolved
+    # value even if the user is already gone at this point.
+    if [ -n "$SANDBOX_UID" ]; then
+        per_uid_state_dir="/var/lib/sandboxd/$SANDBOX_UID"
+    else
+        per_uid_state_dir=""
+    fi
+
     if [ "$YES" -eq 0 ]; then
         emit "${RED}!${RESET} --purge will delete:"
-        emit "    /var/lib/sandbox/  (sessions DB, per-session CA material, audit logs)"
+        if [ -n "$per_uid_state_dir" ]; then
+            emit "    $per_uid_state_dir/  (sessions DB, per-session CA material, audit logs)"
+        fi
+        if [ -d /var/lib/sandbox ]; then
+            emit "    /var/lib/sandbox/  (legacy state directory, if still present)"
+        fi
         if [ "$HAVE_STATE" -eq 1 ] && [ "$WE_CREATED_SANDBOX_USER" = "true" ]; then
             emit "    the 'sandbox' system user"
         fi
@@ -477,10 +536,31 @@ purge_step() {
         [ "$confirm" = "PURGE" ] || die "Aborted."
     fi
 
+    # Remove the per-uid state subtree. NEVER blanket-rm /var/lib/sandboxd —
+    # that would wipe a co-resident sandbox-test e2e subtree.
+    if [ -n "$per_uid_state_dir" ] && [ -d "$per_uid_state_dir" ]; then
+        sudo -k rm -rf "$per_uid_state_dir"
+        record_removed "$per_uid_state_dir/"
+        log_ok "step=purge_state path=$per_uid_state_dir"
+    fi
+
+    # Remove the root /var/lib/sandboxd only if it is now empty (which means
+    # no co-resident daemon user has a subtree there).
+    if [ -d /var/lib/sandboxd ]; then
+        if sudo -k rmdir /var/lib/sandboxd 2>/dev/null; then
+            record_removed "/var/lib/sandboxd/ (empty, removed)"
+            log_ok "step=purge_sandboxd_root action=rmdir"
+        else
+            log_ok "step=purge_sandboxd_root action=skip reason=not-empty"
+        fi
+    fi
+
+    # Also remove the legacy /var/lib/sandbox if it still exists (pre-migration
+    # remnant or a host that never ran the migrating install.sh).
     if [ -d /var/lib/sandbox ]; then
         sudo -k rm -rf /var/lib/sandbox
-        record_removed "/var/lib/sandbox/"
-        log_ok "step=purge_state path=/var/lib/sandbox"
+        record_removed "/var/lib/sandbox/ (legacy)"
+        log_ok "step=purge_state path=/var/lib/sandbox reason=legacy"
     fi
 
     if [ "$HAVE_STATE" -eq 1 ] \
@@ -537,7 +617,11 @@ final_report() {
     if [ "$PURGE" -eq 0 ]; then
         emit ""
         emit "${YELLOW}Kept (run with --purge to remove):${RESET}"
-        emit "  - /var/lib/sandbox/ (state, sessions DB, audit logs)"
+        if [ -n "$SANDBOX_UID" ]; then
+            emit "  - /var/lib/sandboxd/$SANDBOX_UID/ (state, sessions DB, audit logs)"
+        else
+            emit "  - /var/lib/sandboxd/ (no per-uid state dir resolved — legacy install)"
+        fi
         emit "  - 'sandbox' system user and group"
         emit "  - sandbox-gateway docker image"
     fi
@@ -553,6 +637,10 @@ final_report() {
 main() {
     parse_args "$@"
     setup_colors
+
+    # resolve_state_path must run before userdel (which happens in purge_step)
+    # so SANDBOX_UID and STATE_PATH are available while the user still exists.
+    resolve_state_path
 
     check_daemon_running
     read_install_state

@@ -127,7 +127,7 @@ def test_update_air_gapped(
     # State updated.
     state = json.loads(
         vm.shell(
-            "sudo cat /var/lib/sandbox/.install-state.json",
+            "SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json",
             check=True, timeout=10,
         ).stdout
     )

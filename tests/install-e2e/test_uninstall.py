@@ -1,11 +1,9 @@
 """Uninstall coverage — clean, purge, and double-run cases.
 
-
-
 - ``test_uninstall_after_install_clean`` — install, then uninstall (no
-  --purge), assert state dir kept, user kept.
+  --purge), assert per-uid state dir kept, user kept.
 - ``test_uninstall_with_purge_removes_user_and_state`` — install, then
-  uninstall --purge --yes, assert sandbox user gone, /var/lib/sandbox/
+  uninstall --purge --yes, assert sandbox user gone, per-uid state dir
   gone, gateway docker image rm'd.
 - ``test_uninstall_double_run_idempotent`` — install, uninstall,
   uninstall again; second run is no-op.
@@ -38,12 +36,15 @@ def test_uninstall_after_install_clean(
     )
     assert r.returncode == 0, f"uninstall failed:\n{r.stdout}\n{r.stderr}"
 
-    # Binaries / unit gone, state and user kept.
+    # Binaries / unit gone, per-uid state dir and user kept.
     assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0
     assert vm.shell(
         "test -f /etc/systemd/system/sandboxd.service"
     ).returncode != 0
-    assert vm.shell("sudo test -d /var/lib/sandbox").returncode == 0
+    # Per-uid state dir must still be present (no --purge).
+    assert vm.shell(
+        "SUID=$(id -u sandbox); sudo test -d /var/lib/sandboxd/$SUID"
+    ).returncode == 0, "per-uid state dir should be kept without --purge"
     assert vm.shell("id sandbox").returncode == 0
 
 
@@ -51,7 +52,7 @@ def test_uninstall_after_install_clean(
 def test_uninstall_with_purge_removes_user_and_state(
     distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
-    """--purge --yes removes /var/lib/sandbox/, sandbox user, and gateway image."""
+    """--purge --yes removes the per-uid state dir, sandbox user, and gateway image."""
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
@@ -69,8 +70,22 @@ def test_uninstall_with_purge_removes_user_and_state(
 
     # Everything is gone.
     assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0
+    # After the user is gone we cannot resolve its uid; check by looking for
+    # any subdirectory of /var/lib/sandboxd that was the prod state.
+    # The sandbox user uid was resolved before userdel by uninstall.sh —
+    # verify the whole /var/lib/sandboxd tree is empty (no prod subtree left).
+    r = vm.shell(
+        "sudo test -d /var/lib/sandboxd && sudo ls /var/lib/sandboxd 2>/dev/null || true"
+    )
+    # If /var/lib/sandboxd still exists it must be empty (rmdir failed = not empty).
+    # An empty dir is acceptable; a dir with contents is a bug.
+    remaining = r.stdout.strip()
+    assert not remaining, (
+        f"purge left contents in /var/lib/sandboxd: {remaining!r}"
+    )
+    # Legacy dir also gone.
     assert vm.shell("sudo test -d /var/lib/sandbox").returncode != 0, (
-        "purge did not remove /var/lib/sandbox/"
+        "purge did not remove legacy /var/lib/sandbox/"
     )
     # getent passwd sandbox returns empty.
     r = vm.shell("getent passwd sandbox")

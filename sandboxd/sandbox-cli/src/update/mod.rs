@@ -28,11 +28,64 @@ pub mod migrate;
 // Constants (operator-visible paths)
 // ---------------------------------------------------------------------------
 
-/// Canonical install-state path.
-pub const INSTALL_STATE_PATH: &str = "/var/lib/sandbox/.install-state.json";
-
 /// Canonical systemd unit path (presence is the dev-vs-system gate).
 pub const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/sandboxd.service";
+
+// ---------------------------------------------------------------------------
+// Per-uid base-dir discovery
+// ---------------------------------------------------------------------------
+
+/// State-root under which all per-daemon-uid state directories live.
+const SANDBOXD_STATE_ROOT: &str = "/var/lib/sandboxd";
+
+/// Legacy base-dir used before the per-uid migration.
+const LEGACY_BASE_DIR: &str = "/var/lib/sandbox";
+
+/// Resolve the production daemon's base-dir by looking up the `sandbox`
+/// system user and returning `/var/lib/sandboxd/<uid>`.
+///
+/// Returns `None` on a dev host where the `sandbox` user is absent — callers
+/// must degrade gracefully (dev-mode skip / legacy fallback) rather than
+/// panicking or hard-erroring.
+pub fn prod_base_dir() -> Option<PathBuf> {
+    let user = nix::unistd::User::from_name("sandbox").ok()??;
+    Some(PathBuf::from(format!(
+        "{}/{}", SANDBOXD_STATE_ROOT, user.uid.as_raw()
+    )))
+}
+
+/// Resolve a named state artifact using the per-uid-first / legacy-second
+/// precedence rule:
+///
+/// 1. If `prod_base_dir()` resolves AND `<prod_base_dir>/<name>` **exists**,
+///    return that path.
+/// 2. Else return `/var/lib/sandbox/<name>` (pre-migration fallback — covers
+///    a host where install.sh has not yet migrated state, so the file still
+///    lives under the legacy base-dir).
+///
+/// The per-uid path is returned even when the file does not exist yet (fresh
+/// install, or the artifact is being created for the first time) once the
+/// `sandbox` user is present and neither path exists. This preserves
+/// write-to-the-right-place behaviour on a freshly-migrated host.
+pub fn resolve_state_path(name: &str) -> PathBuf {
+    if let Some(base) = prod_base_dir() {
+        let candidate = base.join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+        // Legacy probe: if the legacy path exists, use it (pre-migration host).
+        let legacy = PathBuf::from(LEGACY_BASE_DIR).join(name);
+        if legacy.exists() {
+            return legacy;
+        }
+        // Neither exists yet: write to the per-uid location (correct for
+        // a freshly-migrated or fresh-install host).
+        return candidate;
+    }
+    // No sandbox user (dev host): fall through to legacy path so existing
+    // dev-mode code paths continue to work unchanged.
+    PathBuf::from(LEGACY_BASE_DIR).join(name)
+}
 
 /// Default release-tarball mirror (`--source-url`).
 pub const DEFAULT_SOURCE_URL: &str = "https://github.com/Koriit/sandboxd/releases/download";
@@ -193,7 +246,7 @@ pub fn dev_mode_refusal_text() -> &'static str {
      \n\
      This host looks like a dev install:\n  \
      - no systemd unit at /etc/systemd/system/sandboxd.service\n  \
-     - no install state file at /var/lib/sandbox/.install-state.json\n\
+     - no install state file at /var/lib/sandboxd/<daemon-uid>/.install-state.json\n\
      \n\
      Use `make` to upgrade in development:\n  \
      - `make build`              rebuilds binaries\n  \
@@ -509,7 +562,13 @@ impl DiskCheck {
 }
 
 /// Read the free-space budget against the pinned paths.
+///
+/// The var-lib probe uses the per-uid base-dir when the `sandbox` user is
+/// present; falls back to `/var/lib/sandbox` (pre-migration) or
+/// `/var/lib/sandboxd` (post-migration root) if the sandbox user is absent.
 pub fn check_disk_space(budget: &DiskBudget) -> DiskCheck {
+    let var_lib_probe = prod_base_dir()
+        .unwrap_or_else(|| PathBuf::from("/var/lib/sandboxd"));
     let rows = vec![
         DiskRow {
             path: PathBuf::from("/usr/local"),
@@ -517,8 +576,8 @@ pub fn check_disk_space(budget: &DiskBudget) -> DiskCheck {
             needed_kb: budget.usr_local_kb,
         },
         DiskRow {
-            path: PathBuf::from("/var/lib/sandbox"),
-            free_kb: free_kb_at(Path::new("/var/lib/sandbox")),
+            path: var_lib_probe.clone(),
+            free_kb: free_kb_at(&var_lib_probe),
             needed_kb: budget.var_lib_kb,
         },
         DiskRow {
@@ -539,9 +598,9 @@ pub fn check_disk_space(budget: &DiskBudget) -> DiskCheck {
 /// error — caller treats that as "budget not met" downstream.
 fn free_kb_at(path: &Path) -> u64 {
     // Use the path itself if it exists; otherwise walk up to the first
-    // ancestor that does (this lets `/var/lib/sandbox` probe succeed
+    // ancestor that does (this lets the per-uid base-dir probe succeed
     // on a host where the dir does not exist yet — fallback to
-    // `/var/lib/`).
+    // `/var/lib/sandboxd` or `/var/lib/`).
     let probe = first_existing_ancestor(path);
     match nix::sys::statvfs::statvfs(&probe) {
         Ok(s) => {
@@ -1098,7 +1157,8 @@ pub async fn run(args: UpdateArgs) -> i32 {
     );
 
     // Dev-mode detect / refuse.
-    if is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), Path::new(INSTALL_STATE_PATH)) {
+    let install_state_path = resolve_state_path(".install-state.json");
+    if is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), &install_state_path) {
         log_step("dev_mode_check", "is_dev=1 action=refuse status=fail");
         eprintln!("{}", dev_mode_refusal_text());
         return 2i32;
@@ -1107,7 +1167,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     // Install state read (graceful in read-only modes;
     // hard refusal in full-update mode).
-    let state = match read_install_state(Path::new(INSTALL_STATE_PATH)) {
+    let state = match read_install_state(&install_state_path) {
         Ok(Some(s)) => {
             log_step(
                 "read_state",
@@ -1131,7 +1191,8 @@ pub async fn run(args: UpdateArgs) -> i32 {
                 "installed_version=missing degraded=false status=fail",
             );
             eprintln!(
-                "sandbox update: install state file missing: {INSTALL_STATE_PATH} — was this host installed via install.sh?"
+                "sandbox update: install state file missing: {} — was this host installed via install.sh?",
+                install_state_path.display()
             );
             return 1i32;
         }
@@ -1514,8 +1575,9 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // the held flock. The Drop impl on UpdateLock releases the kernel
     // flock; the file is `rm`'d at lock-release on success.
     let was_running = inputs.daemon_was_running;
+    let lock_path_buf = lock::lock_path();
     let acquire_params = lock::AcquireParams {
-        path: Path::new(lock::LOCK_PATH),
+        path: &lock_path_buf,
         target_version: inputs.target_version,
         from_version: &inputs.state.installed_version,
         probe_was_running: &|| was_running,
@@ -1652,18 +1714,21 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // be absent (a freshly-checkpointed daemon removes them at
     // close), so `SourceAbsent` is the design-faithful no-op outcome
     // for those two paths, not a failure.
+    let sessions_db_path = backup::sessions_db_path();
+    let sessions_db_wal_path = backup::sessions_db_wal_path();
+    let sessions_db_shm_path = backup::sessions_db_shm_path();
     for (src, dst_name) in [
-        (backup::SESSIONS_DB_PATH, "sessions.db.bak"),
-        (backup::SESSIONS_DB_WAL_PATH, "sessions.db-wal.bak"),
-        (backup::SESSIONS_DB_SHM_PATH, "sessions.db-shm.bak"),
+        (sessions_db_path.as_path(), "sessions.db.bak"),
+        (sessions_db_wal_path.as_path(), "sessions.db-wal.bak"),
+        (sessions_db_shm_path.as_path(), "sessions.db-shm.bak"),
     ] {
         let dst = backup_set_dir.join(dst_name);
-        match backup::backup_sandbox_owned_file(Path::new(src), &dst, 0o600) {
+        match backup::backup_sandbox_owned_file(src, &dst, 0o600) {
             Ok(o) => match o.action {
                 backup::CopyAction::SourceAbsent => {
                     log_step(
                         "backup_sessions_db",
-                        &format!("src={src} action=skip status=ok reason=source-absent"),
+                        &format!("src={} action=skip status=ok reason=source-absent", src.display()),
                     );
                 }
                 backup::CopyAction::Skipped => {
@@ -1677,7 +1742,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                     log_step(
                         "backup_sessions_db",
                         &format!(
-                            "src={src} path={} sha256={} action=skip status=ok reason=identical",
+                            "src={} path={} sha256={} action=skip status=ok reason=identical",
+                            src.display(),
                             dst.display(),
                             o.sha256
                         ),
@@ -1694,7 +1760,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                     log_step(
                         "backup_sessions_db",
                         &format!(
-                            "src={src} path={} sha256={} action=copy status=ok",
+                            "src={} path={} sha256={} action=copy status=ok",
+                            src.display(),
                             dst.display(),
                             o.sha256
                         ),
@@ -1704,9 +1771,9 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             Err(e) => {
                 log_step(
                     "backup_sessions_db",
-                    &format!("src={src} action=copy status=fail err=\"{e}\""),
+                    &format!("src={} action=copy status=fail err=\"{e}\"", src.display()),
                 );
-                eprintln!("sandbox update: failed to back up {src}: {e}");
+                eprintln!("sandbox update: failed to back up {}: {e}", src.display());
                 return 1;
             }
         }
@@ -2612,13 +2679,19 @@ fn write_install_state_post_upgrade(inputs: &StatefulInputs<'_>) -> Result<(), S
 
 /// Read the install state as root, apply `mutate`, write via a tempfile
 /// owned by the current process, then `sudo install` over the dest.
+///
+/// The destination path is runtime-resolved via [`resolve_state_path`] so
+/// writes go to the per-uid location on a migrated host and to the legacy
+/// path on a pre-migration host (wherever the file currently lives).
 fn update_install_state_json<F>(mutate: F) -> Result<(), String>
 where
     F: FnOnce(&mut serde_json::Value) -> Result<(), String>,
 {
     use std::io::Write;
+    let dest = resolve_state_path(".install-state.json");
+    let dest_str = dest.to_str().unwrap();
     let out = std::process::Command::new("sudo")
-        .args(["-k", "cat", INSTALL_STATE_PATH])
+        .args(["-k", "cat", dest_str])
         .output()
         .map_err(|e| format!("read install state: {e}"))?;
     if !out.status.success() {
@@ -2649,7 +2722,7 @@ where
             "-g",
             "sandbox",
             tmp_path.to_str().unwrap(),
-            INSTALL_STATE_PATH,
+            dest_str,
         ])
         .output()
         .map_err(|e| format!("sudo install: {e}"))?;
@@ -3569,7 +3642,11 @@ mod tests {
         // here, but the lock-acquisition module is only reachable
         // through `run()`'s post-confirmation arm, which has not been
         // invoked.
-        assert!(!Path::new(lock::LOCK_PATH).exists() || std::fs::read(lock::LOCK_PATH).is_err());
+        // Lock path is runtime-resolved; a hermetic test host has no sandbox
+        // user so lock_path() returns the legacy path — either absent or
+        // unreadable by the test uid is the expected state.
+        let lp = lock::lock_path();
+        assert!(!lp.exists() || std::fs::read(&lp).is_err());
     }
 
     // -----------------------------------------------------------------
@@ -3681,5 +3758,85 @@ mod tests {
         );
         assert_eq!(set.stopped[0].bucket, CompatBucket::Ok);
         assert_eq!(set.stopped[1].bucket, CompatBucket::Recreate);
+    }
+
+    // -----------------------------------------------------------------
+    // prod_base_dir / resolve_state_path
+    // -----------------------------------------------------------------
+
+    /// `prod_base_dir()` returns `None` when the `sandbox` user is
+    /// absent (hermetic test hosts have no system users). This is the
+    /// graceful-degradation contract: a dev host must never panic or
+    /// hard-error because `User::from_name("sandbox")` returned None.
+    ///
+    /// On a host that *does* have the sandbox user the function returns
+    /// `Some(...)` — we cannot assert the exact uid, but we can assert
+    /// the shape of the returned path.
+    #[test]
+    fn prod_base_dir_returns_none_or_sandboxd_rooted_path() {
+        match prod_base_dir() {
+            None => {
+                // Dev host — expected on CI / hermetic test environments.
+            }
+            Some(p) => {
+                let s = p.to_string_lossy();
+                assert!(
+                    s.starts_with("/var/lib/sandboxd/"),
+                    "prod_base_dir must be under /var/lib/sandboxd/; got {s}"
+                );
+                // The trailing segment must be a non-empty numeric uid string.
+                let uid_seg = p.file_name().unwrap().to_string_lossy();
+                assert!(
+                    uid_seg.parse::<u32>().is_ok(),
+                    "trailing path segment must be a numeric uid; got {uid_seg}"
+                );
+            }
+        }
+    }
+
+    /// `resolve_state_path` falls back to the legacy `/var/lib/sandbox/<name>`
+    /// path when neither the per-uid path nor the legacy path exists AND the
+    /// sandbox user is absent (pure dev host). On such a host, both
+    /// `prod_base_dir()` and the file existence checks return nothing so the
+    /// function returns the legacy fallback path.
+    ///
+    /// This test is deliberately written to pass on BOTH a dev host (no
+    /// sandbox user → pure legacy fallback) and a migrated prod host
+    /// (sandbox user present + per-uid dir exists → per-uid path). The
+    /// invariant being pinned is that the function NEVER panics regardless
+    /// of host state.
+    #[test]
+    fn resolve_state_path_never_panics_regardless_of_host_state() {
+        // Should not panic on any host — that is the only universal assertion.
+        let p = resolve_state_path(".install-state.json");
+        // The path must end with the name we asked for.
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            ".install-state.json",
+            "resolve_state_path must preserve the requested name; got {p:?}"
+        );
+        // The path must be absolute.
+        assert!(
+            p.is_absolute(),
+            "resolve_state_path must return an absolute path; got {p:?}"
+        );
+    }
+
+    /// When `prod_base_dir()` returns `None` (no sandbox user), every
+    /// `resolve_state_path` call must return the legacy `/var/lib/sandbox/<name>`
+    /// path. Verifiable only when the sandbox user is actually absent, so
+    /// we skip on a prod host (to avoid asserting the wrong branch).
+    #[test]
+    fn resolve_state_path_uses_legacy_on_dev_host() {
+        if prod_base_dir().is_some() {
+            // Prod host — skip: the per-uid branch would fire, not legacy.
+            return;
+        }
+        let p = resolve_state_path("sessions.db");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/var/lib/sandbox/sessions.db"),
+            "on a dev host (no sandbox user) resolve_state_path must return the legacy path"
+        );
     }
 }

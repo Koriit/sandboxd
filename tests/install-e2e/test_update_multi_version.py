@@ -138,7 +138,7 @@ def test_update_fresh_install_to_next_version(
     # 2. Install-state advanced to v'. the install framework.2.29.
     state = json.loads(
         vm.shell(
-            "sudo cat /var/lib/sandbox/.install-state.json",
+            "SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json",
             check=True, timeout=10,
         ).stdout
     )
@@ -146,14 +146,13 @@ def test_update_fresh_install_to_next_version(
         f"install-state did not advance to {bumped_ver}: {state!r}"
     )
 
-    # 3. sessions.db integrity — the install framework.2.15 backs the DB up
-    # to /var/lib/sandbox/backups/, then preserves the live copy
-    # through the update. After a successful update the live DB at
-    # /var/lib/sandbox/sessions.db must (a) exist, (b) be a
-    # well-formed SQLite database (`PRAGMA integrity_check` returns
-    # "ok"), and (c) carry the `sessions` table the daemon depends
-    # on for queries. Without these assertions a regression that
-    # left the DB truncated or corrupted post-update would only
+    # 3. sessions.db integrity — the update flow backs the DB up to the
+    # per-uid backups dir, then preserves the live copy through the
+    # update. After a successful update the live DB must (a) exist,
+    # (b) be a well-formed SQLite database (`PRAGMA integrity_check`
+    # returns "ok"), and (c) carry the `sessions` table the daemon
+    # depends on for queries. Without these assertions a regression
+    # that left the DB truncated or corrupted post-update would only
     # surface on the next session-create — too late for the update
     # test to catch.
     #
@@ -164,8 +163,8 @@ def test_update_fresh_install_to_next_version(
     # the checks against Python's bundled `sqlite3` module — keeping
     # the guest's tool surface honest to the real install contract.
     vm.shell(
-        "sudo install -m 0644 -o root -g root "
-        "/var/lib/sandbox/sessions.db /tmp/sessions.db.inspect",
+        "SUID=$(id -u sandbox); sudo install -m 0644 -o root -g root "
+        "/var/lib/sandboxd/$SUID/sessions.db /tmp/sessions.db.inspect",
         check=True, timeout=10,
     )
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -178,7 +177,7 @@ def test_update_fresh_install_to_next_version(
             integrity = conn.execute("PRAGMA integrity_check;").fetchone()
             assert integrity is not None and integrity[0] == "ok", (
                 f"post-update sessions.db integrity_check failed: {integrity!r}; "
-                f"the live DB at /var/lib/sandbox/sessions.db is corrupted or truncated"
+                f"the live DB at the per-uid sessions.db is corrupted or truncated"
             )
             # `sessions` table must exist (the migration set is up-to-
             # date post-update; the table presence is the minimum

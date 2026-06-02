@@ -155,10 +155,10 @@ pub enum BaseImageStatus {
 
 /// Root directory for per-operator Lima state.
 ///
-/// Each operator gets an isolated LIMA_HOME at
-/// `/var/lib/sandboxd/<op_uid>/lima/`.  The directory is owned
-/// `sandbox:sandbox 0750` with POSIX ACLs granting the operator rwx on
-/// the directory itself and defaulting that rwx to all children.
+/// Each daemon uid gets its own subtree; within it each operator gets an
+/// isolated LIMA_HOME at `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/`.
+/// The directory is owned `sandbox:sandbox 0750` with POSIX ACLs granting
+/// the operator rwx on the directory itself.
 ///
 /// Installed at startup by `make setup-dev-env` and provisioned on first
 /// use by [`ensure_operator_lima_home`].
@@ -175,29 +175,54 @@ pub const SANDBOXD_STATE_ROOT: &str = "/var/lib/sandboxd";
 /// key-file path. Both sides must agree on the env var name.
 pub const STATE_ROOT_OVERRIDE_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_STATE_ROOT";
 
+/// Pure path-construction kernel for the per-operator LIMA_HOME.
+///
+/// Separated from [`operator_lima_home`] so tests can assert the 3-level path
+/// scheme (`{root}/{daemon_uid}/{op_uid}/lima`) without depending on the live
+/// process uid.
+///
+/// - `root`       — state-root prefix (production: [`SANDBOXD_STATE_ROOT`];
+///                  tests: a caller-supplied tempdir path).
+/// - `daemon_uid` — uid the daemon process itself runs as; the first variable
+///                  segment, isolating per-daemon state trees on the same host.
+/// - `op_uid`     — the human operator's uid; the second variable segment,
+///                  isolating per-operator Lima state within one daemon's tree.
+fn operator_lima_home_inner(root: &str, daemon_uid: u32, op_uid: u32) -> PathBuf {
+    PathBuf::from(format!("{root}/{daemon_uid}/{op_uid}/lima"))
+}
+
 /// Return the LIMA_HOME path for the given operator uid.
+///
+/// Path scheme: `{state_root}/{daemon_uid}/{op_uid}/lima`
+///
+/// - `daemon_uid` is derived from `getuid()` (kernel-provided, not
+///   caller-supplied) so each daemon uid produces an isolated subtree.
+/// - `op_uid` is the human operator's uid (unchanged from the caller's
+///   `--op-uid` argument).
 ///
 /// In `test-env-override` builds, the `SANDBOX_LIMA_HELPER_TEST_STATE_ROOT`
 /// env var can redirect the state root to a tempdir so integration tests
-/// do not touch `/var/lib/sandboxd/`.
+/// do not touch `/var/lib/sandboxd/`.  The daemon-uid segment is still
+/// inserted even when the override is active.
 pub fn operator_lima_home(op_uid: u32) -> PathBuf {
+    let daemon_uid = nix::unistd::Uid::current().as_raw();
     #[cfg(feature = "test-env-override")]
     if let Ok(root) = std::env::var(STATE_ROOT_OVERRIDE_ENV)
         && !root.is_empty()
     {
-        return PathBuf::from(format!("{root}/{op_uid}/lima"));
+        return operator_lima_home_inner(&root, daemon_uid, op_uid);
     }
-    PathBuf::from(format!("{SANDBOXD_STATE_ROOT}/{op_uid}/lima"))
+    operator_lima_home_inner(SANDBOXD_STATE_ROOT, daemon_uid, op_uid)
 }
 
-/// Ensure `/var/lib/sandboxd/<op_uid>/lima/` exists and carries the
-/// correct POSIX ACL so helper-pivoted `limactl` (running as `op_uid`)
+/// Ensure `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/` exists and carries
+/// the correct POSIX ACL so helper-pivoted `limactl` (running as `op_uid`)
 /// can write into it.
 ///
 /// Concrete steps:
 ///
-/// 1. `mkdir -p /var/lib/sandboxd/<op_uid>/lima/`
-/// 2. `setfacl -m u:<op_uid>:rwx,d:u:<op_uid>:rwx <dir>`
+/// 1. `mkdir -p /var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/`
+/// 2. `setfacl -m u:<op_uid>:rwx,d:g::---,d:o::--- <dir>`
 ///
 /// Idempotent: safe to call on every session-create.  The directory
 /// creation uses `std::fs::create_dir_all`, which is a no-op if the
@@ -373,7 +398,8 @@ impl LimaManagerRegistry {
     /// is the first call for that operator.
     ///
     /// On the first call for a given operator uid, this also provisions
-    /// the per-operator LIMA_HOME directory (`/var/lib/sandboxd/<op_uid>/lima/`)
+    /// the per-operator LIMA_HOME directory
+    /// (`/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/`)
     /// and applies the POSIX ACL that grants the operator uid write access.
     /// Without the ACL, limactl (which runs pivoted to the operator uid via
     /// `sandbox-lima-helper`) cannot create VM directories inside LIMA_HOME.
@@ -751,8 +777,8 @@ impl LimaManager {
     ///    LIMA_HOME sidesteps this entirely — Lima never looks outside its own
     ///    home directory.
     ///
-    /// The operator state root (`/var/lib/sandboxd/<op_uid>/`) is a sibling
-    /// of LIMA_HOME and is not scanned by Lima. A `0o644` tempfile there is
+    /// The operator state root (`/var/lib/sandboxd/<daemon_uid>/<op_uid>/`) is
+    /// a sibling of LIMA_HOME and is not scanned by Lima. A `0o644` tempfile there is
     /// readable by everyone (the template contains non-sensitive Lima YAML
     /// config — no keys, no secrets). The file is removed on success and on
     /// all error paths inside the callers (`create_vm`,
@@ -2085,11 +2111,11 @@ provision:
     /// triggers exactly that fatal.  The production path is:
     ///
     /// ```text
-    /// /var/lib/sandboxd/<op_uid>/          ← operator state root
-    ///   lima/                              ← LIMA_HOME  (base_dir)
-    ///     <vm-name>/                       ← Lima instance dirs
-    ///   libexec/                           ← wrapper dir  (base_dir/../libexec)
-    ///     qemu-system-x86_64              ← this wrapper, mode 0755
+    /// /var/lib/sandboxd/<daemon_uid>/<op_uid>/   ← operator state root
+    ///   lima/                                    ← LIMA_HOME  (base_dir)
+    ///     <vm-name>/                             ← Lima instance dirs
+    ///   libexec/                                 ← wrapper dir  (base_dir/../libexec)
+    ///     qemu-system-x86_64                    ← this wrapper, mode 0755
     /// ```
     ///
     /// The wrapper and its directory are world-readable and world-executable
@@ -2100,7 +2126,7 @@ provision:
     pub(crate) fn ensure_qemu_wrapper(&self) -> Result<PathBuf, SandboxError> {
         // Place the wrapper OUTSIDE LIMA_HOME so limactl never enumerates it
         // as a malformed instance.  base_dir == LIMA_HOME, so its parent is
-        // the operator state root (/var/lib/sandboxd/<op_uid>/).
+        // the operator state root (/var/lib/sandboxd/<daemon_uid>/<op_uid>/).
         let state_root = self.base_dir.parent().ok_or_else(|| {
             SandboxError::Internal(format!(
                 "base_dir {} has no parent — cannot derive operator state root for QEMU wrapper",
@@ -4114,18 +4140,21 @@ mod tests {
 
     #[test]
     fn operator_lima_home_path_is_correct() {
-        let path = operator_lima_home(1000);
+        // Use the pure inner fn with fixed uids so the assertion is
+        // independent of the live process uid.
+        let path = operator_lima_home_inner("/var/lib/sandboxd", 999, 1000);
         assert_eq!(
             path,
-            PathBuf::from("/var/lib/sandboxd/1000/lima"),
-            "per-operator LIMA_HOME must be /var/lib/sandboxd/<uid>/lima"
+            PathBuf::from("/var/lib/sandboxd/999/1000/lima"),
+            "per-operator LIMA_HOME must be <root>/<daemon_uid>/<op_uid>/lima"
         );
     }
 
     #[test]
-    fn operator_lima_home_varies_by_uid() {
-        let path_1000 = operator_lima_home(1000);
-        let path_1001 = operator_lima_home(1001);
+    fn operator_lima_home_varies_by_op_uid() {
+        // Different operator uids must yield different paths (daemon uid fixed).
+        let path_1000 = operator_lima_home_inner("/var/lib/sandboxd", 999, 1000);
+        let path_1001 = operator_lima_home_inner("/var/lib/sandboxd", 999, 1001);
         assert_ne!(
             path_1000, path_1001,
             "different operator uids must produce distinct LIMA_HOME paths"
@@ -4137,6 +4166,25 @@ mod tests {
         assert!(
             path_1001.as_os_str().to_string_lossy().contains("1001"),
             "path must contain the operator uid"
+        );
+    }
+
+    #[test]
+    fn operator_lima_home_varies_by_daemon_uid() {
+        // Different daemon uids must yield different paths (op uid fixed).
+        let path_d999 = operator_lima_home_inner("/var/lib/sandboxd", 999, 1000);
+        let path_d1000 = operator_lima_home_inner("/var/lib/sandboxd", 1000, 1000);
+        assert_ne!(
+            path_d999, path_d1000,
+            "different daemon uids must produce distinct LIMA_HOME paths"
+        );
+        assert!(
+            path_d999.as_os_str().to_string_lossy().contains("999"),
+            "path must contain the daemon uid"
+        );
+        assert!(
+            path_d1000.as_os_str().to_string_lossy().contains("1000"),
+            "path must contain the daemon uid"
         );
     }
 
@@ -4166,14 +4214,16 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// Like [`ensure_operator_lima_home`] but with a caller-supplied base
-    /// directory.  Used by hermetic tests to avoid writing under
-    /// `/var/lib/sandboxd/`.
+    /// Like [`ensure_operator_lima_home`] but with caller-supplied base
+    /// directory and daemon uid.  Used by hermetic tests to avoid writing
+    /// under `/var/lib/sandboxd/` and to exercise the 3-level path scheme
+    /// with an explicit daemon uid rather than the live process uid.
     pub(super) fn ensure_operator_lima_home_at(
         base: &std::path::Path,
+        daemon_uid: u32,
         op_uid: u32,
     ) -> Result<PathBuf, SandboxError> {
-        let lima_home = base.join(format!("{op_uid}/lima"));
+        let lima_home = base.join(format!("{daemon_uid}/{op_uid}/lima"));
         std::fs::create_dir_all(&lima_home).map_err(|e| {
             SandboxError::Internal(format!(
                 "failed to create per-operator LIMA_HOME {}: {e}",
@@ -4202,8 +4252,8 @@ mod tests {
     #[test]
     fn ensure_operator_lima_home_creates_directory() {
         let tmp = tempfile::TempDir::new().expect("create tempdir");
-        let op_uid = nix::unistd::Uid::current().as_raw();
-        let lima_home = ensure_operator_lima_home_at(tmp.path(), op_uid)
+        let current_uid = nix::unistd::Uid::current().as_raw();
+        let lima_home = ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
             .expect("ensure_operator_lima_home_at must succeed");
         assert!(
             lima_home.is_dir(),
@@ -4214,11 +4264,12 @@ mod tests {
     #[test]
     fn ensure_operator_lima_home_is_idempotent() {
         let tmp = tempfile::TempDir::new().expect("create tempdir");
-        let op_uid = nix::unistd::Uid::current().as_raw();
+        let current_uid = nix::unistd::Uid::current().as_raw();
         // First call: creates the directory and applies ACLs.
-        ensure_operator_lima_home_at(tmp.path(), op_uid).expect("first ensure call must succeed");
+        ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
+            .expect("first ensure call must succeed");
         // Second call: directory already exists; setfacl is idempotent.
-        ensure_operator_lima_home_at(tmp.path(), op_uid)
+        ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
             .expect("second ensure call must succeed (idempotent)");
     }
 
@@ -4238,11 +4289,11 @@ mod tests {
         // limactl creates (post-setresuid pivot) and accesses them via owner
         // bits — no default named-user propagation needed.
         //
-        // We use the current uid as the operator uid so the test doesn't
-        // need root to set ACLs for an arbitrary uid.
+        // We use the current uid as both daemon uid and operator uid so the
+        // test doesn't need root to set ACLs for an arbitrary uid.
         let tmp = tempfile::TempDir::new().expect("create tempdir");
         let op_uid = nix::unistd::Uid::current().as_raw();
-        let lima_home = ensure_operator_lima_home_at(tmp.path(), op_uid)
+        let lima_home = ensure_operator_lima_home_at(tmp.path(), op_uid, op_uid)
             .expect("ensure_operator_lima_home_at must succeed");
 
         let acl = getfacl_output(&lima_home);
@@ -4319,7 +4370,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, uid),
+            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
         );
         let mgr1 = registry.get_or_create(1000).expect("get_or_create");
         let mgr2 = registry.get_or_create(1000).expect("get_or_create");
@@ -4337,7 +4388,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, uid),
+            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
         );
         let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
         let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
@@ -4357,7 +4408,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, uid),
+            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
         );
         let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
         let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
@@ -4400,7 +4451,7 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, uid),
+            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
         ));
 
         let barrier = Arc::new(Barrier::new(2));
@@ -4450,7 +4501,7 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, uid),
+            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
         ));
 
         let barrier = Arc::new(Barrier::new(2));

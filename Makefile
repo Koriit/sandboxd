@@ -1,6 +1,6 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
-	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-test-base-dir
+	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -137,16 +137,16 @@ TEST ?=
 # container`). Zero convention-driven skips on a properly-configured
 # host; runs in ~5-10 min on a warm runner.
 #
-# The daemon socket is mode 0660 group=sandbox. A developer added via
-# `usermod -aG sandbox` but not yet re-logged-in does not have the
-# group active in their shell. Wrapping pytest in `sg sandbox`
+# The daemon socket is mode 0660 group=sandbox-test. A developer added via
+# `usermod -aG sandbox-test` but not yet re-logged-in does not have the
+# group active in their shell. Wrapping pytest in `sg sandbox-test`
 # activates the group for the subprocess without requiring a re-login.
 test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-prod-cap install-guest-prod
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color -m \"not lima\" -k \"not [lima]\" $(TEST)"; \
-	  echo "[make] wrapping pytest in 'sg sandbox' (daemon socket is group=sandbox)"; \
-	  sg sandbox -c "$$_pytest"
+	  echo "[make] wrapping pytest in 'sg sandbox-test' (daemon socket is group=sandbox-test)"; \
+	  sg sandbox-test -c "$$_pytest"
 
 # Merge-to-main: full matrix -- Lima + container parametrizations plus
 # the Lima-only and container-only test files. Wall clock ~30-45 min.
@@ -156,16 +156,16 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # qemu-bridge-helper / bridge.conf emit per-test skips via the
 # `_lima_required_for_lima_tests` fixture; everything else runs.
 #
-# The daemon socket is mode 0660 group=sandbox. A developer added via
-# `usermod -aG sandbox` but not yet re-logged-in does not have the
-# group active in their shell. Wrapping pytest in `sg sandbox`
+# The daemon socket is mode 0660 group=sandbox-test. A developer added via
+# `usermod -aG sandbox-test` but not yet re-logged-in does not have the
+# group active in their shell. Wrapping pytest in `sg sandbox-test`
 # activates the group for the subprocess without requiring a re-login.
 test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-prod-cap install-guest-prod
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $(TEST)"; \
-	  echo "[make] wrapping pytest in 'sg sandbox' (daemon socket is group=sandbox)"; \
-	  sg sandbox -c "$$_pytest"
+	  echo "[make] wrapping pytest in 'sg sandbox-test' (daemon socket is group=sandbox-test)"; \
+	  sg sandbox-test -c "$$_pytest"
 
 # Back-compat alias. `make test-e2e` continues to run the full matrix.
 test-e2e: test-e2e-matrix
@@ -325,13 +325,16 @@ QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 # keeping it as a Makefile-local constant is enough).
 TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
 
-setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandbox-test-base-dir
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
 	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
 
-# setup-sandboxd-state-dir — create /var/lib/sandboxd/ owned by sandbox:sandbox
-# mode 0750.  This is the root of per-operator Lima state trees
-# (/var/lib/sandboxd/<op_uid>/lima/); per-operator subdirs are created at
-# first session-create time by the daemon via ensure_operator_lima_home().
+# setup-sandboxd-state-dir — create /var/lib/sandboxd/ owned by root:root
+# mode 0755.  This is the traversable root of per-daemon-uid state trees
+# (/var/lib/sandboxd/<daemon_uid>/); each daemon user (sandbox, sandbox-test)
+# owns its own 0750 subtree created by setup-sandboxd-per-uid-state-dir.
+# Mode 0755 (not 0750) is required so BOTH daemon users can traverse into
+# their respective subdirectories — a 0750 root owned by one user would
+# block the other.
 #
 # Idempotence:
 #   - Directory present with correct ownership and mode → ✓ already configured.
@@ -341,27 +344,26 @@ setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap insta
 # The `acl` package must be installed on the host (provides setfacl/getfacl).
 # The daemon uses setfacl to apply per-operator ACLs at session-create time.
 setup-sandboxd-state-dir:
-	@if ! getent passwd sandbox >/dev/null 2>&1; then \
-	  echo "ERROR: system user 'sandbox' does not exist; run 'make setup-sandbox-user' first"; \
-	  exit 1; \
-	fi
 	@if [ ! -d /var/lib/sandboxd ]; then \
 	  echo "[sudo] mkdir -p /var/lib/sandboxd"; \
 	  sudo -k mkdir -p /var/lib/sandboxd; \
-	  echo "[sudo] chown sandbox:sandbox /var/lib/sandboxd"; \
-	  sudo -k chown sandbox:sandbox /var/lib/sandboxd; \
-	  echo "[sudo] chmod 0750 /var/lib/sandboxd"; \
-	  sudo -k chmod 0750 /var/lib/sandboxd; \
+	  echo "[sudo] chown root:root /var/lib/sandboxd"; \
+	  sudo -k chown root:root /var/lib/sandboxd; \
+	  echo "[sudo] chmod 0755 /var/lib/sandboxd"; \
+	  sudo -k chmod 0755 /var/lib/sandboxd; \
 	else \
 	  owner=$$(stat -c '%U:%G' /var/lib/sandboxd 2>/dev/null || echo "?:?"); \
 	  mode=$$(stat -c '%a' /var/lib/sandboxd 2>/dev/null || echo "?"); \
-	  if [ "$$owner" = "sandbox:sandbox" ] && [ "$$mode" = "750" ]; then \
-	    echo "$(GREEN)✓ already configured: /var/lib/sandboxd (sandbox:sandbox 0750)$(RESET)"; \
+	  if [ "$$mode" = "755" ] && [ "$$owner" = "root:root" ]; then \
+	    echo "$(GREEN)✓ already configured: /var/lib/sandboxd ($$owner 0755)$(RESET)"; \
+	  elif [ "$$mode" = "755" ]; then \
+	    echo "[sudo] chown root:root /var/lib/sandboxd (was: $$owner 0755)"; \
+	    sudo -k chown root:root /var/lib/sandboxd; \
 	  else \
-	    echo "[sudo] chown sandbox:sandbox /var/lib/sandboxd (was: $$owner $$mode)"; \
-	    sudo -k chown sandbox:sandbox /var/lib/sandboxd; \
-	    echo "[sudo] chmod 0750 /var/lib/sandboxd"; \
-	    sudo -k chmod 0750 /var/lib/sandboxd; \
+	    echo "[sudo] chown root:root /var/lib/sandboxd (was: $$owner $$mode)"; \
+	    sudo -k chown root:root /var/lib/sandboxd; \
+	    echo "[sudo] chmod 0755 /var/lib/sandboxd (was: $$owner $$mode)"; \
+	    sudo -k chmod 0755 /var/lib/sandboxd; \
 	  fi; \
 	fi
 	@if ! command -v setfacl >/dev/null 2>&1; then \
@@ -369,51 +371,50 @@ setup-sandboxd-state-dir:
 	  echo "         The daemon uses setfacl to provision per-operator LIMA_HOME ACLs at session-create time."; \
 	fi
 
-# setup-sandbox-test-base-dir — create /var/lib/sandbox-test owned by
-# sandbox:sandbox mode 0750. This is the base directory the e2e and
-# integration harnesses point the daemon at (via --base-dir), holding
+# setup-sandboxd-per-uid-state-dir — create the e2e daemon's per-uid base
+# directory /var/lib/sandboxd/<sandbox-test-uid> owned by
+# sandbox-test:sandbox-test mode 0750. This is where the e2e daemon stores
 # sessions.db, per-session state, and the unix socket
-# (/var/lib/sandbox-test/sandboxd.sock).
+# (/var/lib/sandboxd/<sandbox-test-uid>/sandboxd.sock).
 #
-# DELIBERATELY SEPARATE from the production base dir /var/lib/sandbox
-# (which install.sh creates and owns) and from the sandbox user's home
-# (useradd --home-dir /var/lib/sandbox, also prod). A real prod install
-# and the test harness can therefore coexist on one host without the
-# harness's state-dir reset wiping the prod daemon's sessions.db /
-# .install-state.json, and without two daemons sharing one sessions.db.
-# The 0750 mode (group=sandbox, r-x) lets any operator in the sandbox
-# group connect to the socket.
+# Isolation guarantee: the e2e daemon (sandbox-test uid) and the prod daemon
+# (sandbox uid) each own their own 0750 subtree under /var/lib/sandboxd/,
+# which is world-traversable (0755) so both users can reach their subtree.
+# The e2e state-dir reset operates only within the sandbox-test subtree and
+# can never touch the prod daemon's /var/lib/sandboxd/<sandbox-uid>/ tree.
 #
 # Idempotence:
 #   - Directory present with correct ownership and mode → ✓ already configured.
 #   - Directory present but wrong ownership/mode → correct in place.
 #   - Directory absent → create it.
 #
-# Ordering: must run after setup-sandbox-user (the sandbox user/group must exist).
-setup-sandbox-test-base-dir: setup-sandbox-user
-	@if ! getent passwd sandbox >/dev/null 2>&1; then \
-	  echo "ERROR: system user 'sandbox' does not exist; run 'make setup-sandbox-user' first"; \
+# Ordering: must run after setup-sandbox-test-user and setup-sandboxd-state-dir.
+setup-sandboxd-per-uid-state-dir: setup-sandbox-test-user setup-sandboxd-state-dir
+	@if ! getent passwd sandbox-test >/dev/null 2>&1; then \
+	  echo "ERROR: system user 'sandbox-test' does not exist; run 'make setup-sandbox-test-user' first"; \
 	  exit 1; \
 	fi
-	@if [ ! -d /var/lib/sandbox-test ]; then \
-	  echo "[sudo] mkdir -p /var/lib/sandbox-test"; \
-	  sudo -k mkdir -p /var/lib/sandbox-test; \
-	  echo "[sudo] chown sandbox:sandbox /var/lib/sandbox-test"; \
-	  sudo -k chown sandbox:sandbox /var/lib/sandbox-test; \
-	  echo "[sudo] chmod 0750 /var/lib/sandbox-test"; \
-	  sudo -k chmod 0750 /var/lib/sandbox-test; \
-	else \
-	  owner=$$(stat -c '%U:%G' /var/lib/sandbox-test 2>/dev/null || echo "?:?"); \
-	  mode=$$(stat -c '%a' /var/lib/sandbox-test 2>/dev/null || echo "?"); \
-	  if [ "$$owner" = "sandbox:sandbox" ] && [ "$$mode" = "750" ]; then \
-	    echo "$(GREEN)✓ already configured: /var/lib/sandbox-test (sandbox:sandbox 0750)$(RESET)"; \
+	@sandbox_test_uid=$$(id -u sandbox-test); \
+	  per_uid_dir="/var/lib/sandboxd/$$sandbox_test_uid"; \
+	  if [ ! -d "$$per_uid_dir" ]; then \
+	    echo "[sudo] mkdir -p $$per_uid_dir"; \
+	    sudo -k mkdir -p "$$per_uid_dir"; \
+	    echo "[sudo] chown sandbox-test:sandbox-test $$per_uid_dir"; \
+	    sudo -k chown sandbox-test:sandbox-test "$$per_uid_dir"; \
+	    echo "[sudo] chmod 0750 $$per_uid_dir"; \
+	    sudo -k chmod 0750 "$$per_uid_dir"; \
 	  else \
-	    echo "[sudo] chown sandbox:sandbox /var/lib/sandbox-test (was: $$owner $$mode)"; \
-	    sudo -k chown sandbox:sandbox /var/lib/sandbox-test; \
-	    echo "[sudo] chmod 0750 /var/lib/sandbox-test"; \
-	    sudo -k chmod 0750 /var/lib/sandbox-test; \
-	  fi; \
-	fi
+	    owner=$$(stat -c '%U:%G' "$$per_uid_dir" 2>/dev/null || echo "?:?"); \
+	    mode=$$(stat -c '%a' "$$per_uid_dir" 2>/dev/null || echo "?"); \
+	    if [ "$$owner" = "sandbox-test:sandbox-test" ] && [ "$$mode" = "750" ]; then \
+	      echo "$(GREEN)✓ already configured: $$per_uid_dir (sandbox-test:sandbox-test 0750)$(RESET)"; \
+	    else \
+	      echo "[sudo] chown sandbox-test:sandbox-test $$per_uid_dir (was: $$owner $$mode)"; \
+	      sudo -k chown sandbox-test:sandbox-test "$$per_uid_dir"; \
+	      echo "[sudo] chmod 0750 $$per_uid_dir"; \
+	      sudo -k chmod 0750 "$$per_uid_dir"; \
+	    fi; \
+	  fi
 
 # setup-sandbox-user — create the `sandbox` system user and group
 # that the e2e harness drops the daemon to. Mirrors the production
@@ -479,6 +480,81 @@ setup-sandbox-user:
 	  fi; \
 	fi
 
+# setup-sandbox-test-user — create the `sandbox-test` system user and group
+# that the e2e harness drops the daemon to.  Mirrors setup-sandbox-user but
+# for the dedicated e2e daemon uid so the two daemons (prod: sandbox, e2e:
+# sandbox-test) run as distinct uids and their per-uid state trees under
+# /var/lib/sandboxd/ are structurally disjoint.
+#
+# Adds sandbox-test to the `docker` and `kvm` groups so the e2e daemon
+# can reach /dev/kvm and the Docker socket (same rationale as sandbox).
+#
+# Also adds the invoking operator to the `sandbox-test` group so the pytest
+# process can connect to the e2e socket (mode 0660, group=sandbox-test after
+# setup-sandboxd-per-uid-state-dir and daemon startup). The `sg sandbox-test`
+# wrapper in `make test-e2e-*` activates the group without requiring a re-login.
+#
+# Idempotence:
+#
+#   - User present  → print `✓ already configured` and invoke no sudo.
+#   - User missing  → emit a `[sudo]` announce line first, then
+#                     `sudo useradd`. Group adds via `usermod -aG`
+#                     are themselves idempotent (already-member is a
+#                     no-op exit 0).
+#
+# Group-only pre-existing state is handled as in setup-sandbox-user.
+setup-sandbox-test-user:
+	@if getent passwd sandbox-test >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: system user 'sandbox-test' exists$(RESET)"; \
+	else \
+	  if getent group sandbox-test >/dev/null 2>&1; then \
+	    echo "[sudo] useradd --system --gid sandbox-test --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin sandbox-test  (group already exists; binding user to it)"; \
+	    sudo -k useradd \
+	        --system \
+	        --gid sandbox-test \
+	        --no-create-home \
+	        --home-dir /nonexistent \
+	        --shell /usr/sbin/nologin \
+	        --comment "sandboxd e2e test daemon" \
+	        sandbox-test; \
+	  else \
+	    echo "[sudo] useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin sandbox-test"; \
+	    sudo -k useradd \
+	        --system \
+	        --user-group \
+	        --no-create-home \
+	        --home-dir /nonexistent \
+	        --shell /usr/sbin/nologin \
+	        --comment "sandboxd e2e test daemon" \
+	        sandbox-test; \
+	  fi; \
+	fi
+	@if getent group docker >/dev/null 2>&1; then \
+	  if id -nG sandbox-test 2>/dev/null | tr ' ' '\n' | grep -qx docker; then \
+	    echo "$(GREEN)✓ already configured: user 'sandbox-test' is in group 'docker'$(RESET)"; \
+	  else \
+	    echo "[sudo] usermod -aG docker sandbox-test"; \
+	    sudo -k usermod -aG docker sandbox-test; \
+	  fi; \
+	fi
+	@if getent group kvm >/dev/null 2>&1; then \
+	  if id -nG sandbox-test 2>/dev/null | tr ' ' '\n' | grep -qx kvm; then \
+	    echo "$(GREEN)✓ already configured: user 'sandbox-test' is in group 'kvm'$(RESET)"; \
+	  else \
+	    echo "[sudo] usermod -aG kvm sandbox-test"; \
+	    sudo -k usermod -aG kvm sandbox-test; \
+	  fi; \
+	fi
+	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	  echo "$(GREEN)✓ already configured: operator-group-add for sandbox-test skipped (no non-root $$USER set)$(RESET)"; \
+	elif id -nG "$$USER" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox-test; then \
+	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group 'sandbox-test'$(RESET)"; \
+	else \
+	  echo "[sudo] usermod -aG sandbox-test $$USER  (operator needs sandbox-test group to reach e2e socket; new group visible after re-login or via 'sg sandbox-test -c …')"; \
+	  sudo -k usermod -aG sandbox-test "$$USER"; \
+	  echo "$(GREEN)✓ added '$$USER' to group 'sandbox-test' — re-login (or 'sg sandbox-test -c …') required for the change to take effect in the current shell$(RESET)"; \
+	fi
+
 # setup-operator-group-membership — add the invoking operator
 # ($USER) to the `sandbox` group so the operator's CLI can read/write
 # the daemon socket at `/run/sandbox/sandboxd.sock` (mode 0660,
@@ -521,10 +597,10 @@ setup-test-sudoers-fragment:
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
 	  echo "$(GREEN)✓ already configured: sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
 	else \
-	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH\""; \
-	  fragment="$$USER ALL=(sandbox) NOPASSWD: ALL"; \
+	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP\""; \
+	  fragment="$$USER ALL=(sandbox,sandbox-test) NOPASSWD: ALL"; \
 	  tmp=$$(mktemp); \
-	  printf '# Managed by `make setup-test-sudoers-fragment` — do not edit.\n# Grants the operator passwordless impersonation of the unprivileged\n# `sandbox` system user for the e2e harness. Runtime sudo is\n# exclusively `sudo -u sandbox` (never root). The `sandbox` user is\n# an unprivileged system user (nologin, no sudo of its own, no caps);\n# test/dev hosts only.\n#\n# The env_keep directive propagates test-harness variables through\n# sudo (which strips the environment by default).\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
+	  printf '# Managed by `make setup-test-sudoers-fragment` — do not edit.\n# Grants the operator passwordless impersonation of the unprivileged\n# `sandbox` and `sandbox-test` system users for the e2e harness.\n# Runtime sudo is exclusively `sudo -u sandbox` or `sudo -u sandbox-test`\n# (never root). Both users are unprivileged system users (nologin, no\n# sudo of their own, no caps); test/dev hosts only.\n#\n# The env_keep directive propagates test-harness variables through\n# sudo (which strips the environment by default).\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
 	  chmod 0440 "$$tmp"; \
 	  if sudo -k visudo -c -f "$$tmp" >/dev/null 2>&1; then \
 	    : ok; \
@@ -812,39 +888,42 @@ setup-users-conf:
 	  sudo -k chown root:root "$(USERS_CONF_PATH)"; \
 	  sudo -k chmod 0644 "$(USERS_CONF_PATH)"; \
 	fi
-	@# Ensure BOTH managed pools list the daemon's caller uid (`sandbox`)
-	@# alongside the operator account, so the created/managed users.conf is
-	@# production-ready, not just test-ready:
+	@# Ensure BOTH managed pools list the correct daemon caller uid alongside
+	@# the operator account, so the created/managed users.conf is
+	@# production-ready for both prod and e2e daemons:
 	@#   - Production pool 10.209.0.0/20 — the pool the installed prod daemon
-	@#     uses. install.sh skips writing users.conf when the file already
-	@#     exists, so on a dev-env host the prod daemon inherits THIS file;
-	@#     it must already carry a correct prod pool (matching install.sh's
-	@#     10.209.0.0/20, NOT a narrower legacy /24).
-	@#   - E2E test pool 10.220.0.0/20 — used by the e2e harness.
-	@# The route helper's pair-check requires BOTH the caller uid (the
-	@# daemon, `sandbox`) AND the `--for-user` uid in the matched pool's
-	@# `allow_users`, so each managed pool lists both. Idempotent: rewrites
-	@# only when a managed pool's allow_users differs or is missing, and only
-	@# ever touches these two managed entries — never reorders or removes
-	@# other (operator-authored) entries. A pre-existing non-canonical entry
-	@# (e.g. a legacy 10.209.0.0/24) is left in place; remove it by hand or
+	@#     (running as `sandbox`) uses. install.sh skips writing users.conf
+	@#     when the file already exists, so on a dev-env host the prod daemon
+	@#     inherits THIS file; it must already carry a correct prod pool
+	@#     (matching install.sh's 10.209.0.0/20, NOT a narrower legacy /24).
+	@#     allow_users = [$USER, sandbox].
+	@#   - E2E test pool 10.220.0.0/20 — used by the e2e harness whose daemon
+	@#     runs as `sandbox-test`. allow_users = [$USER, sandbox-test].
+	@# The route helper's pair-check requires BOTH the caller uid (the daemon)
+	@# AND the `--for-user` uid in the matched pool's `allow_users`. The
+	@# test pool lists `sandbox-test` (not `sandbox`) because the e2e daemon
+	@# runs as sandbox-test. Idempotent: rewrites only when a managed pool's
+	@# allow_users differs or is missing, and only ever touches these two
+	@# managed entries — never reorders or removes other (operator-authored)
+	@# entries. A pre-existing non-canonical entry (e.g. a legacy
+	@# 10.209.0.0/24) is left in place; remove it by hand or
 	@# `sudo rm $(USERS_CONF_PATH) && make setup-users-conf` to regenerate.
 	@tmp1=$$(mktemp); tmp2=$$(mktemp); \
-	ensure_pool() { USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); cidr=sys.argv[3]; comment=sys.argv[4]; want=[os.environ["USER"],"sandbox"]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")==cidr),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":comment,"cidr":cidr,"allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$$1" "$$2" "$$3" "$$4" 2>/dev/null; }; \
-	r1=$$(ensure_pool "$(USERS_CONF_PATH)" "$$tmp1" "10.209.0.0/20" "Production pool: sandbox daemon caller plus operator for the route-helper pair-check") || { \
+	ensure_pool() { USER="$$USER" WANT_DAEMON="$$1" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); cidr=sys.argv[3]; comment=sys.argv[4]; want=[os.environ["USER"],os.environ["WANT_DAEMON"]]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")==cidr),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":comment,"cidr":cidr,"allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$$2" "$$3" "$$4" "$$5" 2>/dev/null; }; \
+	r1=$$(ensure_pool sandbox "$(USERS_CONF_PATH)" "$$tmp1" "10.209.0.0/20" "Production pool: sandbox daemon caller plus operator for the route-helper pair-check") || { \
 	  echo "ERROR: $(USERS_CONF_PATH) exists but is not parseable as JSON."; \
 	  echo "Refusing to mutate. Inspect the file and re-run after fixing."; \
 	  rm -f "$$tmp1" "$$tmp2"; exit 1; \
 	}; \
-	r2=$$(ensure_pool "$$tmp1" "$$tmp2" "10.220.0.0/20" "E2E test pool (cross-user e2e harness): sandbox daemon caller plus operator accounts for the route-helper pair-check") || { \
+	r2=$$(ensure_pool sandbox-test "$$tmp1" "$$tmp2" "10.220.0.0/20" "E2E test pool (cross-user e2e harness): sandbox-test daemon caller plus operator accounts for the route-helper pair-check") || { \
 	  echo "ERROR: failed to update test pool in $(USERS_CONF_PATH)."; \
 	  rm -f "$$tmp1" "$$tmp2"; exit 1; \
 	}; \
 	if [ "$$r1" = "unchanged" ] && [ "$$r2" = "unchanged" ]; then \
-	  echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (prod pool 10.209.0.0/20 + test pool 10.220.0.0/20 list sandbox + operator)$(RESET)"; \
+	  echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (prod pool 10.209.0.0/20 lists sandbox + operator; test pool 10.220.0.0/20 lists sandbox-test + operator)$(RESET)"; \
 	  rm -f "$$tmp1" "$$tmp2"; \
 	else \
-	  echo "[sudo] ensure prod pool 10.209.0.0/20 and test pool 10.220.0.0/20 allow_users = [$$USER, sandbox] in $(USERS_CONF_PATH)"; \
+	  echo "[sudo] ensure prod pool 10.209.0.0/20 allow_users=[$$USER,sandbox] and test pool 10.220.0.0/20 allow_users=[$$USER,sandbox-test] in $(USERS_CONF_PATH)"; \
 	  echo "[sudo] install -o root -g root -m 0644 <updated> $(USERS_CONF_PATH)"; \
 	  sudo -k install -o root -g root -m 0644 "$$tmp2" "$(USERS_CONF_PATH)"; \
 	  rm -f "$$tmp1" "$$tmp2"; \

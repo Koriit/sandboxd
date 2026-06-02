@@ -492,7 +492,12 @@ Every helper invocation — allowed or denied — writes one JSON-Lines record t
 
 ```bash
 # Production install (operator install via install.sh; daemon runs as the `sandbox` user):
-sudo -u sandbox tail -n 20 /var/lib/sandbox/route-helper-audit.log
+# The audit log path follows the helper's XDG_RUNTIME_DIR resolution — for the sandbox
+# system user this is typically /run/user/<sandbox-uid>/sandboxd/route-helper-audit.log.
+SANDBOX_UID=$(id -u sandbox)
+sudo -u sandbox tail -n 20 "/run/user/${SANDBOX_UID}/sandboxd/route-helper-audit.log"
+# Fallback if the system user has no XDG_RUNTIME_DIR (no linger enabled):
+# sudo -u sandbox tail -n 20 /tmp/sandboxd/route-helper-audit.log
 
 # Developer install (daemon runs as the invoking operator):
 tail -n 20 "$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log"
@@ -511,7 +516,7 @@ The **`reason`** field carries a short tag for the deny class. Common values:
 - `"gateway-ip not in any subnet"` — the daemon asked for a gateway IP that does not fall into any configured pool's CIDR. This is a daemon-side or `users.conf` configuration drift, not an operator-permissions issue.
 - `"username resolution failed"` — `getpwuid_r` could not resolve the helper's UID (e.g., the caller's `/etc/passwd` entry vanished). Restore the entry and retry.
 
-If the audit log itself is missing or the deny path was hit with a write failure, `journalctl -u sandboxd` will show a non-zero helper exit even when no audit record was written — a write failure on the deny path is explicitly escalated (the helper still exits non-zero with a stderr line) so the missing-record case never silences the deny. In that case, check `df -h /var/lib/sandbox` (production) or `df -h $XDG_RUNTIME_DIR` (today's mode) for disk-pressure root causes.
+If the audit log itself is missing or the deny path was hit with a write failure, `journalctl -u sandboxd` will show a non-zero helper exit even when no audit record was written — a write failure on the deny path is explicitly escalated (the helper still exits non-zero with a stderr line) so the missing-record case never silences the deny. In that case, check `df -h /var/lib/sandboxd` (production) or `df -h $XDG_RUNTIME_DIR` (dev install) for disk-pressure root causes.
 
 ## Session stuck in Creating
 

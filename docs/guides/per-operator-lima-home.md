@@ -19,7 +19,7 @@ The solution is a narrowly-scoped setcap helper, `sandbox-lima-helper`, that:
 3. Drops to the operator uid via `setresuid`.
 4. Clears all capabilities.
 5. Execs `limactl` with a sanitised env block that includes
-   `LIMA_HOME=/var/lib/sandboxd/<op_uid>/lima/`.
+   `LIMA_HOME=/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/`.
 
 This mirrors the `sandbox-route-helper` privilege model documented in
 `CLAUDE.md`.
@@ -46,40 +46,62 @@ startup.
 
 ### `/var/lib/sandboxd/`
 
-Root of all per-operator Lima state. Must exist before the daemon starts.
+State root, shared by all daemon users on the host. Must be world-traversable
+so each daemon user (`sandbox`, `sandbox-test`, …) can reach its own per-uid
+subtree.
 
-| Property | Value             |
-| -------- | ----------------- |
-| Owner    | `sandbox:sandbox` |
-| Mode     | `0750`            |
+| Property | Value      |
+| -------- | ---------- |
+| Owner    | `root:root` |
+| Mode     | `0755`     |
 
-Created by `make setup-dev-env` (via the `setup-sandboxd-state-dir` target).
-If the directory is absent at daemon startup the daemon attempts to create it;
-`EACCES` is a fatal startup error.
+Created by `make setup-dev-env` (via the `setup-sandboxd-state-dir` target)
+and by `install.sh` on a production host.
 
-### `/var/lib/sandboxd/<op_uid>/lima/`
+### `/var/lib/sandboxd/<daemon_uid>/`
 
-Per-operator LIMA_HOME. Created automatically at first session-create for
-each operator by `ensure_operator_lima_home()` in `sandbox-core`.
+Per-daemon subtree. Each daemon user owns exactly one subtree keyed on its
+numeric uid. All daemon state (sessions.db, sessions/, events/, backups/,
+.install-state.json, .update.lock) lives here, as does the socket and the
+per-operator Lima homes.
 
-| Property    | Value              |
-| ----------- | ------------------ |
-| Owner       | `sandbox:sandbox`  |
-| Mode        | `0750`             |
-| Access ACL  | `u:<op_uid>:rwx`   |
-| Default ACL | `d:u:<op_uid>:rwx` |
+| Property | Value                    |
+| -------- | ------------------------ |
+| Owner    | `<daemon_user>:<daemon_user>` |
+| Mode     | `0750`                   |
 
-The access ACL grants the operator directory-level rwx. The default ACL
-propagates that rwx to every child that `limactl create` writes inside the
-directory — including `_config/user` (mode 0600, owned by the operator after
-the helper pivot) — without any subsequent `chown` step.
+### `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/`
 
-**Note on `_config/user`:** the key file itself does **not** receive an ACL.
-It is written by helper-pivoted `limactl` running as the operator, so it ends
-up owned `<op_uid>:<op_gid>` mode 0600, satisfying `StrictKeyfileMode` via
-plain `st_mode`/owner match. Adding an ACL to the key file would be
-unnecessary and would cause `ls -l` to display the `+` marker on a file that
-operators reasonably expect to be vanilla.
+Per-operator LIMA_HOME, nested under the daemon uid's subtree. Created
+automatically at first session-create for each operator by
+`ensure_operator_lima_home()` in `sandbox-core`.
+
+| Property   | Value             |
+| ---------- | ----------------- |
+| Owner      | `sandbox:sandbox` |
+| Mode       | `0750`            |
+| Access ACL | `u:<op_uid>:rwx`  |
+| Default ACL | `d:g::---`, `d:o::---` |
+
+The access ACL grants the operator directory-level `rwx` on the LIMA_HOME
+root so helper-pivoted `limactl` (running as `op_uid`) can create instance
+subdirectories and write files inside them. The default ACLs suppress group
+and world read on all children — a belt-and-suspenders guard for the ACL mask.
+
+There is deliberately **no** default named-user ACL (`d:u:<op_uid>:rwx`).
+A default named-user ACL would propagate into every child, including
+`_config/user` (Lima's SSH private key). Linux's ACL mask rule forces
+`st_mode` group bits ≥ the mask whenever a named-user entry exists; OpenSSH's
+`StrictKeyfileMode` calls `stat(2)` and rejects any key whose `st_mode & 077
+≠ 0` — causing the host agent to loop "bad permissions" for the full 600 s
+start timeout. Because helper-pivoted `limactl` runs as the operator and
+**owns** every file it creates, owner-bit access is sufficient; no named-user
+ACL propagation is needed.
+
+**Note on `_config/user`:** the key file does **not** receive an ACL. It is
+written by helper-pivoted `limactl` running as the operator, so it ends up
+owned `<op_uid>:<op_gid>` mode 0600, satisfying `StrictKeyfileMode` via plain
+`st_mode`/owner match.
 
 ---
 

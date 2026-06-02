@@ -1,8 +1,8 @@
 """Two concurrent `sandbox update` runs — second refuses with the
 "another update is in progress" message — the install framework.2, 9.1.
 
-The first invocation acquires the kernel ``flock`` on
-``/var/lib/sandbox/.update.lock`` and writes the JSON payload (PID,
+The first invocation acquires the kernel ``flock`` on the lock file
+under the per-uid base-dir and writes the JSON payload (PID,
 target version, started_at, ...). Any second invocation that tries to
 acquire while the first is alive sees the held flock and refuses with
 exit 1 + the error message from ``lock::LockError::LockHeld``.
@@ -38,7 +38,7 @@ def test_update_concurrent_refused(
     release_tarball_x86_64_bumped,
     sigstore_stack,
 ):
-    """A held flock on `/var/lib/sandbox/.update.lock` forces the second
+    """A held flock on the per-uid base-dir `.update.lock` forces the second
     `sandbox update` to refuse with "another update is in progress".
 
     Assertions:
@@ -110,11 +110,13 @@ def test_update_concurrent_refused(
         "started_at": started_at,
         "was_running": True,
     })
+    # The per-uid base-dir is created by install.sh; the lock file lives
+    # inside it. Resolve the uid at runtime so the path is correct.
     vm.shell(
-        f"sudo install -d -m 0755 -o sandbox -g sandbox /var/lib/sandbox && "
+        f"SUID=$(id -u sandbox) && "
         f"echo {_sh_quote(payload)} | "
-        f"sudo -u sandbox tee /var/lib/sandbox/.update.lock >/dev/null && "
-        f"sudo chmod 0664 /var/lib/sandbox/.update.lock",
+        f"sudo -u sandbox tee /var/lib/sandboxd/$SUID/.update.lock >/dev/null && "
+        f"sudo chmod 0664 /var/lib/sandboxd/$SUID/.update.lock",
         check=True, timeout=30,
     )
     # Hold the flock and run the refused `sandbox update` inside the
@@ -141,7 +143,9 @@ def test_update_concurrent_refused(
     # bugs apart from update-side regressions.
     refusal_recipe = f"""
 set -u
-sudo flock -n /var/lib/sandbox/.update.lock -c "sleep 60" &
+SUID=$(id -u sandbox)
+LOCK_FILE="/var/lib/sandboxd/$SUID/.update.lock"
+sudo flock -n "$LOCK_FILE" -c "sleep 60" &
 HOLDER_PID=$!
 sleep 1
 # Sanity 1: holder process alive.
@@ -150,7 +154,7 @@ if ! ps -p "$HOLDER_PID" >/dev/null; then
     exit 70
 fi
 # Sanity 2: lock truly held (a competing non-blocking flock must fail).
-if sudo flock -n /var/lib/sandbox/.update.lock -c true; then
+if sudo flock -n "$LOCK_FILE" -c true; then
     echo 'flock holder did not actually take the lock' >&2
     sudo kill "$HOLDER_PID" 2>/dev/null
     exit 71
@@ -191,7 +195,7 @@ exit $RC
     # The lock file survives the refused run (the refused process did
     # NOT take ownership, so it did NOT unlink at Drop).
     assert vm.shell(
-        "sudo test -e /var/lib/sandbox/.update.lock"
+        "SUID=$(id -u sandbox); sudo test -e /var/lib/sandboxd/$SUID/.update.lock"
     ).returncode == 0, "held lock file disappeared during refused run"
 
 

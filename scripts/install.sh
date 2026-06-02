@@ -78,7 +78,9 @@ LATEST_API_URL="https://api.github.com/repos/Koriit/sandboxd/releases/latest"
 # path. `sandbox update` reads the same env var for parity (see
 # `sandbox-cli/src/update/mod.rs::resolve_install_log_path`).
 INSTALL_LOG="${SANDBOXD_INSTALL_LOG:-/var/log/sandbox-install.log}"
-STATE_PATH="/var/lib/sandbox/.install-state.json"
+# STATE_PATH is not a static constant: it is derived from the sandbox user's
+# uid after create_sandbox_user resolves SANDBOX_UID. See resolve_state_path().
+STATE_PATH=""
 SCRIPT_NAME="install.sh"
 
 # ----------------------------------------------------------------------------
@@ -98,6 +100,10 @@ NO_COLOR=0
 # Step-discovered state (consumed by step 23 when writing install-state).
 ARCH=""
 TARGET_VER=""
+# Resolved after create_sandbox_user; used by write_install_state and
+# install_systemd_unit. BASE_DIR = /var/lib/sandboxd/$SANDBOX_UID.
+SANDBOX_UID=""
+BASE_DIR=""
 SANDBOX_USER_CREATED=0
 OPERATORS_ADDED=""
 WE_SET_BRIDGE_HELPER_SETUID=0
@@ -415,10 +421,26 @@ detect_preexisting() {
         # the previous successful install. Without this fallback a broken-but-
         # present binary masks the version comparison and we incorrectly fall
         # through to the refuse path on a same-version re-install.
-        if [ -z "$existing_ver" ] && [ -r "$STATE_PATH" ]; then
-            existing_ver=$(sed -n 's/.*"installed_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-                "$STATE_PATH" 2>/dev/null \
-                | head -n 1)
+        #
+        # STATE_PATH is not yet resolved (create_sandbox_user has not run);
+        # probe the per-uid path directly (if the sandbox user already exists)
+        # then fall back to the legacy path.
+        if [ -z "$existing_ver" ]; then
+            _probe_state_path=""
+            if getent passwd sandbox >/dev/null 2>&1; then
+                _probe_uid=$(id -u sandbox 2>/dev/null || true)
+                if [ -n "$_probe_uid" ]; then
+                    _probe_state_path="/var/lib/sandboxd/$_probe_uid/.install-state.json"
+                fi
+            fi
+            if [ -z "$_probe_state_path" ] || [ ! -r "$_probe_state_path" ]; then
+                _probe_state_path="/var/lib/sandbox/.install-state.json"
+            fi
+            if [ -r "$_probe_state_path" ]; then
+                existing_ver=$(sed -n 's/.*"installed_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                    "$_probe_state_path" 2>/dev/null \
+                    | head -n 1)
+            fi
         fi
         if [ -z "$TARGET_VER" ]; then
             # Couldn't resolve target version yet (e.g. --from path). Trust
@@ -614,9 +636,9 @@ free_kb_at() {
 }
 
 check_disk() {
-    # /var/lib/sandbox/ does not exist on a clean host; fall back to /var/lib
+    # /var/lib/sandboxd may not exist on a clean host; fall back to /var/lib
     # or /var or /.
-    var_anchor=/var/lib/sandbox
+    var_anchor=/var/lib/sandboxd
     if [ ! -d "$var_anchor" ]; then var_anchor=/var/lib; fi
     if [ ! -d "$var_anchor" ]; then var_anchor=/var; fi
     if [ ! -d "$var_anchor" ]; then var_anchor=/; fi
@@ -874,7 +896,7 @@ create_sandbox_user() {
             --system \
             --user-group \
             --no-create-home \
-            --home-dir /var/lib/sandbox \
+            --home-dir /nonexistent \
             --shell /usr/sbin/nologin \
             --comment "sandboxd - isolated environment broker" \
             sandbox
@@ -890,6 +912,13 @@ create_sandbox_user() {
         sudo -k usermod -aG kvm sandbox
     fi
     log_ok "step=usermod_groups groups=docker,kvm we_created=$SANDBOX_USER_CREATED"
+
+    # Resolve uid now that the user is guaranteed to exist. BASE_DIR and
+    # STATE_PATH depend on this value; every subsequent step uses them.
+    SANDBOX_UID=$(id -u sandbox)
+    BASE_DIR="/var/lib/sandboxd/$SANDBOX_UID"
+    STATE_PATH="$BASE_DIR/.install-state.json"
+    log_ok "step=resolve_sandbox_uid uid=$SANDBOX_UID base_dir=$BASE_DIR"
 }
 
 # ----------------------------------------------------------------------------
@@ -1142,13 +1171,26 @@ install_systemd_unit() {
     unit_src="$STAGE/systemd/sandboxd.service"
     unit_dst="/etc/systemd/system/sandboxd.service"
     [ -f "$unit_src" ] || die "tarball missing systemd/sandboxd.service"
-    if [ -f "$unit_dst" ] && cmp -s "$unit_src" "$unit_dst"; then
+
+    # Substitute the @SANDBOX_BASE_DIR@ placeholder with the resolved per-uid
+    # path. BASE_DIR is set by create_sandbox_user (after uid resolution).
+    # We render to a tmpfile so we never partially-write the destination.
+    unit_rendered="$TMPDIR_INSTALL/sandboxd.service.rendered"
+    sed "s|@SANDBOX_BASE_DIR@|$BASE_DIR|g" "$unit_src" > "$unit_rendered"
+
+    # Verify the placeholder was replaced (die if it is still present, which
+    # would mean BASE_DIR was empty or the template was malformed).
+    if grep -q '@SANDBOX_BASE_DIR@' "$unit_rendered"; then
+        die "install_systemd_unit: @SANDBOX_BASE_DIR@ placeholder not substituted (BASE_DIR='$BASE_DIR')"
+    fi
+
+    if [ -f "$unit_dst" ] && cmp -s "$unit_rendered" "$unit_dst"; then
         log_ok "step=install_unit action=skip reason=identical"
         return 0
     fi
-    sudo -k install -m 0644 -o root -g root "$unit_src" "$unit_dst"
+    sudo -k install -m 0644 -o root -g root "$unit_rendered" "$unit_dst"
     sha=$(sha256sum "$unit_dst" | awk '{print $1}')
-    log_ok "step=install_unit path=$unit_dst sha256=$sha action=install"
+    log_ok "step=install_unit path=$unit_dst base_dir=$BASE_DIR sha256=$sha action=install"
 }
 
 # ----------------------------------------------------------------------------
@@ -1161,7 +1203,95 @@ systemd_daemon_reload() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 23 — Write /var/lib/sandbox/.install-state.json.
+# Step 22b — Migrate legacy /var/lib/sandbox state to per-uid base-dir.
+#
+# Runs after create_sandbox_user (which sets BASE_DIR) and before
+# write_install_state. Idempotent: if $BASE_DIR/sessions.db already exists
+# the migration is a no-op. If BOTH /var/lib/sandbox/sessions.db AND
+# $BASE_DIR/sessions.db exist (interrupted migration / re-run), prefer the
+# per-uid one and emit a warning — never overwrite the live state.
+#
+# The legacy host-global Lima state at /var/lib/sandbox/.lima/ is NOT
+# relocated: those VMs have no recoverable operator uid and cannot be
+# transferred into the per-operator model. They are left as abandoned
+# filesystem state (the `make uninstall-legacy-lima` convenience target
+# removes them). This matches the V009 migration disposition.
+#
+# POSIX sh only; no bashisms.
+# ----------------------------------------------------------------------------
+
+migrate_legacy_state() {
+    legacy_dir="/var/lib/sandbox"
+
+    # Fast path: nothing to migrate.
+    if [ ! -d "$legacy_dir" ]; then
+        log_ok "step=migrate_legacy action=skip reason=no-legacy-dir"
+        return 0
+    fi
+
+    # Idempotency: if the per-uid DB already exists, migration was already done.
+    if [ -f "$BASE_DIR/sessions.db" ]; then
+        # If the legacy DB also exists this is a double-write situation — warn
+        # but don't touch either side (per-uid is the live copy).
+        if [ -f "$legacy_dir/sessions.db" ]; then
+            emit "${YELLOW}!${RESET} Both $BASE_DIR/sessions.db and $legacy_dir/sessions.db exist."
+            emit "  Keeping the per-uid copy (already migrated). The legacy copy is not touched."
+            log_warn "step=migrate_legacy action=skip reason=both-exist legacy=$legacy_dir"
+        else
+            log_ok "step=migrate_legacy action=skip reason=already-migrated base_dir=$BASE_DIR"
+        fi
+        return 0
+    fi
+
+    # Ensure the per-uid base-dir exists before moving files into it.
+    sudo -k install -d -o root -g root -m 0755 /var/lib/sandboxd
+    sudo -k install -d -o sandbox -g sandbox -m 0750 "$BASE_DIR"
+
+    emit "  Migrating state from $legacy_dir to $BASE_DIR ..."
+
+    # Move each known state artifact. Use mv; if the source does not exist,
+    # that is fine (idempotent). We move .install-state.json and .update.lock
+    # along with the live state — everything ends up under the per-uid root.
+    for name in \
+        sessions.db sessions.db-wal sessions.db-shm \
+        .install-state.json .update.lock \
+        sessions events backups
+    do
+        src="$legacy_dir/$name"
+        dst="$BASE_DIR/$name"
+        if [ -e "$src" ]; then
+            if [ -e "$dst" ]; then
+                emit "  ${YELLOW}!${RESET} $dst already exists, skipping $src"
+                log_warn "step=migrate_legacy item=$name action=skip reason=dst-exists"
+            else
+                sudo -k mv "$src" "$dst"
+                log_ok "step=migrate_legacy item=$name action=mv src=$src dst=$dst"
+            fi
+        fi
+    done
+
+    # Remove the legacy dir if it is now empty (or contains only the
+    # abandoned .lima/ tree which we deliberately left behind).
+    # We attempt rmdir (fails if non-empty) and fall through gracefully.
+    if sudo -k rmdir "$legacy_dir" 2>/dev/null; then
+        log_ok "step=migrate_legacy action=rmdir path=$legacy_dir"
+    else
+        # Check whether the only thing left is .lima/
+        remaining=$(sudo -k ls -A "$legacy_dir" 2>/dev/null | grep -v '^\.lima$' || true)
+        if [ -z "$remaining" ]; then
+            emit "  ${YELLOW}!${RESET} $legacy_dir still contains abandoned Lima state at $legacy_dir/.lima/"
+            emit "      These VMs cannot be recovered into the per-operator model."
+            emit "      Remove them manually or run: make uninstall-legacy-lima"
+            log_warn "step=migrate_legacy action=skip-rmdir reason=lima-remnant path=$legacy_dir"
+        else
+            emit "  ${YELLOW}!${RESET} $legacy_dir has unexpected leftovers: $remaining"
+            log_warn "step=migrate_legacy action=skip-rmdir reason=unexpected-leftovers path=$legacy_dir leftovers=$remaining"
+        fi
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Step 23 — Write $BASE_DIR/.install-state.json.
 # ----------------------------------------------------------------------------
 
 bool_lit() {
@@ -1177,9 +1307,10 @@ json_str() {
 }
 
 write_install_state() {
-    sudo -k mkdir -p /var/lib/sandbox
-    sudo -k chown sandbox:sandbox /var/lib/sandbox
-    sudo -k chmod 0750 /var/lib/sandbox
+    # Create /var/lib/sandboxd (root:root 0755 — traversable by both daemon
+    # users) and the per-uid subtree (sandbox:sandbox 0750).
+    sudo -k install -d -o root -g root -m 0755 /var/lib/sandboxd
+    sudo -k install -d -o sandbox -g sandbox -m 0750 "$BASE_DIR"
 
     installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     installed_by_operator="${SUDO_USER:-(direct-root)}"
@@ -1296,6 +1427,11 @@ main() {
     install_bridge_conf
     install_users_conf
     docker_load_gateway
+
+    # migrate_legacy_state must run after create_sandbox_user (which sets
+    # BASE_DIR) and before install_systemd_unit (which embeds BASE_DIR).
+    migrate_legacy_state
+
     install_systemd_unit
     systemd_daemon_reload
 

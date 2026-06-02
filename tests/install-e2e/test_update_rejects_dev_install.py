@@ -3,7 +3,8 @@
 A dev install is detected by either:
 
 * missing systemd unit at ``/etc/systemd/system/sandboxd.service``, OR
-* missing / unreadable install state at ``/var/lib/sandbox/.install-state.json``.
+* missing / unreadable install state at
+  ``/var/lib/sandboxd/<daemon-uid>/.install-state.json``.
 
 In that case ``sandbox update`` exits 2 with the dev-install message
 that points operators at ``make build`` / ``make gateway-image`` /
@@ -32,7 +33,7 @@ def test_update_rejects_dev_install(
         and drop it at ``/usr/local/bin/sandbox`` (chmod +x, root-owned).
       * Verify no systemd unit + no install state file exist.
       * Run ``sandbox update``; assert exit 2 + refusal substrings.
-      * Assert ``/var/lib/sandbox/.update.lock`` was never created.
+      * Assert the per-uid ``.update.lock`` was never created.
     """
     vm = vm_factory(distro_template)
     # Copy tarball into VM and extract just the sandbox CLI.
@@ -47,12 +48,15 @@ def test_update_rejects_dev_install(
         check=True, timeout=120,
     )
 
-    # Pre-conditions for dev-mode detection.
+    # Pre-conditions for dev-mode detection: no unit, no install state
+    # (neither per-uid path nor legacy path should exist on this fresh VM).
     assert vm.shell(
         "test -f /etc/systemd/system/sandboxd.service"
     ).returncode != 0, "systemd unit should NOT be installed for this test"
     assert vm.shell(
-        "sudo test -r /var/lib/sandbox/.install-state.json"
+        "sudo test -r /var/lib/sandbox/.install-state.json && "
+        "sudo sh -c 'SUID=$(id -u sandbox 2>/dev/null || true); "
+        "[ -n \"$SUID\" ] && test -r /var/lib/sandboxd/$SUID/.install-state.json'"
     ).returncode != 0, "install state should NOT exist for this test"
 
     # Run the update — should refuse with dev-mode message.
@@ -62,11 +66,13 @@ def test_update_rejects_dev_install(
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
     combined = r.stdout + r.stderr
-    # Anchored on the install framework.
+    # Anchored on the install framework. The per-uid path placeholder
+    # "/var/lib/sandboxd/<daemon-uid>/.install-state.json" matches the
+    # literal text emitted by dev_mode_refusal_text() in update/mod.rs.
     for marker in (
         "system installs only",
         "/etc/systemd/system/sandboxd.service",
-        "/var/lib/sandbox/.install-state.json",
+        "/var/lib/sandboxd/<daemon-uid>/.install-state.json",
         "make build",
         "make gateway-image",
         "make setup-dev-env",
@@ -76,8 +82,15 @@ def test_update_rejects_dev_install(
         )
 
     # No lock file was created (the gate fires BEFORE the lock acquire).
+    # Check both the legacy path and per-uid path — neither should exist.
     assert vm.shell(
         "sudo test -e /var/lib/sandbox/.update.lock"
     ).returncode != 0, (
-        "/var/lib/sandbox/.update.lock must not exist after dev-mode refusal"
+        "legacy /var/lib/sandbox/.update.lock must not exist after dev-mode refusal"
+    )
+    assert vm.shell(
+        "SUID=$(id -u sandbox 2>/dev/null || true); "
+        "[ -z \"$SUID\" ] || sudo test -e /var/lib/sandboxd/$SUID/.update.lock"
+    ).returncode != 0, (
+        "per-uid .update.lock must not exist after dev-mode refusal"
     )

@@ -18,28 +18,32 @@ Group=sandbox
 # more permissive mode under a pre-exec race. The daemon sets this via the socket-path mechanism.
 UMask=0117
 
-# State and runtime dirs are auto-created with correct ownership/modes.
-# systemd will mkdir /var/lib/sandbox and /run/sandbox if they do not
-# exist, and chown sandbox:sandbox + chmod 0750 on each.
-StateDirectory=sandbox
-StateDirectoryMode=0750
+# RuntimeDirectory creates /run/sandbox (tmpfs) with correct ownership/modes.
+# The per-uid state directory /var/lib/sandboxd/<uid> is created explicitly
+# by install.sh (StateDirectory does not fit the per-uid nested path model:
+# it would chown the entire /var/lib/sandboxd chain to the sandbox user,
+# breaking traversal by a co-resident sandbox-test daemon user).
 RuntimeDirectory=sandbox
 RuntimeDirectoryMode=0750
 
 # Pin the daemon's ephemeral per-session runtime dirs (listener + event
 # sockets) under the systemd RuntimeDirectory (/run/sandbox — tmpfs). Without
 # these they default to $XDG_RUNTIME_DIR — UNSET for a system service — and
-# silently fall back to $HOME (/var/lib/sandbox, persistent disk), so
-# ephemeral session artifacts would accumulate on disk across reboots. The
-# socket and base-dir are pinned via --socket/--base-dir on ExecStart; these
-# env vars pin the remaining XDG-derived runtime paths to the runtime tmpfs.
+# silently fall back to $HOME (persistent disk), so ephemeral session
+# artifacts would accumulate on disk across reboots. The socket and base-dir
+# are pinned via --socket/--base-dir on ExecStart; these env vars pin the
+# remaining XDG-derived runtime paths to the runtime tmpfs.
 Environment=SANDBOX_LISTENER_DIR=/run/sandbox/listeners
 Environment=SANDBOX_EVENTS_DIR=/run/sandbox/events
 
 # Operators customize via `systemctl edit sandboxd` (drop-in override),
 # not by editing this file. See § 4.3.
+#
+# NOTE: install.sh sed-substitutes @SANDBOX_BASE_DIR@ with the resolved
+# per-uid path (/var/lib/sandboxd/<sandbox-uid>) at install time. The
+# placeholder must never appear in the installed unit on a real host.
 ExecStart=/usr/local/bin/sandboxd \
-    --base-dir /var/lib/sandbox \
+    --base-dir @SANDBOX_BASE_DIR@ \
     --socket /run/sandbox/sandboxd.sock
 
 # Restart policy: any crash bounces; stop bouncing if it crashes >5 times

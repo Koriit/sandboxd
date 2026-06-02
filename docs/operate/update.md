@@ -11,9 +11,9 @@ For the per-flag CLI reference, see [`sandbox update`](/sandboxd/reference/cli/#
 
 Before the first upgrade on a host, confirm:
 
-- **Production install.** `sandbox update` refuses to run against a developer build. Detection is by *both* the systemd unit at `/etc/systemd/system/sandboxd.service` and the install-state file at `/var/lib/sandbox/.install-state.json` being present; if either is missing the host is treated as a dev install. Dev installs upgrade by re-running `make setup-dev-env`.
+- **Production install.** `sandbox update` refuses to run against a developer build. Detection is by *both* the systemd unit at `/etc/systemd/system/sandboxd.service` and the install-state file at `/var/lib/sandboxd/<sandbox-uid>/.install-state.json` being present (the uid is resolved at runtime via the `sandbox` system username); if either is missing the host is treated as a dev install. Dev installs upgrade by re-running `make setup-dev-env`.
 - **`cosign` on PATH (or available to bootstrap).** The CLI verifies the release tarball's sigstore signature before any state change. `install.sh` already installs `cosign` at a pinned version + sha256; the update flow reuses that. If cosign is missing entirely, the CLI bootstraps it on first run.
-- **`sandbox` group membership.** The lock file at `/var/lib/sandbox/.update.lock` is mode `0664 sandbox:sandbox`; the operator running `sandbox update` must be in the `sandbox` group to acquire it directly. Membership is granted by `install.sh` (the invoking operator is added to `sandbox`) and re-granted by `useradd -aG sandbox <other>` for additional operators.
+- **`sandbox` group membership.** The lock file at `/var/lib/sandboxd/<sandbox-uid>/.update.lock` is mode `0664 sandbox:sandbox`; the operator running `sandbox update` must be in the `sandbox` group to acquire it directly. Membership is granted by `install.sh` (the invoking operator is added to `sandbox`) and re-granted by `useradd -aG sandbox <other>` for additional operators.
 - **The install log is writable.** `/var/log/sandbox-install.log` (mode `0640 root:root`) is the shared forensic record for `install.sh`, `uninstall.sh`, and `sandbox update`. Each step appends one `step=<name> action=<verb> status=<ok|fail>` line. The path is overridable via the `SANDBOXD_INSTALL_LOG` env var when `/var/log` is read-only.
 
 ## Pre-flight modes (read-only)
@@ -53,7 +53,7 @@ The 18 stateful steps, condensed:
 
 | # | Step | What it does |
 |---|------|-------------|
-| 13 | `acquire_lock` | `flock -n -x` against `/var/lib/sandbox/.update.lock`; capture sticky `was_running` (§ "Lock file" below). |
+| 13 | `acquire_lock` | `flock -n -x` against `/var/lib/sandboxd/<sandbox-uid>/.update.lock`; capture sticky `was_running` (§ "Lock file" below). |
 | 14 | `stop_daemon` | `systemctl stop sandboxd` (only if `was_running`). |
 | 15 | `backup_sessions_db` | `install -m 0600` `sessions.db`, `.db-wal`, `.db-shm` into the backup set. Idempotent via `cmp -s`. |
 | 16 | `backup_etc_files` | `users.conf` + `bridge.conf` copied at mode `0644`. |
@@ -91,12 +91,12 @@ Lower-case `y` proceeds; anything else aborts (exit `0`). `--yes` skips the prom
 
 ## Backup mechanics
 
-Every stateful upgrade produces one backup set under `/var/lib/sandbox/backups/<ISO8601>-from-<v>-to-<v>/`. The set captures **everything `sandbox update` touched**: binaries, `/etc` files, and `sessions.db` (with its WAL/SHM siblings). Anything the upgrade left alone (operator drop-ins, group memberships, the systemd unit's parent directory, image tags) survives the rollback by virtue of never having been changed.
+Every stateful upgrade produces one backup set under `/var/lib/sandboxd/<sandbox-uid>/backups/<ISO8601>-from-<v>-to-<v>/`. The set captures **everything `sandbox update` touched**: binaries, `/etc` files, and `sessions.db` (with its WAL/SHM siblings). Anything the upgrade left alone (operator drop-ins, group memberships, the systemd unit's parent directory, image tags) survives the rollback by virtue of never having been changed.
 
 ### Layout
 
 ```
-/var/lib/sandbox/backups/
+/var/lib/sandboxd/<sandbox-uid>/backups/
 ├── 2026-05-11T14:23:11Z-from-1.0.0-to-1.1.0/
 │   ├── manifest.json                # completed_ok + per-file sha256
 │   ├── sandboxd.bak                 # mode 0640 sandbox:sandbox
@@ -114,8 +114,8 @@ Every stateful upgrade produces one backup set under `/var/lib/sandbox/backups/<
 The directory is mode `0700 sandbox:sandbox`. Operators in the `sandbox` group cannot read it directly; inspection goes through `sudo -u sandbox`:
 
 ```bash
-sudo -u sandbox sh -c 'ls -ld /var/lib/sandbox/backups/*/'
-sudo -u sandbox sh -c 'jq -r .from_version,.to_version,.completed_ok /var/lib/sandbox/backups/*/manifest.json'
+sudo -u sandbox sh -c 'ls -ld /var/lib/sandboxd/<sandbox-uid>/backups/*/'
+sudo -u sandbox sh -c 'jq -r .from_version,.to_version,.completed_ok /var/lib/sandboxd/<sandbox-uid>/backups/*/manifest.json'
 ```
 
 The mode-`0700` boundary mirrors the per-operator API filter: `sessions.db.bak` carries every operator's session metadata, so the backup directory inherits the same filesystem-level scope.
@@ -149,11 +149,11 @@ The manifest's `arch` field is a sanity check for rollback — a cross-arch rest
 
 ### Why `.bak`, not `.previous` in PATH
 
-Every binary backup lands under `/var/lib/sandbox/backups/<set>/` at mode `0640` (not executable). `.previous` files in `/usr/local/bin/` would create duplicate, confusable binaries on operator PATH. The rollback recipe explicitly `install`s each `.bak` back to its original path with mode `0755` and re-applies setcap as a separate step.
+Every binary backup lands under `/var/lib/sandboxd/<sandbox-uid>/backups/<set>/` at mode `0640` (not executable). `.previous` files in `/usr/local/bin/` would create duplicate, confusable binaries on operator PATH. The rollback recipe explicitly `install`s each `.bak` back to its original path with mode `0755` and re-applies setcap as a separate step.
 
 ## Lock file
 
-`sandbox update` serialises itself via `/var/lib/sandbox/.update.lock`, a JSON file holding the in-flight upgrade's pid + target version + the sticky `was_running` flag. Mode is `0664 sandbox:sandbox` so operators in the `sandbox` group can `O_RDWR|O_CREAT` it directly; acquisition is a non-blocking `flock -n -x` on an FD held open by the running shell.
+`sandbox update` serialises itself via `/var/lib/sandboxd/<sandbox-uid>/.update.lock`, a JSON file holding the in-flight upgrade's pid + target version + the sticky `was_running` flag. Mode is `0664 sandbox:sandbox` so operators in the `sandbox` group can `O_RDWR|O_CREAT` it directly; acquisition is a non-blocking `flock -n -x` on an FD held open by the running shell.
 
 Payload shape:
 
@@ -202,7 +202,7 @@ If you have a recurring need for automated rollback, open an issue describing th
 - Operator-added `allow_users` entries in `/etc/sandboxd/users.conf` (only the `sandbox` system user is added by the V001 migration; existing entries pass through).
 - Operator-added `allow` lines in `/etc/qemu/bridge.conf` beyond the daemon-managed `sb-*` line.
 - Group memberships in the `sandbox` group (additions during install survive; the upgrade neither adds nor removes members).
-- Per-session state on disk under `/var/lib/sandbox/sessions/<id>/`.
+- Per-session state on disk under `/var/lib/sandboxd/<sandbox-uid>/sessions/<id>/`.
 - `/var/log/sandbox-install.log` itself (the upgrade appends; it does not rotate).
 
 The contract: the backup set captures everything `sandbox update` touched. Anything it left alone survives the upgrade, and would survive a rollback, by never having been changed.
@@ -219,7 +219,7 @@ The contract: the backup set captures everything `sandbox update` touched. Anyth
 | `sandbox doctor failed` | Step 29 found a post-upgrade health problem. | The lock survives; investigate the specific doctor probe, then re-run or roll back. |
 | `daemon-reload failed` | Step 26 could not reload systemd. | Check `journalctl -u sandboxd`; ensure `/etc/systemd/system/sandboxd.service` is readable. Re-run after fixing. |
 
-Every failure path leaves the lock in place. The next invocation adopts and resumes. The only operator action that breaks adoption is `rm /var/lib/sandbox/.update.lock` — do that only when the previous run is known-wedged and you have a recovery plan.
+Every failure path leaves the lock in place. The next invocation adopts and resumes. The only operator action that breaks adoption is removing the lock file at `/var/lib/sandboxd/<sandbox-uid>/.update.lock` — do that only when the previous run is known-wedged and you have a recovery plan.
 
 ## Related
 

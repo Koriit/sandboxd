@@ -88,7 +88,7 @@ def test_update_then_manual_rollback(
     # Confirm we're at v'.
     state = json.loads(
         vm.shell(
-            "sudo cat /var/lib/sandbox/.install-state.json",
+            "SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json",
             check=True, timeout=10,
         ).stdout
     )
@@ -111,7 +111,7 @@ def test_update_then_manual_rollback(
     # earlier bytes"; `manifest.files["sessions.db.bak"].sha256` is
     # the captured-bytes ground truth.
     backup_manifest_text = vm.shell(
-        "sudo sh -c 'cat /var/lib/sandbox/backups/*/manifest.json'",
+        "SUID=$(id -u sandbox); sudo sh -c \"cat /var/lib/sandboxd/$SUID/backups/*/manifest.json\"",
         check=True, timeout=10,
     ).stdout
     backup_manifest = json.loads(backup_manifest_text)
@@ -144,7 +144,9 @@ def test_update_then_manual_rollback(
     # to mutate the freshly-restored sessions.db.
     rollback_phase1 = r"""
 set -eux
-BACKUP_DIR=$(sudo -u sandbox sh -c 'ls -td /var/lib/sandbox/backups/*/' \
+SANDBOX_UID=$(id -u sandbox)
+BASE_DIR="/var/lib/sandboxd/$SANDBOX_UID"
+BACKUP_DIR=$(sudo -u sandbox sh -c "ls -td $BASE_DIR/backups/*/" \
                | xargs -I{} sudo -u sandbox sh -c \
                    'test "$(jq -r .completed_ok < "{}/manifest.json")" = "true" && echo "{}"' \
                | head -1)
@@ -163,18 +165,18 @@ sudo install -m 0644 -o root -g root "$BACKUP_DIR/users.conf.bak"  /etc/sandboxd
 if [ -f "$BACKUP_DIR/bridge.conf.bak" ]; then
     sudo install -m 0644 -o root -g root "$BACKUP_DIR/bridge.conf.bak" /etc/qemu/bridge.conf
 fi
-sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db.bak" /var/lib/sandbox/sessions.db
+sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db.bak" "$BASE_DIR/sessions.db"
 if [ -f "$BACKUP_DIR/sessions.db-wal.bak" ]; then
-    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-wal.bak" /var/lib/sandbox/sessions.db-wal
+    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-wal.bak" "$BASE_DIR/sessions.db-wal"
 else
-    sudo rm -f /var/lib/sandbox/sessions.db-wal
+    sudo rm -f "$BASE_DIR/sessions.db-wal"
 fi
 if [ -f "$BACKUP_DIR/sessions.db-shm.bak" ]; then
-    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-shm.bak" /var/lib/sandbox/sessions.db-shm
+    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-shm.bak" "$BASE_DIR/sessions.db-shm"
 else
-    sudo rm -f /var/lib/sandbox/sessions.db-shm
+    sudo rm -f "$BASE_DIR/sessions.db-shm"
 fi
-sudo rm -f /var/lib/sandbox/.update.lock
+sudo rm -f "$BASE_DIR/.update.lock"
 """
     r = vm.shell(rollback_phase1, timeout=120)
     assert r.returncode == 0, (
@@ -186,7 +188,7 @@ sudo rm -f /var/lib/sandbox/.update.lock
     # host can write to the DB — the bytes we read here are exactly
     # what the rollback's `install` step put in place.
     post_sessions_sha = vm.shell(
-        "sudo sha256sum /var/lib/sandbox/sessions.db | awk '{print $1}'",
+        "SUID=$(id -u sandbox); sudo sha256sum /var/lib/sandboxd/$SUID/sessions.db | awk '{print $1}'",
         check=True, timeout=10,
     ).stdout.strip()
     assert expected_sessions_sha == post_sessions_sha, (
@@ -209,8 +211,11 @@ sudo rm -f /var/lib/sandbox/.update.lock
         ).stdout.strip()
         return None if probe == "MISSING" else probe
 
-    post_wal_sha = _post_companion_state("/var/lib/sandbox/sessions.db-wal")
-    post_shm_sha = _post_companion_state("/var/lib/sandbox/sessions.db-shm")
+    # Resolve the per-uid base-dir for companion file checks.
+    sandbox_uid = vm.shell("id -u sandbox", check=True, timeout=10).stdout.strip()
+    base_dir = f"/var/lib/sandboxd/{sandbox_uid}"
+    post_wal_sha = _post_companion_state(f"{base_dir}/sessions.db-wal")
+    post_shm_sha = _post_companion_state(f"{base_dir}/sessions.db-shm")
     assert post_wal_sha == expected_wal_sha, (
         f"sessions.db-wal not restored to the manifest's recorded state: "
         f"expected={expected_wal_sha!r} post={post_wal_sha!r}"
@@ -251,7 +256,7 @@ sudo rm -f /var/lib/sandbox/.update.lock
     )
     # Lock file gone (recipe step 8).
     assert vm.shell(
-        "sudo test -e /var/lib/sandbox/.update.lock"
+        "SUID=$(id -u sandbox); sudo test -e /var/lib/sandboxd/$SUID/.update.lock"
     ).returncode != 0, "lock file should be removed by rollback recipe"
 
     # 

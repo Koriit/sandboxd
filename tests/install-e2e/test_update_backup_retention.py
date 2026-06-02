@@ -92,7 +92,7 @@ def test_update_backup_retention_prunes_oldest(
         extracted_roots.append(f"{stage_dir}/sandboxd-{vers[idx]}-{arch}")
 
     # Run the three updates in order. Each must succeed and produce a
-    # new backup set in `/var/lib/sandbox/backups/`.
+    # new backup set in the per-uid backups directory.
     expected_to_versions_after_each = [
         # After update 1: 1 successful set {base -> v1}.
         [(base_ver, vers[0])],
@@ -118,7 +118,7 @@ def test_update_backup_retention_prunes_oldest(
         # manifests is `},{` rather than `}\n,\n{`, defeating any
         # split-on-newline-comma-newline approach).
         manifests = vm.shell(
-            "sudo sh -c 'jq -s . /var/lib/sandbox/backups/*/manifest.json'",
+            "SUID=$(id -u sandbox); sudo sh -c \"jq -s . /var/lib/sandboxd/$SUID/backups/*/manifest.json\"",
             check=True, timeout=20,
         ).stdout
         parsed = json.loads(manifests)
@@ -148,6 +148,6 @@ def test_update_backup_retention_prunes_oldest(
             f"after update {idx + 1}: total backup-set manifest count "
             f"({len(parsed)}) must equal the expected completed_ok count "
             f"({len(expected)}); the surplus would indicate an orphan "
-            f"forensic survivor in /var/lib/sandbox/backups/ that the "
+            f"forensic survivor in the per-uid backups/ directory that the "
             f"prune missed.\nraw:\n{manifests}"
         )

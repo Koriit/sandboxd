@@ -145,9 +145,10 @@ def test_update_interrupted_then_resumed(
         "was_running": True,
     })
     vm.shell(
+        f"SUID=$(id -u sandbox) && "
         f"echo {_sh_quote(stale_payload)} | "
-        f"sudo -u sandbox tee /var/lib/sandbox/.update.lock >/dev/null && "
-        f"sudo chmod 0664 /var/lib/sandbox/.update.lock",
+        f"sudo -u sandbox tee /var/lib/sandboxd/$SUID/.update.lock >/dev/null && "
+        f"sudo chmod 0664 /var/lib/sandboxd/$SUID/.update.lock",
         check=True, timeout=15,
     )
 
@@ -205,7 +206,7 @@ def test_update_interrupted_then_resumed(
     # Install-state flipped to the bumped version.
     state = json.loads(
         vm.shell(
-            "sudo cat /var/lib/sandbox/.install-state.json",
+            "SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json",
             check=True, timeout=10,
         ).stdout
     )
@@ -215,21 +216,20 @@ def test_update_interrupted_then_resumed(
 
     # On success the lock file is removed at § 3.2.30.
     assert vm.shell(
-        "sudo test -e /var/lib/sandbox/.update.lock"
+        "SUID=$(id -u sandbox); sudo test -e /var/lib/sandboxd/$SUID/.update.lock"
     ).returncode != 0, "lock file should be unlinked on a successful update"
 
     # Backup set landed: exactly one set with completed_ok=true.
-    # `/var/lib/sandbox/backups/` is mode 0700 sandbox:sandbox, so the
-    # glob has to expand inside `sudo sh -c` (the outer shell can't
-    # traverse the dir to list its children). Matches the
-    # `success_sets` shape in the partial-failure test below.
+    # The backups dir is mode 0700 sandbox:sandbox, so the glob has to
+    # expand inside `sudo sh -c` (the outer shell can't traverse the dir
+    # to list its children). Matches the `success_sets` shape below.
     set_count = int(vm.shell(
-        "sudo sh -c 'ls -1d /var/lib/sandbox/backups/*/ 2>/dev/null | wc -l'",
+        "SUID=$(id -u sandbox); sudo sh -c \"ls -1d /var/lib/sandboxd/$SUID/backups/*/ 2>/dev/null | wc -l\"",
         check=True, timeout=10,
     ).stdout.strip())
     assert set_count == 1, f"expected 1 backup set, got {set_count}"
     manifest_text = vm.shell(
-        "sudo sh -c 'cat /var/lib/sandbox/backups/*/manifest.json'",
+        "SUID=$(id -u sandbox); sudo sh -c \"cat /var/lib/sandboxd/$SUID/backups/*/manifest.json\"",
         check=True, timeout=10,
     ).stdout
     manifest = json.loads(manifest_text)
@@ -325,7 +325,7 @@ def test_update_partial_failure_backup_set_preserved(
     # BEFORE the migrate step runs. After the injected failure, exactly
     # one backup set should exist on disk with completed_ok=false.
     forensic_set = vm.shell(
-        "sudo sh -c 'ls -1d /var/lib/sandbox/backups/*/ 2>/dev/null | head -1'",
+        "SUID=$(id -u sandbox); sudo sh -c \"ls -1d /var/lib/sandboxd/$SUID/backups/*/ 2>/dev/null | head -1\"",
         check=True, timeout=10,
     ).stdout.strip()
     assert forensic_set, (
@@ -389,9 +389,10 @@ def test_update_partial_failure_backup_set_preserved(
 
     # A successful set was also created by the clean retry.
     success_sets = vm.shell(
-        "sudo sh -c 'for d in /var/lib/sandbox/backups/*/; do "
-        " jq -r .completed_ok < \"$d/manifest.json\" 2>/dev/null; "
-        "done | grep -c true || true'",
+        "SUID=$(id -u sandbox); "
+        "sudo sh -c \"for d in /var/lib/sandboxd/$SUID/backups/*/; do "
+        " jq -r .completed_ok < \\\"\\$d/manifest.json\\\" 2>/dev/null; "
+        "done | grep -c true || true\"",
         check=True, timeout=15,
     ).stdout.strip()
     assert int(success_sets or "0") >= 1, (

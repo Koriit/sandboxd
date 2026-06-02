@@ -602,7 +602,7 @@ def _inject_synthetic_session(vm, *, session_id, owner_username, backend="lima")
         f"'{now}', '{now}', '{backend}', '{owner_username}', 1, '0.1.0');"
     )
     vm.shell(
-        f"sudo sqlite3 /var/lib/sandbox/sessions.db <<'SQL'\n{sql}\nSQL",
+        f"SUID=$(id -u sandbox); sudo sqlite3 /var/lib/sandboxd/$SUID/sessions.db <<'SQL'\n{sql}\nSQL",
         check=True,
         timeout=10,
     )
@@ -660,7 +660,7 @@ def test_session_isolation_404_on_foreign_id(
         is 404, not 403, to avoid telegraphing whether the id exists.
 
     Mechanism:
-      * A fake row is INSERTed directly into ``/var/lib/sandbox/sessions.db``
+      * A fake row is INSERTed directly into the daemon's sessions.db
         via ``sqlite3`` (run as root), owner = alice. The daemon's
         in-memory state holds nothing; reads go through the open
         sqlite handle and see the new row on next query.

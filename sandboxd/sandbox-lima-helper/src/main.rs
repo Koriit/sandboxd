@@ -516,8 +516,14 @@ fn run() -> ExitCode {
     // Step 10 — build sanitised env block.
     // Pass pw_dir (captured in step 3, reused for limactl resolution in
     // step 9.5) as op_home so HOME is set to the operator's own directory.
+    //
+    // caller_uid is the pre-pivot daemon uid (captured at step 1 before
+    // setresuid). It forms the first variable segment of the LIMA_HOME path,
+    // isolating each daemon's operator trees from one another on the same host.
+    // This mirrors the path constructed by operator_lima_home() in sandbox-core:
+    //   {state_root}/{daemon_uid}/{op_uid}/lima/
     let state_root = resolve_state_root();
-    let lima_home = format!("{state_root}/{op_uid_raw}/lima/");
+    let lima_home = format!("{state_root}/{caller_uid}/{op_uid_raw}/lima/");
     let env_block = build_env_block(&subcommand, &lima_home, &pw_dir, op_uid_raw);
 
     // Step 10.5 — tighten umask to 0077 before exec.
@@ -1507,9 +1513,10 @@ fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str, op_uid: u32
     // daemon uid and mode 0700 — the operator uid has no write access there.
     //
     // Redirecting `XDG_CACHE_HOME` into the per-operator LIMA_HOME tree keeps
-    // the cache under `/var/lib/sandboxd/<op_uid>/lima/.cache/lima/download/`.
+    // the cache under `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/.cache/lima/download/`.
     // That dir sits inside the tree that `ensure_operator_lima_home` ACL-grants
-    // with `d:u:<op_uid>:rwx`, so the operator uid can create and write it.
+    // with `u:<op_uid>:rwx` on the LIMA_HOME root, so the operator uid can
+    // create and write it.
     // Using `<lima_home>/.cache` (one level below LIMA_HOME itself, not inside
     // Lima's instance namespace) avoids any conflict with Lima's own directory
     // layout under `<lima_home>/<instance>/`.
@@ -2836,7 +2843,7 @@ WantedBy=multi-user.target";
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
         let env = build_env_block(
             &sub,
-            "/var/lib/sandboxd/1000/lima/",
+            "/var/lib/sandboxd/4242/1000/lima/",
             "/home/operator-1000",
             1000,
         );
@@ -2853,7 +2860,7 @@ WantedBy=multi-user.target";
     fn env_block_home_is_operator_pw_dir() {
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
         let op_home = "/home/operator-1000";
-        let env = build_env_block(&sub, "/var/lib/sandboxd/1000/lima/", op_home, 1000);
+        let env = build_env_block(&sub, "/var/lib/sandboxd/4242/1000/lima/", op_home, 1000);
         let map: std::collections::HashMap<String, String> = env
             .iter()
             .map(|c| {
@@ -2892,7 +2899,7 @@ WantedBy=multi-user.target";
         });
         let env = build_env_block(
             &sub,
-            "/var/lib/sandboxd/1000/lima/",
+            "/var/lib/sandboxd/4242/1000/lima/",
             "/home/operator-1000",
             1000,
         );
@@ -2933,7 +2940,7 @@ WantedBy=multi-user.target";
         });
         let env = build_env_block(
             &sub,
-            "/var/lib/sandboxd/1000/lima/",
+            "/var/lib/sandboxd/4242/1000/lima/",
             "/home/operator-1000",
             1000,
         );
@@ -2992,7 +2999,7 @@ WantedBy=multi-user.target";
         });
         let env = build_env_block(
             &sub,
-            "/var/lib/sandboxd/1000/lima/",
+            "/var/lib/sandboxd/4242/1000/lima/",
             "/home/operator-1000",
             1000,
         );
@@ -3023,7 +3030,7 @@ WantedBy=multi-user.target";
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
         let env = build_env_block(
             &sub,
-            "/var/lib/sandboxd/1000/lima/",
+            "/var/lib/sandboxd/4242/1000/lima/",
             "/home/operator-1000",
             1000,
         );
@@ -3048,7 +3055,7 @@ WantedBy=multi-user.target";
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
         let env = build_env_block(
             &sub,
-            "/var/lib/sandboxd/1000/lima/",
+            "/var/lib/sandboxd/4242/1000/lima/",
             "/home/operator-1000",
             1000,
         );
@@ -3066,7 +3073,7 @@ WantedBy=multi-user.target";
             "XDG_CACHE_HOME must always be present in env block"
         );
         assert!(
-            xdg.unwrap().starts_with("/var/lib/sandboxd/1000/lima/"),
+            xdg.unwrap().starts_with("/var/lib/sandboxd/4242/1000/lima/"),
             "XDG_CACHE_HOME must be pinned inside the operator LIMA_HOME tree, got: {xdg:?}"
         );
     }
@@ -3082,7 +3089,7 @@ WantedBy=multi-user.target";
         let sub = Subcommand::ListJson(ListJsonArgs { op_uid: 1000 });
         let env = build_env_block(
             &sub,
-            "/var/lib/sandboxd/1000/lima/",
+            "/var/lib/sandboxd/4242/1000/lima/",
             "/home/operator-1000",
             1000,
         );
@@ -3164,17 +3171,18 @@ WantedBy=multi-user.target";
     /// Verify the key path construction: lima_home with trailing slash
     /// concatenated with `_config/user` must resolve to the correct path.
     /// The helper's `run()` constructs `lima_home` as
-    /// `/var/lib/sandboxd/{op_uid}/lima/` (always trailing-slash), so
-    /// `{lima_home}_config/user` must equal
-    /// `/var/lib/sandboxd/{op_uid}/lima/_config/user`.
+    /// `{state_root}/{daemon_uid}/{op_uid}/lima/` (always trailing-slash),
+    /// so `{lima_home}_config/user` must equal
+    /// `{state_root}/{daemon_uid}/{op_uid}/lima/_config/user`.
     #[test]
     fn read_user_key_path_construction_correct() {
+        let daemon_uid: u32 = 999;
         let op_uid: u32 = 1001;
-        let lima_home = format!("/var/lib/sandboxd/{op_uid}/lima/");
+        let lima_home = format!("/var/lib/sandboxd/{daemon_uid}/{op_uid}/lima/");
         let key_path = format!("{lima_home}_config/user");
         assert_eq!(
             key_path,
-            format!("/var/lib/sandboxd/{op_uid}/lima/_config/user"),
+            format!("/var/lib/sandboxd/{daemon_uid}/{op_uid}/lima/_config/user"),
             "key path must be $LIMA_HOME/_config/user; got: {key_path}",
         );
     }

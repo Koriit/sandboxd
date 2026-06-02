@@ -35,7 +35,7 @@ def test_update_check_does_not_mutate(
     """`sandbox update --check` never touches state.
 
     Asserts:
-      * The lock file `/var/lib/sandbox/.update.lock` is ABSENT after
+      * The lock file under the per-uid base-dir is ABSENT after
         the check (direct `os.path.exists`-style probe via `test -e`).
       * The install state's `installed_version` is unchanged.
       * The daemon's `/version` endpoint still reports the original
@@ -59,7 +59,7 @@ def test_update_check_does_not_mutate(
 
     # Snapshot pre-check state.
     state_pre = json.loads(
-        vm.shell("sudo cat /var/lib/sandbox/.install-state.json").stdout
+        vm.shell("SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json").stdout
     )
     assert state_pre["installed_version"] == version
 
@@ -94,14 +94,14 @@ def test_update_check_does_not_mutate(
     # ---- No-mutation assertions ----
 
     # 1. Lock file is ABSENT.
-    lock_probe = vm.shell("sudo test -e /var/lib/sandbox/.update.lock")
+    lock_probe = vm.shell("SUID=$(id -u sandbox); sudo test -e /var/lib/sandboxd/$SUID/.update.lock")
     assert lock_probe.returncode != 0, (
-        "/var/lib/sandbox/.update.lock must not exist after --check"
+        "per-uid .update.lock must not exist after --check"
     )
 
     # 2. Install state's installed_version unchanged.
     state_post = json.loads(
-        vm.shell("sudo cat /var/lib/sandbox/.install-state.json").stdout
+        vm.shell("SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json").stdout
     )
     assert state_post["installed_version"] == state_pre["installed_version"], (
         f"--check mutated install state: pre={state_pre!r} post={state_post!r}"
@@ -160,5 +160,5 @@ def test_update_dry_run_does_not_mutate(
 
     # Lock file absent.
     assert (
-        vm.shell("sudo test -e /var/lib/sandbox/.update.lock").returncode != 0
+        vm.shell("SUID=$(id -u sandbox); sudo test -e /var/lib/sandboxd/$SUID/.update.lock").returncode != 0
     )
