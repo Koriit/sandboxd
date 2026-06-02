@@ -108,6 +108,15 @@ impl Daemon {
             .env("XDG_RUNTIME_DIR", tmp.path())
             .env("SANDBOX_USERS_CONF", &users_conf)
             .env("RUST_LOG", "info")
+            // The daemon resolves and cap-checks `sandbox-lima-helper` at
+            // startup (a fatal prerequisite since the cross-user Lima model
+            // landed). Point it at the `test-env-override` helper that
+            // `make install-lima-helper-test-cap` installs so the daemon can
+            // bind its socket on hosts without the production helper.
+            .env(
+                "SANDBOX_LIMA_HELPER_PATH",
+                "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
+            )
             .stdout(Stdio::from(stdout_fh))
             .stderr(Stdio::from(stderr_fh));
         let proc = cmd.spawn().expect("spawn sandboxd");
