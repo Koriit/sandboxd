@@ -118,6 +118,12 @@ impl Daemon {
             .env("XDG_RUNTIME_DIR", tmp.path())
             .env("SANDBOX_USERS_CONF", &users_conf)
             .env("RUST_LOG", "info")
+            // The daemon resolves and cap-checks `sandbox-lima-helper` at
+            // startup (a fatal prerequisite); set it as a base default so
+            // the container-backend variants (which pass no `extra_env`)
+            // also bring up their socket. The Lima variant re-sets the same
+            // path in `extra_env` alongside its uid-pivot test seams.
+            .env("SANDBOX_LIMA_HELPER_PATH", lima_helper_bin())
             .stdout(Stdio::from(stdout_fh))
             .stderr(Stdio::from(stderr_fh));
         for (k, v) in extra_env {
