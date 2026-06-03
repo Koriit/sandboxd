@@ -99,8 +99,7 @@ def test_install_fresh_then_doctor_passes_rhel_paths(
 
     Fedora ships ``qemu-bridge-helper`` at /usr/libexec/qemu-bridge-helper
     (vs. /usr/lib/qemu/qemu-bridge-helper on Debian-likes). Install.sh's
-    probe step has to find both. OVMF lives at /usr/share/edk2/ovmf/ on
-    Fedora; the prereq check also has to find both.
+    probe step has to find both.
 
     Asserts the same filesystem post-conditions as the Debian-family
     variant (binaries, caps, state file, sandbox user) plus that the

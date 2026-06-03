@@ -514,18 +514,6 @@ check_kernel_version() {
     return 1
 }
 
-find_ovmf() {
-    for f in \
-        /usr/share/OVMF/OVMF_CODE.fd \
-        /usr/share/edk2/ovmf/OVMF_CODE.fd \
-        /usr/share/edk2-ovmf/OVMF_CODE.fd \
-        /usr/share/qemu/OVMF_CODE.fd
-    do
-        if [ -f "$f" ]; then return 0; fi
-    done
-    return 1
-}
-
 check_prereqs() {
     qemu_arch="x86_64"
     case "$ARCH" in
@@ -550,7 +538,14 @@ check_prereqs() {
 
     command -v limactl  >/dev/null 2>&1 || add_missing "lima"
     command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_missing "qemu-system-$qemu_arch"
-    find_ovmf || add_missing "ovmf"
+    # We deliberately do NOT check for UEFI firmware (OVMF/AAVMF). It sits two
+    # layers below us — sandboxd drives `limactl`, Lima drives QEMU, and QEMU
+    # discovers its own firmware (via /usr/share/qemu/firmware/*.json and its
+    # built-in search). Firmware file names/paths churn across distros (the
+    # _4M/secboot split, x64/ subdirs, .bin, the aarch64 set), so any fixed
+    # path list here false-negatives and hard-blocks installs on hosts where
+    # Lima boots VMs perfectly well. Lima's own startup is the authority and
+    # surfaces the accurate error if firmware is genuinely absent.
     command -v setcap  >/dev/null 2>&1 || add_missing "setcap"
     command -v jq      >/dev/null 2>&1 || add_missing "jq"
     command -v curl    >/dev/null 2>&1 || add_missing "curl"
@@ -627,13 +622,6 @@ pkg_name_for() {
                 pacman) echo qemu-arch-extra ;;
                 zypper) echo qemu-arm ;;
                 *)      echo qemu ;;
-            esac ;;
-        ovmf)
-            case "$mgr" in
-                apt)           echo ovmf ;;
-                dnf|pacman)    echo edk2-ovmf ;;
-                zypper)        echo qemu-ovmf-x86_64 ;;
-                *)             echo ovmf ;;
             esac ;;
         setcap)
             case "$mgr" in
