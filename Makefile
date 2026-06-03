@@ -275,8 +275,11 @@ clean:
 	cd sandboxd && cargo clean
 	rm -rf tests/e2e/.venv/
 	rm -rf site/node_modules site/dist
+	@echo "[sudo] rm -f $(ROUTE_HELPER_TEST_PATH)"
 	sudo -k rm -f "$(ROUTE_HELPER_TEST_PATH)"
+	@echo "[sudo] rm -f $(LIMA_HELPER_TEST_PATH)"
 	sudo -k rm -f "$(LIMA_HELPER_TEST_PATH)"
+	@echo "[sudo] rmdir --ignore-fail-on-non-empty /usr/local/libexec/sandboxd-test"
 	sudo -k rmdir --ignore-fail-on-non-empty /usr/local/libexec/sandboxd-test 2>/dev/null || true
 	@# Restore any production binaries dev-env stashed at the canonical
 	@# libexec path (no-op on a pure dev host with no *.prod stash). Each
