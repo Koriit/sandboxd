@@ -1,23 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 445" stroke-linejoin="round" stroke-linecap="round">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 370" stroke-linejoin="round" stroke-linecap="round">
   <defs>
-    <style type="text/css"><![CDATA[
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@900&display=swap');
-    ]]></style>
-    <linearGradient id="flameCore" x1="0.5" y1="0" x2="0.5" y2="1">
-      <stop offset="0"    stop-color="#FFD24A"/>
-      <stop offset="0.35" stop-color="#FF8A1C"/>
-      <stop offset="0.75" stop-color="#E54410"/>
-      <stop offset="1"    stop-color="#A82B06"/>
-    </linearGradient>
-    <linearGradient id="flameBack" x1="0.5" y1="0" x2="0.5" y2="1">
-      <stop offset="0"    stop-color="#FF7A1C"/>
-      <stop offset="0.6"  stop-color="#C9400A"/>
-      <stop offset="1"    stop-color="#6E1B02"/>
-    </linearGradient>
-    <clipPath id="flameClip">
-      <!-- Clip at y=236 to hide the flame's pedestal bar but preserve the curvy tongue bottoms above it. -->
-      <rect x="0" y="0" width="420" height="236"/>
-    </clipPath>
     <linearGradient id="metal" x1="0.5" y1="0" x2="0.5" y2="1">
       <stop offset="0"    stop-color="#FAFAFA"/>
       <stop offset="0.3"  stop-color="#D6D8DC"/>
@@ -56,6 +38,21 @@
       <stop offset="0.5" stop-color="#FF6A13" stop-opacity="0.18"/>
       <stop offset="1"   stop-color="#FF6A13" stop-opacity="0"/>
     </radialGradient>
+    <linearGradient id="flameCore" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0"    stop-color="#FFD24A"/>
+      <stop offset="0.35" stop-color="#FF8A1C"/>
+      <stop offset="0.75" stop-color="#E54410"/>
+      <stop offset="1"    stop-color="#A82B06"/>
+    </linearGradient>
+    <linearGradient id="flameBack" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0"    stop-color="#FF7A1C"/>
+      <stop offset="0.6"  stop-color="#C9400A"/>
+      <stop offset="1"    stop-color="#6E1B02"/>
+    </linearGradient>
+    <clipPath id="flameClip">
+      <!-- Clip at y=236 to hide the flame's pedestal bar but preserve the curvy tongue bottoms above it. -->
+      <rect x="0" y="0" width="420" height="236"/>
+    </clipPath>
     <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
       <feGaussianBlur stdDeviation="4"/>
     </filter>
@@ -65,6 +62,20 @@
       <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
       <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
+  </defs>
+
+  <!-- UP ARROW (left) -->
+  <defs>
+    <linearGradient id="arrowCream" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0"   stop-color="#FFFFFF"/>
+      <stop offset="0.5" stop-color="#F2F3F5"/>
+      <stop offset="1"   stop-color="#C9CED5"/>
+    </linearGradient>
+    <linearGradient id="arrowOrange" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0"   stop-color="#FFAA55"/>
+      <stop offset="0.5" stop-color="#FF7A1C"/>
+      <stop offset="1"   stop-color="#C24008"/>
+    </linearGradient>
   </defs>
 
   <!-- FLAMES (behind everything, rising from crate) -->
@@ -83,19 +94,6 @@
     </g>
   </g>
 
-  <!-- UP ARROW (left) -->
-  <defs>
-    <linearGradient id="arrowCream" x1="0.5" y1="0" x2="0.5" y2="1">
-      <stop offset="0"   stop-color="#FFFFFF"/>
-      <stop offset="0.5" stop-color="#F2F3F5"/>
-      <stop offset="1"   stop-color="#C9CED5"/>
-    </linearGradient>
-    <linearGradient id="arrowOrange" x1="0.5" y1="0" x2="0.5" y2="1">
-      <stop offset="0"   stop-color="#FFAA55"/>
-      <stop offset="0.5" stop-color="#FF7A1C"/>
-      <stop offset="1"   stop-color="#C24008"/>
-    </linearGradient>
-  </defs>
   <g filter="url(#shadow)" stroke="#7A7F86" stroke-width="3">
     <path d="M54 191
              L20 231
@@ -201,7 +199,7 @@
       <line x1="112" y1="262" x2="316" y2="262"/>
       <line x1="108" y1="298" x2="319" y2="298"/>
     </g>
-    <!-- horizontal fibers -->
+    <!-- horizontal fibers (short dark strokes) -->
     <g stroke="#3A1F08" stroke-width="0.6" fill="none" opacity="0.45" stroke-linecap="round">
       <path d="M120 241 Q 130 240, 140 241"/>
       <path d="M230 238 Q 250 237, 272 239"/>
@@ -214,7 +212,7 @@
       <path d="M210 304 Q 225 303, 244 305"/>
       <path d="M272 320 L 295 321"/>
     </g>
-    <!-- horizontal cracks -->
+    <!-- horizontal cracks (thin dark splits) -->
     <g stroke="#1F0B03" stroke-width="0.5" fill="none" opacity="0.55" stroke-linecap="round">
       <path d="M188 248 Q 210 247, 232 248"/>
       <path d="M140 282 L 175 281"/>
@@ -222,10 +220,13 @@
     </g>
     <!-- Natural wood grain: flowing lines deflecting around knot -->
     <g stroke="#2A1406" stroke-width="1.0" fill="none" opacity="0.7" stroke-linecap="round">
+      <!-- Top plank right-to-left: flowing lines -->
       <path d="M316 235 Q 280 232, 240 236 Q 220 238, 210 236"/>
       <path d="M310 250 Q 275 252, 235 249"/>
+      <!-- Middle plank left: flowing lines (avoiding knot at 225,276) -->
       <path d="M104 272 Q 140 269, 180 273 Q 195 275, 208 272"/>
       <path d="M108 285 Q 145 287, 185 284"/>
+      <!-- Bottom plank: lines flowing past knot (163, 318), bowing over and under -->
       <path d="M100 305 Q 140 303, 163 301 Q 186 303, 225 305"/>
       <path d="M100 314 Q 130 313, 150 312 Q 157 309, 163 308 Q 169 309, 176 312 Q 196 313, 225 314"/>
       <path d="M100 322 Q 130 322, 150 324 Q 157 327, 163 328 Q 169 327, 176 324 Q 196 322, 225 322"/>
@@ -260,31 +261,4 @@
 
   <!-- Ground shadow -->
   <ellipse cx="210" cy="348" rx="115" ry="7" fill="#000000" opacity="0.22" filter="url(#soft)"/>
-  <!-- WORDMARK: sandboxd -->
-  <defs>
-    <linearGradient id="wordWhite" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"    stop-color="#FFFFFF"/>
-      <stop offset="0.55" stop-color="#F4F6F9"/>
-      <stop offset="1"    stop-color="#C9CED5"/>
-    </linearGradient>
-    <linearGradient id="wordOrange" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"    stop-color="#FFB460"/>
-      <stop offset="0.5"  stop-color="#FF7A1C"/>
-      <stop offset="1"    stop-color="#B03808"/>
-    </linearGradient>
-    <filter id="wordShadow" x="-10%" y="-10%" width="120%" height="150%">
-      <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
-      <feOffset dx="0" dy="3"/>
-      <feComponentTransfer><feFuncA type="linear" slope="0.4"/></feComponentTransfer>
-      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-  </defs>
-  <g filter="url(#wordShadow)"
-     font-family="'Inter', 'Helvetica Neue', 'Arial Black', system-ui, sans-serif"
-     font-weight="900" font-size="88" letter-spacing="-3"
-     text-anchor="middle">
-    <text x="210" y="425">
-      <tspan fill="url(#wordWhite)" stroke="#AEB2B8" stroke-width="1.2">sandbox</tspan><tspan fill="url(#wordOrange)">d</tspan>
-    </text>
-  </g>
 </svg>
