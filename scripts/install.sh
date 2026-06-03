@@ -186,6 +186,31 @@ emit() {
     fi
 }
 
+# announce_sudo — print the privileged change about to happen BEFORE the
+# sudo password prompt can appear, so the operator always sees *what* they
+# are authenticating for. Mirrors the `[sudo] <change>` convention the
+# project Makefile uses for its setup targets. install.sh re-authenticates
+# on every privileged step (`sudo -k`, the no-cached-sudo invariant), so
+# without these lines the operator faces a bare password prompt with no
+# context for what it is granting.
+announce_sudo() {
+    emit "${BLUE}[sudo]${RESET} $*"
+}
+
+# run_priv — announce a privileged action, then run it under `sudo -k`
+# (fresh credential check, per the no-cached-sudo invariant). Use for the
+# common `sudo -k <cmd>` sites. Sites that redirect sudo's stdout
+# (`… >/dev/null`), pipe into sudo (`… | sudo tee`), or capture it
+# (`$(sudo …)`) must NOT use this wrapper — its announce_sudo line would be
+# swallowed by the redirection; those sites call announce_sudo on its own
+# line first, then run the sudo as before.
+run_priv() {
+    desc="$1"
+    shift
+    announce_sudo "$desc"
+    sudo -k "$@"
+}
+
 log_line() {
     # Append one record to $INSTALL_LOG. Args: full key=value tail.
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -193,9 +218,14 @@ log_line() {
     if [ -w "$INSTALL_LOG" ] || { [ ! -e "$INSTALL_LOG" ] && [ -w "$(dirname "$INSTALL_LOG")" ]; }; then
         printf '%s\n' "$line" >> "$INSTALL_LOG" 2>/dev/null || true
     else
-        # Best-effort via sudo. Suppress failures so early-flag-parse logging
-        # before the log file is created cannot fault the whole script.
-        printf '%s\n' "$line" | sudo -k tee -a "$INSTALL_LOG" >/dev/null 2>&1 || true
+        # Best-effort via NON-INTERACTIVE sudo (`-n`): a log write must never
+        # trigger a password prompt. With the interactive `-k` form, the very
+        # first prompt an operator sees would come from this hidden logging tee
+        # (fired during parse_args, before any step banner) with zero context.
+        # If no usable credential is available the write is silently dropped
+        # (|| true) — the on-host install log is best-effort and the record is
+        # non-essential. Genuine privileged steps below still announce + `-k`.
+        printf '%s\n' "$line" | sudo -n tee -a "$INSTALL_LOG" >/dev/null 2>&1 || true
     fi
 }
 
@@ -239,9 +269,13 @@ ensure_install_log() {
     if [ -e "$INSTALL_LOG" ]; then
         return 0
     fi
+    announce_sudo "create install log $INSTALL_LOG (root:root 0640)"
     if sudo -k touch "$INSTALL_LOG" 2>/dev/null; then
-        sudo -k chmod 0640 "$INSTALL_LOG" 2>/dev/null || true
-        sudo -k chown root:root "$INSTALL_LOG" 2>/dev/null || true
+        # Follow-ups are best-effort and non-interactive (`-n`): the file is
+        # already root-owned (sudo touch ran as root), so a missing credential
+        # here only leaves default perms — never worth a second prompt.
+        sudo -n chmod 0640 "$INSTALL_LOG" 2>/dev/null || true
+        sudo -n chown root:root "$INSTALL_LOG" 2>/dev/null || true
     fi
 }
 
@@ -892,7 +926,8 @@ create_sandbox_user() {
         log_ok "step=useradd action=skip reason=exists"
         SANDBOX_USER_CREATED=0
     else
-        sudo -k useradd \
+        run_priv "create system user 'sandbox' (system account, no home, nologin)" \
+            useradd \
             --system \
             --user-group \
             --no-create-home \
@@ -906,10 +941,10 @@ create_sandbox_user() {
 
     # Group adds are idempotent: usermod -aG on an existing member is a no-op.
     if getent group docker >/dev/null 2>&1; then
-        sudo -k usermod -aG docker sandbox
+        run_priv "add user 'sandbox' to group 'docker'" usermod -aG docker sandbox
     fi
     if getent group kvm >/dev/null 2>&1; then
-        sudo -k usermod -aG kvm sandbox
+        run_priv "add user 'sandbox' to group 'kvm'" usermod -aG kvm sandbox
     fi
     log_ok "step=usermod_groups groups=docker,kvm we_created=$SANDBOX_USER_CREATED"
 
@@ -951,7 +986,7 @@ add_operator_to_group() {
         return 0
     fi
 
-    sudo -k usermod -aG sandbox "$operator"
+    run_priv "add operator '$operator' to group 'sandbox'" usermod -aG sandbox "$operator"
     OPERATORS_ADDED="$operator"
     log_ok "step=operator_add operator=$operator action=add"
 }
@@ -978,7 +1013,8 @@ install_binary() {
     # to restore a stashed prod binary by comparing mtimes: a real install must
     # bump the canonical binary's mtime past any stale dev stash, or clean could
     # silently downgrade this install. See scripts/dev/canonical-binary.sh.
-    sudo -k install -D -m "$mode" -o root -g root "$src" "$dst"
+    run_priv "install $dst (mode $mode, root:root)" \
+        install -D -m "$mode" -o root -g root "$src" "$dst"
     sha=$(sha256sum "$dst" | awk '{print $1}')
     log_ok "step=install_binary path=$dst sha256=$sha action=install"
 }
@@ -1024,7 +1060,7 @@ setcap_route_helper() {
         log_ok "step=setcap caps=$expected action=skip reason=already-set"
         return 0
     fi
-    sudo -k setcap "$expected" "$helper"
+    run_priv "setcap $expected on $helper" setcap "$expected" "$helper"
     new=$(getcap "$helper" 2>/dev/null | awk '{print $NF}')
     [ "$new" = "$expected" ] || die "setcap verification failed: got '$new'"
     log_ok "step=setcap caps=$expected action=set"
@@ -1048,7 +1084,7 @@ setcap_lima_helper() {
         log_ok "step=setcap caps=$setcap_arg action=skip reason=already-set"
         return 0
     fi
-    sudo -k setcap "$setcap_arg" "$helper"
+    run_priv "setcap $setcap_arg on $helper" setcap "$setcap_arg" "$helper"
     new=$(getcap "$helper" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
     [ "$new" = "$expected" ] || die "setcap verification failed: got '$new'"
     log_ok "step=setcap caps=$setcap_arg action=set"
@@ -1085,7 +1121,8 @@ setuid_bridge_helper() {
         WE_SET_BRIDGE_HELPER_SETUID=0
         return 0
     fi
-    sudo -k chmod u+s "$BRIDGE_HELPER"
+    run_priv "chmod u+s $BRIDGE_HELPER (setuid for unprivileged TAP creation)" \
+        chmod u+s "$BRIDGE_HELPER"
     WE_SET_BRIDGE_HELPER_SETUID=1
     log_ok "step=bridge_helper_setuid path=$BRIDGE_HELPER action=set we_set=1"
 }
@@ -1102,13 +1139,15 @@ install_bridge_conf() {
             ADDED_BRIDGE_CONF_RULES=""
             return 0
         fi
+        announce_sudo "append '$target_rule' to /etc/qemu/bridge.conf"
         printf '%s\n' "$target_rule" | sudo -k tee -a /etc/qemu/bridge.conf >/dev/null
         ADDED_BRIDGE_CONF_RULES="$target_rule"
         log_ok "step=bridge_conf action=append rule='$target_rule'"
     else
-        sudo -k mkdir -p /etc/qemu
+        run_priv "mkdir -p /etc/qemu" mkdir -p /etc/qemu
+        announce_sudo "write '$target_rule' to /etc/qemu/bridge.conf"
         printf '%s\n' "$target_rule" | sudo -k tee /etc/qemu/bridge.conf >/dev/null
-        sudo -k chmod 0644 /etc/qemu/bridge.conf
+        run_priv "chmod 0644 /etc/qemu/bridge.conf" chmod 0644 /etc/qemu/bridge.conf
         ADDED_BRIDGE_CONF_RULES="$target_rule"
         log_ok "step=bridge_conf action=create rule='$target_rule'"
     fi
@@ -1124,7 +1163,7 @@ install_users_conf() {
         WE_CREATED_USERS_CONF=0
         return 0
     fi
-    sudo -k mkdir -p /etc/sandboxd
+    run_priv "mkdir -p /etc/sandboxd" mkdir -p /etc/sandboxd
     operator_for_pool="${OPERATORS_ADDED:-sandbox}"
 
     staged="$TMPDIR_INSTALL/users.conf"
@@ -1140,7 +1179,8 @@ install_users_conf() {
   ]
 }
 EOF
-    sudo -k install -m 0644 -o root -g root "$staged" /etc/sandboxd/users.conf
+    run_priv "install /etc/sandboxd/users.conf (mode 0644, root:root)" \
+        install -m 0644 -o root -g root "$staged" /etc/sandboxd/users.conf
     WE_CREATED_USERS_CONF=1
     log_ok "step=users_conf action=create pool=10.209.0.0/20 allow_users='sandbox,$operator_for_pool'"
 }
@@ -1157,6 +1197,7 @@ docker_load_gateway() {
     fi
     image_path="$STAGE/images/sandbox-gateway-${VERSION}.tar"
     [ -f "$image_path" ] || die "tarball missing gateway image at $image_path"
+    announce_sudo "docker load gateway image $tag from $image_path"
     sudo -k docker load -i "$image_path" >/dev/null
     docker image inspect "$tag" >/dev/null 2>&1 \
         || die "docker load did not produce expected tag $tag"
@@ -1188,7 +1229,8 @@ install_systemd_unit() {
         log_ok "step=install_unit action=skip reason=identical"
         return 0
     fi
-    sudo -k install -m 0644 -o root -g root "$unit_rendered" "$unit_dst"
+    run_priv "install systemd unit $unit_dst (mode 0644, root:root)" \
+        install -m 0644 -o root -g root "$unit_rendered" "$unit_dst"
     sha=$(sha256sum "$unit_dst" | awk '{print $1}')
     log_ok "step=install_unit path=$unit_dst base_dir=$BASE_DIR sha256=$sha action=install"
 }
@@ -1198,7 +1240,7 @@ install_systemd_unit() {
 # ----------------------------------------------------------------------------
 
 systemd_daemon_reload() {
-    sudo -k systemctl daemon-reload
+    run_priv "systemctl daemon-reload" systemctl daemon-reload
     log_ok "step=daemon_reload"
 }
 
@@ -1244,8 +1286,10 @@ migrate_legacy_state() {
     fi
 
     # Ensure the per-uid base-dir exists before moving files into it.
-    sudo -k install -d -o root -g root -m 0755 /var/lib/sandboxd
-    sudo -k install -d -o sandbox -g sandbox -m 0750 "$BASE_DIR"
+    run_priv "create /var/lib/sandboxd (root:root 0755)" \
+        install -d -o root -g root -m 0755 /var/lib/sandboxd
+    run_priv "create $BASE_DIR (sandbox:sandbox 0750)" \
+        install -d -o sandbox -g sandbox -m 0750 "$BASE_DIR"
 
     emit "  Migrating state from $legacy_dir to $BASE_DIR ..."
 
@@ -1264,7 +1308,7 @@ migrate_legacy_state() {
                 emit "  ${YELLOW}!${RESET} $dst already exists, skipping $src"
                 log_warn "step=migrate_legacy item=$name action=skip reason=dst-exists"
             else
-                sudo -k mv "$src" "$dst"
+                run_priv "migrate $src -> $dst" mv "$src" "$dst"
                 log_ok "step=migrate_legacy item=$name action=mv src=$src dst=$dst"
             fi
         fi
@@ -1273,11 +1317,15 @@ migrate_legacy_state() {
     # Remove the legacy dir if it is now empty (or contains only the
     # abandoned .lima/ tree which we deliberately left behind).
     # We attempt rmdir (fails if non-empty) and fall through gracefully.
+    announce_sudo "remove legacy dir $legacy_dir if now empty"
     if sudo -k rmdir "$legacy_dir" 2>/dev/null; then
         log_ok "step=migrate_legacy action=rmdir path=$legacy_dir"
     else
-        # Check whether the only thing left is .lima/
-        remaining=$(sudo -k ls -A "$legacy_dir" 2>/dev/null | grep -v '^\.lima$' || true)
+        # Check whether the only thing left is .lima/. Read-only probe via
+        # non-interactive sudo (`-n`) so this diagnostic never prompts; if no
+        # credential is available the listing is empty and we fall through to
+        # the benign lima-remnant branch below.
+        remaining=$(sudo -n ls -A "$legacy_dir" 2>/dev/null | grep -v '^\.lima$' || true)
         if [ -z "$remaining" ]; then
             emit "  ${YELLOW}!${RESET} $legacy_dir still contains abandoned Lima state at $legacy_dir/.lima/"
             emit "      These VMs cannot be recovered into the per-operator model."
@@ -1309,8 +1357,10 @@ json_str() {
 write_install_state() {
     # Create /var/lib/sandboxd (root:root 0755 — traversable by both daemon
     # users) and the per-uid subtree (sandbox:sandbox 0750).
-    sudo -k install -d -o root -g root -m 0755 /var/lib/sandboxd
-    sudo -k install -d -o sandbox -g sandbox -m 0750 "$BASE_DIR"
+    run_priv "create /var/lib/sandboxd (root:root 0755)" \
+        install -d -o root -g root -m 0755 /var/lib/sandboxd
+    run_priv "create $BASE_DIR (sandbox:sandbox 0750)" \
+        install -d -o sandbox -g sandbox -m 0750 "$BASE_DIR"
 
     installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     installed_by_operator="${SUDO_USER:-(direct-root)}"
@@ -1328,7 +1378,9 @@ write_install_state() {
 
     users_conf_sha="null"
     if [ "$WE_CREATED_USERS_CONF" = "1" ] && [ -f /etc/sandboxd/users.conf ]; then
-        h=$(sudo -k sha256sum /etc/sandboxd/users.conf | awk '{print $1}')
+        # users.conf is installed 0644 root:root (world-readable), so the
+        # operator can hash it directly — no sudo, hence no prompt, needed.
+        h=$(sha256sum /etc/sandboxd/users.conf | awk '{print $1}')
         users_conf_sha=$(json_str "$h")
     fi
     if [ -n "$MANIFEST_BUILD_SHA" ]; then
@@ -1367,7 +1419,8 @@ write_install_state() {
             || die "internal error: install-state.json failed jq parse"
     fi
 
-    sudo -k install -m 0640 -o sandbox -g sandbox "$staged" "$STATE_PATH"
+    run_priv "install $STATE_PATH (mode 0640, sandbox:sandbox)" \
+        install -m 0640 -o sandbox -g sandbox "$staged" "$STATE_PATH"
     log_ok "step=install_state path=$STATE_PATH"
 }
 
