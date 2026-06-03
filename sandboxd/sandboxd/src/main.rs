@@ -600,7 +600,8 @@ where
         return Err(SandboxError::Internal(format!(
             "sandbox-route-helper not usable at {env_path} (set via \
              ${ROUTE_HELPER_PATH_ENV}); the file must exist as a regular \
-             file AND carry the route-helper's file capabilities (effective): \
+             file AND carry the route-helper's file capabilities \
+             (CAP_NET_ADMIN, CAP_SYS_PTRACE, CAP_SYS_ADMIN — all effective): \
              `sudo setcap cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip {env_path}`. \
              To use the canonical \
              install instead, unset {env}; the resolver then looks up \
