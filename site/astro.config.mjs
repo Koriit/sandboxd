@@ -78,10 +78,10 @@ export default defineConfig({
       description:
         'Isolated, policy-controlled Linux VMs for coding agents, with per-session networking, TLS interception, and workspace provisioning.',
       logo: {
-        src: './public/logo.svg',
+        src: './public/logo-icon.svg',
         replacesTitle: false,
       },
-      favicon: '/logo.svg',
+      favicon: '/favicon.svg',
       // In dev, rehype-mermaid runs under `pre-mermaid`, emitting raw <pre
       // class="mermaid"> blocks that expect a client-side Mermaid renderer.
       // Ship it from a CDN only in dev — builds render SVGs at the rehype
