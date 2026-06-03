@@ -1869,7 +1869,7 @@ def test_level3_host_mismatch(sandbox_cli, backend):
 
 @pytest.mark.timeout(600)
 def test_level3_method_restriction(sandbox_cli, backend):
-    """Policy allows httpbin.org at level 'http' with only GET filters.
+    """Policy allows httpbingo.org at level 'http' with only GET filters.
     A POST request should get HTTP 599 (policy-denied).
     """
     session_id = None
@@ -1879,7 +1879,7 @@ def test_level3_method_restriction(sandbox_cli, backend):
             "version": "2.0.0",
             "rules": [
                 {
-                    "host": "httpbin.org",
+                    "host": "httpbingo.org",
                     "port": 443,
                     "protocol": "tcp",
                     "level": "http",
@@ -1901,12 +1901,12 @@ def test_level3_method_restriction(sandbox_cli, backend):
         wait_for_state(sandbox_cli, "pol-l3-method", "Running", timeout=10)
 
         # Warm up DNS so the daemon's DNS propagation loop rewrites the
-        # Envoy L3 listener file with a filter chain matching httpbin.org's
+        # Envoy L3 listener file with a filter chain matching httpbingo.org's
         # resolved IPs. Without this the fail-closed listener has no
         # matching chain and the connection is rejected.
         sandbox_cli(
             "ssh", "pol-l3-method", "--",
-            "nslookup", "httpbin.org",
+            "nslookup", "httpbingo.org",
             timeout=120,
         )
         time.sleep(5)
@@ -1915,7 +1915,7 @@ def test_level3_method_restriction(sandbox_cli, backend):
         get_result = sandbox_cli(
             "ssh", "pol-l3-method", "--",
             "bash", "-c",
-            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/get 2>&1"),
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbingo.org/get 2>&1"),
             timeout=120,
         )
         get_code = get_result.stdout.strip()
@@ -1928,7 +1928,7 @@ def test_level3_method_restriction(sandbox_cli, backend):
         post_result = sandbox_cli(
             "ssh", "pol-l3-method", "--",
             "bash", "-c",
-            shlex.quote("curl -s -o /dev/null -w '%{http_code}' -X POST --connect-timeout 15 --max-time 30 https://httpbin.org/post 2>&1"),
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' -X POST --connect-timeout 15 --max-time 30 https://httpbingo.org/post 2>&1"),
             timeout=120,
         )
         post_code = post_result.stdout.strip()
@@ -1960,7 +1960,7 @@ def test_level3_path_restriction(sandbox_cli, backend):
             "version": "2.0.0",
             "rules": [
                 {
-                    "host": "httpbin.org",
+                    "host": "httpbingo.org",
                     "port": 443,
                     "protocol": "tcp",
                     "level": "http",
@@ -1982,12 +1982,12 @@ def test_level3_path_restriction(sandbox_cli, backend):
         wait_for_state(sandbox_cli, "pol-l3-path", "Running", timeout=10)
 
         # Warm up DNS so the daemon's DNS propagation loop rewrites the
-        # Envoy L3 listener file with a filter chain matching httpbin.org's
+        # Envoy L3 listener file with a filter chain matching httpbingo.org's
         # resolved IPs. Without this the fail-closed listener has no
         # matching chain and the connection is rejected.
         sandbox_cli(
             "ssh", "pol-l3-path", "--",
-            "nslookup", "httpbin.org",
+            "nslookup", "httpbingo.org",
             timeout=120,
         )
         time.sleep(5)
@@ -1996,7 +1996,7 @@ def test_level3_path_restriction(sandbox_cli, backend):
         bad_path_result = sandbox_cli(
             "ssh", "pol-l3-path", "--",
             "bash", "-c",
-            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/other/path 2>&1"),
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbingo.org/other/path 2>&1"),
             timeout=120,
         )
         bad_code = bad_path_result.stdout.strip()
@@ -2007,12 +2007,12 @@ def test_level3_path_restriction(sandbox_cli, backend):
         )
 
         # Request to the allowed path prefix should succeed (not 599).
-        # httpbin.org may return 404 for /api/ but that's fine -- we just
+        # httpbingo.org may return 404 for /api/ but that's fine -- we just
         # need to confirm the proxy doesn't block it.
         good_path_result = sandbox_cli(
             "ssh", "pol-l3-path", "--",
             "bash", "-c",
-            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbin.org/api/anything 2>&1"),
+            shlex.quote("curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://httpbingo.org/api/anything 2>&1"),
             timeout=120,
         )
         good_code = good_path_result.stdout.strip()
@@ -2205,8 +2205,8 @@ def test_l3_fail_closed_before_dns_propagation(sandbox_cli, backend):
 @pytest.mark.timeout(600)
 def test_policy_update(sandbox_cli, backend):
     """Create with a policy allowing example.com. Verify it works. Update the
-    policy to allow httpbin.org instead. Verify example.com is now denied and
-    httpbin.org works.
+    policy to allow httpbingo.org instead. Verify example.com is now denied and
+    httpbingo.org works.
     """
     session_id = None
     policy_path_1 = None
@@ -2265,12 +2265,12 @@ def test_policy_update(sandbox_cli, backend):
             f"stdout: {curl_result.stdout}"
         )
 
-        # Update policy: allow httpbin.org:80/tcp instead of example.com.
+        # Update policy: allow httpbingo.org:80/tcp instead of example.com.
         policy_2 = {
             "version": "2.0.0",
             "rules": [
                 {
-                    "host": "httpbin.org",
+                    "host": "httpbingo.org",
                     "port": 80,
                     "protocol": "tcp",
                     "level": "transport",
@@ -2305,26 +2305,26 @@ def test_policy_update(sandbox_cli, backend):
             f"stdout: {denied_dns.stdout}\nstderr: {denied_dns.stderr}"
         )
 
-        # Warm DNS for httpbin.org (the post-update allow) and let the
+        # Warm DNS for httpbingo.org (the post-update allow) and let the
         # propagation loop materialise the L1 transport filter chain +
         # sandbox_policy concat-set entry. Same fail-closed race as the
         # initial-policy curl above.
         sandbox_cli(
             "ssh", "pol-update", "--",
-            "nslookup", "httpbin.org",
+            "nslookup", "httpbingo.org",
             timeout=120,
         )
         time.sleep(5)
 
-        # Verify httpbin.org is now reachable.
+        # Verify httpbingo.org is now reachable.
         httpbin_result = sandbox_cli(
             "ssh", "pol-update", "--",
             "curl", "-s", "--connect-timeout", "15", "--max-time", "30",
-            "http://httpbin.org/get",
+            "http://httpbingo.org/get",
             timeout=120,
         )
         assert httpbin_result.returncode == 0, (
-            f"curl to httpbin.org failed after policy update.\n"
+            f"curl to httpbingo.org failed after policy update.\n"
             f"stdout: {httpbin_result.stdout}\nstderr: {httpbin_result.stderr}"
         )
 

@@ -4,16 +4,16 @@ These tests verify that every daemon limactl invocation goes through
 ``sandbox-lima-helper`` with the operator's uid, so:
 
 1. The Lima VM's ``_config/user`` SSH private key is owned by the *operator*
-   uid (not the daemon uid 999), satisfying OpenSSH ``StrictKeyfileMode``.
+   uid (not the daemon uid), satisfying OpenSSH ``StrictKeyfileMode``.
 2. A session created under a non-daemon operator uid can:
    a. Boot and reach Running state.
    b. Communicate with the guest agent (ping succeeds).
    c. Reach the in-VM sshd through the daemon-mediated proxy endpoint.
 
-These tests exercise the cross-user path: the daemon runs as the ``sandbox``
-system user (via ``sudo -u sandbox``) so the ``SO_PEERCRED`` uid captured on
-session-create differs from the operator invoking the CLI.  They are marked
-``lima`` (Lima/QEMU only).
+These tests exercise the cross-user path: the daemon runs as the
+``sandbox-test`` system user (via ``sudo -u sandbox-test``) so the
+``SO_PEERCRED`` uid captured on session-create differs from the operator
+invoking the CLI.  They are marked ``lima`` (Lima/QEMU only).
 
 Runtime: 5–15 minutes depending on whether the base image needs building.
 Run individually before the full matrix:
@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from conftest import (
+    OP_LIMA_HOME,
     SANDBOX_BIN,
     _SANDBOX_E2E_SOCKET,
     _VM_RESOURCE_ARGS,
@@ -66,14 +67,16 @@ def _config_user_path_for_vm(vm_name: str) -> Path | None:
     """Return the path to _config/user inside the per-operator LIMA_HOME.
 
     Lima stores the SSH keypair at the LIMA_HOME level, not inside each
-    individual VM instance directory.  The correct path is:
-        /var/lib/sandboxd/<op_uid>/lima/_config/user
-    We derive op_uid from os.getuid() (the test runner is the operator).
+    individual VM instance directory.  The correct path is the 3-level
+    per-uid OP_LIMA_HOME:
+        /var/lib/sandboxd/<sandbox-test-uid>/<op_uid>/lima/_config/user
+    We derive this from conftest's OP_LIMA_HOME constant (which encodes
+    both the daemon uid and the operator uid) rather than constructing
+    the path from os.getuid() alone.
     The vm_name parameter is accepted for call-site compatibility but is
     not used in the path construction.
     """
-    op_uid = os.getuid()
-    return Path(f"/var/lib/sandboxd/{op_uid}/lima/_config/user")
+    return Path(OP_LIMA_HOME) / "_config" / "user"
 
 
 # ---------------------------------------------------------------------------
@@ -148,20 +151,22 @@ class TestHelperPivotSessionReachability:
                 sandbox("rm", session_id, check=False)
 
     def test_vm_lives_in_per_operator_lima_home(self, tmp_path):
-        """The VM directory must be under /var/lib/sandboxd/<op_uid>/lima/."""
+        """The VM directory must be under the 3-level per-operator LIMA_HOME."""
         session_id = None
         try:
             result = sandbox("create", "--backend", "lima", *_VM_RESOURCE_ARGS)
             session_id = parse_session_id(result.stdout)
 
-            op_uid = os.getuid()
-            expected_lima_home = Path(f"/var/lib/sandboxd/{op_uid}/lima")
+            # OP_LIMA_HOME is the 3-level path:
+            #   /var/lib/sandboxd/<sandbox-test-uid>/<op_uid>/lima
+            # (conftest encodes both the daemon uid and the operator uid).
+            expected_lima_home = Path(OP_LIMA_HOME)
             vm_dir = expected_lima_home / f"sandbox-{session_id}"
 
             assert vm_dir.exists(), (
                 f"VM directory {vm_dir} does not exist. "
-                "Expected VM to be created in per-operator LIMA_HOME "
-                f"/var/lib/sandboxd/{op_uid}/lima/ but it wasn't. "
+                f"Expected VM to be created in per-operator LIMA_HOME "
+                f"{expected_lima_home}/ but it wasn't. "
                 "Check that sandbox-lima-helper set LIMA_HOME correctly."
             )
         finally:

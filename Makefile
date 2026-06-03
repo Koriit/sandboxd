@@ -13,10 +13,10 @@ GREEN :=
 RESET :=
 endif
 
+# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
+# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
+# otherwise emit plain text so captured logs and CI output stay greppable.
 build: fmt-check
-	# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
-	# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
-	# otherwise emit plain text so captured logs and CI output stay greppable.
 	@if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then \
 	  cd sandboxd && cargo build --workspace; \
 	else \
@@ -33,10 +33,11 @@ fmt-check:
 # default nextest profile (`sandboxd/.config/nextest.toml`) filters out
 # every test named `integration_*`, so this target stays fast and
 # deterministic even as the workspace grows more integration tests.
+#
+# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
+# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
+# otherwise emit plain text so captured logs stay greppable.
 test:
-	# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
-	# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
-	# otherwise emit plain text so captured logs stay greppable.
 	@# Build with the same `test-env-override` features as `test-integration`
 	@# so both targets compile the identical test universe and differ only in
 	@# which nextest profile selects. Without this, `#[cfg(feature =
@@ -68,10 +69,11 @@ test:
 # `install-route-helper-test-cap`). Flag must match the install step
 # or the test's checksum check rejects the on-disk cap'd binary as
 # stale.
+#
+# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
+# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
+# otherwise emit plain text so captured logs stay greppable.
 test-integration: gateway-image lite-image install-route-helper-test-cap install-lima-helper-test-cap
-	# FORCE_COLOR (set in this env) forces ANSI color even into redirected files.
-	# Detect interactive: stdout is a TTY and CI/NO_COLOR are unset → keep color;
-	# otherwise emit plain text so captured logs stay greppable.
 	@if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then \
 	  cd sandboxd && \
 	    cargo build --workspace --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override && \

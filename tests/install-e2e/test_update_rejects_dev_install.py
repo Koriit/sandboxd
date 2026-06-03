@@ -90,7 +90,7 @@ def test_update_rejects_dev_install(
     )
     assert vm.shell(
         "SUID=$(id -u sandbox 2>/dev/null || true); "
-        "[ -z \"$SUID\" ] || sudo test -e /var/lib/sandboxd/$SUID/.update.lock"
+        "[ -n \"$SUID\" ] && sudo test -e /var/lib/sandboxd/$SUID/.update.lock"
     ).returncode != 0, (
         "per-uid .update.lock must not exist after dev-mode refusal"
     )

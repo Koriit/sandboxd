@@ -818,11 +818,14 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         #    delete through `session_policies` / `policy_rules` /
         #    `policy_rule_http_filters` (V003+V004 schema).
         #
-        #    The DB is owned by user `sandbox` (uid 999) inside a
-        #    mode-0700 directory — the test-runner process (operator uid)
-        #    gets EACCES on a direct sqlite3.connect(). Route the mutation
-        #    through `sudo -n -u sandbox sqlite3` so the correct user
-        #    performs the write.
+        #    The DB is owned by user `sandbox-test` (the e2e daemon uid)
+        #    with mode 0600 inside a mode-0750 directory owned by
+        #    `sandbox-test`. The test-runner process (operator uid) gets
+        #    EACCES on a direct sqlite3.connect() — sqlite3 also needs
+        #    write on the directory to create -wal/-journal siblings.
+        #    Route the mutation through `sudo -n -u sandbox-test sqlite3`
+        #    consistent with conftest's _sudo_rm_children_except which
+        #    uses the same principal for all mutations to this tree.
         assert os.path.exists(db_path), (
             f"sessions.db not found at {db_path}; can't synthesise an orphan."
         )
@@ -832,7 +835,7 @@ def test_lite_orphan_cleanup_on_daemon_restart(
             f"DELETE FROM sessions WHERE id = '{sid}';"
         )
         db_result = subprocess.run(
-            ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path],
+            ["sudo", "-n", "-u", "sandbox-test", "sqlite3", db_path],
             input=sql,
             capture_output=True,
             text=True,
@@ -844,7 +847,7 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         )
         # Verify the row is gone by querying count.
         count_result = subprocess.run(
-            ["sudo", "-n", "-u", "sandbox", "sqlite3", db_path,
+            ["sudo", "-n", "-u", "sandbox-test", "sqlite3", db_path,
              f"SELECT COUNT(*) FROM sessions WHERE id = '{sid}';"],
             capture_output=True, text=True, timeout=15,
         )
@@ -855,7 +858,7 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         )
 
         # 3. Restart the daemon with the same socket and base-dir
-        #    (a fresh ``sudo -u sandbox`` Popen).
+        #    (a fresh ``sudo -u sandbox-test`` Popen).
         restarted_handle = restart_test_daemon(sandbox_daemon, sandbox_binaries)
 
         # 4. Allow the boot-time orphan reaper to run. The reaper is

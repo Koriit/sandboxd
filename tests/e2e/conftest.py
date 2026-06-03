@@ -209,14 +209,14 @@ E2E_TEST_POOL_CIDR = "10.220.0.0/20"
 import atexit  # noqa: E402  -- after module-level setup
 import getpass  # noqa: E402
 if "SANDBOX_USERS_CONF" not in os.environ:
-    # ``allow_users`` lists the operator AND the ``sandbox`` system user.
-    # The daemon runs as the ``sandbox`` system user; its startup-time
-    # ``find_subnet_by_uid`` lookup requires the daemon's own uid to
-    # appear in some pool's ``allow_users``. Names that do not resolve
-    # to a uid on a given host are silently skipped by the daemon
-    # ("unresolvable allow_users entries are treated as non-matches"),
-    # so listing ``sandbox`` is a no-op on hosts that have not
-    # provisioned the system user.
+    # ``allow_users`` lists the operator AND the ``sandbox-test`` system
+    # user.  The e2e daemon runs as ``sandbox-test`` (``sudo -u
+    # sandbox-test``); its startup-time ``find_subnet_by_uid`` lookup
+    # requires the daemon's own uid to appear in some pool's
+    # ``allow_users``.  Names that do not resolve to a uid on a given host
+    # are silently skipped by the daemon ("unresolvable allow_users entries
+    # are treated as non-matches"), so listing ``sandbox-test`` is a no-op
+    # on hosts that have not provisioned the system user.
     _users_conf_payload = {
         "_schema_version": _read_min_supported_users_conf_schema(),
         "subnets": [
@@ -226,7 +226,7 @@ if "SANDBOX_USERS_CONF" not in os.environ:
                     "docs/internal/milestones/M12.md S13."
                 ),
                 "cidr": E2E_TEST_POOL_CIDR,
-                "allow_users": [getpass.getuser(), "sandbox"],
+                "allow_users": [getpass.getuser(), "sandbox-test"],
             }
         ]
     }
@@ -240,7 +240,7 @@ if "SANDBOX_USERS_CONF" not in os.environ:
     _users_conf_tf.flush()
     _users_conf_tf.close()
     # Mode 0644 (world-readable) is required so the daemon running as
-    # the ``sandbox`` system user can read the file (it lives under
+    # the ``sandbox-test`` system user can read the file (it lives under
     # /tmp, owned by the test operator). The file lists only CIDR pool
     # definitions for the test daemon — no secrets — so 0644 is safe.
     os.chmod(_users_conf_tf.name, 0o644)
@@ -1044,9 +1044,21 @@ def _launch_daemon_as_sandbox_via_sudo(
     # ``SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP`` is set identically so the
     # helper's group gate matches.  Both env vars are in the sudoers env_keep
     # list so they propagate through ``sudo -u sandbox-test``.
+    #
+    # HOME and DOCKER_CONFIG are NOT in env_keep, so sudo's env_reset
+    # always sets HOME=/nonexistent for sandbox-test regardless of what
+    # the Popen env dict contains. We use an ``env KEY=VAL ...`` wrapper
+    # *after* the sudo user switch to override HOME before execing the
+    # daemon. This gives docker (invoked by the daemon for
+    # ``rebuild-image --backend container``) a writable config dir under
+    # the sandbox-test-owned base dir instead of /nonexistent. The base
+    # dir reset wipes the resulting .docker/ subtree between sessions.
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", "sandbox-test",
+            "env",
+            f"HOME={_SANDBOX_E2E_BASE_DIR}",
+            f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
             str(staged["sandboxd"]),
             "--socket", str(_SANDBOX_E2E_SOCKET),
             "--base-dir", str(_SANDBOX_E2E_BASE_DIR),
@@ -1170,6 +1182,13 @@ def restart_test_daemon(
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", "sandbox-test",
+            # Mirror the HOME/DOCKER_CONFIG env wrapper from the initial
+            # launcher: sudo env_reset sets HOME=/nonexistent for sandbox-test
+            # regardless of the Popen env dict, so we must override after the
+            # user switch via an explicit ``env`` prefix.
+            "env",
+            f"HOME={_SANDBOX_E2E_BASE_DIR}",
+            f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
             str(staged_sandboxd),
             "--socket", str(socket_path),
             "--base-dir", str(base_dir),

@@ -73,12 +73,12 @@ BASE_META_FILENAME = "base-image-meta.json"
 def _base_meta_path(sandbox_daemon) -> Path:
     """Return the path to the daemon's base-image-meta.json.
 
-    The daemon (running as the ``sandbox`` system user) writes this file to
-    the per-operator LIMA_HOME:
-        /var/lib/sandboxd/<op_uid>/lima/base-image-meta.json
+    The daemon (running as the ``sandbox-test`` system user) writes this
+    file to the 3-level per-operator LIMA_HOME:
+        /var/lib/sandboxd/<sandbox-test-uid>/<op_uid>/lima/base-image-meta.json
     which is ``OP_LIMA_HOME/base-image-meta.json`` in conftest terms.
-    The file is owned by the ``sandbox`` system user (daemon uid), not the
-    operator; use the meta-file I/O helpers below rather than accessing
+    The file is owned by the ``sandbox-test`` system user (daemon uid) with
+    mode 0600; use the meta-file I/O helpers below rather than accessing
     the path directly.
     """
     return Path(OP_LIMA_HOME) / BASE_META_FILENAME
@@ -87,52 +87,57 @@ def _base_meta_path(sandbox_daemon) -> Path:
 def _meta_exists(meta_path: Path) -> bool:
     """Return True if the meta file exists.
 
-    The file is owned by ``sandbox``; ``Path.exists()`` works for existence
-    checks since the test user has ``rx`` on the LIMA_HOME directory.
+    The file is owned by ``sandbox-test`` with mode 0600. Route existence
+    checks through ``sudo -n -u sandbox-test`` so the check succeeds even
+    when the operator uid cannot read the file directly.
     """
-    return meta_path.exists()
+    result = subprocess.run(
+        ["sudo", "-n", "-u", "sandbox-test", "test", "-f", str(meta_path)],
+        capture_output=True, timeout=10,
+    )
+    return result.returncode == 0
 
 
 def _meta_read_text(meta_path: Path) -> str:
-    """Read the meta file, routing through ``sudo -u sandbox``.
+    """Read the meta file, routing through ``sudo -u sandbox-test``.
 
-    The daemon writes the file as the ``sandbox`` system user with mode
-    0600 and no ACL entry for the operator uid, so a direct ``open()``
-    raises PermissionError.  We use ``sudo -n -u sandbox cat`` to read
-    it on behalf of the ``sandbox`` user.
+    The daemon writes the file as the ``sandbox-test`` system user with
+    mode 0600 and no ACL entry for the operator uid, so a direct ``open()``
+    raises PermissionError.  We use ``sudo -n -u sandbox-test cat`` to read
+    it on behalf of the daemon user.
     """
     result = subprocess.run(
-        ["sudo", "-n", "-u", "sandbox", "cat", str(meta_path)],
+        ["sudo", "-n", "-u", "sandbox-test", "cat", str(meta_path)],
         capture_output=True, text=True, timeout=10,
     )
     if result.returncode != 0:
         raise PermissionError(
-            f"sudo -u sandbox cat {meta_path} failed "
+            f"sudo -u sandbox-test cat {meta_path} failed "
             f"(rc={result.returncode}): {result.stderr.strip()!r}"
         )
     return result.stdout
 
 
 def _meta_write_text(meta_path: Path, content: str) -> None:
-    """Write ``content`` to the meta file, routing through ``sudo -u sandbox``
+    """Write ``content`` to the meta file, routing through ``sudo -u sandbox-test``
     (see ``_meta_read_text`` for the ownership rationale).
     """
     result = subprocess.run(
-        ["sudo", "-n", "-u", "sandbox",
+        ["sudo", "-n", "-u", "sandbox-test",
          "tee", str(meta_path)],
         input=content, capture_output=True, text=True, timeout=10,
     )
     if result.returncode != 0:
         raise PermissionError(
-            f"sudo -u sandbox tee {meta_path} failed "
+            f"sudo -u sandbox-test tee {meta_path} failed "
             f"(rc={result.returncode}): {result.stderr.strip()!r}"
         )
 
 
 def _meta_unlink(meta_path: Path) -> None:
-    """Remove the meta file, routing through ``sudo -u sandbox``."""
+    """Remove the meta file, routing through ``sudo -u sandbox-test``."""
     subprocess.run(
-        ["sudo", "-n", "-u", "sandbox", "rm", "-f", str(meta_path)],
+        ["sudo", "-n", "-u", "sandbox-test", "rm", "-f", str(meta_path)],
         capture_output=True, timeout=10,
     )
 
@@ -146,8 +151,9 @@ def _daemon_log_snapshot(sandbox_daemon) -> int:
 
     Used as a window start: a later :func:`_daemon_logs_since` reads only
     the bytes appended after this point. The daemon (launched via
-    ``sudo -u sandbox``) writes its tracing output to a single per-session
-    ``_stdout_log`` file, so capturing the size just before a test action
+    ``sudo -u sandbox-test``) writes its tracing output to a single
+    per-session ``_stdout_log`` file, so capturing the size just before a
+    test action
     and reading from it afterwards yields exactly that action's log window
     — excluding session-startup and base-image pre-warm output that would
     otherwise produce false positives (e.g. the pre-warm's "building golden
