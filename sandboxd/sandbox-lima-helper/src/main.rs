@@ -3073,7 +3073,8 @@ WantedBy=multi-user.target";
             "XDG_CACHE_HOME must always be present in env block"
         );
         assert!(
-            xdg.unwrap().starts_with("/var/lib/sandboxd/4242/1000/lima/"),
+            xdg.unwrap()
+                .starts_with("/var/lib/sandboxd/4242/1000/lima/"),
             "XDG_CACHE_HOME must be pinned inside the operator LIMA_HOME tree, got: {xdg:?}"
         );
     }

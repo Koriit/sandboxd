@@ -50,7 +50,9 @@ const LEGACY_BASE_DIR: &str = "/var/lib/sandbox";
 pub fn prod_base_dir() -> Option<PathBuf> {
     let user = nix::unistd::User::from_name("sandbox").ok()??;
     Some(PathBuf::from(format!(
-        "{}/{}", SANDBOXD_STATE_ROOT, user.uid.as_raw()
+        "{}/{}",
+        SANDBOXD_STATE_ROOT,
+        user.uid.as_raw()
     )))
 }
 
@@ -567,8 +569,7 @@ impl DiskCheck {
 /// present; falls back to `/var/lib/sandbox` (pre-migration) or
 /// `/var/lib/sandboxd` (post-migration root) if the sandbox user is absent.
 pub fn check_disk_space(budget: &DiskBudget) -> DiskCheck {
-    let var_lib_probe = prod_base_dir()
-        .unwrap_or_else(|| PathBuf::from("/var/lib/sandboxd"));
+    let var_lib_probe = prod_base_dir().unwrap_or_else(|| PathBuf::from("/var/lib/sandboxd"));
     let rows = vec![
         DiskRow {
             path: PathBuf::from("/usr/local"),
@@ -1728,7 +1729,10 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                 backup::CopyAction::SourceAbsent => {
                     log_step(
                         "backup_sessions_db",
-                        &format!("src={} action=skip status=ok reason=source-absent", src.display()),
+                        &format!(
+                            "src={} action=skip status=ok reason=source-absent",
+                            src.display()
+                        ),
                     );
                 }
                 backup::CopyAction::Skipped => {
@@ -2086,33 +2090,33 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     };
     let unit_src_raw = staged.systemd_unit();
-    let rendered_unit_bytes =
-        match std::fs::read(&unit_src_raw).map_err(|e| e.to_string()).and_then(|bytes| {
+    let rendered_unit_bytes = match std::fs::read(&unit_src_raw)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| {
             let content = String::from_utf8_lossy(&bytes).into_owned();
             render_systemd_unit(&content, &base_dir)
         }) {
-            Ok(b) => b,
-            Err(e) => {
-                log_step(
-                    "install_unit",
-                    &format!("action=render status=fail err=\"{e}\""),
-                );
-                eprintln!("sandbox update: failed to render systemd unit: {e}");
-                return 1;
-            }
-        };
-    let mut rendered_tmp =
-        match tempfile::NamedTempFile::new().map_err(|e| e.to_string()) {
-            Ok(f) => f,
-            Err(e) => {
-                log_step(
-                    "install_unit",
-                    &format!("action=render status=fail err=\"{e}\""),
-                );
-                eprintln!("sandbox update: failed to create tempfile for rendered unit: {e}");
-                return 1;
-            }
-        };
+        Ok(b) => b,
+        Err(e) => {
+            log_step(
+                "install_unit",
+                &format!("action=render status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: failed to render systemd unit: {e}");
+            return 1;
+        }
+    };
+    let mut rendered_tmp = match tempfile::NamedTempFile::new().map_err(|e| e.to_string()) {
+        Ok(f) => f,
+        Err(e) => {
+            log_step(
+                "install_unit",
+                &format!("action=render status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: failed to create tempfile for rendered unit: {e}");
+            return 1;
+        }
+    };
     if let Err(e) = std::io::Write::write_all(&mut rendered_tmp, &rendered_unit_bytes)
         .and_then(|_| std::io::Write::flush(&mut rendered_tmp))
     {
@@ -3908,7 +3912,10 @@ mod tests {
         let template = "# comment: @SANDBOX_BASE_DIR@\nExecStart=... @SANDBOX_BASE_DIR@\n";
         let got = render_systemd_unit(template, "/var/lib/sandboxd/999").unwrap();
         let s = String::from_utf8(got).unwrap();
-        assert!(!s.contains("@SANDBOX_BASE_DIR@"), "all occurrences must be gone; got:\n{s}");
+        assert!(
+            !s.contains("@SANDBOX_BASE_DIR@"),
+            "all occurrences must be gone; got:\n{s}"
+        );
         assert_eq!(s.matches("/var/lib/sandboxd/999").count(), 2);
     }
 

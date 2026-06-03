@@ -4370,7 +4370,9 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
+            move |uid| {
+                ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
+            },
         );
         let mgr1 = registry.get_or_create(1000).expect("get_or_create");
         let mgr2 = registry.get_or_create(1000).expect("get_or_create");
@@ -4388,7 +4390,9 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
+            move |uid| {
+                ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
+            },
         );
         let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
         let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
@@ -4408,7 +4412,9 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
+            move |uid| {
+                ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
+            },
         );
         let mgr1000 = registry.get_or_create(1000).expect("get_or_create 1000");
         let mgr1001 = registry.get_or_create(1001).expect("get_or_create 1001");
@@ -4451,7 +4457,9 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
+            move |uid| {
+                ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
+            },
         ));
 
         let barrier = Arc::new(Barrier::new(2));
@@ -4501,7 +4509,9 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
-            move |uid| ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid),
+            move |uid| {
+                ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
+            },
         ));
 
         let barrier = Arc::new(Barrier::new(2));
