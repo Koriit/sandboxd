@@ -1,0 +1,22 @@
+/* sandboxd docs theme — accent ramp derived from the brand logo's flame palette
+   (core #FF7A1C → #E54410, deep ember #C9400A → #A82B06, highlights #FFB460/#FFD24A).
+   Overrides Starlight's default blue accent so the docs match the logo/favicon.
+
+   Starlight accent roles:
+     --sl-color-accent-low   subtle fills / hover backgrounds
+     --sl-color-accent       links, focus rings, active nav
+     --sl-color-accent-high  high-contrast accent text
+   In dark mode -high is the lightest shade; in light mode it is the darkest. */
+
+:root {
+  /* Dark mode (Starlight default theme) */
+  --sl-color-accent-low: #3a1805;
+  --sl-color-accent: #e5510f;
+  --sl-color-accent-high: #ffb978;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #ffe0c7;
+  --sl-color-accent: #c2410c;
+  --sl-color-accent-high: #6e2104;
+}
