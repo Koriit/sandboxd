@@ -685,17 +685,25 @@ install-route-helper-test-cap: sandboxd/target/.dev-env-stamps/route-helper-test
 
 sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/sandbox-route-helper
 	@mkdir -p $(dir $@)
-	@# No cmp -s short-circuit here: the debug path is shared between
-	@# feature-gated and non-feature builds, so a plain `cargo build`
-	@# can overwrite it with a non-feature binary between make runs.
-	@# Always reinstall to guarantee the installed test binary matches
-	@# the --features test-env-override artifact built just above.
-	echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
-	echo "[sudo] setcap cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip $(ROUTE_HELPER_TEST_PATH)"; \
-	sudo -k install -D -m 0755 \
-	  sandboxd/target/debug/sandbox-route-helper \
-	  "$(ROUTE_HELPER_TEST_PATH)"; \
-	sudo -k setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' "$(ROUTE_HELPER_TEST_PATH)"
+	@# Guard: skip sudo when the installed binary is byte-identical to the
+	@# freshly-built debug artifact AND already carries the exact capabilities.
+	@# This is safe because the .PHONY prerequisite above has ALREADY rebuilt
+	@# sandboxd/target/debug/sandbox-route-helper with --features
+	@# sandbox-route-helper/test-env-override, so the binary we cmp against
+	@# is guaranteed to be the feature artifact — not some earlier plain
+	@# `cargo build` that could have left a non-feature binary at that path.
+	@_built=sandboxd/target/debug/sandbox-route-helper; \
+	_dst="$(ROUTE_HELPER_TEST_PATH)"; \
+	_expected_caps="cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip"; \
+	_current_caps=$$(getcap "$$_dst" 2>/dev/null | awk '{print $$NF}'); \
+	if cmp -s "$$_built" "$$_dst" && [ "$$_current_caps" = "$$_expected_caps" ]; then \
+	  echo "$(GREEN)✓ already current: $$_dst (content matches build, $$_expected_caps)$(RESET)"; \
+	else \
+	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
+	  echo "[sudo] setcap $$_expected_caps $$_dst"; \
+	  sudo -k install -D -m 0755 "$$_built" "$$_dst"; \
+	  sudo -k setcap "$$_expected_caps" "$$_dst"; \
+	fi
 	@touch $@
 
 # Build the test-feature debug binary into the workspace's default
@@ -768,17 +776,28 @@ install-lima-helper-test-cap: sandboxd/target/.dev-env-stamps/lima-helper-test.s
 
 sandboxd/target/.dev-env-stamps/lima-helper-test.stamp: sandboxd/target/debug/sandbox-lima-helper
 	@mkdir -p $(dir $@)
-	@# No cmp -s short-circuit here: the debug path is shared between
-	@# feature-gated and non-feature builds, so a plain `cargo build`
-	@# can overwrite it with a non-feature binary between make runs.
-	@# Always reinstall to guarantee the installed test binary matches
-	@# the --features test-env-override artifact built just above.
-	echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-lima-helper $(LIMA_HELPER_TEST_PATH)"; \
-	echo "[sudo] setcap cap_setuid+ep $(LIMA_HELPER_TEST_PATH)"; \
-	sudo -k install -D -m 0755 \
-	  sandboxd/target/debug/sandbox-lima-helper \
-	  "$(LIMA_HELPER_TEST_PATH)"; \
-	sudo -k setcap 'cap_setuid+ep' "$(LIMA_HELPER_TEST_PATH)"
+	@# Guard: skip sudo when the installed binary is byte-identical to the
+	@# freshly-built debug artifact AND already carries the exact capabilities.
+	@# This is safe because the .PHONY prerequisite above has ALREADY rebuilt
+	@# sandboxd/target/debug/sandbox-lima-helper with --features
+	@# sandbox-lima-helper/test-env-override, so the binary we cmp against
+	@# is guaranteed to be the feature artifact — not some earlier plain
+	@# `cargo build` that could have left a non-feature binary at that path.
+	@# getcap output format varies across libcap versions: older kernels emit
+	@# "path = cap_setuid+ep", newer emit "path cap_setuid=ep". Normalize by
+	@# translating '+' to '=' before comparing, matching install.sh's pattern.
+	@_built=sandboxd/target/debug/sandbox-lima-helper; \
+	_dst="$(LIMA_HELPER_TEST_PATH)"; \
+	_expected_caps="cap_setuid=ep"; \
+	_current_caps=$$(getcap "$$_dst" 2>/dev/null | awk '{print $$NF}' | tr '+' '='); \
+	if cmp -s "$$_built" "$$_dst" && [ "$$_current_caps" = "$$_expected_caps" ]; then \
+	  echo "$(GREEN)✓ already current: $$_dst (content matches build, $$_expected_caps)$(RESET)"; \
+	else \
+	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
+	  echo "[sudo] setcap cap_setuid+ep $$_dst"; \
+	  sudo -k install -D -m 0755 "$$_built" "$$_dst"; \
+	  sudo -k setcap 'cap_setuid+ep' "$$_dst"; \
+	fi
 	@touch $@
 
 .PHONY: sandboxd/target/debug/sandbox-lima-helper
