@@ -123,7 +123,7 @@ def test_install_refuses_when_preexisting(
 
     # Build a tarball claiming a different version (string-level only;
     # the binaries inside are unchanged, but install.sh's preexist guard
-    # keys off MANIFEST.version vs. /usr/local/bin/sandboxd --version).
+    # keys off MANIFEST.version vs. the installed daemon's --version).
     tampered = _repack_with_version(
         release_tarball_x86_64, tmp_path, new_version="9.9.9",
     )

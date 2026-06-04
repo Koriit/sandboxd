@@ -775,6 +775,7 @@ def _install_prereqs(vm):
         cmd = (
             "set -eux; "
             "export DEBIAN_FRONTEND=noninteractive; "
+            "sudo grep -rl 'http://' /etc/apt/ | xargs -r sudo sed -i 's|http://|https://|g'; "
             "sudo apt-get update; "
             "sudo apt-get install -y --no-install-recommends "
             "ca-certificates curl jq tar qemu-system-x86 qemu-utils "
@@ -868,7 +869,7 @@ def _harvest_logs(vm, dest_dir):
          "fi"),
         ("journal-sandboxd", "sudo journalctl -u sandboxd --no-pager 2>/dev/null || true"),
         ("getcap",          "getcap /usr/local/libexec/sandboxd/sandbox-route-helper 2>/dev/null || true"),
-        ("ls-bin",          "ls -la /usr/local/bin/sandboxd /usr/local/bin/sandbox /etc/systemd/system/sandboxd.service /etc/sandboxd/users.conf 2>&1 || true"),
+        ("ls-bin",          "ls -la /usr/local/libexec/sandboxd/sandboxd /usr/local/bin/sandbox /etc/systemd/system/sandboxd.service /etc/sandboxd/users.conf 2>&1 || true"),
     ]
     for fname, cmd in targets:
         try:
@@ -1123,8 +1124,11 @@ def assert_full_install_landed(vm):
     created. Lifted into a helper so both the Debian-family and RHEL-
     family happy-path tests assert the same contract (per § 6.3).
     """
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode == 0, (
-        "sandboxd binary missing or not executable"
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode == 0, (
+        "sandboxd binary missing or not executable at libexec path"
+    )
+    assert vm.shell("test ! -e /usr/local/bin/sandboxd").returncode == 0, (
+        "sandboxd binary must not exist at legacy /usr/local/bin/sandboxd after install"
     )
     assert vm.shell("test -x /usr/local/bin/sandbox").returncode == 0, (
         "sandbox CLI binary missing or not executable"

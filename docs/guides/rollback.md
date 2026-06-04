@@ -66,7 +66,7 @@ fi
 sudo systemctl stop sandboxd
 
 # 4. Restore binaries — install with proper mode/owner.
-sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandboxd.bak"             /usr/local/bin/sandboxd
+sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandboxd.bak"             /usr/local/libexec/sandboxd/sandboxd
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox.bak"              /usr/local/bin/sandbox
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox-route-helper.bak" /usr/local/libexec/sandboxd/sandbox-route-helper
 

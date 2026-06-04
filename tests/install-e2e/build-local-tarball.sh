@@ -352,6 +352,7 @@ elif [ "$portable_build" = "1" ]; then
         -v "$ROOT/sandboxd:/work/sandboxd:rw" \
         -v "$BUILD_CACHE/cargo-home:/cargo-home:rw" \
         -v "$BUILD_CACHE/rustup:/rustup:rw" \
+        -v /etc/ssl/certs/ca-certificates.crt:/run/host-ca.crt:ro \
         -e CARGO_HOME=/cargo-home \
         -e RUSTUP_HOME=/rustup \
         -e CARGO_TARGET_DIR="/work/sandboxd/${CARGO_TARGET_SUBDIR}" \
@@ -365,8 +366,18 @@ elif [ "$portable_build" = "1" ]; then
             export DEBIAN_FRONTEND=noninteractive
             if ! command -v cc >/dev/null 2>&1 \
                || ! command -v curl >/dev/null 2>&1; then
-                apt-get update -qq
-                apt-get install -y -qq --no-install-recommends \
+                # Switch apt to HTTPS: the upstream HTTP mirrors have
+                # timeout/header problems. The stock ubuntu:22.04 image
+                # ships no ca-certificates, so HTTPS apt cannot verify
+                # TLS on its own yet; point the bootstrap fetch at the
+                # host CA bundle (mounted read-only at /run/host-ca.crt)
+                # via Acquire::https::CAinfo. Once ca-certificates is
+                # installed it writes the system bundle, so later apt and
+                # curl calls need no override.
+                grep -rl http:// /etc/apt/ | xargs -r sed -i s,http://,https://,g
+                apt-get -o Acquire::https::CAinfo=/run/host-ca.crt update -qq
+                apt-get -o Acquire::https::CAinfo=/run/host-ca.crt install \
+                    -y -qq --no-install-recommends \
                     curl ca-certificates build-essential pkg-config
             fi
             if ! [ -x "$CARGO_HOME/bin/cargo" ]; then

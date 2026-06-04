@@ -1296,12 +1296,24 @@ def test_ubuntu_preset_smoke(sandbox_cli):
         time.sleep(5)
 
         # apt half — `apt-get update` against the mirrors enabled by
-        # the preset. The base image's stock /etc/apt/sources.list is
+        # the preset. Rewrite sources to HTTPS first: HTTP sources
+        # exhibit timeout and header failures in the sandboxd network
+        # environment. The base image's stock /etc/apt/sources.list is
         # pinned at archive.ubuntu.com / security.ubuntu.com on
         # 22.04+, both of which the preset allows; everything else
         # (PPAs, snap, livepatch) is intentionally not part of the
         # preset, so this command should succeed unmodified on a
         # fresh image.
+        rewrite_sources = sandbox_cli(
+            "ssh", session_name, "--",
+            "sudo", "sed", "-i", "s,http://,https://,g",
+            "/etc/apt/sources.list",
+            timeout=30,
+        )
+        assert rewrite_sources.returncode == 0, (
+            f"Failed to rewrite apt sources to HTTPS (rc={rewrite_sources.returncode}).\n"
+            f"stdout: {rewrite_sources.stdout}\nstderr: {rewrite_sources.stderr}"
+        )
         apt_update = sandbox_cli(
             "ssh", session_name, "--",
             "sudo", "apt-get", "update", "-q",

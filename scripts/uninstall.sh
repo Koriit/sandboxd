@@ -475,7 +475,7 @@ defer_route_helper_caps() {
 # ----------------------------------------------------------------------------
 
 remove_binaries() {
-    for bin in /usr/local/bin/sandboxd \
+    for bin in /usr/local/libexec/sandboxd/sandboxd \
                /usr/local/bin/sandbox \
                /usr/local/libexec/sandboxd/sandbox-route-helper \
                /usr/local/libexec/sandboxd/sandbox-lima-helper \

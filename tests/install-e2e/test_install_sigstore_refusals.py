@@ -91,7 +91,7 @@ def test_install_aborts_on_missing_sigstore_bundle(
     # those steps. This is the load-bearing assertion: a regression
     # that REACHES later steps (despite the missing bundle) would
     # leak state.
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0, (
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode != 0, (
         "sandboxd binary installed despite missing-bundle refusal — "
         "install.sh ordering regression"
     )
@@ -189,7 +189,7 @@ def test_install_aborts_on_tampered_tarball(
     )
 
     # Same state-leak assertions as the missing-bundle test.
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0, (
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode != 0, (
         "sandboxd installed despite tampered-tarball refusal"
     )
     assert vm.shell("getent passwd sandbox").returncode != 0, (

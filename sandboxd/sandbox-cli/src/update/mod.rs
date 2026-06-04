@@ -3890,7 +3890,7 @@ mod tests {
     /// and returns the rendered bytes.
     #[test]
     fn render_systemd_unit_substitutes_placeholder() {
-        let template = "ExecStart=/usr/local/bin/sandboxd \\\n    \
+        let template = "ExecStart=/usr/local/libexec/sandboxd/sandboxd \\\n    \
                         --base-dir @SANDBOX_BASE_DIR@ \\\n    \
                         --socket /run/sandbox/sandboxd.sock\n";
         let base_dir = "/var/lib/sandboxd/1234";

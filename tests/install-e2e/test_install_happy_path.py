@@ -81,7 +81,7 @@ def test_install_fresh_then_doctor_passes(
         f"stdout:\n{r.stdout}\n"
         f"stderr:\n{r.stderr}"
     )
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode != 0
     assert vm.shell(
         "test -f /etc/systemd/system/sandboxd.service"
     ).returncode != 0

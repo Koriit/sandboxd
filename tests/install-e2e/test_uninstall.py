@@ -37,7 +37,7 @@ def test_uninstall_after_install_clean(
     assert r.returncode == 0, f"uninstall failed:\n{r.stdout}\n{r.stderr}"
 
     # Binaries / unit gone, per-uid state dir and user kept.
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode != 0
     assert vm.shell(
         "test -f /etc/systemd/system/sandboxd.service"
     ).returncode != 0
@@ -69,7 +69,7 @@ def test_uninstall_with_purge_removes_user_and_state(
     assert r.returncode == 0, f"purge uninstall failed:\n{r.stdout}\n{r.stderr}"
 
     # Everything is gone.
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode != 0
     # After the user is gone we cannot resolve its uid; check by looking for
     # any subdirectory of /var/lib/sandboxd that was the prod state.
     # The sandbox user uid was resolved before userdel by uninstall.sh —

@@ -154,7 +154,7 @@ test -n "$BACKUP_DIR"
 PREV_VERSION=$(sudo -u sandbox jq -r '.from_version' "$BACKUP_DIR/manifest.json")
 sudo docker image inspect "sandbox-gateway:${PREV_VERSION}" >/dev/null
 sudo systemctl stop sandboxd
-sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandboxd.bak"             /usr/local/bin/sandboxd
+sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandboxd.bak"             /usr/local/libexec/sandboxd/sandboxd
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox.bak"              /usr/local/bin/sandbox
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox-route-helper.bak" /usr/local/libexec/sandboxd/sandbox-route-helper
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox-guest.bak"        /usr/local/libexec/sandboxd/sandbox-guest

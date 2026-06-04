@@ -3,7 +3,7 @@
 
 
 - ``test_install_idempotent_double_run`` — second run is all-skip.
-- ``test_install_partial_failure_recovery`` — kill install mid-step,
+- ``test_install_partial_failure_recovery`` — kill install mid-privileged-step,
    re-run, verify it completes.
 """
 
@@ -69,94 +69,59 @@ def test_install_idempotent_double_run(
             )
 
 
-# Marker injected into install.sh by the partial-failure test. Centralised
-# so the regex used to remove it later stays in sync.
-_PARTIAL_FAILURE_MARKER = "# PARTIAL_FAILURE_INJECTION"
-
-
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_install_partial_failure_recovery(
     distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
-    """Kill the install mid-step, re-run, verify continuation.
+    """Kill the install after the sandbox-user step, re-run, verify continuation.
 
-    Strategy: patch the in-VM install.sh to ``exit 1`` immediately after
-    ``add_operator_to_group`` (step 13). The first run aborts after
-    user creation but BEFORE any binaries land. The patch is then
-    reverted; the second run re-enters with no /usr/local/bin/sandboxd
-    on disk, so the preexist guard passes and the remaining steps fire.
-    Prior steps (useradd, operator_add) emit action=skip since they
-    are inherently idempotent against an already-created user.
+    Strategy: set SANDBOX_INSTALL_PRIV_CHILD_FAIL_AFTER=sandbox-user so
+    the privileged child exits 1 immediately after creating the sandbox
+    system user but BEFORE copying any binaries. The first run therefore
+    aborts with the user present but no sandboxd binary on disk.
 
-    This is the genuine "mid-step kill" recovery shape from.4
-    — previously this test removed the binary post-hoc, which only
-    exercised "binary disappeared" and not "install was interrupted
-    before binaries were copied".
+    On the recovery run (no fail hook), the planning pass detects that
+    the sandbox user already exists (action=skip for useradd) and that
+    the binaries are absent (action=install for each binary). The full
+    install completes.
+
+    This exercises the genuine "mid-privileged-batch failure" recovery
+    shape: the planning pass re-detects completed work on re-run, so the
+    re-run resumes naturally from where it stopped.
     """
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
-    # Patch the in-VM install.sh: insert `exit 1` immediately after the
-    # add_operator_to_group call inside main(). awk is used rather than
-    # sed because the multi-line edit is awkward in sed; the marker
-    # comment lets us locate (and later remove) the injection exactly.
-    inject_cmd = (
-        f"sudo awk '"
-        f"{{ print }} "
-        f"/^    add_operator_to_group$/ "
-        f"{{ print \"    {_PARTIAL_FAILURE_MARKER}\"; "
-        f"   print \"    exit 1\" }}' "
-        f"/tmp/install.sh > /tmp/install.sh.patched "
-        f"&& sudo mv /tmp/install.sh.patched /tmp/install.sh "
-        f"&& sudo chmod +x /tmp/install.sh"
-    )
-    vm.shell(inject_cmd, check=True, timeout=30)
-    # Confirm the marker landed.
-    marker_check = vm.shell(
-        f"grep -c '{_PARTIAL_FAILURE_MARKER}' /tmp/install.sh",
-        check=True, timeout=10,
-    )
-    assert marker_check.stdout.strip() == "1", (
-        f"injection marker did not appear in install.sh:\n{marker_check.stdout}"
-    )
-
-    # First run aborts mid-script with exit 1.
+    # First run: force the privileged child to abort after sandbox-user.
     r1 = vm.shell(
-        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
+        install_sh_cmd(
+            tarball_in_vm,
+            vm=vm,
+            sigstore_stack=sigstore_stack,
+            env={"SANDBOX_INSTALL_PRIV_CHILD_FAIL_AFTER": "sandbox-user"},
+        ),
         timeout=600,
     )
     assert r1.returncode != 0, (
-        f"injected install.sh exited 0 — injection point did not fire:\n"
-        f"{r1.stdout}\n{r1.stderr}"
+        f"install.sh exited 0 despite SANDBOX_INSTALL_PRIV_CHILD_FAIL_AFTER — "
+        f"fail hook did not fire:\n{r1.stdout}\n{r1.stderr}"
     )
 
-    # The sandbox user was created in step 12 (before the injection),
-    # but the binary was NOT installed (step 14 is after the injection).
+    # The sandbox user was created in the privileged child (sandbox-user step
+    # ran), but the binary was NOT installed (install-binaries comes after).
     assert vm.shell("id sandbox").returncode == 0, (
-        "sandbox user not created before injection — injection point too early"
+        "sandbox user not created before privileged child aborted — "
+        "SANDBOX_INSTALL_PRIV_CHILD_FAIL_AFTER may have fired too early"
     )
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode != 0, (
-        "sandboxd installed before injection — injection point too late"
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode != 0, (
+        "sandboxd binary present after partial failure — "
+        "SANDBOX_INSTALL_PRIV_CHILD_FAIL_AFTER may have fired too late"
     )
-
-    # Un-patch by removing both injected lines. The marker line tags the
-    # next line (`exit 1`); delete the marker and the line immediately
-    # following.
-    vm.shell(
-        f"sudo sed -i '/{_PARTIAL_FAILURE_MARKER}/,+1d' /tmp/install.sh",
-        check=True, timeout=10,
-    )
-    # Confirm the injection is gone.
-    assert vm.shell(
-        f"grep -c '{_PARTIAL_FAILURE_MARKER}' /tmp/install.sh "
-        f"|| true",
-        timeout=10,
-    ).stdout.strip() == "0", "marker still present after un-patch"
 
     # Truncate the log so the recovery run is what we read back.
     vm.shell("sudo truncate -s 0 /var/log/sandbox-install.log", check=True)
 
-    # Recovery run.
+    # Recovery run (no fail hook).
     r2 = vm.shell(
         install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
@@ -166,7 +131,7 @@ def test_install_partial_failure_recovery(
     )
 
     # Binary is now in place.
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode == 0
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode == 0
 
     # The recovery run should show the sandbox user step as skip (the
     # user already exists from the aborted first run) and the

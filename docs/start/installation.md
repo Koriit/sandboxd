@@ -76,7 +76,7 @@ Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes
 
 | Artifact | Destination |
 |---|---|
-| `sandboxd` binary | `/usr/local/bin/sandboxd` |
+| `sandboxd` binary | `/usr/local/libexec/sandboxd/sandboxd` |
 | `sandbox` CLI | `/usr/local/bin/sandbox` |
 | `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` (with `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`) |
 | `sandbox-lima-helper` | `/usr/local/libexec/sandboxd/sandbox-lima-helper` (with `cap_setuid+ep`; Lima backend only) |
@@ -92,7 +92,7 @@ The `sandbox` system user is created (if not already present); the invoking oper
 
 ### Why a dedicated `sandbox` user
 
-The daemon's binaries live in shared system paths (`/usr/local/bin/sandboxd`, `/usr/local/libexec/sandboxd/sandbox-route-helper`, the gateway image in the host Docker daemon). The dedicated `sandbox` user + system-service shape is what makes those shared binaries safe and sensible. Without it, the alternative is a per-user install — and a per-user install fails for six concrete reasons:
+The daemon's binaries live in shared system paths (`/usr/local/libexec/sandboxd/sandboxd`, `/usr/local/libexec/sandboxd/sandbox-route-helper`, the gateway image in the host Docker daemon). The dedicated `sandbox` user + system-service shape is what makes those shared binaries safe and sensible. Without it, the alternative is a per-user install — and a per-user install fails for six concrete reasons:
 
 1. **`setcap` helpers must be system-installed — kernel-enforced.** `/usr/local/libexec/sandboxd/` contains binaries with file capabilities (`cap_net_admin`, `cap_sys_admin`). Two kernel constraints make a user-owned install non-viable: (a) file capabilities are **silently ignored** on `nosuid` mounts — home directories on shared hosts are commonly mounted `nosuid`; (b) `setcap(8)` itself requires root to invoke. There is no path to a user-writable install of these helpers that actually retains their capabilities. The system-service shape is not a preference here — it is a hard requirement.
 2. **Divergent versions against shared substrate.** Per-user installs put `sandboxd` and the CLI somewhere user-writable, but several artifacts *must* be system-shared regardless: `sandbox-route-helper` needs root to apply file capabilities, `/etc/sandboxd/users.conf` is root-owned for the helper's authorization boundary, `/etc/qemu/bridge.conf` lives in `/etc`, and the gateway image sits in the host's Docker daemon. With per-user daemons, nothing stops operators from installing *different versions* of `sandboxd` while all of them talk to the same shared route-helper and gateway image — exactly the kind of version skew the CLI ↔ daemon strict-equality check (see [`sandbox doctor`](/sandboxd/reference/cli/#sandbox-doctor)) exists to prevent. One canonical install, one daemon, one version.
@@ -639,7 +639,7 @@ The two install paths produce different layouts:
 
 | Artifact | Developer install (`make setup-dev-env`) | Operator install (`install.sh`) |
 |---|---|---|
-| `sandboxd` binary | Run from `sandboxd/target/release/sandboxd` | `/usr/local/bin/sandboxd` |
+| `sandboxd` binary | Run from `sandboxd/target/release/sandboxd` | `/usr/local/libexec/sandboxd/sandboxd` |
 | `sandbox` CLI | Run from `sandboxd/target/release/sandbox` | `/usr/local/bin/sandbox` |
 | `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` | Same path |
 | systemd unit | Not installed (run by hand) | `/etc/systemd/system/sandboxd.service` |
@@ -649,7 +649,7 @@ The two install paths produce different layouts:
 | `users.conf` | `["sandbox", "$USER"]` | `["sandbox", "<invoking-operator>"]` |
 | `bridge.conf` | `allow all` (dev convenience) | `allow sb-*` (production scope) |
 
-`install.sh`'s pre-existing-install detection refuses if `/usr/local/bin/sandboxd` exists. The developer's daemon under `sandboxd/target/release/sandboxd` is not detected by that check, so `install.sh` runs successfully on a dev box — but the two daemons should not run at the same time. To migrate from the developer path to the operator install: stop the dev daemon, optionally copy `~/.local/share/sandboxd/sessions.db` to `/var/lib/sandboxd/<sandbox-uid>/sessions.db` (manual operation, no automated migration yet), then run `install.sh` and `sudo systemctl enable --now sandboxd`.
+`install.sh`'s pre-existing-install detection probes `/usr/local/libexec/sandboxd/sandboxd`. The developer's daemon under `sandboxd/target/release/sandboxd` is not detected by that check, so `install.sh` runs successfully on a dev box — but the two daemons should not run at the same time. To migrate from the developer path to the operator install: stop the dev daemon, optionally copy `~/.local/share/sandboxd/sessions.db` to `/var/lib/sandboxd/<sandbox-uid>/sessions.db` (manual operation, no automated migration yet), then run `install.sh` and `sudo systemctl enable --now sandboxd`.
 
 ## First run
 

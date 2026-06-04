@@ -61,7 +61,7 @@ Put this at `~/Library/LaunchAgents/com.example.sandboxd.plist`:
 <plist version="1.0"><dict>
   <key>Label</key><string>com.example.sandboxd</string>
   <key>ProgramArguments</key>
-  <array><string>/usr/local/bin/sandboxd</string></array>
+  <array><string>/usr/local/libexec/sandboxd/sandboxd</string></array>
   <key>StandardErrorPath</key><string>/tmp/sandboxd.log</string>
   <key>KeepAlive</key><true/>
 </dict></plist>

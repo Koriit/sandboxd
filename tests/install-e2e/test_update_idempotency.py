@@ -110,7 +110,7 @@ def test_update_interrupted_then_resumed(
     extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
     vm.shell(
         f"sudo install -D -m 0755 -o root -g root "
-        f"{extracted_root}/bin/sandboxd /usr/local/bin/sandboxd && "
+        f"{extracted_root}/bin/sandboxd /usr/local/libexec/sandboxd/sandboxd && "
         f"sudo install -D -m 0755 -o root -g root "
         f"{extracted_root}/bin/sandbox-route-helper "
         f"/usr/local/libexec/sandboxd/sandbox-route-helper && "

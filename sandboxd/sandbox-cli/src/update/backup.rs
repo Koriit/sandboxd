@@ -83,7 +83,7 @@ pub fn sessions_db_shm_path() -> PathBuf {
 pub const RETENTION_KEEP: usize = 2;
 pub const USERS_CONF_PATH: &str = "/etc/sandboxd/users.conf";
 pub const BRIDGE_CONF_PATH: &str = "/etc/qemu/bridge.conf";
-pub const SANDBOXD_BIN_PATH: &str = "/usr/local/bin/sandboxd";
+pub const SANDBOXD_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandboxd";
 pub const SANDBOX_BIN_PATH: &str = "/usr/local/bin/sandbox";
 pub const ROUTE_HELPER_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-route-helper";
 /// Daemon-internal helper. Installed under libexec (FHS § 4.7) so the
