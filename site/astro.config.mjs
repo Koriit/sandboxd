@@ -85,6 +85,13 @@ export default defineConfig({
       // Brand accent: overrides Starlight's default blue with the logo's
       // flame-orange palette. See src/styles/theme.css.
       customCss: ['./src/styles/theme.css'],
+      social: [
+        {
+          icon: 'github',
+          label: 'GitHub',
+          href: 'https://github.com/Koriit/sandboxd',
+        },
+      ],
       // In dev, rehype-mermaid runs under `pre-mermaid`, emitting raw <pre
       // class="mermaid"> blocks that expect a client-side Mermaid renderer.
       // Ship it from a CDN only in dev — builds render SVGs at the rehype
