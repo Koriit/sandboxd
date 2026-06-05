@@ -21,6 +21,8 @@ __pycache__/
 
 .claude/*.local.md
 .claude/scheduled_tasks.lock
+.claude/pr_msg.md
+.claude/commit_msg.txt
 
 # graphify knowledge-graph artefacts (project-level tooling — generated)
 /graphify-out/
