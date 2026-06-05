@@ -64,6 +64,7 @@ top of the profile:
 E2E tests boot real Lima/QEMU VMs and are SLOW. Individual test files take 3-10 minutes. The full suite takes 30-45 minutes.
 
 **Running E2E tests from Claude Code:**
+
 - Never run the full suite in a foreground bash call — it will hit the 10-minute timeout.
 - Delegate to a subagent, or use `run_in_background: true`.
 - To poll between checks, use foreground `true && sleep 120 && <check-command>` — this saves tokens vs. background sleep + separate poll. Set timeout high enough for the sleep.
@@ -150,11 +151,20 @@ Session state persists across daemon restarts in `{base_dir}/sessions.db` (SQLit
 - **JSON blob fields** (columns like `config_json`, `network_info` JSON payloads) — when adding a field to a persisted struct (`SessionConfig`, `NetworkInfo`, etc.), make it `Option<T>` with `#[serde(default)]` so records written by older versions still deserialize. Never remove or rename a persisted blob field without a migration.
 - **Forward-compat on rollback** — records written by a newer daemon may be read by an older one during rollback. Use `#[serde(default)]` + unknown-field tolerance to keep this safe.
 
+## Releasing
+
+Cutting a `vX.Y.Z` release means bumping **all 9 workspace crate versions
+in lockstep** (the tag must match `Cargo.toml`, and the version drives the
+runtime gateway/lite image tags), then committing on `master` and pushing
+the tag — which fires the signed-artifact pipeline. Full procedure and
+rationale: [docs/internal/releasing.md](docs/internal/releasing.md).
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
 
 Rules:
+
 - For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
