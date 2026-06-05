@@ -11,18 +11,18 @@ You need sandboxd installed and the daemon running. See [Installation](/sandboxd
 
 Everything you need from a script is three commands:
 
-| Command | Purpose |
-|---|---|
-| `sandbox create` | Provision a new session. Exit code 0 means the session is `running` and the guest agent has pinged back. |
-| `sandbox exec <session> -- <cmd>` | Run one command inside the session. Exit code and stdout/stderr are forwarded. |
-| `sandbox cp <src> <dst>` | Move files in or out. `session:path` on whichever side is remote. |
+| Command                           | Purpose                                                                                                  |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `sandbox create`                  | Provision a new session. Exit code 0 means the session is `running` and the guest agent has pinged back. |
+| `sandbox exec <session> -- <cmd>` | Run one command inside the session. Exit code and stdout/stderr are forwarded.                           |
+| `sandbox cp <src> <dst>`          | Move files in or out. `session:path` on whichever side is remote.                                        |
 
 Plus the teardown pair:
 
-| Command | Purpose |
-|---|---|
+| Command                  | Purpose                                           |
+| ------------------------ | ------------------------------------------------- |
 | `sandbox stop <session>` | Halt the VM, keep the config. Fast restart later. |
-| `sandbox rm <session>` | Full teardown. Session ID is gone. |
+| `sandbox rm <session>`   | Full teardown. Session ID is gone.                |
 
 `create`, `exec`, `stop`, and `rm` are thin wrappers around the [HTTP API](/sandboxd/reference/http-api/) and each map to a single endpoint. `sandbox cp` (and the related `sandbox ssh` / `sandbox sync`) is a slightly thicker shim: it goes through the standard `scp` / `ssh` / `rsync` client against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), and the underlying byte transport is the daemon's [`GET /sessions/{id}/proxy`](/sandboxd/reference/http-api/#get-sessionsidproxy--websocket-byte-mover-into-the-sessions-sshd) WebSocket. The CLI auto-manages a per-session SSH config block under `~/.ssh/sandbox/` so external tooling (VS Code Remote-SSH, JetBrains Gateway, ad-hoc `scp`/`rsync`) reaches the session through the same alias without the CLI being in the data path. If you want to skip the CLI and speak HTTP over the Unix socket directly, the reference page documents every endpoint.
 
@@ -132,7 +132,7 @@ jobs:
 
       - name: Install sandboxd
         run: |
-          curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash
+          curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh
 
       - name: Start daemon
         run: |

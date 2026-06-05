@@ -5,35 +5,35 @@ description: Install sandboxd on Linux via the signed install.sh, with a develop
 
 This guide covers two install paths:
 
-- [**Operator install**](#operator-install-curl--bash) — the supported production install via the signed `install.sh` hosted on GitHub Pages. This is what you want unless you're building sandboxd from source.
+- [**Operator install**](#operator-install-curl--sh) — the supported production install via the signed `install.sh` hosted on GitHub Pages. This is what you want unless you're building sandboxd from source.
 - [**Developer install**](#developer-install-make-setup-dev-env) — for contributors who want to build the daemon from source and run it as their own user. Same machine-level prerequisites; different artifact layout.
 
 If you want the fast path through create/exec/ssh once installed, see [Quickstart](/sandboxd/start/quickstart/).
 
 ## System requirements
 
-| Requirement | Minimum | Notes |
-|-------------|---------|-------|
-| OS | Linux (x86_64 or aarch64) | Tested on Ubuntu 22.04/24.04 |
-| Linux kernel | 5.8+ | `sandbox-route-helper` needs `pidfd_open(2)` (5.3+) and `setns(pidfd, ...)` (5.8+) |
-| KVM | `/dev/kvm` accessible | Required for hardware-accelerated VMs |
-| Docker | 24.0+ | For gateway containers and networking |
-| Lima | 2.1+ | VM management (`limactl` must be on PATH); skippable at runtime if you only use [lite mode](/sandboxd/guides/lite-mode/) |
-| QEMU | 8.0+ | `qemu-system-x86` with OVMF firmware |
-| `setcap`, `jq`, `curl` | any recent | `install.sh` probes for all three |
-| Rust | 1.88+ (stable) | Developer install only — for building from source |
-| Go | 1.22+ | Developer install only — for the CoreDNS policy plugin |
-| Python | 3.12+ | Developer install only — for E2E tests |
-| `acl` (`setfacl`/`getfacl`) | any recent | Lima backend only — required at runtime for per-operator LIMA_HOME ACL setup; Debian/Ubuntu: `apt install acl`, RHEL/Fedora: `dnf install acl` |
+| Requirement                 | Minimum                   | Notes                                                                                                                                          |
+| --------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| OS                          | Linux (x86_64 or aarch64) | Tested on Ubuntu 22.04/24.04                                                                                                                   |
+| Linux kernel                | 5.8+                      | `sandbox-route-helper` needs `pidfd_open(2)` (5.3+) and `setns(pidfd, ...)` (5.8+)                                                             |
+| KVM                         | `/dev/kvm` accessible     | Required for hardware-accelerated VMs                                                                                                          |
+| Docker                      | 24.0+                     | For gateway containers and networking                                                                                                          |
+| Lima                        | 2.1+                      | VM management (`limactl` must be on PATH); skippable at runtime if you only use [lite mode](/sandboxd/guides/lite-mode/)                       |
+| QEMU                        | 8.0+                      | `qemu-system-x86` with OVMF firmware                                                                                                           |
+| `setcap`, `jq`, `curl`      | any recent                | `install.sh` probes for all three                                                                                                              |
+| Rust                        | 1.88+ (stable)            | Developer install only — for building from source                                                                                              |
+| Go                          | 1.22+                     | Developer install only — for the CoreDNS policy plugin                                                                                         |
+| Python                      | 3.12+                     | Developer install only — for E2E tests                                                                                                         |
+| `acl` (`setfacl`/`getfacl`) | any recent                | Lima backend only — required at runtime for per-operator LIMA_HOME ACL setup; Debian/Ubuntu: `apt install acl`, RHEL/Fedora: `dnf install acl` |
 
 Sections below cover the prerequisites in detail. If `install.sh` finds any missing it will refuse and print the exact package names per detected distro.
 
-## Operator install (`curl | bash`)
+## Operator install (`curl | sh`)
 
 The signed installer lives at `https://Koriit.github.io/sandboxd/install.sh`. It is POSIX-shell, fully idempotent, and re-runnable.
 
 ```bash
-curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh
 ```
 
 This walks 24 steps: prereq probe, sigstore-verified tarball download, binary install, `sandbox` system-user create, `setcap` on the route helper, `setuid` on `qemu-bridge-helper`, `docker load` of the gateway image, and `systemd` unit install. Every privileged step uses `sudo -k`. A re-run on an already-installed host detects each desired end-state and logs `action=skip`.
@@ -55,38 +55,38 @@ sandbox doctor
 
 ```bash
 # Pin a specific release.
-curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- --version 1.1.0
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh -s -- --version 1.1.0
 
 # Air-gapped: the operator already has the tarball locally.
-curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- \
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh -s -- \
     --from /path/to/sandboxd-1.1.0-x86_64-unknown-linux-gnu.tar.gz
 
 # Fully offline: pre-staged tarball + sigstore bundle, no network at all.
-curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- \
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh -s -- \
     --from /path/to/sandboxd-1.1.0-x86_64-unknown-linux-gnu.tar.gz \
     --cosign-bundle /path/to/sandboxd-1.1.0-x86_64-unknown-linux-gnu.tar.gz.sigstore
 
 # Non-interactive (no prompts).
-curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- --yes
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh -s -- --yes
 ```
 
 Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes`, `--verbose`, `--quiet`, `--no-color`, `--help`.
 
 ### What it installs
 
-| Artifact | Destination |
-|---|---|
-| `sandboxd` binary | `/usr/local/libexec/sandboxd/sandboxd` |
-| `sandbox` CLI | `/usr/local/bin/sandbox` |
-| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` (with `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`) |
-| `sandbox-lima-helper` | `/usr/local/libexec/sandboxd/sandbox-lima-helper` (with `cap_setuid+ep`; Lima backend only) |
-| systemd unit | `/etc/systemd/system/sandboxd.service` |
-| `users.conf` | `/etc/sandboxd/users.conf` |
-| Bridge authorization | `allow sb-*` appended to `/etc/qemu/bridge.conf` |
-| Gateway image | `sandbox-gateway:<version>` loaded into Docker |
-| Daemon state dir | `/var/lib/sandboxd/<sandbox-uid>/` (owner `sandbox:sandbox`, mode `0750`; uid resolved at install time via `id -u sandbox`) |
-| Install state record | `/var/lib/sandboxd/<sandbox-uid>/.install-state.json` |
-| Install log | `/var/log/sandbox-install.log` |
+| Artifact               | Destination                                                                                                                 |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `sandboxd` binary      | `/usr/local/libexec/sandboxd/sandboxd`                                                                                      |
+| `sandbox` CLI          | `/usr/local/bin/sandbox`                                                                                                    |
+| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` (with `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`)                  |
+| `sandbox-lima-helper`  | `/usr/local/libexec/sandboxd/sandbox-lima-helper` (with `cap_setuid+ep`; Lima backend only)                                 |
+| systemd unit           | `/etc/systemd/system/sandboxd.service`                                                                                      |
+| `users.conf`           | `/etc/sandboxd/users.conf`                                                                                                  |
+| Bridge authorization   | `allow sb-*` appended to `/etc/qemu/bridge.conf`                                                                            |
+| Gateway image          | `sandbox-gateway:<version>` loaded into Docker                                                                              |
+| Daemon state dir       | `/var/lib/sandboxd/<sandbox-uid>/` (owner `sandbox:sandbox`, mode `0750`; uid resolved at install time via `id -u sandbox`) |
+| Install state record   | `/var/lib/sandboxd/<sandbox-uid>/.install-state.json`                                                                       |
+| Install log            | `/var/log/sandbox-install.log`                                                                                              |
 
 The `sandbox` system user is created (if not already present); the invoking operator (from `$SUDO_USER`) is added to the `sandbox` group.
 
@@ -131,13 +131,13 @@ curl -fsSL https://Koriit.github.io/sandboxd/install.sh | less
 ### Uninstall
 
 ```bash
-curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --yes
+curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | sh -s -- --yes
 ```
 
 This removes the binaries, systemd unit, and any install-time changes recorded in `/var/lib/sandboxd/<sandbox-uid>/.install-state.json` (only reverts changes the installer made). The per-uid state tree at `/var/lib/sandboxd/<sandbox-uid>/` and the `sandbox` user are preserved; add `--purge` to also remove them. `--purge` removes only the production daemon's per-uid subtree — a co-resident e2e or dev daemon's subtree under `/var/lib/sandboxd/` is never touched.
 
 ```bash
-curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --purge --yes
+curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | sh -s -- --purge --yes
 ```
 
 `--force` overrides the running-daemon refusal; running sessions may leak. The current check is coarse (refuses when sandboxd's socket responds at all); a per-session active-session probe lands alongside `sandbox update` in a future release. `--purge` without `--yes` requires typing `PURGE` to confirm.
@@ -168,12 +168,12 @@ sudo sandbox update \
 
 `sandbox update` exit codes:
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success — for a full update: applied; for `--check`: already up to date; for `--dry-run`: plan printed; for the confirmation prompt: answered `N`. |
-| `1` | Runtime error — pre-flight refused, daemon unreachable, network failure, cosign-verify failed, partial-failure mid-flow. The operator should investigate before retrying. |
-| `2` | Argument-parse failure or a refused flag combination (e.g. `--cosign-bundle` without `--from`). |
-| `3` | `--check` only — an update is available (installed version < available version). Scripts can branch on this without parsing stdout. |
+| Code | Meaning                                                                                                                                                                   |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | Success — for a full update: applied; for `--check`: already up to date; for `--dry-run`: plan printed; for the confirmation prompt: answered `N`.                        |
+| `1`  | Runtime error — pre-flight refused, daemon unreachable, network failure, cosign-verify failed, partial-failure mid-flow. The operator should investigate before retrying. |
+| `2`  | Argument-parse failure or a refused flag combination (e.g. `--cosign-bundle` without `--from`).                                                                           |
+| `3`  | `--check` only — an update is available (installed version < available version). Scripts can branch on this without parsing stdout.                                       |
 
 Example: script around `--check`:
 
@@ -218,7 +218,7 @@ ls -la /dev/kvm
 
 Expected output shows the device with group `kvm`:
 
-```
+```text
 crw-rw---- 1 root kvm 10, 232 ... /dev/kvm
 ```
 
@@ -374,7 +374,7 @@ lima
 
 ## Developer install — build from source
 
-Skip this section unless you are building sandboxd from a local checkout. For an operator install, see [Operator install (`curl | bash`)](#operator-install-curl--bash) above.
+Skip this section unless you are building sandboxd from a local checkout. For an operator install, see [Operator install (`curl | sh`)](#operator-install-curl--sh) above.
 
 ### Install Rust via rustup
 
@@ -406,14 +406,14 @@ make build
 
 This produces every workspace binary under `sandboxd/target/debug/`:
 
-| Binary | Description |
-|--------|-------------|
-| `sandboxd` | The daemon |
-| `sandbox` | The CLI (also reused as `git-remote-sandbox` via a symlink) |
-| `sandbox-guest` | The VM/container-side guest agent |
-| `sandbox-route-helper` | Cap'd helper that installs default routes inside container netns'es on the daemon's behalf |
-| `sandbox-nft-deny-logger` | Gateway-container binary that emits structured `deny` records (TCP DNAT + UDP NFLOG) |
-| `sandbox-nft-allow-logger` | Gateway-container binary that audits allowed UDP flows via NFCT |
+| Binary                     | Description                                                                                |
+| -------------------------- | ------------------------------------------------------------------------------------------ |
+| `sandboxd`                 | The daemon                                                                                 |
+| `sandbox`                  | The CLI (also reused as `git-remote-sandbox` via a symlink)                                |
+| `sandbox-guest`            | The VM/container-side guest agent                                                          |
+| `sandbox-route-helper`     | Cap'd helper that installs default routes inside container netns'es on the daemon's behalf |
+| `sandbox-nft-deny-logger`  | Gateway-container binary that emits structured `deny` records (TCP DNAT + UDP NFLOG)       |
+| `sandbox-nft-allow-logger` | Gateway-container binary that audits allowed UDP flows via NFCT                            |
 
 ### Build the gateway container image
 
@@ -447,7 +447,7 @@ make test-e2e           # End-to-end tests (pytest, requires running daemon)
 
 ## sandboxd configuration
 
-Two one-time steps are required before the daemon starts: a system-wide config file at `/etc/sandboxd/users.conf`, and a privileged helper binary at `/usr/local/libexec/sandboxd/sandbox-route-helper`. Both stay in place across upgrades. The [operator install](#operator-install-curl--bash) handles both for you; this section documents the manual equivalent used by the developer path.
+Two one-time steps are required before the daemon starts: a system-wide config file at `/etc/sandboxd/users.conf`, and a privileged helper binary at `/usr/local/libexec/sandboxd/sandbox-route-helper`. Both stay in place across upgrades. The [operator install](#operator-install-curl--sh) handles both for you; this section documents the manual equivalent used by the developer path.
 
 ### One-shot setup: `make setup-dev-env`
 
@@ -461,18 +461,18 @@ make setup-dev-env
 
 This composes the sub-targets below. Each is independently runnable if you only need to (re)apply one step:
 
-| Sub-target | What it does |
-|---|---|
-| `make install-route-helper-prod-cap` | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-route-helper` |
-| `make install-route-helper-test-cap` | Installs the cap'd `test-env-override`-feature helper at `/usr/local/libexec/sandboxd-test/sandbox-route-helper` (used by `make test-integration`) |
-| `make install-lima-helper-prod-cap` | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-lima-helper` with `cap_setuid+ep`; required for the Lima backend |
-| `make setup-sandboxd-state-dir` | Creates `/var/lib/sandboxd/` (`root:root 0755`, world-traversable so multiple daemon users can each reach their own subtree); checks that `setfacl` (`acl` package) is installed, as it is required for per-operator LIMA_HOME provisioning |
-| `make setup-bridge-conf` | Ensures `/etc/qemu/bridge.conf` authorizes sandbox bridges (`sb-*`); refuses to silently mutate an existing file with conflicting content |
-| `make setup-users-conf` | Installs `/etc/sandboxd/users.conf` from `contrib/users.conf.example` with `$USER` substituted; leaves an existing file alone |
-| `make setup-bridge-helper-setuid` | `chmod u+s /usr/lib/qemu/qemu-bridge-helper` if not already setuid |
-| `make setup-sandbox-user` | Creates the `sandbox` system user and group (mirrors `install.sh` Step 12); adds `sandbox` to the `docker` and `kvm` groups if present. Idempotent. |
+| Sub-target                             | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `make install-route-helper-prod-cap`   | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-route-helper`                                                                                                                                                                                                                                                                                                                                                             |
+| `make install-route-helper-test-cap`   | Installs the cap'd `test-env-override`-feature helper at `/usr/local/libexec/sandboxd-test/sandbox-route-helper` (used by `make test-integration`)                                                                                                                                                                                                                                                                                                     |
+| `make install-lima-helper-prod-cap`    | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-lima-helper` with `cap_setuid+ep`; required for the Lima backend                                                                                                                                                                                                                                                                                                          |
+| `make setup-sandboxd-state-dir`        | Creates `/var/lib/sandboxd/` (`root:root 0755`, world-traversable so multiple daemon users can each reach their own subtree); checks that `setfacl` (`acl` package) is installed, as it is required for per-operator LIMA_HOME provisioning                                                                                                                                                                                                            |
+| `make setup-bridge-conf`               | Ensures `/etc/qemu/bridge.conf` authorizes sandbox bridges (`sb-*`); refuses to silently mutate an existing file with conflicting content                                                                                                                                                                                                                                                                                                              |
+| `make setup-users-conf`                | Installs `/etc/sandboxd/users.conf` from `contrib/users.conf.example` with `$USER` substituted; leaves an existing file alone                                                                                                                                                                                                                                                                                                                          |
+| `make setup-bridge-helper-setuid`      | `chmod u+s /usr/lib/qemu/qemu-bridge-helper` if not already setuid                                                                                                                                                                                                                                                                                                                                                                                     |
+| `make setup-sandbox-user`              | Creates the `sandbox` system user and group (mirrors `install.sh` Step 12); adds `sandbox` to the `docker` and `kvm` groups if present. Idempotent.                                                                                                                                                                                                                                                                                                    |
 | `make setup-operator-group-membership` | Adds the invoking operator (`$USER`) to the `sandbox` group so the operator's CLI can read/write the daemon socket (mode `0660`, group `sandbox`) when the e2e harness launches the daemon as `sandbox`. Idempotent. **Re-login required for the new group membership to take effect in the current shell** — group changes are inherited only across login boundaries. Wrap subsequent invocations in `sg sandbox -c '…'` as an immediate workaround. |
-| `make setup-test-sudoers-fragment` | Installs `/etc/sudoers.d/sandboxd-test` authorising the invoking operator to run **only** the workspace's debug `sandboxd` binary (absolute path) as the `sandbox` user, without a password prompt. Consumed by the e2e harness's `SANDBOX_HARNESS=sandbox-sudo` fallback when systemd is unavailable. The fragment is validated via `visudo -c` before being installed; a malformed fragment never lands in `/etc/sudoers.d/`. Idempotent. |
+| `make setup-test-sudoers-fragment`     | Installs `/etc/sudoers.d/sandboxd-test` authorising the invoking operator to run **only** the workspace's debug `sandboxd` binary (absolute path) as the `sandbox` user, without a password prompt. Consumed by the e2e harness's `SANDBOX_HARNESS=sandbox-sudo` fallback when systemd is unavailable. The fragment is validated via `visudo -c` before being installed; a malformed fragment never lands in `/etc/sudoers.d/`. Idempotent.            |
 
 The sections below explain what each prerequisite does and document the manual install path if you cannot or do not want to use the make target.
 
@@ -490,9 +490,9 @@ When systemd is unavailable on the host (CI containers, install-e2e environments
 
 The fragment lives at `/etc/sudoers.d/sandboxd-test`, mode `0440` owned by `root:root`, and authorises **only**:
 
-* The single absolute path `<workspace>/sandboxd/target/debug/sandboxd` (and that path followed by any args).
-* Run as `sandbox` (not any other user).
-* Three env vars in `env_keep` so the harness can thread `SANDBOX_USERS_CONF`, `SANDBOX_BASE_VM_NAME`, and `SANDBOX_SOCKET` through sudo: `Defaults!<binary-path> env_keep += "SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET"`.
+- The single absolute path `<workspace>/sandboxd/target/debug/sandboxd` (and that path followed by any args).
+- Run as `sandbox` (not any other user).
+- Three env vars in `env_keep` so the harness can thread `SANDBOX_USERS_CONF`, `SANDBOX_BASE_VM_NAME`, and `SANDBOX_SOCKET` through sudo: `Defaults!<binary-path> env_keep += "SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET"`.
 
 If you move the workspace to a different directory, re-run `make setup-test-sudoers-fragment` so the fragment's absolute path stays consistent with the new location.
 
@@ -500,11 +500,11 @@ If you move the workspace to a different directory, re-run `make setup-test-sudo
 
 `tests/e2e/conftest.py` selects between three daemon-launch modes via the `SANDBOX_HARNESS` env var:
 
-| `SANDBOX_HARNESS` value | Daemon launch | Socket path | When to use |
-|-------------------------|---------------|-------------|-------------|
-| `sandbox-systemd` (default) | systemd unit `sandboxd-test.service` (installed automatically each session via drop-in override) | `/run/sandbox/sandboxd.sock` | Default on systemd hosts; auto-falls-back to `sandbox-sudo` when `/run/systemd/system` is missing. |
-| `sandbox-sudo` | `sudo -u sandbox <test-binary>` | `/run/sandbox/sandboxd.sock` | Hosts without systemd, or when iterating on the harness itself. |
-| `test-user` (legacy) | spawned as the pytest process's own uid with temp paths | per-pytest tempdir | Baseline regression check for the diff-the-outcomes runs; this mode is scheduled for removal once the cross-user harness is the verified default. |
+| `SANDBOX_HARNESS` value     | Daemon launch                                                                                    | Socket path                  | When to use                                                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sandbox-systemd` (default) | systemd unit `sandboxd-test.service` (installed automatically each session via drop-in override) | `/run/sandbox/sandboxd.sock` | Default on systemd hosts; auto-falls-back to `sandbox-sudo` when `/run/systemd/system` is missing.                                                |
+| `sandbox-sudo`              | `sudo -u sandbox <test-binary>`                                                                  | `/run/sandbox/sandboxd.sock` | Hosts without systemd, or when iterating on the harness itself.                                                                                   |
+| `test-user` (legacy)        | spawned as the pytest process's own uid with temp paths                                          | per-pytest tempdir           | Baseline regression check for the diff-the-outcomes runs; this mode is scheduled for removal once the cross-user harness is the verified default. |
 
 ### users.conf
 
@@ -532,10 +532,10 @@ Multiple subnet entries are allowed; each binds one CIDR pool to a list of allow
 
 For a single-user dev install, `make setup-users-conf` renders `contrib/users.conf.example` with `$USER` substituted in. The example ships **two pools**:
 
-| CIDR | Purpose | Read by |
-|------|---------|---------|
-| `10.209.0.0/20` | Production pool | The operator's `sandboxd` reading the canonical `/etc/sandboxd/users.conf`. The daemon's `find_subnet_by_uid` lookup returns this entry first since it appears first in the array. |
-| `10.220.0.0/20` | E2E test pool | The e2e test daemon, which `tests/e2e/conftest.py` launches with `SANDBOX_USERS_CONF` pointing at a tempfile users.conf containing only this entry. The production `sandbox-route-helper` continues reading the canonical file — which lists both pools — so authorization for the test pool's gateway IP succeeds without weakening the [`SANDBOX_USERS_CONF` privilege boundary](#privilege-boundary-sandbox_users_conf-is-feature-gated). |
+| CIDR            | Purpose         | Read by                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| --------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `10.209.0.0/20` | Production pool | The operator's `sandboxd` reading the canonical `/etc/sandboxd/users.conf`. The daemon's `find_subnet_by_uid` lookup returns this entry first since it appears first in the array.                                                                                                                                                                                                                                                           |
+| `10.220.0.0/20` | E2E test pool   | The e2e test daemon, which `tests/e2e/conftest.py` launches with `SANDBOX_USERS_CONF` pointing at a tempfile users.conf containing only this entry. The production `sandbox-route-helper` continues reading the canonical file — which lists both pools — so authorization for the test pool's gateway IP succeeds without weakening the [`SANDBOX_USERS_CONF` privilege boundary](#privilege-boundary-sandbox_users_conf-is-feature-gated). |
 
 The two pools are non-overlapping `/20` blocks. Disjoint CIDRs let the CIDR-scoped reaper distinguish test-daemon resources from production-daemon resources at startup, so a `make test-e2e` run never touches a live production session.
 
@@ -558,7 +558,7 @@ sudo chmod 0644 /etc/sandboxd/users.conf
 
 The shell-redirect through `sudo tee` is intentional — `sudo echo ... > file` does not work because the shell opens the file before `sudo` is involved.
 
-##### Upgrade path for hosts installed before the dual-pool layout
+#### Upgrade path for hosts installed before the dual-pool layout
 
 Hosts that ran `make setup-dev-env` before the dual-pool layout landed carry a single-pool canonical file (production pool only). Re-running `make setup-users-conf` on such a host detects the missing test pool and idempotently appends it via a `python3` JSON round-trip; operator-added entries are preserved untouched. A second invocation prints `+ already configured` and invokes no `sudo`. `contrib/users.conf.example` is the source of truth for the layout — diff against it if you want to confirm what `make setup-users-conf` will install on a fresh host.
 
@@ -604,16 +604,16 @@ The parent directory is created on the first invocation if it does not exist.
 
 **Format.** One JSON object per line; fields:
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `ts` | RFC 3339 timestamp, millisecond precision (`Z` suffix) | Wall-clock time the record was written. |
-| `decision` | `"allowed"` or `"denied"` | The helper's authorization outcome. |
-| `reason` | string | Present only on `decision: "denied"`. Short tag — e.g. `"pair-check failed"`, `"gateway-ip not in any subnet"`. |
-| `caller` | string | Username resolved from the helper's own `getuid()` (the daemon's runtime uid). |
-| `for_user` | string | Value of the helper's `--for-user` argument (the operator name the daemon asserts). |
-| `pool` | string (CIDR) | The matched subnet, e.g. `"10.209.0.0/20"`. Omitted when the gateway IP did not match any configured subnet (i.e. `reason: "gateway-ip not in any subnet"`). |
-| `gateway_ip` | string | The gateway IP the helper was asked to install a route to. |
-| `pid` | integer | The helper's own PID. |
+| Field        | Type                                                   | Notes                                                                                                                                                        |
+| ------------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ts`         | RFC 3339 timestamp, millisecond precision (`Z` suffix) | Wall-clock time the record was written.                                                                                                                      |
+| `decision`   | `"allowed"` or `"denied"`                              | The helper's authorization outcome.                                                                                                                          |
+| `reason`     | string                                                 | Present only on `decision: "denied"`. Short tag — e.g. `"pair-check failed"`, `"gateway-ip not in any subnet"`.                                              |
+| `caller`     | string                                                 | Username resolved from the helper's own `getuid()` (the daemon's runtime uid).                                                                               |
+| `for_user`   | string                                                 | Value of the helper's `--for-user` argument (the operator name the daemon asserts).                                                                          |
+| `pool`       | string (CIDR)                                          | The matched subnet, e.g. `"10.209.0.0/20"`. Omitted when the gateway IP did not match any configured subnet (i.e. `reason: "gateway-ip not in any subnet"`). |
+| `gateway_ip` | string                                                 | The gateway IP the helper was asked to install a route to.                                                                                                   |
+| `pid`        | integer                                                | The helper's own PID.                                                                                                                                        |
 
 Example lines:
 
@@ -637,17 +637,17 @@ The daemon itself continues to honor `SANDBOX_USERS_CONF` unconditionally becaus
 
 The two install paths produce different layouts:
 
-| Artifact | Developer install (`make setup-dev-env`) | Operator install (`install.sh`) |
-|---|---|---|
-| `sandboxd` binary | Run from `sandboxd/target/release/sandboxd` | `/usr/local/libexec/sandboxd/sandboxd` |
-| `sandbox` CLI | Run from `sandboxd/target/release/sandbox` | `/usr/local/bin/sandbox` |
-| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` | Same path |
-| systemd unit | Not installed (run by hand) | `/etc/systemd/system/sandboxd.service` |
-| State dir | `~/.local/share/sandboxd/` | `/var/lib/sandboxd/<sandbox-uid>/` |
-| Socket | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` | `/run/sandbox/sandboxd.sock` |
-| `sandbox` user | Not created | Created |
-| `users.conf` | `["sandbox", "$USER"]` | `["sandbox", "<invoking-operator>"]` |
-| `bridge.conf` | `allow all` (dev convenience) | `allow sb-*` (production scope) |
+| Artifact               | Developer install (`make setup-dev-env`)           | Operator install (`install.sh`)        |
+| ---------------------- | -------------------------------------------------- | -------------------------------------- |
+| `sandboxd` binary      | Run from `sandboxd/target/release/sandboxd`        | `/usr/local/libexec/sandboxd/sandboxd` |
+| `sandbox` CLI          | Run from `sandboxd/target/release/sandbox`         | `/usr/local/bin/sandbox`               |
+| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` | Same path                              |
+| systemd unit           | Not installed (run by hand)                        | `/etc/systemd/system/sandboxd.service` |
+| State dir              | `~/.local/share/sandboxd/`                         | `/var/lib/sandboxd/<sandbox-uid>/`     |
+| Socket                 | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock`          | `/run/sandbox/sandboxd.sock`           |
+| `sandbox` user         | Not created                                        | Created                                |
+| `users.conf`           | `["sandbox", "$USER"]`                             | `["sandbox", "<invoking-operator>"]`   |
+| `bridge.conf`          | `allow all` (dev convenience)                      | `allow sb-*` (production scope)        |
 
 `install.sh`'s pre-existing-install detection probes `/usr/local/libexec/sandboxd/sandboxd`. The developer's daemon under `sandboxd/target/release/sandboxd` is not detected by that check, so `install.sh` runs successfully on a dev box — but the two daemons should not run at the same time. To migrate from the developer path to the operator install: stop the dev daemon, optionally copy `~/.local/share/sandboxd/sessions.db` to `/var/lib/sandboxd/<sandbox-uid>/sessions.db` (manual operation, no automated migration yet), then run `install.sh` and `sudo systemctl enable --now sandboxd`.
 
@@ -696,11 +696,11 @@ In dev mode (no `sandbox` system user, daemon run by hand), checks specific to t
 
 ### Common startup failure modes
 
-| Error message | Cause | Remediation |
-|---|---|---|
-| `ERROR sandbox-lima-helper not usable; daemon cannot start` | `sandbox-lima-helper` is missing or lacks `cap_setuid+ep` | `make install-lima-helper-prod-cap` |
-| daemon refuses to start, logs mention missing subnet for daemon uid | `/etc/sandboxd/users.conf` absent or daemon uid not listed | `make setup-users-conf` then verify with `sandbox doctor` |
-| `setfacl: command not found` during first Lima session-create | `acl` package not installed | `apt install acl` (Debian/Ubuntu) or `dnf install acl` (RHEL/Fedora) |
+| Error message                                                       | Cause                                                      | Remediation                                                          |
+| ------------------------------------------------------------------- | ---------------------------------------------------------- | -------------------------------------------------------------------- |
+| `ERROR sandbox-lima-helper not usable; daemon cannot start`         | `sandbox-lima-helper` is missing or lacks `cap_setuid+ep`  | `make install-lima-helper-prod-cap`                                  |
+| daemon refuses to start, logs mention missing subnet for daemon uid | `/etc/sandboxd/users.conf` absent or daemon uid not listed | `make setup-users-conf` then verify with `sandbox doctor`            |
+| `setfacl: command not found` during first Lima session-create       | `acl` package not installed                                | `apt install acl` (Debian/Ubuntu) or `dnf install acl` (RHEL/Fedora) |
 
 ## Next steps
 
