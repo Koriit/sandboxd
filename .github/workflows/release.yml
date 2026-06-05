@@ -71,9 +71,12 @@ jobs:
           echo "tag=$tag"  >> "$GITHUB_OUTPUT"
           echo "ver=$ver"  >> "$GITHUB_OUTPUT"
           # Sanity-check: the Cargo.toml version must match the tag.
-          # Pull `sandboxd/sandboxd/Cargo.toml`'s version field and compare.
+          # Every crate inherits `[workspace.package].version` via
+          # `version.workspace = true`, so the single source of truth is
+          # the workspace root `sandboxd/Cargo.toml` — pull its version
+          # field and compare.
           cargo_ver=$(awk -F'"' '/^version/ { print $2; exit }' \
-              sandboxd/sandboxd/Cargo.toml)
+              sandboxd/Cargo.toml)
           if [ "$cargo_ver" != "$ver" ]; then
             echo "::error::tag $tag does not match Cargo.toml version $cargo_ver" >&2
             exit 1

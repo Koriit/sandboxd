@@ -52,10 +52,12 @@ pub const DAEMON_GUEST_PROTO_VERSION: u32 = 1;
 /// Semver of the embedded `sandbox-guest` binary. Stamped into
 /// `sessions.guest_binary_version` on create and on every refresh.
 ///
-/// Sourced at build time from `sandbox-guest/Cargo.toml` via the
-/// `sandbox-core` build script so the daemon never has to mirror the
-/// guest crate's version by hand.
-pub const SANDBOX_GUEST_VERSION: &str = env!("SANDBOX_GUEST_VERSION");
+/// Every workspace crate inherits one shared version
+/// (`[workspace.package].version` + `version.workspace = true`), so
+/// `sandbox-guest`'s version is always identical to `sandbox-core`'s own
+/// `CARGO_PKG_VERSION`. We read it straight from the compiler rather than
+/// parsing the guest crate's manifest at build time.
+pub const SANDBOX_GUEST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `true` when this daemon can drive the wire protocol of a session
 /// last touched at `session_proto`.
