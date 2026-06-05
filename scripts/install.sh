@@ -2675,6 +2675,13 @@ SANDBOX_UID=""
 _fail_after='$_fail_after_esc'
 _priv_maybe_fail_after() {
     if [ -n "\$_fail_after" ] && [ "\$_fail_after" = "\$1" ]; then
+        # Ensure last_completed_step in the failed checkpoint names this step,
+        # whether or not the caller already called _step_ok.  Setting
+        # _last_ok_step here is safe when the caller DID call _step_ok (it
+        # merely repeats the assignment) and necessary when the hook fires
+        # before the step's actual work so the binary / resource is never
+        # written to disk.
+        _last_ok_step="\$1"
         printf 'STEP %s fail %s (test-hook)\n' "\$_n" "\$1" >&3
         # Write a failed-status checkpoint so test assertions can inspect it.
         _write_checkpoint "\$1" "failed"
@@ -2734,6 +2741,9 @@ _priv_maybe_fail_after "operator-group-add"
 
 # ----- Step: install binaries -----
 _step_begin "install-binaries"
+# Fail-injection hook fires before any binary reaches disk so that test
+# assertions can verify the destination path is absent on abort.
+_priv_maybe_fail_after "install-binaries"
 _old_IFS="\$IFS"
 IFS=";"
 for _entry in \$PLAN_BINARIES; do
@@ -2772,7 +2782,6 @@ done
 IFS="\$_old_IFS"
 _step_ok
 _write_checkpoint "install-binaries"
-_priv_maybe_fail_after "install-binaries"
 
 # ----- Step: setcap route-helper -----
 _step_begin "setcap-route-helper"
