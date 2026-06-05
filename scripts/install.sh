@@ -722,35 +722,25 @@ ui_render_checklist() {
     _urc_available=$(( UI_ROWS - 2 - 1 - 1 ))
     if [ "$_urc_available" -lt 1 ]; then _urc_available=1; fi
 
-    # Buffer the entire repaint into a temp file then flush it to the TTY in a
-    # single cat.  One atomic write renders as a single frame on the terminal,
-    # eliminating the blank flash that a bare home+clear followed by incremental
-    # redraws produces.
-    _urc_real_tty="$UI_TTY"
-    _urc_frame=$(mktemp)
+    # Hide cursor during repaint to reduce visible flicker.
+    printf '\033[?25l' >"$UI_TTY" 2>/dev/null || true
 
-    # Point UI_TTY at the frame buffer so all sub-function writes go there.
-    UI_TTY="$_urc_frame"
+    # Cursor-home + clear to end of screen.
+    tput home >"$UI_TTY" 2>/dev/null || true
+    tput ed   >"$UI_TTY" 2>/dev/null || true
 
-    # Cursor-home + clear to end of screen into the frame buffer.
-    tput home >>"$_urc_frame" 2>/dev/null || true
-    tput ed   >>"$_urc_frame" 2>/dev/null || true
-
-    # Header (2 rows: text + rule) into the frame buffer.
+    # Header (2 rows: text + rule).
     ui_render_header "${UI_CURRENT_HEADER}"
 
-    # Render visible phase rows into the frame buffer.
+    # Render visible phase rows.
     _ui_render_checklist_body "$_urc_available"
 
-    # Bottom rule line into the frame buffer.
+    # Bottom rule line.
     _urc_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' | cut -c1-"${UI_COLS:-80}")
-    printf '%s\r\n' "$_urc_rule" >>"$_urc_frame"
+    printf '%s\r\n' "$_urc_rule" >"$UI_TTY"
 
-    # Restore real TTY, then flush the entire frame in a single atomic write.
-    UI_TTY="$_urc_real_tty"
-    cat "$_urc_frame" >"$UI_TTY" 2>/dev/null || true
-    rm -f "$_urc_frame"
-    # Cursor is now on the detail line; the animator will own it.
+    # Show cursor; cursor is now on the detail line; the animator will own it.
+    printf '\033[?25h' >"$UI_TTY" 2>/dev/null || true
 
     WINCH_PENDING=0
 
