@@ -34,6 +34,21 @@ RICH_BLOCK=$(awk '
     in_winch && /^}$/ { exit }
 ' "$INSTALL_SH")
 
+# Extract is_utf8 (needed by download_with_bar to pick bar style).
+IS_UTF8_BLOCK=$(awk '
+    /^is_utf8\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
+# Extract bar renderers + kb converter + download_with_bar.
+BAR_BLOCK=$(awk '
+    /^_bar_style_b\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^download_with_bar\(\)/ { in_dwb = 1 }
+    in_dwb && /^}$/ { exit }
+' "$INSTALL_SH")
+
 # ---------------------------------------------------------------------------
 # Failure tracking.
 # ---------------------------------------------------------------------------
@@ -65,6 +80,7 @@ _run_scenario() {
     _rs_snippet="$2"
     _rs_rows="${3:-24}"
     _rs_cols="${4:-80}"
+    _rs_extra_block="${5:-}"
 
     _rs_file="${_H_TMPDIR}/s$$.sh"
     _rs_tty="${_H_TMPDIR}/t$$.out"
@@ -94,6 +110,10 @@ _run_scenario() {
         printf 'UI_ANIM_PID=0\n'
         # Inject the extracted function block.
         printf '%s\n' "$RICH_BLOCK"
+        # Inject optional extra block (e.g. bar renderers).
+        if [ -n "$_rs_extra_block" ]; then
+            printf '%s\n' "$_rs_extra_block"
+        fi
         # Configure RICH_UI=1, pointing UI_TTY at a scratch file.
         printf 'RICH_UI=1\n'
         printf 'UI_TTY="%s"\n' "$_rs_tty"
@@ -112,6 +132,16 @@ _run_scenario() {
         _fail "$_rs_label (exit=$_rs_exit) $_rs_msg"
     fi
     rm -f "$_rs_file" "$_rs_tty" "$_rs_err"
+}
+
+# Convenience wrapper: injects RICH_BLOCK + is_utf8 + BAR_BLOCK.
+_run_bar_scenario() {
+    _rbs_label="$1"
+    _rbs_snippet="$2"
+    _rbs_rows="${3:-24}"
+    _rbs_cols="${4:-80}"
+    _run_scenario "$_rbs_label" "$_rbs_snippet" "$_rbs_rows" "$_rbs_cols" \
+        "$(printf '%s\n%s\n' "$IS_UTF8_BLOCK" "$BAR_BLOCK")"
 }
 
 # ===========================================================================
@@ -475,6 +505,221 @@ _cp_render() {
         || { printf "cpr_a=%s out of range\n" "$_cpr_a" >&2; exit 1; }
 }
 _cp_render
+'
+
+# ---------------------------------------------------------------------------
+# Structural escape-sequence assertions: ui_render_checklist
+#
+# These assert that the repaint strategy is "clear-as-you-draw":
+#   - Every painted line is prefixed with \033[K (erase-to-EOL before content).
+#   - A cursor-home sequence is emitted before content.
+#   - \033[2J (erase-entire-screen) must NEVER appear — that is the flicker op.
+# ---------------------------------------------------------------------------
+
+_run_scenario "escape-seq: ui_render_checklist emits \\033[K on painted lines" '
+ui_init_phases "$(printf "P1\nP2\nP3")"
+UI_PHASE_STATUSES=$(ui_set_phase_status 2 active)
+UI_CURRENT_HEADER="test header"
+ui_render_checklist
+# TTY output must contain at least one erase-to-EOL sequence.
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[K")"*) : ;;
+    *) printf "missing \\033[K in TTY output\n" >&2; exit 1 ;;
+esac
+'
+
+_run_scenario "escape-seq: ui_render_checklist emits cursor-home" '
+ui_init_phases "$(printf "P1\nP2\nP3")"
+UI_PHASE_STATUSES=$(ui_set_phase_status 1 active)
+UI_CURRENT_HEADER="test header"
+ui_render_checklist
+# TTY output must contain cursor-home (ESC[H or tput home which on most terms
+# also produces ESC[H, but we accept either ESC[H or the octal \033[H form).
+out=$(cat "$UI_TTY")
+# tput home on a dumb term may emit nothing; we check for the common ESC[H.
+# On a dumb terminal tput home is a no-op, so we accept missing home only
+# when TERM=dumb.  In CI we set TERM=dumb so skip this check gracefully.
+case "$TERM" in
+    dumb) : ;;  # tput home is a no-op on dumb; skip
+    *)
+        case "$out" in
+            *"$(printf "\033[H")"*) : ;;
+            *) printf "missing cursor-home in TTY output\n" >&2; exit 1 ;;
+        esac
+    ;;
+esac
+'
+
+_run_scenario "escape-seq: ui_render_checklist must NOT emit \\033[2J" '
+ui_init_phases "$(printf "P1\nP2\nP3")"
+UI_PHASE_STATUSES=$(ui_set_phase_status 2 active)
+UI_CURRENT_HEADER="test header"
+ui_render_checklist
+# \033[2J is the erase-entire-screen op that causes flicker.  It must never
+# appear in the repaint output.
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[2J")"*)
+        printf "\\033[2J found in TTY output — flicker op must not be present\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+_run_scenario "escape-seq: ui_render_checklist emits trailing \\033[J after content" '
+ui_init_phases "$(printf "P1\nP2\nP3")"
+UI_PHASE_STATUSES=$(ui_set_phase_status 2 active)
+UI_CURRENT_HEADER="test header"
+ui_render_checklist
+# \033[J erases leftover rows below the newly drawn frame.  It must be present.
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[J")"*) : ;;
+    *) printf "missing trailing \\033[J in TTY output\n" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# Structural assertions: _bar_style_b / _bar_style_c return bar cells via stdout
+# ---------------------------------------------------------------------------
+
+_run_bar_scenario "_bar_style_b: returns non-empty bar string to stdout" '
+bar=$(_bar_style_b 96 24)
+[ -n "$bar" ] || { printf "_bar_style_b returned empty\n" >&2; exit 1; }
+# Length must equal total_cells (24).
+len=$(printf "%s" "$bar" | wc -m | tr -d " ")
+[ "$len" -eq 24 ] || { printf "bar len=%s expected 24\n" "$len" >&2; exit 1; }
+'
+
+_run_bar_scenario "_bar_style_b: fully empty bar (0 progress)" '
+bar=$(_bar_style_b 0 8)
+[ -n "$bar" ] || { printf "empty bar returned nothing\n" >&2; exit 1; }
+# All cells should be spaces.
+expected="        "
+[ "$bar" = "$expected" ] || { printf "bar=%s expected 8 spaces\n" "$bar" >&2; exit 1; }
+'
+
+_run_bar_scenario "_bar_style_b: fully filled bar" '
+bar=$(_bar_style_b 64 8)
+[ -n "$bar" ] || { printf "full bar returned nothing\n" >&2; exit 1; }
+expected="████████"
+[ "$bar" = "$expected" ] || { printf "bar=%s expected 8 full blocks\n" "$bar" >&2; exit 1; }
+'
+
+_run_bar_scenario "_bar_style_c: returns non-empty bar string to stdout" '
+bar=$(_bar_style_c 12 24)
+[ -n "$bar" ] || { printf "_bar_style_c returned empty\n" >&2; exit 1; }
+len=$(printf "%s" "$bar" | wc -c | tr -d " ")
+[ "$len" -eq 24 ] || { printf "bar len=%s expected 24\n" "$len" >&2; exit 1; }
+'
+
+_run_bar_scenario "_bar_style_c: fully empty bar (0 filled)" '
+bar=$(_bar_style_c 0 8)
+[ -n "$bar" ] || { printf "empty bar returned nothing\n" >&2; exit 1; }
+# When filled=0, first cell is ">" and rest are spaces.
+case "$bar" in
+    ">"*) : ;;
+    *) printf "expected > at start, got: %s\n" "$bar" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# Structural assertions: download_with_bar — progress bar is rendered on the
+# detail line.  We stub curl with a script that pre-writes the destination
+# file and exits, so the poll loop sees a non-zero size and runs at least one
+# iteration.
+# ---------------------------------------------------------------------------
+
+_run_bar_scenario "download_with_bar: rich mode writes bar framing chars to TTY" '
+# Create a fake destination file large enough to report meaningful KB.
+_fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_$$"
+# Write 512 KB of data so du reports >= 512.
+dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
+
+# Stub curl: when called with --head, emit a Content-Length header so
+# download_with_bar learns the total size and enters the rich progress-bar
+# branch.  When called with -o, copy the pre-created file to the destination.
+_stub_dir="${_H_TMPDIR:-/tmp}/stub_$$"
+mkdir -p "$_stub_dir"
+cat >"$_stub_dir/curl" <<'"'"'STUB'"'"'
+#!/bin/sh
+_is_head=0
+_out_file=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) _is_head=1; shift ;;
+        -o) shift; _out_file="$1"; shift ;;
+        *)  shift ;;
+    esac
+done
+if [ "$_is_head" -eq 1 ]; then
+    _sz=$(wc -c <"$FAKE_DEST" 2>/dev/null | tr -d ' ')
+    printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n' "${_sz:-524288}"
+else
+    # Sleep briefly so the poll loop gets at least one tick before curl exits.
+    sleep 2
+    cp "$FAKE_DEST" "$_out_file"
+fi
+STUB
+chmod +x "$_stub_dir/curl"
+export FAKE_DEST="$_fake_dest"
+export PATH="$_stub_dir:$PATH"
+DOWNLOAD_BAR_FAILED=0
+download_with_bar "http://example.com/fake" "$_fake_dest"
+# TTY output must contain progress bar framing characters.
+_tty_out=$(cat "$UI_TTY")
+for _char in "[" "]" "%" "MB" "KB/s"; do
+    case "$_tty_out" in
+        *"$_char"*) : ;;
+        *) printf "missing %s in TTY output\n" "$_char" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
+    esac
+done
+rm -rf "$_stub_dir" "$_fake_dest"
+'
+
+_run_bar_scenario "download_with_bar: rich mode must NOT write spinner glyphs to TTY" '
+_fake_dest="${_H_TMPDIR:-/tmp}/fake_dest2_$$"
+dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
+_stub_dir="${_H_TMPDIR:-/tmp}/stub2_$$"
+mkdir -p "$_stub_dir"
+cat >"$_stub_dir/curl" <<'"'"'STUB'"'"'
+#!/bin/sh
+_is_head=0
+_out_file=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) _is_head=1; shift ;;
+        -o) shift; _out_file="$1"; shift ;;
+        *)  shift ;;
+    esac
+done
+if [ "$_is_head" -eq 1 ]; then
+    _sz=$(wc -c <"$FAKE_DEST" 2>/dev/null | tr -d ' ')
+    printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n' "${_sz:-524288}"
+else
+    sleep 2
+    cp "$FAKE_DEST" "$_out_file"
+fi
+STUB
+chmod +x "$_stub_dir/curl"
+export FAKE_DEST="$_fake_dest"
+export PATH="$_stub_dir:$PATH"
+DOWNLOAD_BAR_FAILED=0
+download_with_bar "http://example.com/fake" "$_fake_dest"
+_tty_out=$(cat "$UI_TTY")
+# Animator spinner glyphs must not appear — the animator is stopped before
+# the poll loop so the detail line is owned solely by the progress bar.
+for _glyph in "▌" "▀" "▐" "▄"; do
+    case "$_tty_out" in
+        *"$_glyph"*)
+            printf "spinner glyph %s found in TTY output\n" "$_glyph" >&2
+            rm -rf "$_stub_dir" "$_fake_dest"
+            exit 1 ;;
+        *) : ;;
+    esac
+done
+rm -rf "$_stub_dir" "$_fake_dest"
 '
 
 # ---------------------------------------------------------------------------

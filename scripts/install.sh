@@ -461,7 +461,7 @@ cleanup_tmpdir() {
         kill "$UI_ANIM_PID" 2>/dev/null || true
         wait "$UI_ANIM_PID" 2>/dev/null || true
         if [ -n "$UI_TTY" ]; then
-            printf '\r\033[K' >"$UI_TTY" 2>/dev/null || true
+            printf '\r\033[K' >>"$UI_TTY" 2>/dev/null || true
         fi
         UI_ANIM_PID=0
     fi
@@ -522,7 +522,7 @@ ui_leave_alt_screen() {
 # redirects so that /dev/tty is never opened in plain mode.
 tty_print() {
     [ -n "$UI_TTY" ] || return 0
-    printf '%s' "$1" >"$UI_TTY"
+    printf '%s' "$1" >>"$UI_TTY"
 }
 
 # ui_clamp — truncate STRING to at most WIDTH characters (never wraps).
@@ -548,7 +548,7 @@ ui_render_header() {
     _urh_line=$(ui_clamp "$_urh_cols" "$_urh_text")
     # Rule: a line of dashes clamped to terminal width.
     _urh_rule=$(printf '%*s' "$_urh_cols" '' | tr ' ' '-' | cut -c1-"$_urh_cols")
-    printf '%s\r\n%s\r\n' "$_urh_line" "$_urh_rule" >"$UI_TTY"
+    printf '\033[K%s\r\n\033[K%s\r\n' "$_urh_line" "$_urh_rule" >>"$UI_TTY"
 }
 
 # ui_phase_name — retrieve the Nth phase name (1-based).
@@ -675,7 +675,7 @@ _ui_render_checklist_body() {
     # Emit indicator line if needed.
     if [ "$_rcb_need_indicator" -eq 1 ] && [ "$_rcb_above" -gt 0 ]; then
         _rcb_ind=$(ui_clamp "$_rcb_cols" "  ⋮ $_rcb_above done above")
-        printf '%s\r\n' "$_rcb_ind" >"$UI_TTY"
+        printf '\033[K%s\r\n' "$_rcb_ind" >>"$UI_TTY"
     fi
 
     # Emit visible phase rows. The pipeline here only produces TTY output —
@@ -693,7 +693,7 @@ _ui_render_checklist_body() {
             esac
             _rcb_line="  $_rcb_glyph $_rcb_name"
             _rcb_clamped=$(ui_clamp "$_rcb_cols" "$_rcb_line")
-            printf '%s\r\n' "$_rcb_clamped" >"$UI_TTY"
+            printf '\033[K%s\r\n' "$_rcb_clamped" >>"$UI_TTY"
         fi
         _rcb_row=$((_rcb_row + 1))
     done
@@ -722,12 +722,9 @@ ui_render_checklist() {
     _urc_available=$(( UI_ROWS - 2 - 1 - 1 ))
     if [ "$_urc_available" -lt 1 ]; then _urc_available=1; fi
 
-    # Hide cursor during repaint to reduce visible flicker.
-    printf '\033[?25l' >"$UI_TTY" 2>/dev/null || true
-
-    # Cursor-home + clear to end of screen.
-    tput home >"$UI_TTY" 2>/dev/null || true
-    tput ed   >"$UI_TTY" 2>/dev/null || true
+    # Hide cursor; then home — no pre-clear so the screen never goes blank.
+    printf '\033[?25l' >>"$UI_TTY" 2>/dev/null || true
+    tput home >>"$UI_TTY" 2>/dev/null || true
 
     # Header (2 rows: text + rule).
     ui_render_header "${UI_CURRENT_HEADER}"
@@ -737,10 +734,15 @@ ui_render_checklist() {
 
     # Bottom rule line.
     _urc_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' | cut -c1-"${UI_COLS:-80}")
-    printf '%s\r\n' "$_urc_rule" >"$UI_TTY"
+    printf '\033[K%s\r\n' "$_urc_rule" >>"$UI_TTY"
+
+    # Erase any leftover rows below the newly drawn frame (e.g. after terminal
+    # resize made the frame shorter).  Content is already on-screen at this
+    # point so there is no blank gap.
+    printf '\033[J' >>"$UI_TTY" 2>/dev/null || true
 
     # Show cursor; cursor is now on the detail line; the animator will own it.
-    printf '\033[?25h' >"$UI_TTY" 2>/dev/null || true
+    printf '\033[?25h' >>"$UI_TTY" 2>/dev/null || true
 
     WINCH_PENDING=0
 
@@ -798,7 +800,7 @@ ui_animator_stop() {
         UI_ANIM_PID=0
     fi
     if [ -n "$UI_TTY" ]; then
-        printf '\r\033[K' >"$UI_TTY" 2>/dev/null || true
+        printf '\r\033[K' >>"$UI_TTY" 2>/dev/null || true
     fi
     UI_DETAIL_TEXT=""
 }
@@ -1436,20 +1438,16 @@ spinner_run() {
     return "$_sr_exit"
 }
 
-# _bar_style_b — render a style-B (UTF-8 true eighths) progress bar.
-# Args: $1=progress_eighths_total $2=total_cells $3=pct $4=done_mb $5=total_mb $6=speed_kbps
+# _bar_style_b — build a style-B (UTF-8 true eighths) progress bar string.
+# Args: $1=progress_eighths_total $2=total_cells
+# Prints the bar cell string to stdout; caller wraps it with framing.
 #
 # progress_eighths_total = (done_kb * total_cells * 8) / total_kb  (integer)
 # The caller computes this; we slice it into full cells + a fractional leader.
-# Eighths characters (U+2588 down to U+2581): █▇▆▅▄▃▂▁
-# We use ascending fill: index 1=▏ through 8=█ (U+258F..U+2588).
+# Eighths characters ascending fill: index 1=▏ through 8=█ (U+258F..U+2588).
 _bar_style_b() {
     _bsb_eighths="$1"   # total sub-cell progress (full_cells * 8 + frac_eighths)
     _bsb_total="$2"
-    _bsb_pct="$3"
-    _bsb_done_mb="$4"
-    _bsb_total_mb="$5"
-    _bsb_speed="$6"
 
     _bsb_full=$((_bsb_eighths / 8))
     _bsb_frac=$((_bsb_eighths % 8))
@@ -1477,19 +1475,15 @@ _bar_style_b() {
         fi
         _bsb_i=$((_bsb_i + 1))
     done
-    printf '\r  [%s] %3s%% %s/%s MB  %s KB/s  ' \
-        "$_bsb_bar" "$_bsb_pct" "$_bsb_done_mb" "$_bsb_total_mb" "$_bsb_speed" >&2
+    printf '%s' "$_bsb_bar"
 }
 
-# _bar_style_c — render a style-C (ASCII) progress bar.
-# Args: $1=filled_cells $2=total_cells $3=pct $4=done_mb $5=total_mb $6=speed_kbps
+# _bar_style_c — build a style-C (ASCII) progress bar string.
+# Args: $1=filled_cells $2=total_cells
+# Prints the bar cell string to stdout; caller wraps it with framing.
 _bar_style_c() {
     _bsc_filled="$1"
     _bsc_total="$2"
-    _bsc_pct="$3"
-    _bsc_done_mb="$4"
-    _bsc_total_mb="$5"
-    _bsc_speed="$6"
 
     _bsc_bar=""
     _bsc_i=0
@@ -1503,8 +1497,7 @@ _bar_style_c() {
         fi
         _bsc_i=$((_bsc_i + 1))
     done
-    printf '\r  [%s] %3s%% %s/%s MB  %s KB/s  ' \
-        "$_bsc_bar" "$_bsc_pct" "$_bsc_done_mb" "$_bsc_total_mb" "$_bsc_speed" >&2
+    printf '%s' "$_bsc_bar"
 }
 
 # _kb_to_mb_1dp — convert KB integer to MB string with one decimal place.
@@ -1542,20 +1535,57 @@ download_with_bar() {
     _dwb_curl_pid=$!
 
     if [ "$RICH_UI" -eq 1 ] && [ "$_dwb_total_kb" -gt 0 ]; then
-        # Rich mode with known size: update the detail-line label with live
-        # transfer progress while curl runs in the background.
+        # Rich mode with known size: take sole ownership of the detail line and
+        # render a live progress bar.  Stop the spinner first so no two writers
+        # contend for the same line.
+        ui_animator_stop
+        _dwb_bar_cells=24
+        # Clamp bar width to terminal (leave room for framing: "  [" + "] 100% 99.9/99.9 MB  9999 KB/s")
+        _dwb_frame_overhead=35
+        _dwb_avail=$(( (${UI_COLS:-80} - _dwb_frame_overhead) ))
+        if [ "$_dwb_avail" -lt 4 ]; then _dwb_avail=4; fi
+        if [ "$_dwb_avail" -lt "$_dwb_bar_cells" ]; then _dwb_bar_cells=$_dwb_avail; fi
+        _dwb_t0=$(date +%s)
+        _dwb_bytes_at_t0=0
         while kill -0 "$_dwb_curl_pid" 2>/dev/null; do
             _dwb_done_kb=0
             if [ -f "$_dwb_dest" ]; then
                 _dwb_done_kb=$(du -k "$_dwb_dest" 2>/dev/null | awk '{print $1}')
                 _dwb_done_kb="${_dwb_done_kb:-0}"
             fi
+            # Percentage (clamped to 100).
+            _dwb_pct=$((_dwb_done_kb * 100 / _dwb_total_kb))
+            if [ "$_dwb_pct" -gt 100 ]; then _dwb_pct=100; fi
+            # Human-readable MB strings.
             _dwb_done_mb=$(_kb_to_mb_1dp "$_dwb_done_kb")
             _dwb_total_mb=$(_kb_to_mb_1dp "$_dwb_total_kb")
-            ui_animator_start "${_dwb_done_mb}/${_dwb_total_mb} MB"
+            # Speed: KB transferred since last sample divided by elapsed seconds.
+            _dwb_t1=$(date +%s)
+            _dwb_elapsed=$((_dwb_t1 - _dwb_t0))
+            if [ "$_dwb_elapsed" -gt 0 ]; then
+                _dwb_speed=$(( (_dwb_done_kb - _dwb_bytes_at_t0) / _dwb_elapsed ))
+            else
+                _dwb_speed=0
+            fi
+            _dwb_t0=$_dwb_t1
+            _dwb_bytes_at_t0=$_dwb_done_kb
+            # Build the bar cell string via the appropriate style function.
+            if is_utf8; then
+                _dwb_eighths=$((_dwb_done_kb * _dwb_bar_cells * 8 / _dwb_total_kb))
+                _dwb_bar=$(_bar_style_b "$_dwb_eighths" "$_dwb_bar_cells")
+            else
+                _dwb_filled=$((_dwb_done_kb * _dwb_bar_cells / _dwb_total_kb))
+                _dwb_bar=$(_bar_style_c "$_dwb_filled" "$_dwb_bar_cells")
+            fi
+            # Write the full progress line directly to the TTY detail row.
+            printf '\r\033[K  [%s] %3s%% %s/%s MB  %s KB/s' \
+                "$_dwb_bar" "$_dwb_pct" "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
+                >>"$UI_TTY"
             sleep 1
         done
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
+        # Clear the detail line once the download finishes.
+        printf '\r\033[K' >>"$UI_TTY"
     elif [ "$RICH_UI" -eq 0 ] && [ "$_dwb_total_kb" -gt 0 ]; then
         # Plain mode with known size: emit periodic log lines (~10% increments).
         _dwb_last_pct_reported=-10
@@ -2258,7 +2288,7 @@ confirm_plan() {
             _cpr_b="$_cpr_end"
 
             # Cursor home, clear screen.
-            printf '\033[H\033[2J' >"$UI_TTY"
+            printf '\033[H\033[2J' >>"$UI_TTY"
 
             # Header.
             ui_render_header "sandboxd $VERSION · review plan"
@@ -2266,23 +2296,23 @@ confirm_plan() {
             # Plan lines for the viewport window.
             printf '%s\n' "$_cp_plan_text" \
                 | awk -v s="$_cpr_a" -v e="$_cpr_b" 'NR>=s && NR<=e' \
-                >"$UI_TTY"
+                >>"$UI_TTY"
 
             # Pad remaining viewport rows with blank lines.
             _cpr_shown=$(( _cpr_b - _cp_offset ))
             _cpr_pad=$(( _cp_viewport - _cpr_shown ))
             _cpr_p=0
             while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
-                printf '\r\n' >"$UI_TTY"
+                printf '\r\n' >>"$UI_TTY"
                 _cpr_p=$(( _cpr_p + 1 ))
             done
 
             # Footer rule + prompt.
             _cpr_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' \
                 | cut -c1-"${UI_COLS:-80}")
-            printf '%s\r\n' "$_cpr_rule" >"$UI_TTY"
+            printf '%s\r\n' "$_cpr_rule" >>"$UI_TTY"
             printf '[y] proceed  [n] abort  \xe2\x86\x91/\xe2\x86\x93 PgUp/PgDn scroll  lines %d\xe2\x80\x93%d of %d  ' \
-                "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >"$UI_TTY"
+                "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
         }
 
         _cp_render
