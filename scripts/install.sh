@@ -495,6 +495,9 @@ cleanup_tmpdir() {
 ui_enter_alt_screen() {
     if [ "$RICH_UI" -eq 1 ]; then
         tput smcup 2>/dev/null || true
+        # Hide cursor for the duration of the rich UI. tput rmcup restores it
+        # on all exit paths (success, failure, Ctrl-C) via the EXIT trap.
+        printf '\033[?25l' >>"$UI_TTY" 2>/dev/null || true
         ALT_SCREEN_ACTIVE=1
     fi
 }
@@ -722,8 +725,9 @@ ui_render_checklist() {
     _urc_available=$(( UI_ROWS - 2 - 1 - 1 ))
     if [ "$_urc_available" -lt 1 ]; then _urc_available=1; fi
 
-    # Hide cursor; then home — no pre-clear so the screen never goes blank.
-    printf '\033[?25l' >>"$UI_TTY" 2>/dev/null || true
+    # Home — no pre-clear so the screen never goes blank. Cursor stays hidden
+    # for the duration of the rich UI (hidden on alt-screen entry; restored by
+    # tput rmcup on exit).
     tput home >>"$UI_TTY" 2>/dev/null || true
 
     # Header (2 rows: text + rule).
@@ -740,9 +744,6 @@ ui_render_checklist() {
     # resize made the frame shorter).  Content is already on-screen at this
     # point so there is no blank gap.
     printf '\033[J' >>"$UI_TTY" 2>/dev/null || true
-
-    # Show cursor; cursor is now on the detail line; the animator will own it.
-    printf '\033[?25h' >>"$UI_TTY" 2>/dev/null || true
 
     WINCH_PENDING=0
 
@@ -1536,13 +1537,30 @@ download_with_bar() {
 
     if [ "$RICH_UI" -eq 1 ] && [ "$_dwb_total_kb" -gt 0 ]; then
         # Rich mode with known size: take sole ownership of the detail line and
-        # render a live progress bar.  Stop the spinner first so no two writers
-        # contend for the same line.
+        # render a live progress bar.  Capture the substep title first —
+        # ui_animator_stop clears UI_DETAIL_TEXT.
+        _dwb_title="$UI_DETAIL_TEXT"
         ui_animator_stop
+        _dwb_title_len=$(printf '%s' "$_dwb_title" | wc -c | tr -d ' ')
+        # Separator "  " (2 chars) between title and bar framing.
+        # Bar framing without speed:  "["(1) + bar + "]"(1) + " "(1) + "100%"(4) + " "(1) + "99.9/99.9 MB"(12) = 20 + bar_cells
+        # Speed suffix: "  9999 KB/s" = 11 chars.
+        # Total fixed overhead (no title, no bar cells): 1+1+1+4+1+12 = 20.
+        # With title prefix: title_len + 2 (sep) + 20 = title_len + 22 fixed, plus bar_cells.
         _dwb_bar_cells=24
-        # Clamp bar width to terminal (leave room for framing: "  [" + "] 100% 99.9/99.9 MB  9999 KB/s")
-        _dwb_frame_overhead=35
-        _dwb_avail=$(( (${UI_COLS:-80} - _dwb_frame_overhead) ))
+        _dwb_cols="${UI_COLS:-80}"
+        # Fixed chars when speed is included: title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
+        # "  [" = 3, "] " = 2, "100%" = 4, " " = 1, "99.9/99.9 MB" = 12, "  9999 KB/s" = 11 → 33 fixed + title_len + 2
+        _dwb_fixed_with_speed=$(( _dwb_title_len + 2 + 3 + 2 + 4 + 1 + 12 + 11 ))
+        # Fixed chars without speed: drop "  9999 KB/s" (11 chars).
+        _dwb_fixed_no_speed=$(( _dwb_fixed_with_speed - 11 ))
+        _dwb_avail=$(( _dwb_cols - _dwb_fixed_with_speed ))
+        _dwb_show_speed=1
+        if [ "$_dwb_avail" -lt 4 ]; then
+            # Try dropping speed segment to regain 11 chars.
+            _dwb_avail=$(( _dwb_cols - _dwb_fixed_no_speed ))
+            _dwb_show_speed=0
+        fi
         if [ "$_dwb_avail" -lt 4 ]; then _dwb_avail=4; fi
         if [ "$_dwb_avail" -lt "$_dwb_bar_cells" ]; then _dwb_bar_cells=$_dwb_avail; fi
         _dwb_t0=$(date +%s)
@@ -1577,10 +1595,18 @@ download_with_bar() {
                 _dwb_filled=$((_dwb_done_kb * _dwb_bar_cells / _dwb_total_kb))
                 _dwb_bar=$(_bar_style_c "$_dwb_filled" "$_dwb_bar_cells")
             fi
-            # Write the full progress line directly to the TTY detail row.
-            printf '\r\033[K  [%s] %3s%% %s/%s MB  %s KB/s' \
-                "$_dwb_bar" "$_dwb_pct" "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
-                >>"$UI_TTY"
+            # Write the full progress line: "<title>  [bar] pct% done/total MB  speed KB/s"
+            if [ "$_dwb_show_speed" -eq 1 ]; then
+                printf '\r\033[K%s  [%s] %3s%% %s/%s MB  %s KB/s' \
+                    "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
+                    "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
+                    >>"$UI_TTY"
+            else
+                printf '\r\033[K%s  [%s] %3s%% %s/%s MB' \
+                    "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
+                    "$_dwb_done_mb" "$_dwb_total_mb" \
+                    >>"$UI_TTY"
+            fi
             sleep 1
         done
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1

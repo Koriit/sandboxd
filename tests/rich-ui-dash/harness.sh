@@ -567,6 +567,23 @@ case "$out" in
 esac
 '
 
+_run_scenario "escape-seq: ui_render_checklist must NOT emit \\033[?25h (show cursor)" '
+ui_init_phases "$(printf "P1\nP2\nP3")"
+UI_PHASE_STATUSES=$(ui_set_phase_status 2 active)
+UI_CURRENT_HEADER="test header"
+ui_render_checklist
+# The cursor must remain hidden for the duration of the rich UI. Show-cursor
+# (ESC[?25h) must never appear in a repaint — cursor is hidden once on
+# alt-screen entry and restored only via tput rmcup on exit.
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?25h")"*)
+        printf "\\033[?25h found in TTY output — show-cursor must not appear in repaint\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
 _run_scenario "escape-seq: ui_render_checklist emits trailing \\033[J after content" '
 ui_init_phases "$(printf "P1\nP2\nP3")"
 UI_PHASE_STATUSES=$(ui_set_phase_status 2 active)
@@ -666,13 +683,14 @@ chmod +x "$_stub_dir/curl"
 export FAKE_DEST="$_fake_dest"
 export PATH="$_stub_dir:$PATH"
 DOWNLOAD_BAR_FAILED=0
+UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
-# TTY output must contain progress bar framing characters.
+# TTY output must contain the substep title, bar framing, and progress info.
 _tty_out=$(cat "$UI_TTY")
-for _char in "[" "]" "%" "MB" "KB/s"; do
+for _token in "fetching tarball" "[" "]" "%" "MB" "KB/s"; do
     case "$_tty_out" in
-        *"$_char"*) : ;;
-        *) printf "missing %s in TTY output\n" "$_char" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
+        *"$_token"*) : ;;
+        *) printf "missing token {%s} in TTY output\n" "$_token" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
     esac
 done
 rm -rf "$_stub_dir" "$_fake_dest"
