@@ -49,6 +49,13 @@ BAR_BLOCK=$(awk '
     in_dwb && /^}$/ { exit }
 ' "$INSTALL_SH")
 
+# Extract cleanup_tmpdir (needed to verify cursor-show on exit).
+CLEANUP_BLOCK=$(awk '
+    /^cleanup_tmpdir\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
 # ---------------------------------------------------------------------------
 # Failure tracking.
 # ---------------------------------------------------------------------------
@@ -572,13 +579,57 @@ ui_init_phases "$(printf "P1\nP2\nP3")"
 UI_PHASE_STATUSES=$(ui_set_phase_status 2 active)
 UI_CURRENT_HEADER="test header"
 ui_render_checklist
-# The cursor must remain hidden for the duration of the rich UI. Show-cursor
-# (ESC[?25h) must never appear in a repaint — cursor is hidden once on
-# alt-screen entry and restored only via tput rmcup on exit.
+# The cursor must remain hidden during repaints. Show-cursor (ESC[?25h) must
+# never appear in a repaint — cursor is hidden once on alt-screen entry and
+# restored explicitly in cleanup_tmpdir on every exit path.
 out=$(cat "$UI_TTY")
 case "$out" in
     *"$(printf "\033[?25h")"*)
         printf "\\033[?25h found in TTY output — show-cursor must not appear in repaint\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# Convenience wrapper: injects RICH_BLOCK + CLEANUP_BLOCK.
+_run_cleanup_scenario() {
+    _rcs_label="$1"
+    _rcs_snippet="$2"
+    _rcs_rows="${3:-24}"
+    _rcs_cols="${4:-80}"
+    _run_scenario "$_rcs_label" "$_rcs_snippet" "$_rcs_rows" "$_rcs_cols" \
+        "$CLEANUP_BLOCK"
+}
+
+_run_cleanup_scenario "escape-seq: cleanup_tmpdir emits \\033[?25h when RICH_UI=1" '
+# Preconditions: RICH_UI=1 and UI_TTY are already set by _run_scenario.
+# SPINNER_PID, UI_ANIM_PID, ALT_SCREEN_ACTIVE default to 0 so the kill/wait
+# and rmcup branches are skipped; only the cursor-show branch executes.
+# Initialize vars referenced by cleanup_tmpdir but not set by _run_scenario.
+TMPDIR_INSTALL=""
+SUMMARY_FILE=""
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?25h")"*) : ;;
+    *) printf "\\033[?25h missing from cleanup_tmpdir output in rich mode\n" >&2; exit 1 ;;
+esac
+'
+
+_run_cleanup_scenario "escape-seq: cleanup_tmpdir must NOT emit \\033[?25h when RICH_UI=0" '
+# Override to plain mode: cursor was never hidden, so show-cursor must not fire.
+RICH_UI=0
+# Initialize vars referenced by cleanup_tmpdir but not set by _run_scenario.
+TMPDIR_INSTALL=""
+SUMMARY_FILE=""
+# Ensure the TTY file exists so cat succeeds even though cleanup_tmpdir will
+# not write to it in plain mode (the cursor-show branch is gated on RICH_UI=1).
+: >>"$UI_TTY"
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?25h")"*)
+        printf "\\033[?25h found in cleanup_tmpdir plain-mode output — must not appear\n" >&2
         exit 1 ;;
     *) : ;;
 esac

@@ -475,6 +475,14 @@ cleanup_tmpdir() {
         tput rmcup 2>/dev/null || true
         ALT_SCREEN_ACTIVE=0
     fi
+    # Re-show the cursor if rich mode hid it. Cursor visibility is terminal-
+    # global and independent of the alt-screen buffer, so tput rmcup alone does
+    # not restore it. This must fire on every exit path (success, failure,
+    # abort, Ctrl-C) — gated on RICH_UI and a non-empty UI_TTY so that plain-
+    # mode exits (where the cursor was never hidden) are unaffected.
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$UI_TTY" ]; then
+        printf '\033[?25h' >>"$UI_TTY" 2>/dev/null || true
+    fi
     # In rich mode, flush any durable summary to the primary screen now that
     # the alt-screen is closed (or was never opened). This is the single flush
     # point for all exits — die(), pre-flight failures, abort, and success all
@@ -495,8 +503,10 @@ cleanup_tmpdir() {
 ui_enter_alt_screen() {
     if [ "$RICH_UI" -eq 1 ]; then
         tput smcup 2>/dev/null || true
-        # Hide cursor for the duration of the rich UI. tput rmcup restores it
-        # on all exit paths (success, failure, Ctrl-C) via the EXIT trap.
+        # Hide cursor for the duration of the rich UI. Cursor visibility is
+        # terminal-global and independent of the alt-screen buffer, so rmcup
+        # alone does not restore it — cleanup_tmpdir emits \033[?25h explicitly
+        # on all exit paths (success, failure, abort, Ctrl-C).
         printf '\033[?25l' >>"$UI_TTY" 2>/dev/null || true
         ALT_SCREEN_ACTIVE=1
     fi
