@@ -131,8 +131,21 @@ RESET=""
 # (the install-e2e harness) is byte-for-byte unchanged.
 RICH_UI=0
 
+# Minimum terminal height (rows) required for rich mode. The layout needs
+# header + rule + at least 3 content rows + rule + detail = 8 rows, plus one
+# spare for readability.
+RICH_UI_MIN_ROWS=9
+
 # Set to 1 while the alt-screen is active so the EXIT trap can restore it.
 ALT_SCREEN_ACTIVE=0
+
+# Set to 1 while the pager has put the TTY into raw mode. Cleared by
+# ui_restore_stty. cleanup_tmpdir calls ui_restore_stty unconditionally so
+# that Ctrl-C, die(), or any signal during the pager always restores the
+# line discipline.
+STTY_RAW_ACTIVE=0
+# Saved stty state captured before entering raw mode.
+STTY_SAVED=""
 
 TMPDIR_INSTALL=""
 
@@ -180,6 +193,69 @@ PLAN_BRIDGE_CONF_APPEND=""
 # the parent. Placed inside TMPDIR_INSTALL so cleanup_tmpdir handles it.
 PRIV_PROGRESS_FIFO=""
 PRIV_SCRIPT=""
+
+# ----------------------------------------------------------------------------
+# Rich-UI render state — all set in detect_tty, consumed by the render engine.
+# Only meaningful when RICH_UI=1; never read in plain mode.
+# ----------------------------------------------------------------------------
+
+# TTY device used for all UI output (set to /dev/tty in rich mode, empty in
+# plain mode). Empty means no UI writes; all render helpers no-op.
+UI_TTY=""
+
+# Terminal dimensions captured at startup; updated on WINCH.
+UI_ROWS=0
+UI_COLS=0
+
+# Text shown in the header line (e.g. "sandboxd 0.1.2 · acquiring").
+UI_CURRENT_HEADER=""
+
+# Set to 1 by the WINCH trap; cleared after a repaint.
+WINCH_PENDING=0
+
+# Phase model — three parallel newline-separated strings (one entry per phase).
+# Entries are appended by ui_init_phases; mutated by set_phase.
+UI_PHASE_NAMES=""      # human-readable label, e.g. "Resolve version"
+UI_PHASE_STATUSES=""   # one of: pending active done failed
+UI_PHASE_COUNT=0       # number of phases registered
+
+# Detail text for the active phase (shown on the detail line by the animator).
+UI_DETAIL_TEXT=""
+
+# Background animator PID (0 when no animator is running).
+UI_ANIM_PID=0
+
+# ----------------------------------------------------------------------------
+# Phase-name constants for ui_init_phases.
+# Two sets: acquire (Phases 6) and install (Phase 8).
+# ----------------------------------------------------------------------------
+
+UI_ACQUIRE_PHASES="Resolve version
+Check prerequisites
+Check disk space
+Bootstrap cosign
+Fetch tarball
+Verify signature
+Extract tarball"
+
+UI_INSTALL_PHASES="sandbox-user
+operator-group-add
+install-binaries
+setcap-route-helper
+setcap-lima-helper
+bridge-helper-setuid
+bridge-conf
+users-conf
+docker-load-gateway
+migrate-legacy-state
+install-systemd-unit
+daemon-reload
+write-install-state"
+
+# FIFO for phase commands from the consumer subshell to the main process
+# during run_priv_child.  Written by consumer (SET_PHASE N status), read
+# by a background reader in the main process that calls set_phase.
+PHASE_CMD_FIFO=""
 
 # ----------------------------------------------------------------------------
 # Helper functions.
@@ -289,7 +365,38 @@ log_fail() {
 
 die() {
     msg="$1"
-    emit "${RED}x${RESET} ${msg}"
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+        # Mark the currently-active phase as failed so the checklist renders
+        # with a ✗ glyph before the screen is torn down.
+        if [ "$UI_PHASE_COUNT" -gt 0 ]; then
+            _die_active=$(printf '%s\n' "$UI_PHASE_STATUSES" \
+                | awk '/^active$/{print NR; exit}')
+            if [ -n "$_die_active" ] && [ "$_die_active" -gt 0 ]; then
+                set_phase "$_die_active" "failed"
+            fi
+        fi
+        {
+            # Checklist-shaped durable report: reproduce completed/failed rows.
+            _die_i=1
+            printf '%s\n' "$UI_PHASE_STATUSES" | while IFS= read -r _die_st; do
+                [ -z "$_die_st" ] && continue
+                _die_name=$(printf '%s\n' "$UI_PHASE_NAMES" \
+                    | awk -v n="$_die_i" 'NR==n{print; exit}')
+                case "$_die_st" in
+                    done)   printf '%b\n' "  ${GREEN}✔${RESET} ${_die_name}" ;;
+                    failed) printf '%b\n' "  ${RED}✗${RESET} ${_die_name}" ;;
+                esac
+                _die_i=$((_die_i + 1))
+            done
+            printf '%b\n' ""
+            printf '%b\n' "${RED}✗${RESET} Error: ${msg}"
+            printf '%b\n' ""
+            printf '%b\n' "  Recovery: fix the root cause, then re-run install.sh."
+            printf '%b\n' "  Install log: ${INSTALL_LOG}"
+        } > "$SUMMARY_FILE"
+    else
+        emit "${RED}x${RESET} ${msg}"
+    fi
     log_fail "step=die error='${msg}'"
     exit 1
 }
@@ -336,6 +443,9 @@ ensure_install_log() {
 }
 
 cleanup_tmpdir() {
+    # Disable the SIGWINCH handler immediately so no resize repaints race
+    # with the cleanup sequence below (animator kill + rmcup + summary cat).
+    trap - WINCH
     # Kill any active spinner so the terminal is not left with dangling
     # cursor artifacts if the script dies (die(), Ctrl-C, etc.).
     if [ "$SPINNER_PID" -ne 0 ]; then
@@ -344,11 +454,33 @@ cleanup_tmpdir() {
         printf '\r\033[K' >&2
         SPINNER_PID=0
     fi
+    # Kill the rich-UI background animator before restoring the screen.
+    # Clears the detail line so no ghost characters remain on the primary
+    # screen after rmcup.
+    if [ "$UI_ANIM_PID" -ne 0 ]; then
+        kill "$UI_ANIM_PID" 2>/dev/null || true
+        wait "$UI_ANIM_PID" 2>/dev/null || true
+        if [ -n "$UI_TTY" ]; then
+            printf '\r\033[K' >"$UI_TTY" 2>/dev/null || true
+        fi
+        UI_ANIM_PID=0
+    fi
+    # Restore the TTY line discipline if the pager put it into raw mode.
+    # Must happen before rmcup so that a Ctrl-C during the pager leaves the
+    # terminal in a usable state.
+    ui_restore_stty
     # Restore the alt-screen before any output so the terminal is not left
     # in alt-screen state on Ctrl-C or unexpected exit.
     if [ "$ALT_SCREEN_ACTIVE" -eq 1 ]; then
         tput rmcup 2>/dev/null || true
         ALT_SCREEN_ACTIVE=0
+    fi
+    # In rich mode, flush any durable summary to the primary screen now that
+    # the alt-screen is closed (or was never opened). This is the single flush
+    # point for all exits — die(), pre-flight failures, abort, and success all
+    # write to SUMMARY_FILE and rely on this to display the text.
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ] && [ -s "$SUMMARY_FILE" ]; then
+        cat "$SUMMARY_FILE"
     fi
     if [ -n "$TMPDIR_INSTALL" ] && [ -d "$TMPDIR_INSTALL" ]; then
         rm -rf "$TMPDIR_INSTALL"
@@ -367,20 +499,371 @@ ui_enter_alt_screen() {
     fi
 }
 
-# ui_leave_alt_screen — restore the primary screen. Prints the durable
-# summary that was buffered in $1 (a temp file) to real stdout after the
-# screen is restored, so it persists in the scrollback.
-# In plain mode this is a no-op (the durable output was already on stdout).
+# ui_leave_alt_screen — restore the primary screen. The durable summary is
+# NOT flushed here; the EXIT trap (cleanup_tmpdir) is the single flush point
+# and will cat SUMMARY_FILE to stdout after rmcup completes.
+# In plain mode this is a no-op.
 ui_leave_alt_screen() {
-    _summary_file="${1:-}"
     if [ "$ALT_SCREEN_ACTIVE" -eq 1 ]; then
         tput rmcup 2>/dev/null || true
         ALT_SCREEN_ACTIVE=0
-        # Print the durable summary to real stdout (now the primary screen).
-        if [ -n "$_summary_file" ] && [ -r "$_summary_file" ]; then
-            cat "$_summary_file"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Phase-3 render engine — rich-mode only.
+#
+# All functions in this section no-op when RICH_UI=0 or UI_TTY is empty.
+# Plain-mode output is never touched here.
+# ----------------------------------------------------------------------------
+
+# tty_print — write raw text to the UI TTY. No-op when UI_TTY is empty
+# (i.e. plain mode). All UI output must go through this or direct >/dev/tty
+# redirects so that /dev/tty is never opened in plain mode.
+tty_print() {
+    [ -n "$UI_TTY" ] || return 0
+    printf '%s' "$1" >"$UI_TTY"
+}
+
+# ui_clamp — truncate STRING to at most WIDTH characters (never wraps).
+# Prints the (possibly truncated) string to stdout.
+# Args: $1=width $2=string
+ui_clamp() {
+    _uc_w="$1"
+    _uc_s="$2"
+    if [ "$_uc_w" -le 0 ]; then
+        return 0
+    fi
+    printf '%s' "$_uc_s" | cut -c1-"$_uc_w"
+}
+
+# ui_render_header — paint header + rule to the TTY.
+# Does NOT move the cursor afterwards; callers must position as needed.
+# Args: $1=header_text
+ui_render_header() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    _urh_text="$1"
+    _urh_cols="${UI_COLS:-80}"
+    # Clamp header text to terminal width.
+    _urh_line=$(ui_clamp "$_urh_cols" "$_urh_text")
+    # Rule: a line of dashes clamped to terminal width.
+    _urh_rule=$(printf '%*s' "$_urh_cols" '' | tr ' ' '-' | cut -c1-"$_urh_cols")
+    printf '%s\r\n%s\r\n' "$_urh_line" "$_urh_rule" >"$UI_TTY"
+}
+
+# ui_phase_name — retrieve the Nth phase name (1-based).
+ui_phase_name() {
+    _upn_idx="$1"
+    _upn_i=1
+    printf '%s\n' "$UI_PHASE_NAMES" | while IFS= read -r _upn_row; do
+        [ -z "$_upn_row" ] && continue
+        if [ "$_upn_i" -eq "$_upn_idx" ]; then
+            printf '%s' "$_upn_row"
+            return 0
+        fi
+        _upn_i=$((_upn_i + 1))
+    done
+}
+
+# ui_phase_status — retrieve the Nth phase status (1-based).
+ui_phase_status() {
+    _ups_idx="$1"
+    _ups_i=1
+    printf '%s\n' "$UI_PHASE_STATUSES" | while IFS= read -r _ups_row; do
+        [ -z "$_ups_row" ] && continue
+        if [ "$_ups_i" -eq "$_ups_idx" ]; then
+            printf '%s' "$_ups_row"
+            return 0
+        fi
+        _ups_i=$((_ups_i + 1))
+    done
+}
+
+# ui_set_phase_status — replace the Nth entry in UI_PHASE_STATUSES.
+# Args: $1=index (1-based) $2=new_status
+ui_set_phase_status() {
+    _sps_idx="$1"
+    _sps_new="$2"
+    _sps_result=""
+    _sps_i=1
+    printf '%s\n' "$UI_PHASE_STATUSES" | while IFS= read -r _sps_row; do
+        [ -z "$_sps_row" ] && continue
+        if [ "$_sps_i" -eq "$_sps_idx" ]; then
+            printf '%s\n' "$_sps_new"
+        else
+            printf '%s\n' "$_sps_row"
+        fi
+        _sps_i=$((_sps_i + 1))
+    done
+}
+
+# ui_init_phases — register all phases for the current screen.
+# Resets the phase model and populates it with the provided newline-separated
+# list of phase names; all statuses start as "pending".
+# Args: $1=newline-separated list of phase names
+ui_init_phases() {
+    # Trim leading/trailing blank lines and store the cleaned name list.
+    UI_PHASE_NAMES=$(printf '%s' "$1" | awk 'NF{found=1} found && NF')
+    UI_DETAIL_TEXT=""
+    # Count non-empty lines to get the phase count.
+    UI_PHASE_COUNT=$(printf '%s\n' "$UI_PHASE_NAMES" | awk 'NF{n++} END{print n+0}')
+    # Generate one "pending" per phase, newline-separated.
+    UI_PHASE_STATUSES=$(awk -v n="$UI_PHASE_COUNT" 'BEGIN{for(i=1;i<=n;i++) print "pending"}')
+}
+
+# _ui_render_checklist_body — write the visible phase rows to the TTY.
+# Implements auto-follow viewport: the active phase is always visible.
+# Completed rows scrolled off the top are represented by "⋮ N done above".
+# Args: $1=available_rows (how many rows the checklist region can use)
+_ui_render_checklist_body() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    _rcb_avail="$1"
+    _rcb_cols="${UI_COLS:-80}"
+    _rcb_total="$UI_PHASE_COUNT"
+
+    if [ "$_rcb_total" -eq 0 ] || [ "$_rcb_avail" -le 0 ]; then
+        return 0
+    fi
+
+    # Find the 1-based index of the first "active" phase using awk (avoids
+    # subshell variable-mutation issues with pipelines).
+    _rcb_active_idx=$(printf '%s\n' "$UI_PHASE_STATUSES" \
+        | awk '/^active$/{print NR; exit} END{if(!found) print 0}')
+    # If no active phase found, default to the last phase.
+    if [ "$_rcb_active_idx" -eq 0 ]; then
+        _rcb_active_idx="$_rcb_total"
+    fi
+
+    # Determine viewport: show as many phases as fit, keeping active visible.
+    # If all phases fit, show from row 1. Otherwise compute the scroll offset.
+    _rcb_need_indicator=0
+    _rcb_start=1
+    if [ "$_rcb_total" -gt "$_rcb_avail" ]; then
+        # Reserve one row for the "⋮ N done above" indicator.
+        _rcb_content_rows=$((_rcb_avail - 1))
+        if [ "$_rcb_content_rows" -lt 1 ]; then _rcb_content_rows=1; fi
+        # Place active row at position 2 from the top of the visible window.
+        _rcb_preferred_start=$((_rcb_active_idx - 1))
+        if [ "$_rcb_preferred_start" -lt 1 ]; then _rcb_preferred_start=1; fi
+        # Don't scroll past the end.
+        _rcb_max_start=$((_rcb_total - _rcb_content_rows + 1))
+        if [ "$_rcb_preferred_start" -gt "$_rcb_max_start" ]; then
+            _rcb_preferred_start="$_rcb_max_start"
+        fi
+        if [ "$_rcb_preferred_start" -lt 1 ]; then _rcb_preferred_start=1; fi
+        _rcb_start="$_rcb_preferred_start"
+        if [ "$_rcb_start" -gt 1 ]; then
+            _rcb_need_indicator=1
         fi
     fi
+
+    # Count phases above the viewport start (for the indicator text).
+    _rcb_above=0
+    if [ "$_rcb_need_indicator" -eq 1 ]; then
+        _rcb_above=$(( _rcb_start - 1 ))
+    fi
+
+    # Determine the last visible row index.
+    _rcb_end=$((_rcb_start + _rcb_avail - 1))
+    if [ "$_rcb_need_indicator" -eq 1 ]; then
+        _rcb_end=$((_rcb_start + _rcb_avail - 2))
+    fi
+    if [ "$_rcb_end" -gt "$_rcb_total" ]; then
+        _rcb_end="$_rcb_total"
+    fi
+
+    # Emit indicator line if needed.
+    if [ "$_rcb_need_indicator" -eq 1 ] && [ "$_rcb_above" -gt 0 ]; then
+        _rcb_ind=$(ui_clamp "$_rcb_cols" "  ⋮ $_rcb_above done above")
+        printf '%s\r\n' "$_rcb_ind" >"$UI_TTY"
+    fi
+
+    # Emit visible phase rows. The pipeline here only produces TTY output —
+    # no variables need to escape the subshell, so this is safe.
+    _rcb_row=1
+    printf '%s\n' "$UI_PHASE_NAMES" | while IFS= read -r _rcb_name; do
+        [ -z "$_rcb_name" ] && continue
+        if [ "$_rcb_row" -ge "$_rcb_start" ] && [ "$_rcb_row" -le "$_rcb_end" ]; then
+            _rcb_status=$(ui_phase_status "$_rcb_row")
+            case "$_rcb_status" in
+                active)  _rcb_glyph="▸" ;;
+                done)    _rcb_glyph="✔" ;;
+                failed)  _rcb_glyph="✗" ;;
+                *)       _rcb_glyph="·" ;;
+            esac
+            _rcb_line="  $_rcb_glyph $_rcb_name"
+            _rcb_clamped=$(ui_clamp "$_rcb_cols" "$_rcb_line")
+            printf '%s\r\n' "$_rcb_clamped" >"$UI_TTY"
+        fi
+        _rcb_row=$((_rcb_row + 1))
+    done
+}
+
+# ui_render_checklist — full repaint of the header + checklist region.
+# Uses cursor-home + clear-to-end (not full clear) per R6.4.
+# Leaves the cursor on the detail line below the checklist.
+ui_render_checklist() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    UI_ROWS=$(tput lines 2>/dev/null || printf '%s' "${UI_ROWS:-24}")
+    UI_COLS=$(tput cols  2>/dev/null || printf '%s' "${UI_COLS:-80}")
+
+    # Stop the animator before touching the checklist region.
+    _urc_anim_was_running=0
+    if [ "$UI_ANIM_PID" -ne 0 ]; then
+        _urc_anim_was_running=1
+        kill "$UI_ANIM_PID" 2>/dev/null || true
+        wait "$UI_ANIM_PID" 2>/dev/null || true
+        UI_ANIM_PID=0
+    fi
+
+    # Cursor-home + clear to end of screen.
+    tput home >"$UI_TTY" 2>/dev/null || true
+    tput ed   >"$UI_TTY" 2>/dev/null || true
+
+    # Header (2 rows: text + rule).
+    ui_render_header "${UI_CURRENT_HEADER}"
+
+    # How many rows remain for the checklist + detail?
+    # Layout: 2 header rows + N phase rows + 1 rule + 1 detail.
+    # Minimum 1 content row; detail line always at the bottom.
+    _urc_available=$(( UI_ROWS - 2 - 1 - 1 ))
+    if [ "$_urc_available" -lt 1 ]; then _urc_available=1; fi
+
+    # Render visible phase rows.
+    _ui_render_checklist_body "$_urc_available"
+
+    # Bottom rule line.
+    _urc_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' | cut -c1-"${UI_COLS:-80}")
+    printf '%s\r\n' "$_urc_rule" >"$UI_TTY"
+    # Cursor is now on the detail line; the animator will own it.
+
+    WINCH_PENDING=0
+
+    # Restart the animator if it was running.
+    if [ "$_urc_anim_was_running" -eq 1 ]; then
+        ui_animator_start "$UI_DETAIL_TEXT"
+    fi
+}
+
+# ui_animator_body — the animator loop. Run as a background process.
+# Args: $1=detail_text $2=detail_row (1-based row number on screen)
+# The process writes only to UI_TTY and only to the detail line.
+# It re-queries tput cols each tick for resize handling.
+_ui_animator_body() {
+    _ab_text="$1"
+    _ab_tty="$UI_TTY"
+    [ -n "$_ab_tty" ] || exit 0
+    _ab_frames='▌▀▐▄'
+    _ab_t=0
+    while true; do
+        _ab_cols=$(tput cols 2>/dev/null || printf '80')
+        _ab_idx=$((_ab_t % 4))
+        _ab_frame=$(printf '%s' "$_ab_frames" | cut -c$((_ab_idx + 1)))
+        _ab_detail="  $_ab_frame $_ab_text"
+        _ab_clamped=$(printf '%s' "$_ab_detail" | cut -c1-"$_ab_cols")
+        # Move to start of line, clear it, print the detail.
+        printf '\r\033[K%s' "$_ab_clamped" >"$_ab_tty"
+        sleep 0.25
+        _ab_t=$((_ab_t + 1))
+    done
+}
+
+# ui_animator_start — launch the background animator.
+# Args: $1=detail_text
+ui_animator_start() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    [ -n "$UI_TTY" ] || return 0
+    # Kill any leftover animator first.
+    if [ "$UI_ANIM_PID" -ne 0 ]; then
+        kill "$UI_ANIM_PID" 2>/dev/null || true
+        wait "$UI_ANIM_PID" 2>/dev/null || true
+        UI_ANIM_PID=0
+    fi
+    UI_DETAIL_TEXT="$1"
+    _ui_animator_body "$1" &
+    UI_ANIM_PID=$!
+}
+
+# ui_animator_stop — stop the background animator and clear the detail line.
+ui_animator_stop() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    if [ "$UI_ANIM_PID" -ne 0 ]; then
+        kill "$UI_ANIM_PID" 2>/dev/null || true
+        wait "$UI_ANIM_PID" 2>/dev/null || true
+        UI_ANIM_PID=0
+    fi
+    if [ -n "$UI_TTY" ]; then
+        printf '\r\033[K' >"$UI_TTY" 2>/dev/null || true
+    fi
+    UI_DETAIL_TEXT=""
+}
+
+# ui_restore_stty — restore the terminal line discipline after raw mode.
+# Idempotent: safe to call multiple times. Called from cleanup_tmpdir so
+# SIGINT / SIGTERM / SIGHUP / EXIT all restore the TTY line discipline even
+# when the pager is interrupted mid-read.
+ui_restore_stty() {
+    if [ "$STTY_RAW_ACTIVE" -eq 1 ] && [ -e /dev/tty ]; then
+        stty "$STTY_SAVED" </dev/tty 2>/dev/null \
+            || stty sane </dev/tty 2>/dev/null \
+            || true
+        STTY_RAW_ACTIVE=0
+    fi
+}
+
+# ui_service_winch — handle a pending WINCH by repainting the checklist.
+# Call this at any free moment (between phases, at prompts).
+ui_service_winch() {
+    [ "$WINCH_PENDING" -eq 1 ] || return 0
+    [ "$RICH_UI" -eq 1 ] || return 0
+    ui_render_checklist
+}
+
+# set_phase — single entry point for phase-model mutation + repaint.
+# Stops the animator, updates the model, repaints the checklist, then
+# restarts the animator (if the new status is "active").
+# Args: $1=phase_index (1-based) $2=status (pending|active|done|failed)
+#       $3=detail_text (optional, shown on detail line when active)
+set_phase() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    _sp_idx="$1"
+    _sp_status="$2"
+    _sp_detail="${3:-}"
+
+    # Stop the animator before mutating the model.
+    ui_animator_stop
+
+    # Mutate the phase status.
+    UI_PHASE_STATUSES=$(ui_set_phase_status "$_sp_idx" "$_sp_status")
+
+    # Repaint the checklist (cursor-home + clear-to-end + redraw).
+    ui_render_checklist
+
+    # Start animator if this phase is now active.
+    if [ "$_sp_status" = "active" ]; then
+        ui_animator_start "$_sp_detail"
+    fi
+}
+
+# ui_find_phase — find the index of a phase by name (exact match).
+# Prints the index (1-based) to stdout, or 0 if not found.
+ui_find_phase() {
+    _ufp_name="$1"
+    _ufp_i=1
+    printf '%s\n' "$UI_PHASE_NAMES" | while IFS= read -r _ufp_row; do
+        [ -z "$_ufp_row" ] && continue
+        if [ "$_ufp_row" = "$_ufp_name" ]; then
+            printf '%s' "$_ufp_i"
+            return 0
+        fi
+        _ufp_i=$((_ufp_i + 1))
+    done
+    printf '0'
+}
+
+# _ui_winch_trap — signal handler for SIGWINCH.
+_ui_winch_trap() {
+    WINCH_PENDING=1
 }
 
 # ----------------------------------------------------------------------------
@@ -505,19 +988,29 @@ detect_tty() {
     if [ -n "$GREEN" ]; then color_state="yes"; fi
 
     # Rich UI requires: stdout is a TTY, /dev/tty is usable, tput + a working
-    # terminfo entry are present, and neither --no-color nor --quiet is set.
-    # We probe tput smcup/rmcup to confirm terminfo is functional; if tput
-    # itself is missing or the terminal type has no smcup capability the probe
-    # exits non-zero and we fall back to plain mode.
+    # terminfo entry are present, neither --no-color / --quiet / --verbose is
+    # set, and the terminal is tall enough for the layout. We probe tput
+    # smcup/rmcup to confirm terminfo is functional; if tput itself is missing
+    # or the terminal type has no smcup capability the probe exits non-zero and
+    # we fall back to plain mode.
     if [ "$tty_state" = "yes" ] \
         && [ "$NO_COLOR" -eq 0 ] \
         && [ "$QUIET" -eq 0 ] \
+        && [ "$VERBOSE" -eq 0 ] \
         && [ -e /dev/tty ] \
         && command -v tput >/dev/null 2>&1 \
         && tput smcup >/dev/null 2>&1 \
-        && tput rmcup >/dev/null 2>&1; then
+        && tput rmcup >/dev/null 2>&1 \
+        && [ "$(tput lines 2>/dev/null || echo 0)" -ge "$RICH_UI_MIN_ROWS" ]; then
         RICH_UI=1
         rich_state="yes"
+        UI_TTY="/dev/tty"
+        UI_ROWS=$(tput lines 2>/dev/null || printf '24')
+        UI_COLS=$(tput cols  2>/dev/null || printf '80')
+        # SIGWINCH handler is only meaningful in rich mode; installing it
+        # unconditionally would set WINCH_PENDING=1 in plain-mode scripts and
+        # non-TTY environments where the flag is never drained.
+        trap '_ui_winch_trap' WINCH
     fi
 
     log_ok "step=tty_detect tty=$tty_state color=$color_state rich=$rich_state"
@@ -619,17 +1112,27 @@ detect_preexisting() {
                 *)
                     # status=complete (or absent / unknown) — already installed.
                     log_ok "step=preexist version=$existing_ver action=skip"
-                    emit "${GREEN}+${RESET} sandboxd $existing_ver is already installed"
-                    cleanup_tmpdir
+                    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+                        printf '%b\n' "${GREEN}+${RESET} sandboxd $existing_ver is already installed" > "$SUMMARY_FILE"
+                    else
+                        emit "${GREEN}+${RESET} sandboxd $existing_ver is already installed"
+                    fi
                     exit 0
                     ;;
             esac
         else
-            emit "${YELLOW}!${RESET} sandboxd ${existing_ver:-(unknown)} is already installed."
-            emit "  install.sh installs from scratch only."
-            emit "  To upgrade or downgrade, run:"
-            emit "      sudo sandbox update --version $TARGET_VER"
-            emit "  (Not yet available — re-run install.sh once update lands.)"
+            _emit_version_mismatch() {
+                emit "${YELLOW}!${RESET} sandboxd ${existing_ver:-(unknown)} is already installed."
+                emit "  install.sh installs from scratch only."
+                emit "  To upgrade or downgrade, run:"
+                emit "      sudo sandbox update --version $TARGET_VER"
+                emit "  (Not yet available — re-run install.sh once update lands.)"
+            }
+            if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+                _emit_version_mismatch > "$SUMMARY_FILE"
+            else
+                _emit_version_mismatch
+            fi
             log_warn "step=preexist version=${existing_ver:-unknown} target=$TARGET_VER action=refuse"
             exit 1
         fi
@@ -692,25 +1195,32 @@ check_prereqs() {
     command -v tar     >/dev/null 2>&1 || add_missing "tar"
 
     if [ -n "$missing" ]; then
-        emit "${RED}x${RESET} missing prerequisites:"
         mgr=$(detect_pkg_mgr 2>/dev/null || true)
-        for m in $missing; do
-            pkg=""
-            if [ -n "$mgr" ]; then
-                pkg=$(pkg_name_for "$m" "$mgr" 2>/dev/null || true)
-            fi
-            if [ -n "$pkg" ]; then
-                hint=$(pkg_hint_for "$m")
-                if [ -n "$hint" ]; then
-                    emit "    - $m:    $mgr install $pkg     $hint"
-                else
-                    emit "    - $m:    $mgr install $pkg"
+        _emit_prereq_fail() {
+            emit "${RED}x${RESET} missing prerequisites:"
+            for m in $missing; do
+                pkg=""
+                if [ -n "$mgr" ]; then
+                    pkg=$(pkg_name_for "$m" "$mgr" 2>/dev/null || true)
                 fi
-            else
-                emit "    - $m"
-            fi
-        done
-        emit "  Install these, then re-run install.sh."
+                if [ -n "$pkg" ]; then
+                    hint=$(pkg_hint_for "$m")
+                    if [ -n "$hint" ]; then
+                        emit "    - $m:    $mgr install $pkg     $hint"
+                    else
+                        emit "    - $m:    $mgr install $pkg"
+                    fi
+                else
+                    emit "    - $m"
+                fi
+            done
+            emit "  Install these, then re-run install.sh."
+        }
+        if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+            _emit_prereq_fail > "$SUMMARY_FILE"
+        else
+            _emit_prereq_fail
+        fi
         log_fail "step=prereq missing=$(printf '%s' "$missing" | tr ' ' ',')"
         exit 1
     fi
@@ -815,18 +1325,31 @@ check_disk() {
 
     fail=0
     if [ -z "$usr_free" ] || [ "$usr_free" -lt 50000 ]; then
-        emit "${RED}x${RESET} /usr/local has less than 50 MB free (${usr_free:-?} KB)"
         fail=1
     fi
     if [ -z "$var_free" ] || [ "$var_free" -lt 200000 ]; then
-        emit "${RED}x${RESET} $var_anchor has less than 200 MB free (${var_free:-?} KB)"
         fail=1
     fi
     if [ -z "$docker_free" ] || [ "$docker_free" -lt 500000 ]; then
-        emit "${RED}x${RESET} $docker_anchor has less than 500 MB free (${docker_free:-?} KB)"
         fail=1
     fi
     if [ "$fail" -eq 1 ]; then
+        _emit_disk_fail() {
+            if [ -z "$usr_free" ] || [ "$usr_free" -lt 50000 ]; then
+                emit "${RED}x${RESET} /usr/local has less than 50 MB free (${usr_free:-?} KB)"
+            fi
+            if [ -z "$var_free" ] || [ "$var_free" -lt 200000 ]; then
+                emit "${RED}x${RESET} $var_anchor has less than 200 MB free (${var_free:-?} KB)"
+            fi
+            if [ -z "$docker_free" ] || [ "$docker_free" -lt 500000 ]; then
+                emit "${RED}x${RESET} $docker_anchor has less than 500 MB free (${docker_free:-?} KB)"
+            fi
+        }
+        if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+            _emit_disk_fail > "$SUMMARY_FILE"
+        else
+            _emit_disk_fail
+        fi
         log_fail "step=disk_check usr_free=${usr_free:-?}KB var_free=${var_free:-?}KB"
         exit 1
     fi
@@ -858,6 +1381,7 @@ _spinner_frame() {
 
 # spinner_start — begin a spinner animation in the background (rich mode only).
 # In plain mode this is a no-op: the calling code continues unchanged.
+# Plain mode MUST remain a no-op (R2.1 / R2.3 — see spec).
 # Sets the global SPINNER_PID to the spinner background process id.
 # The caller MUST call spinner_stop when the operation is done.
 # The EXIT trap in cleanup_tmpdir will kill any lingering spinner on die().
@@ -866,27 +1390,19 @@ _spinner_frame() {
 spinner_start() {
     _ss_label="$1"
 
-    if [ "$RICH_UI" -ne 1 ]; then
-        SPINNER_PID=0
-        return 0
-    fi
-
-    # Launch the spinner animation loop in the background.
-    # It writes to stderr so it does not mix with stdout content.
-    (
-        _t=0
-        while true; do
-            _spinner_frame "$_t" "$_ss_label"
-            sleep 1
-            _t=$((_t + 1))
-        done
-    ) &
-    SPINNER_PID=$!
+    # Both plain and rich mode: no background spinner.
+    # In rich mode the Phase-6/8 animator owns the detail line; a separate
+    # stderr spinner would corrupt the alt-screen.
+    # In plain mode there was never a background spinner here; spinner_run
+    # executes the command foreground and spinner_stop prints the settle line.
+    # Plain mode MUST remain a no-op (R2.1 / R2.3 — see spec).
+    SPINNER_PID=0
 }
 
 # spinner_stop — stop the spinner and print a ✔ or ✗ settle line.
 # Args: $1=0 for success, non-zero for failure; $2=label to print.
 # In plain mode: no-op (no spinner was started).
+# Plain mode MUST remain a no-op (R2.1 / R2.3 — see spec).
 spinner_stop() {
     _sto_exit="${1:-0}"
     _sto_label="$2"
@@ -1029,60 +1545,7 @@ download_with_bar() {
     curl -fsSL --retry 3 --retry-delay 2 -o "$_dwb_dest" "$_dwb_url" 2>/dev/null &
     _dwb_curl_pid=$!
 
-    if [ "$RICH_UI" -eq 1 ] && [ "$_dwb_total_kb" -gt 0 ]; then
-        # Rich mode with known size: show a determinate bar.
-        _dwb_cols=$(tput cols 2>/dev/null || printf '80')
-        # Bar width: columns minus ~30 chars for pct/size/speed annotation.
-        _dwb_bar_w=$((_dwb_cols - 32))
-        if [ "$_dwb_bar_w" -lt 10 ]; then _dwb_bar_w=10; fi
-        if [ "$_dwb_bar_w" -gt 50 ]; then _dwb_bar_w=50; fi
-
-        _dwb_use_utf8=0
-        is_utf8 && _dwb_use_utf8=1
-
-        _dwb_last_kb=0
-        _dwb_speed_kb=0
-        while kill -0 "$_dwb_curl_pid" 2>/dev/null; do
-            _dwb_done_kb=0
-            if [ -f "$_dwb_dest" ]; then
-                _dwb_done_kb=$(du -k "$_dwb_dest" 2>/dev/null | awk '{print $1}')
-                _dwb_done_kb="${_dwb_done_kb:-0}"
-            fi
-            _dwb_pct=0
-            if [ "$_dwb_total_kb" -gt 0 ]; then
-                _dwb_pct=$((_dwb_done_kb * 100 / _dwb_total_kb))
-                if [ "$_dwb_pct" -gt 100 ]; then _dwb_pct=100; fi
-            fi
-            _dwb_done_mb=$(_kb_to_mb_1dp "$_dwb_done_kb")
-            _dwb_total_mb=$(_kb_to_mb_1dp "$_dwb_total_kb")
-
-            # Speed: instantaneous KB/s from the previous sample delta.
-            # Poll is 0.25 s, so multiply delta by 4 to get KB/s.
-            _dwb_delta_kb=$((_dwb_done_kb - _dwb_last_kb))
-            if [ "$_dwb_delta_kb" -gt 0 ]; then
-                _dwb_speed_kb=$((_dwb_delta_kb * 4))
-            fi
-            _dwb_last_kb=$_dwb_done_kb
-
-            if [ "$_dwb_use_utf8" -eq 1 ]; then
-                # Compute sub-cell eighths: (done_kb * bar_cells * 8) / total_kb.
-                _dwb_eighths=$((_dwb_done_kb * _dwb_bar_w * 8 / _dwb_total_kb))
-                if [ "$_dwb_eighths" -gt $((_dwb_bar_w * 8)) ]; then
-                    _dwb_eighths=$((_dwb_bar_w * 8))
-                fi
-                _bar_style_b "$_dwb_eighths" "$_dwb_bar_w" "$_dwb_pct" \
-                    "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed_kb"
-            else
-                _dwb_filled=$((_dwb_pct * _dwb_bar_w / 100))
-                _bar_style_c "$_dwb_filled" "$_dwb_bar_w" "$_dwb_pct" \
-                    "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed_kb"
-            fi
-            sleep 0.25
-        done
-        # Erase the bar line.
-        printf '\r\033[K' >&2
-
-    elif [ "$RICH_UI" -eq 0 ] && [ "$_dwb_total_kb" -gt 0 ]; then
+    if [ "$RICH_UI" -eq 0 ] && [ "$_dwb_total_kb" -gt 0 ]; then
         # Plain mode with known size: emit periodic log lines (~10% increments).
         _dwb_last_pct_reported=-10
         while kill -0 "$_dwb_curl_pid" 2>/dev/null; do
@@ -1106,14 +1569,14 @@ download_with_bar() {
             sleep 1
         done
     else
-        # No size info (unknown Content-Length) or rich mode: just wait for curl.
-        # Capture exit code directly here; skip the outer wait below.
+        # Rich mode or no size info: just wait for curl.  The detail-line
+        # animator already provides visual feedback in rich mode.
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
         return 0
     fi
 
-    # For the rich-bar and plain-bar branches, the poll loop exits when the
-    # process dies; capture the final exit code here.
+    # For the plain-bar branch the poll loop exits when the process dies;
+    # capture the final exit code here.
     wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
 }
 
@@ -1723,11 +2186,9 @@ confirm_plan() {
         return 0
     fi
 
-    # No --yes: require an interactive terminal (stdout is a TTY AND /dev/tty
-    # is accessible). When stdout is a pipe or a non-terminal fd (the e2e
-    # harness, CI, nohup, logged pipes), we must hard-abort — there is no
-    # human at the other end to confirm the privileged change set.
-    if [ ! -t 1 ] || [ ! -e /dev/tty ]; then
+    # No --yes: require an interactive terminal (/dev/tty accessible).
+    # In plain mode stdout must also be a TTY.
+    if [ ! -e /dev/tty ] || { [ "$RICH_UI" -ne 1 ] && [ ! -t 1 ]; }; then
         printf '%s\n' "Aborting: no terminal and --yes not passed." >&2
         printf '%s\n' "  Re-run with --yes to proceed non-interactively:" >&2
         printf '%s\n' "      install.sh --yes [other options]" >&2
@@ -1735,19 +2196,176 @@ confirm_plan() {
         exit 1
     fi
 
-    printf 'Proceed with these privileged changes? [y/N] ' >/dev/tty
-    read -r _answer </dev/tty || _answer=""
-    case "$_answer" in
-        [yY]|[yY][eE][sS])
-            log_ok "step=confirm action=yes-interactive"
-            emit ""
-            ;;
-        *)
-            emit "${YELLOW}!${RESET} Aborted. No changes were made."
+    if [ "$RICH_UI" -eq 1 ]; then
+        # Rich mode: display the plan text through an interactive viewport pager.
+        # Capture the full plan output into a variable (emit() writes to stdout,
+        # which is redirected to the variable via command substitution).
+        _cp_plan_text=$(render_plan 2>/dev/null)
+        _cp_plan_lines=$(printf '%s' "$_cp_plan_text" | awk 'END{print NR}')
+
+        # Viewport dimensions: leave 4 rows for header+rule+prompt+border.
+        _cp_viewport=$(( UI_ROWS - 4 ))
+        if [ "$_cp_viewport" -lt 1 ]; then _cp_viewport=1; fi
+
+        _cp_offset=0    # index of first visible line (0-based)
+        _cp_done=0      # 1 = user decided (proceed or abort)
+        _cp_proceed=0   # 1 = proceed, 0 = abort
+
+        # ESC byte — built with POSIX printf so this works under dash/sh,
+        # not just bash ($'\x1b' is a bash/ksh ANSI-C extension).
+        _cp_esc=$(printf '\033')
+
+        # Switch to raw single-char input; restore on all exit paths via
+        # ui_restore_stty (which is also called from cleanup_tmpdir).
+        STTY_SAVED=$(stty -g </dev/tty 2>/dev/null || true)
+        if stty raw -echo </dev/tty 2>/dev/null; then
+            STTY_RAW_ACTIVE=1
+        fi
+
+        _cp_restore_stty() {
+            ui_restore_stty
+        }
+
+        # _cp_render — repaint the full pager screen.
+        # Refreshes terminal dimensions first so that a resize (SIGWINCH) is
+        # handled on the next repaint without needing a separate resize path.
+        _cp_render() {
+            # Refresh dimensions; recompute viewport so a resize takes effect.
+            UI_ROWS=$(tput lines 2>/dev/null || printf '24')
+            UI_COLS=$(tput cols  2>/dev/null || printf '80')
+            _cp_viewport=$(( UI_ROWS - 4 ))
+            if [ "$_cp_viewport" -lt 1 ]; then _cp_viewport=1; fi
+            # Clamp scroll offset to the new viewport bounds.
+            _cpr_max=$(( _cp_plan_lines - _cp_viewport ))
+            if [ "$_cpr_max" -lt 0 ]; then _cpr_max=0; fi
+            if [ "$_cp_offset" -gt "$_cpr_max" ]; then _cp_offset="$_cpr_max"; fi
+            # Drain any pending WINCH flag now that we are about to repaint.
+            WINCH_PENDING=0
+
+            _cpr_end=$(( _cp_offset + _cp_viewport ))
+            if [ "$_cpr_end" -gt "$_cp_plan_lines" ]; then
+                _cpr_end="$_cp_plan_lines"
+            fi
+            _cpr_a=$(( _cp_offset + 1 ))
+            _cpr_b="$_cpr_end"
+
+            # Cursor home, clear screen.
+            printf '\033[H\033[2J' >"$UI_TTY"
+
+            # Header.
+            ui_render_header "sandboxd $VERSION · review plan"
+
+            # Plan lines for the viewport window.
+            printf '%s\n' "$_cp_plan_text" \
+                | awk -v s="$_cpr_a" -v e="$_cpr_b" 'NR>=s && NR<=e' \
+                >"$UI_TTY"
+
+            # Pad remaining viewport rows with blank lines.
+            _cpr_shown=$(( _cpr_b - _cp_offset ))
+            _cpr_pad=$(( _cp_viewport - _cpr_shown ))
+            _cpr_p=0
+            while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
+                printf '\r\n' >"$UI_TTY"
+                _cpr_p=$(( _cpr_p + 1 ))
+            done
+
+            # Footer rule + prompt.
+            _cpr_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' \
+                | cut -c1-"${UI_COLS:-80}")
+            printf '%s\r\n' "$_cpr_rule" >"$UI_TTY"
+            printf '[y] proceed  [n] abort  \xe2\x86\x91/\xe2\x86\x93 PgUp/PgDn scroll  lines %d\xe2\x80\x93%d of %d  ' \
+                "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >"$UI_TTY"
+        }
+
+        _cp_render
+
+        while [ "$_cp_done" -eq 0 ]; do
+            # Service any pending resize before blocking on input.
+            if [ "$WINCH_PENDING" -eq 1 ]; then
+                _cp_render
+            fi
+            # Read one byte from the TTY.
+            _cp_ch=$(dd bs=1 count=1 2>/dev/null </dev/tty)
+
+            case "$_cp_ch" in
+                y|Y)
+                    _cp_done=1
+                    _cp_proceed=1
+                    ;;
+                n|N|q|Q)
+                    _cp_done=1
+                    _cp_proceed=0
+                    ;;
+                "$_cp_esc")
+                    # Escape sequence: read two more bytes for arrow/page keys.
+                    _cp_b2=$(dd bs=1 count=1 2>/dev/null </dev/tty)
+                    _cp_b3=$(dd bs=1 count=1 2>/dev/null </dev/tty)
+                    case "${_cp_b2}${_cp_b3}" in
+                        '[A')   # Up arrow — scroll up one line.
+                            if [ "$_cp_offset" -gt 0 ]; then
+                                _cp_offset=$(( _cp_offset - 1 ))
+                            fi
+                            ;;
+                        '[B')   # Down arrow — scroll down one line.
+                            _cp_max=$(( _cp_plan_lines - _cp_viewport ))
+                            if [ "$_cp_max" -lt 0 ]; then _cp_max=0; fi
+                            if [ "$_cp_offset" -lt "$_cp_max" ]; then
+                                _cp_offset=$(( _cp_offset + 1 ))
+                            fi
+                            ;;
+                        '[5')   # PgUp — read trailing ~; scroll up one viewport.
+                            dd bs=1 count=1 2>/dev/null </dev/tty >/dev/null || true
+                            _cp_offset=$(( _cp_offset - _cp_viewport ))
+                            if [ "$_cp_offset" -lt 0 ]; then _cp_offset=0; fi
+                            ;;
+                        '[6')   # PgDn — read trailing ~; scroll down one viewport.
+                            dd bs=1 count=1 2>/dev/null </dev/tty >/dev/null || true
+                            _cp_max=$(( _cp_plan_lines - _cp_viewport ))
+                            if [ "$_cp_max" -lt 0 ]; then _cp_max=0; fi
+                            _cp_offset=$(( _cp_offset + _cp_viewport ))
+                            if [ "$_cp_offset" -gt "$_cp_max" ]; then
+                                _cp_offset="$_cp_max"
+                            fi
+                            ;;
+                    esac
+                    _cp_render
+                    continue
+                    ;;
+            esac
+
+            if [ "$_cp_done" -eq 0 ]; then
+                _cp_render
+            fi
+        done
+
+        _cp_restore_stty
+
+        if [ "$_cp_proceed" -eq 0 ]; then
+            if [ -n "$SUMMARY_FILE" ]; then
+                printf '%b\n' "${YELLOW}!${RESET} Aborted. No changes were made." > "$SUMMARY_FILE"
+            fi
             log_ok "step=confirm action=no-interactive"
-            exit 0
-            ;;
-    esac
+            exit 1
+        fi
+        log_ok "step=confirm action=yes-interactive"
+    else
+        # Plain mode: print the plan then ask for confirmation on stdout/tty.
+        render_plan
+
+        printf 'Proceed with these privileged changes? [y/N] ' >/dev/tty
+        read -r _answer </dev/tty || _answer=""
+        case "$_answer" in
+            [yY]|[yY][eE][sS])
+                log_ok "step=confirm action=yes-interactive"
+                emit ""
+                ;;
+            *)
+                emit "${YELLOW}!${RESET} Aborted. No changes were made."
+                log_ok "step=confirm action=no-interactive"
+                exit 1
+                ;;
+        esac
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -2379,6 +2997,15 @@ run_priv_child() {
     _failed_step_n=0     # step number that failed
     _total_steps=0       # from TOTAL N message
     _current_label=""    # label of the step currently in-progress
+    _phase_reader_pid=0  # PID of the phase-command reader; 0 means not started
+
+    # In rich mode, initialise the install-screen phase model before the child
+    # starts so the checklist is visible immediately.
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_init_phases "$UI_INSTALL_PHASES"
+        UI_CURRENT_HEADER="sandboxd · installing"
+        ui_render_checklist
+    fi
 
     # Anti-hang design: the FIFO consumer runs in a BACKGROUND subshell.
     # The main process:
@@ -2400,6 +3027,36 @@ run_priv_child() {
 
     # Temp file for the consumer to report step history back to the main process.
     _step_history_file="$TMPDIR_INSTALL/step-history.txt"
+
+    # In rich mode, create a second FIFO so the consumer subshell can send
+    # set_phase commands to the main process. The consumer cannot call set_phase
+    # directly because subshell variable mutations are invisible to the parent.
+    if [ "$RICH_UI" -eq 1 ]; then
+        PHASE_CMD_FIFO="$TMPDIR_INSTALL/phase-cmd.fifo"
+        mkfifo "$PHASE_CMD_FIFO"
+        # Open phase-cmd FIFO O_RDWR as a keepalive (same pattern as progress FIFO).
+        exec 5<> "$PHASE_CMD_FIFO"
+        # Launch the phase-command reader in the background.
+        # It reads SET_PHASE lines and calls set_phase in the main process.
+        (
+            exec 5>&-
+            while IFS= read -r _pcmd; do
+                case "$_pcmd" in
+                    SET_PHASE\ *)
+                        _pc_rest="${_pcmd#SET_PHASE }"
+                        _pc_n="${_pc_rest%% *}"
+                        _pc_st="${_pc_rest#* }"
+                        set_phase "$_pc_n" "$_pc_st"
+                        ui_service_winch
+                        ;;
+                    DONE_PHASES)
+                        break
+                        ;;
+                esac
+            done < "$PHASE_CMD_FIFO"
+        ) &
+        _phase_reader_pid=$!
+    fi
 
     # Open FIFO O_RDWR (non-blocking on FIFOs) as the write-end keepalive.
     exec 4<> "$PRIV_PROGRESS_FIFO"
@@ -2425,92 +3082,27 @@ run_priv_child() {
     #   4. The subshell writes step-history to _step_history_file and exits.
     #   5. The main process reads the step-history file.
     (
-        # Close the inherited write-end of the FIFO immediately. The consumer
-        # only needs the read end. Without this, the consumer itself is a
-        # writer of the FIFO, so FIFO EOF never arrives even after both the
+        # Close the inherited write-end of the progress FIFO immediately. The
+        # consumer only needs the read end. Without this, the consumer itself is
+        # a writer of the FIFO, so FIFO EOF never arrives even after both the
         # child (fd 3) and the parent (fd 4) close their write-ends — the
         # consumer's own inherited fd 4 keeps the FIFO "open for writing" and
         # `read` blocks forever. Closing it here means the write-ends are
         # exactly {child fd 3, parent fd 4}; when both close the consumer sees
         # EOF and exits normally on both success and failure paths.
         exec 4>&-
-
-        # Local checklist state (subshell-private).
-        _cl_labels=""
-        _cl_states=""
-        _cl_rows=0
-
-        _cl_add_row() {
-            _car_lbl="$1"
-            if [ -z "$_cl_labels" ]; then
-                _cl_labels="$_car_lbl"
-                _cl_states="pending"
-            else
-                _cl_labels="${_cl_labels}
-${_car_lbl}"
-                _cl_states="${_cl_states}
-pending"
-            fi
-            _cl_rows=$((_cl_rows + 1))
-        }
-
-        _cl_set_state() {
-            _css_idx="$1"
-            _css_new="$2"
-            _css_new_states=""
-            _css_i=1
-            while IFS= read -r _css_row; do
-                [ -z "$_css_row" ] && continue
-                if [ "$_css_i" -eq "$_css_idx" ]; then
-                    _css_new_states="${_css_new_states}${_css_new}"
-                else
-                    _css_new_states="${_css_new_states}${_css_row}"
-                fi
-                _css_new_states="${_css_new_states}
-"
-                _css_i=$((_css_i + 1))
-            done <<_CL_EOF
-$_cl_states
-_CL_EOF
-            _cl_states="${_css_new_states%
-}"
-        }
-
-        _cl_get_state() {
-            _cgs_idx="$1"
-            _cgs_i=1
-            while IFS= read -r _cgs_row; do
-                [ -z "$_cgs_row" ] && continue
-                if [ "$_cgs_i" -eq "$_cgs_idx" ]; then
-                    printf '%s' "$_cgs_row"
-                    return 0
-                fi
-                _cgs_i=$((_cgs_i + 1))
-            done <<_CGS_EOF
-$_cl_states
-_CGS_EOF
-        }
-
-        _cl_redraw() {
-            [ "$RICH_UI" -ne 1 ] && return 0
-            [ "$_cl_rows" -eq 0 ] && return 0
-            printf '\033[%sA' "$_cl_rows"
-            _crd_i=1
-            while IFS= read -r _crd_lbl; do
-                [ -z "$_crd_lbl" ] && continue
-                _crd_state=$(_cl_get_state "$_crd_i")
-                case "$_crd_state" in
-                    ok)      _crd_icon="${GREEN}+${RESET}" ;;
-                    fail)    _crd_icon="${RED}x${RESET}" ;;
-                    active)  _crd_icon="${BLUE}>${RESET}" ;;
-                    *)       _crd_icon="-" ;;
-                esac
-                printf '\r\033[K  %b %s\n' "$_crd_icon" "$_crd_lbl"
-                _crd_i=$((_crd_i + 1))
-            done <<_CL_LBL
-$_cl_labels
-_CL_LBL
-        }
+        # Close the inherited read/write-end of the phase-cmd FIFO (rich mode
+        # only). We open a dedicated write-only fd 6 below instead of reusing
+        # fd 5; keeping fd 5 open here would make the consumer an extra reader
+        # as well as writer, potentially preventing the phase-reader from seeing
+        # EOF after DONE_PHASES.
+        exec 5>&- 2>/dev/null || true
+        # Open a persistent write fd 6 for phase commands (rich mode only).
+        # A single persistent open avoids repeated O_WRONLY open/close calls
+        # that can block briefly on a FIFO when the reader is between reads.
+        if [ "$RICH_UI" -eq 1 ]; then
+            exec 6>"$PHASE_CMD_FIFO" 2>/dev/null || true
+        fi
 
         # Local step-history state (written to file at end).
         _sh_steps_done=""
@@ -2528,15 +3120,10 @@ _CL_LBL
                     ;;
                 STEP\ *\ begin\ *)
                     _current_label="${_prog_line#STEP * begin }"
+                    _sb_n="${_prog_line#STEP }"
+                    _sb_n="${_sb_n%% *}"
                     if [ "$RICH_UI" -eq 1 ]; then
-                        _sb_n="${_prog_line#STEP }"
-                        _sb_n="${_sb_n%% *}"
-                        if [ "$_cl_rows" -lt "$_sb_n" ]; then
-                            _cl_add_row "$_current_label"
-                            printf '  - %s\n' "$_current_label"
-                        fi
-                        _cl_set_state "$_sb_n" "active"
-                        _cl_redraw
+                        printf 'SET_PHASE %s active\n' "$_sb_n" >&6 || true
                     else
                         emit "  ${BLUE}...${RESET} $_current_label"
                     fi
@@ -2552,8 +3139,7 @@ _CL_LBL
 ${_ok_label}"
                     fi
                     if [ "$RICH_UI" -eq 1 ]; then
-                        _cl_set_state "$_ok_n" "ok"
-                        _cl_redraw
+                        printf 'SET_PHASE %s done\n' "$_ok_n" >&6 || true
                     else
                         emit "  ${GREEN}+${RESET} $_ok_label"
                     fi
@@ -2566,8 +3152,7 @@ ${_ok_label}"
                     _sh_failed_step="$_fail_label"
                     _sh_failed_step_n="$_fail_n"
                     if [ "$RICH_UI" -eq 1 ]; then
-                        _cl_set_state "$_fail_n" "fail"
-                        _cl_redraw
+                        printf 'SET_PHASE %s failed\n' "$_fail_n" >&6 || true
                     else
                         emit "  ${RED}x${RESET} $_fail_label"
                     fi
@@ -2576,6 +3161,13 @@ ${_ok_label}"
                     ;;
             esac
         done < "$PRIV_PROGRESS_FIFO"
+
+        # Signal the phase-command reader that no more commands are coming,
+        # then close the persistent write fd so the reader sees EOF cleanly.
+        if [ "$RICH_UI" -eq 1 ]; then
+            printf 'DONE_PHASES\n' >&6 || true
+            exec 6>&-
+        fi
 
         # Write step-history to the temp file for the main process to read.
         # Format: tab-separated fields, one line each.
@@ -2600,6 +3192,13 @@ ${_ok_label}"
     # Wait for the consumer subshell to finish writing the history file.
     wait "$_consumer_pid" || true
 
+    # In rich mode, close the phase-cmd FIFO keepalive and wait for the reader.
+    if [ "$RICH_UI" -eq 1 ]; then
+        exec 5>&-
+        wait "$_phase_reader_pid" || true
+        ui_animator_stop
+    fi
+
     # Read step-history back from the temp file.
     if [ -r "$_step_history_file" ]; then
         while IFS="	" read -r _sh_key _sh_val; do
@@ -2622,11 +3221,10 @@ ${_ok_label}"
             STATE_PATH="$BASE_DIR/.install-state.json"
         fi
         # In rich mode, capture the failure report to SUMMARY_FILE so it is
-        # printed to real stdout after rmcup restores the primary screen.
+        # printed to real stdout after the EXIT trap restores the primary screen.
         if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
             _print_failure_report "$_failed_step" "$_failed_step_n" \
                 "$_total_steps" "$_steps_done" > "$SUMMARY_FILE"
-            ui_leave_alt_screen "$SUMMARY_FILE"
         else
             _print_failure_report "$_failed_step" "$_failed_step_n" \
                 "$_total_steps" "$_steps_done"
@@ -2646,38 +3244,70 @@ ${_ok_label}"
 
 # _print_failure_report — print the structured failure report to stdout.
 # Args: $1=failed_step_label, $2=failed_step_n, $3=total_steps, $4=done_list
+#
+# In rich mode the phase model (UI_PHASE_NAMES / UI_PHASE_STATUSES) is live,
+# so the report reproduces the checklist shape: completed phases with ✔,
+# failed phase with ✗.  In plain mode the legacy step-list format is used.
 _print_failure_report() {
     _fr_step="${1:-unknown}"
     _fr_n="${2:-?}"
     _fr_total="${3:-?}"
     _fr_done="${4:-}"
 
-    emit ""
-    emit "${RED}x${RESET} Install failed at step ${_fr_n} of ${_fr_total}: ${_fr_step}"
-    emit ""
-
-    if [ -n "$_fr_done" ]; then
-        emit "  Steps applied (left in place — a re-run will skip them):"
-        printf '%s\n' "$_fr_done" | while IFS= read -r _s; do
-            [ -n "$_s" ] && emit "    ${GREEN}+${RESET} $_s"
+    if [ "$RICH_UI" -eq 1 ] && [ "$UI_PHASE_COUNT" -gt 0 ]; then
+        # Checklist-shaped report from live phase model.
+        _pfr_i=1
+        printf '%s\n' "$UI_PHASE_STATUSES" | while IFS= read -r _pfr_st; do
+            [ -z "$_pfr_st" ] && continue
+            _pfr_name=$(printf '%s\n' "$UI_PHASE_NAMES" \
+                | awk -v n="$_pfr_i" 'NR==n{print; exit}')
+            case "$_pfr_st" in
+                done)   printf '%b\n' "  ${GREEN}✔${RESET} ${_pfr_name}" ;;
+                failed) printf '%b\n' "  ${RED}✗${RESET} ${_pfr_name}" ;;
+                active) printf '%b\n' "  ${RED}✗${RESET} ${_pfr_name}" ;;
+            esac
+            _pfr_i=$((_pfr_i + 1))
         done
+        printf '\n'
+        printf '%b\n' "${RED}✗${RESET} Install failed: ${_fr_step}"
+        printf '\n'
+        printf '%b\n' "  Recovery: fix the root cause, then re-run install.sh."
+        printf '%b\n' "  The planning pass will re-detect completed work and skip it."
+        printf '\n'
+        if [ -n "$STATE_PATH" ] && [ -r "$STATE_PATH" ]; then
+            printf '%b\n' "  Partial install state: ${STATE_PATH}"
+            printf '%b\n' "    (status=failed; we_* flags reflect what was applied)"
+        fi
+        printf '%b\n' "  Install log: ${INSTALL_LOG}"
+        printf '\n'
     else
-        emit "  No steps were applied before the failure."
-    fi
-    emit ""
-    emit "  Step that failed: ${RED}${_fr_step}${RESET}"
-    emit ""
-    emit "  Recovery: fix the root cause, then re-run install.sh with the"
-    emit "  same arguments. The planning pass will re-detect completed work"
-    emit "  and skip it — only the failed and subsequent steps will run."
-    emit ""
+        emit ""
+        emit "${RED}x${RESET} Install failed at step ${_fr_n} of ${_fr_total}: ${_fr_step}"
+        emit ""
 
-    if [ -n "$STATE_PATH" ] && [ -r "$STATE_PATH" ]; then
-        emit "  Partial install state: $STATE_PATH"
-        emit "    (status=failed; we_* flags reflect what was applied)"
+        if [ -n "$_fr_done" ]; then
+            emit "  Steps applied (left in place — a re-run will skip them):"
+            printf '%s\n' "$_fr_done" | while IFS= read -r _s; do
+                [ -n "$_s" ] && emit "    ${GREEN}+${RESET} $_s"
+            done
+        else
+            emit "  No steps were applied before the failure."
+        fi
+        emit ""
+        emit "  Step that failed: ${RED}${_fr_step}${RESET}"
+        emit ""
+        emit "  Recovery: fix the root cause, then re-run install.sh with the"
+        emit "  same arguments. The planning pass will re-detect completed work"
+        emit "  and skip it — only the failed and subsequent steps will run."
+        emit ""
+
+        if [ -n "$STATE_PATH" ] && [ -r "$STATE_PATH" ]; then
+            emit "  Partial install state: $STATE_PATH"
+            emit "    (status=failed; we_* flags reflect what was applied)"
+        fi
+        emit "  Install log:           $INSTALL_LOG"
+        emit ""
     fi
-    emit "  Install log:           $INSTALL_LOG"
-    emit ""
 }
 
 # ----------------------------------------------------------------------------
@@ -2721,17 +3351,59 @@ main() {
     SUMMARY_FILE=$(mktemp "/var/tmp/sandbox-install-summary.XXXXXX")
     trap cleanup_tmpdir EXIT INT TERM HUP
 
+    # Enter alt-screen as early as possible — trap is now in place so the EXIT
+    # handler will restore the primary screen on any exit path (rich mode only;
+    # no-op in plain).
+    ui_enter_alt_screen
+
     ensure_install_log
 
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_init_phases "$UI_ACQUIRE_PHASES"
+        UI_CURRENT_HEADER="sandboxd · acquiring"
+        ui_render_checklist
+    fi
+
+    set_phase 1 "active" "resolving version"
     resolve_target_version
     detect_preexisting
-    check_prereqs
-    check_disk
+    set_phase 1 "done"
+    ui_service_winch
 
+    set_phase 2 "active" "checking prerequisites"
+    check_prereqs
+    set_phase 2 "done"
+    ui_service_winch
+
+    set_phase 3 "active" "checking disk space"
+    check_disk
+    set_phase 3 "done"
+    ui_service_winch
+
+    set_phase 4 "active" "bootstrapping cosign"
     cosign_bootstrap
+    set_phase 4 "done"
+    ui_service_winch
+
+    set_phase 5 "active" "fetching tarball"
     tarball_fetch
+    set_phase 5 "done"
+    ui_service_winch
+
+    set_phase 6 "active" "verifying signature"
     sigstore_verify
+    set_phase 6 "done"
+    ui_service_winch
+
+    set_phase 7 "active" "extracting tarball"
     extract_tarball
+    set_phase 7 "done"
+    ui_service_winch
+
+    # Stop the animator after the last acquire phase.
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_animator_stop
+    fi
 
     # Detect operator identity (unprivileged parent).
     detect_operator
@@ -2739,14 +3411,12 @@ main() {
     # Planning pass: compute the minimal action list.
     compute_plan
 
-    # Enter alt-screen before rendering the plan (rich mode only; no-op in plain).
-    ui_enter_alt_screen
-
-    # Render the plan for the operator to review.
-    render_plan
-
     # Confirmation gate: operator must explicitly approve (or pass --yes).
-    # Reads from /dev/tty so it works even inside the alt-screen.
+    # In rich mode confirm_plan renders the plan inside a pager.
+    # In plain mode render_plan prints to stdout, then confirm_plan prompts.
+    if [ "$RICH_UI" -ne 1 ]; then
+        render_plan
+    fi
     confirm_plan
 
     # Build the privileged child script.
@@ -2756,9 +3426,10 @@ main() {
     run_priv_child
 
     # Capture the durable summary so it persists in scrollback after rmcup.
+    # The EXIT trap (cleanup_tmpdir) will restore the primary screen and then
+    # cat SUMMARY_FILE to stdout. In plain mode, print directly to stdout.
     if [ "$RICH_UI" -eq 1 ]; then
         print_next_steps > "$SUMMARY_FILE"
-        ui_leave_alt_screen "$SUMMARY_FILE"
     else
         print_next_steps
     fi
