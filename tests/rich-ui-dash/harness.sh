@@ -424,6 +424,29 @@ ui_animator_stop
 [ "$UI_ANIM_PID" -eq 0 ] || { printf "PID not zero\n" >&2; exit 1; }
 '
 
+_run_scenario "animator: _ui_animator_body emits a complete UTF-8 glyph (not a partial byte)" '
+# Run _ui_animator_body for a short burst (0.3 s covers at least one 0.25 s tick)
+# then kill it and inspect what it wrote to the TTY.
+_ab_tty="$UI_TTY"
+_ui_animator_body "test task" &
+_ab_pid=$!
+sleep 0.3
+kill "$_ab_pid" 2>/dev/null || true
+wait "$_ab_pid" 2>/dev/null || true
+_ab_out=$(cat "$_ab_tty")
+# The output must contain at least one complete spinner glyph.
+# A partial-byte extraction (the prior cut -c bug) would produce 0xe2 or similar
+# and would NOT match any of these full 3-byte UTF-8 characters.
+_ab_found=0
+for _g in "▌" "▀" "▐" "▄"; do
+    case "$_ab_out" in
+        *"$_g"*) _ab_found=1; break ;;
+    esac
+done
+[ "$_ab_found" -eq 1 ] \
+    || { printf "_ui_animator_body output contains no complete spinner glyph (possible partial-byte bug)\n" >&2; exit 1; }
+'
+
 # ---------------------------------------------------------------------------
 # ui_service_winch
 # ---------------------------------------------------------------------------
@@ -747,7 +770,7 @@ done
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
-_run_bar_scenario "download_with_bar: progress line begins with 2-space indent before title" '
+_run_bar_scenario "download_with_bar: progress line prefix matches animator indent (  ▌  before title)" '
 _fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_ind_$$"
 dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
 _stub_dir="${_H_TMPDIR:-/tmp}/stub_ind_$$"
@@ -777,17 +800,18 @@ export PATH="$_stub_dir:$PATH"
 DOWNLOAD_BAR_FAILED=0
 UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
-# The rendered line must contain "  fetching tarball" (2-space indent + title),
-# matching the animator detail line indent so the title stays at column 3.
+# The rendered line must contain "  ▌ fetching tarball" — the same prefix shape
+# as the animator detail line ("  ▌ text") so the title stays at column 5 and
+# does not jump horizontally when the bar replaces the spinner.
 _tty_out=$(cat "$UI_TTY")
 case "$_tty_out" in
-    *"  fetching tarball"*) : ;;
-    *) printf "progress line missing 2-space indent before title\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
+    *"  ▌ fetching tarball"*) : ;;
+    *) printf "progress line missing prefix \"  ▌ \" before title\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
 esac
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
-_run_bar_scenario "download_with_bar: rich mode must NOT write spinner glyphs to TTY" '
+_run_bar_scenario "download_with_bar: animator is stopped — animated-only glyphs must not appear" '
 _fake_dest="${_H_TMPDIR:-/tmp}/fake_dest2_$$"
 dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
 _stub_dir="${_H_TMPDIR:-/tmp}/stub2_$$"
@@ -815,19 +839,27 @@ chmod +x "$_stub_dir/curl"
 export FAKE_DEST="$_fake_dest"
 export PATH="$_stub_dir:$PATH"
 DOWNLOAD_BAR_FAILED=0
+UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
 _tty_out=$(cat "$UI_TTY")
-# Animator spinner glyphs must not appear — the animator is stopped before
-# the poll loop so the detail line is owned solely by the progress bar.
-for _glyph in "▌" "▀" "▐" "▄"; do
+# The download bar uses a static "▌" as its prefix glyph (matching the animator
+# indent), so "▌" is expected and correct.  The glyphs "▀", "▐", "▄" only appear
+# when the animator loop is running — the animator must be stopped before the
+# poll loop, so these three must not appear in the output.
+for _glyph in "▀" "▐" "▄"; do
     case "$_tty_out" in
         *"$_glyph"*)
-            printf "spinner glyph %s found in TTY output\n" "$_glyph" >&2
+            printf "animated-only glyph %s found — animator must be stopped during download\n" "$_glyph" >&2
             rm -rf "$_stub_dir" "$_fake_dest"
             exit 1 ;;
         *) : ;;
     esac
 done
+# Static "▌" prefix must be present in the download bar output.
+case "$_tty_out" in
+    *"▌"*) : ;;
+    *) printf "static ▌ prefix missing from download bar output\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
+esac
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 

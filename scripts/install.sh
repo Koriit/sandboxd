@@ -771,12 +771,20 @@ _ui_animator_body() {
     _ab_text="$1"
     _ab_tty="$UI_TTY"
     [ -n "$_ab_tty" ] || exit 0
-    _ab_frames='▌▀▐▄'
     _ab_t=0
     while true; do
         _ab_cols=$(tput cols 2>/dev/null || printf '80')
         _ab_idx=$((_ab_t % 4))
-        _ab_frame=$(printf '%s' "$_ab_frames" | cut -c$((_ab_idx + 1)))
+        # cut -c is byte-based for multi-byte UTF-8 glyphs in this environment,
+        # so indexing into the frames string with it yields a broken partial byte.
+        # A case statement is locale/cut-independent and always emits a full glyph.
+        case "$_ab_idx" in
+            0) _ab_frame='▌' ;;
+            1) _ab_frame='▀' ;;
+            2) _ab_frame='▐' ;;
+            3) _ab_frame='▄' ;;
+            *) _ab_frame='▌' ;;
+        esac
         _ab_detail="  $_ab_frame $_ab_text"
         _ab_clamped=$(printf '%s' "$_ab_detail" | cut -c1-"$_ab_cols")
         # Move to start of line, clear it, print the detail.
@@ -1559,9 +1567,10 @@ download_with_bar() {
         # With title prefix: title_len + 2 (sep) + 20 = title_len + 22 fixed, plus bar_cells.
         _dwb_bar_cells=24
         _dwb_cols="${UI_COLS:-80}"
-        # Fixed chars when speed is included: "  " + title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
-        # Leading "  " = 2, "  [" = 3, "] " = 2, "100%" = 4, " " = 1, "99.9/99.9 MB" = 12, "  9999 KB/s" = 11 → 35 fixed + title_len + 2
-        _dwb_fixed_with_speed=$(( _dwb_title_len + 2 + 2 + 3 + 2 + 4 + 1 + 12 + 11 ))
+        # Fixed cols when speed is included: "  ▌ " + title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
+        # "  ▌ " = 4 display cols (2 spaces + 1-col glyph + 1 space), "  [" = 3, "] " = 2,
+        # "100%" = 4, " " = 1, "99.9/99.9 MB" = 12, "  9999 KB/s" = 11 → 37 fixed + title_len + 2
+        _dwb_fixed_with_speed=$(( _dwb_title_len + 2 + 4 + 3 + 2 + 4 + 1 + 12 + 11 ))
         # Fixed chars without speed: drop "  9999 KB/s" (11 chars).
         _dwb_fixed_no_speed=$(( _dwb_fixed_with_speed - 11 ))
         _dwb_avail=$(( _dwb_cols - _dwb_fixed_with_speed ))
@@ -1605,17 +1614,17 @@ download_with_bar() {
                 _dwb_filled=$((_dwb_done_kb * _dwb_bar_cells / _dwb_total_kb))
                 _dwb_bar=$(_bar_style_c "$_dwb_filled" "$_dwb_bar_cells")
             fi
-            # Write the full progress line: "  <title>  [bar] pct% done/total MB  speed KB/s"
-            # The leading 2 spaces match the indent of the animator detail line
-            # ("  ▌ fetching tarball") so the title stays at the same column when
-            # the bar replaces the spinner — no horizontal jump.
+            # Write the full progress line: "  ▌ <title>  [bar] pct% done/total MB  speed KB/s"
+            # The prefix "  ▌ " mirrors the animator's "  ▌ " exactly (2-space indent,
+            # static block glyph, space) so the title lands at the same column as the
+            # spinner detail line — no horizontal jump on the spinner→bar transition.
             if [ "$_dwb_show_speed" -eq 1 ]; then
-                printf '\r\033[K  %s  [%s] %3s%% %s/%s MB  %s KB/s' \
+                printf '\r\033[K  ▌ %s  [%s] %3s%% %s/%s MB  %s KB/s' \
                     "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
                     >>"$UI_TTY"
             else
-                printf '\r\033[K  %s  [%s] %3s%% %s/%s MB' \
+                printf '\r\033[K  ▌ %s  [%s] %3s%% %s/%s MB' \
                     "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" \
                     >>"$UI_TTY"
