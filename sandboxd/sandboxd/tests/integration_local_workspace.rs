@@ -766,7 +766,7 @@ async fn http_post_json(
 ///
 /// The request never reaches a backend boot — the gate fires
 /// immediately after the gateway-image pre-flight (which we pass
-/// trivially via the production `sandbox-gateway:0.1.0` tag the host
+/// trivially via the production `sandbox-gateway:0.1.2` tag the host
 /// already has loaded).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_create_session_rejects_no_gitignore_with_non_local_workspace() {
