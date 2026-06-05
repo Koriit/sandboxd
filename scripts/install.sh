@@ -686,9 +686,9 @@ _ui_render_checklist_body() {
         if [ "$_rcb_row" -ge "$_rcb_start" ] && [ "$_rcb_row" -le "$_rcb_end" ]; then
             _rcb_status=$(ui_phase_status "$_rcb_row")
             case "$_rcb_status" in
-                active)  _rcb_glyph="▸" ;;
-                done)    _rcb_glyph="✔" ;;
-                failed)  _rcb_glyph="✗" ;;
+                active)  _rcb_glyph="${YELLOW:-}▸${RESET:-}" ;;
+                done)    _rcb_glyph="${GREEN:-}✔${RESET:-}" ;;
+                failed)  _rcb_glyph="${RED:-}✗${RESET:-}" ;;
                 *)       _rcb_glyph="·" ;;
             esac
             _rcb_line="  $_rcb_glyph $_rcb_name"
@@ -716,25 +716,40 @@ ui_render_checklist() {
         UI_ANIM_PID=0
     fi
 
-    # Cursor-home + clear to end of screen.
-    tput home >"$UI_TTY" 2>/dev/null || true
-    tput ed   >"$UI_TTY" 2>/dev/null || true
-
-    # Header (2 rows: text + rule).
-    ui_render_header "${UI_CURRENT_HEADER}"
-
     # How many rows remain for the checklist + detail?
     # Layout: 2 header rows + N phase rows + 1 rule + 1 detail.
     # Minimum 1 content row; detail line always at the bottom.
     _urc_available=$(( UI_ROWS - 2 - 1 - 1 ))
     if [ "$_urc_available" -lt 1 ]; then _urc_available=1; fi
 
-    # Render visible phase rows.
+    # Buffer the entire repaint into a temp file then flush it to the TTY in a
+    # single cat.  One atomic write renders as a single frame on the terminal,
+    # eliminating the blank flash that a bare home+clear followed by incremental
+    # redraws produces.
+    _urc_real_tty="$UI_TTY"
+    _urc_frame=$(mktemp)
+
+    # Point UI_TTY at the frame buffer so all sub-function writes go there.
+    UI_TTY="$_urc_frame"
+
+    # Cursor-home + clear to end of screen into the frame buffer.
+    tput home >>"$_urc_frame" 2>/dev/null || true
+    tput ed   >>"$_urc_frame" 2>/dev/null || true
+
+    # Header (2 rows: text + rule) into the frame buffer.
+    ui_render_header "${UI_CURRENT_HEADER}"
+
+    # Render visible phase rows into the frame buffer.
     _ui_render_checklist_body "$_urc_available"
 
-    # Bottom rule line.
+    # Bottom rule line into the frame buffer.
     _urc_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' | cut -c1-"${UI_COLS:-80}")
-    printf '%s\r\n' "$_urc_rule" >"$UI_TTY"
+    printf '%s\r\n' "$_urc_rule" >>"$_urc_frame"
+
+    # Restore real TTY, then flush the entire frame in a single atomic write.
+    UI_TTY="$_urc_real_tty"
+    cat "$_urc_frame" >"$UI_TTY" 2>/dev/null || true
+    rm -f "$_urc_frame"
     # Cursor is now on the detail line; the animator will own it.
 
     WINCH_PENDING=0
@@ -1536,7 +1551,22 @@ download_with_bar() {
     curl -fsSL --retry 3 --retry-delay 2 -o "$_dwb_dest" "$_dwb_url" 2>/dev/null &
     _dwb_curl_pid=$!
 
-    if [ "$RICH_UI" -eq 0 ] && [ "$_dwb_total_kb" -gt 0 ]; then
+    if [ "$RICH_UI" -eq 1 ] && [ "$_dwb_total_kb" -gt 0 ]; then
+        # Rich mode with known size: update the detail-line label with live
+        # transfer progress while curl runs in the background.
+        while kill -0 "$_dwb_curl_pid" 2>/dev/null; do
+            _dwb_done_kb=0
+            if [ -f "$_dwb_dest" ]; then
+                _dwb_done_kb=$(du -k "$_dwb_dest" 2>/dev/null | awk '{print $1}')
+                _dwb_done_kb="${_dwb_done_kb:-0}"
+            fi
+            _dwb_done_mb=$(_kb_to_mb_1dp "$_dwb_done_kb")
+            _dwb_total_mb=$(_kb_to_mb_1dp "$_dwb_total_kb")
+            ui_animator_start "${_dwb_done_mb}/${_dwb_total_mb} MB"
+            sleep 1
+        done
+        wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
+    elif [ "$RICH_UI" -eq 0 ] && [ "$_dwb_total_kb" -gt 0 ]; then
         # Plain mode with known size: emit periodic log lines (~10% increments).
         _dwb_last_pct_reported=-10
         while kill -0 "$_dwb_curl_pid" 2>/dev/null; do
@@ -1559,16 +1589,13 @@ download_with_bar() {
             fi
             sleep 1
         done
+        wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
     else
-        # Rich mode or no size info: just wait for curl.  The detail-line
-        # animator already provides visual feedback in rich mode.
+        # No size info available: just wait for curl.  The detail-line animator
+        # already provides visual feedback in rich mode via the active phase label.
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
         return 0
     fi
-
-    # For the plain-bar branch the poll loop exits when the process dies;
-    # capture the final exit code here.
-    wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
 }
 
 # ----------------------------------------------------------------------------
