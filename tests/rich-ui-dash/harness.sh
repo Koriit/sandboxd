@@ -747,6 +747,46 @@ done
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
+_run_bar_scenario "download_with_bar: progress line begins with 2-space indent before title" '
+_fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_ind_$$"
+dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
+_stub_dir="${_H_TMPDIR:-/tmp}/stub_ind_$$"
+mkdir -p "$_stub_dir"
+cat >"$_stub_dir/curl" <<'"'"'STUB'"'"'
+#!/bin/sh
+_is_head=0
+_out_file=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) _is_head=1; shift ;;
+        -o) shift; _out_file="$1"; shift ;;
+        *)  shift ;;
+    esac
+done
+if [ "$_is_head" -eq 1 ]; then
+    _sz=$(wc -c <"$FAKE_DEST" 2>/dev/null | tr -d ' ')
+    printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n' "${_sz:-524288}"
+else
+    sleep 2
+    cp "$FAKE_DEST" "$_out_file"
+fi
+STUB
+chmod +x "$_stub_dir/curl"
+export FAKE_DEST="$_fake_dest"
+export PATH="$_stub_dir:$PATH"
+DOWNLOAD_BAR_FAILED=0
+UI_DETAIL_TEXT="fetching tarball"
+download_with_bar "http://example.com/fake" "$_fake_dest"
+# The rendered line must contain "  fetching tarball" (2-space indent + title),
+# matching the animator detail line indent so the title stays at column 3.
+_tty_out=$(cat "$UI_TTY")
+case "$_tty_out" in
+    *"  fetching tarball"*) : ;;
+    *) printf "progress line missing 2-space indent before title\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
+esac
+rm -rf "$_stub_dir" "$_fake_dest"
+'
+
 _run_bar_scenario "download_with_bar: rich mode must NOT write spinner glyphs to TTY" '
 _fake_dest="${_H_TMPDIR:-/tmp}/fake_dest2_$$"
 dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null

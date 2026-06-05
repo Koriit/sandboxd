@@ -1559,9 +1559,9 @@ download_with_bar() {
         # With title prefix: title_len + 2 (sep) + 20 = title_len + 22 fixed, plus bar_cells.
         _dwb_bar_cells=24
         _dwb_cols="${UI_COLS:-80}"
-        # Fixed chars when speed is included: title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
-        # "  [" = 3, "] " = 2, "100%" = 4, " " = 1, "99.9/99.9 MB" = 12, "  9999 KB/s" = 11 → 33 fixed + title_len + 2
-        _dwb_fixed_with_speed=$(( _dwb_title_len + 2 + 3 + 2 + 4 + 1 + 12 + 11 ))
+        # Fixed chars when speed is included: "  " + title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
+        # Leading "  " = 2, "  [" = 3, "] " = 2, "100%" = 4, " " = 1, "99.9/99.9 MB" = 12, "  9999 KB/s" = 11 → 35 fixed + title_len + 2
+        _dwb_fixed_with_speed=$(( _dwb_title_len + 2 + 2 + 3 + 2 + 4 + 1 + 12 + 11 ))
         # Fixed chars without speed: drop "  9999 KB/s" (11 chars).
         _dwb_fixed_no_speed=$(( _dwb_fixed_with_speed - 11 ))
         _dwb_avail=$(( _dwb_cols - _dwb_fixed_with_speed ))
@@ -1605,14 +1605,17 @@ download_with_bar() {
                 _dwb_filled=$((_dwb_done_kb * _dwb_bar_cells / _dwb_total_kb))
                 _dwb_bar=$(_bar_style_c "$_dwb_filled" "$_dwb_bar_cells")
             fi
-            # Write the full progress line: "<title>  [bar] pct% done/total MB  speed KB/s"
+            # Write the full progress line: "  <title>  [bar] pct% done/total MB  speed KB/s"
+            # The leading 2 spaces match the indent of the animator detail line
+            # ("  ▌ fetching tarball") so the title stays at the same column when
+            # the bar replaces the spinner — no horizontal jump.
             if [ "$_dwb_show_speed" -eq 1 ]; then
-                printf '\r\033[K%s  [%s] %3s%% %s/%s MB  %s KB/s' \
+                printf '\r\033[K  %s  [%s] %3s%% %s/%s MB  %s KB/s' \
                     "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
                     >>"$UI_TTY"
             else
-                printf '\r\033[K%s  [%s] %3s%% %s/%s MB' \
+                printf '\r\033[K  %s  [%s] %3s%% %s/%s MB' \
                     "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" \
                     >>"$UI_TTY"
