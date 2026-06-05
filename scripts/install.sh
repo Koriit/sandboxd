@@ -628,7 +628,7 @@ _ui_render_checklist_body() {
     # Find the 1-based index of the first "active" phase using awk (avoids
     # subshell variable-mutation issues with pipelines).
     _rcb_active_idx=$(printf '%s\n' "$UI_PHASE_STATUSES" \
-        | awk '/^active$/{print NR; exit} END{if(!found) print 0}')
+        | awk '/^active$/{print NR; found=1; exit} END{if(!found) print 0}')
     # If no active phase found, default to the last phase.
     if [ "$_rcb_active_idx" -eq 0 ]; then
         _rcb_active_idx="$_rcb_total"
@@ -848,17 +848,8 @@ set_phase() {
 # ui_find_phase — find the index of a phase by name (exact match).
 # Prints the index (1-based) to stdout, or 0 if not found.
 ui_find_phase() {
-    _ufp_name="$1"
-    _ufp_i=1
-    printf '%s\n' "$UI_PHASE_NAMES" | while IFS= read -r _ufp_row; do
-        [ -z "$_ufp_row" ] && continue
-        if [ "$_ufp_row" = "$_ufp_name" ]; then
-            printf '%s' "$_ufp_i"
-            return 0
-        fi
-        _ufp_i=$((_ufp_i + 1))
-    done
-    printf '0'
+    printf '%s\n' "$UI_PHASE_NAMES" \
+        | awk -v name="$1" '$0==name{print NR; found=1; exit} END{if(!found) print 0}'
 }
 
 # _ui_winch_trap — signal handler for SIGWINCH.
