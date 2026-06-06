@@ -779,19 +779,19 @@ ui_render_checklist() {
     fi
 }
 
-# _ui_spinner_frame INDEX — emit the braille spinner glyph for INDEX % 4.
+# _ui_spinner_frame INDEX — emit the circle-arc spinner glyph for INDEX % 4.
 # Uses a case statement (not cut -c) so each 3-byte UTF-8 glyph is always
-# emitted whole, regardless of locale or shell. A single dot orbits the four
-# corners of the 2x3 braille cell — top-left (dot 1), top-right (dot 4),
-# bottom-right (dot 6), bottom-left (dot 3) — clockwise. Every frame is one
-# dot, so the rotation is perfectly uniform: ⠁ ⠈ ⠠ ⠄.
+# emitted whole, regardless of locale or shell. The four quadrant-arc glyphs
+# trace a clockwise orbit: upper-left (◜) → upper-right (◝) → lower-right
+# (◞) → lower-left (◟), giving a smooth single-stroke rotation at every
+# frame rate.
 _ui_spinner_frame() {
     case "$(($1 % 4))" in
-        0) printf '⠁' ;;
-        1) printf '⠈' ;;
-        2) printf '⠠' ;;
-        3) printf '⠄' ;;
-        *) printf '⠁' ;;
+        0) printf '◜' ;;   # U+25DC upper-left quadrant arc
+        1) printf '◝' ;;   # U+25DD upper-right quadrant arc
+        2) printf '◞' ;;   # U+25DE lower-right quadrant arc
+        3) printf '◟' ;;   # U+25DF lower-left quadrant arc
+        *) printf '◜' ;;
     esac
 }
 
