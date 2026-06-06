@@ -211,30 +211,36 @@ def test_upgrade_caps_survive_reinstall(
     )
 
     # The installed binaries must genuinely carry the capability sets.
+    # Normalize '+' to '=' before matching: older libcap versions print
+    # "cap_setuid+ep" while newer ones print "cap_setuid=ep"; install.sh
+    # already normalises via `tr '+' '='` before comparing, so we mirror
+    # that here to avoid spurious failures on hosts with older libcap.
     r_route = vm.shell(f"getcap {_ROUTE_HELPER_PATH}", timeout=10)
     assert r_route.returncode == 0, (
         f"getcap returned non-zero for route-helper: {r_route.stderr!r}"
     )
-    assert r_route.stdout.strip(), (
+    route_caps = r_route.stdout.replace("+", "=")
+    assert route_caps.strip(), (
         f"route-helper has empty caps after reinstall; "
         f"Bug 1 not fixed: {r_route.stdout!r}"
     )
-    assert _ROUTE_HELPER_CAPS in r_route.stdout, (
+    assert _ROUTE_HELPER_CAPS in route_caps, (
         f"route-helper caps mismatch; "
-        f"got {r_route.stdout.strip()!r}, expected to contain {_ROUTE_HELPER_CAPS!r}"
+        f"got {route_caps.strip()!r}, expected to contain {_ROUTE_HELPER_CAPS!r}"
     )
 
     r_lima = vm.shell(f"getcap {_LIMA_HELPER_PATH}", timeout=10)
     assert r_lima.returncode == 0, (
         f"getcap returned non-zero for lima-helper: {r_lima.stderr!r}"
     )
-    assert r_lima.stdout.strip(), (
+    lima_caps = r_lima.stdout.replace("+", "=")
+    assert lima_caps.strip(), (
         f"lima-helper has empty caps after reinstall; "
         f"Bug 1 not fixed: {r_lima.stdout!r}"
     )
-    assert _LIMA_HELPER_CAPS in r_lima.stdout, (
+    assert _LIMA_HELPER_CAPS in lima_caps, (
         f"lima-helper caps mismatch; "
-        f"got {r_lima.stdout.strip()!r}, expected to contain {_LIMA_HELPER_CAPS!r}"
+        f"got {lima_caps.strip()!r}, expected to contain {_LIMA_HELPER_CAPS!r}"
     )
 
 
@@ -323,6 +329,15 @@ def test_upgrade_v0_users_conf_migrated_by_installer(
         f"users.conf content changed between first and second install runs; "
         f"migration is not idempotent.\nAfter first:\n{raw}\nAfter second:\n{raw2}"
     )
+    # The second run's log must not contain a users_conf migrate-fail token —
+    # a no-op idempotent run must not surface a failure path.
+    log2 = vm.shell(
+        "sudo cat /var/log/sandbox-install.log", check=True, timeout=15,
+    ).stdout
+    assert "step=users_conf action=migrate-fail" not in log2, (
+        f"second install run logged a migrate-fail for users_conf; "
+        f"idempotent run must not fail:\n{log2}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +373,15 @@ def test_upgrade_combined_caps_and_migration(
     )
 
     # Bug 1: both helpers must be capped.
+    # Normalize '+' to '=' to handle older libcap output formats.
     r_route = vm.shell(f"getcap {_ROUTE_HELPER_PATH}", timeout=10)
-    assert r_route.stdout.strip() and _ROUTE_HELPER_CAPS in r_route.stdout, (
+    route_caps = r_route.stdout.replace("+", "=")
+    assert route_caps.strip() and _ROUTE_HELPER_CAPS in route_caps, (
         f"route-helper uncapped after combined upgrade: {r_route.stdout!r}"
     )
     r_lima = vm.shell(f"getcap {_LIMA_HELPER_PATH}", timeout=10)
-    assert r_lima.stdout.strip() and _LIMA_HELPER_CAPS in r_lima.stdout, (
+    lima_caps = r_lima.stdout.replace("+", "=")
+    assert lima_caps.strip() and _LIMA_HELPER_CAPS in lima_caps, (
         f"lima-helper uncapped after combined upgrade: {r_lima.stdout!r}"
     )
 

@@ -3197,6 +3197,15 @@ if [ "\$PLAN_USERS_CONF" = "create" ]; then
 else
     _log "step=users_conf action=skip status=ok"
 fi
+# Back up the file before touching it so the operator can revert by hand
+# if a migration ever produces unexpected results. cp -a preserves mode
+# and ownership. Only written when the file exists at backup time (i.e.
+# on upgrade paths, not fresh installs); fails fast if the copy fails.
+if [ -f /etc/sandboxd/users.conf ]; then
+    cp -a /etc/sandboxd/users.conf /etc/sandboxd/users.conf.pre-migrate.bak >> "\$_LOG" 2>&1 \
+        || { _log "step=users_conf action=backup-fail status=fail"; _step_fail; }
+    _log "step=users_conf action=backup status=ok"
+fi
 # Apply config-migration chain via the just-installed binary. Idempotent:
 # newly-created files are already at the latest schema version and the
 # chain returns immediately; pre-existing files (including v0 files
@@ -3204,7 +3213,7 @@ fi
 # root — the binary's root gate is satisfied inside the privileged child.
 /usr/local/bin/sandbox apply-config-migrations >> "\$_LOG" 2>&1 \
     || { _log "step=users_conf action=migrate-fail status=fail"; _step_fail; }
-_log "step=users_conf action=migrate status=ok"
+_log "step=users_conf action=migrate-check status=ok"
 _step_ok
 _write_checkpoint "users-conf"
 _priv_maybe_fail_after "users-conf"
