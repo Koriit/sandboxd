@@ -728,13 +728,28 @@ _ui_render_checklist_body() {
     done
 }
 
+# ui_term_size — query the live terminal dimensions from the controlling terminal.
+# Prints "ROWS COLS" (e.g. "36 120") on success, or nothing on failure.
+# Uses stty size </dev/tty so the TIOCGWINSZ ioctl runs on the real terminal
+# fd rather than a pipe (which is what command substitution creates for tput,
+# causing tput to fall back to the static terminfo default).
+# The subshell wrapper silences the shell's own fd-open error when /dev/tty is
+# unavailable (e.g. in non-interactive or piped invocations), in addition to
+# stty's own stderr. Always exits 0 so callers under set -e are safe.
+ui_term_size() {
+    ( stty size </dev/tty ) 2>/dev/null || true
+}
+
 # ui_render_checklist — full repaint of the header + checklist region.
 # Uses cursor-home + clear-to-end (not full clear) per R6.4.
 # Leaves the cursor on the detail line below the checklist.
 ui_render_checklist() {
     [ "$RICH_UI" -eq 1 ] || return 0
-    UI_ROWS=$(tput lines 2>/dev/null || printf '%s' "${UI_ROWS:-24}")
-    UI_COLS=$(tput cols  2>/dev/null || printf '%s' "${UI_COLS:-80}")
+    _urc_sz=$(ui_term_size)
+    UI_ROWS=${_urc_sz%% *}
+    case "$UI_ROWS" in ''|*[!0-9]*) UI_ROWS=$(tput lines 2>/dev/null || printf '%s' "${UI_ROWS:-24}") ;; esac
+    UI_COLS=${_urc_sz##* }
+    case "$UI_COLS" in ''|*[!0-9]*) UI_COLS=$(tput cols  2>/dev/null || printf '%s' "${UI_COLS:-80}") ;; esac
 
     # Stop the animator before touching the checklist region.
     _urc_anim_was_running=0
@@ -829,14 +844,16 @@ _ui_spinner_frame() {
 # ui_animator_body — the animator loop. Run as a background process.
 # Args: $1=detail_text $2=detail_row (1-based row number on screen)
 # The process writes only to UI_TTY and only to the detail line.
-# It re-queries tput cols each tick for resize handling.
+# It re-queries the terminal width each tick for resize handling.
 _ui_animator_body() {
     _ab_text="$1"
     _ab_tty="$UI_TTY"
     [ -n "$_ab_tty" ] || exit 0
     _ab_t=0
     while true; do
-        _ab_cols=$(tput cols 2>/dev/null || printf '80')
+        _ab_sz=$(ui_term_size)
+        _ab_cols=${_ab_sz##* }
+        case "$_ab_cols" in ''|*[!0-9]*) _ab_cols=$(tput cols 2>/dev/null || printf '80') ;; esac
         _ab_frame="${BLUE:-}$(_ui_spinner_frame "$_ab_t")${RESET:-}"
         _ab_detail="  $_ab_frame $_ab_text"
         # Use awk for column-aware truncation: cut -c counts bytes, which splits
@@ -1086,6 +1103,12 @@ detect_tty() {
     # smcup/rmcup to confirm terminfo is functional; if tput itself is missing
     # or the terminal type has no smcup capability the probe exits non-zero and
     # we fall back to plain mode.
+    #
+    # Query the live terminal height before the gate so the height check uses
+    # the real window size rather than the static terminfo default.
+    _dt_sz=$( ( stty size </dev/tty ) 2>/dev/null || true)
+    _dt_rows=${_dt_sz%% *}
+    case "$_dt_rows" in ''|*[!0-9]*) _dt_rows=$(tput lines 2>/dev/null || printf '0') ;; esac
     if [ "$tty_state" = "yes" ] \
         && [ "$NO_COLOR" -eq 0 ] \
         && [ "$QUIET" -eq 0 ] \
@@ -1094,12 +1117,14 @@ detect_tty() {
         && command -v tput >/dev/null 2>&1 \
         && tput smcup >/dev/null 2>&1 \
         && tput rmcup >/dev/null 2>&1 \
-        && [ "$(tput lines 2>/dev/null || echo 0)" -ge "$RICH_UI_MIN_ROWS" ]; then
+        && [ "$_dt_rows" -ge "$RICH_UI_MIN_ROWS" ]; then
         RICH_UI=1
         rich_state="yes"
         UI_TTY="/dev/tty"
-        UI_ROWS=$(tput lines 2>/dev/null || printf '24')
-        UI_COLS=$(tput cols  2>/dev/null || printf '80')
+        _dt_cols=${_dt_sz##* }
+        case "$_dt_cols" in ''|*[!0-9]*) _dt_cols=$(tput cols 2>/dev/null || printf '80') ;; esac
+        UI_ROWS="$_dt_rows"
+        UI_COLS="$_dt_cols"
         # SIGWINCH handler is only meaningful in rich mode; installing it
         # unconditionally would set WINCH_PENDING=1 in plain-mode scripts and
         # non-TTY environments where the flag is never drained.
@@ -2417,8 +2442,11 @@ confirm_plan() {
         # handled on the next repaint without needing a separate resize path.
         _cp_render() {
             # Refresh dimensions; recompute viewport so a resize takes effect.
-            UI_ROWS=$(tput lines 2>/dev/null || printf '24')
-            UI_COLS=$(tput cols  2>/dev/null || printf '80')
+            _cpr_sz=$(ui_term_size)
+            UI_ROWS=${_cpr_sz%% *}
+            case "$UI_ROWS" in ''|*[!0-9]*) UI_ROWS=$(tput lines 2>/dev/null || printf '24') ;; esac
+            UI_COLS=${_cpr_sz##* }
+            case "$UI_COLS" in ''|*[!0-9]*) UI_COLS=$(tput cols  2>/dev/null || printf '80') ;; esac
             _cp_viewport=$(( UI_ROWS - 4 ))
             if [ "$_cp_viewport" -lt 1 ]; then _cp_viewport=1; fi
             # Clamp scroll offset to the new viewport bounds.
