@@ -582,10 +582,25 @@ _cp_render() {
     _cpr_end=$(( _cp_offset + _cp_viewport ))
     [ "$_cpr_end" -le "$_cp_plan_lines" ] || _cpr_end="$_cp_plan_lines"
     _cpr_a=$(( _cp_offset + 1 ))
-    printf "\033[H\033[2J" >"$UI_TTY"
+    _cpr_b="$_cpr_end"
+    printf "\033[H" >>"$UI_TTY"
     ui_render_header "sandboxd $VERSION · review plan"
+    _cpr_esc=$(printf "\033")
     printf "%s\n" "$_cp_plan_text" \
-        | awk -v s="$_cpr_a" -v e="$_cpr_end" "NR>=s && NR<=e" >"$UI_TTY"
+        | awk -v s="$_cpr_a" -v e="$_cpr_b" \
+              -v ORS="\r\n" -v esc="$_cpr_esc" \
+              "NR>=s && NR<=e {print esc \"[K\" \$0}" >>"$UI_TTY"
+    _cpr_shown=$(( _cpr_b - _cp_offset ))
+    _cpr_pad=$(( _cp_viewport - _cpr_shown ))
+    _cpr_p=0
+    while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
+        printf "\033[K\r\n" >>"$UI_TTY"
+        _cpr_p=$(( _cpr_p + 1 ))
+    done
+    _cpr_rule=$(printf "%*s" "${UI_COLS:-80}" "" | tr " " "-" | cut -c1-"${UI_COLS:-80}")
+    printf "\033[K%s\r\n" "$_cpr_rule" >>"$UI_TTY"
+    printf "\033[K[y] proceed  [n] abort  lines %d-%d of %d  " \
+        "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
 }
 _cp_render
 '
@@ -729,6 +744,158 @@ case "$out" in
         printf "\\033[?25h found in TTY output — show-cursor must not appear in repaint\n" >&2
         exit 1 ;;
     *) : ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# Structural escape-sequence assertions: _cp_render (plan pager)
+#
+# Mirrors the checklist assertions above for the plan pager:
+#   - \033[2J (erase-entire-screen) must NEVER appear — flicker op.
+#   - Each body line must be prefixed with \033[K (erase-to-EOL).
+#   - Body lines must end with \r\n (CRLF) because the terminal is in raw mode.
+# ---------------------------------------------------------------------------
+
+_run_scenario "escape-seq: _cp_render must NOT emit \\033[2J" '
+_cp_plan_text=$(printf "Alpha\nBeta\nGamma")
+_cp_plan_lines=3
+_cp_offset=0
+VERSION="0.0.0-test"
+UI_CURRENT_HEADER="test"
+_cp_render() {
+    UI_ROWS="${UI_ROWS:-24}"
+    UI_COLS="${UI_COLS:-80}"
+    _cp_viewport=$(( UI_ROWS - 4 ))
+    [ "$_cp_viewport" -ge 1 ] || _cp_viewport=1
+    _cpr_max=$(( _cp_plan_lines - _cp_viewport ))
+    [ "$_cpr_max" -ge 0 ] || _cpr_max=0
+    [ "$_cp_offset" -le "$_cpr_max" ] || _cp_offset="$_cpr_max"
+    WINCH_PENDING=0
+    _cpr_end=$(( _cp_offset + _cp_viewport ))
+    [ "$_cpr_end" -le "$_cp_plan_lines" ] || _cpr_end="$_cp_plan_lines"
+    _cpr_a=$(( _cp_offset + 1 ))
+    _cpr_b="$_cpr_end"
+    printf "\033[H" >>"$UI_TTY"
+    ui_render_header "sandboxd $VERSION · review plan"
+    _cpr_esc=$(printf "\033")
+    printf "%s\n" "$_cp_plan_text" \
+        | awk -v s="$_cpr_a" -v e="$_cpr_b" \
+              -v ORS="\r\n" -v esc="$_cpr_esc" \
+              "NR>=s && NR<=e {print esc \"[K\" \$0}" >>"$UI_TTY"
+    _cpr_shown=$(( _cpr_b - _cp_offset ))
+    _cpr_pad=$(( _cp_viewport - _cpr_shown ))
+    _cpr_p=0
+    while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
+        printf "\033[K\r\n" >>"$UI_TTY"
+        _cpr_p=$(( _cpr_p + 1 ))
+    done
+    _cpr_rule=$(printf "%*s" "${UI_COLS:-80}" "" | tr " " "-" | cut -c1-"${UI_COLS:-80}")
+    printf "\033[K%s\r\n" "$_cpr_rule" >>"$UI_TTY"
+    printf "\033[K[y] proceed  [n] abort  lines %d-%d of %d  " \
+        "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
+}
+_cp_render
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[2J")"*)
+        printf "\\033[2J found in _cp_render output — flicker op must not be present\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+_run_scenario "escape-seq: _cp_render emits \\033[K on body lines" '
+_cp_plan_text=$(printf "Alpha\nBeta\nGamma")
+_cp_plan_lines=3
+_cp_offset=0
+VERSION="0.0.0-test"
+UI_CURRENT_HEADER="test"
+_cp_render() {
+    UI_ROWS="${UI_ROWS:-24}"
+    UI_COLS="${UI_COLS:-80}"
+    _cp_viewport=$(( UI_ROWS - 4 ))
+    [ "$_cp_viewport" -ge 1 ] || _cp_viewport=1
+    _cpr_max=$(( _cp_plan_lines - _cp_viewport ))
+    [ "$_cpr_max" -ge 0 ] || _cpr_max=0
+    [ "$_cp_offset" -le "$_cpr_max" ] || _cp_offset="$_cpr_max"
+    WINCH_PENDING=0
+    _cpr_end=$(( _cp_offset + _cp_viewport ))
+    [ "$_cpr_end" -le "$_cp_plan_lines" ] || _cpr_end="$_cp_plan_lines"
+    _cpr_a=$(( _cp_offset + 1 ))
+    _cpr_b="$_cpr_end"
+    printf "\033[H" >>"$UI_TTY"
+    ui_render_header "sandboxd $VERSION · review plan"
+    _cpr_esc=$(printf "\033")
+    printf "%s\n" "$_cp_plan_text" \
+        | awk -v s="$_cpr_a" -v e="$_cpr_b" \
+              -v ORS="\r\n" -v esc="$_cpr_esc" \
+              "NR>=s && NR<=e {print esc \"[K\" \$0}" >>"$UI_TTY"
+    _cpr_shown=$(( _cpr_b - _cp_offset ))
+    _cpr_pad=$(( _cp_viewport - _cpr_shown ))
+    _cpr_p=0
+    while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
+        printf "\033[K\r\n" >>"$UI_TTY"
+        _cpr_p=$(( _cpr_p + 1 ))
+    done
+    _cpr_rule=$(printf "%*s" "${UI_COLS:-80}" "" | tr " " "-" | cut -c1-"${UI_COLS:-80}")
+    printf "\033[K%s\r\n" "$_cpr_rule" >>"$UI_TTY"
+    printf "\033[K[y] proceed  [n] abort  lines %d-%d of %d  " \
+        "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
+}
+_cp_render
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[K")"*) : ;;
+    *) printf "missing \\033[K in _cp_render output\n" >&2; exit 1 ;;
+esac
+'
+
+_run_scenario "escape-seq: _cp_render body lines end with CRLF in raw mode" '
+_cp_plan_text=$(printf "Alpha\nBeta\nGamma")
+_cp_plan_lines=3
+_cp_offset=0
+VERSION="0.0.0-test"
+UI_CURRENT_HEADER="test"
+_cp_render() {
+    UI_ROWS="${UI_ROWS:-24}"
+    UI_COLS="${UI_COLS:-80}"
+    _cp_viewport=$(( UI_ROWS - 4 ))
+    [ "$_cp_viewport" -ge 1 ] || _cp_viewport=1
+    _cpr_max=$(( _cp_plan_lines - _cp_viewport ))
+    [ "$_cpr_max" -ge 0 ] || _cpr_max=0
+    [ "$_cp_offset" -le "$_cpr_max" ] || _cp_offset="$_cpr_max"
+    WINCH_PENDING=0
+    _cpr_end=$(( _cp_offset + _cp_viewport ))
+    [ "$_cpr_end" -le "$_cp_plan_lines" ] || _cpr_end="$_cp_plan_lines"
+    _cpr_a=$(( _cp_offset + 1 ))
+    _cpr_b="$_cpr_end"
+    printf "\033[H" >>"$UI_TTY"
+    ui_render_header "sandboxd $VERSION · review plan"
+    _cpr_esc=$(printf "\033")
+    printf "%s\n" "$_cp_plan_text" \
+        | awk -v s="$_cpr_a" -v e="$_cpr_b" \
+              -v ORS="\r\n" -v esc="$_cpr_esc" \
+              "NR>=s && NR<=e {print esc \"[K\" \$0}" >>"$UI_TTY"
+    _cpr_shown=$(( _cpr_b - _cp_offset ))
+    _cpr_pad=$(( _cp_viewport - _cpr_shown ))
+    _cpr_p=0
+    while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
+        printf "\033[K\r\n" >>"$UI_TTY"
+        _cpr_p=$(( _cpr_p + 1 ))
+    done
+    _cpr_rule=$(printf "%*s" "${UI_COLS:-80}" "" | tr " " "-" | cut -c1-"${UI_COLS:-80}")
+    printf "\033[K%s\r\n" "$_cpr_rule" >>"$UI_TTY"
+    printf "\033[K[y] proceed  [n] abort  lines %d-%d of %d  " \
+        "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
+}
+_cp_render
+# Body lines must contain \r\n (CR+LF) because the terminal is in stty raw mode.
+# A bare \n (LF-only) would advance the row without returning to column 0,
+# producing a staircase.  Check that at least one \r\n appears in the output.
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\r\n")"*) : ;;
+    *) printf "no CRLF found in _cp_render output — body lines must end with \\\\r\\\\n in raw mode\n" >&2; exit 1 ;;
 esac
 '
 

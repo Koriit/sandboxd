@@ -2371,38 +2371,46 @@ confirm_plan() {
             _cpr_a=$(( _cp_offset + 1 ))
             _cpr_b="$_cpr_end"
 
-            # Cursor home, clear screen.
-            printf '\033[H\033[2J' >>"$UI_TTY"
+            # Cursor home only — no erase-display. The in-place overwrite
+            # strategy (each line prefixed with \033[K) replaces the old
+            # clear-then-redraw approach that caused a blank-frame flicker.
+            printf '\033[H' >>"$UI_TTY"
 
-            # Header.
+            # Header (ui_render_header already prefixes \033[K on each row).
             ui_render_header "sandboxd $VERSION · review plan"
 
             # Plan lines for the viewport window.
+            # In-place overwrite: each record is prefixed with \033[K so any
+            # stale content on that row is erased before the new text lands.
+            # ESC is passed via -v to avoid awk interpreting \033 as text.
             # ORS='\r\n': the terminal is in stty raw mode, so bare \n is
             # LF-only (no CR). Without the explicit CR every line would
             # advance the row but not return to column 0, producing a
             # staircase. Width is not clamped here because plan lines may
             # contain ANSI SGR escapes; naive byte-truncation would split
-            # escape sequences mid-sequence and cause color bleed. The
+            # escape sequences mid-sequence and cause colour bleed. The
             # terminal will wrap overlong lines — an acceptable trade-off.
+            _cpr_esc=$(printf '\033')
             printf '%s\n' "$_cp_plan_text" \
-                | awk -v s="$_cpr_a" -v e="$_cpr_b" -v ORS='\r\n' 'NR>=s && NR<=e' \
+                | awk -v s="$_cpr_a" -v e="$_cpr_b" \
+                      -v ORS='\r\n' -v esc="$_cpr_esc" \
+                      'NR>=s && NR<=e {print esc "[K" $0}' \
                 >>"$UI_TTY"
 
-            # Pad remaining viewport rows with blank lines.
+            # Pad remaining viewport rows — erase each row before advancing.
             _cpr_shown=$(( _cpr_b - _cp_offset ))
             _cpr_pad=$(( _cp_viewport - _cpr_shown ))
             _cpr_p=0
             while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
-                printf '\r\n' >>"$UI_TTY"
+                printf '\033[K\r\n' >>"$UI_TTY"
                 _cpr_p=$(( _cpr_p + 1 ))
             done
 
-            # Footer rule + prompt.
+            # Footer rule + prompt — erase each row before drawing.
             _cpr_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' \
                 | cut -c1-"${UI_COLS:-80}")
-            printf '%s\r\n' "$_cpr_rule" >>"$UI_TTY"
-            printf '[y] proceed  [n] abort  ↑/↓ PgUp/PgDn scroll  lines %d–%d of %d  ' \
+            printf '\033[K%s\r\n' "$_cpr_rule" >>"$UI_TTY"
+            printf '\033[K[y] proceed  [n] abort  ↑/↓ PgUp/PgDn scroll  lines %d–%d of %d  ' \
                 "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
         }
 
