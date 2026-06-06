@@ -59,6 +59,28 @@ fn integration_rebuild_image_gateway_backend_refuses_with_pointer_to_update() {
 }
 
 // ---------------------------------------------------------------------------
+// apply-config-migrations (plural) access gating
+// ---------------------------------------------------------------------------
+
+/// `apply-config-migrations` (plural) invoked by a non-root caller (the
+/// test process) refuses with the `requires root` substring and exits
+/// non-zero. The root check is the first gate — no path is read or written.
+#[test]
+fn integration_apply_config_migrations_subprocess_refuses_non_root_caller() {
+    let output = Command::new(sandbox_bin())
+        .arg("apply-config-migrations")
+        .output()
+        .expect("spawn sandbox CLI");
+    let code = output.status.code().expect("exited normally");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(code, 0, "non-root must exit non-zero; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("requires root"),
+        "stderr must carry `requires root`; got:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // apply-config-migration access gating
 // ---------------------------------------------------------------------------
 
