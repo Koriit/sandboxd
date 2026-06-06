@@ -461,7 +461,7 @@ cleanup_tmpdir() {
         kill "$UI_ANIM_PID" 2>/dev/null || true
         wait "$UI_ANIM_PID" 2>/dev/null || true
         if [ -n "$UI_TTY" ]; then
-            printf '\r\033[K' >"$UI_TTY" 2>/dev/null || true
+            printf '\r\033[K' >>"$UI_TTY" 2>/dev/null || true
         fi
         UI_ANIM_PID=0
     fi
@@ -474,6 +474,15 @@ cleanup_tmpdir() {
     if [ "$ALT_SCREEN_ACTIVE" -eq 1 ]; then
         tput rmcup 2>/dev/null || true
         ALT_SCREEN_ACTIVE=0
+    fi
+    # Re-show the cursor if rich mode hid it. Cursor visibility is terminal-
+    # global and independent of the alt-screen buffer, so tput rmcup alone does
+    # not restore it. This must fire on every exit path (success, failure,
+    # abort, Ctrl-C) — gated on RICH_UI and a non-empty UI_TTY so that plain-
+    # mode exits (where the cursor was never hidden) are unaffected.
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$UI_TTY" ]; then
+        printf '\033[?25h' >>"$UI_TTY" 2>/dev/null || true
+        printf '\033[?7h' >>"$UI_TTY" 2>/dev/null || true
     fi
     # In rich mode, flush any durable summary to the primary screen now that
     # the alt-screen is closed (or was never opened). This is the single flush
@@ -495,6 +504,17 @@ cleanup_tmpdir() {
 ui_enter_alt_screen() {
     if [ "$RICH_UI" -eq 1 ]; then
         tput smcup 2>/dev/null || true
+        # Hide cursor for the duration of the rich UI. Cursor visibility is
+        # terminal-global and independent of the alt-screen buffer, so rmcup
+        # alone does not restore it — cleanup_tmpdir emits \033[?25h explicitly
+        # on all exit paths (success, failure, abort, Ctrl-C).
+        printf '\033[?25l' >>"$UI_TTY" 2>/dev/null || true
+        # Disable auto-wrap (DECAWM) so long lines truncate at the right margin
+        # instead of wrapping to a second physical row. Wrapping breaks the
+        # one-row-per-logical-line assumption in pad math and can cause the
+        # terminal to scroll, leaving prior-frame footers visible alongside
+        # the new frame. cleanup_tmpdir re-enables auto-wrap on all exit paths.
+        printf '\033[?7l' >>"$UI_TTY" 2>/dev/null || true
         ALT_SCREEN_ACTIVE=1
     fi
 }
@@ -522,19 +542,28 @@ ui_leave_alt_screen() {
 # redirects so that /dev/tty is never opened in plain mode.
 tty_print() {
     [ -n "$UI_TTY" ] || return 0
-    printf '%s' "$1" >"$UI_TTY"
+    printf '%s' "$1" >>"$UI_TTY"
 }
 
 # ui_clamp — truncate STRING to at most WIDTH characters (never wraps).
 # Prints the (possibly truncated) string to stdout.
 # Args: $1=width $2=string
+#
+# Uses awk for truncation rather than cut -c.  POSIX cut -c counts bytes in a
+# C locale, so cutting at column N on a string that contains 3-byte UTF-8
+# glyphs (⋮, ▸, ✔, ✗) can land mid-sequence and emit a broken partial byte.
+# awk length()/substr() operate on characters (code points) in a multibyte
+# locale, so they stop on whole-glyph boundaries regardless of byte width.
 ui_clamp() {
     _uc_w="$1"
     _uc_s="$2"
     if [ "$_uc_w" -le 0 ]; then
         return 0
     fi
-    printf '%s' "$_uc_s" | cut -c1-"$_uc_w"
+    printf '%s' "$_uc_s" | awk -v w="$_uc_w" '{
+        if (length($0) <= w) { printf "%s", $0 }
+        else { printf "%s", substr($0, 1, w) }
+    }'
 }
 
 # ui_render_header — paint header + rule to the TTY.
@@ -548,7 +577,7 @@ ui_render_header() {
     _urh_line=$(ui_clamp "$_urh_cols" "$_urh_text")
     # Rule: a line of dashes clamped to terminal width.
     _urh_rule=$(printf '%*s' "$_urh_cols" '' | tr ' ' '-' | cut -c1-"$_urh_cols")
-    printf '%s\r\n%s\r\n' "$_urh_line" "$_urh_rule" >"$UI_TTY"
+    printf '\033[K%s\r\n\033[K%s\r\n' "$_urh_line" "$_urh_rule" >>"$UI_TTY"
 }
 
 # ui_phase_name — retrieve the Nth phase name (1-based).
@@ -675,7 +704,7 @@ _ui_render_checklist_body() {
     # Emit indicator line if needed.
     if [ "$_rcb_need_indicator" -eq 1 ] && [ "$_rcb_above" -gt 0 ]; then
         _rcb_ind=$(ui_clamp "$_rcb_cols" "  ⋮ $_rcb_above done above")
-        printf '%s\r\n' "$_rcb_ind" >"$UI_TTY"
+        printf '\033[K%s\r\n' "$_rcb_ind" >>"$UI_TTY"
     fi
 
     # Emit visible phase rows. The pipeline here only produces TTY output —
@@ -693,10 +722,22 @@ _ui_render_checklist_body() {
             esac
             _rcb_line="  $_rcb_glyph $_rcb_name"
             _rcb_clamped=$(ui_clamp "$_rcb_cols" "$_rcb_line")
-            printf '%s\r\n' "$_rcb_clamped" >"$UI_TTY"
+            printf '\033[K%s\r\n' "$_rcb_clamped" >>"$UI_TTY"
         fi
         _rcb_row=$((_rcb_row + 1))
     done
+}
+
+# ui_term_size — query the live terminal dimensions from the controlling terminal.
+# Prints "ROWS COLS" (e.g. "36 120") on success, or nothing on failure.
+# Uses stty size </dev/tty so the TIOCGWINSZ ioctl runs on the real terminal
+# fd rather than a pipe (which is what command substitution creates for tput,
+# causing tput to fall back to the static terminfo default).
+# The subshell wrapper silences the shell's own fd-open error when /dev/tty is
+# unavailable (e.g. in non-interactive or piped invocations), in addition to
+# stty's own stderr. Always exits 0 so callers under set -e are safe.
+ui_term_size() {
+    ( stty size </dev/tty ) 2>/dev/null || true
 }
 
 # ui_render_checklist — full repaint of the header + checklist region.
@@ -704,8 +745,11 @@ _ui_render_checklist_body() {
 # Leaves the cursor on the detail line below the checklist.
 ui_render_checklist() {
     [ "$RICH_UI" -eq 1 ] || return 0
-    UI_ROWS=$(tput lines 2>/dev/null || printf '%s' "${UI_ROWS:-24}")
-    UI_COLS=$(tput cols  2>/dev/null || printf '%s' "${UI_COLS:-80}")
+    _urc_sz=$(ui_term_size)
+    UI_ROWS=${_urc_sz%% *}
+    case "$UI_ROWS" in ''|*[!0-9]*) UI_ROWS=$(tput lines 2>/dev/null || printf '%s' "${UI_ROWS:-24}") ;; esac
+    UI_COLS=${_urc_sz##* }
+    case "$UI_COLS" in ''|*[!0-9]*) UI_COLS=$(tput cols  2>/dev/null || printf '%s' "${UI_COLS:-80}") ;; esac
 
     # Stop the animator before touching the checklist region.
     _urc_anim_was_running=0
@@ -722,35 +766,25 @@ ui_render_checklist() {
     _urc_available=$(( UI_ROWS - 2 - 1 - 1 ))
     if [ "$_urc_available" -lt 1 ]; then _urc_available=1; fi
 
-    # Buffer the entire repaint into a temp file then flush it to the TTY in a
-    # single cat.  One atomic write renders as a single frame on the terminal,
-    # eliminating the blank flash that a bare home+clear followed by incremental
-    # redraws produces.
-    _urc_real_tty="$UI_TTY"
-    _urc_frame=$(mktemp)
+    # Home — no pre-clear so the screen never goes blank. Cursor stays hidden
+    # for the duration of the rich UI (hidden on alt-screen entry; restored by
+    # tput rmcup on exit).
+    tput home >>"$UI_TTY" 2>/dev/null || true
 
-    # Point UI_TTY at the frame buffer so all sub-function writes go there.
-    UI_TTY="$_urc_frame"
-
-    # Cursor-home + clear to end of screen into the frame buffer.
-    tput home >>"$_urc_frame" 2>/dev/null || true
-    tput ed   >>"$_urc_frame" 2>/dev/null || true
-
-    # Header (2 rows: text + rule) into the frame buffer.
+    # Header (2 rows: text + rule).
     ui_render_header "${UI_CURRENT_HEADER}"
 
-    # Render visible phase rows into the frame buffer.
+    # Render visible phase rows.
     _ui_render_checklist_body "$_urc_available"
 
-    # Bottom rule line into the frame buffer.
+    # Bottom rule line.
     _urc_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' | cut -c1-"${UI_COLS:-80}")
-    printf '%s\r\n' "$_urc_rule" >>"$_urc_frame"
+    printf '\033[K%s\r\n' "$_urc_rule" >>"$UI_TTY"
 
-    # Restore real TTY, then flush the entire frame in a single atomic write.
-    UI_TTY="$_urc_real_tty"
-    cat "$_urc_frame" >"$UI_TTY" 2>/dev/null || true
-    rm -f "$_urc_frame"
-    # Cursor is now on the detail line; the animator will own it.
+    # Erase any leftover rows below the newly drawn frame (e.g. after terminal
+    # resize made the frame shorter).  Content is already on-screen at this
+    # point so there is no blank gap.
+    printf '\033[J' >>"$UI_TTY" 2>/dev/null || true
 
     WINCH_PENDING=0
 
@@ -760,25 +794,80 @@ ui_render_checklist() {
     fi
 }
 
+# _ui_spinner_frame INDEX — emit the braille spinner glyph for INDEX % 35.
+# Uses a case statement (not cut -c) so each 3-byte UTF-8 glyph is always
+# emitted whole, regardless of locale or shell. The 35 frames describe a
+# wrap-around fill/drain spinner: dots progressively fill the braille cell
+# from empty to the fully-filled ⣿ glyph, then drain back to empty and
+# wrap around continuously — no back-and-forth, no duplicate frames.
+_ui_spinner_frame() {
+    case "$(($1 % 35))" in
+        0)  printf '⠁' ;;
+        1)  printf '⠂' ;;
+        2)  printf '⠄' ;;
+        3)  printf '⡀' ;;
+        4)  printf '⡈' ;;
+        5)  printf '⡐' ;;
+        6)  printf '⡠' ;;
+        7)  printf '⣀' ;;
+        8)  printf '⣁' ;;
+        9)  printf '⣂' ;;
+        10) printf '⣄' ;;
+        11) printf '⣌' ;;
+        12) printf '⣔' ;;
+        13) printf '⣤' ;;
+        14) printf '⣥' ;;
+        15) printf '⣦' ;;
+        16) printf '⣮' ;;
+        17) printf '⣶' ;;
+        18) printf '⣷' ;;
+        19) printf '⣿' ;;
+        20) printf '⡿' ;;
+        21) printf '⠿' ;;
+        22) printf '⢟' ;;
+        23) printf '⠟' ;;
+        24) printf '⡛' ;;
+        25) printf '⠛' ;;
+        26) printf '⠫' ;;
+        27) printf '⢋' ;;
+        28) printf '⠋' ;;
+        29) printf '⠍' ;;
+        30) printf '⡉' ;;
+        31) printf '⠉' ;;
+        32) printf '⠑' ;;
+        33) printf '⠡' ;;
+        34) printf '⢁' ;;
+        *)  printf '⠁' ;;
+    esac
+}
+
 # ui_animator_body — the animator loop. Run as a background process.
 # Args: $1=detail_text $2=detail_row (1-based row number on screen)
 # The process writes only to UI_TTY and only to the detail line.
-# It re-queries tput cols each tick for resize handling.
+# It re-queries the terminal width each tick for resize handling.
 _ui_animator_body() {
     _ab_text="$1"
     _ab_tty="$UI_TTY"
     [ -n "$_ab_tty" ] || exit 0
-    _ab_frames='▌▀▐▄'
     _ab_t=0
     while true; do
-        _ab_cols=$(tput cols 2>/dev/null || printf '80')
-        _ab_idx=$((_ab_t % 4))
-        _ab_frame=$(printf '%s' "$_ab_frames" | cut -c$((_ab_idx + 1)))
+        _ab_sz=$(ui_term_size)
+        _ab_cols=${_ab_sz##* }
+        case "$_ab_cols" in ''|*[!0-9]*) _ab_cols=$(tput cols 2>/dev/null || printf '80') ;; esac
+        _ab_frame="${BLUE:-}$(_ui_spinner_frame "$_ab_t")${RESET:-}"
         _ab_detail="  $_ab_frame $_ab_text"
-        _ab_clamped=$(printf '%s' "$_ab_detail" | cut -c1-"$_ab_cols")
-        # Move to start of line, clear it, print the detail.
-        printf '\r\033[K%s' "$_ab_clamped" >"$_ab_tty"
-        sleep 0.25
+        # Use awk for column-aware truncation: cut -c counts bytes, which splits
+        # multi-byte UTF-8 glyphs when the terminal is narrow.
+        _ab_clamped=$(printf '%s' "$_ab_detail" | awk -v w="$_ab_cols" '{
+            if (length($0) <= w) { printf "%s", $0 }
+            else { printf "%s", substr($0, 1, w) }
+        }')
+        # Return to column 0, write the content, then erase any stale
+        # characters that remain to the right of the new content.
+        # Writing before erasing means the cursor never passes through a
+        # blank stretch — no blank-frame flash on each animator tick.
+        printf '\r%s\033[K' "$_ab_clamped" >>"$_ab_tty"
+        sleep 0.1
         _ab_t=$((_ab_t + 1))
     done
 }
@@ -808,7 +897,22 @@ ui_animator_stop() {
         UI_ANIM_PID=0
     fi
     if [ -n "$UI_TTY" ]; then
-        printf '\r\033[K' >"$UI_TTY" 2>/dev/null || true
+        printf '\r\033[K' >>"$UI_TTY" 2>/dev/null || true
+    fi
+    UI_DETAIL_TEXT=""
+}
+
+# ui_animator_stop_noclear — stop the background animator WITHOUT clearing the
+# detail line.  Used by download_with_bar before it takes over the detail line:
+# the download's first write overwrites the last spinner frame in-place, so no
+# blank gap appears between the animator stopping and the bar starting.  All
+# other callers that want the line blanked should use ui_animator_stop instead.
+ui_animator_stop_noclear() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    if [ "$UI_ANIM_PID" -ne 0 ]; then
+        kill "$UI_ANIM_PID" 2>/dev/null || true
+        wait "$UI_ANIM_PID" 2>/dev/null || true
+        UI_ANIM_PID=0
     fi
     UI_DETAIL_TEXT=""
 }
@@ -999,6 +1103,12 @@ detect_tty() {
     # smcup/rmcup to confirm terminfo is functional; if tput itself is missing
     # or the terminal type has no smcup capability the probe exits non-zero and
     # we fall back to plain mode.
+    #
+    # Query the live terminal height before the gate so the height check uses
+    # the real window size rather than the static terminfo default.
+    _dt_sz=$( ( stty size </dev/tty ) 2>/dev/null || true)
+    _dt_rows=${_dt_sz%% *}
+    case "$_dt_rows" in ''|*[!0-9]*) _dt_rows=$(tput lines 2>/dev/null || printf '0') ;; esac
     if [ "$tty_state" = "yes" ] \
         && [ "$NO_COLOR" -eq 0 ] \
         && [ "$QUIET" -eq 0 ] \
@@ -1007,12 +1117,14 @@ detect_tty() {
         && command -v tput >/dev/null 2>&1 \
         && tput smcup >/dev/null 2>&1 \
         && tput rmcup >/dev/null 2>&1 \
-        && [ "$(tput lines 2>/dev/null || echo 0)" -ge "$RICH_UI_MIN_ROWS" ]; then
+        && [ "$_dt_rows" -ge "$RICH_UI_MIN_ROWS" ]; then
         RICH_UI=1
         rich_state="yes"
         UI_TTY="/dev/tty"
-        UI_ROWS=$(tput lines 2>/dev/null || printf '24')
-        UI_COLS=$(tput cols  2>/dev/null || printf '80')
+        _dt_cols=${_dt_sz##* }
+        case "$_dt_cols" in ''|*[!0-9]*) _dt_cols=$(tput cols 2>/dev/null || printf '80') ;; esac
+        UI_ROWS="$_dt_rows"
+        UI_COLS="$_dt_cols"
         # SIGWINCH handler is only meaningful in rich mode; installing it
         # unconditionally would set WINCH_PENDING=1 in plain-mode scripts and
         # non-TTY environments where the flag is never drained.
@@ -1046,7 +1158,9 @@ resolve_target_version() {
         VERSION="$resolved"
         log_ok "step=resolve_version source=manifest version=$VERSION"
     elif [ "$VERSION" = "latest" ] && [ -z "$FROM" ]; then
-        emit "  resolving latest release tag ..."
+        if [ "$RICH_UI" -ne 1 ]; then
+            emit "  resolving latest release tag ..."
+        fi
         # Strip a leading 'v' from the tag if present.
         resolved=$(curl -fsSL "$LATEST_API_URL" 2>/dev/null \
             | grep '"tag_name"' \
@@ -1113,7 +1227,11 @@ detect_preexisting() {
                     # which will re-detect completed steps and skip them,
                     # effectively resuming the install.
                     log_ok "step=preexist version=$existing_ver status=$_prior_status action=resume"
-                    emit "${YELLOW}!${RESET} Resuming partial install of sandboxd $existing_ver (prior status: $_prior_status)."
+                    if [ "$RICH_UI" -eq 1 ]; then
+                        set_phase 1 "active" "resuming partial install of $existing_ver"
+                    else
+                        emit "${YELLOW}!${RESET} Resuming partial install of sandboxd $existing_ver (prior status: $_prior_status)."
+                    fi
                     ;;
                 *)
                     # status=complete (or absent / unknown) — already installed.
@@ -1177,8 +1295,11 @@ check_prereqs() {
         if ! docker info >/dev/null 2>&1; then
             # docker installed but daemon unreachable from this user;
             # not fatal at this step (operator-group-add fixes it),
-            # but call it out.
-            emit "${YELLOW}!${RESET} docker is installed but not reachable from this user."
+            # but call it out. In rich mode the managed checklist screen
+            # owns stdout, so suppress the plain-text warning there.
+            if [ "$RICH_UI" -ne 1 ]; then
+                emit "${YELLOW}!${RESET} docker is installed but not reachable from this user."
+            fi
         fi
     else
         add_missing "docker"
@@ -1446,20 +1567,16 @@ spinner_run() {
     return "$_sr_exit"
 }
 
-# _bar_style_b — render a style-B (UTF-8 true eighths) progress bar.
-# Args: $1=progress_eighths_total $2=total_cells $3=pct $4=done_mb $5=total_mb $6=speed_kbps
+# _bar_style_b — build a style-B (UTF-8 true eighths) progress bar string.
+# Args: $1=progress_eighths_total $2=total_cells
+# Prints the bar cell string to stdout; caller wraps it with framing.
 #
 # progress_eighths_total = (done_kb * total_cells * 8) / total_kb  (integer)
 # The caller computes this; we slice it into full cells + a fractional leader.
-# Eighths characters (U+2588 down to U+2581): █▇▆▅▄▃▂▁
-# We use ascending fill: index 1=▏ through 8=█ (U+258F..U+2588).
+# Eighths characters ascending fill: index 1=▏ through 8=█ (U+258F..U+2588).
 _bar_style_b() {
     _bsb_eighths="$1"   # total sub-cell progress (full_cells * 8 + frac_eighths)
     _bsb_total="$2"
-    _bsb_pct="$3"
-    _bsb_done_mb="$4"
-    _bsb_total_mb="$5"
-    _bsb_speed="$6"
 
     _bsb_full=$((_bsb_eighths / 8))
     _bsb_frac=$((_bsb_eighths % 8))
@@ -1487,19 +1604,15 @@ _bar_style_b() {
         fi
         _bsb_i=$((_bsb_i + 1))
     done
-    printf '\r  [%s] %3s%% %s/%s MB  %s KB/s  ' \
-        "$_bsb_bar" "$_bsb_pct" "$_bsb_done_mb" "$_bsb_total_mb" "$_bsb_speed" >&2
+    printf '%s' "$_bsb_bar"
 }
 
-# _bar_style_c — render a style-C (ASCII) progress bar.
-# Args: $1=filled_cells $2=total_cells $3=pct $4=done_mb $5=total_mb $6=speed_kbps
+# _bar_style_c — build a style-C (ASCII) progress bar string.
+# Args: $1=filled_cells $2=total_cells
+# Prints the bar cell string to stdout; caller wraps it with framing.
 _bar_style_c() {
     _bsc_filled="$1"
     _bsc_total="$2"
-    _bsc_pct="$3"
-    _bsc_done_mb="$4"
-    _bsc_total_mb="$5"
-    _bsc_speed="$6"
 
     _bsc_bar=""
     _bsc_i=0
@@ -1513,8 +1626,7 @@ _bar_style_c() {
         fi
         _bsc_i=$((_bsc_i + 1))
     done
-    printf '\r  [%s] %3s%% %s/%s MB  %s KB/s  ' \
-        "$_bsc_bar" "$_bsc_pct" "$_bsc_done_mb" "$_bsc_total_mb" "$_bsc_speed" >&2
+    printf '%s' "$_bsc_bar"
 }
 
 # _kb_to_mb_1dp — convert KB integer to MB string with one decimal place.
@@ -1552,20 +1664,103 @@ download_with_bar() {
     _dwb_curl_pid=$!
 
     if [ "$RICH_UI" -eq 1 ] && [ "$_dwb_total_kb" -gt 0 ]; then
-        # Rich mode with known size: update the detail-line label with live
-        # transfer progress while curl runs in the background.
+        # Rich mode with known size: take sole ownership of the detail line and
+        # render a live progress bar.  Capture the substep title first —
+        # ui_animator_stop_noclear stops the animator without blanking the
+        # detail line; the download's first write overwrites the last spinner
+        # frame in place so there is no blank flash at the handoff.
+        _dwb_title="$UI_DETAIL_TEXT"
+        ui_animator_stop_noclear
+        _dwb_title_len=$(printf '%s' "$_dwb_title" | wc -c | tr -d ' ')
+        # Separator "  " (2 chars) between title and bar framing.
+        # Bar framing without speed:  "["(1) + bar + "]"(1) + " "(1) + "100%"(4) + " "(1) + "99.9/99.9 MB"(12) = 20 + bar_cells
+        # Speed suffix: "  9999 KB/s" = 11 chars.
+        # Total fixed overhead (no title, no bar cells): 1+1+1+4+1+12 = 20.
+        # With title prefix: title_len + 2 (sep) + 20 = title_len + 22 fixed, plus bar_cells.
+        _dwb_bar_cells=24
+        _dwb_cols="${UI_COLS:-80}"
+        # Fixed cols when speed is included: "  <glyph> " + title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
+        # "  <glyph> " = 4 display cols (2 spaces + 1-col glyph + 1 space), "  [" = 3, "] " = 2,
+        # "100%" = 4, " " = 1, "99.9/99.9 MB" = 12, "  9999 KB/s" = 11 → 37 fixed + title_len + 2
+        _dwb_fixed_with_speed=$(( _dwb_title_len + 2 + 4 + 3 + 2 + 4 + 1 + 12 + 11 ))
+        # Fixed chars without speed: drop "  9999 KB/s" (11 chars).
+        _dwb_fixed_no_speed=$(( _dwb_fixed_with_speed - 11 ))
+        _dwb_avail=$(( _dwb_cols - _dwb_fixed_with_speed ))
+        _dwb_show_speed=1
+        if [ "$_dwb_avail" -lt 4 ]; then
+            # Try dropping speed segment to regain 11 chars.
+            _dwb_avail=$(( _dwb_cols - _dwb_fixed_no_speed ))
+            _dwb_show_speed=0
+        fi
+        if [ "$_dwb_avail" -lt 4 ]; then _dwb_avail=4; fi
+        if [ "$_dwb_avail" -lt "$_dwb_bar_cells" ]; then _dwb_bar_cells=$_dwb_avail; fi
+        # Frame counter for braille spinner animation (advances each 0.2s tick).
+        _dwb_frame_idx=0
+        # Speed baseline: only refresh when date +%s advances by ≥1s so that the
+        # integer-second resolution of date +%s does not yield elapsed=0 every tick.
+        _dwb_spd_t=$(date +%s)
+        _dwb_spd_kb=0
+        _dwb_speed=0
         while kill -0 "$_dwb_curl_pid" 2>/dev/null; do
             _dwb_done_kb=0
             if [ -f "$_dwb_dest" ]; then
                 _dwb_done_kb=$(du -k "$_dwb_dest" 2>/dev/null | awk '{print $1}')
                 _dwb_done_kb="${_dwb_done_kb:-0}"
             fi
+            # Percentage (clamped to 100).
+            _dwb_pct=$((_dwb_done_kb * 100 / _dwb_total_kb))
+            if [ "$_dwb_pct" -gt 100 ]; then _dwb_pct=100; fi
+            # Human-readable MB strings.
             _dwb_done_mb=$(_kb_to_mb_1dp "$_dwb_done_kb")
             _dwb_total_mb=$(_kb_to_mb_1dp "$_dwb_total_kb")
-            ui_animator_start "${_dwb_done_mb}/${_dwb_total_mb} MB"
-            sleep 1
+            # Speed: only refresh the sample when at least 1 second has elapsed;
+            # keep displaying the last computed speed between refreshes.
+            _dwb_now=$(date +%s)
+            _dwb_elapsed=$((_dwb_now - _dwb_spd_t))
+            if [ "$_dwb_elapsed" -ge 1 ]; then
+                _dwb_speed=$(( (_dwb_done_kb - _dwb_spd_kb) / _dwb_elapsed ))
+                _dwb_spd_t=$_dwb_now
+                _dwb_spd_kb=$_dwb_done_kb
+            fi
+            # Braille spinner frame, colored to indicate in-progress state.
+            _dwb_frame="${BLUE:-}$(_ui_spinner_frame "$_dwb_frame_idx")${RESET:-}"
+            _dwb_frame_idx=$((_dwb_frame_idx + 1))
+            # Build the bar cell string via the appropriate style function.
+            if is_utf8; then
+                _dwb_eighths=$((_dwb_done_kb * _dwb_bar_cells * 8 / _dwb_total_kb))
+                _dwb_bar=$(_bar_style_b "$_dwb_eighths" "$_dwb_bar_cells")
+            else
+                _dwb_filled=$((_dwb_done_kb * _dwb_bar_cells / _dwb_total_kb))
+                _dwb_bar=$(_bar_style_c "$_dwb_filled" "$_dwb_bar_cells")
+            fi
+            # Write the full progress line: "  <frame> <title>  [bar] pct% done/total MB  speed KB/s"
+            # The "  <frame> " prefix (2-space indent + 1-col glyph + 1 space) mirrors
+            # the animator's layout so the title lands at the same column throughout.
+            # Write content then erase trailing stale characters.
+            # The erase-to-EOL (\033[K) comes AFTER the content so there is
+            # no blank gap between the last frame and the new one — the same
+            # write-then-erase rule applied in _ui_animator_body.
+            if [ "$_dwb_show_speed" -eq 1 ]; then
+                printf '\r  %s %s  [%s%s%s] %3s%% %s/%s MB  %s KB/s\033[K' \
+                    "$_dwb_frame" "$_dwb_title" \
+                    "${GREEN:-}" "$_dwb_bar" "${RESET:-}" \
+                    "$_dwb_pct" "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
+                    >>"$UI_TTY"
+            else
+                printf '\r  %s %s  [%s%s%s] %3s%% %s/%s MB\033[K' \
+                    "$_dwb_frame" "$_dwb_title" \
+                    "${GREEN:-}" "$_dwb_bar" "${RESET:-}" \
+                    "$_dwb_pct" "$_dwb_done_mb" "$_dwb_total_mb" \
+                    >>"$UI_TTY"
+            fi
+            sleep 0.1
         done
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
+        # Clear the detail line once the download finishes.  Use EL2 (\033[2K)
+        # which erases the whole line from any cursor position, avoiding the
+        # \r\033[K pattern that would look like erase-before-write in the
+        # render loop (both sequences produce the same visible result here).
+        printf '\033[2K\r' >>"$UI_TTY"
     elif [ "$RICH_UI" -eq 0 ] && [ "$_dwb_total_kb" -gt 0 ]; then
         # Plain mode with known size: emit periodic log lines (~10% increments).
         _dwb_last_pct_reported=-10
@@ -2232,6 +2427,11 @@ confirm_plan() {
         # ESC byte — built with POSIX printf so this works under dash/sh,
         # not just bash ($'\x1b' is a bash/ksh ANSI-C extension).
         _cp_esc=$(printf '\033')
+        # Ctrl-D (0x04) and Ctrl-U (0x15) for half-page scroll.  In raw mode
+        # the terminal delivers these as literal bytes; no EOF/line-kill
+        # processing occurs.
+        _cp_cd=$(printf '\004')
+        _cp_cu=$(printf '\025')
 
         # Switch to raw single-char input; restore on all exit paths via
         # ui_restore_stty (which is also called from cleanup_tmpdir).
@@ -2249,8 +2449,11 @@ confirm_plan() {
         # handled on the next repaint without needing a separate resize path.
         _cp_render() {
             # Refresh dimensions; recompute viewport so a resize takes effect.
-            UI_ROWS=$(tput lines 2>/dev/null || printf '24')
-            UI_COLS=$(tput cols  2>/dev/null || printf '80')
+            _cpr_sz=$(ui_term_size)
+            UI_ROWS=${_cpr_sz%% *}
+            case "$UI_ROWS" in ''|*[!0-9]*) UI_ROWS=$(tput lines 2>/dev/null || printf '24') ;; esac
+            UI_COLS=${_cpr_sz##* }
+            case "$UI_COLS" in ''|*[!0-9]*) UI_COLS=$(tput cols  2>/dev/null || printf '80') ;; esac
             _cp_viewport=$(( UI_ROWS - 4 ))
             if [ "$_cp_viewport" -lt 1 ]; then _cp_viewport=1; fi
             # Clamp scroll offset to the new viewport bounds.
@@ -2267,32 +2470,47 @@ confirm_plan() {
             _cpr_a=$(( _cp_offset + 1 ))
             _cpr_b="$_cpr_end"
 
-            # Cursor home, clear screen.
-            printf '\033[H\033[2J' >"$UI_TTY"
+            # Cursor home only — no erase-display. The in-place overwrite
+            # strategy (each line prefixed with \033[K) replaces the old
+            # clear-then-redraw approach that caused a blank-frame flicker.
+            printf '\033[H' >>"$UI_TTY"
 
-            # Header.
+            # Header (ui_render_header already prefixes \033[K on each row).
             ui_render_header "sandboxd $VERSION · review plan"
 
             # Plan lines for the viewport window.
+            # In-place overwrite: each record is prefixed with \033[K so any
+            # stale content on that row is erased before the new text lands.
+            # ESC is passed via -v to avoid awk interpreting \033 as text.
+            # ORS='\r\n': the terminal is in stty raw mode, so bare \n is
+            # LF-only (no CR). Without the explicit CR every line would
+            # advance the row but not return to column 0, producing a
+            # staircase. Width is not clamped here because plan lines may
+            # contain ANSI SGR escapes; naive byte-truncation would split
+            # escape sequences mid-sequence and cause colour bleed. The
+            # terminal will wrap overlong lines — an acceptable trade-off.
+            _cpr_esc=$(printf '\033')
             printf '%s\n' "$_cp_plan_text" \
-                | awk -v s="$_cpr_a" -v e="$_cpr_b" 'NR>=s && NR<=e' \
-                >"$UI_TTY"
+                | awk -v s="$_cpr_a" -v e="$_cpr_b" \
+                      -v ORS='\r\n' -v esc="$_cpr_esc" \
+                      'NR>=s && NR<=e {print esc "[K" $0}' \
+                >>"$UI_TTY"
 
-            # Pad remaining viewport rows with blank lines.
+            # Pad remaining viewport rows — erase each row before advancing.
             _cpr_shown=$(( _cpr_b - _cp_offset ))
             _cpr_pad=$(( _cp_viewport - _cpr_shown ))
             _cpr_p=0
             while [ "$_cpr_p" -lt "$_cpr_pad" ]; do
-                printf '\r\n' >"$UI_TTY"
+                printf '\033[K\r\n' >>"$UI_TTY"
                 _cpr_p=$(( _cpr_p + 1 ))
             done
 
-            # Footer rule + prompt.
+            # Footer rule + prompt — erase each row before drawing.
             _cpr_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' \
                 | cut -c1-"${UI_COLS:-80}")
-            printf '%s\r\n' "$_cpr_rule" >"$UI_TTY"
-            printf '[y] proceed  [n] abort  \xe2\x86\x91/\xe2\x86\x93 PgUp/PgDn scroll  lines %d\xe2\x80\x93%d of %d  ' \
-                "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >"$UI_TTY"
+            printf '\033[K%s\r\n' "$_cpr_rule" >>"$UI_TTY"
+            printf '\033[K[y] proceed  [n] abort  ↑/↓ PgUp/PgDn scroll  lines %d–%d of %d  ' \
+                "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
         }
 
         _cp_render
@@ -2313,6 +2531,26 @@ confirm_plan() {
                 n|N|q|Q)
                     _cp_done=1
                     _cp_proceed=0
+                    ;;
+                "$_cp_cd")
+                    # Ctrl-D — scroll down half a page.
+                    _cp_half=$(( _cp_viewport / 2 ))
+                    if [ "$_cp_half" -lt 1 ]; then _cp_half=1; fi
+                    _cp_max=$(( _cp_plan_lines - _cp_viewport ))
+                    if [ "$_cp_max" -lt 0 ]; then _cp_max=0; fi
+                    _cp_offset=$(( _cp_offset + _cp_half ))
+                    if [ "$_cp_offset" -gt "$_cp_max" ]; then _cp_offset="$_cp_max"; fi
+                    _cp_render
+                    continue
+                    ;;
+                "$_cp_cu")
+                    # Ctrl-U — scroll up half a page.
+                    _cp_half=$(( _cp_viewport / 2 ))
+                    if [ "$_cp_half" -lt 1 ]; then _cp_half=1; fi
+                    _cp_offset=$(( _cp_offset - _cp_half ))
+                    if [ "$_cp_offset" -lt 0 ]; then _cp_offset=0; fi
+                    _cp_render
+                    continue
                     ;;
                 "$_cp_esc")
                     # Escape sequence: read two more bytes for arrow/page keys.
