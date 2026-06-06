@@ -541,13 +541,22 @@ tty_print() {
 # ui_clamp — truncate STRING to at most WIDTH characters (never wraps).
 # Prints the (possibly truncated) string to stdout.
 # Args: $1=width $2=string
+#
+# Uses awk for truncation rather than cut -c.  POSIX cut -c counts bytes in a
+# C locale, so cutting at column N on a string that contains 3-byte UTF-8
+# glyphs (⋮, ▸, ✔, ✗) can land mid-sequence and emit a broken partial byte.
+# awk length()/substr() operate on characters (code points) in a multibyte
+# locale, so they stop on whole-glyph boundaries regardless of byte width.
 ui_clamp() {
     _uc_w="$1"
     _uc_s="$2"
     if [ "$_uc_w" -le 0 ]; then
         return 0
     fi
-    printf '%s' "$_uc_s" | cut -c1-"$_uc_w"
+    printf '%s' "$_uc_s" | awk -v w="$_uc_w" '{
+        if (length($0) <= w) { printf "%s", $0 }
+        else { printf "%s", substr($0, 1, w) }
+    }'
 }
 
 # ui_render_header — paint header + rule to the TTY.
@@ -786,7 +795,12 @@ _ui_animator_body() {
             *) _ab_frame='▌' ;;
         esac
         _ab_detail="  $_ab_frame $_ab_text"
-        _ab_clamped=$(printf '%s' "$_ab_detail" | cut -c1-"$_ab_cols")
+        # Use awk for column-aware truncation: cut -c counts bytes, which splits
+        # the 3-byte UTF-8 frame glyph (▌ ▀ ▐ ▄) when the terminal is narrow.
+        _ab_clamped=$(printf '%s' "$_ab_detail" | awk -v w="$_ab_cols" '{
+            if (length($0) <= w) { printf "%s", $0 }
+            else { printf "%s", substr($0, 1, w) }
+        }')
         # Move to start of line, clear it, print the detail.
         printf '\r\033[K%s' "$_ab_clamped" >"$_ab_tty"
         sleep 0.25

@@ -185,6 +185,25 @@ out=$(ui_clamp 200 "short")
 [ "$out" = "short" ] || { printf "expected short, got: %s\n" "$out" >&2; exit 1; }
 ' 24 200
 
+_run_scenario "ui_clamp: multibyte glyph not split at byte boundary (cut -c regression)" '
+# "  ⋮ x" — two spaces, then ⋮ (U+22EE, 3 bytes: e2 8b ae), space, "x"
+# At width=3 the column boundary falls inside the ⋮ byte sequence.
+# With awk (char-aware) the result must be exactly "  ⋮" (two spaces + whole glyph),
+# 5 bytes total.  The old cut -c implementation returned "  " + a partial byte.
+inp="  ⋮ x"
+out=$(ui_clamp 3 "$inp")
+# Verify the full 3-byte sequence of ⋮ is present in the output.
+case "$out" in
+    *"⋮"*) ;;
+    *) printf "glyph ⋮ was split; raw bytes: "; printf "%s" "$out" | od -An -tx1 | tr -d " \n"; printf "\n"; exit 1 ;;
+esac
+# The output must not extend past 3 characters; "  ⋮" is 3 chars, so no trailing char.
+case "$out" in
+    "  ⋮") ;;
+    *) printf "expected \"  ⋮\", got %s bytes: " "$(printf "%s" "$out" | wc -c | tr -d " ")"; printf "%s" "$out" | od -An -tx1 | tr -d " \n"; printf "\n"; exit 1 ;;
+esac
+'
+
 # ---------------------------------------------------------------------------
 # ui_init_phases
 # ---------------------------------------------------------------------------
@@ -446,6 +465,34 @@ done
 [ "$_ab_found" -eq 1 ] \
     || { printf "_ui_animator_body output contains no complete spinner glyph (possible partial-byte bug)\n" >&2; exit 1; }
 '
+
+_run_scenario "animator: detail-line width clamp does not split leading glyph bytes (cut -c regression)" '
+# At terminal width 4 the detail line is "  ▌ task" (2 spaces + ▌ + space + ...).
+# ▌ is U+2590, 3 bytes: e2 96 8c.  At width=4 the whole line "  ▌ " fits (4 chars).
+# The old cut -c implementation would count 4 BYTES and return "  " + first 2 bytes of ▌
+# (e2 96), emitting a broken glyph.
+# Run for a short burst and capture the output to verify no partial byte appears.
+_ab_tty="$UI_TTY"
+_ui_animator_body "task" &
+_ab_pid=$!
+sleep 0.6
+kill "$_ab_pid" 2>/dev/null || true
+wait "$_ab_pid" 2>/dev/null || true
+_ab_raw=$(cat "$_ab_tty")
+# Every one of the 3-byte spinner glyphs must appear as a whole character in
+# the output.  If a partial byte was emitted, the string would contain an
+# invalid UTF-8 sequence and would NOT contain the canonical 3-byte form.
+# We verify by checking that at least one complete glyph IS present (same as
+# the test above but now at a deliberately narrow simulated terminal).
+_ab_found=0
+for _g in "▌" "▀" "▐" "▄"; do
+    case "$_ab_raw" in
+        *"$_g"*) _ab_found=1; break ;;
+    esac
+done
+[ "$_ab_found" -eq 1 ] \
+    || { printf "no complete spinner glyph in output at narrow width — possible cut-c byte-split\n" >&2; exit 1; }
+' 24 4
 
 # ---------------------------------------------------------------------------
 # ui_service_winch
