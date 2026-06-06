@@ -1741,14 +1741,16 @@ download_with_bar() {
             # no blank gap between the last frame and the new one — the same
             # write-then-erase rule applied in _ui_animator_body.
             if [ "$_dwb_show_speed" -eq 1 ]; then
-                printf '\r  %s %s  [%s] %3s%% %s/%s MB  %s KB/s\033[K' \
-                    "$_dwb_frame" "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
-                    "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
+                printf '\r  %s %s  [%s%s%s] %3s%% %s/%s MB  %s KB/s\033[K' \
+                    "$_dwb_frame" "$_dwb_title" \
+                    "${GREEN:-}" "$_dwb_bar" "${RESET:-}" \
+                    "$_dwb_pct" "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
                     >>"$UI_TTY"
             else
-                printf '\r  %s %s  [%s] %3s%% %s/%s MB\033[K' \
-                    "$_dwb_frame" "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
-                    "$_dwb_done_mb" "$_dwb_total_mb" \
+                printf '\r  %s %s  [%s%s%s] %3s%% %s/%s MB\033[K' \
+                    "$_dwb_frame" "$_dwb_title" \
+                    "${GREEN:-}" "$_dwb_bar" "${RESET:-}" \
+                    "$_dwb_pct" "$_dwb_done_mb" "$_dwb_total_mb" \
                     >>"$UI_TTY"
             fi
             sleep 0.1
@@ -2425,6 +2427,11 @@ confirm_plan() {
         # ESC byte — built with POSIX printf so this works under dash/sh,
         # not just bash ($'\x1b' is a bash/ksh ANSI-C extension).
         _cp_esc=$(printf '\033')
+        # Ctrl-D (0x04) and Ctrl-U (0x15) for half-page scroll.  In raw mode
+        # the terminal delivers these as literal bytes; no EOF/line-kill
+        # processing occurs.
+        _cp_cd=$(printf '\004')
+        _cp_cu=$(printf '\025')
 
         # Switch to raw single-char input; restore on all exit paths via
         # ui_restore_stty (which is also called from cleanup_tmpdir).
@@ -2524,6 +2531,26 @@ confirm_plan() {
                 n|N|q|Q)
                     _cp_done=1
                     _cp_proceed=0
+                    ;;
+                "$_cp_cd")
+                    # Ctrl-D — scroll down half a page.
+                    _cp_half=$(( _cp_viewport / 2 ))
+                    if [ "$_cp_half" -lt 1 ]; then _cp_half=1; fi
+                    _cp_max=$(( _cp_plan_lines - _cp_viewport ))
+                    if [ "$_cp_max" -lt 0 ]; then _cp_max=0; fi
+                    _cp_offset=$(( _cp_offset + _cp_half ))
+                    if [ "$_cp_offset" -gt "$_cp_max" ]; then _cp_offset="$_cp_max"; fi
+                    _cp_render
+                    continue
+                    ;;
+                "$_cp_cu")
+                    # Ctrl-U — scroll up half a page.
+                    _cp_half=$(( _cp_viewport / 2 ))
+                    if [ "$_cp_half" -lt 1 ]; then _cp_half=1; fi
+                    _cp_offset=$(( _cp_offset - _cp_half ))
+                    if [ "$_cp_offset" -lt 0 ]; then _cp_offset=0; fi
+                    _cp_render
+                    continue
                     ;;
                 "$_cp_esc")
                     # Escape sequence: read two more bytes for arrow/page keys.

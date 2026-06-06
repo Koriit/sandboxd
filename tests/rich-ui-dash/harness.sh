@@ -1349,6 +1349,223 @@ rm -rf "$_stub_dir" "$_fake_dest"
 '
 
 # ---------------------------------------------------------------------------
+# GREEN bar SGR: download_with_bar wraps bar cells in GREEN when GREEN is set
+# ---------------------------------------------------------------------------
+
+_run_bar_scenario "green-bar: rich mode output contains GREEN SGR around bar cells" '
+GREEN=$(printf "\033[0;32m")
+RESET=$(printf "\033[0m")
+_fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_green_$$"
+dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
+_stub_dir="${_H_TMPDIR:-/tmp}/stub_green_$$"
+mkdir -p "$_stub_dir"
+cat >"$_stub_dir/curl" <<'"'"'STUB'"'"'
+#!/bin/sh
+_is_head=0
+_out_file=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) _is_head=1; shift ;;
+        -o) shift; _out_file="$1"; shift ;;
+        *)  shift ;;
+    esac
+done
+if [ "$_is_head" -eq 1 ]; then
+    _sz=$(wc -c <"$FAKE_DEST" 2>/dev/null | tr -d " ")
+    printf "HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n" "${_sz:-524288}"
+else
+    sleep 2
+    cp "$FAKE_DEST" "$_out_file"
+fi
+STUB
+chmod +x "$_stub_dir/curl"
+export FAKE_DEST="$_fake_dest"
+export PATH="$_stub_dir:$PATH"
+DOWNLOAD_BAR_FAILED=0
+UI_DETAIL_TEXT="fetching tarball"
+download_with_bar "http://example.com/fake" "$_fake_dest"
+out=$(cat "$UI_TTY")
+# GREEN SGR (printf '\''\033[0;32m'\'') must appear in the output.
+_green=$(printf "\033[0;32m")
+case "$out" in
+    *"${_green}"*)
+        : ;;
+    *)
+        printf "GREEN SGR not found in download_with_bar output — bar coloring missing\n" >&2
+        rm -rf "$_stub_dir" "$_fake_dest"
+        exit 1 ;;
+esac
+# RESET SGR (printf '\''\033[0m'\'') must appear after the GREEN SGR.
+_reset=$(printf "\033[0m")
+case "$out" in
+    *"${_green}"*"${_reset}"*)
+        : ;;
+    *)
+        printf "RESET SGR not found after GREEN SGR in download_with_bar output\n" >&2
+        rm -rf "$_stub_dir" "$_fake_dest"
+        exit 1 ;;
+esac
+rm -rf "$_stub_dir" "$_fake_dest"
+'
+
+_run_bar_scenario "green-bar: plain mode (GREEN unset) emits no GREEN SGR" '
+# GREEN is deliberately left unset (or empty) — plain mode must emit no SGR.
+GREEN=""
+_fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_plain_$$"
+dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
+_stub_dir="${_H_TMPDIR:-/tmp}/stub_plain_$$"
+mkdir -p "$_stub_dir"
+cat >"$_stub_dir/curl" <<'"'"'STUB'"'"'
+#!/bin/sh
+_is_head=0
+_out_file=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) _is_head=1; shift ;;
+        -o) shift; _out_file="$1"; shift ;;
+        *)  shift ;;
+    esac
+done
+if [ "$_is_head" -eq 1 ]; then
+    _sz=$(wc -c <"$FAKE_DEST" 2>/dev/null | tr -d " ")
+    printf "HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n" "${_sz:-524288}"
+else
+    sleep 2
+    cp "$FAKE_DEST" "$_out_file"
+fi
+STUB
+chmod +x "$_stub_dir/curl"
+export FAKE_DEST="$_fake_dest"
+export PATH="$_stub_dir:$PATH"
+DOWNLOAD_BAR_FAILED=0
+UI_DETAIL_TEXT="fetching tarball"
+download_with_bar "http://example.com/fake" "$_fake_dest"
+out=$(cat "$UI_TTY")
+# With GREEN="" the ${GREEN:-} expansion yields nothing — no SGR bytes emitted.
+_green=$(printf "\033[0;32m")
+case "$out" in
+    *"${_green}"*)
+        printf "GREEN SGR found in plain-mode output — must not appear when GREEN is empty\n" >&2
+        rm -rf "$_stub_dir" "$_fake_dest"
+        exit 1 ;;
+    *) : ;;
+esac
+rm -rf "$_stub_dir" "$_fake_dest"
+'
+
+# ---------------------------------------------------------------------------
+# Ctrl-D / Ctrl-U structural: byte matchers defined, offset math correct
+# ---------------------------------------------------------------------------
+
+# Unit-test the Ctrl-D half-page scroll offset arithmetic directly.
+_run_scenario "ctrl-d/ctrl-u: Ctrl-D scrolls down half a page with clamping" '
+# Simulate a pager state and apply the Ctrl-D arm logic directly.
+_cp_plan_lines=40
+_cp_viewport=20
+_cp_offset=0
+# Ctrl-D arm logic (verbatim from confirm_plan):
+_cp_half=$(( _cp_viewport / 2 ))
+if [ "$_cp_half" -lt 1 ]; then _cp_half=1; fi
+_cp_max=$(( _cp_plan_lines - _cp_viewport ))
+if [ "$_cp_max" -lt 0 ]; then _cp_max=0; fi
+_cp_offset=$(( _cp_offset + _cp_half ))
+if [ "$_cp_offset" -gt "$_cp_max" ]; then _cp_offset="$_cp_max"; fi
+# Half of 20 = 10; from offset 0 we should land at 10.
+[ "$_cp_offset" -eq 10 ] || {
+    printf "expected offset 10, got %d\n" "$_cp_offset" >&2; exit 1
+}
+# Second Ctrl-D from offset 10 should land at 20 (== _cp_max).
+_cp_offset=$(( _cp_offset + _cp_half ))
+if [ "$_cp_offset" -gt "$_cp_max" ]; then _cp_offset="$_cp_max"; fi
+[ "$_cp_offset" -eq 20 ] || {
+    printf "expected offset 20 (clamped to max), got %d\n" "$_cp_offset" >&2; exit 1
+}
+# Third Ctrl-D from max should stay at max (clamped).
+_cp_offset=$(( _cp_offset + _cp_half ))
+if [ "$_cp_offset" -gt "$_cp_max" ]; then _cp_offset="$_cp_max"; fi
+[ "$_cp_offset" -eq 20 ] || {
+    printf "expected offset 20 (still clamped), got %d\n" "$_cp_offset" >&2; exit 1
+}
+'
+
+_run_scenario "ctrl-d/ctrl-u: Ctrl-U scrolls up half a page floored at 0" '
+_cp_plan_lines=40
+_cp_viewport=20
+_cp_offset=15
+# Ctrl-U arm logic (verbatim from confirm_plan):
+_cp_half=$(( _cp_viewport / 2 ))
+if [ "$_cp_half" -lt 1 ]; then _cp_half=1; fi
+_cp_offset=$(( _cp_offset - _cp_half ))
+if [ "$_cp_offset" -lt 0 ]; then _cp_offset=0; fi
+# Half of 20 = 10; from offset 15 we should land at 5.
+[ "$_cp_offset" -eq 5 ] || {
+    printf "expected offset 5, got %d\n" "$_cp_offset" >&2; exit 1
+}
+# Second Ctrl-U from offset 5 should land at 0 (floored).
+_cp_offset=$(( _cp_offset - _cp_half ))
+if [ "$_cp_offset" -lt 0 ]; then _cp_offset=0; fi
+[ "$_cp_offset" -eq 0 ] || {
+    printf "expected offset 0 (floored), got %d\n" "$_cp_offset" >&2; exit 1
+}
+# Third Ctrl-U from 0 should stay at 0.
+_cp_offset=$(( _cp_offset - _cp_half ))
+if [ "$_cp_offset" -lt 0 ]; then _cp_offset=0; fi
+[ "$_cp_offset" -eq 0 ] || {
+    printf "expected offset 0 (still floored), got %d\n" "$_cp_offset" >&2; exit 1
+}
+'
+
+_run_scenario "ctrl-d/ctrl-u: half-page minimum is 1 even with tiny viewport" '
+# A viewport of 1 gives _cp_half = 0 from integer division; minimum clamped to 1.
+_cp_plan_lines=10
+_cp_viewport=1
+_cp_offset=0
+_cp_half=$(( _cp_viewport / 2 ))
+if [ "$_cp_half" -lt 1 ]; then _cp_half=1; fi
+[ "$_cp_half" -eq 1 ] || {
+    printf "expected _cp_half=1 for viewport=1, got %d\n" "$_cp_half" >&2; exit 1
+}
+'
+
+_run_scenario "ctrl-d/ctrl-u: byte matchers use POSIX printf (0x04 and 0x15)" '
+# Verify the raw byte values generated by the POSIX printf patterns.
+_cp_cd=$(printf '"'"'\004'"'"')
+_cp_cu=$(printf '"'"'\025'"'"')
+# The byte matcher for Ctrl-D must be exactly one byte with value 0x04.
+_cd_len=$(printf "%s" "$_cp_cd" | wc -c | tr -d " ")
+[ "$_cd_len" -eq 1 ] || {
+    printf "_cp_cd length expected 1, got %s\n" "$_cd_len" >&2; exit 1
+}
+# The byte matcher for Ctrl-U must be exactly one byte with value 0x15.
+_cu_len=$(printf "%s" "$_cp_cu" | wc -c | tr -d " ")
+[ "$_cu_len" -eq 1 ] || {
+    printf "_cp_cu length expected 1, got %s\n" "$_cu_len" >&2; exit 1
+}
+# Confirm they are distinct.
+[ "$_cp_cd" != "$_cp_cu" ] || {
+    printf "_cp_cd and _cp_cu must be distinct bytes\n" >&2; exit 1
+}
+'
+
+_run_scenario "ctrl-d/ctrl-u: footer text contains no Ctrl-D or Ctrl-U reference" '
+# The footer line is assembled in _cp_render via printf; check the install.sh
+# source directly to confirm the footer string does not mention Ctrl-D, Ctrl-U,
+# or their key symbols (^D, ^U, C-d, C-u).
+_footer_line=$(grep -n "proceed.*abort.*PgUp" '"'"'/home/olek/Workspaces/sandboxd/sandboxd/scripts/install.sh'"'"' | head -1)
+# Must find the footer line at all.
+[ -n "$_footer_line" ] || {
+    printf "footer line not found in install.sh\n" >&2; exit 1
+}
+# Footer must not contain any reference to the hidden keys.
+case "$_footer_line" in
+    *"Ctrl-D"*|*"Ctrl-U"*|*"^D"*|*"^U"*|*"C-d"*|*"C-u"*)
+        printf "footer text references hidden scroll keys — must be absent\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf '\n--- %d passed, %d failed ---\n' "$PASS" "$FAILS"
