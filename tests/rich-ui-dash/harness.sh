@@ -63,6 +63,13 @@ CLEANUP_BLOCK=$(awk '
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
 
+# Extract ui_enter_alt_screen (needed to verify DECAWM disable on entry).
+ALT_SCREEN_BLOCK=$(awk '
+    /^ui_enter_alt_screen\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
 # ---------------------------------------------------------------------------
 # Failure tracking.
 # ---------------------------------------------------------------------------
@@ -899,6 +906,16 @@ case "$out" in
 esac
 '
 
+# Convenience wrapper: injects ALT_SCREEN_BLOCK (ui_enter_alt_screen).
+_run_alt_screen_scenario() {
+    _ras_label="$1"
+    _ras_snippet="$2"
+    _ras_rows="${3:-24}"
+    _ras_cols="${4:-80}"
+    _run_scenario "$_ras_label" "$_ras_snippet" "$_ras_rows" "$_ras_cols" \
+        "$ALT_SCREEN_BLOCK"
+}
+
 # Convenience wrapper: injects RICH_BLOCK + CLEANUP_BLOCK.
 _run_cleanup_scenario() {
     _rcs_label="$1"
@@ -1190,6 +1207,144 @@ for _g in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧"; do
 done
 [ "$_distinct" -ge 2 ] \
     || { printf "only %d distinct braille frame(s) in download output — spinner not advancing\n" "$_distinct" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
+rm -rf "$_stub_dir" "$_fake_dest"
+'
+
+# ---------------------------------------------------------------------------
+# DECAWM (auto-wrap) control: ui_enter_alt_screen and cleanup_tmpdir
+#
+# Fix B disables auto-wrap on alt-screen entry (\033[?7l) and restores it
+# on every exit path (\033[?7h).  Both sequences must be gated on RICH_UI=1
+# so plain mode is byte-identical (drift-safe).
+# ---------------------------------------------------------------------------
+
+_run_alt_screen_scenario "escape-seq: ui_enter_alt_screen emits \\033[?7l in rich mode" '
+# RICH_UI=1 and UI_TTY are already set by _run_scenario.
+ui_enter_alt_screen
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7l")"*) : ;;
+    *) printf "\\033[?7l missing from ui_enter_alt_screen output in rich mode\n" >&2; exit 1 ;;
+esac
+'
+
+_run_alt_screen_scenario "escape-seq: ui_enter_alt_screen must NOT emit \\033[?7l in plain mode" '
+RICH_UI=0
+: >>"$UI_TTY"
+ui_enter_alt_screen
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7l")"*)
+        printf "\\033[?7l found in ui_enter_alt_screen plain-mode output — must not appear\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+_run_cleanup_scenario "escape-seq: cleanup_tmpdir emits \\033[?7h when RICH_UI=1" '
+TMPDIR_INSTALL=""
+SUMMARY_FILE=""
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7h")"*) : ;;
+    *) printf "\\033[?7h missing from cleanup_tmpdir output in rich mode\n" >&2; exit 1 ;;
+esac
+'
+
+_run_cleanup_scenario "escape-seq: cleanup_tmpdir must NOT emit \\033[?7h when RICH_UI=0" '
+RICH_UI=0
+TMPDIR_INSTALL=""
+SUMMARY_FILE=""
+: >>"$UI_TTY"
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7h")"*)
+        printf "\\033[?7h found in cleanup_tmpdir plain-mode output — must not appear\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# Write-then-erase order: animator and download detail writes
+#
+# Fix A moves the erase-to-EOL (\033[K) AFTER content so the cursor never
+# passes through a blank stretch.  Assert that no \033[K appears immediately
+# after \r (which would mean erase-before-write), and that content does
+# appear before the trailing \033[K.
+# ---------------------------------------------------------------------------
+
+_run_scenario "escape-seq: animator detail write is write-then-erase (no \\033[K immediately after \\r)" '
+_ab_tty="$UI_TTY"
+_ui_animator_body "checking order" &
+_ab_pid=$!
+sleep 0.3
+kill "$_ab_pid" 2>/dev/null || true
+wait "$_ab_pid" 2>/dev/null || true
+out=$(cat "$_ab_tty")
+# The erase-before-write pattern is \r followed immediately by \033[K.
+# That sequence must NOT appear in the output.
+case "$out" in
+    *"$(printf "\r\033[K")"*)
+        printf "animator emits \\r\\033[K (erase-before-write) — must be write-then-erase\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+# At least one \033[K must still be present (the trailing erase-to-EOL).
+case "$out" in
+    *"$(printf "\033[K")"*) : ;;
+    *) printf "no \\033[K at all in animator output — trailing erase-to-EOL is missing\n" >&2; exit 1 ;;
+esac
+'
+
+_run_bar_scenario "escape-seq: download_with_bar detail write is write-then-erase (no \\033[K immediately after \\r)" '
+_fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_erase_$$"
+dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
+_stub_dir="${_H_TMPDIR:-/tmp}/stub_erase_$$"
+mkdir -p "$_stub_dir"
+cat >"$_stub_dir/curl" <<'"'"'STUB'"'"'
+#!/bin/sh
+_is_head=0
+_out_file=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) _is_head=1; shift ;;
+        -o) shift; _out_file="$1"; shift ;;
+        *)  shift ;;
+    esac
+done
+if [ "$_is_head" -eq 1 ]; then
+    _sz=$(wc -c <"$FAKE_DEST" 2>/dev/null | tr -d " ")
+    printf "HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n" "${_sz:-524288}"
+else
+    sleep 2
+    cp "$FAKE_DEST" "$_out_file"
+fi
+STUB
+chmod +x "$_stub_dir/curl"
+export FAKE_DEST="$_fake_dest"
+export PATH="$_stub_dir:$PATH"
+DOWNLOAD_BAR_FAILED=0
+UI_DETAIL_TEXT="fetching tarball"
+download_with_bar "http://example.com/fake" "$_fake_dest"
+out=$(cat "$UI_TTY")
+# The erase-before-write pattern (\r immediately followed by \033[K) must not appear.
+case "$out" in
+    *"$(printf "\r\033[K")"*)
+        printf "download_with_bar emits \\r\\033[K (erase-before-write) — must be write-then-erase\n" >&2
+        rm -rf "$_stub_dir" "$_fake_dest"
+        exit 1 ;;
+    *) : ;;
+esac
+# At least one trailing \033[K must be present.
+case "$out" in
+    *"$(printf "\033[K")"*) : ;;
+    *) printf "no \\033[K at all in download_with_bar output — trailing erase-to-EOL is missing\n" >&2
+       rm -rf "$_stub_dir" "$_fake_dest"
+       exit 1 ;;
+esac
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 

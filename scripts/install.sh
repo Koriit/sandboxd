@@ -482,6 +482,7 @@ cleanup_tmpdir() {
     # mode exits (where the cursor was never hidden) are unaffected.
     if [ "$RICH_UI" -eq 1 ] && [ -n "$UI_TTY" ]; then
         printf '\033[?25h' >>"$UI_TTY" 2>/dev/null || true
+        printf '\033[?7h' >>"$UI_TTY" 2>/dev/null || true
     fi
     # In rich mode, flush any durable summary to the primary screen now that
     # the alt-screen is closed (or was never opened). This is the single flush
@@ -508,6 +509,12 @@ ui_enter_alt_screen() {
         # alone does not restore it — cleanup_tmpdir emits \033[?25h explicitly
         # on all exit paths (success, failure, abort, Ctrl-C).
         printf '\033[?25l' >>"$UI_TTY" 2>/dev/null || true
+        # Disable auto-wrap (DECAWM) so long lines truncate at the right margin
+        # instead of wrapping to a second physical row. Wrapping breaks the
+        # one-row-per-logical-line assumption in pad math and can cause the
+        # terminal to scroll, leaving prior-frame footers visible alongside
+        # the new frame. cleanup_tmpdir re-enables auto-wrap on all exit paths.
+        printf '\033[?7l' >>"$UI_TTY" 2>/dev/null || true
         ALT_SCREEN_ACTIVE=1
     fi
 }
@@ -808,8 +815,11 @@ _ui_animator_body() {
             if (length($0) <= w) { printf "%s", $0 }
             else { printf "%s", substr($0, 1, w) }
         }')
-        # Move to start of line, clear it, print the detail.
-        printf '\r\033[K%s' "$_ab_clamped" >>"$_ab_tty"
+        # Return to column 0, write the content, then erase any stale
+        # characters that remain to the right of the new content.
+        # Writing before erasing means the cursor never passes through a
+        # blank stretch — no blank-frame flash on each animator tick.
+        printf '\r%s\033[K' "$_ab_clamped" >>"$_ab_tty"
         sleep 0.25
         _ab_t=$((_ab_t + 1))
     done
@@ -841,6 +851,21 @@ ui_animator_stop() {
     fi
     if [ -n "$UI_TTY" ]; then
         printf '\r\033[K' >>"$UI_TTY" 2>/dev/null || true
+    fi
+    UI_DETAIL_TEXT=""
+}
+
+# ui_animator_stop_noclear — stop the background animator WITHOUT clearing the
+# detail line.  Used by download_with_bar before it takes over the detail line:
+# the download's first write overwrites the last spinner frame in-place, so no
+# blank gap appears between the animator stopping and the bar starting.  All
+# other callers that want the line blanked should use ui_animator_stop instead.
+ui_animator_stop_noclear() {
+    [ "$RICH_UI" -eq 1 ] || return 0
+    if [ "$UI_ANIM_PID" -ne 0 ]; then
+        kill "$UI_ANIM_PID" 2>/dev/null || true
+        wait "$UI_ANIM_PID" 2>/dev/null || true
+        UI_ANIM_PID=0
     fi
     UI_DETAIL_TEXT=""
 }
@@ -1586,9 +1611,11 @@ download_with_bar() {
     if [ "$RICH_UI" -eq 1 ] && [ "$_dwb_total_kb" -gt 0 ]; then
         # Rich mode with known size: take sole ownership of the detail line and
         # render a live progress bar.  Capture the substep title first —
-        # ui_animator_stop clears UI_DETAIL_TEXT.
+        # ui_animator_stop_noclear stops the animator without blanking the
+        # detail line; the download's first write overwrites the last spinner
+        # frame in place so there is no blank flash at the handoff.
         _dwb_title="$UI_DETAIL_TEXT"
-        ui_animator_stop
+        ui_animator_stop_noclear
         _dwb_title_len=$(printf '%s' "$_dwb_title" | wc -c | tr -d ' ')
         # Separator "  " (2 chars) between title and bar framing.
         # Bar framing without speed:  "["(1) + bar + "]"(1) + " "(1) + "100%"(4) + " "(1) + "99.9/99.9 MB"(12) = 20 + bar_cells
@@ -1654,13 +1681,17 @@ download_with_bar() {
             # Write the full progress line: "  <frame> <title>  [bar] pct% done/total MB  speed KB/s"
             # The "  <frame> " prefix (2-space indent + 1-col glyph + 1 space) mirrors
             # the animator's layout so the title lands at the same column throughout.
+            # Write content then erase trailing stale characters.
+            # The erase-to-EOL (\033[K) comes AFTER the content so there is
+            # no blank gap between the last frame and the new one — the same
+            # write-then-erase rule applied in _ui_animator_body.
             if [ "$_dwb_show_speed" -eq 1 ]; then
-                printf '\r\033[K  %s %s  [%s] %3s%% %s/%s MB  %s KB/s' \
+                printf '\r  %s %s  [%s] %3s%% %s/%s MB  %s KB/s\033[K' \
                     "$_dwb_frame" "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
                     >>"$UI_TTY"
             else
-                printf '\r\033[K  %s %s  [%s] %3s%% %s/%s MB' \
+                printf '\r  %s %s  [%s] %3s%% %s/%s MB\033[K' \
                     "$_dwb_frame" "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" \
                     >>"$UI_TTY"
@@ -1668,8 +1699,11 @@ download_with_bar() {
             sleep 0.2
         done
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
-        # Clear the detail line once the download finishes.
-        printf '\r\033[K' >>"$UI_TTY"
+        # Clear the detail line once the download finishes.  Use EL2 (\033[2K)
+        # which erases the whole line from any cursor position, avoiding the
+        # \r\033[K pattern that would look like erase-before-write in the
+        # render loop (both sequences produce the same visible result here).
+        printf '\033[2K\r' >>"$UI_TTY"
     elif [ "$RICH_UI" -eq 0 ] && [ "$_dwb_total_kb" -gt 0 ]; then
         # Plain mode with known size: emit periodic log lines (~10% increments).
         _dwb_last_pct_reported=-10
