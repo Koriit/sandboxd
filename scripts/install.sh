@@ -772,6 +772,23 @@ ui_render_checklist() {
     fi
 }
 
+# _ui_spinner_frame INDEX — emit the braille spinner glyph for INDEX % 8.
+# Uses a case statement (not cut -c) so each 3-byte UTF-8 glyph is always
+# emitted whole, regardless of locale or shell.
+_ui_spinner_frame() {
+    case "$(($1 % 8))" in
+        0) printf '⠋' ;;
+        1) printf '⠙' ;;
+        2) printf '⠹' ;;
+        3) printf '⠸' ;;
+        4) printf '⠼' ;;
+        5) printf '⠴' ;;
+        6) printf '⠦' ;;
+        7) printf '⠧' ;;
+        *) printf '⠋' ;;
+    esac
+}
+
 # ui_animator_body — the animator loop. Run as a background process.
 # Args: $1=detail_text $2=detail_row (1-based row number on screen)
 # The process writes only to UI_TTY and only to the detail line.
@@ -783,26 +800,16 @@ _ui_animator_body() {
     _ab_t=0
     while true; do
         _ab_cols=$(tput cols 2>/dev/null || printf '80')
-        _ab_idx=$((_ab_t % 4))
-        # cut -c is byte-based for multi-byte UTF-8 glyphs in this environment,
-        # so indexing into the frames string with it yields a broken partial byte.
-        # A case statement is locale/cut-independent and always emits a full glyph.
-        case "$_ab_idx" in
-            0) _ab_frame='▌' ;;
-            1) _ab_frame='▀' ;;
-            2) _ab_frame='▐' ;;
-            3) _ab_frame='▄' ;;
-            *) _ab_frame='▌' ;;
-        esac
+        _ab_frame="${BLUE:-}$(_ui_spinner_frame "$_ab_t")${RESET:-}"
         _ab_detail="  $_ab_frame $_ab_text"
         # Use awk for column-aware truncation: cut -c counts bytes, which splits
-        # the 3-byte UTF-8 frame glyph (▌ ▀ ▐ ▄) when the terminal is narrow.
+        # multi-byte UTF-8 glyphs when the terminal is narrow.
         _ab_clamped=$(printf '%s' "$_ab_detail" | awk -v w="$_ab_cols" '{
             if (length($0) <= w) { printf "%s", $0 }
             else { printf "%s", substr($0, 1, w) }
         }')
         # Move to start of line, clear it, print the detail.
-        printf '\r\033[K%s' "$_ab_clamped" >"$_ab_tty"
+        printf '\r\033[K%s' "$_ab_clamped" >>"$_ab_tty"
         sleep 0.25
         _ab_t=$((_ab_t + 1))
     done
@@ -1581,8 +1588,8 @@ download_with_bar() {
         # With title prefix: title_len + 2 (sep) + 20 = title_len + 22 fixed, plus bar_cells.
         _dwb_bar_cells=24
         _dwb_cols="${UI_COLS:-80}"
-        # Fixed cols when speed is included: "  ▌ " + title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
-        # "  ▌ " = 4 display cols (2 spaces + 1-col glyph + 1 space), "  [" = 3, "] " = 2,
+        # Fixed cols when speed is included: "  <glyph> " + title + "  [" + "] 100% 99.9/99.9 MB  9999 KB/s"
+        # "  <glyph> " = 4 display cols (2 spaces + 1-col glyph + 1 space), "  [" = 3, "] " = 2,
         # "100%" = 4, " " = 1, "99.9/99.9 MB" = 12, "  9999 KB/s" = 11 → 37 fixed + title_len + 2
         _dwb_fixed_with_speed=$(( _dwb_title_len + 2 + 4 + 3 + 2 + 4 + 1 + 12 + 11 ))
         # Fixed chars without speed: drop "  9999 KB/s" (11 chars).
@@ -1596,8 +1603,13 @@ download_with_bar() {
         fi
         if [ "$_dwb_avail" -lt 4 ]; then _dwb_avail=4; fi
         if [ "$_dwb_avail" -lt "$_dwb_bar_cells" ]; then _dwb_bar_cells=$_dwb_avail; fi
-        _dwb_t0=$(date +%s)
-        _dwb_bytes_at_t0=0
+        # Frame counter for braille spinner animation (advances each 0.2s tick).
+        _dwb_frame_idx=0
+        # Speed baseline: only refresh when date +%s advances by ≥1s so that the
+        # integer-second resolution of date +%s does not yield elapsed=0 every tick.
+        _dwb_spd_t=$(date +%s)
+        _dwb_spd_kb=0
+        _dwb_speed=0
         while kill -0 "$_dwb_curl_pid" 2>/dev/null; do
             _dwb_done_kb=0
             if [ -f "$_dwb_dest" ]; then
@@ -1610,16 +1622,18 @@ download_with_bar() {
             # Human-readable MB strings.
             _dwb_done_mb=$(_kb_to_mb_1dp "$_dwb_done_kb")
             _dwb_total_mb=$(_kb_to_mb_1dp "$_dwb_total_kb")
-            # Speed: KB transferred since last sample divided by elapsed seconds.
-            _dwb_t1=$(date +%s)
-            _dwb_elapsed=$((_dwb_t1 - _dwb_t0))
-            if [ "$_dwb_elapsed" -gt 0 ]; then
-                _dwb_speed=$(( (_dwb_done_kb - _dwb_bytes_at_t0) / _dwb_elapsed ))
-            else
-                _dwb_speed=0
+            # Speed: only refresh the sample when at least 1 second has elapsed;
+            # keep displaying the last computed speed between refreshes.
+            _dwb_now=$(date +%s)
+            _dwb_elapsed=$((_dwb_now - _dwb_spd_t))
+            if [ "$_dwb_elapsed" -ge 1 ]; then
+                _dwb_speed=$(( (_dwb_done_kb - _dwb_spd_kb) / _dwb_elapsed ))
+                _dwb_spd_t=$_dwb_now
+                _dwb_spd_kb=$_dwb_done_kb
             fi
-            _dwb_t0=$_dwb_t1
-            _dwb_bytes_at_t0=$_dwb_done_kb
+            # Braille spinner frame, colored to indicate in-progress state.
+            _dwb_frame="${BLUE:-}$(_ui_spinner_frame "$_dwb_frame_idx")${RESET:-}"
+            _dwb_frame_idx=$((_dwb_frame_idx + 1))
             # Build the bar cell string via the appropriate style function.
             if is_utf8; then
                 _dwb_eighths=$((_dwb_done_kb * _dwb_bar_cells * 8 / _dwb_total_kb))
@@ -1628,22 +1642,21 @@ download_with_bar() {
                 _dwb_filled=$((_dwb_done_kb * _dwb_bar_cells / _dwb_total_kb))
                 _dwb_bar=$(_bar_style_c "$_dwb_filled" "$_dwb_bar_cells")
             fi
-            # Write the full progress line: "  ▌ <title>  [bar] pct% done/total MB  speed KB/s"
-            # The prefix "  ▌ " mirrors the animator's "  ▌ " exactly (2-space indent,
-            # static block glyph, space) so the title lands at the same column as the
-            # spinner detail line — no horizontal jump on the spinner→bar transition.
+            # Write the full progress line: "  <frame> <title>  [bar] pct% done/total MB  speed KB/s"
+            # The "  <frame> " prefix (2-space indent + 1-col glyph + 1 space) mirrors
+            # the animator's layout so the title lands at the same column throughout.
             if [ "$_dwb_show_speed" -eq 1 ]; then
-                printf '\r\033[K  ▌ %s  [%s] %3s%% %s/%s MB  %s KB/s' \
-                    "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
+                printf '\r\033[K  %s %s  [%s] %3s%% %s/%s MB  %s KB/s' \
+                    "$_dwb_frame" "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" "$_dwb_speed" \
                     >>"$UI_TTY"
             else
-                printf '\r\033[K  ▌ %s  [%s] %3s%% %s/%s MB' \
-                    "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
+                printf '\r\033[K  %s %s  [%s] %3s%% %s/%s MB' \
+                    "$_dwb_frame" "$_dwb_title" "$_dwb_bar" "$_dwb_pct" \
                     "$_dwb_done_mb" "$_dwb_total_mb" \
                     >>"$UI_TTY"
             fi
-            sleep 1
+            sleep 0.2
         done
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
         # Clear the detail line once the download finishes.

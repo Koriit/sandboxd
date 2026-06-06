@@ -41,6 +41,13 @@ IS_UTF8_BLOCK=$(awk '
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
 
+# Extract _ui_spinner_frame (needed by download_with_bar's loop).
+SPINNER_FRAME_BLOCK=$(awk '
+    /^_ui_spinner_frame\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
 # Extract bar renderers + kb converter + download_with_bar.
 BAR_BLOCK=$(awk '
     /^_bar_style_b\(\)/ { in_block = 1 }
@@ -115,6 +122,8 @@ _run_scenario() {
         printf 'UI_PHASE_COUNT=0\n'
         printf 'UI_DETAIL_TEXT=""\n'
         printf 'UI_ANIM_PID=0\n'
+        printf 'BLUE=""\n'
+        printf 'RESET=""\n'
         # Inject the extracted function block.
         printf '%s\n' "$RICH_BLOCK"
         # Inject optional extra block (e.g. bar renderers).
@@ -141,14 +150,14 @@ _run_scenario() {
     rm -f "$_rs_file" "$_rs_tty" "$_rs_err"
 }
 
-# Convenience wrapper: injects RICH_BLOCK + is_utf8 + BAR_BLOCK.
+# Convenience wrapper: injects RICH_BLOCK + is_utf8 + _ui_spinner_frame + BAR_BLOCK.
 _run_bar_scenario() {
     _rbs_label="$1"
     _rbs_snippet="$2"
     _rbs_rows="${3:-24}"
     _rbs_cols="${4:-80}"
     _run_scenario "$_rbs_label" "$_rbs_snippet" "$_rbs_rows" "$_rbs_cols" \
-        "$(printf '%s\n%s\n' "$IS_UTF8_BLOCK" "$BAR_BLOCK")"
+        "$(printf '%s\n%s\n%s\n' "$IS_UTF8_BLOCK" "$SPINNER_FRAME_BLOCK" "$BAR_BLOCK")"
 }
 
 # ===========================================================================
@@ -443,7 +452,7 @@ ui_animator_stop
 [ "$UI_ANIM_PID" -eq 0 ] || { printf "PID not zero\n" >&2; exit 1; }
 '
 
-_run_scenario "animator: _ui_animator_body emits a complete UTF-8 glyph (not a partial byte)" '
+_run_scenario "animator: _ui_animator_body emits a complete braille UTF-8 glyph (not a partial byte)" '
 # Run _ui_animator_body for a short burst (0.3 s covers at least one 0.25 s tick)
 # then kill it and inspect what it wrote to the TTY.
 _ab_tty="$UI_TTY"
@@ -453,24 +462,24 @@ sleep 0.3
 kill "$_ab_pid" 2>/dev/null || true
 wait "$_ab_pid" 2>/dev/null || true
 _ab_out=$(cat "$_ab_tty")
-# The output must contain at least one complete spinner glyph.
-# A partial-byte extraction (the prior cut -c bug) would produce 0xe2 or similar
-# and would NOT match any of these full 3-byte UTF-8 characters.
+# The output must contain at least one complete braille spinner glyph.
+# A partial-byte extraction would produce a broken byte sequence and would NOT
+# match any of these full 3-byte UTF-8 braille characters.
 _ab_found=0
-for _g in "▌" "▀" "▐" "▄"; do
+for _g in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧"; do
     case "$_ab_out" in
         *"$_g"*) _ab_found=1; break ;;
     esac
 done
 [ "$_ab_found" -eq 1 ] \
-    || { printf "_ui_animator_body output contains no complete spinner glyph (possible partial-byte bug)\n" >&2; exit 1; }
+    || { printf "_ui_animator_body output contains no complete braille spinner glyph (possible partial-byte bug)\n" >&2; exit 1; }
 '
 
 _run_scenario "animator: detail-line width clamp does not split leading glyph bytes (cut -c regression)" '
-# At terminal width 4 the detail line is "  ▌ task" (2 spaces + ▌ + space + ...).
-# ▌ is U+2590, 3 bytes: e2 96 8c.  At width=4 the whole line "  ▌ " fits (4 chars).
-# The old cut -c implementation would count 4 BYTES and return "  " + first 2 bytes of ▌
-# (e2 96), emitting a broken glyph.
+# At terminal width 4 the detail line is "  ⠋ task" (2 spaces + braille glyph + space + ...).
+# Each braille glyph is 3 bytes (e.g. ⠋ = e2 a0 8b).  At width=4 the whole prefix
+# "  ⠋ " fits (4 chars).  The old cut -c implementation would count 4 BYTES and
+# return "  " + first 2 bytes of the glyph, emitting a broken sequence.
 # Run for a short burst and capture the output to verify no partial byte appears.
 _ab_tty="$UI_TTY"
 _ui_animator_body "task" &
@@ -479,20 +488,38 @@ sleep 0.6
 kill "$_ab_pid" 2>/dev/null || true
 wait "$_ab_pid" 2>/dev/null || true
 _ab_raw=$(cat "$_ab_tty")
-# Every one of the 3-byte spinner glyphs must appear as a whole character in
-# the output.  If a partial byte was emitted, the string would contain an
-# invalid UTF-8 sequence and would NOT contain the canonical 3-byte form.
-# We verify by checking that at least one complete glyph IS present (same as
-# the test above but now at a deliberately narrow simulated terminal).
+# At least one complete braille glyph must be present in the output.
+# If a partial byte was emitted the canonical 3-byte form would not match.
 _ab_found=0
-for _g in "▌" "▀" "▐" "▄"; do
+for _g in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧"; do
     case "$_ab_raw" in
         *"$_g"*) _ab_found=1; break ;;
     esac
 done
 [ "$_ab_found" -eq 1 ] \
-    || { printf "no complete spinner glyph in output at narrow width — possible cut-c byte-split\n" >&2; exit 1; }
+    || { printf "no complete braille glyph in output at narrow width — possible cut-c byte-split\n" >&2; exit 1; }
 ' 24 4
+
+_run_scenario "animator: braille frame changes across ticks (spinner animates)" '
+# Run _ui_animator_body for ~1.1 s (covers at least 4 ticks at 0.25 s each).
+# Capture the output and verify that at least 2 distinct braille glyphs appear —
+# confirming that the frame advances and is not stuck on a single symbol.
+_ab_tty="$UI_TTY"
+_ui_animator_body "animating task" &
+_ab_pid=$!
+sleep 1.1
+kill "$_ab_pid" 2>/dev/null || true
+wait "$_ab_pid" 2>/dev/null || true
+_ab_out=$(cat "$_ab_tty")
+_ab_distinct=0
+for _g in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧"; do
+    case "$_ab_out" in
+        *"$_g"*) _ab_distinct=$(( _ab_distinct + 1 )) ;;
+    esac
+done
+[ "$_ab_distinct" -ge 2 ] \
+    || { printf "only %d distinct braille frame(s) in 1.1s — spinner is not advancing\n" "$_ab_distinct" >&2; exit 1; }
+'
 
 # ---------------------------------------------------------------------------
 # ui_service_winch
@@ -861,7 +888,7 @@ done
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
-_run_bar_scenario "download_with_bar: progress line prefix matches animator indent (  ▌  before title)" '
+_run_bar_scenario "download_with_bar: progress line prefix uses braille glyph before title (animator column alignment)" '
 _fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_ind_$$"
 dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
 _stub_dir="${_H_TMPDIR:-/tmp}/stub_ind_$$"
@@ -891,18 +918,22 @@ export PATH="$_stub_dir:$PATH"
 DOWNLOAD_BAR_FAILED=0
 UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
-# The rendered line must contain "  ▌ fetching tarball" — the same prefix shape
-# as the animator detail line ("  ▌ text") so the title stays at column 5 and
-# does not jump horizontally when the bar replaces the spinner.
+# The rendered line must contain a braille glyph followed by the title.
+# The "  <glyph> " prefix (2 spaces + 1-col braille + 1 space) keeps the title
+# at the same display column as the animator detail line.
 _tty_out=$(cat "$UI_TTY")
-case "$_tty_out" in
-    *"  ▌ fetching tarball"*) : ;;
-    *) printf "progress line missing prefix \"  ▌ \" before title\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
-esac
+_pref_found=0
+for _g in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧"; do
+    case "$_tty_out" in
+        *"  ${_g} fetching tarball"*) _pref_found=1; break ;;
+    esac
+done
+[ "$_pref_found" -eq 1 ] \
+    || { printf "progress line missing \"  <braille> fetching tarball\" prefix\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
-_run_bar_scenario "download_with_bar: animator is stopped — animated-only glyphs must not appear" '
+_run_bar_scenario "download_with_bar: download bar emits braille glyph (own spinner, not block chars)" '
 _fake_dest="${_H_TMPDIR:-/tmp}/fake_dest2_$$"
 dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
 _stub_dir="${_H_TMPDIR:-/tmp}/stub2_$$"
@@ -933,24 +964,65 @@ DOWNLOAD_BAR_FAILED=0
 UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
 _tty_out=$(cat "$UI_TTY")
-# The download bar uses a static "▌" as its prefix glyph (matching the animator
-# indent), so "▌" is expected and correct.  The glyphs "▀", "▐", "▄" only appear
-# when the animator loop is running — the animator must be stopped before the
-# poll loop, so these three must not appear in the output.
-for _glyph in "▀" "▐" "▄"; do
+# The download bar draws its own braille spinner glyph (not the old block chars).
+# Confirm at least one braille glyph is present in the captured output.
+_braille_found=0
+for _g in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧"; do
     case "$_tty_out" in
-        *"$_glyph"*)
-            printf "animated-only glyph %s found — animator must be stopped during download\n" "$_glyph" >&2
-            rm -rf "$_stub_dir" "$_fake_dest"
-            exit 1 ;;
-        *) : ;;
+        *"$_g"*) _braille_found=1; break ;;
     esac
 done
-# Static "▌" prefix must be present in the download bar output.
-case "$_tty_out" in
-    *"▌"*) : ;;
-    *) printf "static ▌ prefix missing from download bar output\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1 ;;
-esac
+[ "$_braille_found" -eq 1 ] \
+    || { printf "no braille glyph found in download bar output — spinner not rendering\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
+rm -rf "$_stub_dir" "$_fake_dest"
+'
+
+_run_bar_scenario "download_with_bar: spinner glyph changes across ticks (animates during download)" '
+# Stub: HEAD reports 2 MB total; body sleeps 3s so the poll loop runs several ticks.
+_total_kb=2048
+_fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_anim_$$"
+_stub_dir="${_H_TMPDIR:-/tmp}/stub_anim_$$"
+mkdir -p "$_stub_dir"
+export FAKE_DEST="$_fake_dest"
+export FAKE_TOTAL_KB="$_total_kb"
+cat >"$_stub_dir/curl" <<'"'"'STUB'"'"'
+#!/bin/sh
+_is_head=0
+_out_file=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) _is_head=1; shift ;;
+        -o) shift; _out_file="$1"; shift ;;
+        *)  shift ;;
+    esac
+done
+if [ "$_is_head" -eq 1 ]; then
+    printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\n\r\n' "$(( FAKE_TOTAL_KB * 1024 ))"
+else
+    # Write data incrementally so du -k sees a growing file during poll.
+    i=0
+    while [ "$i" -lt 6 ]; do
+        dd if=/dev/zero bs=1024 count=341 2>/dev/null >> "$_out_file"
+        sleep 0.4
+        i=$(( i + 1 ))
+    done
+fi
+STUB
+chmod +x "$_stub_dir/curl"
+export PATH="$_stub_dir:$PATH"
+DOWNLOAD_BAR_FAILED=0
+UI_DETAIL_TEXT="fetching tarball"
+download_with_bar "http://example.com/fake" "$_fake_dest"
+_tty_out=$(cat "$UI_TTY")
+# Count distinct braille frames seen in the captured TTY output.
+_distinct=0
+for _g in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧"; do
+    case "$_tty_out" in
+        *"$_g"*) _distinct=$(( _distinct + 1 )) ;;
+    esac
+done
+[ "$_distinct" -ge 2 ] \
+    || { printf "only %d distinct braille frame(s) in download output — spinner not advancing\n" "$_distinct" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
