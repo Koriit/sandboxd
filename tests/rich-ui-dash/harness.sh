@@ -70,6 +70,20 @@ ALT_SCREEN_BLOCK=$(awk '
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
 
+# Extract emit (needed by _print_failure_report in plain and rich branches).
+EMIT_BLOCK=$(awk '
+    /^emit\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
+# Extract _print_failure_report (tested for unguarded-abort failure attribution).
+PRINT_FAILURE_REPORT_BLOCK=$(awk '
+    /^_print_failure_report\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
 # ---------------------------------------------------------------------------
 # Failure tracking.
 # ---------------------------------------------------------------------------
@@ -1564,6 +1578,143 @@ case "$_footer_line" in
     *) : ;;
 esac
 '
+
+# ---------------------------------------------------------------------------
+# _print_failure_report: failure attribution and log-tail display.
+# These scenarios verify the rich branch names the failing step (not "unknown")
+# and renders the "Last log lines:" section when a log-tail file is present.
+# ---------------------------------------------------------------------------
+
+_run_scenario "failure-report rich: step name present, not 'unknown'" "
+$(printf '%s\n' "$EMIT_BLOCK")
+$(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+STATE_PATH=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_INSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_INSTALL\"' EXIT
+# No log-tail file — test only the step-name attribution in rich mode.
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'sandbox-user\ninstall-binaries\nwrite-install-state\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'install-binaries' '2' '13' '' 2>&1)
+case \"\$out\" in
+    *'install-binaries'*) ;;
+    *) printf 'step name not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'unknown'*) printf 'fallback word \"unknown\" must not appear; got: %s\n' \"\$out\" >&2; exit 1 ;;
+    *) ;;
+esac
+"
+
+_run_scenario "failure-report rich: log-tail section present when file exists" "
+$(printf '%s\n' "$EMIT_BLOCK")
+$(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+STATE_PATH=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_INSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_INSTALL\"' EXIT
+printf 'step=install_binaries action=fail status=fail\n' > \"\$TMPDIR_INSTALL/failure-log-tail.txt\"
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'sandbox-user\ninstall-binaries\nwrite-install-state\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'install-binaries' '2' '13' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) ;;
+    *) printf 'log-tail section not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'step=install_binaries'*) ;;
+    *) printf 'log-tail content not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+"
+
+_run_scenario "failure-report rich: no log-tail section when file absent" "
+$(printf '%s\n' "$EMIT_BLOCK")
+$(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+STATE_PATH=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_INSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_INSTALL\"' EXIT
+# No failure-log-tail.txt — log-tail section must be absent.
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'sandbox-user\ninstall-binaries\nwrite-install-state\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'install-binaries' '2' '13' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) printf 'log-tail section present but file absent; got: %s\n' \"\$out\" >&2; exit 1 ;;
+    *) ;;
+esac
+"
+
+_run_scenario "failure-report plain: log-tail section present and content appears" "
+$(printf '%s\n' "$EMIT_BLOCK")
+$(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+STATE_PATH=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_INSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_INSTALL\"' EXIT
+printf 'step=install_binaries action=fail status=fail\n' > \"\$TMPDIR_INSTALL/failure-log-tail.txt\"
+RICH_UI=0
+UI_PHASE_COUNT=0
+UI_PHASE_NAMES=''
+UI_PHASE_STATUSES=''
+out=\$(_print_failure_report 'install-binaries' '2' '13' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) ;;
+    *) printf 'plain: log-tail section not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'step=install_binaries'*) ;;
+    *) printf 'plain: log-tail content not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+"
+
+_run_scenario "failure-report plain: log-tail bytes identical to rich branch" "
+$(printf '%s\n' "$EMIT_BLOCK")
+$(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+STATE_PATH=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_INSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_INSTALL\"' EXIT
+printf 'step=install_binaries action=fail status=fail\n' > \"\$TMPDIR_INSTALL/failure-log-tail.txt\"
+UI_PHASE_COUNT=3
+RICH_UI=1
+UI_PHASE_NAMES=\$(printf 'sandbox-user\ninstall-binaries\nwrite-install-state\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+_rich_out=\$(_print_failure_report 'install-binaries' '2' '13' '' 2>&1)
+RICH_UI=0
+UI_PHASE_COUNT=0
+UI_PHASE_NAMES=''
+UI_PHASE_STATUSES=''
+_plain_out=\$(_print_failure_report 'install-binaries' '2' '13' '' 2>&1)
+_rich_tail=\$(printf '%s\n' \"\$_rich_out\" | sed -n '/Last log lines:/,\$p')
+_plain_tail=\$(printf '%s\n' \"\$_plain_out\" | sed -n '/Last log lines:/,\$p')
+[ \"\$_rich_tail\" = \"\$_plain_tail\" ] || {
+    printf 'log-tail block differs between rich and plain branches\nrich:\n%s\nplain:\n%s\n' \"\$_rich_tail\" \"\$_plain_tail\" >&2
+    exit 1
+}
+"
 
 # ---------------------------------------------------------------------------
 # Summary

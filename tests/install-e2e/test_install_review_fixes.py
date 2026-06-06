@@ -294,3 +294,70 @@ def test_last_completed_step_is_last_ok_on_failure(
     # We verify this with the idempotent-resume test below, but also check
     # that the complete-status state from a success run omits the field.
     # (Done in test_checkpoint_status_complete_on_success in test_install_phase2.py.)
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Unguarded abort names the failing step.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
+def test_unguarded_abort_names_failing_step(
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
+):
+    """Unguarded mid-step abort produces a failure report naming the step.
+
+    SANDBOX_INSTALL_PRIV_CHILD_ABORT_AT=install-binaries causes the privileged
+    child to execute a raw ``exit 1`` inside the install-binaries step body,
+    AFTER _step_begin but BEFORE _step_ok/_step_fail and without emitting a
+    ``STEP N fail`` token.  This simulates a command failure caught by ``set -e``
+    (e.g. a missing binary, a failed sysctl) — exactly the scenario that produced
+    "Install failed: unknown" in production.
+
+    The EXIT trap added to the generated privileged script detects _step_inflight=1
+    at exit time and emits the retroactive fail token so the consumer records the
+    correct step name.
+
+    Asserts:
+    - install exits non-zero,
+    - failure report contains the step name "install-binaries" (NOT "unknown"),
+    - failure report contains "Last log lines:" (log-tail section present),
+    - the sandboxd binary is absent (step never completed).
+    """
+    vm = vm_factory(distro_template)
+    tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
+
+    r = vm.shell(
+        install_sh_cmd(
+            tarball_in_vm,
+            vm=vm,
+            sigstore_stack=sigstore_stack,
+            env={"SANDBOX_INSTALL_PRIV_CHILD_ABORT_AT": "install-binaries"},
+        ),
+        timeout=120,
+    )
+
+    assert r.returncode != 0, (
+        f"install.sh should exit non-zero after unguarded abort; "
+        f"got exit 0.\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+
+    output = r.stdout + r.stderr
+
+    assert "install-binaries" in output, (
+        f"failure report must name the failing step 'install-binaries', "
+        f"not fall back to 'unknown':\n{output}"
+    )
+    assert "Install failed: unknown" not in output, (
+        f"failure report must not contain the fallback phrase 'Install failed: unknown' — "
+        f"step attribution did not work:\n{output}"
+    )
+    assert "Last log lines:" in output, (
+        f"failure report must include 'Last log lines:' section from the "
+        f"log-tail captured by the EXIT trap:\n{output}"
+    )
+
+    # The binary must NOT exist — the abort fired before install-binaries ran
+    # any install commands.
+    assert vm.shell("test -x /usr/local/libexec/sandboxd/sandboxd").returncode != 0, (
+        "sandboxd binary present despite unguarded abort in install-binaries"
+    )
