@@ -473,7 +473,7 @@ _ab_out=$(cat "$_ab_tty")
 # A partial-byte extraction would produce a broken byte sequence and would NOT
 # match any of these full 3-byte UTF-8 braille characters.
 _ab_found=0
-for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
+for _g in "⠁" "⠂" "⠄" "⠉" "⣿" "⠿"; do
     case "$_ab_out" in
         *"$_g"*) _ab_found=1; break ;;
     esac
@@ -498,7 +498,7 @@ _ab_raw=$(cat "$_ab_tty")
 # At least one complete braille glyph must be present in the output.
 # If a partial byte was emitted the canonical 3-byte form would not match.
 _ab_found=0
-for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
+for _g in "⠁" "⠂" "⠄" "⠉" "⣿" "⠿"; do
     case "$_ab_raw" in
         *"$_g"*) _ab_found=1; break ;;
     esac
@@ -508,26 +508,24 @@ done
 ' 24 4
 
 _run_scenario "animator: braille frame changes across ticks (spinner animates)" '
-# Run _ui_animator_body for ~6.3 s, which covers more than a full 24-frame bounce
-# cycle (24 × 0.25 s = 6.0 s). The bounce pattern has intentional duplicate frames
-# at the turnaround points (e.g. ⠂ at indices 5-6 and 17-18, ⠄ at indices 11-12),
-# so short captures could see only duplicates. A full-cycle capture guarantees
-# at least 2 distinct glyphs.
+# Run _ui_animator_body for ~1.5 s, which covers ~6 frames of the 35-frame
+# wrap-around cycle (35 × 0.25 s = 8.75 s full cycle; no duplicate frames so
+# even a short capture reliably yields ≥ 2 distinct glyphs).
 _ab_tty="$UI_TTY"
 _ui_animator_body "animating task" &
 _ab_pid=$!
-sleep 6.3
+sleep 1.5
 kill "$_ab_pid" 2>/dev/null || true
 wait "$_ab_pid" 2>/dev/null || true
 _ab_out=$(cat "$_ab_tty")
 _ab_distinct=0
-for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
+for _g in "⠁" "⠂" "⠄" "⠉" "⣿" "⠿"; do
     case "$_ab_out" in
         *"$_g"*) _ab_distinct=$(( _ab_distinct + 1 )) ;;
     esac
 done
 [ "$_ab_distinct" -ge 2 ] \
-    || { printf "only %d distinct braille frame(s) in 6.3s — spinner is not advancing\n" "$_ab_distinct" >&2; exit 1; }
+    || { printf "only %d distinct braille frame(s) in 1.5s — spinner is not advancing\n" "$_ab_distinct" >&2; exit 1; }
 '
 
 # ---------------------------------------------------------------------------
@@ -1109,7 +1107,7 @@ download_with_bar "http://example.com/fake" "$_fake_dest"
 # at the same display column as the animator detail line.
 _tty_out=$(cat "$UI_TTY")
 _pref_found=0
-for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
+for _g in "⠁" "⠂" "⠄" "⠉" "⣿" "⠿"; do
     case "$_tty_out" in
         *"  ${_g} fetching tarball"*) _pref_found=1; break ;;
     esac
@@ -1150,10 +1148,10 @@ DOWNLOAD_BAR_FAILED=0
 UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
 _tty_out=$(cat "$UI_TTY")
-# The download bar draws its own braille bounce spinner glyph (not the old block chars).
+# The download bar draws its own braille wrap-around spinner glyph (not the old block chars).
 # Confirm at least one braille glyph is present in the captured output.
 _braille_found=0
-for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
+for _g in "⠁" "⠂" "⠄" "⠉" "⣿" "⠿"; do
     case "$_tty_out" in
         *"$_g"*) _braille_found=1; break ;;
     esac
@@ -1202,7 +1200,7 @@ download_with_bar "http://example.com/fake" "$_fake_dest"
 _tty_out=$(cat "$UI_TTY")
 # Count distinct braille frames seen in the captured TTY output.
 _distinct=0
-for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
+for _g in "⠁" "⠂" "⠄" "⠉" "⣿" "⠿"; do
     case "$_tty_out" in
         *"$_g"*) _distinct=$(( _distinct + 1 )) ;;
     esac

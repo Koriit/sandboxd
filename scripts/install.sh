@@ -779,38 +779,49 @@ ui_render_checklist() {
     fi
 }
 
-# _ui_spinner_frame INDEX — emit the braille spinner glyph for INDEX % 24.
+# _ui_spinner_frame INDEX — emit the braille spinner glyph for INDEX % 35.
 # Uses a case statement (not cut -c) so each 3-byte UTF-8 glyph is always
-# emitted whole, regardless of locale or shell. The 24 frames describe a
-# back-and-forth bounce: dots sweep up across the braille cell then reverse
-# and sweep back down, pausing at each turnaround. The intentional repeats
-# (e.g. ⠂ at indices 5-6 and 17-18) implement the easing dwell at endpoints.
+# emitted whole, regardless of locale or shell. The 35 frames describe a
+# wrap-around fill/drain spinner: dots progressively fill the braille cell
+# from empty to the fully-filled ⣿ glyph, then drain back to empty and
+# wrap around continuously — no back-and-forth, no duplicate frames.
 _ui_spinner_frame() {
-    case "$(($1 % 24))" in
+    case "$(($1 % 35))" in
         0)  printf '⠁' ;;
-        1)  printf '⠉' ;;
-        2)  printf '⠙' ;;
-        3)  printf '⠚' ;;
-        4)  printf '⠒' ;;
-        5)  printf '⠂' ;;
-        6)  printf '⠂' ;;
-        7)  printf '⠒' ;;
-        8)  printf '⠲' ;;
-        9)  printf '⠴' ;;
-        10) printf '⠤' ;;
-        11) printf '⠄' ;;
-        12) printf '⠄' ;;
-        13) printf '⠤' ;;
-        14) printf '⠴' ;;
-        15) printf '⠲' ;;
-        16) printf '⠒' ;;
-        17) printf '⠂' ;;
-        18) printf '⠂' ;;
-        19) printf '⠒' ;;
-        20) printf '⠚' ;;
-        21) printf '⠙' ;;
-        22) printf '⠉' ;;
-        23) printf '⠁' ;;
+        1)  printf '⠂' ;;
+        2)  printf '⠄' ;;
+        3)  printf '⡀' ;;
+        4)  printf '⡈' ;;
+        5)  printf '⡐' ;;
+        6)  printf '⡠' ;;
+        7)  printf '⣀' ;;
+        8)  printf '⣁' ;;
+        9)  printf '⣂' ;;
+        10) printf '⣄' ;;
+        11) printf '⣌' ;;
+        12) printf '⣔' ;;
+        13) printf '⣤' ;;
+        14) printf '⣥' ;;
+        15) printf '⣦' ;;
+        16) printf '⣮' ;;
+        17) printf '⣶' ;;
+        18) printf '⣷' ;;
+        19) printf '⣿' ;;
+        20) printf '⡿' ;;
+        21) printf '⠿' ;;
+        22) printf '⢟' ;;
+        23) printf '⠟' ;;
+        24) printf '⡛' ;;
+        25) printf '⠛' ;;
+        26) printf '⠫' ;;
+        27) printf '⢋' ;;
+        28) printf '⠋' ;;
+        29) printf '⠍' ;;
+        30) printf '⡉' ;;
+        31) printf '⠉' ;;
+        32) printf '⠑' ;;
+        33) printf '⠡' ;;
+        34) printf '⢁' ;;
         *)  printf '⠁' ;;
     esac
 }
