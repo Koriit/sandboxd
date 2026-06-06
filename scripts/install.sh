@@ -781,17 +781,17 @@ ui_render_checklist() {
 
 # _ui_spinner_frame INDEX — emit the braille spinner glyph for INDEX % 4.
 # Uses a case statement (not cut -c) so each 3-byte UTF-8 glyph is always
-# emitted whole, regardless of locale or shell. Only uniform 3-dot frames are
-# used so every frame has equal visual weight: a clean 4-step orbit
-# ⠋ ⠙ ⠴ ⠦. The asymmetric (⠸ ⠼) and 4-dot (⠹ ⠧) frames are omitted because
-# they render offset/heavier in many fonts and break the rotation's symmetry.
+# emitted whole, regardless of locale or shell. A single dot orbits the four
+# corners of the 2x3 braille cell — top-left (dot 1), top-right (dot 4),
+# bottom-right (dot 6), bottom-left (dot 3) — clockwise. Every frame is one
+# dot, so the rotation is perfectly uniform: ⠁ ⠈ ⠠ ⠄.
 _ui_spinner_frame() {
     case "$(($1 % 4))" in
-        0) printf '⠋' ;;
-        1) printf '⠙' ;;
-        2) printf '⠴' ;;
-        3) printf '⠦' ;;
-        *) printf '⠋' ;;
+        0) printf '⠁' ;;
+        1) printf '⠈' ;;
+        2) printf '⠠' ;;
+        3) printf '⠄' ;;
+        *) printf '⠁' ;;
     esac
 }
 
