@@ -2667,6 +2667,7 @@ write_priv_script() {
     # the privileged child receives it even though sudo strips the env.
     _fail_after_esc=$(_sq "${SANDBOX_INSTALL_PRIV_CHILD_FAIL_AFTER:-}")
     _fail_before_fifo_esc=$(_sq "${SANDBOX_INSTALL_PRIV_CHILD_FAIL_BEFORE_FIFO:-}")
+    _abort_at_esc=$(_sq "${SANDBOX_INSTALL_PRIV_CHILD_ABORT_AT:-}")
 
     cat > "$PRIV_SCRIPT" <<PRIV_SCRIPT_EOF
 #!/bin/sh
@@ -2697,6 +2698,21 @@ fi
 # and does not hit spurious EOF between individual step writes.
 exec 3> "\$_FIFO"
 
+# EXIT trap: when set -e aborts mid-step (an unguarded command failure), the
+# child exits non-zero without ever calling _step_fail, so the parent never
+# sees a STEP N fail token and falls back to "unknown" in the failure report.
+# This trap catches those unguarded exits: if a step was in-flight (_step_inflight=1)
+# and the exit status is non-zero, emit the fail token retroactively so the
+# consumer can record the correct step name.  Write the last 12 log lines to
+# a temp file so the parent can surface them in the failure report.
+trap '_xs=\$?
+if [ "\$_xs" -ne 0 ] && [ "\${_step_inflight:-0}" -eq 1 ]; then
+    printf "STEP %s fail %s\n" "\$_n" "\$_label" >&3 2>/dev/null || true
+fi
+tail -n 12 "\$_LOG" > "\$TMPDIR_INSTALL/failure-log-tail.txt" 2>/dev/null || true
+chmod a+r "\$TMPDIR_INSTALL/failure-log-tail.txt" 2>/dev/null || true
+exec 3>&- 2>/dev/null || true' EXIT
+
 _n=0
 _TOTAL_STEPS=13
 # Tracks the label of the last successfully completed step (set by _step_ok).
@@ -2704,16 +2720,22 @@ _TOTAL_STEPS=13
 # failure checkpoints (the failing step should appear in failed_step, not
 # in last_completed_step which must name an actually completed step).
 _last_ok_step=""
+# Tracks whether a step is currently executing so the EXIT trap can emit a
+# retroactive fail token when set -e aborts mid-step without calling _step_fail.
+_step_inflight=0
 _step_begin() {
     _n=\$((_n + 1))
     _label="\$1"
+    _step_inflight=1
     printf 'STEP %s begin %s\n' "\$_n" "\$_label" >&3
 }
 _step_ok() {
+    _step_inflight=0
     printf 'STEP %s ok %s\n' "\$_n" "\$_label" >&3
     _last_ok_step="\$_label"
 }
 _step_fail() {
+    _step_inflight=0
     printf 'STEP %s fail %s\n' "\$_n" "\$_label" >&3
     # Write a failed-status checkpoint if BASE_DIR is resolved so uninstall
     # can act on it. _write_checkpoint is not yet defined here; we call it
@@ -2945,10 +2967,26 @@ _priv_maybe_fail_after() {
         exit 1
     fi
 }
+#
+# SANDBOX_INSTALL_PRIV_CHILD_ABORT_AT — test hook that causes an unguarded
+# raw exit 1 INSIDE the named step body, without emitting a STEP fail token.
+# This simulates a command that fails under set -e (e.g. a missing binary or
+# a failed sysctl call) — exactly the condition the EXIT trap is designed to
+# catch.  The hook is called at the START of the step body (after _step_begin)
+# so the step never completes.  MUST NEVER BE SET IN PRODUCTION.
+_abort_at='$_abort_at_esc'
+_priv_maybe_abort_at() {
+    if [ -n "\$_abort_at" ] && [ "\$_abort_at" = "\$1" ]; then
+        # Raw exit — no STEP fail token, no checkpoint.  The EXIT trap must
+        # detect _step_inflight=1 and emit the fail token on our behalf.
+        exit 1
+    fi
+}
 # END_TEST_ENV
 
 # ----- Step: sandbox user -----
 _step_begin "sandbox-user"
+_priv_maybe_abort_at "sandbox-user"
 SANDBOX_USER_CREATED=0
 if [ "\$PLAN_SANDBOX_USER" = "create" ]; then
     useradd \\
@@ -2983,6 +3021,7 @@ _priv_maybe_fail_after "sandbox-user"
 
 # ----- Step: operator group add -----
 _step_begin "operator-group-add"
+_priv_maybe_abort_at "operator-group-add"
 OPERATORS_ADDED=""
 if [ "\$PLAN_OPERATOR_ADD" = "add" ] && [ -n "\$_OPERATOR" ]; then
     usermod -aG sandbox "\$_OPERATOR" >> "\$_LOG" 2>&1 || { _log "step=operator_add action=fail status=fail"; _step_fail; }
@@ -2997,6 +3036,7 @@ _priv_maybe_fail_after "operator-group-add"
 
 # ----- Step: install binaries -----
 _step_begin "install-binaries"
+_priv_maybe_abort_at "install-binaries"
 # Fail-injection hook fires before any binary reaches disk so that test
 # assertions can verify the destination path is absent on abort.
 _priv_maybe_fail_after "install-binaries"
@@ -3041,6 +3081,7 @@ _write_checkpoint "install-binaries"
 
 # ----- Step: setcap route-helper -----
 _step_begin "setcap-route-helper"
+_priv_maybe_abort_at "setcap-route-helper"
 if [ "\$PLAN_ROUTE_HELPER_CAPS" = "set" ]; then
     setcap "\$PLAN_ROUTE_CAPS_STR" "\$PLAN_ROUTE_HELPER_PATH" >> "\$_LOG" 2>&1 \
         || { _log "step=setcap caps=\$PLAN_ROUTE_CAPS_STR action=fail status=fail"; _step_fail; }
@@ -3059,6 +3100,7 @@ _priv_maybe_fail_after "setcap-route-helper"
 
 # ----- Step: setcap lima-helper -----
 _step_begin "setcap-lima-helper"
+_priv_maybe_abort_at "setcap-lima-helper"
 if [ "\$PLAN_LIMA_HELPER_CAPS" = "set" ]; then
     setcap "\$PLAN_LIMA_CAPS_STR" "\$PLAN_LIMA_HELPER_PATH" >> "\$_LOG" 2>&1 \
         || { _log "step=setcap caps=\$PLAN_LIMA_CAPS_STR action=fail status=fail"; _step_fail; }
@@ -3077,6 +3119,7 @@ _priv_maybe_fail_after "setcap-lima-helper"
 
 # ----- Step: bridge-helper setuid -----
 _step_begin "bridge-helper-setuid"
+_priv_maybe_abort_at "bridge-helper-setuid"
 WE_SET_BRIDGE_HELPER_SETUID=0
 if [ "\$PLAN_BRIDGE_HELPER_SETUID" = "set" ]; then
     chmod u+s "\$BRIDGE_HELPER" >> "\$_LOG" 2>&1 \
@@ -3092,6 +3135,7 @@ _priv_maybe_fail_after "bridge-helper-setuid"
 
 # ----- Step: bridge.conf -----
 _step_begin "bridge-conf"
+_priv_maybe_abort_at "bridge-conf"
 WE_ADDED_BRIDGE_CONF_RULES=""
 if [ "\$PLAN_BRIDGE_CONF" = "append" ]; then
     printf '%s\n' "\$PLAN_BRIDGE_CONF_APPEND" >> /etc/qemu/bridge.conf \
@@ -3115,6 +3159,7 @@ _priv_maybe_fail_after "bridge-conf"
 
 # ----- Step: users.conf -----
 _step_begin "users-conf"
+_priv_maybe_abort_at "users-conf"
 WE_CREATED_USERS_CONF=0
 if [ "\$PLAN_USERS_CONF" = "create" ]; then
     mkdir -p /etc/sandboxd >> "\$_LOG" 2>&1 \
@@ -3135,6 +3180,7 @@ _priv_maybe_fail_after "users-conf"
 
 # ----- Step: docker load gateway -----
 _step_begin "docker-load-gateway"
+_priv_maybe_abort_at "docker-load-gateway"
 _gateway_tag="sandbox-gateway:\$VERSION"
 if [ "\$PLAN_GATEWAY_IMAGE" = "load" ]; then
     _image_path="\$STAGE/images/sandbox-gateway-\${VERSION}.tar"
@@ -3156,6 +3202,7 @@ _priv_maybe_fail_after "docker-load-gateway"
 
 # ----- Step: migrate legacy state -----
 _step_begin "migrate-legacy-state"
+_priv_maybe_abort_at "migrate-legacy-state"
 _legacy_dir="/var/lib/sandbox"
 if [ "\$PLAN_LEGACY_MIGRATE" = "migrate" ]; then
     install -d -o root -g root -m 0755 /var/lib/sandboxd >> "\$_LOG" 2>&1 || true
@@ -3194,6 +3241,7 @@ _priv_maybe_fail_after "migrate-legacy-state"
 
 # ----- Step: install systemd unit -----
 _step_begin "install-systemd-unit"
+_priv_maybe_abort_at "install-systemd-unit"
 if [ "\$PLAN_UNIT" = "install" ]; then
     _unit_src="\$STAGE/systemd/sandboxd.service"
     _unit_rendered="\$TMPDIR_INSTALL/sandboxd.service.rendered"
@@ -3215,6 +3263,7 @@ _priv_maybe_fail_after "install-systemd-unit"
 
 # ----- Step: systemctl daemon-reload -----
 _step_begin "daemon-reload"
+_priv_maybe_abort_at "daemon-reload"
 systemctl daemon-reload >> "\$_LOG" 2>&1 \
     || { _log "step=daemon_reload action=fail status=fail"; _step_fail; }
 _log "step=daemon_reload status=ok"
@@ -3224,6 +3273,7 @@ _priv_maybe_fail_after "daemon-reload"
 
 # ----- Step: write install-state (final, status=complete) -----
 _step_begin "write-install-state"
+_priv_maybe_abort_at "write-install-state"
 # Write the final checkpoint with status=complete. _write_checkpoint handles
 # directory creation and the atomic install to STATE_PATH.
 _write_checkpoint "write-install-state" "complete"
@@ -3544,6 +3594,14 @@ _print_failure_report() {
             printf '%b\n' "    (status=failed; we_* flags reflect what was applied)"
         fi
         printf '%b\n' "  Install log: ${INSTALL_LOG}"
+        if [ -f "$TMPDIR_INSTALL/failure-log-tail.txt" ] \
+                && [ -s "$TMPDIR_INSTALL/failure-log-tail.txt" ]; then
+            emit ""
+            emit "  Last log lines:"
+            while IFS= read -r _fr_line; do
+                emit "    ${_fr_line}"
+            done < "$TMPDIR_INSTALL/failure-log-tail.txt"
+        fi
         printf '\n'
     else
         emit ""
@@ -3571,6 +3629,14 @@ _print_failure_report() {
             emit "    (status=failed; we_* flags reflect what was applied)"
         fi
         emit "  Install log:           $INSTALL_LOG"
+        if [ -f "$TMPDIR_INSTALL/failure-log-tail.txt" ] \
+                && [ -s "$TMPDIR_INSTALL/failure-log-tail.txt" ]; then
+            emit ""
+            emit "  Last log lines:"
+            while IFS= read -r _fr_line; do
+                emit "    ${_fr_line}"
+            done < "$TMPDIR_INSTALL/failure-log-tail.txt"
+        fi
         emit ""
     fi
 }
