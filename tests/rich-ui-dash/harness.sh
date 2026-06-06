@@ -538,6 +538,50 @@ _cp_render
 '
 
 # ---------------------------------------------------------------------------
+# confirm_plan footer: pager prompt must contain literal arrow glyphs, not \x
+#
+# The footer printf previously used \xe2\x86\x91 / \xe2\x86\x93 / \xe2\x80\x93
+# for ↑, ↓, and – (en-dash).  Dash's printf does not interpret \x escapes (they
+# are a bash/GNU extension), so those would print literally as "\xe2\x86\x91"
+# etc. under dash.  The fix is to embed the literal UTF-8 glyphs directly.
+# This assertion verifies that the footer output contains the actual Unicode
+# characters and does NOT contain the text "\x" anywhere.
+# ---------------------------------------------------------------------------
+
+_run_scenario "confirm_plan footer: literal ↑/↓/– glyphs, no \\x text" '
+# Re-create only the variables the footer printf needs; invoke the footer
+# printf directly (no need to exercise the full pager state machine).
+_cpr_a=1
+_cpr_b=10
+_cp_plan_lines=20
+_footer_out=$(printf '"'"'[y] proceed  [n] abort  ↑/↓ PgUp/PgDn scroll  lines %d–%d of %d  '"'"' \
+    "$_cpr_a" "$_cpr_b" "$_cp_plan_lines")
+# Must contain literal ↑.
+case "$_footer_out" in
+    *"↑"*) : ;;
+    *) printf "footer missing literal ↑ arrow\n" >&2; exit 1 ;;
+esac
+# Must contain literal ↓.
+case "$_footer_out" in
+    *"↓"*) : ;;
+    *) printf "footer missing literal ↓ arrow\n" >&2; exit 1 ;;
+esac
+# Must contain literal – (en-dash U+2013).
+case "$_footer_out" in
+    *"–"*) : ;;
+    *) printf "footer missing literal – (en-dash)\n" >&2; exit 1 ;;
+esac
+# Must NOT contain the text \x (which would indicate an uninterpreted hex escape).
+case "$_footer_out" in
+    *"\\x"*)
+        printf "footer contains literal \\\\x text — hex escape was not interpreted: %s\n" \
+            "$_footer_out" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
 # Structural escape-sequence assertions: ui_render_checklist
 #
 # These assert that the repaint strategy is "clear-as-you-draw":

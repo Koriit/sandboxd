@@ -2359,7 +2359,7 @@ confirm_plan() {
             _cpr_rule=$(printf '%*s' "${UI_COLS:-80}" '' | tr ' ' '-' \
                 | cut -c1-"${UI_COLS:-80}")
             printf '%s\r\n' "$_cpr_rule" >>"$UI_TTY"
-            printf '[y] proceed  [n] abort  \xe2\x86\x91/\xe2\x86\x93 PgUp/PgDn scroll  lines %d\xe2\x80\x93%d of %d  ' \
+            printf '[y] proceed  [n] abort  ↑/↓ PgUp/PgDn scroll  lines %d–%d of %d  ' \
                 "$_cpr_a" "$_cpr_b" "$_cp_plan_lines" >>"$UI_TTY"
         }
 
