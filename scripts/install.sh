@@ -1078,7 +1078,9 @@ resolve_target_version() {
         VERSION="$resolved"
         log_ok "step=resolve_version source=manifest version=$VERSION"
     elif [ "$VERSION" = "latest" ] && [ -z "$FROM" ]; then
-        emit "  resolving latest release tag ..."
+        if [ "$RICH_UI" -ne 1 ]; then
+            emit "  resolving latest release tag ..."
+        fi
         # Strip a leading 'v' from the tag if present.
         resolved=$(curl -fsSL "$LATEST_API_URL" 2>/dev/null \
             | grep '"tag_name"' \
@@ -1145,7 +1147,11 @@ detect_preexisting() {
                     # which will re-detect completed steps and skip them,
                     # effectively resuming the install.
                     log_ok "step=preexist version=$existing_ver status=$_prior_status action=resume"
-                    emit "${YELLOW}!${RESET} Resuming partial install of sandboxd $existing_ver (prior status: $_prior_status)."
+                    if [ "$RICH_UI" -eq 1 ]; then
+                        set_phase 1 "active" "resuming partial install of $existing_ver"
+                    else
+                        emit "${YELLOW}!${RESET} Resuming partial install of sandboxd $existing_ver (prior status: $_prior_status)."
+                    fi
                     ;;
                 *)
                     # status=complete (or absent / unknown) — already installed.
@@ -1209,8 +1215,11 @@ check_prereqs() {
         if ! docker info >/dev/null 2>&1; then
             # docker installed but daemon unreachable from this user;
             # not fatal at this step (operator-group-add fixes it),
-            # but call it out.
-            emit "${YELLOW}!${RESET} docker is installed but not reachable from this user."
+            # but call it out. In rich mode the managed checklist screen
+            # owns stdout, so suppress the plain-text warning there.
+            if [ "$RICH_UI" -ne 1 ]; then
+                emit "${YELLOW}!${RESET} docker is installed but not reachable from this user."
+            fi
         fi
     else
         add_missing "docker"
@@ -2369,8 +2378,15 @@ confirm_plan() {
             ui_render_header "sandboxd $VERSION · review plan"
 
             # Plan lines for the viewport window.
+            # ORS='\r\n': the terminal is in stty raw mode, so bare \n is
+            # LF-only (no CR). Without the explicit CR every line would
+            # advance the row but not return to column 0, producing a
+            # staircase. Width is not clamped here because plan lines may
+            # contain ANSI SGR escapes; naive byte-truncation would split
+            # escape sequences mid-sequence and cause color bleed. The
+            # terminal will wrap overlong lines — an acceptable trade-off.
             printf '%s\n' "$_cp_plan_text" \
-                | awk -v s="$_cpr_a" -v e="$_cpr_b" 'NR>=s && NR<=e' \
+                | awk -v s="$_cpr_a" -v e="$_cpr_b" -v ORS='\r\n' 'NR>=s && NR<=e' \
                 >>"$UI_TTY"
 
             # Pad remaining viewport rows with blank lines.
