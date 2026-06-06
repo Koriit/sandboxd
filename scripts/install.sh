@@ -819,7 +819,7 @@ _ui_animator_body() {
         # Writing before erasing means the cursor never passes through a
         # blank stretch — no blank-frame flash on each animator tick.
         printf '\r%s\033[K' "$_ab_clamped" >>"$_ab_tty"
-        sleep 0.25
+        sleep 0.1
         _ab_t=$((_ab_t + 1))
     done
 }
@@ -1695,7 +1695,7 @@ download_with_bar() {
                     "$_dwb_done_mb" "$_dwb_total_mb" \
                     >>"$UI_TTY"
             fi
-            sleep 0.2
+            sleep 0.1
         done
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
         # Clear the detail line once the download finishes.  Use EL2 (\033[2K)
