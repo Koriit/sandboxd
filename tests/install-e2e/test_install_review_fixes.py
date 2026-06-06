@@ -347,8 +347,8 @@ def test_unguarded_abort_names_failing_step(
         f"failure report must name the failing step 'install-binaries', "
         f"not fall back to 'unknown':\n{output}"
     )
-    assert "unknown" not in output, (
-        f"failure report must not contain the fallback word 'unknown' — "
+    assert "Install failed: unknown" not in output, (
+        f"failure report must not contain the fallback phrase 'Install failed: unknown' — "
         f"step attribution did not work:\n{output}"
     )
     assert "Last log lines:" in output, (

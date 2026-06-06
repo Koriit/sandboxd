@@ -2709,8 +2709,10 @@ trap '_xs=\$?
 if [ "\$_xs" -ne 0 ] && [ "\${_step_inflight:-0}" -eq 1 ]; then
     printf "STEP %s fail %s\n" "\$_n" "\$_label" >&3 2>/dev/null || true
 fi
-tail -n 12 "\$_LOG" > "\$TMPDIR_INSTALL/failure-log-tail.txt" 2>/dev/null || true
-chmod a+r "\$TMPDIR_INSTALL/failure-log-tail.txt" 2>/dev/null || true
+if [ -n "\${TMPDIR_INSTALL:-}" ]; then
+    tail -n 12 "\$_LOG" > "\$TMPDIR_INSTALL/failure-log-tail.txt" 2>/dev/null || true
+    chmod a+r "\$TMPDIR_INSTALL/failure-log-tail.txt" 2>/dev/null || true
+fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
@@ -2943,6 +2945,12 @@ BASE_DIR=""
 STATE_PATH=""
 SANDBOX_UID=""
 
+# Production no-op stubs — shadowed by the real definitions inside BEGIN_TEST_ENV
+# when the test block is present. These survive the docs-deploy strip so the
+# published installer does not call undefined functions under set -eu.
+_priv_maybe_fail_after() { :; }
+_priv_maybe_abort_at() { :; }
+
 # BEGIN_TEST_ENV — stripped from published install.sh at docs-deploy time
 #
 # SANDBOX_INSTALL_PRIV_CHILD_FAIL_AFTER — test hook that forces the
@@ -2977,9 +2985,10 @@ _priv_maybe_fail_after() {
 _abort_at='$_abort_at_esc'
 _priv_maybe_abort_at() {
     if [ -n "\$_abort_at" ] && [ "\$_abort_at" = "\$1" ]; then
-        # Raw exit — no STEP fail token, no checkpoint.  The EXIT trap must
-        # detect _step_inflight=1 and emit the fail token on our behalf.
-        exit 1
+        # Bare failing command — lets set -e abort exactly as a real unguarded
+        # production failure would.  The EXIT trap detects _step_inflight=1
+        # and emits the fail token on our behalf.
+        false
     fi
 }
 # END_TEST_ENV
@@ -3596,10 +3605,10 @@ _print_failure_report() {
         printf '%b\n' "  Install log: ${INSTALL_LOG}"
         if [ -f "$TMPDIR_INSTALL/failure-log-tail.txt" ] \
                 && [ -s "$TMPDIR_INSTALL/failure-log-tail.txt" ]; then
-            emit ""
-            emit "  Last log lines:"
+            printf '\n'
+            printf '  Last log lines:\n'
             while IFS= read -r _fr_line; do
-                emit "    ${_fr_line}"
+                printf '    %s\n' "$_fr_line"
             done < "$TMPDIR_INSTALL/failure-log-tail.txt"
         fi
         printf '\n'
@@ -3631,10 +3640,10 @@ _print_failure_report() {
         emit "  Install log:           $INSTALL_LOG"
         if [ -f "$TMPDIR_INSTALL/failure-log-tail.txt" ] \
                 && [ -s "$TMPDIR_INSTALL/failure-log-tail.txt" ]; then
-            emit ""
-            emit "  Last log lines:"
+            printf '\n'
+            printf '  Last log lines:\n'
             while IFS= read -r _fr_line; do
-                emit "    ${_fr_line}"
+                printf '    %s\n' "$_fr_line"
             done < "$TMPDIR_INSTALL/failure-log-tail.txt"
         fi
         emit ""
