@@ -2191,6 +2191,20 @@ compute_plan() {
     done
     PLAN_BINARIES="$_bin_plan"
 
+    # ---- caps override: installing a binary always strips the xattr ----
+    # install(1) strips security.capability when it overwrites the file, so
+    # any pre-existing caps read above are no longer valid once the binary is
+    # rewritten. Force setcap whenever the binary entry is "install:" —
+    # regardless of what getcap reported on the OLD on-disk binary.
+    case "$PLAN_BINARIES" in
+        *"install:${PLAN_ROUTE_HELPER_PATH};"*)
+            PLAN_ROUTE_HELPER_CAPS="set" ;;
+    esac
+    case "$PLAN_BINARIES" in
+        *"install:${PLAN_LIMA_HELPER_PATH};"*)
+            PLAN_LIMA_HELPER_CAPS="set" ;;
+    esac
+
     # ---- systemd unit (cmp rendered vs installed) ----
     unit_src="$STAGE/systemd/sandboxd.service"
     unit_dst="$PLAN_UNIT_DST"
@@ -3183,6 +3197,14 @@ if [ "\$PLAN_USERS_CONF" = "create" ]; then
 else
     _log "step=users_conf action=skip status=ok"
 fi
+# Apply config-migration chain via the just-installed binary. Idempotent:
+# newly-created files are already at the latest schema version and the
+# chain returns immediately; pre-existing files (including v0 files
+# without _schema_version) are migrated to the current target. Runs as
+# root — the binary's root gate is satisfied inside the privileged child.
+/usr/local/bin/sandbox apply-config-migrations >> "\$_LOG" 2>&1 \
+    || { _log "step=users_conf action=migrate-fail status=fail"; _step_fail; }
+_log "step=users_conf action=migrate status=ok"
 _step_ok
 _write_checkpoint "users-conf"
 _priv_maybe_fail_after "users-conf"

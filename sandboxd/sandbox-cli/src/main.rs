@@ -530,6 +530,21 @@ enum Command {
         out: String,
     },
 
+    /// Hidden installer affordance: apply the full config-migration chain
+    /// for every managed config file, idempotently advancing each to the
+    /// latest registered schema version.
+    ///
+    /// Requires root (`geteuid() == 0`). Writes directly to the canonical
+    /// paths (e.g. `/etc/sandboxd/users.conf`, `/etc/qemu/bridge.conf`)
+    /// using atomic rename. Safe to call when a file is already at the
+    /// latest version — `apply_pending_at` is a no-op in that case.
+    ///
+    /// Invoked by `scripts/install.sh` from within its privileged root
+    /// batch after the binaries are written, so that a pre-existing v0
+    /// `users.conf` is migrated before the daemon is (re)started.
+    #[command(hide = true, name = "apply-config-migrations")]
+    ApplyConfigMigrations,
+
     /// Hidden internal affordance: print the static migration registry
     /// as JSON to stdout. Used by `sandbox update --dry-run` for the
     /// stopped-session classification step. Read-only
@@ -1431,10 +1446,11 @@ fn build_request(command: &Command) -> Option<Request<String>> {
         // dispatched client-side in `main()` before `build_request`
         // is reached. Reaching this branch indicates a dispatch bug.
         Command::ApplyConfigMigration { .. }
+        | Command::ApplyConfigMigrations
         | Command::DumpMigrationSet
         | Command::DumpProtoVersion => {
             unreachable!(
-                "`sandbox apply-config-migration` / `dump-migration-set` / \
+                "`sandbox apply-config-migration(s)` / `dump-migration-set` / \
                  `dump-proto-version` are handled client-side in main() before build_request"
             );
         }
@@ -1684,6 +1700,7 @@ fn command_bypasses_version_check(command: &Command) -> bool {
         Command::Version
             | Command::Doctor { .. }
             | Command::ApplyConfigMigration { .. }
+            | Command::ApplyConfigMigrations
             | Command::DumpMigrationSet
             | Command::DumpProtoVersion
             // `sandbox update` must run under a CLI/daemon version
@@ -2012,6 +2029,7 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             );
         }
         Command::ApplyConfigMigration { .. }
+        | Command::ApplyConfigMigrations
         | Command::DumpMigrationSet
         | Command::DumpProtoVersion => {
             // Hidden config-migration / proto-version affordances are
@@ -2019,7 +2037,7 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             // before any HTTP request fires. Reaching `handle_response`
             // for them indicates a dispatch bug.
             unreachable!(
-                "`apply-config-migration` / `dump-migration-set` / `dump-proto-version` \
+                "`apply-config-migration(s)` / `dump-migration-set` / `dump-proto-version` \
                  are handled client-side in main() before send_request"
             );
         }
@@ -5918,6 +5936,63 @@ fn handle_dump_proto_version() -> i32 {
     }
 }
 
+/// `apply-config-migrations` handler.
+///
+/// Applies the full migration chain for every managed config file that
+/// exists on disk, advancing each to the latest registered schema version.
+/// Files already at the latest version are silently skipped (idempotent).
+/// Files that do not exist on disk are skipped without error — they will
+/// be created fresh by the daemon or a later install step with the correct
+/// schema.
+///
+/// Requires root. Returns `0` on success (including nothing-to-do),
+/// `1` on any error.
+fn handle_apply_config_migrations() -> i32 {
+    use sandbox_cli::cfg_migrations::TargetFile;
+
+    let euid = nix::unistd::geteuid();
+    if !euid.is_root() {
+        eprintln!(
+            "sandbox: apply-config-migrations requires root; \
+             run as root (e.g. from within the installer's privileged batch)"
+        );
+        return 1;
+    }
+
+    let files = [TargetFile::UsersConf, TargetFile::BridgeConf];
+    let mut exit_code = 0i32;
+
+    for file in files {
+        let path = file.canonical_path();
+        if !path.exists() {
+            continue;
+        }
+        match sandbox_cli::cfg_migrations::apply_pending_at(file, &path) {
+            Ok(applied) if applied.is_empty() => {
+                // Already at latest version — no-op.
+            }
+            Ok(applied) => {
+                let ids: Vec<String> =
+                    applied.iter().map(|id| format!("V{id:03}")).collect();
+                eprintln!(
+                    "sandbox: apply-config-migrations: {} migrated ({})",
+                    path.display(),
+                    ids.join(", ")
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "sandbox: apply-config-migrations: failed for {}: {e}",
+                    path.display()
+                );
+                exit_code = 1;
+            }
+        }
+    }
+
+    exit_code
+}
+
 /// Per-backend dispatcher for `sandbox rebuild-image`.
 ///
 /// Fans out one HTTP call per selected backend, prefixes per-backend
@@ -6300,6 +6375,10 @@ async fn main() {
     } = &cli.command
     {
         let code = handle_apply_config_migration(file, migration, out);
+        process::exit(code);
+    }
+    if matches!(&cli.command, Command::ApplyConfigMigrations) {
+        let code = handle_apply_config_migrations();
         process::exit(code);
     }
     if matches!(&cli.command, Command::DumpMigrationSet) {
