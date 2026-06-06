@@ -459,7 +459,7 @@ ui_animator_stop
 [ "$UI_ANIM_PID" -eq 0 ] || { printf "PID not zero\n" >&2; exit 1; }
 '
 
-_run_scenario "animator: _ui_animator_body emits a complete circle-arc UTF-8 glyph (not a partial byte)" '
+_run_scenario "animator: _ui_animator_body emits a complete braille UTF-8 glyph (not a partial byte)" '
 # Run _ui_animator_body for a short burst (0.3 s covers at least one 0.25 s tick)
 # then kill it and inspect what it wrote to the TTY.
 _ab_tty="$UI_TTY"
@@ -469,23 +469,23 @@ sleep 0.3
 kill "$_ab_pid" 2>/dev/null || true
 wait "$_ab_pid" 2>/dev/null || true
 _ab_out=$(cat "$_ab_tty")
-# The output must contain at least one complete circle-arc spinner glyph.
+# The output must contain at least one complete braille spinner glyph.
 # A partial-byte extraction would produce a broken byte sequence and would NOT
-# match any of these full 3-byte UTF-8 arc characters.
+# match any of these full 3-byte UTF-8 braille characters.
 _ab_found=0
-for _g in "◜" "◝" "◞" "◟"; do
+for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
     case "$_ab_out" in
         *"$_g"*) _ab_found=1; break ;;
     esac
 done
 [ "$_ab_found" -eq 1 ] \
-    || { printf "_ui_animator_body output contains no complete circle-arc spinner glyph (possible partial-byte bug)\n" >&2; exit 1; }
+    || { printf "_ui_animator_body output contains no complete braille spinner glyph (possible partial-byte bug)\n" >&2; exit 1; }
 '
 
 _run_scenario "animator: detail-line width clamp does not split leading glyph bytes (cut -c regression)" '
-# At terminal width 4 the detail line is "  ◜ task" (2 spaces + arc glyph + space + ...).
-# Each arc glyph is 3 bytes (e.g. ◜ = e2 97 9c).  At width=4 the whole prefix
-# "  ◜ " fits (4 chars).  The old cut -c implementation would count 4 BYTES and
+# At terminal width 4 the detail line is "  ⠁ task" (2 spaces + braille glyph + space + ...).
+# Each braille glyph is 3 bytes (e.g. ⠁ = e2 a0 81).  At width=4 the whole prefix
+# "  ⠁ " fits (4 chars).  The old cut -c implementation would count 4 BYTES and
 # return "  " + first 2 bytes of the glyph, emitting a broken sequence.
 # Run for a short burst and capture the output to verify no partial byte appears.
 _ab_tty="$UI_TTY"
@@ -495,37 +495,39 @@ sleep 0.6
 kill "$_ab_pid" 2>/dev/null || true
 wait "$_ab_pid" 2>/dev/null || true
 _ab_raw=$(cat "$_ab_tty")
-# At least one complete arc glyph must be present in the output.
+# At least one complete braille glyph must be present in the output.
 # If a partial byte was emitted the canonical 3-byte form would not match.
 _ab_found=0
-for _g in "◜" "◝" "◞" "◟"; do
+for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
     case "$_ab_raw" in
         *"$_g"*) _ab_found=1; break ;;
     esac
 done
 [ "$_ab_found" -eq 1 ] \
-    || { printf "no complete circle-arc glyph in output at narrow width — possible cut-c byte-split\n" >&2; exit 1; }
+    || { printf "no complete braille glyph in output at narrow width — possible cut-c byte-split\n" >&2; exit 1; }
 ' 24 4
 
-_run_scenario "animator: arc frame changes across ticks (spinner animates)" '
-# Run _ui_animator_body for ~1.1 s (covers at least 4 ticks at 0.25 s each).
-# Capture the output and verify that at least 2 distinct arc glyphs appear —
-# confirming that the frame advances and is not stuck on a single symbol.
+_run_scenario "animator: braille frame changes across ticks (spinner animates)" '
+# Run _ui_animator_body for ~6.3 s, which covers more than a full 24-frame bounce
+# cycle (24 × 0.25 s = 6.0 s). The bounce pattern has intentional duplicate frames
+# at the turnaround points (e.g. ⠂ at indices 5-6 and 17-18, ⠄ at indices 11-12),
+# so short captures could see only duplicates. A full-cycle capture guarantees
+# at least 2 distinct glyphs.
 _ab_tty="$UI_TTY"
 _ui_animator_body "animating task" &
 _ab_pid=$!
-sleep 1.1
+sleep 6.3
 kill "$_ab_pid" 2>/dev/null || true
 wait "$_ab_pid" 2>/dev/null || true
 _ab_out=$(cat "$_ab_tty")
 _ab_distinct=0
-for _g in "◜" "◝" "◞" "◟"; do
+for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
     case "$_ab_out" in
         *"$_g"*) _ab_distinct=$(( _ab_distinct + 1 )) ;;
     esac
 done
 [ "$_ab_distinct" -ge 2 ] \
-    || { printf "only %d distinct arc frame(s) in 1.1s — spinner is not advancing\n" "$_ab_distinct" >&2; exit 1; }
+    || { printf "only %d distinct braille frame(s) in 6.3s — spinner is not advancing\n" "$_ab_distinct" >&2; exit 1; }
 '
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1074,7 @@ done
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
-_run_bar_scenario "download_with_bar: progress line prefix uses arc glyph before title (animator column alignment)" '
+_run_bar_scenario "download_with_bar: progress line prefix uses braille glyph before title (animator column alignment)" '
 _fake_dest="${_H_TMPDIR:-/tmp}/fake_dest_ind_$$"
 dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
 _stub_dir="${_H_TMPDIR:-/tmp}/stub_ind_$$"
@@ -1102,22 +1104,22 @@ export PATH="$_stub_dir:$PATH"
 DOWNLOAD_BAR_FAILED=0
 UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
-# The rendered line must contain an arc glyph followed by the title.
-# The "  <glyph> " prefix (2 spaces + 1-col arc + 1 space) keeps the title
+# The rendered line must contain a braille glyph followed by the title.
+# The "  <glyph> " prefix (2 spaces + 1-col braille + 1 space) keeps the title
 # at the same display column as the animator detail line.
 _tty_out=$(cat "$UI_TTY")
 _pref_found=0
-for _g in "◜" "◝" "◞" "◟"; do
+for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
     case "$_tty_out" in
         *"  ${_g} fetching tarball"*) _pref_found=1; break ;;
     esac
 done
 [ "$_pref_found" -eq 1 ] \
-    || { printf "progress line missing \"  <arc> fetching tarball\" prefix\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
+    || { printf "progress line missing \"  <braille> fetching tarball\" prefix\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
-_run_bar_scenario "download_with_bar: download bar emits arc glyph (own spinner, not block chars)" '
+_run_bar_scenario "download_with_bar: download bar emits braille glyph (own spinner, not block chars)" '
 _fake_dest="${_H_TMPDIR:-/tmp}/fake_dest2_$$"
 dd if=/dev/zero of="$_fake_dest" bs=1024 count=512 2>/dev/null
 _stub_dir="${_H_TMPDIR:-/tmp}/stub2_$$"
@@ -1148,16 +1150,16 @@ DOWNLOAD_BAR_FAILED=0
 UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
 _tty_out=$(cat "$UI_TTY")
-# The download bar draws its own circle-arc spinner glyph (not the old block chars).
-# Confirm at least one arc glyph is present in the captured output.
-_arc_found=0
-for _g in "◜" "◝" "◞" "◟"; do
+# The download bar draws its own braille bounce spinner glyph (not the old block chars).
+# Confirm at least one braille glyph is present in the captured output.
+_braille_found=0
+for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
     case "$_tty_out" in
-        *"$_g"*) _arc_found=1; break ;;
+        *"$_g"*) _braille_found=1; break ;;
     esac
 done
-[ "$_arc_found" -eq 1 ] \
-    || { printf "no circle-arc glyph found in download bar output — spinner not rendering\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
+[ "$_braille_found" -eq 1 ] \
+    || { printf "no braille glyph found in download bar output — spinner not rendering\n" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 
@@ -1198,15 +1200,15 @@ DOWNLOAD_BAR_FAILED=0
 UI_DETAIL_TEXT="fetching tarball"
 download_with_bar "http://example.com/fake" "$_fake_dest"
 _tty_out=$(cat "$UI_TTY")
-# Count distinct arc frames seen in the captured TTY output.
+# Count distinct braille frames seen in the captured TTY output.
 _distinct=0
-for _g in "◜" "◝" "◞" "◟"; do
+for _g in "⠁" "⠉" "⠙" "⠚" "⠒" "⠂" "⠲" "⠴" "⠤" "⠄"; do
     case "$_tty_out" in
         *"$_g"*) _distinct=$(( _distinct + 1 )) ;;
     esac
 done
 [ "$_distinct" -ge 2 ] \
-    || { printf "only %d distinct arc frame(s) in download output — spinner not advancing\n" "$_distinct" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
+    || { printf "only %d distinct braille frame(s) in download output — spinner not advancing\n" "$_distinct" >&2; rm -rf "$_stub_dir" "$_fake_dest"; exit 1; }
 rm -rf "$_stub_dir" "$_fake_dest"
 '
 

@@ -779,19 +779,39 @@ ui_render_checklist() {
     fi
 }
 
-# _ui_spinner_frame INDEX — emit the circle-arc spinner glyph for INDEX % 4.
+# _ui_spinner_frame INDEX — emit the braille spinner glyph for INDEX % 24.
 # Uses a case statement (not cut -c) so each 3-byte UTF-8 glyph is always
-# emitted whole, regardless of locale or shell. The four quadrant-arc glyphs
-# trace a clockwise orbit: upper-left (◜) → upper-right (◝) → lower-right
-# (◞) → lower-left (◟), giving a smooth single-stroke rotation at every
-# frame rate.
+# emitted whole, regardless of locale or shell. The 24 frames describe a
+# back-and-forth bounce: dots sweep up across the braille cell then reverse
+# and sweep back down, pausing at each turnaround. The intentional repeats
+# (e.g. ⠂ at indices 5-6 and 17-18) implement the easing dwell at endpoints.
 _ui_spinner_frame() {
-    case "$(($1 % 4))" in
-        0) printf '◜' ;;   # U+25DC upper-left quadrant arc
-        1) printf '◝' ;;   # U+25DD upper-right quadrant arc
-        2) printf '◞' ;;   # U+25DE lower-right quadrant arc
-        3) printf '◟' ;;   # U+25DF lower-left quadrant arc
-        *) printf '◜' ;;
+    case "$(($1 % 24))" in
+        0)  printf '⠁' ;;
+        1)  printf '⠉' ;;
+        2)  printf '⠙' ;;
+        3)  printf '⠚' ;;
+        4)  printf '⠒' ;;
+        5)  printf '⠂' ;;
+        6)  printf '⠂' ;;
+        7)  printf '⠒' ;;
+        8)  printf '⠲' ;;
+        9)  printf '⠴' ;;
+        10) printf '⠤' ;;
+        11) printf '⠄' ;;
+        12) printf '⠄' ;;
+        13) printf '⠤' ;;
+        14) printf '⠴' ;;
+        15) printf '⠲' ;;
+        16) printf '⠒' ;;
+        17) printf '⠂' ;;
+        18) printf '⠂' ;;
+        19) printf '⠒' ;;
+        20) printf '⠚' ;;
+        21) printf '⠙' ;;
+        22) printf '⠉' ;;
+        23) printf '⠁' ;;
+        *)  printf '⠁' ;;
     esac
 }
 
