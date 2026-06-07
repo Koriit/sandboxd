@@ -2,9 +2,9 @@
 # scripts/build.sh — assemble publishable install.sh / uninstall.sh.
 #
 # Inlines ui.sh into each selected script (replacing the BEGIN_INLINE…END_INLINE
-# marker span), strips BEGIN_TEST_ENV…END_TEST_ENV spans from install.sh (unless
-# --keep-test-env), and verifies the output before writing it to the output
-# directory.
+# marker span), strips BEGIN_TEST_ENV…END_TEST_ENV spans from install.sh and
+# uninstall.sh (unless --keep-test-env), and verifies the output before writing
+# it to the output directory.
 #
 # Usage:
 #   scripts/build.sh [--install-only|--uninstall-only] [--out DIR] [--keep-test-env]
@@ -13,7 +13,7 @@
 #   --install-only    Build only install.sh (skip uninstall.sh)
 #   --uninstall-only  Build only uninstall.sh (skip install.sh)
 #   --out DIR         Output directory (default: build/dist/)
-#   --keep-test-env   Suppress test-env stripping from install.sh
+#   --keep-test-env   Suppress test-env stripping from install.sh and uninstall.sh
 #
 # Output files mirror their source scripts' executable bit (chmod --reference).
 # Two invocations with the same inputs and flags produce byte-identical output.
@@ -261,5 +261,5 @@ if [ "$_UNINSTALL_ONLY" -eq 0 ]; then
 fi
 
 if [ "$_INSTALL_ONLY" -eq 0 ]; then
-    _build_script "$_UNINSTALL_SH_SRC" "uninstall.sh" 0
+    _build_script "$_UNINSTALL_SH_SRC" "uninstall.sh" 1
 fi

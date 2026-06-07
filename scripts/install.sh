@@ -226,6 +226,12 @@ write-install-state"
 # by a background reader in the main process that calls set_phase.
 PHASE_CMD_FIFO=""
 
+# PIDs of background processes started inside run_priv_child.  Initialised
+# to 0 here so cleanup_tmpdir's EXIT trap can safely guard on [ "$pid" -gt 0 ]
+# even if the trap fires before run_priv_child starts.
+_phase_reader_pid=0
+_consumer_pid=0
+
 # ----------------------------------------------------------------------------
 # Helper functions.
 # ----------------------------------------------------------------------------
@@ -311,6 +317,17 @@ ensure_install_log() {
 }
 
 cleanup_tmpdir() {
+    # Kill background processes that may still be running if we are aborting
+    # mid-installation (e.g. on SIGINT).  Both variables are initialised to 0
+    # at script scope so the guard is safe even before run_priv_child starts.
+    if [ "$_consumer_pid" -gt 0 ]; then
+        kill "$_consumer_pid" 2>/dev/null || true
+        wait "$_consumer_pid" 2>/dev/null || true
+    fi
+    if [ "$_phase_reader_pid" -gt 0 ]; then
+        kill "$_phase_reader_pid" 2>/dev/null || true
+        wait "$_phase_reader_pid" 2>/dev/null || true
+    fi
     ui_teardown
     if [ -n "$TMPDIR_INSTALL" ] && [ -d "$TMPDIR_INSTALL" ]; then
         rm -rf "$TMPDIR_INSTALL"
@@ -2163,8 +2180,6 @@ run_priv_child() {
     _failed_step_n=0     # step number that failed
     _total_steps=0       # from TOTAL N message
     _current_label=""    # label of the step currently in-progress
-    _phase_reader_pid=0  # PID of the phase-command reader; 0 means not started
-
     # In rich mode, initialise the install-screen phase model before the child
     # starts so the checklist is visible immediately.
     if [ "$RICH_UI" -eq 1 ]; then

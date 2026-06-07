@@ -58,6 +58,8 @@ PRIV_PROGRESS_FIFO=""
 PRIV_SCRIPT=""
 TMPDIR_UNINSTALL=""
 SUMMARY_FILE=""
+_phase_reader_pid=0
+_consumer_pid=0
 
 REMOVED_ITEMS=""
 
@@ -165,6 +167,14 @@ detect_tty() {
 }
 
 cleanup_tmpdir() {
+    if [ "$_phase_reader_pid" -gt 0 ]; then
+        kill "$_phase_reader_pid" 2>/dev/null || true
+        wait "$_phase_reader_pid" 2>/dev/null || true
+    fi
+    if [ "$_consumer_pid" -gt 0 ]; then
+        kill "$_consumer_pid" 2>/dev/null || true
+        wait "$_consumer_pid" 2>/dev/null || true
+    fi
     ui_teardown
     if [ -n "$TMPDIR_UNINSTALL" ] && [ -d "$TMPDIR_UNINSTALL" ]; then
         rm -rf "$TMPDIR_UNINSTALL"
@@ -294,9 +304,16 @@ check_daemon_running() {
     fi
     if [ "$FORCE" -eq 0 ]; then
         log_fail "step=daemon_check running=1 force=0 action=refuse"
-        emit "${RED}x${RESET} sandboxd is running; stop it first:"
-        emit "    sudo systemctl stop sandboxd"
-        emit "Or pass --force to proceed anyway."
+        _emit_daemon_refuse() {
+            printf '%b\n' "${RED}x${RESET} sandboxd is running; stop it first:"
+            printf '%s\n'  "    sudo systemctl stop sandboxd"
+            printf '%s\n'  "Or pass --force to proceed anyway."
+        }
+        if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+            _emit_daemon_refuse > "$SUMMARY_FILE"
+        else
+            _emit_daemon_refuse
+        fi
         exit 1
     fi
     emit "${YELLOW}!${RESET} --force: proceeding while sandboxd is running; sessions may leak."
@@ -339,16 +356,17 @@ read_install_state() {
 # The plan is a newline-separated list stored in _UNINSTALL_PLAN_LINES.
 _UNINSTALL_PLAN_LINES=""
 
+_plan_append() {
+    if [ -z "$_UNINSTALL_PLAN_LINES" ]; then
+        _UNINSTALL_PLAN_LINES="$1"
+    else
+        _UNINSTALL_PLAN_LINES="$_UNINSTALL_PLAN_LINES
+$1"
+    fi
+}
+
 compute_plan() {
     _UNINSTALL_PLAN_LINES=""
-    _plan_append() {
-        if [ -z "$_UNINSTALL_PLAN_LINES" ]; then
-            _UNINSTALL_PLAN_LINES="$1"
-        else
-            _UNINSTALL_PLAN_LINES="$_UNINSTALL_PLAN_LINES
-$1"
-        fi
-    }
 
     _plan_append "The following changes will be made (as root):"
     _plan_append ""
@@ -428,14 +446,20 @@ render_plan() {
 confirm_plan() {
     if [ "$YES" -eq 1 ]; then
         emit "${BLUE}--yes passed; proceeding without interactive confirmation.${RESET}"
-        log_ok "step=confirm action=yes-flag"
         return 0
     fi
 
     if [ ! -e /dev/tty ] || { [ "$RICH_UI" -ne 1 ] && [ ! -t 1 ]; }; then
-        printf '%s\n' "Aborting: no terminal and --yes not passed." >&2
-        printf '%s\n' "  Re-run with --yes to proceed non-interactively:" >&2
-        printf '%s\n' "      uninstall.sh --yes [other options]" >&2
+        _emit_confirm_no_tty() {
+            printf '%s\n' "Aborting: no terminal and --yes not passed."
+            printf '%s\n' "  Re-run with --yes to proceed non-interactively:"
+            printf '%s\n' "      uninstall.sh --yes [other options]"
+        }
+        if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+            _emit_confirm_no_tty > "$SUMMARY_FILE"
+        else
+            _emit_confirm_no_tty >&2
+        fi
         log_fail "step=confirm action=abort reason=no-tty"
         exit 1
     fi
@@ -448,14 +472,12 @@ confirm_plan() {
             log_ok "step=confirm action=no-interactive"
             exit 1
         }
-        log_ok "step=confirm action=yes-interactive"
     else
         render_plan
         printf 'Proceed with these privileged changes? [y/N] ' >/dev/tty
         read -r _answer </dev/tty || _answer=""
         case "$_answer" in
             [yY]|[yY][eE][sS])
-                log_ok "step=confirm action=yes-interactive"
                 emit ""
                 ;;
             *)
@@ -468,12 +490,26 @@ confirm_plan() {
 
     # PURGE two-step: after plan confirmation, require typing literal PURGE
     # when --purge is requested and --yes was not passed.
+    #
+    # This deliberately keeps two separate confirmation gates (plan review +
+    # literal PURGE keyword) rather than collapsing them into one, to give users
+    # a clear decision point on the irreversible state-deletion path.
     if [ "$PURGE" -eq 1 ]; then
+        if [ "$RICH_UI" -eq 1 ]; then
+            printf '\033[2J\033[H'
+        fi
         emit "${RED}!${RESET} --purge is irreversible. Type PURGE to confirm deletion of all state data:"
         printf 'Type %sPURGE%s to confirm: ' "$YELLOW" "$RESET" >/dev/tty
         read -r _purge_confirm </dev/tty || _purge_confirm=""
         if [ "$_purge_confirm" != "PURGE" ]; then
-            emit "${YELLOW}!${RESET} Aborted. No changes were made."
+            _emit_purge_decline() {
+                printf '%b\n' "${YELLOW}!${RESET} Aborted. No changes were made."
+            }
+            if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+                _emit_purge_decline > "$SUMMARY_FILE"
+            else
+                _emit_purge_decline
+            fi
             log_ok "step=confirm action=no-interactive reason=purge-not-confirmed"
             exit 1
         fi
@@ -506,6 +542,9 @@ write_priv_script() {
     # Embed multi-line state values safely.
     _added_bridge_rules_esc=$(_sq "$ADDED_BRIDGE_RULES")
     _ops_added_esc=$(_sq "$OPS_ADDED")
+    # Capture test-hook variable from parent's environment (if set) so
+    # the privileged child receives it even though sudo strips the env.
+    _fail_after_esc=$(_sq "${SANDBOX_UNINSTALL_PRIV_CHILD_FAIL_AFTER:-}")
 
     # Compute total steps: base 6, plus 4 purge steps if --purge.
     _total_steps=6
@@ -587,6 +626,28 @@ _log() {
 # Emit total step count so the parent can compute N of M in failure reports.
 printf 'TOTAL %s\n' "\$_TOTAL_STEPS" >&3
 
+# Production no-op stub — shadowed by the real definition inside BEGIN_TEST_ENV
+# when the test block is present. This survives the build strip so the
+# published uninstaller does not call an undefined function under set -eu.
+_priv_maybe_fail_after() { :; }
+
+# BEGIN_TEST_ENV — stripped from published uninstall.sh at build time
+#
+# SANDBOX_UNINSTALL_PRIV_CHILD_FAIL_AFTER — test hook that forces the
+# privileged child to exit 1 immediately after the named step completes.
+# Set to the step label (e.g. "remove-binaries") to simulate a mid-batch
+# failure. MUST NEVER BE SET IN PRODUCTION — it intentionally leaves the
+# uninstall in a partial state.
+_fail_after='$_fail_after_esc'
+_priv_maybe_fail_after() {
+    if [ -n "\$_fail_after" ] && [ "\$_fail_after" = "\$1" ]; then
+        printf 'STEP %s fail %s (test-hook)\n' "\$_n" "\$1" >&3
+        exec 3>&-
+        exit 1
+    fi
+}
+# END_TEST_ENV
+
 # Variables encoded from parent.
 TMPDIR_UNINSTALL='$(_sq "$TMPDIR_UNINSTALL")'
 HAVE_STATE='$(_sq "$HAVE_STATE")'
@@ -629,6 +690,7 @@ else
     esac
     _step_ok
 fi
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 2: remove-systemd-unit -----
 _step_begin "remove-systemd-unit"
@@ -643,6 +705,7 @@ else
     _log "step=remove_unit action=skip reason=absent"
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 3: revert-bridge-helper-setuid -----
 _step_begin "revert-bridge-helper-setuid"
@@ -659,6 +722,7 @@ else
     _log "step=revert_setuid action=skip reason=already-not-setuid"
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 4: remove-bridge-conf-rules -----
 _step_begin "remove-bridge-conf-rules"
@@ -691,6 +755,7 @@ else
     rm -f "\$_tmp_bc" "\$_tmp_rules" "\${_tmp_bc}.new" 2>/dev/null || true
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 5: remove-users-conf -----
 _step_begin "remove-users-conf"
@@ -725,6 +790,7 @@ if [ -d /etc/sandboxd ]; then
     fi
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 6: remove-binaries -----
 # File capabilities on sandbox-route-helper and sandbox-lima-helper are
@@ -751,6 +817,7 @@ if [ -d /usr/local/libexec/sandboxd ]; then
     fi
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 PRIV_SCRIPT_EOF
 
@@ -782,6 +849,7 @@ if [ -d /var/lib/sandbox ]; then
     _log "step=purge_state path=/var/lib/sandbox reason=legacy"
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 8: purge-user -----
 _step_begin "purge-user"
@@ -795,6 +863,7 @@ else
 fi
 _log "step=remove_drop_ins action=skip reason=operator-owned"
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 9: purge-group -----
 _step_begin "purge-group"
@@ -814,6 +883,7 @@ if [ "\$HAVE_STATE" -eq 1 ] && [ -n "\$OPS_ADDED" ]; then
     done
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 
 # ----- Step 10: purge-image -----
 _step_begin "purge-image"
@@ -829,13 +899,13 @@ else
     _log "step=docker_rmi action=skip reason=no-version-or-docker"
 fi
 _step_ok
+_priv_maybe_fail_after "\$_label"
 PURGE_EOF
     fi
 
     # Append the DONE sentinel.
     printf 'printf '"'"'DONE\n'"'"' >&3\n' >> "$PRIV_SCRIPT"
 
-    chmod +x "$PRIV_SCRIPT"
 }
 
 # run_priv_child — invoke the privileged child under a single sudo,
@@ -902,6 +972,7 @@ run_priv_child() {
         fi
 
         _sh_steps_done=""
+        _sh_removed_items=""
         _sh_failed_step=""
         _sh_failed_step_n=0
         _sh_total_steps=0
@@ -935,6 +1006,12 @@ run_priv_child() {
                         _sh_steps_done="${_sh_steps_done}
 ${_ok_label}"
                     fi
+                    if [ -z "$_sh_removed_items" ]; then
+                        _sh_removed_items="$_ok_label"
+                    else
+                        _sh_removed_items="${_sh_removed_items}
+${_ok_label}"
+                    fi
                     if [ "$RICH_UI" -eq 1 ]; then
                         printf 'SET_PHASE %s done\n' "$_ok_n" >&6 || true
                     else
@@ -965,10 +1042,11 @@ ${_ok_label}"
         fi
 
         {
-            printf 'total\t%s\n'       "$_sh_total_steps"
-            printf 'failed_step\t%s\n' "$_sh_failed_step"
-            printf 'failed_n\t%s\n'    "$_sh_failed_step_n"
-            printf 'steps_done\t%s\n'  "$(printf '%s' "$_sh_steps_done" | base64 | tr -d '\n')"
+            printf 'total\t%s\n'         "$_sh_total_steps"
+            printf 'failed_step\t%s\n'   "$_sh_failed_step"
+            printf 'failed_n\t%s\n'      "$_sh_failed_step_n"
+            printf 'steps_done\t%s\n'    "$(printf '%s' "$_sh_steps_done"    | base64 | tr -d '\n')"
+            printf 'removed_items\t%s\n' "$(printf '%s' "$_sh_removed_items" | base64 | tr -d '\n')"
         } > "$_step_history_file"
     ) &
     _consumer_pid=$!
@@ -999,6 +1077,13 @@ ${_ok_label}"
                 steps_done)
                     _steps_done=$(printf '%s' "$_sh_val" | base64 -d 2>/dev/null || true)
                     ;;
+                removed_items)
+                    _removed=$(printf '%s' "$_sh_val" | base64 -d 2>/dev/null || true)
+                    printf '%s\n' "$_removed" | while IFS= read -r _item; do
+                        [ -n "$_item" ] || continue
+                        record_removed "$_item"
+                    done
+                    ;;
             esac
         done < "$_step_history_file"
     fi
@@ -1013,6 +1098,12 @@ ${_ok_label}"
         fi
         log_fail "step=priv_child action=fail failed_step=${_failed_step:-unknown} exit=$_priv_exit"
         exit 1
+    fi
+
+    # The drop-in directory (/etc/systemd/system/sandboxd.service.d/) is
+    # operator-owned and is never removed, regardless of --purge.
+    if [ "$PURGE" -eq 0 ]; then
+        log_ok "step=remove_drop_ins action=skip reason=operator-owned"
     fi
 }
 
