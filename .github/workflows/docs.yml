@@ -8,6 +8,8 @@ on:
       - 'site/**'
       - 'scripts/install.sh'
       - 'scripts/uninstall.sh'
+      - 'scripts/ui.sh'
+      - 'scripts/build.sh'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -59,18 +61,13 @@ jobs:
       # behaviour.
       - name: Stage install scripts
         working-directory: ${{ github.workspace }}
-        # Strip BEGIN_TEST_ENV…END_TEST_ENV spans so test-only env-var
-        # reads (used by tests/install-e2e/) never reach operators.
+        # build.sh inlines ui.sh, strips BEGIN_TEST_ENV…END_TEST_ENV spans,
+        # and verifies the output — no inline sed/grep logic needed here.
+        # --install-only: uninstall.sh adopts the inline marker in the next
+        # phase; until then it is copied verbatim.
         run: |
-          sed '/# BEGIN_TEST_ENV/,/# END_TEST_ENV/d' \
-              scripts/install.sh > site/public/install.sh
-          chmod --reference=scripts/install.sh site/public/install.sh
+          scripts/build.sh --install-only --out site/public
           cp scripts/uninstall.sh site/public/uninstall.sh
-          if grep -E 'SANDBOX_(INSTALL|UPDATE)_TEST_|_DEBUG_COSIGN_STDERR|_SKIP_SIGSTORE' \
-                  site/public/install.sh; then
-            echo "::error::strip failed: test env vars leaked into site/public/install.sh" >&2
-            exit 1
-          fi
 
       - name: Type-check and Astro check
         run: npm run check

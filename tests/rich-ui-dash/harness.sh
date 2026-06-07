@@ -18,61 +18,27 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_SH="$(cd "$SCRIPT_DIR/../.." && pwd)/scripts/install.sh"
+_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+UI_SH="$_REPO_ROOT/scripts/ui.sh"
+INSTALL_SH="$_REPO_ROOT/scripts/install.sh"
 
 # ---------------------------------------------------------------------------
-# Extract the rich-UI function block from install.sh.
-# We pull from tty_print() (first function in the block) through the closing
-# brace of _ui_winch_trap() (last function before "Step 1 — Arg parsing").
-# Strategy: awk from the start marker to the blank line after the first "}"
-# that follows the _ui_winch_trap function body.
+# Validate source files exist up front.
 # ---------------------------------------------------------------------------
-RICH_BLOCK=$(awk '
-    /^tty_print\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^_ui_winch_trap\(\)/ { in_winch = 1 }
-    in_winch && /^}$/ { exit }
-' "$INSTALL_SH")
+for _f in "$UI_SH" "$INSTALL_SH"; do
+    if [ ! -f "$_f" ]; then
+        printf 'harness.sh: required source file not found: %s\n' "$_f" >&2
+        exit 1
+    fi
+done
 
-# Extract is_utf8 (needed by download_with_bar to pick bar style).
-IS_UTF8_BLOCK=$(awk '
-    /^is_utf8\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract _ui_spinner_frame (needed by download_with_bar's loop).
-SPINNER_FRAME_BLOCK=$(awk '
-    /^_ui_spinner_frame\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract bar renderers + kb converter + download_with_bar.
-BAR_BLOCK=$(awk '
-    /^_bar_style_b\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^download_with_bar\(\)/ { in_dwb = 1 }
-    in_dwb && /^}$/ { exit }
-' "$INSTALL_SH")
+# ---------------------------------------------------------------------------
+# Extract install-specific functions still in install.sh (not in ui.sh).
+# ---------------------------------------------------------------------------
 
 # Extract cleanup_tmpdir (needed to verify cursor-show on exit).
 CLEANUP_BLOCK=$(awk '
     /^cleanup_tmpdir\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract ui_enter_alt_screen (needed to verify DECAWM disable on entry).
-ALT_SCREEN_BLOCK=$(awk '
-    /^ui_enter_alt_screen\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract emit (needed by _print_failure_report in plain and rich branches).
-EMIT_BLOCK=$(awk '
-    /^emit\(\)/ { in_block = 1 }
     in_block { print }
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
@@ -104,7 +70,7 @@ _pass() {
 # _run_scenario LABEL SNIPPET [ROWS [COLS]]
 #
 # Writes SNIPPET into a temp sh file that (1) sets up all rich-UI globals,
-# (2) sources the RICH_BLOCK, and (3) runs the snippet.  Runs under `sh`.
+# (2) sources ui.sh, and (3) runs the snippet.  Runs under `sh`.
 # All output from UI functions goes to a scratch file (not a real TTY).
 # ---------------------------------------------------------------------------
 _H_TMPDIR=$(mktemp -d)
@@ -121,33 +87,25 @@ _run_scenario() {
     _rs_tty="${_H_TMPDIR}/t$$.out"
     _rs_err="${_H_TMPDIR}/e$$.txt"
 
-    # Write the global state setup + extracted functions + test snippet.
+    # Write the global state setup + sourced ui.sh + test snippet.
     # We use printf to avoid any heredoc quoting issues inside _rs_snippet.
     {
         printf '#!/bin/sh\nset -eu\n'
-        # Rich-UI global state variables.
-        printf 'RICH_UI=0\n'
-        printf 'RICH_UI_MIN_ROWS=9\n'
-        printf 'ALT_SCREEN_ACTIVE=0\n'
-        printf 'STTY_RAW_ACTIVE=0\n'
-        printf 'STTY_SAVED=""\n'
-        printf 'SPINNER_PID=0\n'
-        printf 'SUMMARY_FILE=""\n'
-        printf 'UI_TTY=""\n'
-        printf 'UI_ROWS=0\n'
-        printf 'UI_COLS=0\n'
-        printf 'UI_CURRENT_HEADER=""\n'
-        printf 'WINCH_PENDING=0\n'
-        printf 'UI_PHASE_NAMES=""\n'
-        printf 'UI_PHASE_STATUSES=""\n'
-        printf 'UI_PHASE_COUNT=0\n'
-        printf 'UI_DETAIL_TEXT=""\n'
-        printf 'UI_ANIM_PID=0\n'
-        printf 'BLUE=""\n'
-        printf 'RESET=""\n'
-        # Inject the extracted function block.
-        printf '%s\n' "$RICH_BLOCK"
-        # Inject optional extra block (e.g. bar renderers).
+        # Variables ui.sh requires callers to define before sourcing.
+        printf 'QUIET=0\n'
+        printf 'NO_COLOR=0\n'
+        printf 'VERBOSE=0\n'
+        printf 'INSTALL_LOG=/dev/null\n'
+        printf 'SCRIPT_NAME=test\n'
+        # Expose source file paths so scenarios can inspect install.sh
+        # properties (e.g. grep for expected strings without hardcoding paths).
+        printf 'UI_SH="%s"\n' "$UI_SH"
+        printf 'INSTALL_SH="%s"\n' "$INSTALL_SH"
+        # Source the engine from ui.sh — all rich-UI functions and their
+        # module-level defaults are defined by this single dot-source.
+        # shellcheck disable=SC1090
+        printf '. "%s"\n' "$UI_SH"
+        # Inject optional extra block (e.g. install-specific functions).
         if [ -n "$_rs_extra_block" ]; then
             printf '%s\n' "$_rs_extra_block"
         fi
@@ -171,14 +129,16 @@ _run_scenario() {
     rm -f "$_rs_file" "$_rs_tty" "$_rs_err"
 }
 
-# Convenience wrapper: injects RICH_BLOCK + is_utf8 + _ui_spinner_frame + BAR_BLOCK.
+# Convenience wrapper: runs a bar-renderer scenario.
+# All bar functions (is_utf8, _ui_spinner_frame, _bar_style_b/c,
+# _kb_to_mb_1dp, download_with_bar) live in ui.sh and are already sourced
+# by _run_scenario, so no extra block is needed here.
 _run_bar_scenario() {
     _rbs_label="$1"
     _rbs_snippet="$2"
     _rbs_rows="${3:-24}"
     _rbs_cols="${4:-80}"
-    _run_scenario "$_rbs_label" "$_rbs_snippet" "$_rbs_rows" "$_rbs_cols" \
-        "$(printf '%s\n%s\n%s\n' "$IS_UTF8_BLOCK" "$SPINNER_FRAME_BLOCK" "$BAR_BLOCK")"
+    _run_scenario "$_rbs_label" "$_rbs_snippet" "$_rbs_rows" "$_rbs_cols"
 }
 
 # ===========================================================================
@@ -920,17 +880,19 @@ case "$out" in
 esac
 '
 
-# Convenience wrapper: injects ALT_SCREEN_BLOCK (ui_enter_alt_screen).
+# Convenience wrapper for alt-screen scenarios.
+# ui_enter_alt_screen lives in ui.sh and is already sourced by _run_scenario;
+# no extra block injection is needed.
 _run_alt_screen_scenario() {
     _ras_label="$1"
     _ras_snippet="$2"
     _ras_rows="${3:-24}"
     _ras_cols="${4:-80}"
-    _run_scenario "$_ras_label" "$_ras_snippet" "$_ras_rows" "$_ras_cols" \
-        "$ALT_SCREEN_BLOCK"
+    _run_scenario "$_ras_label" "$_ras_snippet" "$_ras_rows" "$_ras_cols"
 }
 
-# Convenience wrapper: injects RICH_BLOCK + CLEANUP_BLOCK.
+# Convenience wrapper: injects CLEANUP_BLOCK (install-specific functions).
+# The rich-UI engine is already sourced from ui.sh by _run_scenario.
 _run_cleanup_scenario() {
     _rcs_label="$1"
     _rcs_snippet="$2"
@@ -1562,13 +1524,13 @@ _cu_len=$(printf "%s" "$_cp_cu" | wc -c | tr -d " ")
 '
 
 _run_scenario "ctrl-d/ctrl-u: footer text contains no Ctrl-D or Ctrl-U reference" '
-# The footer line is assembled in _cp_render via printf; check the install.sh
+# The footer line is assembled in _cp_render via printf; check the ui.sh
 # source directly to confirm the footer string does not mention Ctrl-D, Ctrl-U,
 # or their key symbols (^D, ^U, C-d, C-u).
-_footer_line=$(grep -n "proceed.*abort.*PgUp" '"'"'/home/olek/Workspaces/sandboxd/sandboxd/scripts/install.sh'"'"' | head -1)
+_footer_line=$(grep -n "proceed.*abort.*PgUp" "$UI_SH" | head -1)
 # Must find the footer line at all.
 [ -n "$_footer_line" ] || {
-    printf "footer line not found in install.sh\n" >&2; exit 1
+    printf "footer line not found in ui.sh\n" >&2; exit 1
 }
 # Footer must not contain any reference to the hidden keys.
 case "$_footer_line" in
@@ -1586,7 +1548,6 @@ esac
 # ---------------------------------------------------------------------------
 
 _run_scenario "failure-report rich: step name present, not 'unknown'" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1612,7 +1573,6 @@ esac
 "
 
 _run_scenario "failure-report rich: log-tail section present when file exists" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1638,7 +1598,6 @@ esac
 "
 
 _run_scenario "failure-report rich: no log-tail section when file absent" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1660,7 +1619,6 @@ esac
 "
 
 _run_scenario "failure-report plain: log-tail section present and content appears" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1687,7 +1645,6 @@ esac
 "
 
 _run_scenario "failure-report plain: log-tail bytes identical to rich branch" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''

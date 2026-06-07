@@ -42,9 +42,7 @@ import pytest
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent.parent
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
-INSTALL_SH = SCRIPTS_DIR / "install.sh"
-UNINSTALL_SH = SCRIPTS_DIR / "uninstall.sh"
-LIB_SH = SCRIPTS_DIR / "lib.sh"
+BUILD_SH = SCRIPTS_DIR / "build.sh"
 
 DIST_DIR = HERE / "dist"
 LOGS_DIR = HERE / "logs"
@@ -723,14 +721,38 @@ class VM:
         return lima_cp(self.name, src, dst)
 
 
+@pytest.fixture(scope="session")
+def built_scripts(tmp_path_factory) -> Path:
+    """Assemble install.sh and uninstall.sh once per test session.
+
+    Runs ``scripts/build.sh --keep-test-env --out <tmpdir>`` once. The
+    ``--keep-test-env`` flag inlines ui.sh (the assembly under test) while
+    retaining the ``BEGIN_TEST_ENV``/``END_TEST_ENV`` spans that the
+    VM-backed e2e harness relies on (SANDBOX_INSTALL_TEST_* env vars, the
+    sigstore-stub path, etc.). The docs build strips those spans; the e2e
+    needs them — see Decision D12.
+
+    The output directory is returned; callers access
+    ``built_scripts / "install.sh"`` and ``built_scripts / "uninstall.sh"``.
+    """
+    out = tmp_path_factory.mktemp("built-scripts")
+    subprocess.run(
+        [str(BUILD_SH), "--keep-test-env", "--out", str(out)],
+        check=True,
+        timeout=60,
+    )
+    return out
+
+
 @pytest.fixture
-def vm_factory(request):
+def vm_factory(request, built_scripts):
     """Spawn-on-demand factory for Lima VMs scoped to a single test.
 
     The factory returns a callable; each invocation produces a fresh VM,
     boots it from the given template, installs the install/uninstall
     prerequisites (jq, curl, qemu, lima, docker, setcap, ovmf, ...) via
-    the distro's package manager, copies in install.sh / uninstall.sh,
+    the distro's package manager, copies in the built install.sh /
+    uninstall.sh (assembled via ``scripts/build.sh --keep-test-env``),
     and returns a VM handle.
 
     Every VM created via the factory is force-deleted on test teardown
@@ -750,7 +772,7 @@ def vm_factory(request):
             _install_prereqs(vm)
 
         if install_scripts:
-            _stage_scripts(vm)
+            _stage_scripts(vm, built_scripts)
 
         return vm
 
@@ -836,19 +858,17 @@ def _install_prereqs(vm):
     )
 
 
-def _stage_scripts(vm):
-    """Copy install.sh + uninstall.sh into /tmp inside the VM.
+def _stage_scripts(vm, built_dir: Path) -> None:
+    """Copy the built install.sh + uninstall.sh into /tmp inside the VM.
 
-    install.sh is staged unmodified — the harness no longer patches
-    cosign_bootstrap or sigstore_verify. The real cosign verify-blob
-    path runs against the local Sigstore stack via the
-    SANDBOX_INSTALL_TEST_* env vars that ``install_sh_cmd`` injects.
+    Stages the artifacts produced by ``scripts/build.sh --keep-test-env``
+    (ui.sh inlined, test-env spans retained for the SANDBOX_INSTALL_TEST_*
+    escape hatches). No adjacent lib.sh is needed: the cosign constants are
+    carried inline in the built install.sh (the lib.sh resolver is present
+    but finds nothing to override, so the inline copy takes effect).
     """
-    vm.cp(INSTALL_SH, "/tmp/install.sh")
-    vm.cp(UNINSTALL_SH, "/tmp/uninstall.sh")
-    # install.sh sources scripts/lib.sh (cosign pin constants) — stage it
-    # adjacent so the in-tree fallback `$(dirname $0)/lib.sh` resolves.
-    vm.cp(LIB_SH, "/tmp/lib.sh")
+    vm.cp(built_dir / "install.sh", "/tmp/install.sh")
+    vm.cp(built_dir / "uninstall.sh", "/tmp/uninstall.sh")
     vm.shell("chmod +x /tmp/install.sh /tmp/uninstall.sh", check=True)
 
 
