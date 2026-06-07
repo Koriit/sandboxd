@@ -5972,8 +5972,7 @@ fn handle_apply_config_migrations() -> i32 {
                 // Already at latest version — no-op.
             }
             Ok(applied) => {
-                let ids: Vec<String> =
-                    applied.iter().map(|id| format!("V{id:03}")).collect();
+                let ids: Vec<String> = applied.iter().map(|id| format!("V{id:03}")).collect();
                 eprintln!(
                     "sandbox: apply-config-migrations: {} migrated ({})",
                     path.display(),
