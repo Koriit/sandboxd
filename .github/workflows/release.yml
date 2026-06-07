@@ -59,7 +59,7 @@ jobs:
       attestations: write   # for actions/attest-build-provenance
     steps:
       - name: Checkout (at the tag)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0    # full history; build_sha needs the resolved commit
 
@@ -89,7 +89,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -192,12 +192,12 @@ jobs:
               "sandboxd-${VER}-${ARCH}.tar.gz"
 
       - name: Build provenance attestation
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'sandboxd-${{ steps.version.outputs.ver }}-${{ matrix.target }}.tar.gz'
 
       - name: Upload artifacts to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           fail_on_unmatched_files: true
