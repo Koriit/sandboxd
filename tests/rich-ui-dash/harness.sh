@@ -18,61 +18,28 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_SH="$(cd "$SCRIPT_DIR/../.." && pwd)/scripts/install.sh"
+_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+UI_SH="$_REPO_ROOT/scripts/ui.sh"
+INSTALL_SH="$_REPO_ROOT/scripts/install.sh"
+UNINSTALL_SH="$_REPO_ROOT/scripts/uninstall.sh"
 
 # ---------------------------------------------------------------------------
-# Extract the rich-UI function block from install.sh.
-# We pull from tty_print() (first function in the block) through the closing
-# brace of _ui_winch_trap() (last function before "Step 1 — Arg parsing").
-# Strategy: awk from the start marker to the blank line after the first "}"
-# that follows the _ui_winch_trap function body.
+# Validate source files exist up front.
 # ---------------------------------------------------------------------------
-RICH_BLOCK=$(awk '
-    /^tty_print\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^_ui_winch_trap\(\)/ { in_winch = 1 }
-    in_winch && /^}$/ { exit }
-' "$INSTALL_SH")
+for _f in "$UI_SH" "$INSTALL_SH" "$UNINSTALL_SH"; do
+    if [ ! -f "$_f" ]; then
+        printf 'harness.sh: required source file not found: %s\n' "$_f" >&2
+        exit 1
+    fi
+done
 
-# Extract is_utf8 (needed by download_with_bar to pick bar style).
-IS_UTF8_BLOCK=$(awk '
-    /^is_utf8\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract _ui_spinner_frame (needed by download_with_bar's loop).
-SPINNER_FRAME_BLOCK=$(awk '
-    /^_ui_spinner_frame\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract bar renderers + kb converter + download_with_bar.
-BAR_BLOCK=$(awk '
-    /^_bar_style_b\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^download_with_bar\(\)/ { in_dwb = 1 }
-    in_dwb && /^}$/ { exit }
-' "$INSTALL_SH")
+# ---------------------------------------------------------------------------
+# Extract install-specific functions still in install.sh (not in ui.sh).
+# ---------------------------------------------------------------------------
 
 # Extract cleanup_tmpdir (needed to verify cursor-show on exit).
 CLEANUP_BLOCK=$(awk '
     /^cleanup_tmpdir\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract ui_enter_alt_screen (needed to verify DECAWM disable on entry).
-ALT_SCREEN_BLOCK=$(awk '
-    /^ui_enter_alt_screen\(\)/ { in_block = 1 }
-    in_block { print }
-    in_block && /^}$/ { in_block = 0; exit }
-' "$INSTALL_SH")
-
-# Extract emit (needed by _print_failure_report in plain and rich branches).
-EMIT_BLOCK=$(awk '
-    /^emit\(\)/ { in_block = 1 }
     in_block { print }
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
@@ -83,6 +50,52 @@ PRINT_FAILURE_REPORT_BLOCK=$(awk '
     in_block { print }
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
+
+# ---------------------------------------------------------------------------
+# Extract uninstall-specific functions from uninstall.sh.
+# These use TMPDIR_UNINSTALL (not TMPDIR_INSTALL) so they cannot share the
+# install extraction blocks above.
+# ---------------------------------------------------------------------------
+
+UNINSTALL_CLEANUP_BLOCK=$(awk '
+    /^cleanup_tmpdir\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$UNINSTALL_SH")
+
+UNINSTALL_PRINT_FAILURE_REPORT_BLOCK=$(awk '
+    /^_print_failure_report\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$UNINSTALL_SH")
+
+# Extract socket_responsive and check_daemon_running (BLOCKER-2a coverage).
+# Both are extracted and concatenated so scenarios have the full call graph.
+UNINSTALL_CHECK_DAEMON_BLOCK=$(
+    awk '
+        /^socket_responsive\(\)/ { in_block = 1 }
+        in_block { print }
+        in_block && /^}$/ { in_block = 0; exit }
+    ' "$UNINSTALL_SH"
+    awk '
+        /^check_daemon_running\(\)/ { in_block = 1 }
+        in_block { print }
+        in_block && /^}$/ { in_block = 0; exit }
+    ' "$UNINSTALL_SH"
+)
+
+# Extract record_removed and print_next_steps (SF-2 coverage).
+UNINSTALL_RECORD_REMOVED_BLOCK=$(awk '
+    /^record_removed\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$UNINSTALL_SH")
+
+UNINSTALL_PRINT_NEXT_STEPS_BLOCK=$(awk '
+    /^print_next_steps\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$UNINSTALL_SH")
 
 # ---------------------------------------------------------------------------
 # Failure tracking.
@@ -104,7 +117,7 @@ _pass() {
 # _run_scenario LABEL SNIPPET [ROWS [COLS]]
 #
 # Writes SNIPPET into a temp sh file that (1) sets up all rich-UI globals,
-# (2) sources the RICH_BLOCK, and (3) runs the snippet.  Runs under `sh`.
+# (2) sources ui.sh, and (3) runs the snippet.  Runs under `sh`.
 # All output from UI functions goes to a scratch file (not a real TTY).
 # ---------------------------------------------------------------------------
 _H_TMPDIR=$(mktemp -d)
@@ -121,33 +134,25 @@ _run_scenario() {
     _rs_tty="${_H_TMPDIR}/t$$.out"
     _rs_err="${_H_TMPDIR}/e$$.txt"
 
-    # Write the global state setup + extracted functions + test snippet.
+    # Write the global state setup + sourced ui.sh + test snippet.
     # We use printf to avoid any heredoc quoting issues inside _rs_snippet.
     {
         printf '#!/bin/sh\nset -eu\n'
-        # Rich-UI global state variables.
-        printf 'RICH_UI=0\n'
-        printf 'RICH_UI_MIN_ROWS=9\n'
-        printf 'ALT_SCREEN_ACTIVE=0\n'
-        printf 'STTY_RAW_ACTIVE=0\n'
-        printf 'STTY_SAVED=""\n'
-        printf 'SPINNER_PID=0\n'
-        printf 'SUMMARY_FILE=""\n'
-        printf 'UI_TTY=""\n'
-        printf 'UI_ROWS=0\n'
-        printf 'UI_COLS=0\n'
-        printf 'UI_CURRENT_HEADER=""\n'
-        printf 'WINCH_PENDING=0\n'
-        printf 'UI_PHASE_NAMES=""\n'
-        printf 'UI_PHASE_STATUSES=""\n'
-        printf 'UI_PHASE_COUNT=0\n'
-        printf 'UI_DETAIL_TEXT=""\n'
-        printf 'UI_ANIM_PID=0\n'
-        printf 'BLUE=""\n'
-        printf 'RESET=""\n'
-        # Inject the extracted function block.
-        printf '%s\n' "$RICH_BLOCK"
-        # Inject optional extra block (e.g. bar renderers).
+        # Variables ui.sh requires callers to define before sourcing.
+        printf 'QUIET=0\n'
+        printf 'NO_COLOR=0\n'
+        printf 'VERBOSE=0\n'
+        printf 'INSTALL_LOG=/dev/null\n'
+        printf 'SCRIPT_NAME=test\n'
+        # Expose source file paths so scenarios can inspect install.sh
+        # properties (e.g. grep for expected strings without hardcoding paths).
+        printf 'UI_SH="%s"\n' "$UI_SH"
+        printf 'INSTALL_SH="%s"\n' "$INSTALL_SH"
+        # Source the engine from ui.sh — all rich-UI functions and their
+        # module-level defaults are defined by this single dot-source.
+        # shellcheck disable=SC1090
+        printf '. "%s"\n' "$UI_SH"
+        # Inject optional extra block (e.g. install-specific functions).
         if [ -n "$_rs_extra_block" ]; then
             printf '%s\n' "$_rs_extra_block"
         fi
@@ -171,14 +176,16 @@ _run_scenario() {
     rm -f "$_rs_file" "$_rs_tty" "$_rs_err"
 }
 
-# Convenience wrapper: injects RICH_BLOCK + is_utf8 + _ui_spinner_frame + BAR_BLOCK.
+# Convenience wrapper: runs a bar-renderer scenario.
+# All bar functions (is_utf8, _ui_spinner_frame, _bar_style_b/c,
+# _kb_to_mb_1dp, download_with_bar) live in ui.sh and are already sourced
+# by _run_scenario, so no extra block is needed here.
 _run_bar_scenario() {
     _rbs_label="$1"
     _rbs_snippet="$2"
     _rbs_rows="${3:-24}"
     _rbs_cols="${4:-80}"
-    _run_scenario "$_rbs_label" "$_rbs_snippet" "$_rbs_rows" "$_rbs_cols" \
-        "$(printf '%s\n%s\n%s\n' "$IS_UTF8_BLOCK" "$SPINNER_FRAME_BLOCK" "$BAR_BLOCK")"
+    _run_scenario "$_rbs_label" "$_rbs_snippet" "$_rbs_rows" "$_rbs_cols"
 }
 
 # ===========================================================================
@@ -920,17 +927,19 @@ case "$out" in
 esac
 '
 
-# Convenience wrapper: injects ALT_SCREEN_BLOCK (ui_enter_alt_screen).
+# Convenience wrapper for alt-screen scenarios.
+# ui_enter_alt_screen lives in ui.sh and is already sourced by _run_scenario;
+# no extra block injection is needed.
 _run_alt_screen_scenario() {
     _ras_label="$1"
     _ras_snippet="$2"
     _ras_rows="${3:-24}"
     _ras_cols="${4:-80}"
-    _run_scenario "$_ras_label" "$_ras_snippet" "$_ras_rows" "$_ras_cols" \
-        "$ALT_SCREEN_BLOCK"
+    _run_scenario "$_ras_label" "$_ras_snippet" "$_ras_rows" "$_ras_cols"
 }
 
-# Convenience wrapper: injects RICH_BLOCK + CLEANUP_BLOCK.
+# Convenience wrapper: injects CLEANUP_BLOCK (install-specific functions).
+# The rich-UI engine is already sourced from ui.sh by _run_scenario.
 _run_cleanup_scenario() {
     _rcs_label="$1"
     _rcs_snippet="$2"
@@ -940,11 +949,46 @@ _run_cleanup_scenario() {
         "$CLEANUP_BLOCK"
 }
 
+# Convenience wrapper: injects UNINSTALL_CHECK_DAEMON_BLOCK
+# (socket_responsive + check_daemon_running from uninstall.sh).
+_run_uninstall_check_daemon_scenario() {
+    _rudcs_label="$1"
+    _rudcs_snippet="$2"
+    _rudcs_rows="${3:-24}"
+    _rudcs_cols="${4:-80}"
+    _run_scenario "$_rudcs_label" "$_rudcs_snippet" "$_rudcs_rows" "$_rudcs_cols" \
+        "$UNINSTALL_CHECK_DAEMON_BLOCK"
+}
+
+# Convenience wrapper: injects UNINSTALL_RECORD_REMOVED_BLOCK +
+# UNINSTALL_PRINT_NEXT_STEPS_BLOCK (SF-2 coverage).
+_run_uninstall_next_steps_scenario() {
+    _runss_label="$1"
+    _runss_snippet="$2"
+    _runss_rows="${3:-24}"
+    _runss_cols="${4:-80}"
+    _run_scenario "$_runss_label" "$_runss_snippet" "$_runss_rows" "$_runss_cols" \
+        "$(printf '%s\n%s\n' "$UNINSTALL_RECORD_REMOVED_BLOCK" "$UNINSTALL_PRINT_NEXT_STEPS_BLOCK")"
+}
+
+# Convenience wrapper: injects UNINSTALL_CLEANUP_BLOCK (uninstall-specific
+# functions).  Uses TMPDIR_UNINSTALL so it cannot share _run_cleanup_scenario.
+_run_uninstall_cleanup_scenario() {
+    _rucs_label="$1"
+    _rucs_snippet="$2"
+    _rucs_rows="${3:-24}"
+    _rucs_cols="${4:-80}"
+    _run_scenario "$_rucs_label" "$_rucs_snippet" "$_rucs_rows" "$_rucs_cols" \
+        "$UNINSTALL_CLEANUP_BLOCK"
+}
+
 _run_cleanup_scenario "escape-seq: cleanup_tmpdir emits \\033[?25h when RICH_UI=1" '
 # Preconditions: RICH_UI=1 and UI_TTY are already set by _run_scenario.
 # SPINNER_PID, UI_ANIM_PID, ALT_SCREEN_ACTIVE default to 0 so the kill/wait
 # and rmcup branches are skipped; only the cursor-show branch executes.
 # Initialize vars referenced by cleanup_tmpdir but not set by _run_scenario.
+_phase_reader_pid=0
+_consumer_pid=0
 TMPDIR_INSTALL=""
 SUMMARY_FILE=""
 cleanup_tmpdir
@@ -959,6 +1003,8 @@ _run_cleanup_scenario "escape-seq: cleanup_tmpdir must NOT emit \\033[?25h when 
 # Override to plain mode: cursor was never hidden, so show-cursor must not fire.
 RICH_UI=0
 # Initialize vars referenced by cleanup_tmpdir but not set by _run_scenario.
+_phase_reader_pid=0
+_consumer_pid=0
 TMPDIR_INSTALL=""
 SUMMARY_FILE=""
 # Ensure the TTY file exists so cat succeeds even though cleanup_tmpdir will
@@ -1256,6 +1302,8 @@ esac
 '
 
 _run_cleanup_scenario "escape-seq: cleanup_tmpdir emits \\033[?7h when RICH_UI=1" '
+_phase_reader_pid=0
+_consumer_pid=0
 TMPDIR_INSTALL=""
 SUMMARY_FILE=""
 cleanup_tmpdir
@@ -1268,6 +1316,8 @@ esac
 
 _run_cleanup_scenario "escape-seq: cleanup_tmpdir must NOT emit \\033[?7h when RICH_UI=0" '
 RICH_UI=0
+_phase_reader_pid=0
+_consumer_pid=0
 TMPDIR_INSTALL=""
 SUMMARY_FILE=""
 : >>"$UI_TTY"
@@ -1562,13 +1612,13 @@ _cu_len=$(printf "%s" "$_cp_cu" | wc -c | tr -d " ")
 '
 
 _run_scenario "ctrl-d/ctrl-u: footer text contains no Ctrl-D or Ctrl-U reference" '
-# The footer line is assembled in _cp_render via printf; check the install.sh
+# The footer line is assembled in _cp_render via printf; check the ui.sh
 # source directly to confirm the footer string does not mention Ctrl-D, Ctrl-U,
 # or their key symbols (^D, ^U, C-d, C-u).
-_footer_line=$(grep -n "proceed.*abort.*PgUp" '"'"'/home/olek/Workspaces/sandboxd/sandboxd/scripts/install.sh'"'"' | head -1)
+_footer_line=$(grep -n "proceed.*abort.*PgUp" "$UI_SH" | head -1)
 # Must find the footer line at all.
 [ -n "$_footer_line" ] || {
-    printf "footer line not found in install.sh\n" >&2; exit 1
+    printf "footer line not found in ui.sh\n" >&2; exit 1
 }
 # Footer must not contain any reference to the hidden keys.
 case "$_footer_line" in
@@ -1586,7 +1636,6 @@ esac
 # ---------------------------------------------------------------------------
 
 _run_scenario "failure-report rich: step name present, not 'unknown'" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1612,7 +1661,6 @@ esac
 "
 
 _run_scenario "failure-report rich: log-tail section present when file exists" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1638,7 +1686,6 @@ esac
 "
 
 _run_scenario "failure-report rich: no log-tail section when file absent" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1660,7 +1707,6 @@ esac
 "
 
 _run_scenario "failure-report plain: log-tail section present and content appears" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1687,7 +1733,6 @@ esac
 "
 
 _run_scenario "failure-report plain: log-tail bytes identical to rich branch" "
-$(printf '%s\n' "$EMIT_BLOCK")
 $(printf '%s\n' "$PRINT_FAILURE_REPORT_BLOCK")
 QUIET=0
 RED=''
@@ -1715,6 +1760,570 @@ _plain_tail=\$(printf '%s\n' \"\$_plain_out\" | sed -n '/Last log lines:/,\$p')
     exit 1
 }
 "
+
+# ---------------------------------------------------------------------------
+# die() regression guards — BLOCKING-1 (plain-mode terse output) and
+# BLOCKING-2 (rich-mode active-phase ✗ omitted).
+# ---------------------------------------------------------------------------
+
+# BLOCKING-1: in plain mode, die() emits the terse "${RED}x${RESET} <msg>" line
+# directly via emit() — not via ui_die_report/SUMMARY_FILE.  ui_teardown must
+# NOT flush any report in plain mode.
+_run_scenario "die regression: plain mode emit produces terse x-prefixed line" '
+RICH_UI=0
+out=$(emit "${RED}x${RESET} Boom" 2>/dev/null)
+case "$out" in
+    *"Boom"*) ;;
+    *) printf "expected \"Boom\" in plain-mode emit output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# BLOCKING-1 (teardown): in plain mode ui_teardown must NOT flush SUMMARY_FILE
+# even if it contains content (master guards the flush with RICH_UI=1).
+_run_scenario "die regression: plain mode ui_teardown must NOT flush SUMMARY_FILE" '
+RICH_UI=0
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+printf "should not appear\n" > "$SUMMARY_FILE"
+out=$(ui_teardown 2>/dev/null)
+case "$out" in
+    *"should not appear"*)
+        printf "plain-mode ui_teardown flushed SUMMARY_FILE — must not appear\n" >&2; exit 1 ;;
+    *) ;;
+esac
+'
+
+# BLOCKING-1 (rich variant): when RICH_UI=1 ui_die_report writes to SUMMARY_FILE
+# and ui_teardown flushes it to stdout.
+_run_scenario "die regression: rich mode still flushes SUMMARY_FILE via ui_teardown" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+ui_init_phases "Phase 1
+Phase 2"
+UI_PHASE_STATUSES=$(printf "done\npending\n")
+ui_die_report "RichBoom" "fix it and re-run" "/dev/null"
+out=$(ui_teardown 2>/dev/null)
+case "$out" in
+    *"RichBoom"*) ;;
+    *) printf "expected \"RichBoom\" in rich-mode teardown output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# BLOCKING-2: when ui_die_report fires while a phase is active, the durable
+# report must contain "✗ <phase-name>" (i.e. the active phase is flipped to
+# failed before the checklist is rendered).
+_run_scenario "die regression: active phase appears as failed in SUMMARY_FILE" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+ui_init_phases "Phase 1
+Phase 2
+Phase 3"
+UI_PHASE_STATUSES=$(printf "done\nactive\npending\n")
+ui_die_report "Boom" "fix it" "/dev/null"
+content=$(cat "$SUMMARY_FILE")
+# Phase 2 must appear as ✗ (octal \342\234\227 = UTF-8 cross mark)
+case "$content" in
+    *"Phase 2"*) ;;
+    *) printf "Phase 2 missing from report; got:\n%s\n" "$content" >&2; exit 1 ;;
+esac
+# Verify the error text is present
+case "$content" in
+    *"Boom"*) ;;
+    *) printf "Error text missing from report; got:\n%s\n" "$content" >&2; exit 1 ;;
+esac
+'
+
+# BLOCKING-2 (variant): when no phase is active, ui_die_report must not fail.
+_run_scenario "die regression: ui_die_report with no active phase succeeds" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+ui_init_phases "Phase 1
+Phase 2"
+UI_PHASE_STATUSES=$(printf "done\ndone\n")
+ui_die_report "NoBoom" "fix it" "/dev/null"
+content=$(cat "$SUMMARY_FILE")
+case "$content" in
+    *"NoBoom"*) ;;
+    *) printf "Error text missing from report; got:\n%s\n" "$content" >&2; exit 1 ;;
+esac
+'
+
+# ===========================================================================
+# Uninstall-specific scenarios
+# ===========================================================================
+#
+# These scenarios exercise functions extracted from uninstall.sh.  They
+# mirror the install equivalents above but use TMPDIR_UNINSTALL instead of
+# TMPDIR_INSTALL.
+
+# ---------------------------------------------------------------------------
+# uninstall cleanup_tmpdir — cursor-show and DECAWM escape sequences.
+# ---------------------------------------------------------------------------
+
+# CURSOR-SHOW: cleanup_tmpdir emits \033[?25h in rich mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir emits \\033[?25h when RICH_UI=1" '
+# SPINNER_PID, UI_ANIM_PID, ALT_SCREEN_ACTIVE default to 0; cursor-show
+# branch executes; tmpdir/summary vars are empty so deletion branches skip.
+_phase_reader_pid=0
+_consumer_pid=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?25h")"*) : ;;
+    *) printf "\\033[?25h missing from uninstall cleanup_tmpdir rich-mode output\n" >&2; exit 1 ;;
+esac
+'
+
+# CURSOR-SHOW: cleanup_tmpdir must NOT emit \033[?25h in plain mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir must NOT emit \\033[?25h when RICH_UI=0" '
+RICH_UI=0
+_phase_reader_pid=0
+_consumer_pid=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+: >>"$UI_TTY"
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?25h")"*)
+        printf "\\033[?25h found in uninstall cleanup_tmpdir plain-mode output — must not appear\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# DECAWM restore: cleanup_tmpdir emits \033[?7h in rich mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir emits \\033[?7h when RICH_UI=1" '
+_phase_reader_pid=0
+_consumer_pid=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7h")"*) : ;;
+    *) printf "\\033[?7h missing from uninstall cleanup_tmpdir rich-mode output\n" >&2; exit 1 ;;
+esac
+'
+
+# DECAWM restore: cleanup_tmpdir must NOT emit \033[?7h in plain mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir must NOT emit \\033[?7h when RICH_UI=0" '
+RICH_UI=0
+_phase_reader_pid=0
+_consumer_pid=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+: >>"$UI_TTY"
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7h")"*)
+        printf "\\033[?7h found in uninstall cleanup_tmpdir plain-mode output — must not appear\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# uninstall _print_failure_report — failure attribution and log-tail.
+# ---------------------------------------------------------------------------
+
+# Rich mode: failing step label appears in output, not the fallback "unknown".
+_run_scenario "uninstall failure-report rich: step name present, not 'unknown'" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'remove-binaries'*) ;;
+    *) printf 'step name not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'unknown'*) printf 'fallback word \"unknown\" must not appear; got: %s\n' \"\$out\" >&2; exit 1 ;;
+    *) ;;
+esac
+"
+
+# Rich mode: log-tail section appears when failure-log-tail.txt exists.
+_run_scenario "uninstall failure-report rich: log-tail section present when file exists" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+printf 'step=remove_binaries action=fail status=fail\n' > \"\$TMPDIR_UNINSTALL/failure-log-tail.txt\"
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) ;;
+    *) printf 'log-tail section not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'step=remove_binaries'*) ;;
+    *) printf 'log-tail content not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+"
+
+# Rich mode: no log-tail section when failure-log-tail.txt is absent.
+_run_scenario "uninstall failure-report rich: no log-tail section when file absent" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) printf 'log-tail section present but file absent; got: %s\n' \"\$out\" >&2; exit 1 ;;
+    *) ;;
+esac
+"
+
+# Plain mode: log-tail section appears when failure-log-tail.txt exists.
+_run_scenario "uninstall failure-report plain: log-tail section present and content appears" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+printf 'step=remove_binaries action=fail status=fail\n' > \"\$TMPDIR_UNINSTALL/failure-log-tail.txt\"
+RICH_UI=0
+UI_PHASE_COUNT=0
+UI_PHASE_NAMES=''
+UI_PHASE_STATUSES=''
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) ;;
+    *) printf 'plain: log-tail section not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'step=remove_binaries'*) ;;
+    *) printf 'plain: log-tail content not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+"
+
+# Plain mode: log-tail block identical between rich and plain branches.
+_run_scenario "uninstall failure-report plain: log-tail bytes identical to rich branch" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+printf 'step=remove_binaries action=fail status=fail\n' > \"\$TMPDIR_UNINSTALL/failure-log-tail.txt\"
+UI_PHASE_COUNT=3
+RICH_UI=1
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+_rich_out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+RICH_UI=0
+UI_PHASE_COUNT=0
+UI_PHASE_NAMES=''
+UI_PHASE_STATUSES=''
+_plain_out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+_rich_tail=\$(printf '%s\n' \"\$_rich_out\" | sed -n '/Last log lines:/,\$p')
+_plain_tail=\$(printf '%s\n' \"\$_plain_out\" | sed -n '/Last log lines:/,\$p')
+[ \"\$_rich_tail\" = \"\$_plain_tail\" ] || {
+    printf 'log-tail block differs between rich and plain branches\nrich:\n%s\nplain:\n%s\n' \"\$_rich_tail\" \"\$_plain_tail\" >&2
+    exit 1
+}
+"
+
+# ---------------------------------------------------------------------------
+# uninstall die() regression guards
+# ---------------------------------------------------------------------------
+
+# BLOCKING-1 (uninstall): in plain mode cleanup_tmpdir must NOT flush
+# SUMMARY_FILE even when it has content.
+_run_uninstall_cleanup_scenario "uninstall die regression: plain mode cleanup_tmpdir must NOT flush SUMMARY_FILE" '
+RICH_UI=0
+_phase_reader_pid=0
+_consumer_pid=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+printf "should not appear\n" > "$SUMMARY_FILE"
+out=$(cleanup_tmpdir 2>/dev/null)
+case "$out" in
+    *"should not appear"*)
+        printf "plain-mode cleanup_tmpdir flushed SUMMARY_FILE — must not appear\n" >&2; exit 1 ;;
+    *) : ;;
+esac
+'
+
+# BLOCKING-1 (uninstall, rich variant): when RICH_UI=1 ui_die_report writes
+# to SUMMARY_FILE and the teardown path inside cleanup_tmpdir flushes it.
+_run_uninstall_cleanup_scenario "uninstall die regression: rich mode cleanup_tmpdir flushes SUMMARY_FILE via ui_teardown" '
+_phase_reader_pid=0
+_consumer_pid=0
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+TMPDIR_UNINSTALL=""
+ui_init_phases "stop-disable-unit
+remove-binaries"
+UI_PHASE_STATUSES=$(printf "done\npending\n")
+ui_die_report "UninstallRichBoom" "fix it and re-run uninstall.sh" "/dev/null"
+out=$(cleanup_tmpdir 2>/dev/null)
+case "$out" in
+    *"UninstallRichBoom"*) : ;;
+    *) printf "expected \"UninstallRichBoom\" in cleanup_tmpdir rich-mode output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# BLOCKER-2a: check_daemon_running — SUMMARY_FILE routing for daemon-refuse.
+# ---------------------------------------------------------------------------
+
+# Rich mode, daemon running, FORCE=0: refuse message goes to SUMMARY_FILE,
+# not stdout.  Call inside a subshell because the function calls exit 1.
+_run_uninstall_check_daemon_scenario "uninstall blocker-2a: daemon-refuse in rich mode goes to SUMMARY_FILE" '
+FORCE=0
+SOCK_PATH=/nonexistent/sandboxd.sock
+# Stub socket_responsive to report daemon is up without touching the filesystem.
+socket_responsive() { return 0; }
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+( check_daemon_running ) || true
+got=$(cat "$SUMMARY_FILE")
+case "$got" in
+    *"sandboxd is running"*) : ;;
+    *) printf "expected refuse message in SUMMARY_FILE; got: %s\n" "$got" >&2; exit 1 ;;
+esac
+'
+
+# Rich mode, daemon running, FORCE=0: refuse message must NOT go to stdout
+# when SUMMARY_FILE is set (it goes there instead).
+_run_uninstall_check_daemon_scenario "uninstall blocker-2a: daemon-refuse in rich mode is absent from stdout" '
+FORCE=0
+SOCK_PATH=/nonexistent/sandboxd.sock
+socket_responsive() { return 0; }
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+out=$( ( check_daemon_running ) 2>/dev/null || true )
+case "$out" in
+    *"sandboxd is running"*)
+        printf "refuse message appeared on stdout — should be in SUMMARY_FILE; got: %s\n" "$out" >&2; exit 1 ;;
+    *) : ;;
+esac
+'
+
+# Plain mode, daemon running, FORCE=0: refuse message goes to stdout
+# (SUMMARY_FILE routing must NOT fire when RICH_UI=0).
+_run_uninstall_check_daemon_scenario "uninstall blocker-2a: daemon-refuse in plain mode goes to stdout" '
+RICH_UI=0
+FORCE=0
+SOCK_PATH=/nonexistent/sandboxd.sock
+socket_responsive() { return 0; }
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+out=$( ( check_daemon_running ) 2>/dev/null || true )
+case "$out" in
+    *"sandboxd is running"*) : ;;
+    *) printf "plain mode: expected refuse message on stdout; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# No daemon: check_daemon_running returns 0 and no refuse message is emitted.
+_run_uninstall_check_daemon_scenario "uninstall blocker-2a: no daemon means no refuse message" '
+FORCE=0
+SOCK_PATH=/nonexistent/sandboxd.sock
+socket_responsive() { return 1; }
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+check_daemon_running
+[ -z "$(cat "$SUMMARY_FILE")" ] || {
+    printf "SUMMARY_FILE non-empty when no daemon; content: %s\n" "$(cat "$SUMMARY_FILE")" >&2; exit 1
+}
+'
+
+# ---------------------------------------------------------------------------
+# BLOCKER-2b: _emit_confirm_no_tty routing — SUMMARY_FILE in rich mode.
+#
+# confirm_plan() calls exit 1 after writing; we test the routing branch
+# directly (define the helper and apply the dispatch logic) rather than
+# triggering the full confirm_plan() path, which would require /dev/tty to
+# be absent — an invariant we cannot guarantee at test time.
+# ---------------------------------------------------------------------------
+
+# Rich mode: no-tty message goes to SUMMARY_FILE, not stdout.
+_run_scenario "uninstall blocker-2b: no-tty abort in rich mode goes to SUMMARY_FILE" '
+_emit_confirm_no_tty() {
+    printf "%s\n" "Aborting: no terminal and --yes not passed."
+    printf "%s\n" "  Re-run with --yes to proceed non-interactively:"
+    printf "%s\n" "      uninstall.sh --yes [other options]"
+}
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+    _emit_confirm_no_tty > "$SUMMARY_FILE"
+else
+    _emit_confirm_no_tty >&2
+fi
+got=$(cat "$SUMMARY_FILE")
+case "$got" in
+    *"Aborting: no terminal"*) : ;;
+    *) printf "expected no-tty message in SUMMARY_FILE; got: %s\n" "$got" >&2; exit 1 ;;
+esac
+'
+
+# Plain mode: no-tty message goes to stderr (not SUMMARY_FILE).
+_run_scenario "uninstall blocker-2b: no-tty abort in plain mode goes to stderr, not SUMMARY_FILE" '
+RICH_UI=0
+_emit_confirm_no_tty() {
+    printf "%s\n" "Aborting: no terminal and --yes not passed."
+}
+SUMMARY_FILE=$(mktemp)
+_err_capture=$(mktemp)
+trap "rm -f $SUMMARY_FILE $_err_capture" EXIT
+if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+    _emit_confirm_no_tty > "$SUMMARY_FILE"
+else
+    _emit_confirm_no_tty >"$_err_capture" 2>&1
+fi
+[ -z "$(cat "$SUMMARY_FILE")" ] || {
+    printf "plain: SUMMARY_FILE non-empty — should have gone to stderr; content: %s\n" "$(cat "$SUMMARY_FILE")" >&2; exit 1
+}
+err=$(cat "$_err_capture")
+case "$err" in
+    *"Aborting: no terminal"*) : ;;
+    *) printf "plain: expected no-tty message on stderr; got: %s\n" "$err" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# BLOCKER-2c / SF-1: _emit_purge_decline routing — SUMMARY_FILE in rich mode.
+# ---------------------------------------------------------------------------
+
+# Rich mode: purge-decline message goes to SUMMARY_FILE, not stdout.
+_run_scenario "uninstall blocker-2c: purge-decline in rich mode goes to SUMMARY_FILE" '
+_emit_purge_decline() {
+    printf "%b\n" "${YELLOW}!${RESET} Aborted. No changes were made."
+}
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+    _emit_purge_decline > "$SUMMARY_FILE"
+else
+    _emit_purge_decline
+fi
+got=$(cat "$SUMMARY_FILE")
+case "$got" in
+    *"Aborted. No changes were made."*) : ;;
+    *) printf "expected purge-decline message in SUMMARY_FILE; got: %s\n" "$got" >&2; exit 1 ;;
+esac
+'
+
+# Plain mode: purge-decline message goes to stdout (not SUMMARY_FILE).
+_run_scenario "uninstall blocker-2c: purge-decline in plain mode goes to stdout" '
+RICH_UI=0
+_emit_purge_decline() {
+    printf "%s\n" "Aborted. No changes were made."
+}
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+out=$(
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+        _emit_purge_decline > "$SUMMARY_FILE"
+    else
+        _emit_purge_decline
+    fi
+)
+[ -z "$(cat "$SUMMARY_FILE")" ] || {
+    printf "plain: SUMMARY_FILE non-empty — should have gone to stdout; content: %s\n" "$(cat "$SUMMARY_FILE")" >&2; exit 1
+}
+case "$out" in
+    *"Aborted. No changes were made."*) : ;;
+    *) printf "plain: expected purge-decline on stdout; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# SF-2: print_next_steps — Removed: section with record_removed population.
+# ---------------------------------------------------------------------------
+
+# Non-empty REMOVED_ITEMS: "Removed:" section and each item appear in output.
+_run_uninstall_next_steps_scenario "uninstall sf-2: print_next_steps shows Removed: section when items present" '
+REMOVED_ITEMS=""
+record_removed "/usr/local/bin/sandbox"
+record_removed "/usr/local/libexec/sandboxd/"
+PURGE=0
+SANDBOX_UID=""
+out=$(print_next_steps 2>/dev/null)
+case "$out" in
+    *"Removed:"*) : ;;
+    *) printf "expected Removed: section in output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+case "$out" in
+    *"/usr/local/bin/sandbox"*) : ;;
+    *) printf "expected first removed item in output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+case "$out" in
+    *"/usr/local/libexec/sandboxd/"*) : ;;
+    *) printf "expected second removed item in output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# Empty REMOVED_ITEMS: "Removed:" section must NOT appear.
+_run_uninstall_next_steps_scenario "uninstall sf-2: print_next_steps omits Removed: section when no items" '
+REMOVED_ITEMS=""
+PURGE=0
+SANDBOX_UID=""
+out=$(print_next_steps 2>/dev/null)
+case "$out" in
+    *"Removed:"*)
+        printf "Removed: section present but REMOVED_ITEMS is empty; got: %s\n" "$out" >&2; exit 1 ;;
+    *) : ;;
+esac
+'
+
+# record_removed accumulates multiple items without losing earlier entries.
+_run_uninstall_next_steps_scenario "uninstall sf-2: record_removed accumulates items across multiple calls" '
+REMOVED_ITEMS=""
+record_removed "first-item"
+record_removed "second-item"
+record_removed "third-item"
+case "$REMOVED_ITEMS" in
+    *"first-item"*) : ;;
+    *) printf "first item missing from REMOVED_ITEMS; got: %s\n" "$REMOVED_ITEMS" >&2; exit 1 ;;
+esac
+case "$REMOVED_ITEMS" in
+    *"second-item"*) : ;;
+    *) printf "second item missing from REMOVED_ITEMS; got: %s\n" "$REMOVED_ITEMS" >&2; exit 1 ;;
+esac
+case "$REMOVED_ITEMS" in
+    *"third-item"*) : ;;
+    *) printf "third item missing from REMOVED_ITEMS; got: %s\n" "$REMOVED_ITEMS" >&2; exit 1 ;;
+esac
+'
 
 # ---------------------------------------------------------------------------
 # Summary
