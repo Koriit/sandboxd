@@ -21,11 +21,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 _REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 UI_SH="$_REPO_ROOT/scripts/ui.sh"
 INSTALL_SH="$_REPO_ROOT/scripts/install.sh"
+UNINSTALL_SH="$_REPO_ROOT/scripts/uninstall.sh"
 
 # ---------------------------------------------------------------------------
 # Validate source files exist up front.
 # ---------------------------------------------------------------------------
-for _f in "$UI_SH" "$INSTALL_SH"; do
+for _f in "$UI_SH" "$INSTALL_SH" "$UNINSTALL_SH"; do
     if [ ! -f "$_f" ]; then
         printf 'harness.sh: required source file not found: %s\n' "$_f" >&2
         exit 1
@@ -49,6 +50,24 @@ PRINT_FAILURE_REPORT_BLOCK=$(awk '
     in_block { print }
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
+
+# ---------------------------------------------------------------------------
+# Extract uninstall-specific functions from uninstall.sh.
+# These use TMPDIR_UNINSTALL (not TMPDIR_INSTALL) so they cannot share the
+# install extraction blocks above.
+# ---------------------------------------------------------------------------
+
+UNINSTALL_CLEANUP_BLOCK=$(awk '
+    /^cleanup_tmpdir\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$UNINSTALL_SH")
+
+UNINSTALL_PRINT_FAILURE_REPORT_BLOCK=$(awk '
+    /^_print_failure_report\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$UNINSTALL_SH")
 
 # ---------------------------------------------------------------------------
 # Failure tracking.
@@ -900,6 +919,17 @@ _run_cleanup_scenario() {
     _rcs_cols="${4:-80}"
     _run_scenario "$_rcs_label" "$_rcs_snippet" "$_rcs_rows" "$_rcs_cols" \
         "$CLEANUP_BLOCK"
+}
+
+# Convenience wrapper: injects UNINSTALL_CLEANUP_BLOCK (uninstall-specific
+# functions).  Uses TMPDIR_UNINSTALL so it cannot share _run_cleanup_scenario.
+_run_uninstall_cleanup_scenario() {
+    _rucs_label="$1"
+    _rucs_snippet="$2"
+    _rucs_rows="${3:-24}"
+    _rucs_cols="${4:-80}"
+    _run_scenario "$_rucs_label" "$_rucs_snippet" "$_rucs_rows" "$_rucs_cols" \
+        "$UNINSTALL_CLEANUP_BLOCK"
 }
 
 _run_cleanup_scenario "escape-seq: cleanup_tmpdir emits \\033[?25h when RICH_UI=1" '
@@ -1760,6 +1790,242 @@ content=$(cat "$SUMMARY_FILE")
 case "$content" in
     *"NoBoom"*) ;;
     *) printf "Error text missing from report; got:\n%s\n" "$content" >&2; exit 1 ;;
+esac
+'
+
+# ===========================================================================
+# Uninstall-specific scenarios
+# ===========================================================================
+#
+# These scenarios exercise functions extracted from uninstall.sh.  They
+# mirror the install equivalents above but use TMPDIR_UNINSTALL instead of
+# TMPDIR_INSTALL.
+
+# ---------------------------------------------------------------------------
+# uninstall cleanup_tmpdir — cursor-show and DECAWM escape sequences.
+# ---------------------------------------------------------------------------
+
+# CURSOR-SHOW: cleanup_tmpdir emits \033[?25h in rich mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir emits \\033[?25h when RICH_UI=1" '
+# SPINNER_PID, UI_ANIM_PID, ALT_SCREEN_ACTIVE default to 0; cursor-show
+# branch executes; tmpdir/summary vars are empty so deletion branches skip.
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?25h")"*) : ;;
+    *) printf "\\033[?25h missing from uninstall cleanup_tmpdir rich-mode output\n" >&2; exit 1 ;;
+esac
+'
+
+# CURSOR-SHOW: cleanup_tmpdir must NOT emit \033[?25h in plain mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir must NOT emit \\033[?25h when RICH_UI=0" '
+RICH_UI=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+: >>"$UI_TTY"
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?25h")"*)
+        printf "\\033[?25h found in uninstall cleanup_tmpdir plain-mode output — must not appear\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# DECAWM restore: cleanup_tmpdir emits \033[?7h in rich mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir emits \\033[?7h when RICH_UI=1" '
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7h")"*) : ;;
+    *) printf "\\033[?7h missing from uninstall cleanup_tmpdir rich-mode output\n" >&2; exit 1 ;;
+esac
+'
+
+# DECAWM restore: cleanup_tmpdir must NOT emit \033[?7h in plain mode.
+_run_uninstall_cleanup_scenario "uninstall: cleanup_tmpdir must NOT emit \\033[?7h when RICH_UI=0" '
+RICH_UI=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
+: >>"$UI_TTY"
+cleanup_tmpdir
+out=$(cat "$UI_TTY")
+case "$out" in
+    *"$(printf "\033[?7h")"*)
+        printf "\\033[?7h found in uninstall cleanup_tmpdir plain-mode output — must not appear\n" >&2
+        exit 1 ;;
+    *) : ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# uninstall _print_failure_report — failure attribution and log-tail.
+# ---------------------------------------------------------------------------
+
+# Rich mode: failing step label appears in output, not the fallback "unknown".
+_run_scenario "uninstall failure-report rich: step name present, not 'unknown'" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'remove-binaries'*) ;;
+    *) printf 'step name not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'unknown'*) printf 'fallback word \"unknown\" must not appear; got: %s\n' \"\$out\" >&2; exit 1 ;;
+    *) ;;
+esac
+"
+
+# Rich mode: log-tail section appears when failure-log-tail.txt exists.
+_run_scenario "uninstall failure-report rich: log-tail section present when file exists" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+printf 'step=remove_binaries action=fail status=fail\n' > \"\$TMPDIR_UNINSTALL/failure-log-tail.txt\"
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) ;;
+    *) printf 'log-tail section not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'step=remove_binaries'*) ;;
+    *) printf 'log-tail content not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+"
+
+# Rich mode: no log-tail section when failure-log-tail.txt is absent.
+_run_scenario "uninstall failure-report rich: no log-tail section when file absent" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+UI_PHASE_COUNT=3
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) printf 'log-tail section present but file absent; got: %s\n' \"\$out\" >&2; exit 1 ;;
+    *) ;;
+esac
+"
+
+# Plain mode: log-tail section appears when failure-log-tail.txt exists.
+_run_scenario "uninstall failure-report plain: log-tail section present and content appears" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+printf 'step=remove_binaries action=fail status=fail\n' > \"\$TMPDIR_UNINSTALL/failure-log-tail.txt\"
+RICH_UI=0
+UI_PHASE_COUNT=0
+UI_PHASE_NAMES=''
+UI_PHASE_STATUSES=''
+out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+case \"\$out\" in
+    *'Last log lines:'*) ;;
+    *) printf 'plain: log-tail section not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+case \"\$out\" in
+    *'step=remove_binaries'*) ;;
+    *) printf 'plain: log-tail content not in output; got: %s\n' \"\$out\" >&2; exit 1 ;;
+esac
+"
+
+# Plain mode: log-tail block identical between rich and plain branches.
+_run_scenario "uninstall failure-report plain: log-tail bytes identical to rich branch" "
+$(printf '%s\n' "$UNINSTALL_PRINT_FAILURE_REPORT_BLOCK")
+QUIET=0
+RED=''
+GREEN=''
+RESET=''
+INSTALL_LOG='/var/log/sandbox-install.log'
+TMPDIR_UNINSTALL=\$(mktemp -d)
+trap 'rm -rf \"\$TMPDIR_UNINSTALL\"' EXIT
+printf 'step=remove_binaries action=fail status=fail\n' > \"\$TMPDIR_UNINSTALL/failure-log-tail.txt\"
+UI_PHASE_COUNT=3
+RICH_UI=1
+UI_PHASE_NAMES=\$(printf 'stop-disable-unit\nremove-binaries\nremove-users-conf\n')
+UI_PHASE_STATUSES=\$(printf 'done\nfailed\n')
+_rich_out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+RICH_UI=0
+UI_PHASE_COUNT=0
+UI_PHASE_NAMES=''
+UI_PHASE_STATUSES=''
+_plain_out=\$(_print_failure_report 'remove-binaries' '2' '6' '' 2>&1)
+_rich_tail=\$(printf '%s\n' \"\$_rich_out\" | sed -n '/Last log lines:/,\$p')
+_plain_tail=\$(printf '%s\n' \"\$_plain_out\" | sed -n '/Last log lines:/,\$p')
+[ \"\$_rich_tail\" = \"\$_plain_tail\" ] || {
+    printf 'log-tail block differs between rich and plain branches\nrich:\n%s\nplain:\n%s\n' \"\$_rich_tail\" \"\$_plain_tail\" >&2
+    exit 1
+}
+"
+
+# ---------------------------------------------------------------------------
+# uninstall die() regression guards
+# ---------------------------------------------------------------------------
+
+# BLOCKING-1 (uninstall): in plain mode cleanup_tmpdir must NOT flush
+# SUMMARY_FILE even when it has content.
+_run_uninstall_cleanup_scenario "uninstall die regression: plain mode cleanup_tmpdir must NOT flush SUMMARY_FILE" '
+RICH_UI=0
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+printf "should not appear\n" > "$SUMMARY_FILE"
+out=$(cleanup_tmpdir 2>/dev/null)
+case "$out" in
+    *"should not appear"*)
+        printf "plain-mode cleanup_tmpdir flushed SUMMARY_FILE — must not appear\n" >&2; exit 1 ;;
+    *) : ;;
+esac
+'
+
+# BLOCKING-1 (uninstall, rich variant): when RICH_UI=1 ui_die_report writes
+# to SUMMARY_FILE and the teardown path inside cleanup_tmpdir flushes it.
+_run_uninstall_cleanup_scenario "uninstall die regression: rich mode cleanup_tmpdir flushes SUMMARY_FILE via ui_teardown" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+TMPDIR_UNINSTALL=""
+ui_init_phases "stop-disable-unit
+remove-binaries"
+UI_PHASE_STATUSES=$(printf "done\npending\n")
+ui_die_report "UninstallRichBoom" "fix it and re-run uninstall.sh" "/dev/null"
+out=$(cleanup_tmpdir 2>/dev/null)
+case "$out" in
+    *"UninstallRichBoom"*) : ;;
+    *) printf "expected \"UninstallRichBoom\" in cleanup_tmpdir rich-mode output; got: %s\n" "$out" >&2; exit 1 ;;
 esac
 '
 

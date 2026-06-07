@@ -52,10 +52,12 @@ ADDED_BRIDGE_RULES=""
 OPS_ADDED=""
 INSTALLED_VERSION=""
 
-RED=""
-GREEN=""
-YELLOW=""
-RESET=""
+RICH_UI=0
+PHASE_CMD_FIFO=""
+PRIV_PROGRESS_FIFO=""
+PRIV_SCRIPT=""
+TMPDIR_UNINSTALL=""
+SUMMARY_FILE=""
 
 REMOVED_ITEMS=""
 
@@ -99,46 +101,37 @@ are preserved; pass --purge to remove them.
 EOF
 }
 
-emit() {
-    if [ "$QUIET" -eq 0 ]; then
-        printf '%b\n' "$*"
+__sandbox_ui_sh_resolve() {
+    if [ -n "${SANDBOX_UI_SH:-}" ] && [ -r "$SANDBOX_UI_SH" ]; then
+        printf '%s' "$SANDBOX_UI_SH"
+        return 0
     fi
-}
-
-log_line() {
-    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    line="$ts $SCRIPT_NAME $* pid=$$"
-    if [ -w "$INSTALL_LOG" ] || { [ ! -e "$INSTALL_LOG" ] && [ -w "$(dirname "$INSTALL_LOG")" ]; }; then
-        printf '%s\n' "$line" >> "$INSTALL_LOG" 2>/dev/null || true
-    else
-        printf '%s\n' "$line" | sudo -k tee -a "$INSTALL_LOG" >/dev/null 2>&1 || true
+    case "$0" in
+        */*)
+            __ui_script_dir=$(dirname -- "$0")
+            if [ -r "$__ui_script_dir/ui.sh" ]; then
+                printf '%s' "$__ui_script_dir/ui.sh"
+                return 0
+            fi
+            ;;
+    esac
+    if [ -r "./ui.sh" ]; then
+        printf '%s' "./ui.sh"
+        return 0
     fi
+    return 1
 }
-
-log_ok()   { log_line "$*" "status=ok"; }
-log_warn() { log_line "$*" "status=warn"; }
-log_fail() { log_line "$*" "status=fail"; }
-
-die() {
-    msg="$1"
-    emit "${RED}x${RESET} ${msg}"
-    log_fail "step=die error='${msg}'"
+# BEGIN_INLINE ui.sh
+__sandbox_ui_sh_path=$(__sandbox_ui_sh_resolve) || {
+    printf 'ui.sh not found next to this script. If you are running from a local\n' >&2
+    printf 'checkout, ensure scripts/ui.sh is present. If you fetched this file\n' >&2
+    printf 'directly, use the published self-contained uninstaller:\n' >&2
+    printf '  curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | sh\n' >&2
     exit 1
 }
-
-setup_colors() {
-    if [ -t 1 ] && [ "$NO_COLOR" -eq 0 ]; then
-        RED=$(printf '\033[0;31m')
-        GREEN=$(printf '\033[0;32m')
-        YELLOW=$(printf '\033[0;33m')
-        RESET=$(printf '\033[0m')
-    else
-        RED=""
-        GREEN=""
-        YELLOW=""
-        RESET=""
-    fi
-}
+# shellcheck disable=SC1090
+. "$__sandbox_ui_sh_path"
+# END_INLINE ui.sh
 
 record_removed() {
     if [ -z "$REMOVED_ITEMS" ]; then
@@ -148,6 +141,56 @@ record_removed() {
 $1"
     fi
 }
+
+die() {
+    msg="$1"
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+        ui_die_report "$msg" "fix the root cause, then re-run uninstall.sh." "Uninstall log: ${INSTALL_LOG}"
+    else
+        emit "${RED}x${RESET} ${msg}"
+    fi
+    log_fail "step=die error='${msg}'"
+    exit 1
+}
+
+detect_tty() {
+    ui_detect_tty
+    tty_state="no"
+    color_state="no"
+    rich_state="no"
+    if [ -t 1 ]; then tty_state="yes"; fi
+    if [ -n "$GREEN" ]; then color_state="yes"; fi
+    if [ "$RICH_UI" -eq 1 ]; then rich_state="yes"; fi
+    log_ok "step=tty_detect tty=$tty_state color=$color_state rich=$rich_state"
+}
+
+cleanup_tmpdir() {
+    ui_teardown
+    if [ -n "$TMPDIR_UNINSTALL" ] && [ -d "$TMPDIR_UNINSTALL" ]; then
+        rm -rf "$TMPDIR_UNINSTALL"
+    fi
+    if [ -n "$SUMMARY_FILE" ] && [ -f "$SUMMARY_FILE" ]; then
+        rm -f "$SUMMARY_FILE"
+    fi
+}
+
+# Phase lists for the rich-UI checklist.
+UI_ANALYZE_PHASES="check-daemon
+read-state"
+
+# Remove phases: base set always present, purge phases appended when PURGE=1.
+# The final list is assembled by write_priv_script when PURGE is known.
+UI_REMOVE_PHASES_BASE="stop-disable-unit
+remove-systemd-unit
+revert-bridge-helper-setuid
+remove-bridge-conf-rules
+remove-users-conf
+remove-binaries"
+
+UI_REMOVE_PHASES_PURGE="purge-state
+purge-user
+purge-group
+purge-image"
 
 # ----------------------------------------------------------------------------
 # Resolve the install-state path.
@@ -187,7 +230,7 @@ resolve_state_path() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 1 — Arg parsing.
+# Arg parsing.
 # ----------------------------------------------------------------------------
 
 parse_args() {
@@ -216,7 +259,7 @@ parse_args() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 2 — Refuse if the daemon is running.
+# Refuse if the daemon is running.
 #
 # A finer-grained per-session probe (refuse only when actual sessions are
 # active) will land alongside `sandbox update` in a future release; that
@@ -261,7 +304,7 @@ check_daemon_running() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 3 — Read install state.
+# Read install state.
 # ----------------------------------------------------------------------------
 
 read_install_state() {
@@ -289,323 +332,768 @@ read_install_state() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 4 — Stop and disable systemd unit.
+# Plan computation and rendering.
 # ----------------------------------------------------------------------------
 
-stop_and_disable_unit() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_warn "step=systemctl_disable action=skip reason=no-systemctl"
-        return 0
-    fi
-    state_enabled=$(systemctl is-enabled sandboxd 2>/dev/null || true)
-    state_active=$(systemctl is-active sandboxd 2>/dev/null || true)
+# compute_plan assembles the human-readable plan for the pager/confirm screen.
+# The plan is a newline-separated list stored in _UNINSTALL_PLAN_LINES.
+_UNINSTALL_PLAN_LINES=""
 
-    case "$state_enabled" in
-        enabled|static|enabled-runtime)
-            sudo -k systemctl disable --now sandboxd 2>/dev/null || true
-            log_ok "step=systemctl_disable action=disable"
-            return 0
-            ;;
-    esac
-    if [ "$state_active" = "active" ]; then
-        sudo -k systemctl stop sandboxd 2>/dev/null || true
-        log_ok "step=systemctl_stop action=stop"
-        return 0
-    fi
-    log_ok "step=systemctl_disable action=skip reason=not-active"
-}
+compute_plan() {
+    _UNINSTALL_PLAN_LINES=""
+    _plan_append() {
+        if [ -z "$_UNINSTALL_PLAN_LINES" ]; then
+            _UNINSTALL_PLAN_LINES="$1"
+        else
+            _UNINSTALL_PLAN_LINES="$_UNINSTALL_PLAN_LINES
+$1"
+        fi
+    }
 
-# ----------------------------------------------------------------------------
-# Step 5 — Remove systemd unit.
-# ----------------------------------------------------------------------------
+    _plan_append "The following changes will be made (as root):"
+    _plan_append ""
 
-remove_systemd_unit() {
+    # Systemd unit
     unit=/etc/systemd/system/sandboxd.service
     if [ -f "$unit" ]; then
-        sudo -k rm -f "$unit"
-        if command -v systemctl >/dev/null 2>&1; then
-            sudo -k systemctl daemon-reload 2>/dev/null || true
-        fi
-        record_removed "$unit"
-        log_ok "step=remove_unit path=$unit action=rm"
+        _plan_append "  stop + disable + remove  $unit"
     else
-        log_ok "step=remove_unit action=skip reason=absent"
+        _plan_append "  skip (absent)            $unit"
     fi
-}
 
-# ----------------------------------------------------------------------------
-# Step 6 — Revert qemu-bridge-helper setuid.
-# ----------------------------------------------------------------------------
-
-revert_bridge_helper_setuid() {
-    if [ "$HAVE_STATE" -eq 0 ]; then
-        log_ok "step=revert_setuid action=skip reason=no-state"
-        return 0
-    fi
-    if [ "$WE_SET_BH_SETUID" != "true" ]; then
-        log_ok "step=revert_setuid action=skip reason=we-did-not-set-it"
-        return 0
-    fi
-    if [ -z "$BH_PATH" ] || [ ! -e "$BH_PATH" ]; then
-        log_ok "step=revert_setuid action=skip reason=helper-absent"
-        return 0
-    fi
-    if [ -u "$BH_PATH" ]; then
-        sudo -k chmod u-s "$BH_PATH"
-        record_removed "setuid bit on $BH_PATH"
-        log_ok "step=revert_setuid path=$BH_PATH action=unset"
+    # Bridge-helper setuid
+    if [ "$HAVE_STATE" -eq 1 ] && [ "$WE_SET_BH_SETUID" = "true" ] \
+       && [ -n "$BH_PATH" ] && [ -e "$BH_PATH" ] && [ -u "$BH_PATH" ]; then
+        _plan_append "  revert setuid bit        $BH_PATH"
     else
-        log_ok "step=revert_setuid action=skip reason=already-not-setuid"
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Step 7 — Remove /etc/qemu/bridge.conf rules we added.
-# ----------------------------------------------------------------------------
-
-remove_bridge_conf_rules() {
-    if [ "$HAVE_STATE" -eq 0 ]; then
-        log_ok "step=bridge_conf action=skip reason=no-state"
-        return 0
-    fi
-    if [ ! -f /etc/qemu/bridge.conf ]; then
-        log_ok "step=bridge_conf action=skip reason=file-absent"
-        return 0
-    fi
-    if [ -z "$ADDED_BRIDGE_RULES" ]; then
-        log_ok "step=bridge_conf action=skip reason=no-rules-recorded"
-        return 0
+        _plan_append "  skip (not set by us)     bridge-helper setuid"
     fi
 
-    tmp=$(mktemp)
-    tmp_rules=$(mktemp)
-    sudo -k cat /etc/qemu/bridge.conf | tee "$tmp" >/dev/null
-    original_lines=$(wc -l < "$tmp" 2>/dev/null || echo 0)
-    # ADDED_BRIDGE_RULES is one rule per line (jq output). Drop empty lines
-    # so an empty recorded set does not match every line in bridge.conf.
-    printf '%s\n' "$ADDED_BRIDGE_RULES" | awk 'NF' > "$tmp_rules"
-    rules_count=$(wc -l < "$tmp_rules" 2>/dev/null || echo 0)
-
-    # Single-pass awk: read the recorded rules into a set, then emit every
-    # bridge.conf line that is NOT in the set. No subshell, no per-rule
-    # rewrite — operator-added rules are preserved by construction.
-    awk 'NR==FNR { drop[$0]=1; next } !($0 in drop)' \
-        "$tmp_rules" "$tmp" > "${tmp}.new"
-    mv "${tmp}.new" "$tmp"
-
-    # Only delete /etc/qemu/bridge.conf if (i) the filtered result is empty
-    # AND (ii) the recorded rule count matches the original line count —
-    # i.e. every line in the file was one we added. Otherwise an operator-
-    # added rule sitting alongside ours would be lost.
-    if [ ! -s "$tmp" ] && [ "$rules_count" -gt 0 ] \
-       && [ "$rules_count" -eq "$original_lines" ]; then
-        sudo -k rm -f /etc/qemu/bridge.conf
-        record_removed "/etc/qemu/bridge.conf"
-        log_ok "step=bridge_conf action=remove_file reason=empty rules=$rules_count"
-    elif ! cmp -s "$tmp" /etc/qemu/bridge.conf; then
-        sudo -k install -m 0644 -o root -g root "$tmp" /etc/qemu/bridge.conf
-        record_removed "added rules in /etc/qemu/bridge.conf"
-        log_ok "step=bridge_conf action=removed_lines rules=$rules_count"
+    # Bridge.conf rules
+    if [ "$HAVE_STATE" -eq 1 ] && [ -n "$ADDED_BRIDGE_RULES" ]; then
+        _plan_append "  remove our rules from    /etc/qemu/bridge.conf"
     else
-        log_ok "step=bridge_conf action=skip reason=no-matching-lines"
+        _plan_append "  skip                     /etc/qemu/bridge.conf"
     fi
-    rm -f "$tmp" "$tmp_rules" "${tmp}.new"
-}
 
-# ----------------------------------------------------------------------------
-# Step 8 — Remove /etc/sandboxd/users.conf (with backup if modified).
-# ----------------------------------------------------------------------------
-
-remove_users_conf() {
-    if [ "$HAVE_STATE" -eq 0 ]; then
-        log_ok "step=remove_users_conf action=skip reason=no-state"
-        # Still try to remove an empty /etc/sandboxd directory below.
-    elif [ "$WE_CREATED_USERS_CONF" = "true" ] && [ -f /etc/sandboxd/users.conf ]; then
-        current_sha=$(sudo -k sha256sum /etc/sandboxd/users.conf 2>/dev/null | awk '{print $1}')
-        backup_path=""
-        if [ -n "$USERS_CONF_SHA_AT_INSTALL" ] \
-           && [ -n "$current_sha" ] \
-           && [ "$current_sha" != "$USERS_CONF_SHA_AT_INSTALL" ]; then
-            home_dir="${HOME:-}"
-            if [ -z "$home_dir" ] && [ -n "${SUDO_USER:-}" ]; then
-                home_dir=$(getent passwd "$SUDO_USER" | cut -d: -f6 2>/dev/null || true)
-            fi
-            if [ -z "$home_dir" ]; then home_dir="/tmp"; fi
-            backup_dir="$home_dir/sandboxd-uninstall-backup-$(date -u +%Y%m%dT%H%M%SZ)"
-            mkdir -p "$backup_dir"
-            sudo -k cp /etc/sandboxd/users.conf "$backup_dir/users.conf"
-            backup_path="$backup_dir/users.conf"
-            emit "${YELLOW}!${RESET} /etc/sandboxd/users.conf was modified since install."
-            emit "  Backup saved to: $backup_path"
-            log_warn "step=backup_users_conf to=$backup_path reason=modified-since-install"
-        fi
-        sudo -k rm -f /etc/sandboxd/users.conf
-        record_removed "/etc/sandboxd/users.conf"
-        log_ok "step=remove_users_conf backup=${backup_path:-none}"
+    # users.conf
+    if [ "$HAVE_STATE" -eq 1 ] && [ "$WE_CREATED_USERS_CONF" = "true" ] \
+       && [ -f /etc/sandboxd/users.conf ]; then
+        _plan_append "  remove                   /etc/sandboxd/users.conf"
     else
-        log_ok "step=remove_users_conf action=skip reason=we-did-not-create-it"
+        _plan_append "  skip (not created by us) /etc/sandboxd/users.conf"
     fi
 
-    if [ -d /etc/sandboxd ]; then
-        if [ -z "$(sudo -k ls -A /etc/sandboxd 2>/dev/null)" ]; then
-            sudo -k rmdir /etc/sandboxd
-            record_removed "/etc/sandboxd/ (empty)"
-            log_ok "step=remove_users_conf_dir"
-        fi
-    fi
-}
+    # Binaries
+    _plan_append "  remove (if present)      /usr/local/bin/sandbox"
+    _plan_append "  remove (if present)      /usr/local/libexec/sandboxd/ (binaries)"
 
-# ----------------------------------------------------------------------------
-# Step 9 — Note that route-helper and lima-helper caps are removed with the
-#           binary (the kernel drops file capabilities when the file is
-#           unlinked, so removing the binary is sufficient).
-# ----------------------------------------------------------------------------
-
-defer_route_helper_caps() {
-    helper=/usr/local/libexec/sandboxd/sandbox-route-helper
-    if [ -x "$helper" ]; then
-        log_ok "step=helper_caps action=defer reason=will-remove-binary"
-    else
-        log_ok "step=helper_caps action=skip reason=absent"
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Step 10 — Remove binaries.
-# ----------------------------------------------------------------------------
-
-remove_binaries() {
-    for bin in /usr/local/libexec/sandboxd/sandboxd \
-               /usr/local/bin/sandbox \
-               /usr/local/libexec/sandboxd/sandbox-route-helper \
-               /usr/local/libexec/sandboxd/sandbox-lima-helper \
-               /usr/local/libexec/sandboxd/sandbox-guest
-    do
-        if [ -f "$bin" ]; then
-            sudo -k rm -f "$bin"
-            record_removed "$bin"
-            log_ok "step=remove_binary path=$bin action=rm"
-        else
-            log_ok "step=remove_binary path=$bin action=skip reason=absent"
-        fi
-    done
-
-    if [ -d /usr/local/libexec/sandboxd ]; then
-        if [ -z "$(ls -A /usr/local/libexec/sandboxd 2>/dev/null)" ]; then
-            sudo -k rmdir /usr/local/libexec/sandboxd
-            log_ok "step=remove_libexec_dir"
-        fi
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Step 11 — Purge: state dir, user, drop-ins, group memberships, image.
-# ----------------------------------------------------------------------------
-
-purge_step() {
-    if [ "$PURGE" -ne 1 ]; then
-        log_ok "step=purge action=skip reason=not-requested"
-        return 0
-    fi
-
-    # Compute the per-uid state dir. SANDBOX_UID was resolved early (before
-    # userdel) by resolve_state_path(); use it here. Fall back to the resolved
-    # value even if the user is already gone at this point.
-    if [ -n "$SANDBOX_UID" ]; then
-        per_uid_state_dir="/var/lib/sandboxd/$SANDBOX_UID"
-    else
-        per_uid_state_dir=""
-    fi
-
-    if [ "$YES" -eq 0 ]; then
-        emit "${RED}!${RESET} --purge will delete:"
-        if [ -n "$per_uid_state_dir" ]; then
-            emit "    $per_uid_state_dir/  (sessions DB, per-session CA material, audit logs)"
+    if [ "$PURGE" -eq 1 ]; then
+        _plan_append ""
+        _plan_append "  --purge was requested — the following will also be removed:"
+        if [ -n "$SANDBOX_UID" ]; then
+            _plan_append "  purge                    /var/lib/sandboxd/$SANDBOX_UID/"
         fi
         if [ -d /var/lib/sandbox ]; then
-            emit "    /var/lib/sandbox/  (legacy state directory, if still present)"
+            _plan_append "  purge (legacy)           /var/lib/sandbox/"
         fi
         if [ "$HAVE_STATE" -eq 1 ] && [ "$WE_CREATED_SANDBOX_USER" = "true" ]; then
-            emit "    the 'sandbox' system user"
+            _plan_append "  userdel                  sandbox"
         fi
         if [ -n "$OPS_ADDED" ]; then
-            emit "    'sandbox' group membership for: $(printf '%s' "$OPS_ADDED" | tr '\n' ' ')"
+            _ops_str=$(printf '%s' "$OPS_ADDED" | tr '\n' ' ')
+            _plan_append "  revoke group membership  sandbox group for: $_ops_str"
         fi
-        printf 'Type %sPURGE%s to confirm: ' "$YELLOW" "$RESET"
-        read -r confirm
-        [ "$confirm" = "PURGE" ] || die "Aborted."
-    fi
-
-    # Remove the per-uid state subtree. NEVER blanket-rm /var/lib/sandboxd —
-    # that would wipe a co-resident sandbox-test e2e subtree.
-    if [ -n "$per_uid_state_dir" ] && [ -d "$per_uid_state_dir" ]; then
-        sudo -k rm -rf "$per_uid_state_dir"
-        record_removed "$per_uid_state_dir/"
-        log_ok "step=purge_state path=$per_uid_state_dir"
-    fi
-
-    # Remove the root /var/lib/sandboxd only if it is now empty (which means
-    # no co-resident daemon user has a subtree there).
-    if [ -d /var/lib/sandboxd ]; then
-        if sudo -k rmdir /var/lib/sandboxd 2>/dev/null; then
-            record_removed "/var/lib/sandboxd/ (empty, removed)"
-            log_ok "step=purge_sandboxd_root action=rmdir"
-        else
-            log_ok "step=purge_sandboxd_root action=skip reason=not-empty"
+        if [ -n "$INSTALLED_VERSION" ]; then
+            _plan_append "  docker image rm          sandbox-gateway:$INSTALLED_VERSION"
         fi
+        _plan_append ""
+        _plan_append "  WARNING: --purge is irreversible. All session data will be lost."
     fi
 
-    # Also remove the legacy /var/lib/sandbox if it still exists (pre-migration
-    # remnant or a host that never ran the migrating install.sh).
-    if [ -d /var/lib/sandbox ]; then
-        sudo -k rm -rf /var/lib/sandbox
-        record_removed "/var/lib/sandbox/ (legacy)"
-        log_ok "step=purge_state path=/var/lib/sandbox reason=legacy"
+    _plan_append ""
+    _plan_append "  /etc/systemd/system/sandboxd.service.d/ is NOT removed (operator-owned)."
+    _plan_append ""
+    _plan_append "Uninstall log: $INSTALL_LOG"
+}
+
+render_plan() {
+    emit ""
+    printf '%s\n' "$_UNINSTALL_PLAN_LINES" | while IFS= read -r _pl; do
+        emit "$_pl"
+    done
+    emit ""
+}
+
+confirm_plan() {
+    if [ "$YES" -eq 1 ]; then
+        emit "${BLUE}--yes passed; proceeding without interactive confirmation.${RESET}"
+        log_ok "step=confirm action=yes-flag"
+        return 0
     fi
 
-    if [ "$HAVE_STATE" -eq 1 ] \
-       && [ "$WE_CREATED_SANDBOX_USER" = "true" ] \
-       && getent passwd sandbox >/dev/null 2>&1; then
-        sudo -k userdel sandbox
-        record_removed "system user: sandbox"
-        log_ok "step=userdel"
-        if getent group sandbox >/dev/null 2>&1; then
-            sudo -k groupdel sandbox 2>/dev/null || true
-            log_ok "step=groupdel"
-        fi
+    if [ ! -e /dev/tty ] || { [ "$RICH_UI" -ne 1 ] && [ ! -t 1 ]; }; then
+        printf '%s\n' "Aborting: no terminal and --yes not passed." >&2
+        printf '%s\n' "  Re-run with --yes to proceed non-interactively:" >&2
+        printf '%s\n' "      uninstall.sh --yes [other options]" >&2
+        log_fail "step=confirm action=abort reason=no-tty"
+        exit 1
     fi
 
-    # /etc/systemd/system/sandboxd.service.d/ is operator-owned (drop-in
-    # overrides); install.sh never creates it, uninstall.sh never removes it.
-    log_ok "step=remove_drop_ins action=skip reason=operator-owned"
-
-    if [ "$HAVE_STATE" -eq 1 ] && [ -n "$OPS_ADDED" ]; then
-        printf '%s\n' "$OPS_ADDED" | while IFS= read -r op; do
-            [ -n "$op" ] || continue
-            if id -nG "$op" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
-                sudo -k gpasswd -d "$op" sandbox >/dev/null 2>&1 || true
-                log_ok "step=group_revoke operator=$op"
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_pager_confirm render_plan "sandboxd · review uninstall plan" || {
+            if [ -n "$SUMMARY_FILE" ]; then
+                printf '%b\n' "${YELLOW}!${RESET} Aborted. No changes were made." > "$SUMMARY_FILE"
             fi
-        done
+            log_ok "step=confirm action=no-interactive"
+            exit 1
+        }
+        log_ok "step=confirm action=yes-interactive"
+    else
+        render_plan
+        printf 'Proceed with these privileged changes? [y/N] ' >/dev/tty
+        read -r _answer </dev/tty || _answer=""
+        case "$_answer" in
+            [yY]|[yY][eE][sS])
+                log_ok "step=confirm action=yes-interactive"
+                emit ""
+                ;;
+            *)
+                emit "${YELLOW}!${RESET} Aborted. No changes were made."
+                log_ok "step=confirm action=no-interactive"
+                exit 1
+                ;;
+        esac
     fi
 
-    if [ -n "$INSTALLED_VERSION" ] && command -v docker >/dev/null 2>&1; then
-        image_tag="sandbox-gateway:$INSTALLED_VERSION"
-        if docker image inspect "$image_tag" >/dev/null 2>&1; then
-            sudo -k docker image rm "$image_tag" >/dev/null 2>&1 || true
-            record_removed "docker image: $image_tag"
-            log_ok "step=docker_rmi image=$image_tag"
+    # PURGE two-step: after plan confirmation, require typing literal PURGE
+    # when --purge is requested and --yes was not passed.
+    if [ "$PURGE" -eq 1 ]; then
+        emit "${RED}!${RESET} --purge is irreversible. Type PURGE to confirm deletion of all state data:"
+        printf 'Type %sPURGE%s to confirm: ' "$YELLOW" "$RESET" >/dev/tty
+        read -r _purge_confirm </dev/tty || _purge_confirm=""
+        if [ "$_purge_confirm" != "PURGE" ]; then
+            emit "${YELLOW}!${RESET} Aborted. No changes were made."
+            log_ok "step=confirm action=no-interactive reason=purge-not-confirmed"
+            exit 1
         fi
+        log_ok "step=confirm action=purge-confirmed"
     fi
 }
 
 # ----------------------------------------------------------------------------
-# Step 12 — Final state report.
+# Build the privileged child script.
+#
+# The parent has gathered all information needed. It writes a temporary
+# privileged shell script and runs it under a single `sudo sh`.
+#
+# Progress protocol: the child writes lines of the form
+#   STEP <n> begin <label>
+#   STEP <n> ok <label>
+#   STEP <n> fail <label>
+# to a FIFO at $PRIV_PROGRESS_FIFO. The parent reads these and drives the
+# checklist live. The child's actual command stdout/stderr goes to INSTALL_LOG.
 # ----------------------------------------------------------------------------
 
-final_report() {
+write_priv_script() {
+    PRIV_PROGRESS_FIFO="$TMPDIR_UNINSTALL/priv-progress.fifo"
+    mkfifo "$PRIV_PROGRESS_FIFO"
+    PRIV_SCRIPT="$TMPDIR_UNINSTALL/priv-child.sh"
+
+    # Escape values for embedding as single-quoted shell strings.
+    _sq() { printf '%s' "$1" | sed "s/'/'\\''/g"; }
+
+    # Embed multi-line state values safely.
+    _added_bridge_rules_esc=$(_sq "$ADDED_BRIDGE_RULES")
+    _ops_added_esc=$(_sq "$OPS_ADDED")
+
+    # Compute total steps: base 6, plus 4 purge steps if --purge.
+    _total_steps=6
+    if [ "$PURGE" -eq 1 ]; then
+        _total_steps=$((_total_steps + 4))
+    fi
+
+    # Assemble the remove-phase list for the rich checklist re-init.
+    if [ "$PURGE" -eq 1 ]; then
+        UI_REMOVE_PHASES="$UI_REMOVE_PHASES_BASE
+$UI_REMOVE_PHASES_PURGE"
+    else
+        UI_REMOVE_PHASES="$UI_REMOVE_PHASES_BASE"
+    fi
+
+    # In rich mode, re-initialise phases for the Remove screen before child runs.
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_init_phases "$UI_REMOVE_PHASES"
+        UI_CURRENT_HEADER="sandboxd · removing"
+        ui_render_checklist
+    fi
+
+    cat > "$PRIV_SCRIPT" <<PRIV_SCRIPT_EOF
+#!/bin/sh
+# privileged child — runs as root under a single sudo invocation.
+# Arguments: PROGRESS_FIFO INSTALL_LOG
+set -eu
+
+_FIFO="\$1"
+_LOG="\$2"
+
+# Open the FIFO for writing on fd 3; keep it open for the entire child
+# lifetime so the parent read loop sees a single continuous stream
+# and does not hit spurious EOF between individual step writes.
+exec 3> "\$_FIFO"
+
+# EXIT trap: when set -e aborts mid-step (an unguarded command failure), the
+# child exits non-zero without ever calling _step_fail, so the parent never
+# sees a STEP N fail token and falls back to "unknown" in the failure report.
+# This trap catches those unguarded exits: if a step was in-flight (_step_inflight=1)
+# and the exit status is non-zero, emit the fail token retroactively so the
+# consumer can record the correct step name. Write the last 12 log lines to
+# a temp file so the parent can surface them in the failure report.
+trap '_xs=\$?
+if [ "\$_xs" -ne 0 ] && [ "\${_step_inflight:-0}" -eq 1 ]; then
+    printf "STEP %s fail %s\n" "\$_n" "\$_label" >&3 2>/dev/null || true
+fi
+if [ -n "\${TMPDIR_UNINSTALL:-}" ]; then
+    tail -n 12 "\$_LOG" > "\$TMPDIR_UNINSTALL/failure-log-tail.txt" 2>/dev/null || true
+    chmod a+r "\$TMPDIR_UNINSTALL/failure-log-tail.txt" 2>/dev/null || true
+fi
+exec 3>&- 2>/dev/null || true' EXIT
+
+_n=0
+_TOTAL_STEPS=$_total_steps
+_step_inflight=0
+_label=""
+_step_begin() {
+    _n=\$((_n + 1))
+    _label="\$1"
+    _step_inflight=1
+    printf 'STEP %s begin %s\n' "\$_n" "\$_label" >&3
+}
+_step_ok() {
+    _step_inflight=0
+    printf 'STEP %s ok %s\n' "\$_n" "\$_label" >&3
+}
+_step_fail() {
+    _step_inflight=0
+    printf 'STEP %s fail %s\n' "\$_n" "\$_label" >&3
+    exec 3>&-
+    exit 1
+}
+_log() {
+    ts=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    printf '%s uninstall.sh %s pid=%s\n' "\$ts" "\$*" "\$\$" >> "\$_LOG" 2>/dev/null || true
+}
+
+# Emit total step count so the parent can compute N of M in failure reports.
+printf 'TOTAL %s\n' "\$_TOTAL_STEPS" >&3
+
+# Variables encoded from parent.
+TMPDIR_UNINSTALL='$(_sq "$TMPDIR_UNINSTALL")'
+HAVE_STATE='$(_sq "$HAVE_STATE")'
+WE_CREATED_SANDBOX_USER='$(_sq "$WE_CREATED_SANDBOX_USER")'
+WE_SET_BH_SETUID='$(_sq "$WE_SET_BH_SETUID")'
+BH_PATH='$(_sq "$BH_PATH")'
+WE_CREATED_USERS_CONF='$(_sq "$WE_CREATED_USERS_CONF")'
+USERS_CONF_SHA_AT_INSTALL='$(_sq "$USERS_CONF_SHA_AT_INSTALL")'
+ADDED_BRIDGE_RULES='$_added_bridge_rules_esc'
+OPS_ADDED='$_ops_added_esc'
+INSTALLED_VERSION='$(_sq "$INSTALLED_VERSION")'
+SANDBOX_UID='$(_sq "$SANDBOX_UID")'
+PURGE='$(_sq "$PURGE")'
+
+# Determine home-dir for users.conf backup (resolved in parent, passed in).
+_HOME_DIR='$(_sq "${HOME:-}")'
+_SUDO_USER='$(_sq "${SUDO_USER:-}")'
+
+# ----- Step 1: stop-disable-unit -----
+_step_begin "stop-disable-unit"
+if ! command -v systemctl >/dev/null 2>&1; then
+    _log "step=systemctl_disable action=skip reason=no-systemctl"
+    _step_ok
+else
+    state_enabled=\$(systemctl is-enabled sandboxd 2>/dev/null || true)
+    state_active=\$(systemctl is-active sandboxd 2>/dev/null || true)
+    case "\$state_enabled" in
+        enabled|static|enabled-runtime)
+            systemctl disable --now sandboxd >> "\$_LOG" 2>&1 || true
+            _log "step=systemctl_disable action=disable"
+            ;;
+        *)
+            if [ "\$state_active" = "active" ]; then
+                systemctl stop sandboxd >> "\$_LOG" 2>&1 || true
+                _log "step=systemctl_stop action=stop"
+            else
+                _log "step=systemctl_disable action=skip reason=not-active"
+            fi
+            ;;
+    esac
+    _step_ok
+fi
+
+# ----- Step 2: remove-systemd-unit -----
+_step_begin "remove-systemd-unit"
+_unit=/etc/systemd/system/sandboxd.service
+if [ -f "\$_unit" ]; then
+    rm -f "\$_unit"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >> "\$_LOG" 2>&1 || true
+    fi
+    _log "step=remove_unit path=\$_unit action=rm"
+else
+    _log "step=remove_unit action=skip reason=absent"
+fi
+_step_ok
+
+# ----- Step 3: revert-bridge-helper-setuid -----
+_step_begin "revert-bridge-helper-setuid"
+if [ "\$HAVE_STATE" -eq 0 ]; then
+    _log "step=revert_setuid action=skip reason=no-state"
+elif [ "\$WE_SET_BH_SETUID" != "true" ]; then
+    _log "step=revert_setuid action=skip reason=we-did-not-set-it"
+elif [ -z "\$BH_PATH" ] || [ ! -e "\$BH_PATH" ]; then
+    _log "step=revert_setuid action=skip reason=helper-absent"
+elif [ -u "\$BH_PATH" ]; then
+    chmod u-s "\$BH_PATH" >> "\$_LOG" 2>&1 || { _log "step=revert_setuid action=fail"; _step_fail; }
+    _log "step=revert_setuid path=\$BH_PATH action=unset"
+else
+    _log "step=revert_setuid action=skip reason=already-not-setuid"
+fi
+_step_ok
+
+# ----- Step 4: remove-bridge-conf-rules -----
+_step_begin "remove-bridge-conf-rules"
+if [ "\$HAVE_STATE" -eq 0 ]; then
+    _log "step=bridge_conf action=skip reason=no-state"
+elif [ ! -f /etc/qemu/bridge.conf ]; then
+    _log "step=bridge_conf action=skip reason=file-absent"
+elif [ -z "\$ADDED_BRIDGE_RULES" ]; then
+    _log "step=bridge_conf action=skip reason=no-rules-recorded"
+else
+    _tmp_bc=\$(mktemp)
+    _tmp_rules=\$(mktemp)
+    cp /etc/qemu/bridge.conf "\$_tmp_bc"
+    _orig_lines=\$(wc -l < "\$_tmp_bc" 2>/dev/null || printf '0')
+    printf '%s\n' "\$ADDED_BRIDGE_RULES" | awk 'NF' > "\$_tmp_rules"
+    _rules_count=\$(wc -l < "\$_tmp_rules" 2>/dev/null || printf '0')
+    awk 'NR==FNR { drop[\$0]=1; next } !(\$0 in drop)' \
+        "\$_tmp_rules" "\$_tmp_bc" > "\${_tmp_bc}.new"
+    mv "\${_tmp_bc}.new" "\$_tmp_bc"
+    if [ ! -s "\$_tmp_bc" ] && [ "\$_rules_count" -gt 0 ] \
+       && [ "\$_rules_count" -eq "\$_orig_lines" ]; then
+        rm -f /etc/qemu/bridge.conf
+        _log "step=bridge_conf action=remove_file reason=empty rules=\$_rules_count"
+    elif ! cmp -s "\$_tmp_bc" /etc/qemu/bridge.conf; then
+        install -m 0644 -o root -g root "\$_tmp_bc" /etc/qemu/bridge.conf
+        _log "step=bridge_conf action=removed_lines rules=\$_rules_count"
+    else
+        _log "step=bridge_conf action=skip reason=no-matching-lines"
+    fi
+    rm -f "\$_tmp_bc" "\$_tmp_rules" "\${_tmp_bc}.new" 2>/dev/null || true
+fi
+_step_ok
+
+# ----- Step 5: remove-users-conf -----
+_step_begin "remove-users-conf"
+if [ "\$HAVE_STATE" -eq 0 ]; then
+    _log "step=remove_users_conf action=skip reason=no-state"
+elif [ "\$WE_CREATED_USERS_CONF" = "true" ] && [ -f /etc/sandboxd/users.conf ]; then
+    _current_sha=\$(sha256sum /etc/sandboxd/users.conf 2>/dev/null | awk '{print \$1}' || true)
+    _backup_path=""
+    if [ -n "\$USERS_CONF_SHA_AT_INSTALL" ] \
+       && [ -n "\$_current_sha" ] \
+       && [ "\$_current_sha" != "\$USERS_CONF_SHA_AT_INSTALL" ]; then
+        _home_dir="\$_HOME_DIR"
+        if [ -z "\$_home_dir" ] && [ -n "\$_SUDO_USER" ]; then
+            _home_dir=\$(getent passwd "\$_SUDO_USER" | cut -d: -f6 2>/dev/null || true)
+        fi
+        if [ -z "\$_home_dir" ]; then _home_dir="/tmp"; fi
+        _backup_dir="\$_home_dir/sandboxd-uninstall-backup-\$(date -u +%Y%m%dT%H%M%SZ)"
+        mkdir -p "\$_backup_dir"
+        cp /etc/sandboxd/users.conf "\$_backup_dir/users.conf"
+        _backup_path="\$_backup_dir/users.conf"
+        _log "step=backup_users_conf to=\$_backup_path reason=modified-since-install"
+    fi
+    rm -f /etc/sandboxd/users.conf
+    _log "step=remove_users_conf backup=\${_backup_path:-none}"
+else
+    _log "step=remove_users_conf action=skip reason=we-did-not-create-it"
+fi
+if [ -d /etc/sandboxd ]; then
+    if [ -z "\$(ls -A /etc/sandboxd 2>/dev/null)" ]; then
+        rmdir /etc/sandboxd 2>/dev/null || true
+        _log "step=remove_users_conf_dir"
+    fi
+fi
+_step_ok
+
+# ----- Step 6: remove-binaries -----
+# File capabilities on sandbox-route-helper and sandbox-lima-helper are
+# dropped automatically when the files are unlinked (the kernel removes
+# file capabilities on unlink).
+_step_begin "remove-binaries"
+for _bin in /usr/local/libexec/sandboxd/sandboxd \
+            /usr/local/bin/sandbox \
+            /usr/local/libexec/sandboxd/sandbox-route-helper \
+            /usr/local/libexec/sandboxd/sandbox-lima-helper \
+            /usr/local/libexec/sandboxd/sandbox-guest
+do
+    if [ -f "\$_bin" ]; then
+        rm -f "\$_bin"
+        _log "step=remove_binary path=\$_bin action=rm"
+    else
+        _log "step=remove_binary path=\$_bin action=skip reason=absent"
+    fi
+done
+if [ -d /usr/local/libexec/sandboxd ]; then
+    if [ -z "\$(ls -A /usr/local/libexec/sandboxd 2>/dev/null)" ]; then
+        rmdir /usr/local/libexec/sandboxd 2>/dev/null || true
+        _log "step=remove_libexec_dir"
+    fi
+fi
+_step_ok
+
+PRIV_SCRIPT_EOF
+
+    if [ "$PURGE" -eq 1 ]; then
+        cat >> "$PRIV_SCRIPT" <<PURGE_EOF
+
+# ----- Step 7: purge-state -----
+_step_begin "purge-state"
+if [ -n "\$SANDBOX_UID" ]; then
+    _per_uid_dir="/var/lib/sandboxd/\$SANDBOX_UID"
+    if [ -d "\$_per_uid_dir" ]; then
+        rm -rf "\$_per_uid_dir"
+        _log "step=purge_state path=\$_per_uid_dir"
+    else
+        _log "step=purge_state path=\$_per_uid_dir action=skip reason=absent"
+    fi
+else
+    _log "step=purge_state action=skip reason=no-uid"
+fi
+if [ -d /var/lib/sandboxd ]; then
+    if rmdir /var/lib/sandboxd 2>/dev/null; then
+        _log "step=purge_sandboxd_root action=rmdir"
+    else
+        _log "step=purge_sandboxd_root action=skip reason=not-empty"
+    fi
+fi
+if [ -d /var/lib/sandbox ]; then
+    rm -rf /var/lib/sandbox
+    _log "step=purge_state path=/var/lib/sandbox reason=legacy"
+fi
+_step_ok
+
+# ----- Step 8: purge-user -----
+_step_begin "purge-user"
+if [ "\$HAVE_STATE" -eq 1 ] \
+   && [ "\$WE_CREATED_SANDBOX_USER" = "true" ] \
+   && getent passwd sandbox >/dev/null 2>&1; then
+    userdel sandbox >> "\$_LOG" 2>&1 || { _log "step=userdel action=fail"; _step_fail; }
+    _log "step=userdel action=remove"
+else
+    _log "step=userdel action=skip reason=we-did-not-create-it-or-absent"
+fi
+_log "step=remove_drop_ins action=skip reason=operator-owned"
+_step_ok
+
+# ----- Step 9: purge-group -----
+_step_begin "purge-group"
+if getent group sandbox >/dev/null 2>&1; then
+    groupdel sandbox >> "\$_LOG" 2>&1 || true
+    _log "step=groupdel action=remove"
+else
+    _log "step=groupdel action=skip reason=absent"
+fi
+if [ "\$HAVE_STATE" -eq 1 ] && [ -n "\$OPS_ADDED" ]; then
+    printf '%s\n' "\$OPS_ADDED" | while IFS= read -r _op; do
+        [ -n "\$_op" ] || continue
+        if id -nG "\$_op" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
+            gpasswd -d "\$_op" sandbox >> "\$_LOG" 2>/dev/null || true
+            _log "step=group_revoke operator=\$_op"
+        fi
+    done
+fi
+_step_ok
+
+# ----- Step 10: purge-image -----
+_step_begin "purge-image"
+if [ -n "\$INSTALLED_VERSION" ] && command -v docker >/dev/null 2>&1; then
+    _img_tag="sandbox-gateway:\$INSTALLED_VERSION"
+    if docker image inspect "\$_img_tag" >/dev/null 2>&1; then
+        docker image rm "\$_img_tag" >> "\$_LOG" 2>&1 || true
+        _log "step=docker_rmi image=\$_img_tag"
+    else
+        _log "step=docker_rmi image=\$_img_tag action=skip reason=absent"
+    fi
+else
+    _log "step=docker_rmi action=skip reason=no-version-or-docker"
+fi
+_step_ok
+PURGE_EOF
+    fi
+
+    # Append the DONE sentinel.
+    printf 'printf '"'"'DONE\n'"'"' >&3\n' >> "$PRIV_SCRIPT"
+
+    chmod +x "$PRIV_SCRIPT"
+}
+
+# run_priv_child — invoke the privileged child under a single sudo,
+# read the STEP progress lines from the FIFO, drive the checklist live,
+# and emit a structured failure report if the child exits non-zero.
+run_priv_child() {
+    _priv_exit=0
+
+    _step_history_file="$TMPDIR_UNINSTALL/step-history.txt"
+
+    _steps_done=""
+    _failed_step=""
+    _failed_step_n=0
+    _total_steps=0
+    _phase_reader_pid=0
+
+    # In rich mode, create a second FIFO so the consumer subshell can send
+    # set_phase commands to the main process. The consumer cannot call set_phase
+    # directly because subshell variable mutations are invisible to the parent.
+    if [ "$RICH_UI" -eq 1 ]; then
+        PHASE_CMD_FIFO="$TMPDIR_UNINSTALL/phase-cmd.fifo"
+        mkfifo "$PHASE_CMD_FIFO"
+        # Open phase-cmd FIFO O_RDWR as keepalive.
+        exec 5<> "$PHASE_CMD_FIFO"
+        # Launch the phase-command reader in the background.
+        (
+            exec 5>&-
+            while IFS= read -r _pcmd; do
+                case "$_pcmd" in
+                    SET_PHASE\ *)
+                        _pc_rest="${_pcmd#SET_PHASE }"
+                        _pc_n="${_pc_rest%% *}"
+                        _pc_st="${_pc_rest#* }"
+                        set_phase "$_pc_n" "$_pc_st"
+                        ui_service_winch
+                        ;;
+                    DONE_PHASES)
+                        break
+                        ;;
+                esac
+            done < "$PHASE_CMD_FIFO"
+        ) &
+        _phase_reader_pid=$!
+    fi
+
+    # Open progress FIFO O_RDWR (non-blocking on FIFOs) as write-end keepalive.
+    exec 4<> "$PRIV_PROGRESS_FIFO"
+
+    # Launch the privileged child. sudo's password prompt appears on /dev/tty.
+    sudo sh "$PRIV_SCRIPT" \
+        "$PRIV_PROGRESS_FIFO" \
+        "$INSTALL_LOG" &
+    _child_pid=$!
+
+    # Launch FIFO consumer in a background subshell to avoid deadlock.
+    (
+        # Close inherited write-end of progress FIFO immediately.
+        exec 4>&-
+        # Close inherited phase-cmd FIFO keepalive fd.
+        exec 5>&- 2>/dev/null || true
+        # Open a persistent write fd 6 for phase commands (rich mode only).
+        if [ "$RICH_UI" -eq 1 ]; then
+            exec 6>"$PHASE_CMD_FIFO" 2>/dev/null || true
+        fi
+
+        _sh_steps_done=""
+        _sh_failed_step=""
+        _sh_failed_step_n=0
+        _sh_total_steps=0
+        _sh_current_label=""
+
+        while IFS= read -r _prog_line; do
+            case "$_prog_line" in
+                DONE)
+                    break
+                    ;;
+                TOTAL\ *)
+                    _sh_total_steps="${_prog_line#TOTAL }"
+                    ;;
+                STEP\ *\ begin\ *)
+                    _sh_current_label="${_prog_line#STEP * begin }"
+                    _sb_n="${_prog_line#STEP }"
+                    _sb_n="${_sb_n%% *}"
+                    if [ "$RICH_UI" -eq 1 ]; then
+                        printf 'SET_PHASE %s active\n' "$_sb_n" >&6 || true
+                    else
+                        emit "  ${BLUE}...${RESET} $_sh_current_label"
+                    fi
+                    ;;
+                STEP\ *\ ok\ *)
+                    _ok_label="${_prog_line#STEP * ok }"
+                    _ok_n="${_prog_line#STEP }"
+                    _ok_n="${_ok_n%% *}"
+                    if [ -z "$_sh_steps_done" ]; then
+                        _sh_steps_done="$_ok_label"
+                    else
+                        _sh_steps_done="${_sh_steps_done}
+${_ok_label}"
+                    fi
+                    if [ "$RICH_UI" -eq 1 ]; then
+                        printf 'SET_PHASE %s done\n' "$_ok_n" >&6 || true
+                    else
+                        emit "  ${GREEN}+${RESET} $_ok_label"
+                    fi
+                    ;;
+                STEP\ *\ fail\ *)
+                    _fail_raw="${_prog_line#STEP * fail }"
+                    _fail_label="${_fail_raw% (test-hook)}"
+                    _fail_n="${_prog_line#STEP }"
+                    _fail_n="${_fail_n%% *}"
+                    _sh_failed_step="$_fail_label"
+                    _sh_failed_step_n="$_fail_n"
+                    if [ "$RICH_UI" -eq 1 ]; then
+                        printf 'SET_PHASE %s failed\n' "$_fail_n" >&6 || true
+                    else
+                        emit "  ${RED}x${RESET} $_fail_label"
+                    fi
+                    ;;
+                *)
+                    ;;
+            esac
+        done < "$PRIV_PROGRESS_FIFO"
+
+        if [ "$RICH_UI" -eq 1 ]; then
+            printf 'DONE_PHASES\n' >&6 || true
+            exec 6>&-
+        fi
+
+        {
+            printf 'total\t%s\n'       "$_sh_total_steps"
+            printf 'failed_step\t%s\n' "$_sh_failed_step"
+            printf 'failed_n\t%s\n'    "$_sh_failed_step_n"
+            printf 'steps_done\t%s\n'  "$(printf '%s' "$_sh_steps_done" | base64 | tr -d '\n')"
+        } > "$_step_history_file"
+    ) &
+    _consumer_pid=$!
+
+    # Main process waits for the privileged child to finish.
+    wait "$_child_pid" || _priv_exit=$?
+
+    # Close the write-end keeper, delivering EOF to the consumer.
+    exec 4>&-
+
+    # Wait for the consumer to finish writing history.
+    wait "$_consumer_pid" || true
+
+    # In rich mode, close phase-cmd FIFO and wait for the reader.
+    if [ "$RICH_UI" -eq 1 ]; then
+        exec 5>&-
+        wait "$_phase_reader_pid" || true
+        ui_animator_stop
+    fi
+
+    # Read step-history back.
+    if [ -r "$_step_history_file" ]; then
+        while IFS="	" read -r _sh_key _sh_val; do
+            case "$_sh_key" in
+                total)       _total_steps="$_sh_val" ;;
+                failed_step) _failed_step="$_sh_val" ;;
+                failed_n)    _failed_step_n="$_sh_val" ;;
+                steps_done)
+                    _steps_done=$(printf '%s' "$_sh_val" | base64 -d 2>/dev/null || true)
+                    ;;
+            esac
+        done < "$_step_history_file"
+    fi
+
+    if [ "$_priv_exit" -ne 0 ]; then
+        if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+            _print_failure_report "$_failed_step" "$_failed_step_n" \
+                "$_total_steps" "$_steps_done" > "$SUMMARY_FILE"
+        else
+            _print_failure_report "$_failed_step" "$_failed_step_n" \
+                "$_total_steps" "$_steps_done"
+        fi
+        log_fail "step=priv_child action=fail failed_step=${_failed_step:-unknown} exit=$_priv_exit"
+        exit 1
+    fi
+}
+
+# _print_failure_report — print the structured failure report to stdout.
+# Args: $1=failed_step_label, $2=failed_step_n, $3=total_steps, $4=done_list
+_print_failure_report() {
+    _fr_step="${1:-unknown}"
+    _fr_n="${2:-?}"
+    _fr_total="${3:-?}"
+    _fr_done="${4:-}"
+
+    if [ "$RICH_UI" -eq 1 ] && [ "$UI_PHASE_COUNT" -gt 0 ]; then
+        _pfr_i=1
+        printf '%s\n' "$UI_PHASE_STATUSES" | while IFS= read -r _pfr_st; do
+            [ -z "$_pfr_st" ] && continue
+            _pfr_name=$(printf '%s\n' "$UI_PHASE_NAMES" \
+                | awk -v n="$_pfr_i" 'NR==n{print; exit}')
+            case "$_pfr_st" in
+                done)   printf '%b\n' "  ${GREEN}✔${RESET} ${_pfr_name}" ;;
+                failed) printf '%b\n' "  ${RED}✗${RESET} ${_pfr_name}" ;;
+                active) printf '%b\n' "  ${RED}✗${RESET} ${_pfr_name}" ;;
+            esac
+            _pfr_i=$((_pfr_i + 1))
+        done
+        printf '\n'
+        printf '%b\n' "${RED}✗${RESET} Uninstall failed: ${_fr_step}"
+        printf '\n'
+        printf '%b\n' "  Recovery: fix the root cause, then re-run uninstall.sh."
+        printf '%b\n' "  The uninstaller is idempotent — already-removed items will be skipped."
+        printf '\n'
+        printf '%b\n' "  Uninstall log: ${INSTALL_LOG}"
+        if [ -f "$TMPDIR_UNINSTALL/failure-log-tail.txt" ] \
+                && [ -s "$TMPDIR_UNINSTALL/failure-log-tail.txt" ]; then
+            printf '\n'
+            printf '  Last log lines:\n'
+            while IFS= read -r _fr_line; do
+                printf '    %s\n' "$_fr_line"
+            done < "$TMPDIR_UNINSTALL/failure-log-tail.txt"
+        fi
+        printf '\n'
+    else
+        emit ""
+        emit "${RED}x${RESET} Uninstall failed at step ${_fr_n} of ${_fr_total}: ${_fr_step}"
+        emit ""
+
+        if [ -n "$_fr_done" ]; then
+            emit "  Steps applied (already removed — a re-run will skip them):"
+            printf '%s\n' "$_fr_done" | while IFS= read -r _s; do
+                [ -n "$_s" ] && emit "    ${GREEN}+${RESET} $_s"
+            done
+        else
+            emit "  No steps were applied before the failure."
+        fi
+        emit ""
+        emit "  Step that failed: ${RED}${_fr_step}${RESET}"
+        emit ""
+        emit "  Recovery: fix the root cause, then re-run uninstall.sh with the"
+        emit "  same arguments. The uninstaller is idempotent — already-removed"
+        emit "  items will be skipped."
+        emit ""
+        emit "  Uninstall log: $INSTALL_LOG"
+        if [ -f "$TMPDIR_UNINSTALL/failure-log-tail.txt" ] \
+                && [ -s "$TMPDIR_UNINSTALL/failure-log-tail.txt" ]; then
+            printf '\n'
+            printf '  Last log lines:\n'
+            while IFS= read -r _fr_line; do
+                printf '    %s\n' "$_fr_line"
+            done < "$TMPDIR_UNINSTALL/failure-log-tail.txt"
+        fi
+        emit ""
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Final report.
+# ----------------------------------------------------------------------------
+
+print_next_steps() {
     emit ""
     emit "${GREEN}+${RESET} sandboxd uninstalled."
+
     if [ -n "$REMOVED_ITEMS" ]; then
         emit ""
         emit "Removed:"
@@ -614,6 +1102,7 @@ final_report() {
             emit "  - $item"
         done
     fi
+
     if [ "$PURGE" -eq 0 ]; then
         emit ""
         emit "${YELLOW}Kept (run with --purge to remove):${RESET}"
@@ -625,6 +1114,7 @@ final_report() {
         emit "  - 'sandbox' system user and group"
         emit "  - sandbox-gateway docker image"
     fi
+
     emit ""
     emit "Uninstall log: $INSTALL_LOG"
     log_ok "step=done"
@@ -636,23 +1126,59 @@ final_report() {
 
 main() {
     parse_args "$@"
-    setup_colors
+    detect_tty
 
-    # resolve_state_path must run before userdel (which happens in purge_step)
-    # so SANDBOX_UID and STATE_PATH are available while the user still exists.
+    TMPDIR_UNINSTALL=$(mktemp -d "/var/tmp/sandbox-uninstall.XXXXXX")
+    SUMMARY_FILE=$(mktemp "/var/tmp/sandbox-uninstall-summary.XXXXXX")
+    trap cleanup_tmpdir EXIT INT TERM HUP
+
+    # Enter alt-screen as early as possible — trap is in place so EXIT handler
+    # restores the primary screen on any exit path (rich mode only; no-op in plain).
+    ui_enter_alt_screen
+
+    # ----- Analyze screen -----
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_init_phases "$UI_ANALYZE_PHASES"
+        UI_CURRENT_HEADER="sandboxd · analyzing"
+        ui_render_checklist
+    fi
+
+    set_phase 1 "active" "checking daemon"
+    # resolve_state_path must run before purge_step's userdel so SANDBOX_UID
+    # and STATE_PATH are available while the sandbox user still exists.
     resolve_state_path
-
     check_daemon_running
+    set_phase 1 "done"
+    ui_service_winch
+
+    set_phase 2 "active" "reading install state"
     read_install_state
-    stop_and_disable_unit
-    remove_systemd_unit
-    revert_bridge_helper_setuid
-    remove_bridge_conf_rules
-    remove_users_conf
-    defer_route_helper_caps
-    remove_binaries
-    purge_step
-    final_report
+    set_phase 2 "done"
+    ui_service_winch
+
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_animator_stop
+    fi
+
+    # ----- Plan + confirm screen -----
+    compute_plan
+    if [ "$RICH_UI" -ne 1 ]; then
+        render_plan
+    fi
+    confirm_plan
+
+    # ----- Remove screen -----
+    write_priv_script
+    run_priv_child
+
+    # Durable summary: written to SUMMARY_FILE in rich mode (ui_teardown cats
+    # it to real stdout after restoring the primary screen), or to stdout
+    # directly in plain mode.
+    if [ "$RICH_UI" -eq 1 ]; then
+        print_next_steps > "$SUMMARY_FILE"
+    else
+        print_next_steps
+    fi
 }
 
 main "$@"
