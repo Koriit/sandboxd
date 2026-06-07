@@ -4,9 +4,11 @@
 # side effects beyond function definitions and default-value variable
 # initialisations, and is always consumed via `.` (dot-source).
 #
-# Callers must define the following variables before sourcing this file:
+# Callers must define the following variables before invoking any ui.sh
+# function (not required at dot-source time):
 #   QUIET          — 0 or 1 (suppress emit() output when 1)
 #   NO_COLOR       — 0 or 1 (force plain output when 1)
+#   VERBOSE        — 0 or 1 (enable verbose TTY detection in ui_detect_tty)
 #   INSTALL_LOG    — writable path for log_line()
 #   SCRIPT_NAME    — label injected into every log_line() record
 #
@@ -188,7 +190,7 @@ ui_teardown() {
         printf '\033[?25h' >>"$UI_TTY" 2>/dev/null || true
         printf '\033[?7h' >>"$UI_TTY" 2>/dev/null || true
     fi
-    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ] && [ -s "$SUMMARY_FILE" ]; then
+    if [ -n "$SUMMARY_FILE" ] && [ -s "$SUMMARY_FILE" ]; then
         cat "$SUMMARY_FILE"
     fi
 }
@@ -1041,6 +1043,13 @@ ui_die_report() {
     _udr_msg="$1"
     _udr_recovery="$2"
     _udr_logline="$3"
+
+    # Flip the first active phase to failed so the checklist shows the
+    # in-progress step as ✗ rather than silently omitting it.
+    _udr_active=$(printf '%s\n' "$UI_PHASE_STATUSES" | awk '/^active$/{print NR; exit}')
+    if [ -n "$_udr_active" ] && [ "$_udr_active" -gt 0 ]; then
+        UI_PHASE_STATUSES=$(ui_set_phase_status "$_udr_active" failed)
+    fi
 
     {
         _udr_i=1

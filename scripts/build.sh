@@ -190,18 +190,18 @@ _verify() {
         _v_ok=0
     fi
 
-    if grep -qE '^\s*\. .*ui\.sh' "$_v_file"; then
+    if grep -qE '^[[:space:]]*\. .*ui\.sh' "$_v_file"; then
         printf 'build.sh: FAIL: "`. ui.sh`" invocation survived in %s\n' "$_v_file" >&2
         _v_ok=0
     fi
 
-    if ! grep -q '^_ui_spinner_frame()' "$_v_file"; then
+    if ! grep -q '^_ui_spinner_frame() {' "$_v_file"; then
         printf 'build.sh: FAIL: engine sentinel _ui_spinner_frame() not found in %s\n' "$_v_file" >&2
         _v_ok=0
     fi
 
     if [ "$_v_is_install" -eq 1 ] && [ "$_KEEP_TEST_ENV" -eq 0 ]; then
-        if grep -qE '^\s*# (BEGIN|END)_TEST_ENV(\s|$)' "$_v_file"; then
+        if grep -qE '^[[:space:]]*# (BEGIN|END)_TEST_ENV([[:space:]]|$)' "$_v_file"; then
             printf 'build.sh: FAIL: test-env markers survived in %s\n' "$_v_file" >&2
             _v_ok=0
         fi

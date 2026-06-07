@@ -61,13 +61,10 @@ jobs:
       # behaviour.
       - name: Stage install scripts
         working-directory: ${{ github.workspace }}
-        # build.sh inlines ui.sh, strips BEGIN_TEST_ENV…END_TEST_ENV spans,
-        # and verifies the output — no inline sed/grep logic needed here.
-        # --install-only: uninstall.sh adopts the inline marker in the next
-        # phase; until then it is copied verbatim.
-        run: |
-          scripts/build.sh --install-only --out site/public
-          cp scripts/uninstall.sh site/public/uninstall.sh
+        # build.sh inlines ui.sh into install.sh, strips BEGIN_TEST_ENV spans,
+        # verifies the output, and copies any markerless script (uninstall.sh)
+        # verbatim — no extra cp or --install-only needed.
+        run: scripts/build.sh --out site/public
 
       - name: Type-check and Astro check
         run: npm run check

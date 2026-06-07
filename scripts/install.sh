@@ -89,14 +89,16 @@ __sandbox_ui_sh_resolve() {
         printf '%s' "./ui.sh"
         return 0
     fi
+    return 1
+}
+# BEGIN_INLINE ui.sh
+__sandbox_ui_sh_path=$(__sandbox_ui_sh_resolve) || {
     printf 'ui.sh not found next to this script. If you are running from a local\n' >&2
     printf 'checkout, ensure scripts/ui.sh is present. If you fetched this file\n' >&2
     printf 'directly, use the published self-contained installer:\n' >&2
     printf '  curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh\n' >&2
     exit 1
 }
-# BEGIN_INLINE ui.sh
-__sandbox_ui_sh_path=$(__sandbox_ui_sh_resolve) || exit 1
 # shellcheck disable=SC1090
 . "$__sandbox_ui_sh_path"
 # END_INLINE ui.sh

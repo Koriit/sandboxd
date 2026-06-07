@@ -1674,6 +1674,86 @@ _plain_tail=\$(printf '%s\n' \"\$_plain_out\" | sed -n '/Last log lines:/,\$p')
 "
 
 # ---------------------------------------------------------------------------
+# die() regression guards — BLOCKING-1 (plain-mode silence) and
+# BLOCKING-2 (rich-mode active-phase ✗ omitted).
+# ---------------------------------------------------------------------------
+
+# BLOCKING-1: plain-mode die() must emit error text via ui_teardown flushing
+# SUMMARY_FILE.  Call ui_die_report then ui_teardown directly and capture the
+# combined output from teardown (the flush point).
+_run_scenario "die regression: plain mode emits error text via ui_teardown" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=0
+UI_PHASE_COUNT=0
+UI_PHASE_NAMES=""
+UI_PHASE_STATUSES=""
+ui_die_report "Boom" "fix it and re-run" "/dev/null"
+out=$(ui_teardown 2>/dev/null)
+case "$out" in
+    *"Boom"*) ;;
+    *) printf "expected \"Boom\" in plain-mode teardown output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# BLOCKING-1 (variant): when RICH_UI=1 the existing flush path still works.
+_run_scenario "die regression: rich mode still flushes SUMMARY_FILE via ui_teardown" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+ui_init_phases "Phase 1
+Phase 2"
+UI_PHASE_STATUSES=$(printf "done\npending\n")
+ui_die_report "RichBoom" "fix it and re-run" "/dev/null"
+out=$(ui_teardown 2>/dev/null)
+case "$out" in
+    *"RichBoom"*) ;;
+    *) printf "expected \"RichBoom\" in rich-mode teardown output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# BLOCKING-2: when ui_die_report fires while a phase is active, the durable
+# report must contain "✗ <phase-name>" (i.e. the active phase is flipped to
+# failed before the checklist is rendered).
+_run_scenario "die regression: active phase appears as failed in SUMMARY_FILE" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+ui_init_phases "Phase 1
+Phase 2
+Phase 3"
+UI_PHASE_STATUSES=$(printf "done\nactive\npending\n")
+ui_die_report "Boom" "fix it" "/dev/null"
+content=$(cat "$SUMMARY_FILE")
+# Phase 2 must appear as ✗ (octal \342\234\227 = UTF-8 cross mark)
+case "$content" in
+    *"Phase 2"*) ;;
+    *) printf "Phase 2 missing from report; got:\n%s\n" "$content" >&2; exit 1 ;;
+esac
+# Verify the error text is present
+case "$content" in
+    *"Boom"*) ;;
+    *) printf "Error text missing from report; got:\n%s\n" "$content" >&2; exit 1 ;;
+esac
+'
+
+# BLOCKING-2 (variant): when no phase is active, ui_die_report must not fail.
+_run_scenario "die regression: ui_die_report with no active phase succeeds" '
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+RICH_UI=1
+ui_init_phases "Phase 1
+Phase 2"
+UI_PHASE_STATUSES=$(printf "done\ndone\n")
+ui_die_report "NoBoom" "fix it" "/dev/null"
+content=$(cat "$SUMMARY_FILE")
+case "$content" in
+    *"NoBoom"*) ;;
+    *) printf "Error text missing from report; got:\n%s\n" "$content" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf '\n--- %d passed, %d failed ---\n' "$PASS" "$FAILS"
