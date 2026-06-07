@@ -286,8 +286,13 @@ EOF
 }
 
 die() {
-    ui_die_report "$1" "fix the root cause, then re-run install.sh." "$INSTALL_LOG"
-    log_fail "step=die error='${1}'"
+    msg="$1"
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+        ui_die_report "$msg" "fix the root cause, then re-run install.sh." "Install log: ${INSTALL_LOG}"
+    else
+        emit "${RED}x${RESET} ${msg}"
+    fi
+    log_fail "step=die error='${msg}'"
     exit 1
 }
 

@@ -190,7 +190,7 @@ ui_teardown() {
         printf '\033[?25h' >>"$UI_TTY" 2>/dev/null || true
         printf '\033[?7h' >>"$UI_TTY" 2>/dev/null || true
     fi
-    if [ -n "$SUMMARY_FILE" ] && [ -s "$SUMMARY_FILE" ]; then
+    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ] && [ -s "$SUMMARY_FILE" ]; then
         cat "$SUMMARY_FILE"
     fi
 }

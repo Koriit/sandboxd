@@ -1674,29 +1674,39 @@ _plain_tail=\$(printf '%s\n' \"\$_plain_out\" | sed -n '/Last log lines:/,\$p')
 "
 
 # ---------------------------------------------------------------------------
-# die() regression guards — BLOCKING-1 (plain-mode silence) and
+# die() regression guards — BLOCKING-1 (plain-mode terse output) and
 # BLOCKING-2 (rich-mode active-phase ✗ omitted).
 # ---------------------------------------------------------------------------
 
-# BLOCKING-1: plain-mode die() must emit error text via ui_teardown flushing
-# SUMMARY_FILE.  Call ui_die_report then ui_teardown directly and capture the
-# combined output from teardown (the flush point).
-_run_scenario "die regression: plain mode emits error text via ui_teardown" '
-SUMMARY_FILE=$(mktemp)
-trap "rm -f $SUMMARY_FILE" EXIT
+# BLOCKING-1: in plain mode, die() emits the terse "${RED}x${RESET} <msg>" line
+# directly via emit() — not via ui_die_report/SUMMARY_FILE.  ui_teardown must
+# NOT flush any report in plain mode.
+_run_scenario "die regression: plain mode emit produces terse x-prefixed line" '
 RICH_UI=0
-UI_PHASE_COUNT=0
-UI_PHASE_NAMES=""
-UI_PHASE_STATUSES=""
-ui_die_report "Boom" "fix it and re-run" "/dev/null"
-out=$(ui_teardown 2>/dev/null)
+out=$(emit "${RED}x${RESET} Boom" 2>/dev/null)
 case "$out" in
     *"Boom"*) ;;
-    *) printf "expected \"Boom\" in plain-mode teardown output; got: %s\n" "$out" >&2; exit 1 ;;
+    *) printf "expected \"Boom\" in plain-mode emit output; got: %s\n" "$out" >&2; exit 1 ;;
 esac
 '
 
-# BLOCKING-1 (variant): when RICH_UI=1 the existing flush path still works.
+# BLOCKING-1 (teardown): in plain mode ui_teardown must NOT flush SUMMARY_FILE
+# even if it contains content (master guards the flush with RICH_UI=1).
+_run_scenario "die regression: plain mode ui_teardown must NOT flush SUMMARY_FILE" '
+RICH_UI=0
+SUMMARY_FILE=$(mktemp)
+trap "rm -f $SUMMARY_FILE" EXIT
+printf "should not appear\n" > "$SUMMARY_FILE"
+out=$(ui_teardown 2>/dev/null)
+case "$out" in
+    *"should not appear"*)
+        printf "plain-mode ui_teardown flushed SUMMARY_FILE — must not appear\n" >&2; exit 1 ;;
+    *) ;;
+esac
+'
+
+# BLOCKING-1 (rich variant): when RICH_UI=1 ui_die_report writes to SUMMARY_FILE
+# and ui_teardown flushes it to stdout.
 _run_scenario "die regression: rich mode still flushes SUMMARY_FILE via ui_teardown" '
 SUMMARY_FILE=$(mktemp)
 trap "rm -f $SUMMARY_FILE" EXIT
