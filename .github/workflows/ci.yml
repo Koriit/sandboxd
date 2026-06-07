@@ -37,10 +37,13 @@ jobs:
       - name: Test
         run: make test
 
-  # Shellcheck for the install / uninstall scripts. Both scripts must pass
-  # POSIX-sh (`-s sh`) plus stylistic warnings (`-S style`). The scripts
-  # themselves are not yet present; until then the step short-circuits
-  # when neither file exists rather than failing CI.
+  # Shellcheck for the install / uninstall scripts and their shared engine.
+  # All four scripts must pass POSIX-sh (`-s sh`) plus stylistic warnings
+  # (`-S style`). `-x` enables cross-file source-following so shellcheck
+  # can resolve variables that install.sh/uninstall.sh set and ui.sh reads
+  # (and vice versa). The scripts themselves are not yet present in older
+  # checkouts; until then the step short-circuits when none of the files
+  # exist rather than failing CI.
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -48,10 +51,10 @@ jobs:
 
       - name: Shellcheck
         run: |
-          if [ -f scripts/install.sh ] || [ -f scripts/uninstall.sh ]; then
-            shellcheck -s sh -S style scripts/install.sh scripts/uninstall.sh
+          if [ -f scripts/install.sh ] || [ -f scripts/uninstall.sh ] || [ -f scripts/ui.sh ] || [ -f scripts/build.sh ]; then
+            shellcheck -x -s sh -S style scripts/install.sh scripts/uninstall.sh scripts/ui.sh scripts/build.sh
           else
-            echo "scripts/install.sh and scripts/uninstall.sh not present yet; skipping."
+            echo "scripts/ not present yet; skipping."
           fi
 
   # Integration tests: every `integration_*`-prefixed test in the Rust

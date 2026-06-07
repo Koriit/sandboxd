@@ -821,6 +821,7 @@ download_with_bar() {
         done
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
     else
+        # shellcheck disable=SC2034  # consumed by the caller (install.sh)
         wait "$_dwb_curl_pid" || DOWNLOAD_BAR_FAILED=1
         return 0
     fi

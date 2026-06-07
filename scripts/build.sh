@@ -191,6 +191,7 @@ _verify() {
     fi
 
     if grep -qE '^[[:space:]]*\. .*ui\.sh' "$_v_file"; then
+        # shellcheck disable=SC2016  # single quotes are intentional: displaying a literal shell pattern
         printf 'build.sh: FAIL: "`. ui.sh`" invocation survived in %s\n' "$_v_file" >&2
         _v_ok=0
     fi

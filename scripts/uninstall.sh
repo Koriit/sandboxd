@@ -131,7 +131,7 @@ __sandbox_ui_sh_path=$(__sandbox_ui_sh_resolve) || {
     printf '  curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | sh\n' >&2
     exit 1
 }
-# shellcheck disable=SC1090
+# shellcheck source=scripts/ui.sh
 . "$__sandbox_ui_sh_path"
 # END_INLINE ui.sh
 
