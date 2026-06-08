@@ -2565,6 +2565,37 @@ case "$_unhealthy" in
 esac
 '
 
+_run_health_check_scenario "install_health_check: H4 non-numeric schema version (null) sets users-conf-schema" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{}\n" > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+getcap() { printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1"; }
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+# jq returns "null" (key absent) — previously slipped past the 2>/dev/null crutch.
+jq() { printf "null\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"users-conf-schema"*) : ;;
+    *) printf "expected users-conf-schema in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
 _run_health_check_scenario "install_health_check: H5 missing gateway image sets gateway-image" '
 _hc_d=$(mktemp -d)
 _hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
@@ -2716,6 +2747,35 @@ out=$(maybe_emit_group_activation_hint 2>/dev/null)
 case "$out" in
     "") : ;;
     *) printf "expected no output when operator not in group; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# B1 regression guard: hint must be reachable on the healthy-skip path, meaning
+# OPERATOR_NAME must be set before maybe_emit_group_activation_hint is called.
+_run_hint_scenario "maybe_emit_group_activation_hint: emits hint when called with OPERATOR_NAME already set" '
+OPERATOR_NAME="alice"
+BLUE=""
+RESET=""
+getent() { return 0; }
+# alice is a sandbox group member but sandbox is not in the live session.
+id() {
+    case "$*" in
+        "-nG alice") printf "alice sandbox\n" ;;
+        "-nG")       printf "alice\n" ;;
+        *)           command id "$@" ;;
+    esac
+}
+out=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out" in
+    *"newgrp sandbox"*) : ;;
+    *) printf "expected newgrp hint; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+# Confirm the guard: with OPERATOR_NAME="" the hint must be silent.
+OPERATOR_NAME=""
+out2=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out2" in
+    "") : ;;
+    *) printf "expected silence when OPERATOR_NAME empty; got: %s\n" "$out2" >&2; exit 1 ;;
 esac
 '
 

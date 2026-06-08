@@ -510,17 +510,26 @@ install_health_check() {
         _unhealthy="${_unhealthy:+$_unhealthy,}missing-binaries"
     fi
 
-    # H2 — Route-helper has the required capabilities.
-    _hc_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | awk '{print $NF}')
-    if [ "$_hc_route_caps" != "$PLAN_ROUTE_CAPS_STR" ]; then
-        _unhealthy="${_unhealthy:+$_unhealthy,}route-caps"
-    fi
+    # H2 + H3 — Capability checks require the binaries to be present (H1 must
+    # pass) and getcap to be available.  A missing getcap is its own reason so
+    # the operator knows what to install.
+    if [ "$_hc_ok" -eq 1 ]; then
+        if command -v getcap >/dev/null 2>&1; then
+            # H2 — Route-helper has the required capabilities.
+            _hc_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | awk '{print $NF}')
+            if [ "$_hc_route_caps" != "$PLAN_ROUTE_CAPS_STR" ]; then
+                _unhealthy="${_unhealthy:+$_unhealthy,}route-caps"
+            fi
 
-    # H3 — Lima-helper has the required capabilities.
-    # getcap emits cap_setuid+ep; normalise '+' → '=' for comparison.
-    _hc_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
-    if [ "$_hc_lima_caps" != "cap_setuid=ep" ]; then
-        _unhealthy="${_unhealthy:+$_unhealthy,}lima-caps"
+            # H3 — Lima-helper has the required capabilities.
+            # getcap emits cap_setuid+ep; normalise '+' → '=' for comparison.
+            _hc_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
+            if [ "$_hc_lima_caps" != "cap_setuid=ep" ]; then
+                _unhealthy="${_unhealthy:+$_unhealthy,}lima-caps"
+            fi
+        else
+            _unhealthy="${_unhealthy:+$_unhealthy,}getcap-missing"
+        fi
     fi
 
     # H4 — users.conf schema version is at the daemon-minimum supported value.
@@ -538,7 +547,11 @@ install_health_check() {
         fi
     fi
     _hc_schema_ver="${_hc_schema_ver:-0}"
-    if [ "$_hc_schema_ver" -lt "$_hc_schema_min" ] 2>/dev/null; then
+    # Reject non-numeric values (e.g. jq returning "null") by treating them as 0.
+    case "$_hc_schema_ver" in
+        ''|*[!0-9]*) _hc_schema_ver=0 ;;
+    esac
+    if [ "$_hc_schema_ver" -lt "$_hc_schema_min" ]; then
         _unhealthy="${_unhealthy:+$_unhealthy,}users-conf-schema"
     fi
 
@@ -670,7 +683,6 @@ detect_preexisting() {
                         else
                             emit "${YELLOW}!${RESET} sandboxd $existing_ver is installed but unhealthy ($_unhealthy); repairing."
                         fi
-                        # fall through (return) into the normal install flow.
                     fi
                     ;;
             esac
@@ -728,7 +740,7 @@ check_prereqs() {
         if ! docker info >/dev/null 2>&1; then
             # docker installed but daemon unreachable — always a hard failure
             # (both provisioning paths require a reachable Docker daemon).
-            add_missing "docker (installed but daemon unreachable from this user)"
+            add_missing "docker-unreachable"
         fi
     else
         add_missing "docker"
@@ -775,7 +787,12 @@ check_prereqs() {
                         emit "    - $m:    $mgr install $pkg"
                     fi
                 else
-                    emit "    - $m"
+                    hint=$(pkg_hint_for "$m")
+                    if [ -n "$hint" ]; then
+                        emit "    - $m:    $hint"
+                    else
+                        emit "    - $m"
+                    fi
                 fi
             done
             emit "  Install these, then re-run install.sh."
@@ -827,6 +844,7 @@ pkg_name_for() {
     case "$prereq" in
         docker)
             case "$mgr" in apt) echo docker.io ;; *) echo docker ;; esac ;;
+        docker-unreachable) return 1 ;;
         lima)
             echo lima ;;
         qemu-system-x86_64)
@@ -854,6 +872,7 @@ pkg_name_for() {
         jq|curl|tar) echo "$prereq" ;;
         sha256sum)   echo coreutils ;;
         kernel-5.8+) return 1 ;;
+        /dev/kvm)    return 1 ;;
         *)           echo "$prereq" ;;
     esac
 }
@@ -864,8 +883,10 @@ pkg_name_for() {
 # path.
 pkg_hint_for() {
     case "$1" in
-        docker) echo "# or follow https://docs.docker.com/engine/install/" ;;
-        lima)   echo "# or download from https://github.com/lima-vm/lima/releases" ;;
+        docker)             echo "# or follow https://docs.docker.com/engine/install/" ;;
+        docker-unreachable) echo "# daemon unreachable — add user to docker group: sudo usermod -aG docker \$USER" ;;
+        lima)               echo "# or download from https://github.com/lima-vm/lima/releases" ;;
+        /dev/kvm)           echo "# enable KVM: sudo modprobe kvm && sudo usermod -aG kvm \$USER" ;;
         *)      ;;
     esac
 }
@@ -1910,7 +1931,6 @@ SANDBOX_UID=""
 # published installer does not call undefined functions under set -eu.
 _priv_maybe_fail_after() { :; }
 _priv_maybe_abort_at() { :; }
-_prov_maybe_force_fail() { :; }
 
 # BEGIN_TEST_ENV — stripped from published install.sh at docs-deploy time
 #
@@ -2702,7 +2722,6 @@ run_provision() {
         ui_render_checklist
     fi
 
-    emit "${BLUE}...${RESET} building backend images (this may take a few minutes)"
     log_ok "step=provision action=start operator=$OPERATOR_NAME"
 
     _prov_failed_backends=""
@@ -2713,7 +2732,11 @@ run_provision() {
             lima)      _prov_phase=2 ;;
         esac
 
-        set_phase "$_prov_phase" "active" "building $_prov_backend image"
+        if [ "$_prov_backend" = "container" ]; then
+            set_phase "$_prov_phase" "active" "building $_prov_backend image (a few minutes)"
+        else
+            set_phase "$_prov_phase" "active" "building $_prov_backend image"
+        fi
         if [ "$RICH_UI" -eq 1 ]; then
             ui_animator_start
         else
@@ -2792,7 +2815,7 @@ print_next_steps() {
     emit ""
     emit "Next:"
     maybe_emit_group_activation_hint
-    emit "  2. Verify the install:         ${BLUE}sandbox doctor${RESET}"
+    emit "  - Verify the install:         ${BLUE}sandbox doctor${RESET}"
     emit ""
     emit "Install state recorded at: $STATE_PATH"
     emit "Install log:               $INSTALL_LOG"
@@ -2825,6 +2848,11 @@ main() {
         UI_CURRENT_HEADER="sandboxd · acquiring"
         ui_render_checklist
     fi
+
+    # Detect operator identity before detect_preexisting so that
+    # maybe_emit_group_activation_hint has OPERATOR_NAME available on the
+    # healthy-skip path.
+    detect_operator
 
     set_phase 1 "active" "resolving version"
     resolve_target_version
@@ -2866,9 +2894,6 @@ main() {
     if [ "$RICH_UI" -eq 1 ]; then
         ui_animator_stop
     fi
-
-    # Detect operator identity (unprivileged parent).
-    detect_operator
 
     # Planning pass: compute the minimal action list.
     compute_plan
