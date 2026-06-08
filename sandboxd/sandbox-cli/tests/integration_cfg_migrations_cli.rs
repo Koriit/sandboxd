@@ -113,6 +113,118 @@ fn integration_apply_config_migration_subprocess_refuses_non_root_caller() {
 }
 
 // ---------------------------------------------------------------------------
+// apply-config-migrations stability contract regression
+// ---------------------------------------------------------------------------
+
+/// Regression test pinning the stable external contract for
+/// `apply-config-migrations` (plural, no flags).
+///
+/// `scripts/install.sh` invokes exactly `sandbox apply-config-migrations`
+/// across releases.  This test asserts that:
+/// 1. The subcommand name `apply-config-migrations` is recognised (not an
+///    "unrecognised subcommand" / exit-2 clap error).
+/// 2. The no-flags calling convention is accepted — no required argument
+///    is missing.
+/// 3. The non-root refusal path is taken first (the test runner is not
+///    root), exiting non-zero with a message containing `requires root`.
+///
+/// A prior-release orchestrator MUST be able to invoke this exact
+/// incantation against a newer binary and have it behave consistently.
+#[test]
+fn integration_apply_config_migrations_stable_contract_recognised_and_refuses_non_root() {
+    let output = Command::new(sandbox_bin())
+        .arg("apply-config-migrations")
+        .output()
+        .expect("spawn sandbox CLI");
+    let code = output.status.code().expect("exited normally");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Must not be clap's "unrecognised subcommand" exit code (2).
+    assert_ne!(
+        code, 2,
+        "`apply-config-migrations` must be a recognised subcommand (not a clap parse error); \
+         stderr:\n{stderr}"
+    );
+    // Must exit non-zero (non-root caller).
+    assert_ne!(code, 0, "non-root must exit non-zero; stderr:\n{stderr}");
+    // Must carry the stable `requires root` substring.
+    assert!(
+        stderr.contains("requires root"),
+        "stderr must carry `requires root` for non-root caller; got:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// apply-config-migration call-shape regression (Real-G)
+// ---------------------------------------------------------------------------
+
+/// Regression guard for the Real-G bug: the migration orchestrator in
+/// `update/migrate.rs` must invoke `sandbox apply-config-migration` (as a
+/// subcommand), not `sandbox --apply-config-migration` (which clap treats as
+/// an unknown long option and exits 2).
+///
+/// This test verifies that `apply-config-migration` is recognised by the
+/// binary as a subcommand. Clap exits 2 with "unexpected argument" for
+/// an unknown flag; a recognised subcommand goes through its own handler
+/// and either exits 0 (success) or exits 1 (gate refusal). The non-root
+/// caller takes the root-check refusal path — exit non-zero with "requires
+/// root" — but crucially NOT exit 2 with a clap parse error.
+///
+/// A secondary assertion confirms that the flag form `--apply-config-migration`
+/// is NOT accepted (would exit 2), proving the two forms are distinguishable
+/// and pinning why the old code was broken.
+#[test]
+fn integration_apply_config_migration_subcommand_form_recognised_not_clap_exit_2() {
+    // Subcommand form (correct): clap must recognise the subcommand.
+    // The non-root gate fires and gives a non-zero exit, but NOT exit 2.
+    let output_subcommand = Command::new(sandbox_bin())
+        .args([
+            "apply-config-migration",
+            "--file",
+            "/etc/sandboxd/users.conf",
+            "--migration",
+            "V001",
+            "--out",
+            "/etc/sandboxd/.users.conf.tmp.V001",
+        ])
+        .output()
+        .expect("spawn sandbox CLI");
+    let code_sub = output_subcommand.status.code().expect("exited normally");
+    let stderr_sub = String::from_utf8_lossy(&output_subcommand.stderr);
+
+    assert_ne!(
+        code_sub, 2,
+        "`apply-config-migration` (subcommand form) must be recognised — \
+         clap parse-error exit 2 means the `--` prefix bug regressed; \
+         stderr:\n{stderr_sub}"
+    );
+    assert!(
+        stderr_sub.contains("requires root"),
+        "subcommand form: non-root caller must see `requires root`; got:\n{stderr_sub}"
+    );
+
+    // Flag form (the old broken form): clap must reject this with exit 2.
+    let output_flag = Command::new(sandbox_bin())
+        .args([
+            "--apply-config-migration",
+            "--file",
+            "/etc/sandboxd/users.conf",
+            "--migration",
+            "V001",
+            "--out",
+            "/etc/sandboxd/.users.conf.tmp.V001",
+        ])
+        .output()
+        .expect("spawn sandbox CLI");
+    let code_flag = output_flag.status.code().expect("exited normally");
+    assert_eq!(
+        code_flag, 2,
+        "`--apply-config-migration` (flag form, the pre-fix broken invocation) \
+         must exit 2 (clap parse error — unknown flag); got exit {code_flag}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // dump-migration-set
 // ---------------------------------------------------------------------------
 

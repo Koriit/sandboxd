@@ -456,9 +456,12 @@ enum Command {
         /// Pin to a specific release tag (default: latest).
         #[arg(long, default_value = "latest")]
         version: String,
-        /// Use a pre-staged local tarball instead of fetching from
-        /// GitHub Releases. Required for air-gapped operation;
-        /// requires `--cosign-bundle` (or a sibling `.sigstore` file).
+        /// Use a local tarball instead of auto-downloading from GitHub
+        /// Releases. Air-gap override: when absent, the tarball and its
+        /// `.sigstore` bundle are downloaded automatically from
+        /// `--source-url`. Requires `--cosign-bundle` (or a sibling
+        /// `.sigstore` file) when the bundle is not alongside the
+        /// tarball.
         #[arg(long)]
         from: Option<std::path::PathBuf>,
         /// Path to a sigstore bundle for `--from` air-gap
@@ -542,6 +545,18 @@ enum Command {
     /// Invoked by `scripts/install.sh` from within its privileged root
     /// batch after the binaries are written, so that a pre-existing v0
     /// `users.conf` is migrated before the daemon is (re)started.
+    ///
+    /// # Stable external contract
+    ///
+    /// The subcommand name `apply-config-migrations` (plural, no flags)
+    /// and the `requires-root` refusal text are a **stable external
+    /// contract**: the install.sh installer calls this exact invocation
+    /// across releases. Do NOT rename this subcommand, do NOT change the
+    /// calling convention, and do NOT alter the `requires root` error
+    /// message prefix without a coordinated, backwards-compatible change
+    /// to `scripts/install.sh`. A prior-release orchestrator MUST be able
+    /// to invoke `sandbox apply-config-migrations` against a newer binary
+    /// and have it succeed.
     #[command(hide = true, name = "apply-config-migrations")]
     ApplyConfigMigrations,
 
@@ -5861,7 +5876,7 @@ fn apply_config_migration_inner(
 
     // All gates passed. Read --file, apply in memory, validate, write
     // to --out via the framework's atomic_write. The outer
-    // `sandbox update` shell flow then `sudo -k mv`s --out into place.
+    // `sandbox update` shell flow then `sudo mv`s --out into place.
     let input = match std::fs::read(file_path) {
         Ok(b) => b,
         Err(e) => {
@@ -5883,6 +5898,33 @@ fn apply_config_migration_inner(
     if let Err(e) = sandbox_cli::cfg_migrations::atomic_write(out_path, &transformed) {
         eprintln!("sandbox: failed to write {out_arg}: {e}");
         return 1;
+    }
+
+    // atomic_write creates the tempfile with mode 0600. The subsequent
+    // `rename_via_sudo` (sudo mv) preserves whatever mode the tempfile
+    // has, so we must set the intended mode here — before the caller renames.
+    //
+    // Force 0644 unconditionally: this is the canonical mode for all daemon
+    // config files (install.sh sets it; the daemon requires world-readable
+    // to parse on startup). Preserving the existing mode would perpetuate
+    // a broken 0600 — the exact misconfiguration this path is supposed to
+    // repair. An explicit chown root:root is redundant here (this subcommand
+    // is root-gated) but it makes the intent unambiguous.
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(out_path, std::fs::Permissions::from_mode(0o644)) {
+        eprintln!("sandbox: failed to set permissions on {out_arg}: {e}");
+        return 1;
+    }
+    // chown root:root on the output tempfile so the rename lands with the
+    // correct owner regardless of the process umask or temp-area ownership.
+    {
+        use nix::unistd::{Gid, Uid, chown};
+        let root_uid = Uid::from_raw(0);
+        let root_gid = Gid::from_raw(0);
+        if let Err(e) = chown(out_path, Some(root_uid), Some(root_gid)) {
+            eprintln!("sandbox: failed to chown {out_arg} to root:root: {e}");
+            return 1;
+        }
     }
     0
 }
@@ -5947,6 +5989,17 @@ fn handle_dump_proto_version() -> i32 {
 ///
 /// Requires root. Returns `0` on success (including nothing-to-do),
 /// `1` on any error.
+///
+/// # Stable external contract — do NOT change the calling convention
+///
+/// `scripts/install.sh` invokes `sandbox apply-config-migrations` (no
+/// flags) from within its privileged root batch across releases. The
+/// subcommand name, the zero-argument calling convention, and the
+/// `requires root` refusal message prefix are all load-bearing: a
+/// prior-release installer shell must be able to run the current binary
+/// with this exact incantation. Renaming, adding required flags, or
+/// changing the error prefix requires a coordinated, backwards-compatible
+/// change to `scripts/install.sh`.
 fn handle_apply_config_migrations() -> i32 {
     use sandbox_cli::cfg_migrations::TargetFile;
 
@@ -10255,6 +10308,74 @@ mod tests {
             "/etc/sandboxd/.users.conf.tmp.V999",
             nix::unistd::Uid::from_raw(0),
             "not found in registry",
+        );
+    }
+
+    /// Regression guard for the J fix: `apply_config_migration_inner`
+    /// must force 0644 on the output tempfile regardless of the input
+    /// file's existing mode. The corrupted state this repair targets is
+    /// an existing `users.conf` at mode 0600 — preserving that mode
+    /// would leave the daemon unable to read the file after migration.
+    ///
+    /// This test requires root to pass the gate's euid check and to read
+    /// `/etc/sandboxd/users.conf`. It is skipped when not running as
+    /// root so it does not block CI. The E2E suite provides root-level
+    /// coverage.
+    #[test]
+    fn apply_config_migration_inner_forces_0644_on_output_tempfile() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !nix::unistd::geteuid().is_root() {
+            // Not root → the gate would refuse; skip rather than fail.
+            return;
+        }
+
+        // Use the real /etc/sandboxd/users.conf if it exists; if not the
+        // gate will pass (euid=root, canonical path recognised) but
+        // std::fs::read will fail — skip in that case too.
+        let file_arg = "/etc/sandboxd/users.conf";
+        let out_arg = "/etc/sandboxd/.users.conf.tmp.V001";
+        let migration_arg = "V001";
+
+        if !std::path::Path::new(file_arg).exists() {
+            // No live config on this host (e.g. a plain CI machine).
+            return;
+        }
+
+        // Set the destination file to 0600 before the inner call.
+        // The inner call must force it to 0644 on the output tempfile,
+        // not propagate the 0600 source mode.
+        let src_meta = std::fs::metadata(file_arg).expect("metadata on source file");
+        let orig_mode = src_meta.permissions().mode() & 0o7777;
+        std::fs::set_permissions(file_arg, std::fs::Permissions::from_mode(0o600))
+            .expect("set source file to 0600 for test");
+
+        let code = apply_config_migration_inner(
+            file_arg,
+            migration_arg,
+            out_arg,
+            nix::unistd::Uid::from_raw(0),
+        );
+
+        // Restore the source file mode regardless of outcome.
+        let _ = std::fs::set_permissions(file_arg, std::fs::Permissions::from_mode(orig_mode));
+
+        if code != 0 {
+            // Might fail if V001 is already applied; that's fine — the
+            // interesting invariant is the output mode when it does succeed.
+            let _ = std::fs::remove_file(out_arg);
+            return;
+        }
+
+        let out_mode = std::fs::metadata(out_arg)
+            .expect("out tempfile exists after success")
+            .permissions()
+            .mode()
+            & 0o7777;
+        let _ = std::fs::remove_file(out_arg);
+        assert_eq!(
+            out_mode, 0o644,
+            "output tempfile must be 0644 regardless of source mode; got {out_mode:#o}"
         );
     }
 

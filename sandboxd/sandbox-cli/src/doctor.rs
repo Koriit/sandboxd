@@ -1257,7 +1257,7 @@ fn check_state_dir_mode() -> CheckRow {
             id: "C10",
             name: "state dir mode",
             outcome: CheckOutcome::Fail {
-                detail: format!("stat({}): {e}", path_display),
+                detail: format!("stat({path_display}): {e}"),
                 hint: Some(format!("ensure {path_display} exists and is readable")),
             },
         },
