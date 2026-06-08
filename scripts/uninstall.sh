@@ -76,10 +76,9 @@ Uninstall sandboxd, reversing the changes recorded by install.sh.
 Options:
   --purge       Also delete the sandbox daemon's per-uid state directory
                 (/var/lib/sandboxd/<sandbox-uid>/), the sandbox user,
-                operator group memberships, and the gateway docker image.
-                Prompts unless --yes. (Does not touch
-                /etc/systemd/system/sandboxd.service.d/, which is
-                operator-owned.)
+                operator group memberships, the gateway docker image, and
+                /etc/systemd/system/sandboxd.service.d/.
+                Prompts unless --yes.
   --force       Proceed even if sandboxd is running (default: refuse).
                 A per-session active-session probe lands with
                 'sandbox update' in a future release; for now the check
@@ -167,6 +166,7 @@ detect_tty() {
 }
 
 cleanup_tmpdir() {
+    _ct_exit=$?
     if [ "$_phase_reader_pid" -gt 0 ]; then
         kill "$_phase_reader_pid" 2>/dev/null || true
         wait "$_phase_reader_pid" 2>/dev/null || true
@@ -176,6 +176,13 @@ cleanup_tmpdir() {
         wait "$_consumer_pid" 2>/dev/null || true
     fi
     ui_teardown
+    if [ "$_ct_exit" -ne 0 ]; then
+        if [ -n "$SUMMARY_FILE" ] && [ -s "$SUMMARY_FILE" ]; then
+            cat "$SUMMARY_FILE"
+        fi
+        printf '\n'
+        printf 'uninstall failed (exit %s) — see %s\n' "$_ct_exit" "${INSTALL_LOG:-/var/log/sandboxd-uninstall.log}"
+    fi
     if [ -n "$TMPDIR_UNINSTALL" ] && [ -d "$TMPDIR_UNINSTALL" ]; then
         rm -rf "$TMPDIR_UNINSTALL"
     fi
@@ -200,7 +207,8 @@ remove-binaries"
 UI_REMOVE_PHASES_PURGE="purge-state
 purge-user
 purge-group
-purge-image"
+purge-image
+purge-service-drop-in"
 
 # ----------------------------------------------------------------------------
 # Resolve the install-state path.
@@ -425,12 +433,33 @@ compute_plan() {
         if [ -n "$INSTALLED_VERSION" ]; then
             _plan_append "  docker image rm          sandbox-gateway:$INSTALLED_VERSION"
         fi
+        _plan_append "  remove (if present)      /etc/systemd/system/sandboxd.service.d/"
         _plan_append ""
         _plan_append "  WARNING: --purge is irreversible. All session data will be lost."
+    else
+        _plan_append ""
+        _plan_append "  The following will be KEPT (pass --purge to remove them):"
+        if [ -n "$SANDBOX_UID" ]; then
+            _plan_append "  keep  /var/lib/sandboxd/$SANDBOX_UID/"
+            _plan_append "        (remove with: sudo rm -rf /var/lib/sandboxd/$SANDBOX_UID/)"
+        fi
+        _plan_append "  keep  /etc/sandboxd/users.conf"
+        _plan_append "        (remove with: sudo rm -f /etc/sandboxd/users.conf)"
+        _plan_append "  keep  /etc/qemu/bridge.conf (our rules, if any)"
+        _plan_append "        (remove with: sudo sed -i '/^allow virbr/d' /etc/qemu/bridge.conf)"
+        _plan_append "  keep  /etc/systemd/system/sandboxd.service.d/"
+        _plan_append "        (remove with: sudo rm -rf /etc/systemd/system/sandboxd.service.d/)"
+        _plan_append "  keep  sandbox system group and user"
+        _plan_append "        (remove with: sudo userdel sandbox && sudo groupdel sandbox)"
+        if [ -n "$INSTALLED_VERSION" ]; then
+            _plan_append "  keep  sandbox-gateway:$INSTALLED_VERSION (Docker image)"
+            _plan_append "        (remove with: sudo docker image rm sandbox-gateway:$INSTALLED_VERSION)"
+        else
+            _plan_append "  keep  sandbox-gateway Docker image (version unknown)"
+            _plan_append "        (remove with: sudo docker image rm sandbox-gateway:<version>)"
+        fi
     fi
 
-    _plan_append ""
-    _plan_append "  /etc/systemd/system/sandboxd.service.d/ is NOT removed (operator-owned)."
     _plan_append ""
     _plan_append "Uninstall log: $INSTALL_LOG"
 }
@@ -546,10 +575,10 @@ write_priv_script() {
     # the privileged child receives it even though sudo strips the env.
     _fail_after_esc=$(_sq "${SANDBOX_UNINSTALL_PRIV_CHILD_FAIL_AFTER:-}")
 
-    # Compute total steps: base 6, plus 4 purge steps if --purge.
+    # Compute total steps: base 6, plus 5 purge steps if --purge.
     _total_steps=6
     if [ "$PURGE" -eq 1 ]; then
-        _total_steps=$((_total_steps + 4))
+        _total_steps=$((_total_steps + 5))
     fi
 
     # Assemble the remove-phase list for the rich checklist re-init.
@@ -861,7 +890,6 @@ if [ "\$HAVE_STATE" -eq 1 ] \
 else
     _log "step=userdel action=skip reason=we-did-not-create-it-or-absent"
 fi
-_log "step=remove_drop_ins action=skip reason=operator-owned"
 _step_ok
 _priv_maybe_fail_after "\$_label"
 
@@ -897,6 +925,18 @@ if [ -n "\$INSTALLED_VERSION" ] && command -v docker >/dev/null 2>&1; then
     fi
 else
     _log "step=docker_rmi action=skip reason=no-version-or-docker"
+fi
+_step_ok
+_priv_maybe_fail_after "\$_label"
+
+# ----- Step 11: purge-service-drop-in -----
+_step_begin "purge-service-drop-in"
+_dropin_dir="/etc/systemd/system/sandboxd.service.d"
+if [ -d "\$_dropin_dir" ]; then
+    rm -rf "\$_dropin_dir"
+    _log "step=purge_service_drop_in path=\$_dropin_dir action=remove"
+else
+    _log "step=purge_service_drop_in path=\$_dropin_dir action=skip reason=absent"
 fi
 _step_ok
 _priv_maybe_fail_after "\$_label"
@@ -1100,10 +1140,11 @@ ${_ok_label}"
         exit 1
     fi
 
-    # The drop-in directory (/etc/systemd/system/sandboxd.service.d/) is
-    # operator-owned and is never removed, regardless of --purge.
+    # On a plain uninstall the drop-in directory is left in place; the
+    # purge-service-drop-in step inside the privileged batch removes it when
+    # --purge is requested.
     if [ "$PURGE" -eq 0 ]; then
-        log_ok "step=remove_drop_ins action=skip reason=operator-owned"
+        log_ok "step=remove_drop_ins action=skip reason=not-purge"
     fi
 }
 
@@ -1196,14 +1237,29 @@ print_next_steps() {
 
     if [ "$PURGE" -eq 0 ]; then
         emit ""
-        emit "${YELLOW}Kept (run with --purge to remove):${RESET}"
+        emit "${YELLOW}Kept (pass --purge to remove):${RESET}"
         if [ -n "$SANDBOX_UID" ]; then
-            emit "  - /var/lib/sandboxd/$SANDBOX_UID/ (state, sessions DB, audit logs)"
+            emit "  - /var/lib/sandboxd/$SANDBOX_UID/  (state, sessions DB, audit logs)"
+            emit "    remove: sudo rm -rf /var/lib/sandboxd/$SANDBOX_UID/"
         else
-            emit "  - /var/lib/sandboxd/ (no per-uid state dir resolved — legacy install)"
+            emit "  - /var/lib/sandboxd/  (no per-uid state dir resolved — legacy install)"
+            emit "    remove: sudo rm -rf /var/lib/sandboxd/"
         fi
-        emit "  - 'sandbox' system user and group"
-        emit "  - sandbox-gateway docker image"
+        emit "  - /etc/sandboxd/users.conf  (operator allowlist)"
+        emit "    remove: sudo rm -f /etc/sandboxd/users.conf"
+        emit "  - /etc/qemu/bridge.conf  (bridge access rules)"
+        emit "    remove: sudo sed -i '/^allow virbr/d' /etc/qemu/bridge.conf"
+        emit "  - /etc/systemd/system/sandboxd.service.d/  (service drop-in directory)"
+        emit "    remove: sudo rm -rf /etc/systemd/system/sandboxd.service.d/"
+        emit "  - 'sandbox' system group and user"
+        emit "    remove: sudo userdel sandbox && sudo groupdel sandbox"
+        if [ -n "$INSTALLED_VERSION" ]; then
+            emit "  - sandbox-gateway:$INSTALLED_VERSION  (gateway Docker image)"
+            emit "    remove: sudo docker image rm sandbox-gateway:$INSTALLED_VERSION"
+        else
+            emit "  - sandbox-gateway Docker image  (version unknown)"
+            emit "    remove: sudo docker image rm sandbox-gateway:<version>"
+        fi
     fi
 
     emit ""
