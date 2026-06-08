@@ -143,11 +143,10 @@ pub enum ManifestError {
 pub enum FetchError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    /// `/usr/local/bin/cosign` is absent. Surfaced when the operator
-    /// never ran install.sh on this host, or has uninstalled cosign
-    /// out-of-band. The update flow does not bootstrap cosign — that is
-    /// install.sh's responsibility (separation of
-    /// concerns).
+    /// `/usr/local/libexec/sandboxd/cosign` is absent. Surfaced when the
+    /// operator never ran install.sh on this host, or has uninstalled
+    /// cosign out-of-band. The update flow does not bootstrap cosign —
+    /// that is install.sh's responsibility (separation of concerns).
     #[error(
         "cosign binary not found at {path} — \
          run install.sh once on this host first (it stages the pinned cosign), \
@@ -213,9 +212,9 @@ fn resolve_bundle_path(
 /// also accepted here (and vice versa).
 ///
 /// Pre-conditions:
-/// * `/usr/local/bin/cosign` exists. The update flow does not bootstrap
-///   cosign — operators get cosign by running install.sh once. Surfaces
-///   [`FetchError::CosignNotFound`] otherwise.
+/// * `/usr/local/libexec/sandboxd/cosign` exists. The update flow does
+///   not bootstrap cosign — operators get cosign by running install.sh
+///   once. Surfaces [`FetchError::CosignNotFound`] otherwise.
 /// * A signature bundle is locatable — either passed as `bundle` or
 ///   found as `<tarball>.sigstore` sibling.
 ///

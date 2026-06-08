@@ -6,7 +6,7 @@
 //! walk each managed file's pending migration chain, run
 //! the transform in-process, write to a sudo-controlled tempfile at a
 //! canonical path (`/etc/sandboxd/.users.conf.tmp.V001` and friends),
-//! and `sudo -k mv` the tempfile over the destination in one atomic
+//! and `sudo mv` the tempfile over the destination in one atomic
 //! `rename(2)` call.
 //!
 //! Why the tempfile-then-mv split rather than a single in-process
@@ -26,7 +26,7 @@
 //!    path under `/etc/sandboxd/` keeps the rename atomic.
 //!
 //! The actual transform runs in-process via the hidden CLI subcommand
-//! `sandbox --apply-config-migration --file <path> --migration V<NNN>
+//! `sandbox apply-config-migration --file <path> --migration V<NNN>
 //! --out <tmp>`. That subcommand is gated on `getuid() == 0` and
 //! canonical-path validation (see `main.rs::apply_config_migration_gate`).
 //! The orchestrating shell flow (`sandbox update`) re-execs itself
@@ -91,7 +91,7 @@ pub enum ApplyError {
 }
 
 /// Apply every pending migration for the given target file, in
-/// registry order, with one `sudo -k sandbox --apply-config-migration
+/// registry order, with one `sudo sandbox apply-config-migration
 /// ...` invocation per migration.
 ///
 /// Returns the (possibly empty) list of applied migration ids. Empty
@@ -135,12 +135,12 @@ pub fn apply_file_chain(target: cfg_migrations::TargetFile) -> Result<ApplyOutco
         let tmp = tempfile_path_for(target, migration_id);
 
         // Step 1: in-process transform via `sandbox
-        // --apply-config-migration --file <canonical> --migration
+        // apply-config-migration --file <canonical> --migration
         // V<NNN> --out <tmp>`. The subcommand re-execs `sandbox` under
         // `sudo` to satisfy its `getuid() == 0` gate.
         invoke_apply_subcommand(&canonical, migration_id, &tmp)?;
 
-        // Step 2: atomic rename via `sudo -k mv <tmp> <canonical>`.
+        // Step 2: atomic rename via `sudo mv <tmp> <canonical>`.
         // `mv` calls `rename(2)` which is atomic on the same FS.
         rename_via_sudo(&tmp, &canonical)?;
 
@@ -163,9 +163,8 @@ fn invoke_apply_subcommand(
     let migration_arg = format!("V{migration_id:03}");
     let status = Command::new("sudo")
         .args([
-            "-k",
             "/usr/local/bin/sandbox",
-            "--apply-config-migration",
+            "apply-config-migration",
             "--file",
             canonical.to_str().unwrap(),
             "--migration",
@@ -188,10 +187,10 @@ fn invoke_apply_subcommand(
     Ok(())
 }
 
-/// `sudo -k mv <src> <dst>` — atomic rename across the same FS.
+/// `sudo mv <src> <dst>` — atomic rename across the same FS.
 fn rename_via_sudo(src: &Path, dst: &Path) -> Result<(), ApplyError> {
     let status = Command::new("sudo")
-        .args(["-k", "mv", src.to_str().unwrap(), dst.to_str().unwrap()])
+        .args(["mv", src.to_str().unwrap(), dst.to_str().unwrap()])
         .output()
         .map_err(ApplyError::Io)?;
     if !status.status.success() {

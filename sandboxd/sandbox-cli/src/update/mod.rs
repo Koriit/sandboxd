@@ -206,17 +206,22 @@ pub fn detect_host_arch() -> String {
 }
 
 /// Read the install state file at `path`. Returns `Ok(None)` when the
-/// file is absent or unreadable — the read-only modes degrade
-/// gracefully; the full-update path treats `None` as a hard refusal.
+/// file is absent. Uses `sudo -n cat` because the parent directory is
+/// `0750 sandbox:sandbox` and the operator does not have read access.
 pub fn read_install_state(path: &Path) -> std::io::Result<Option<InstallState>> {
-    match std::fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice::<InstallState>(&bytes) {
-            Ok(s) => Ok(Some(s)),
-            Err(_) => Ok(None),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
-        Err(e) => Err(e),
+    let out = std::process::Command::new("sudo")
+        .args(["-n", "cat", path.to_str().unwrap_or("")])
+        .output()?;
+    if !out.status.success() {
+        // Exit 1 from sudo -n when no cached credential and NOPASSWD is
+        // absent, or a genuine ENOENT from cat — treat both as "absent"
+        // so the caller can emit a human-readable error rather than a
+        // raw sudo error.
+        return Ok(None);
+    }
+    match serde_json::from_slice::<InstallState>(&out.stdout) {
+        Ok(s) => Ok(Some(s)),
+        Err(_) => Ok(None),
     }
 }
 
@@ -257,7 +262,7 @@ pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> Option<DevModeR
     // sudo itself cannot run or cannot authenticate.
     let state_missing = {
         match Command::new("sudo")
-            .args(["-n", "-k", "test", "-e", &install_state.to_string_lossy()])
+            .args(["-n", "test", "-e", &install_state.to_string_lossy()])
             .output()
         {
             Ok(out) => {
@@ -958,16 +963,16 @@ pub fn render_dry_run<W: Write>(
         ("§ 3.2.20", "docker load gateway image"),
         ("§ 3.2.21", "install binaries"),
         ("§ 3.2.22", "setcap on route-helper"),
-        ("§ 3.2.23", "install systemd unit"),
-        ("§ 3.2.24", "apply config migrations"),
-        ("§ 3.2.25", "prune older backups"),
-        ("§ 3.2.26", "start daemon"),
-        ("§ 3.2.27", "verify /version"),
-        ("§ 3.2.28", "run sandbox doctor"),
-        ("§ 3.2.29", "update install state"),
-        ("§ 3.2.30", "release lock"),
-        ("§ 3.2.31", "install lima-helper"),
-        ("§ 3.2.32", "setcap on lima-helper"),
+        ("§ 3.2.23", "setcap on lima-helper"),
+        ("§ 3.2.24", "verify lima-helper caps"),
+        ("§ 3.2.25", "install systemd unit"),
+        ("§ 3.2.26", "apply config migrations"),
+        ("§ 3.2.27", "prune older backups"),
+        ("§ 3.2.28", "start daemon"),
+        ("§ 3.2.29", "verify /version"),
+        ("§ 3.2.30", "run sandbox doctor"),
+        ("§ 3.2.31", "update install state"),
+        ("§ 3.2.32", "release lock"),
     ];
     for (id, name) in steps {
         let verdict = stateful_step_verdict(id, up_to_date, has_pending_migrations);
@@ -1012,12 +1017,12 @@ pub fn stateful_step_verdict(
     // retention prune (a no-op when nothing is eligible, but still
     // runs the enumeration).
     match step_id {
-        "§ 3.2.13" | "§ 3.2.19" | "§ 3.2.25" | "§ 3.2.26" | "§ 3.2.27" | "§ 3.2.28"
-        | "§ 3.2.29" | "§ 3.2.30" => return "would execute",
+        "§ 3.2.13" | "§ 3.2.19" | "§ 3.2.27" | "§ 3.2.28" | "§ 3.2.29" | "§ 3.2.30"
+        | "§ 3.2.31" | "§ 3.2.32" => return "would execute",
         _ => {}
     }
     // Config migration apply: skips when no pending.
-    if step_id == "§ 3.2.24" {
+    if step_id == "§ 3.2.26" {
         return if has_pending_migrations {
             "would execute"
         } else {
@@ -1303,11 +1308,6 @@ pub async fn run(args: UpdateArgs) -> i32 {
             ),
         );
         eprintln!("{}", dev_mode_refusal_text(&reason));
-
-        // Emit group-activation hint when the operator is listed in the
-        // `sandbox` group DB entry but the group is absent from their
-        // live session — they added themselves to the group after the
-        // session started and just need a `newgrp sandbox` or re-login.
         if operator_needs_group_activation() {
             eprintln!(
                 "hint: you are in the `sandbox` group but it is not active in this session.\n\
@@ -1317,6 +1317,17 @@ pub async fn run(args: UpdateArgs) -> i32 {
         return 2i32;
     }
     log_step("dev_mode_check", "is_dev=0 action=continue status=ok");
+    // Emit group-activation hint when the operator is listed in the
+    // `sandbox` group DB entry but the group is absent from their live
+    // session — fires on the success path as well as any early-exit paths
+    // above, so a user who just added themselves to the group always
+    // sees the hint regardless of whether the update succeeded.
+    if operator_needs_group_activation() {
+        eprintln!(
+            "hint: you are in the `sandbox` group but it is not active in this session.\n\
+             Run `newgrp sandbox` and retry, or log out and back in."
+        );
+    }
 
     // Install state read (graceful in read-only modes;
     // hard refusal in full-update mode).
@@ -1774,7 +1785,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // Stop daemon (only if `was_running`).
     if sticky_was_running {
         let out = Command::new("sudo")
-            .args(["-k", "systemctl", "stop", "sandboxd"])
+            .args(["-n", "systemctl", "stop", "sandboxd"])
             .output();
         match out {
             Ok(o) if o.status.success() => {
@@ -1845,7 +1856,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             eprintln!("sandbox update: failed to create backup set: {e}");
             eprint!(
                 "{}",
-                recovery_guidance(None, &inputs.state.installed_version)
+                recovery_guidance_ex(None, &inputs.state.installed_version, sticky_was_running)
             );
             return 1;
         }
@@ -2145,7 +2156,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         );
     } else {
         match Command::new("sudo")
-            .args(["-k", "docker", "load", "-i"])
+            .args(["-n", "docker", "load", "-i"])
             .arg(&image_tar)
             .output()
         {
@@ -2242,7 +2253,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         log_step("setcap", "caps=already-set action=skip status=ok");
     } else {
         match Command::new("sudo")
-            .args(["-k", "setcap", expected, helper])
+            .args(["-n", "setcap", expected, helper])
             .output()
         {
             Ok(o) if o.status.success() => {
@@ -2269,6 +2280,122 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             Err(e) => {
                 log_step("setcap", &format!("action=set status=fail err=\"{e}\""));
                 eprintln!("sandbox update: failed to invoke setcap: {e}");
+                eprint!(
+                    "{}",
+                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                );
+                return 1;
+            }
+        }
+    }
+
+    // Install lima-helper capabilities.
+    // cap_setuid is required by Lima's networking: the helper sets uid/gid
+    // mappings on behalf of the VM user so the VM's network interfaces
+    // become visible inside the operator's session. Capabilities are
+    // stripped by the binary-overwrite in the install step above, so
+    // setcap must always run after installation even if the binary was
+    // already present and skipped. Sequenced here — before daemon start —
+    // because the daemon hard-refuses to start without cap_setuid+ep on
+    // the lima-helper; running setcap after start_daemon would guarantee
+    // a start failure and trigger recovery.
+    {
+        let lima_helper = backup::LIMA_HELPER_BIN_PATH;
+        let lima_caps = "cap_setuid+ep";
+        let cur_out = Command::new("getcap").arg(lima_helper).output();
+        let current = cur_out
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let already_set = current.contains(lima_caps);
+        if already_set {
+            log_step(
+                "install_lima_helper",
+                "caps=already-set action=skip status=ok",
+            );
+        } else {
+            match Command::new("sudo")
+                .args(["-n", "setcap", lima_caps, lima_helper])
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    log_step(
+                        "install_lima_helper",
+                        &format!("caps={lima_caps} action=set status=ok"),
+                    );
+                }
+                Ok(o) => {
+                    log_step(
+                        "install_lima_helper",
+                        &format!(
+                            "caps={lima_caps} action=set status=fail stderr={}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        ),
+                    );
+                    eprintln!(
+                        "sandbox update: setcap failed for {lima_helper}: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                    eprint!(
+                        "{}",
+                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                    );
+                    return 1;
+                }
+                Err(e) => {
+                    log_step(
+                        "install_lima_helper",
+                        &format!("action=set status=fail err=\"{e}\""),
+                    );
+                    eprintln!("sandbox update: failed to invoke setcap for {lima_helper}: {e}");
+                    eprint!(
+                        "{}",
+                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                    );
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // Verify lima-helper capabilities.
+    // Post-install check: getcap must confirm cap_setuid+ep is present so
+    // the next session create does not fail with permission-denied at the
+    // uid-map step.
+    {
+        let lima_helper = backup::LIMA_HELPER_BIN_PATH;
+        let required_cap = "cap_setuid+ep";
+        let verify_out = Command::new("getcap").arg(lima_helper).output();
+        match verify_out {
+            Ok(o) => {
+                let caps = String::from_utf8_lossy(&o.stdout);
+                if caps.contains(required_cap) {
+                    log_step(
+                        "setcap_lima_helper",
+                        &format!("caps={required_cap} verify=pass status=ok"),
+                    );
+                } else {
+                    log_step(
+                        "setcap_lima_helper",
+                        &format!("caps={required_cap} verify=fail getcap={}", caps.trim()),
+                    );
+                    eprintln!(
+                        "sandbox update: cap_setuid+ep not set on {lima_helper} after setcap — \
+                         manual recovery: sudo setcap cap_setuid+ep {lima_helper}"
+                    );
+                    eprint!(
+                        "{}",
+                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                    );
+                    return 1;
+                }
+            }
+            Err(e) => {
+                log_step(
+                    "setcap_lima_helper",
+                    &format!("action=verify status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to invoke getcap for {lima_helper}: {e}");
                 eprint!(
                     "{}",
                     recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
@@ -2372,7 +2499,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                 // of the OLD unit while we'd happily report ok — fail
                 // loud instead, with a forensic-parity log line.
                 match Command::new("sudo")
-                    .args(["-k", "systemctl", "daemon-reload"])
+                    .args(["-n", "systemctl", "daemon-reload"])
                     .output()
                 {
                     Ok(o) if o.status.success() => {
@@ -2513,7 +2640,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // Start daemon (only if `was_running`).
     if sticky_was_running {
         match Command::new("sudo")
-            .args(["-k", "systemctl", "start", "sandboxd"])
+            .args(["-n", "systemctl", "start", "sandboxd"])
             .output()
         {
             Ok(o) if o.status.success() => {
@@ -2638,37 +2765,14 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         );
     }
 
-    // `sandbox doctor --verbose`. The CLI binary on disk is the new one
-    // (we just installed it) — the running process keeps executing the
-    // old code, so we exec the new binary explicitly.
-    //
-    // Drop privileges to the `sandbox` user for the doctor invocation.
-    // The operator runs `sudo sandbox update`, so this code runs as
-    // root; doctor's C4 check (`current user in 'sandbox' group`) reads
-    // the calling process's `getgroups()`, and root is not in the
-    // sandbox group, so C4 would `Fail` and the doctor would exit 1
-    // even on an otherwise-healthy host. Running doctor as the
-    // `sandbox` user matches the operator-facing contract (operators
-    // are added to the sandbox group by install.sh) and
-    // mirrors how `assert_doctor_passes` in the e2e harness invokes it.
-    //
-    // `SANDBOX_SOCKET` is explicitly planted to the systemd-managed
-    // path: `sudo -u sandbox` drops most env vars, the target user has
-    // no `XDG_RUNTIME_DIR`, and the default fallback resolves to
-    // `$HOME/.local/share/sandboxd/sandboxd.sock` which is wrong for
-    // the systemd-managed daemon. Use `env SANDBOX_SOCKET=...` to
-    // replant it (same shape as `assert_doctor_passes`).
-    let doctor = Command::new("sudo")
-        .args([
-            "-k",
-            "-u",
-            "sandbox",
-            "env",
-            "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock",
-            "/usr/local/bin/sandbox",
-            "doctor",
-            "--verbose",
-        ])
+    // `sandbox doctor --verbose`. Run as the operator (the user who invoked
+    // `sandbox update`) so that operator-environment faults — group
+    // membership, socket reachability — are actually caught. The new binary
+    // is exec'd directly; `SANDBOX_SOCKET` is planted explicitly because the
+    // operator may not have it set in the environment that `sudo` inherited.
+    let doctor = Command::new("/usr/local/bin/sandbox")
+        .args(["doctor", "--verbose"])
+        .env("SANDBOX_SOCKET", "/run/sandbox/sandboxd.sock")
         .output();
     match doctor {
         Ok(o) if o.status.success() => {
@@ -2772,119 +2876,6 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // Install lima-helper capabilities (§ 3.2.31).
-    // cap_setuid is required by Lima's networking: the helper sets uid/gid
-    // mappings on behalf of the VM user so the VM's network interfaces
-    // become visible inside the operator's session. Capabilities are
-    // stripped by the binary-overwrite in the install step above, so
-    // setcap must always run after installation even if the binary was
-    // already present and skipped.
-    {
-        let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let lima_caps = "cap_setuid+ep";
-        let cur_out = Command::new("getcap").arg(lima_helper).output();
-        let current = cur_out
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        let already_set = current.contains(lima_caps);
-        if already_set {
-            log_step(
-                "install_lima_helper",
-                "caps=already-set action=skip status=ok",
-            );
-        } else {
-            match Command::new("sudo")
-                .args(["-k", "setcap", lima_caps, lima_helper])
-                .output()
-            {
-                Ok(o) if o.status.success() => {
-                    log_step(
-                        "install_lima_helper",
-                        &format!("caps={lima_caps} action=set status=ok"),
-                    );
-                }
-                Ok(o) => {
-                    log_step(
-                        "install_lima_helper",
-                        &format!(
-                            "caps={lima_caps} action=set status=fail stderr={}",
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        ),
-                    );
-                    eprintln!(
-                        "sandbox update: setcap failed for {lima_helper}: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    );
-                    eprint!(
-                        "{}",
-                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-                    );
-                    return 1;
-                }
-                Err(e) => {
-                    log_step(
-                        "install_lima_helper",
-                        &format!("action=set status=fail err=\"{e}\""),
-                    );
-                    eprintln!("sandbox update: failed to invoke setcap for {lima_helper}: {e}");
-                    eprint!(
-                        "{}",
-                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-                    );
-                    return 1;
-                }
-            }
-        }
-    }
-
-    // Verify lima-helper capabilities (§ 3.2.32).
-    // Post-install check: getcap must confirm cap_setuid+ep is present so
-    // the next session create does not fail with permission-denied at the
-    // uid-map step.
-    {
-        let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let required_cap = "cap_setuid+ep";
-        let verify_out = Command::new("getcap").arg(lima_helper).output();
-        match verify_out {
-            Ok(o) => {
-                let caps = String::from_utf8_lossy(&o.stdout);
-                if caps.contains(required_cap) {
-                    log_step(
-                        "setcap_lima_helper",
-                        &format!("caps={required_cap} verify=pass status=ok"),
-                    );
-                } else {
-                    log_step(
-                        "setcap_lima_helper",
-                        &format!("caps={required_cap} verify=fail getcap={}", caps.trim()),
-                    );
-                    eprintln!(
-                        "sandbox update: cap_setuid+ep not set on {lima_helper} after setcap — \
-                         manual recovery: sudo setcap cap_setuid+ep {lima_helper}"
-                    );
-                    eprint!(
-                        "{}",
-                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-                    );
-                    return 1;
-                }
-            }
-            Err(e) => {
-                log_step(
-                    "setcap_lima_helper",
-                    &format!("action=verify status=fail err=\"{e}\""),
-                );
-                eprintln!("sandbox update: failed to invoke getcap for {lima_helper}: {e}");
-                eprint!(
-                    "{}",
-                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-                );
-                return 1;
-            }
-        }
-    }
-
     // Release the lock. Dropping `held_lock` removes the file and
     // closes the FD (releases the kernel flock).
     drop(held_lock);
@@ -2957,8 +2948,14 @@ fn prepare_staged_tarball(
         .map_err(|e| format!("sandbox update: signature verification failed: {e}"))?;
 
     let extract_dir = std::env::temp_dir().join(format!("sandboxd-update-{}", std::process::id()));
-    fetch::extract_tarball(&tarball_path, &extract_dir)
-        .map_err(|e| format!("extract {}: {e}", tarball_path.display()))
+    let staged = fetch::extract_tarball(&tarball_path, &extract_dir)
+        .map_err(|e| format!("extract {}: {e}", tarball_path.display()))?;
+    // Cross-check the MANIFEST arch and version against what we requested
+    // so a tampered or mismatched tarball is caught before anything is
+    // written to the filesystem.
+    fetch::check_manifest_arch(&staged.manifest, installed_arch).map_err(|e| e.to_string())?;
+    fetch::check_manifest_version(&staged.manifest, target_version).map_err(|e| e.to_string())?;
+    Ok(staged)
 }
 
 /// One entry returned by the staged binary's `--dump-migration-set`.
@@ -3071,13 +3068,32 @@ fn render_systemd_unit(template: &str, base_dir: &str) -> Result<Vec<u8>, String
 ///   the daemon is down; the operator must either restore or re-run after
 ///   fixing the root cause.
 fn recovery_guidance(backup_set_dir: Option<&std::path::Path>, from_version: &str) -> String {
+    recovery_guidance_ex(backup_set_dir, from_version, false)
+}
+
+fn recovery_guidance_ex(
+    backup_set_dir: Option<&std::path::Path>,
+    from_version: &str,
+    daemon_was_stopped: bool,
+) -> String {
     match backup_set_dir {
-        None => "\n\
-             sandbox update: no backup was created — host state is unchanged.\n\
-             \n\
-             To retry the upgrade:\n\
-             \x20 sudo sandbox update\n"
-            .to_string(),
+        None => {
+            let daemon_note = if daemon_was_stopped {
+                "sandbox update: daemon was stopped — restart with:\n\
+                 \x20 sudo systemctl start sandboxd\n\
+                 \n"
+            } else {
+                ""
+            };
+            format!(
+                "\n\
+                 {daemon_note}\
+                 sandbox update: no backup was created — host state is otherwise unchanged.\n\
+                 \n\
+                 To retry the upgrade:\n\
+                 \x20 sudo sandbox update\n"
+            )
+        }
         Some(bsd) => {
             let sessions_db = backup::sessions_db_path();
             format!(
@@ -3133,7 +3149,7 @@ fn install_binary_if_changed(
     // downgrade this install. See scripts/dev/canonical-binary.sh.
     let status = std::process::Command::new("sudo")
         .args([
-            "-k",
+            "-n",
             "install",
             "-D",
             "-m",
@@ -3256,7 +3272,7 @@ where
     let dest = resolve_state_path(".install-state.json");
     let dest_str = dest.to_str().unwrap();
     let out = std::process::Command::new("sudo")
-        .args(["-k", "cat", dest_str])
+        .args(["-n", "cat", dest_str])
         .output()
         .map_err(|e| format!("read install state: {e}"))?;
     if !out.status.success() {
@@ -3278,7 +3294,7 @@ where
     let tmp_path = tmp.path().to_path_buf();
     let status = std::process::Command::new("sudo")
         .args([
-            "-k",
+            "-n",
             "install",
             "-m",
             "0640",
@@ -3353,7 +3369,7 @@ fn log_step(step: &str, fields: &str) {
         return;
     }
     let _ = std::process::Command::new("sudo")
-        .args(["-k", "tee", "-a", &path])
+        .args(["-n", "tee", "-a", &path])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -3692,8 +3708,8 @@ mod tests {
             "§ 3.2.22",
             "§ 3.2.23",
             "§ 3.2.24",
-            "§ 3.2.31",
-            "§ 3.2.32",
+            "§ 3.2.25",
+            "§ 3.2.26",
         ] {
             let needle = format!("{id} ");
             let line = s
@@ -3710,12 +3726,12 @@ mod tests {
         for id in [
             "§ 3.2.13",
             "§ 3.2.19",
-            "§ 3.2.25",
-            "§ 3.2.26",
             "§ 3.2.27",
             "§ 3.2.28",
             "§ 3.2.29",
             "§ 3.2.30",
+            "§ 3.2.31",
+            "§ 3.2.32",
         ] {
             let needle = format!("{id} ");
             let line = s
@@ -3740,12 +3756,12 @@ mod tests {
         for id in [
             "§ 3.2.13",
             "§ 3.2.19",
-            "§ 3.2.25",
-            "§ 3.2.26",
             "§ 3.2.27",
             "§ 3.2.28",
             "§ 3.2.29",
             "§ 3.2.30",
+            "§ 3.2.31",
+            "§ 3.2.32",
         ] {
             assert_eq!(stateful_step_verdict(id, true, true), "would execute");
             assert_eq!(stateful_step_verdict(id, true, false), "would execute");
@@ -3761,8 +3777,8 @@ mod tests {
             "§ 3.2.21",
             "§ 3.2.22",
             "§ 3.2.23",
-            "§ 3.2.31",
-            "§ 3.2.32",
+            "§ 3.2.24",
+            "§ 3.2.25",
         ] {
             assert_eq!(stateful_step_verdict(id, true, false), "would skip");
             assert_eq!(stateful_step_verdict(id, false, false), "would execute");
@@ -3770,18 +3786,18 @@ mod tests {
         // Apply-config-migrations flips on pending-migrations independently
         // of up-to-date.
         assert_eq!(
-            stateful_step_verdict("§ 3.2.24", false, true),
+            stateful_step_verdict("§ 3.2.26", false, true),
             "would execute"
         );
         assert_eq!(
-            stateful_step_verdict("§ 3.2.24", false, false),
+            stateful_step_verdict("§ 3.2.26", false, false),
             "would skip"
         );
         assert_eq!(
-            stateful_step_verdict("§ 3.2.24", true, true),
+            stateful_step_verdict("§ 3.2.26", true, true),
             "would execute"
         );
-        assert_eq!(stateful_step_verdict("§ 3.2.24", true, false), "would skip");
+        assert_eq!(stateful_step_verdict("§ 3.2.26", true, false), "would skip");
     }
 
     /// `--dry-run` lists all 20 stateful step ids.
@@ -4207,7 +4223,7 @@ mod tests {
         render_dry_run(&mut out3, &report_ne, &disk).unwrap();
         let s3 = String::from_utf8(out3).unwrap();
         assert!(s3.contains("§ 3.1.5"), "phase 3: {s3}");
-        assert!(s3.contains("§ 3.2.30"), "phase 3: {s3}");
+        assert!(s3.contains("§ 3.2.32"), "phase 3: {s3}");
         assert!(s3.contains("would execute"), "phase 3: {s3}");
 
         // Phase 4 — confirmation prompt answered `N`. The prompt text
