@@ -132,6 +132,7 @@ YES=0
 VERBOSE=0
 QUIET=0
 NO_COLOR=0
+NO_PROVISION=0
 
 # Step-discovered state (consumed by the privileged child when writing install-state).
 ARCH=""
@@ -226,6 +227,9 @@ daemon-reload
 enable-start-daemon
 write-install-state"
 
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+
 # FIFO for phase commands from the consumer subshell to the main process
 # during run_priv_child.  Written by consumer (SET_PHASE N status), read
 # by a background reader in the main process that calls set_phase.
@@ -263,6 +267,9 @@ Options:
   --cosign-bundle <path>    Use a local sigstore bundle (requires --from).
   --source-url <url>        Override base URL for tarball download.
   --yes                     Skip the privileged-changes confirmation prompt.
+  --no-provision            Skip eager backend-image provisioning after install.
+                            Also relaxes the Lima/KVM prerequisites to warnings
+                            (useful in CI or environments without /dev/kvm).
   --verbose                 Echo every command before invocation.
   --quiet                   Suppress non-error output.
   --no-color                Force plain text output.
@@ -389,6 +396,10 @@ parse_args() {
                 ;;
             --yes)
                 YES=1
+                shift
+                ;;
+            --no-provision)
+                NO_PROVISION=1
                 shift
                 ;;
             --verbose)
@@ -707,25 +718,32 @@ check_prereqs() {
 
     missing=""
     add_missing() { missing="$missing $1"; }
+    # Warnings emitted when --no-provision relaxes a prereq from hard to advisory.
+    prov_warn=""
+    add_prov_warn() { prov_warn="$prov_warn $1"; }
 
     check_kernel_version || add_missing "kernel-5.8+"
 
     if command -v docker >/dev/null 2>&1; then
         if ! docker info >/dev/null 2>&1; then
-            # docker installed but daemon unreachable from this user;
-            # not fatal at this step (operator-group-add fixes it),
-            # but call it out. In rich mode the managed checklist screen
-            # owns stdout, so suppress the plain-text warning there.
-            if [ "$RICH_UI" -ne 1 ]; then
-                emit "${YELLOW}!${RESET} docker is installed but not reachable from this user."
-            fi
+            # docker installed but daemon unreachable — always a hard failure
+            # (both provisioning paths require a reachable Docker daemon).
+            add_missing "docker (installed but daemon unreachable from this user)"
         fi
     else
         add_missing "docker"
     fi
 
-    command -v limactl  >/dev/null 2>&1 || add_missing "lima"
-    command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_missing "qemu-system-$qemu_arch"
+    # Lima / KVM: hard-fail when provisioning is on (default); warn-only with --no-provision.
+    if [ "$NO_PROVISION" -eq 1 ]; then
+        command -v limactl >/dev/null 2>&1 || add_prov_warn "lima"
+        command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_prov_warn "qemu-system-$qemu_arch"
+        [ -e /dev/kvm ] || add_prov_warn "/dev/kvm"
+    else
+        command -v limactl >/dev/null 2>&1 || add_missing "lima"
+        command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_missing "qemu-system-$qemu_arch"
+        [ -e /dev/kvm ] || add_missing "/dev/kvm"
+    fi
     # We deliberately do NOT check for UEFI firmware (OVMF/AAVMF). It sits two
     # layers below us — sandboxd drives `limactl`, Lima drives QEMU, and QEMU
     # discovers its own firmware (via /usr/share/qemu/firmware/*.json and its
@@ -770,7 +788,15 @@ check_prereqs() {
         log_fail "step=prereq missing=$(printf '%s' "$missing" | tr ' ' ',')"
         exit 1
     fi
-    log_ok "step=prereq missing=none"
+    if [ -n "$prov_warn" ]; then
+        # --no-provision was set; Lima/KVM prereqs degrade to advisories.
+        for w in $prov_warn; do
+            emit "${YELLOW}!${RESET} $w not found — Lima backend will not be available until installed (--no-provision set)"
+        done
+        log_ok "step=prereq missing=none prov_warn=$(printf '%s' "$prov_warn" | tr ' ' ',')"
+    else
+        log_ok "step=prereq missing=none"
+    fi
 }
 
 # Detect the host's package manager from /etc/os-release's ID/ID_LIKE.
@@ -1884,6 +1910,7 @@ SANDBOX_UID=""
 # published installer does not call undefined functions under set -eu.
 _priv_maybe_fail_after() { :; }
 _priv_maybe_abort_at() { :; }
+_prov_maybe_force_fail() { :; }
 
 # BEGIN_TEST_ENV — stripped from published install.sh at docs-deploy time
 #
@@ -2630,6 +2657,114 @@ _print_failure_report() {
 }
 
 # ----------------------------------------------------------------------------
+# Step 16 — Eager backend-image provisioning (parent, group-activated).
+# ----------------------------------------------------------------------------
+
+# Production no-op stub — shadowed by the real definition inside BEGIN_TEST_ENV
+# when scripts are staged with --keep-test-env (harness / repair e2e).
+# shellcheck disable=SC2317,SC2329  # intentional no-op; shadowed by BEGIN_TEST_ENV definition
+_prov_maybe_force_fail() { :; }
+
+# BEGIN_TEST_ENV — stripped from published install.sh at docs-deploy time
+# Provides a deterministic failure-injection hook for provisioning tests.
+# Set SANDBOX_INSTALL_PROVISION_FORCE_FAIL=<backend> to force rebuild-image
+# to appear to fail for that backend (e.g. "container" or "lima").
+_prov_maybe_force_fail() {
+    _pmmf_backend="$1"
+    _pmmf_target="${SANDBOX_INSTALL_PROVISION_FORCE_FAIL:-}"
+    if [ -n "$_pmmf_target" ] && [ "$_pmmf_target" = "$_pmmf_backend" ]; then
+        return 1
+    fi
+    return 0
+}
+# END_TEST_ENV
+
+# run_provision — build both backend images (container then lima) as the operator,
+# with the sandbox group active. Runs in the parent after run_priv_child succeeds.
+# Non-fatal: a rebuild-image failure marks the phase failed and emits retry guidance,
+# but the overall install exits 0 (the daemon is up and provisioning is re-runnable).
+run_provision() {
+    if [ "$NO_PROVISION" -eq 1 ]; then
+        emit "${BLUE}...${RESET} provisioning skipped (--no-provision); run ${BLUE}sandbox rebuild-image${RESET} when ready"
+        log_ok "step=provision action=skip reason=no-provision"
+        return 0
+    fi
+
+    if [ -z "$OPERATOR_NAME" ]; then
+        emit "${YELLOW}!${RESET} no operator resolved; provisioning skipped — run ${BLUE}sandbox rebuild-image${RESET} as your operator user"
+        log_ok "step=provision action=skip reason=no-operator"
+        return 0
+    fi
+
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_init_phases "$UI_PROVISION_PHASES"
+        UI_CURRENT_HEADER="sandboxd $VERSION · provisioning"
+        ui_render_checklist
+    fi
+
+    emit "${BLUE}...${RESET} building backend images (this may take a few minutes)"
+    log_ok "step=provision action=start operator=$OPERATOR_NAME"
+
+    _prov_failed_backends=""
+
+    for _prov_backend in container lima; do
+        case "$_prov_backend" in
+            container) _prov_phase=1 ;;
+            lima)      _prov_phase=2 ;;
+        esac
+
+        set_phase "$_prov_phase" "active" "building $_prov_backend image"
+        if [ "$RICH_UI" -eq 1 ]; then
+            ui_animator_start
+        else
+            emit "${BLUE}...${RESET} building $_prov_backend image"
+        fi
+
+        _prov_ok=0
+        if _prov_maybe_force_fail "$_prov_backend"; then
+            if [ "$(id -u)" -eq 0 ]; then
+                # shellcheck disable=SC2024  # redirect is intentionally to parent's INSTALL_LOG
+                if sudo -u "$OPERATOR_NAME" sg sandbox -c \
+                    "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock /usr/local/bin/sandbox rebuild-image --backend $_prov_backend -y" \
+                    >> "$INSTALL_LOG" 2>&1; then
+                    _prov_ok=1
+                fi
+            else
+                if sg sandbox -c \
+                    "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock /usr/local/bin/sandbox rebuild-image --backend $_prov_backend -y" \
+                    >> "$INSTALL_LOG" 2>&1; then
+                    _prov_ok=1
+                fi
+            fi
+        fi
+
+        if [ "$RICH_UI" -eq 1 ]; then
+            ui_animator_stop
+        fi
+
+        if [ "$_prov_ok" -eq 1 ]; then
+            set_phase "$_prov_phase" "done"
+            emit "${GREEN}+${RESET} $_prov_backend image built"
+            log_ok "step=provision action=rebuild-image backend=$_prov_backend status=ok"
+        else
+            set_phase "$_prov_phase" "failed"
+            _prov_failed_backends="$_prov_failed_backends $_prov_backend"
+            emit "${YELLOW}!${RESET} Backend image provisioning incomplete: $_prov_backend"
+            emit "  The daemon is installed and running; this only affects first-session latency."
+            emit "  Retry: ${BLUE}sandbox rebuild-image --backend $_prov_backend${RESET}"
+            emit "  Provisioning log: $INSTALL_LOG"
+            log_warn "step=provision action=rebuild-image backend=$_prov_backend status=fail"
+        fi
+    done
+
+    if [ -n "$_prov_failed_backends" ]; then
+        log_warn "step=provision action=complete status=partial failed=$_prov_failed_backends"
+    else
+        log_ok "step=provision action=complete status=ok"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # Step 17 — Print next-steps.
 # ----------------------------------------------------------------------------
 
@@ -2751,6 +2886,11 @@ main() {
 
     # Execute the single privileged child.
     run_priv_child
+
+    # Build backend images as the operator (group-activated). Non-fatal: exits 0
+    # even if rebuild-image fails (daemon install succeeded; provisioning is
+    # independently re-runnable via sandbox rebuild-image).
+    run_provision
 
     # Capture the durable summary so it persists in scrollback after rmcup.
     # The EXIT trap (cleanup_tmpdir) will restore the primary screen and then

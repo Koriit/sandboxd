@@ -64,6 +64,16 @@ MAYBE_EMIT_HINT_BLOCK=$(awk '
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
 
+# Extract run_provision (Step 16 — eager backend-image provisioning).
+# Uses single-function awk (with exit) so it captures only the one function
+# and does not accidentally pull in heredoc-embedded stubs that precede it.
+# Scenarios define _prov_maybe_force_fail inline to control failure injection.
+RUN_PROVISION_BLOCK=$(awk '
+    /^run_provision\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
 # ---------------------------------------------------------------------------
 # Extract uninstall-specific functions from uninstall.sh.
 # These use TMPDIR_UNINSTALL (not TMPDIR_INSTALL) so they cannot share the
@@ -1015,6 +1025,21 @@ _run_hint_scenario() {
     _rhs_cols="${4:-80}"
     _run_scenario "$_rhs_label" "$_rhs_snippet" "$_rhs_rows" "$_rhs_cols" \
         "$MAYBE_EMIT_HINT_BLOCK"
+}
+
+# Convenience wrapper: injects RUN_PROVISION_BLOCK (run_provision from install.sh).
+# Scenarios must:
+#   - Define _prov_maybe_force_fail() inline (controls failure injection per-scenario).
+#   - Set NO_PROVISION, OPERATOR_NAME, and RICH_UI=0 (RICH_UI is already 1 from
+#     _run_scenario; override to 0 in plain-text scenarios to avoid TTY-writer calls).
+#   - Stub sg, sudo, and id as needed to control the operator/root code paths.
+_run_provision_scenario() {
+    _rps_label="$1"
+    _rps_snippet="$2"
+    _rps_rows="${3:-24}"
+    _rps_cols="${4:-80}"
+    _run_scenario "$_rps_label" "$_rps_snippet" "$_rps_rows" "$_rps_cols" \
+        "$RUN_PROVISION_BLOCK"
 }
 
 _run_cleanup_scenario "escape-seq: cleanup_tmpdir emits \\033[?25h when RICH_UI=1" '
@@ -2692,6 +2717,142 @@ case "$out" in
     "") : ;;
     *) printf "expected no output when operator not in group; got: %s\n" "$out" >&2; exit 1 ;;
 esac
+'
+
+# ---------------------------------------------------------------------------
+# run_provision — Step 16 eager backend-image provisioning
+# ---------------------------------------------------------------------------
+
+# Scenario: --no-provision=1 skips entirely — no sg/rebuild-image call, exits 0.
+_run_provision_scenario "run_provision: --no-provision skips all backends" '
+RICH_UI=0
+NO_PROVISION=1
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+# _prov_maybe_force_fail would succeed, but run_provision must return before
+# ever calling it when NO_PROVISION=1.
+_prov_maybe_force_fail() { return 0; }
+sg() { printf "sg called unexpectedly\n" >&2; exit 1; }
+sudo() { printf "sudo called unexpectedly\n" >&2; exit 1; }
+run_provision
+'
+
+# Scenario: no operator resolves — skips with reason=no-operator, no sg call, exits 0.
+_run_provision_scenario "run_provision: empty OPERATOR_NAME skips with reason=no-operator" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME=""
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+_prov_maybe_force_fail() { return 0; }
+sg() { printf "sg called without operator\n" >&2; exit 1; }
+sudo() { printf "sudo called without operator\n" >&2; exit 1; }
+run_provision
+'
+
+# Scenario: non-root operator path — sg is invoked without sudo prefix.
+# Both container and lima backends must be invoked.
+_run_provision_scenario "run_provision: non-root uses bare sg for both backends" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+_prov_maybe_force_fail() { return 0; }
+_sg_calls=""
+sg() {
+    # sg sandbox -c "..."  -> record the backend argument
+    _sg_arg="$*"
+    case "$_sg_arg" in
+        *"--backend container"*) _sg_calls="${_sg_calls}container " ;;
+        *"--backend lima"*)      _sg_calls="${_sg_calls}lima " ;;
+    esac
+    return 0
+}
+sudo() { printf "sudo called in non-root path\n" >&2; exit 1; }
+# Pretend euid != 0 by overriding id to return 1000.
+id() { printf "1000\n"; }
+run_provision
+case "$_sg_calls" in
+    *"container"*) : ;;
+    *) printf "container backend not invoked via sg\n" >&2; exit 1 ;;
+esac
+case "$_sg_calls" in
+    *"lima"*) : ;;
+    *) printf "lima backend not invoked via sg\n" >&2; exit 1 ;;
+esac
+'
+
+# Scenario: root path — sudo -u <operator> sg is invoked for both backends.
+_run_provision_scenario "run_provision: root uses sudo -u operator sg for both backends" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+_prov_maybe_force_fail() { return 0; }
+_sudo_calls=""
+sudo() {
+    # sudo -u alice sg sandbox -c "..."
+    _sudo_arg="$*"
+    case "$_sudo_arg" in
+        *"-u alice"*"--backend container"*) _sudo_calls="${_sudo_calls}container " ;;
+        *"-u alice"*"--backend lima"*)      _sudo_calls="${_sudo_calls}lima " ;;
+    esac
+    return 0
+}
+sg() { printf "bare sg called in root path\n" >&2; exit 1; }
+# Pretend euid == 0.
+id() { printf "0\n"; }
+run_provision
+case "$_sudo_calls" in
+    *"container"*) : ;;
+    *) printf "container backend not invoked via sudo sg\n" >&2; exit 1 ;;
+esac
+case "$_sudo_calls" in
+    *"lima"*) : ;;
+    *) printf "lima backend not invoked via sudo sg\n" >&2; exit 1 ;;
+esac
+'
+
+# Scenario: one backend fails rebuild-image — non-fatal; run_provision exits 0.
+_run_provision_scenario "run_provision: failing rebuild-image is non-fatal (exits 0)" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+# Inject failure for container backend only.
+_prov_maybe_force_fail() {
+    [ "$1" != "container" ]
+}
+sg() { return 0; }
+sudo() { return 0; }
+id() { printf "1000\n"; }
+# run_provision must exit 0 even with one backend failed.
+run_provision
+'
+
+# Scenario: both backends fail — still exits 0 (non-fatal).
+_run_provision_scenario "run_provision: all backends failing is non-fatal (exits 0)" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+# Force-fail every backend.
+_prov_maybe_force_fail() { return 1; }
+sg() { return 0; }
+sudo() { return 0; }
+id() { printf "1000\n"; }
+run_provision
 '
 
 # ---------------------------------------------------------------------------

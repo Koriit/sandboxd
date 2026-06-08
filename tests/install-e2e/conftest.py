@@ -1041,10 +1041,11 @@ def install_sh_cmd(tarball_in_vm, *extra_flags, env=None,
                    vm=None, sigstore_stack=None):
     """Build the canonical install.sh invocation used by every test.
 
-    Always passes ``--from``, ``--version``, ``--yes``, ``--no-color``
-    so test output is parser-friendly and idempotency assertions land
-    on a known version string. Additional flags (e.g. ``--cosign-bundle``)
-    can be appended.
+    Always passes ``--from``, ``--version``, ``--yes``, ``--no-color``,
+    ``--no-provision`` so test output is parser-friendly, idempotency
+    assertions land on a known version string, and the KVM/Lima prereq
+    is relaxed to a warning (the e2e VMs lack nested KVM). Additional
+    flags (e.g. ``--cosign-bundle``) can be appended.
 
     ``env`` is an optional dict of environment variables exported to
     the install.sh process (via ``sudo VAR=val ...``). Used by the
@@ -1078,6 +1079,7 @@ def install_sh_cmd(tarball_in_vm, *extra_flags, env=None,
         f"--version {ver}",
         "--yes",
         "--no-color",
+        "--no-provision",
     ]
     base.extend(extra_flags)
     return " ".join(base)

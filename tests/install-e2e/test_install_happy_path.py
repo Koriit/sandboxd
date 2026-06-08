@@ -56,12 +56,7 @@ def test_install_fresh_then_doctor_passes(
     # well-formed install-state. Shared with the RHEL-paths variant.
     assert_full_install_landed(vm)
 
-    # Bring the daemon up. `enable --now` fails if the gateway image is
-    # missing, the route-helper caps are wrong, etc., so this is a
-    # meaningful smoke before doctor runs.
-    vm.shell(
-        "sudo systemctl enable --now sandboxd", check=True, timeout=60,
-    )
+    # The install batch (step 13) starts the daemon; wait for it to be active.
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
@@ -138,11 +133,7 @@ def test_install_fresh_then_doctor_passes_rhel_paths(
     # Shared filesystem-state asserts (binaries, caps, state, user).
     assert_full_install_landed(vm)
 
-    # Doctor green on RHEL paths too. Same enable + wait + doctor as the
-    # Debian-family variant.
-    vm.shell(
-        "sudo systemctl enable --now sandboxd", check=True, timeout=60,
-    )
+    # The install batch (step 13) starts the daemon; wait for it to be active.
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
     assert_doctor_passes(vm)
