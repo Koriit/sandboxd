@@ -223,6 +223,7 @@ docker-load-gateway
 migrate-legacy-state
 install-systemd-unit
 daemon-reload
+enable-start-daemon
 write-install-state"
 
 # FIFO for phase commands from the consumer subshell to the main process
@@ -1649,7 +1650,7 @@ fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
-_TOTAL_STEPS=13
+_TOTAL_STEPS=14
 # Tracks the label of the last successfully completed step (set by _step_ok).
 # Used by _write_checkpoint to populate last_completed_step correctly on
 # failure checkpoints (the failing step should appear in failed_step, not
@@ -2230,6 +2231,36 @@ _step_ok
 _write_checkpoint "daemon-reload"
 _priv_maybe_fail_after "daemon-reload"
 
+# ----- Step: enable and start sandboxd, wait for readiness -----
+_step_begin "enable-start-daemon"
+_priv_maybe_abort_at "enable-start-daemon"
+# Clear any crash-loop lockout from a prior failed install before (re)starting.
+systemctl reset-failed sandboxd >> "\$_LOG" 2>&1 || true
+if systemctl enable --now sandboxd >> "\$_LOG" 2>&1; then
+    _log "step=enable_start_daemon action=enable-now status=ok"
+else
+    _log "step=enable_start_daemon action=enable-now status=fail"
+    _step_fail
+fi
+# Readiness wait: poll up to ~30 iterations (~30s) for the socket + active state.
+_ready=0
+_i=0
+while [ "\$_i" -lt 30 ]; do
+    if systemctl is-active --quiet sandboxd && [ -S /run/sandbox/sandboxd.sock ]; then
+        _ready=1; break
+    fi
+    _i=\$((\$_i + 1))
+    sleep 1
+done
+if [ "\$_ready" -ne 1 ]; then
+    _log "step=enable_start_daemon action=readiness-wait status=fail"
+    _step_fail
+fi
+_log "step=enable_start_daemon action=ready status=ok"
+_step_ok
+_write_checkpoint "enable-start-daemon"
+_priv_maybe_fail_after "enable-start-daemon"
+
 # ----- Step: write install-state (final, status=complete) -----
 _step_begin "write-install-state"
 _priv_maybe_abort_at "write-install-state"
@@ -2626,8 +2657,7 @@ print_next_steps() {
     emit ""
     emit "Next:"
     maybe_emit_group_activation_hint
-    emit "  2. Start the daemon:           ${BLUE}sudo systemctl enable --now sandboxd${RESET}"
-    emit "  3. Verify the install:         ${BLUE}sandbox doctor${RESET}"
+    emit "  2. Verify the install:         ${BLUE}sandbox doctor${RESET}"
     emit ""
     emit "Install state recorded at: $STATE_PATH"
     emit "Install log:               $INSTALL_LOG"
