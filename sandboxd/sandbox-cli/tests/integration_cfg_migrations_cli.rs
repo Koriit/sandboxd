@@ -113,6 +113,48 @@ fn integration_apply_config_migration_subprocess_refuses_non_root_caller() {
 }
 
 // ---------------------------------------------------------------------------
+// apply-config-migrations stability contract regression
+// ---------------------------------------------------------------------------
+
+/// Regression test pinning the stable external contract for
+/// `apply-config-migrations` (plural, no flags).
+///
+/// `scripts/install.sh` invokes exactly `sandbox apply-config-migrations`
+/// across releases.  This test asserts that:
+/// 1. The subcommand name `apply-config-migrations` is recognised (not an
+///    "unrecognised subcommand" / exit-2 clap error).
+/// 2. The no-flags calling convention is accepted — no required argument
+///    is missing.
+/// 3. The non-root refusal path is taken first (the test runner is not
+///    root), exiting non-zero with a message containing `requires root`.
+///
+/// A prior-release orchestrator MUST be able to invoke this exact
+/// incantation against a newer binary and have it behave consistently.
+#[test]
+fn integration_apply_config_migrations_stable_contract_recognised_and_refuses_non_root() {
+    let output = Command::new(sandbox_bin())
+        .arg("apply-config-migrations")
+        .output()
+        .expect("spawn sandbox CLI");
+    let code = output.status.code().expect("exited normally");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Must not be clap's "unrecognised subcommand" exit code (2).
+    assert_ne!(
+        code, 2,
+        "`apply-config-migrations` must be a recognised subcommand (not a clap parse error); \
+         stderr:\n{stderr}"
+    );
+    // Must exit non-zero (non-root caller).
+    assert_ne!(code, 0, "non-root must exit non-zero; stderr:\n{stderr}");
+    // Must carry the stable `requires root` substring.
+    assert!(
+        stderr.contains("requires root"),
+        "stderr must carry `requires root` for non-root caller; got:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // dump-migration-set
 // ---------------------------------------------------------------------------
 

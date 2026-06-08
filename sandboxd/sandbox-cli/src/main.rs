@@ -456,9 +456,12 @@ enum Command {
         /// Pin to a specific release tag (default: latest).
         #[arg(long, default_value = "latest")]
         version: String,
-        /// Use a pre-staged local tarball instead of fetching from
-        /// GitHub Releases. Required for air-gapped operation;
-        /// requires `--cosign-bundle` (or a sibling `.sigstore` file).
+        /// Use a local tarball instead of auto-downloading from GitHub
+        /// Releases. Air-gap override: when absent, the tarball and its
+        /// `.sigstore` bundle are downloaded automatically from
+        /// `--source-url`. Requires `--cosign-bundle` (or a sibling
+        /// `.sigstore` file) when the bundle is not alongside the
+        /// tarball.
         #[arg(long)]
         from: Option<std::path::PathBuf>,
         /// Path to a sigstore bundle for `--from` air-gap
@@ -542,6 +545,18 @@ enum Command {
     /// Invoked by `scripts/install.sh` from within its privileged root
     /// batch after the binaries are written, so that a pre-existing v0
     /// `users.conf` is migrated before the daemon is (re)started.
+    ///
+    /// # Stable external contract
+    ///
+    /// The subcommand name `apply-config-migrations` (plural, no flags)
+    /// and the `requires-root` refusal text are a **stable external
+    /// contract**: the install.sh installer calls this exact invocation
+    /// across releases. Do NOT rename this subcommand, do NOT change the
+    /// calling convention, and do NOT alter the `requires root` error
+    /// message prefix without a coordinated, backwards-compatible change
+    /// to `scripts/install.sh`. A prior-release orchestrator MUST be able
+    /// to invoke `sandbox apply-config-migrations` against a newer binary
+    /// and have it succeed.
     #[command(hide = true, name = "apply-config-migrations")]
     ApplyConfigMigrations,
 
@@ -5884,6 +5899,23 @@ fn apply_config_migration_inner(
         eprintln!("sandbox: failed to write {out_arg}: {e}");
         return 1;
     }
+
+    // atomic_write creates the tempfile with mode 0600. The subsequent
+    // `rename_via_sudo` (sudo -k mv) preserves whatever mode the tempfile
+    // has, so we must set the intended mode here — before the caller renames.
+    //
+    // Policy: preserve the canonical destination's existing mode when it is
+    // already present (idempotent re-runs keep the operator's permissions);
+    // default to 0644 (world-readable config) for first-time installs.
+    use std::os::unix::fs::PermissionsExt;
+    let target_mode: u32 = std::fs::metadata(file_path)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
+    if let Err(e) = std::fs::set_permissions(out_path, std::fs::Permissions::from_mode(target_mode))
+    {
+        eprintln!("sandbox: failed to set permissions on {out_arg}: {e}");
+        return 1;
+    }
     0
 }
 
@@ -5947,6 +5979,17 @@ fn handle_dump_proto_version() -> i32 {
 ///
 /// Requires root. Returns `0` on success (including nothing-to-do),
 /// `1` on any error.
+///
+/// # Stable external contract — do NOT change the calling convention
+///
+/// `scripts/install.sh` invokes `sandbox apply-config-migrations` (no
+/// flags) from within its privileged root batch across releases. The
+/// subcommand name, the zero-argument calling convention, and the
+/// `requires root` refusal message prefix are all load-bearing: a
+/// prior-release installer shell must be able to run the current binary
+/// with this exact incantation. Renaming, adding required flags, or
+/// changing the error prefix requires a coordinated, backwards-compatible
+/// change to `scripts/install.sh`.
 fn handle_apply_config_migrations() -> i32 {
     use sandbox_cli::cfg_migrations::TargetFile;
 

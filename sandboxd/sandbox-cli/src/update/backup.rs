@@ -90,6 +90,10 @@ pub const ROUTE_HELPER_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-rou
 /// daemon's startup-staging path can read it; never exposed on
 /// `$PATH`. Mirrors the install.sh layout.
 pub const GUEST_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-guest";
+/// Network helper that acquires `CAP_SETUID` to set up Lima's
+/// networking. Installed under libexec; granted `cap_setuid+ep`
+/// via `setcap` after install. Mirrors the install.sh layout.
+pub const LIMA_HELPER_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-lima-helper";
 
 // ---------------------------------------------------------------------------
 // Manifest shape

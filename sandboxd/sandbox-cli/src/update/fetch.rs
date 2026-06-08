@@ -32,7 +32,7 @@ use ring::digest;
 /// the update flow refuses with [`FetchError::CosignNotFound`] pointing
 /// the operator at the install docs — bootstrapping cosign from the
 /// update flow is deliberately out of scope.
-pub const COSIGN_BIN_PATH: &str = "/usr/local/bin/cosign";
+pub const COSIGN_BIN_PATH: &str = "/usr/local/libexec/sandboxd/cosign";
 
 /// Fulcio certificate-identity regexp matching tarballs signed by the
 /// official release workflow. **MUST stay byte-identical to install.sh's
@@ -411,6 +411,10 @@ impl StagedTarball {
     pub fn guest_bin(&self) -> PathBuf {
         self.stage_dir.join("bin/sandbox-guest")
     }
+    /// `<stage>/bin/sandbox-lima-helper`.
+    pub fn lima_helper_bin(&self) -> PathBuf {
+        self.stage_dir.join("bin/sandbox-lima-helper")
+    }
     /// `<stage>/systemd/sandboxd.service`.
     pub fn systemd_unit(&self) -> PathBuf {
         self.stage_dir.join("systemd/sandboxd.service")
@@ -564,6 +568,66 @@ pub fn resolve_latest_version_via_github() -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-download
+// ---------------------------------------------------------------------------
+
+/// Download a release tarball and its `.sigstore` signature bundle from
+/// `{source_url}/{version}/sandboxd-{version}-{arch}.tar.gz`.
+///
+/// Both the tarball and the `.sigstore` bundle are written into `dest_dir`.
+/// On success, returns the local paths `(tarball, sigstore)`.
+///
+/// `source_url` is the base URL without a trailing slash, matching the
+/// `DEFAULT_SOURCE_URL` convention. The arch string is the Rust target
+/// triple from `installed_arch` (e.g. `x86_64-unknown-linux-gnu`).
+///
+/// Uses `curl -fsSL --retry 3 --retry-delay 2` — the same flags as
+/// `install.sh`'s download helpers. On `curl` failure both partial
+/// files are deleted so the caller sees a clean `dest_dir`.
+pub fn download_tarball(
+    source_url: &str,
+    version: &str,
+    arch: &str,
+    dest_dir: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("create download dir {}: {e}", dest_dir.display()))?;
+
+    let tarball_name = format!("sandboxd-{version}-{arch}.tar.gz");
+    let sigstore_name = format!("{tarball_name}.sigstore");
+    let tarball_url = format!("{source_url}/{version}/{tarball_name}");
+    let sigstore_url = format!("{source_url}/{version}/{sigstore_name}");
+
+    let tarball_path = dest_dir.join(&tarball_name);
+    let sigstore_path = dest_dir.join(&sigstore_name);
+
+    for (url, dest) in [
+        (tarball_url.as_str(), &tarball_path),
+        (sigstore_url.as_str(), &sigstore_path),
+    ] {
+        let status = Command::new("curl")
+            .args(["-fsSL", "--retry", "3", "--retry-delay", "2", "-o"])
+            .arg(dest)
+            .arg(url)
+            .status()
+            .map_err(|e| format!("invoke curl to download {url}: {e}"))?;
+
+        if !status.success() {
+            // Clean up any partial files before surfacing the error.
+            let _ = std::fs::remove_file(&tarball_path);
+            let _ = std::fs::remove_file(&sigstore_path);
+            return Err(format!(
+                "download failed (curl exit {:?}): {url}\n  \
+                 Check your network connection or pass `--from <tarball>` for air-gapped operation.",
+                status.code()
+            ));
+        }
+    }
+
+    Ok((tarball_path, sigstore_path))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -660,6 +724,11 @@ mod tests {
         std::fs::write(stage_dir.join("bin/sandbox"), b"fake-sandbox").unwrap();
         std::fs::write(stage_dir.join("bin/sandbox-route-helper"), b"fake-rh").unwrap();
         std::fs::write(stage_dir.join("bin/sandbox-guest"), b"fake-guest").unwrap();
+        std::fs::write(
+            stage_dir.join("bin/sandbox-lima-helper"),
+            b"fake-lima-helper",
+        )
+        .unwrap();
         std::fs::write(stage_dir.join("systemd/sandboxd.service"), b"[Unit]\n").unwrap();
         std::fs::write(
             stage_dir.join("images/sandbox-gateway-9.9.9.tar"),
@@ -696,6 +765,7 @@ mod tests {
         assert!(staged.sandbox_bin().exists());
         assert!(staged.route_helper_bin().exists());
         assert!(staged.guest_bin().exists());
+        assert!(staged.lima_helper_bin().exists());
         assert!(staged.systemd_unit().exists());
         assert!(staged.gateway_image_tar().exists());
     }
