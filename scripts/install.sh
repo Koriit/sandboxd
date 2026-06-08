@@ -215,6 +215,7 @@ Extract tarball"
 UI_INSTALL_PHASES="sandbox-user
 operator-group-add
 install-binaries
+install-cosign
 setcap-route-helper
 setcap-lima-helper
 bridge-helper-setuid
@@ -329,6 +330,7 @@ ensure_install_log() {
 }
 
 cleanup_tmpdir() {
+    _ct_exit=$?
     # Kill background processes that may still be running if we are aborting
     # mid-installation (e.g. on SIGINT).  Both variables are initialised to 0
     # at script scope so the guard is safe even before run_priv_child starts.
@@ -341,6 +343,13 @@ cleanup_tmpdir() {
         wait "$_phase_reader_pid" 2>/dev/null || true
     fi
     ui_teardown
+    if [ "$_ct_exit" -ne 0 ]; then
+        if [ -n "$SUMMARY_FILE" ] && [ -s "$SUMMARY_FILE" ]; then
+            cat "$SUMMARY_FILE"
+        fi
+        printf '\n'
+        printf 'install failed (exit %s) — see %s\n' "$_ct_exit" "${INSTALL_LOG:-/var/log/sandboxd-install.log}"
+    fi
     if [ -n "$TMPDIR_INSTALL" ] && [ -d "$TMPDIR_INSTALL" ]; then
         rm -rf "$TMPDIR_INSTALL"
     fi
@@ -692,7 +701,6 @@ detect_preexisting() {
                 emit "  install.sh installs from scratch only."
                 emit "  To upgrade or downgrade, run:"
                 emit "      sudo sandbox update --version $TARGET_VER"
-                emit "  (Not yet available — re-run install.sh once update lands.)"
             }
             if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
                 _emit_version_mismatch > "$SUMMARY_FILE"
@@ -1697,7 +1705,7 @@ fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
-_TOTAL_STEPS=14
+_TOTAL_STEPS=15
 # Tracks the label of the last successfully completed step (set by _step_ok).
 # Used by _write_checkpoint to populate last_completed_step correctly on
 # failure checkpoints (the failing step should appear in failed_step, not
@@ -1897,6 +1905,7 @@ STAGE='$(_sq "$STAGE")'
 TMPDIR_INSTALL='$(_sq "$TMPDIR_INSTALL")'
 TARBALL_SHA256='$(_sq "$TARBALL_SHA256")'
 MANIFEST_BUILD_SHA='$(_sq "$MANIFEST_BUILD_SHA")'
+COSIGN='$(_sq "$COSIGN")'
 
 # Helpers for JSON encoding of state file.
 bool_lit() {
@@ -2068,6 +2077,16 @@ done
 IFS="\$_old_IFS"
 _step_ok
 _write_checkpoint "install-binaries"
+
+# ----- Step: install cosign -----
+_step_begin "install-cosign"
+_priv_maybe_abort_at "install-cosign"
+install -D -m 0755 -o root -g root "\$COSIGN" /usr/local/libexec/sandboxd/cosign >> "\$_LOG" 2>&1 \
+    || { _log "step=install_cosign path=/usr/local/libexec/sandboxd/cosign action=fail status=fail"; _step_fail; }
+_log "step=install_cosign path=/usr/local/libexec/sandboxd/cosign action=install status=ok"
+_step_ok
+_write_checkpoint "install-cosign"
+_priv_maybe_fail_after "install-cosign"
 
 # ----- Step: setcap route-helper -----
 _step_begin "setcap-route-helper"
@@ -2717,9 +2736,9 @@ run_provision() {
     fi
 
     if [ "$RICH_UI" -eq 1 ]; then
-        ui_init_phases "$UI_PROVISION_PHASES"
+        ui_init_phases "$UI_PROVISION_PHASES" || true
         UI_CURRENT_HEADER="sandboxd $VERSION · provisioning"
-        ui_render_checklist
+        ui_render_checklist || true
     fi
 
     log_ok "step=provision action=start operator=$OPERATOR_NAME"
@@ -2733,12 +2752,12 @@ run_provision() {
         esac
 
         if [ "$_prov_backend" = "container" ]; then
-            set_phase "$_prov_phase" "active" "building $_prov_backend image (a few minutes)"
+            set_phase "$_prov_phase" "active" "building $_prov_backend image (a few minutes)" || true
         else
-            set_phase "$_prov_phase" "active" "building $_prov_backend image"
+            set_phase "$_prov_phase" "active" "building $_prov_backend image" || true
         fi
         if [ "$RICH_UI" -eq 1 ]; then
-            ui_animator_start
+            ui_animator_start || true
         else
             emit "${BLUE}...${RESET} building $_prov_backend image"
         fi
@@ -2762,15 +2781,15 @@ run_provision() {
         fi
 
         if [ "$RICH_UI" -eq 1 ]; then
-            ui_animator_stop
+            ui_animator_stop || true
         fi
 
         if [ "$_prov_ok" -eq 1 ]; then
-            set_phase "$_prov_phase" "done"
+            set_phase "$_prov_phase" "done" || true
             emit "${GREEN}+${RESET} $_prov_backend image built"
             log_ok "step=provision action=rebuild-image backend=$_prov_backend status=ok"
         else
-            set_phase "$_prov_phase" "failed"
+            set_phase "$_prov_phase" "failed" || true
             _prov_failed_backends="$_prov_failed_backends $_prov_backend"
             emit "${YELLOW}!${RESET} Backend image provisioning incomplete: $_prov_backend"
             emit "  The daemon is installed and running; this only affects first-session latency."
