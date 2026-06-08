@@ -182,11 +182,11 @@ pub const STATE_ROOT_OVERRIDE_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_STATE_ROOT";
 /// process uid.
 ///
 /// - `root`       — state-root prefix (production: [`SANDBOXD_STATE_ROOT`];
-///                  tests: a caller-supplied tempdir path).
+///   tests: a caller-supplied tempdir path).
 /// - `daemon_uid` — uid the daemon process itself runs as; the first variable
-///                  segment, isolating per-daemon state trees on the same host.
+///   segment, isolating per-daemon state trees on the same host.
 /// - `op_uid`     — the human operator's uid; the second variable segment,
-///                  isolating per-operator Lima state within one daemon's tree.
+///   isolating per-operator Lima state within one daemon's tree.
 fn operator_lima_home_inner(root: &str, daemon_uid: u32, op_uid: u32) -> PathBuf {
     PathBuf::from(format!("{root}/{daemon_uid}/{op_uid}/lima"))
 }

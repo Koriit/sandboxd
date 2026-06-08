@@ -31,12 +31,14 @@
 //! ## Sudo elevation
 //!
 //! All file operations that need to land at `sandbox:sandbox` ownership
-//! shell out via `sudo -k -u sandbox install ...` (matching install.sh
-//! conventions). `/etc` files require a two-step `sudo cat |
-//! sudo -u sandbox tee` because the destination directory is owned by
+//! shell out via `sudo -n -u sandbox install ...` (matching install.sh
+//! conventions). `/etc` files require a two-step `sudo -n cat |
+//! sudo -n -u sandbox tee` because the destination directory is owned by
 //! `sandbox:sandbox` but the source is `root:root`-only readable; the
 //! intermediate "read as root, write as sandbox" pipeline keeps both
-//! ends honest.
+//! ends honest. `-n` (non-interactive) relies on the upfront `sudo -v`
+//! credential warm done at the start of `sandbox update` — it never
+//! busts the cache mid-run.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -159,19 +161,12 @@ pub fn backup_set_name(started_at: &str, from_version: &str, to_version: &str) -
 /// (see [`backups_root_path`]). Idempotent — re-running on an existing
 /// directory is a no-op. Mode `0700 sandbox:sandbox`.
 ///
-/// In production this shells out to `sudo -k -u sandbox mkdir -p`; for
+/// In production this shells out to `sudo -n -u sandbox mkdir -p`; for
 /// tests we expose [`create_backup_set_dir_at`] which uses plain
 /// `std::fs` against a test-owned parent dir.
 pub fn create_backup_set_dir(set_name: &str) -> Result<PathBuf, BackupError> {
     let target = backups_root_path().join(set_name);
-    run_sudo(&[
-        "-k",
-        "-u",
-        "sandbox",
-        "mkdir",
-        "-p",
-        target.to_str().unwrap(),
-    ])?;
+    run_sudo(&["-u", "sandbox", "mkdir", "-p", target.to_str().unwrap()])?;
     Ok(target)
 }
 
@@ -219,7 +214,7 @@ pub enum CopyAction {
 /// * Source missing → returns `CopyAction::SourceAbsent` (no file
 ///   mutation).
 /// * Destination exists with identical bytes → `CopyAction::Skipped`.
-/// * Otherwise → invokes `sudo -k -u sandbox install -m <mode>`.
+/// * Otherwise → invokes `sudo -n -u sandbox install -m <mode>`.
 pub fn backup_sandbox_owned_file(
     src: &Path,
     dst: &Path,
@@ -249,7 +244,6 @@ pub fn backup_sandbox_owned_file(
     }
     let mode_str = format!("{mode:04o}");
     run_sudo(&[
-        "-k",
         "-u",
         "sandbox",
         "install",
@@ -289,21 +283,14 @@ pub fn backup_etc_file(src: &Path, dst: &Path, mode: u32) -> Result<CopyOutcome,
             size: src_size,
         });
     }
-    // `sudo -k cat <src> | sudo -k -u sandbox tee <dst> >/dev/null` —
+    // `sudo -n cat <src> | sudo -n -u sandbox tee <dst> >/dev/null` —
     // we drive the pipeline via `std::process::Command` so the parent
     // process can wait on both ends. `tee` is preferred over `cp`
     // because we cross a uid boundary; the bytes are explicit on the
     // pipe and the destination is created at the right ownership.
     pipe_sudo_cat_to_sandbox_tee(src, dst)?;
     let mode_str = format!("{mode:04o}");
-    run_sudo(&[
-        "-k",
-        "-u",
-        "sandbox",
-        "chmod",
-        &mode_str,
-        dst.to_str().unwrap(),
-    ])?;
+    run_sudo(&["-u", "sandbox", "chmod", &mode_str, dst.to_str().unwrap()])?;
     Ok(CopyOutcome {
         action: CopyAction::Copied,
         sha256: src_sha,
@@ -505,24 +492,19 @@ fn hex_encode(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// `sudo` invocation prefix every backup helper runs through. The
-/// `-k` flag forces a fresh credential prompt by discarding any
-/// cached operator credentials before the call; this enforces the "no-cached-sudo" invariant — every privileged step in
-/// the update flow must re-authenticate so an unattended terminal
-/// session cannot inadvertently authorize a stateful mutation.
+/// `-n` flag (non-interactive) causes sudo to fail rather than prompt
+/// for a password. Backup helpers rely on the upfront `sudo -v`
+/// credential warm done at the start of `sandbox update`; they must
+/// never bust that cache mid-run.
 ///
 /// The helpers below splice this prefix in front of the caller's
 /// args so the invariant is enforced centrally rather than relying
-/// on every call site to remember the `-k`. Calls that nominally
-/// supply their own `-k` still work — sudo accepts repeated `-k` —
-/// but the canonical pattern is now to pass only the post-`sudo -k`
-/// argv.
-const SUDO_PREFIX: &[&str] = &["-k"];
+/// on every call site.
+const SUDO_PREFIX: &[&str] = &["-n"];
 
-/// Run `sudo -k <args>` and propagate stderr on non-zero exit. The
-/// `-k` (kill cached credentials) prefix is enforced internally —
-/// callers pass only the post-`-k` argv. Calls that still include
-/// a redundant `-k` are tolerated (repeated `-k` is idempotent in
-/// sudo).
+/// Run `sudo -n <args>` and propagate stderr on non-zero exit. The
+/// `-n` (non-interactive) prefix is enforced via [`SUDO_PREFIX`] —
+/// callers pass only the post-`-n` argv.
 fn run_sudo(args: &[&str]) -> Result<(), BackupError> {
     let mut cmd = Command::new("sudo");
     cmd.args(SUDO_PREFIX);
@@ -530,7 +512,7 @@ fn run_sudo(args: &[&str]) -> Result<(), BackupError> {
     let status = cmd.output().map_err(BackupError::Io)?;
     if !status.status.success() {
         return Err(BackupError::Subprocess {
-            cmd: format!("sudo -k {}", args.join(" ")),
+            cmd: format!("sudo -n {}", args.join(" ")),
             code: status.status.code(),
             stderr: String::from_utf8_lossy(&status.stderr).into_owned(),
         });
@@ -538,8 +520,8 @@ fn run_sudo(args: &[&str]) -> Result<(), BackupError> {
     Ok(())
 }
 
-/// Run `sudo -k <args>` and return stdout bytes on success. Same
-/// `-k`-enforcement semantics as [`run_sudo`].
+/// Run `sudo -n <args>` and return stdout bytes on success. Same
+/// `-n`-enforcement semantics as [`run_sudo`].
 fn run_sudo_capture(args: &[&str]) -> Result<Vec<u8>, BackupError> {
     let mut cmd = Command::new("sudo");
     cmd.args(SUDO_PREFIX);
@@ -547,7 +529,7 @@ fn run_sudo_capture(args: &[&str]) -> Result<Vec<u8>, BackupError> {
     let out = cmd.output().map_err(BackupError::Io)?;
     if !out.status.success() {
         return Err(BackupError::Subprocess {
-            cmd: format!("sudo -k {}", args.join(" ")),
+            cmd: format!("sudo -n {}", args.join(" ")),
             code: out.status.code(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
@@ -555,11 +537,11 @@ fn run_sudo_capture(args: &[&str]) -> Result<Vec<u8>, BackupError> {
     Ok(out.stdout)
 }
 
-/// `sudo -k cat <src>` piped into `sudo -k -u sandbox tee <dst>`.
+/// `sudo -n cat <src>` piped into `sudo -n -u sandbox tee <dst>`.
 fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupError> {
     use std::process::Stdio;
     let mut reader = Command::new("sudo")
-        .args(["-k", "cat", src.to_str().unwrap()])
+        .args(["-n", "cat", src.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -569,7 +551,7 @@ fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupErro
         .take()
         .ok_or_else(|| BackupError::Io(std::io::Error::other("cat stdout missing")))?;
     let writer = Command::new("sudo")
-        .args(["-k", "-u", "sandbox", "tee", dst.to_str().unwrap()])
+        .args(["-n", "-u", "sandbox", "tee", dst.to_str().unwrap()])
         .stdin(Stdio::from(reader_stdout))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -579,14 +561,14 @@ fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupErro
     let r_status = reader.wait().map_err(BackupError::Io)?;
     if !r_status.success() {
         return Err(BackupError::Subprocess {
-            cmd: format!("sudo -k cat {}", src.display()),
+            cmd: format!("sudo -n cat {}", src.display()),
             code: r_status.code(),
             stderr: "cat failed (stderr captured separately)".to_string(),
         });
     }
     if !w_out.status.success() {
         return Err(BackupError::Subprocess {
-            cmd: format!("sudo -k -u sandbox tee {}", dst.display()),
+            cmd: format!("sudo -n -u sandbox tee {}", dst.display()),
             code: w_out.status.code(),
             stderr: String::from_utf8_lossy(&w_out.stderr).into_owned(),
         });
@@ -595,7 +577,7 @@ fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupErro
 }
 
 /// Write `bytes` to a `sandbox`-owned file at `mode`. Uses a tempfile
-/// under `/tmp` written by the current process, then `sudo -k -u
+/// under `/tmp` written by the current process, then `sudo -n -u
 /// sandbox install -m <mode> <tmp> <dst>` to atomically land it at
 /// the right ownership.
 fn write_sandbox_owned_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), BackupError> {
@@ -617,7 +599,6 @@ fn write_sandbox_owned_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), B
     let tmp_path = tmp.path().to_path_buf();
     let mode_str = format!("{mode:04o}");
     run_sudo(&[
-        "-k",
         "-u",
         "sandbox",
         "install",
@@ -641,7 +622,7 @@ fn read_sandbox_owned_file(path: &Path) -> Result<Vec<u8>, BackupError> {
     run_sudo_capture(&["cat", path.to_str().unwrap()])
 }
 
-/// List the basenames of every entry under `dir`. Uses `sudo -k ls -1`
+/// List the basenames of every entry under `dir`. Uses `sudo -n ls -1`
 /// because the backups root is mode `0700 sandbox:sandbox`.
 fn list_dir_sudo(dir: &Path) -> Result<Vec<String>, BackupError> {
     if !dir.exists() {
@@ -658,12 +639,12 @@ fn list_dir_sudo(dir: &Path) -> Result<Vec<String>, BackupError> {
         }
         return Ok(names);
     }
-    let out = run_sudo_capture(&["-k", "ls", "-1", dir.to_str().unwrap()])?;
+    let out = run_sudo_capture(&["ls", "-1", dir.to_str().unwrap()])?;
     let s = String::from_utf8_lossy(&out);
     Ok(s.lines().map(|l| l.to_string()).collect())
 }
 
-/// `rm -rf` on a backup-set directory. Uses `sudo -k -u sandbox` so the
+/// `rm -rf` on a backup-set directory. Uses `sudo -n -u sandbox` so the
 /// ownership semantics match the create path.
 fn remove_dir_all_sudo(path: &Path) -> Result<(), BackupError> {
     // For tests against a tempdir-owned tree, plain remove_dir_all
@@ -671,7 +652,7 @@ fn remove_dir_all_sudo(path: &Path) -> Result<(), BackupError> {
     if std::fs::remove_dir_all(path).is_ok() {
         return Ok(());
     }
-    run_sudo(&["-k", "-u", "sandbox", "rm", "-rf", path.to_str().unwrap()])
+    run_sudo(&["-u", "sandbox", "rm", "-rf", path.to_str().unwrap()])
 }
 
 // ---------------------------------------------------------------------------

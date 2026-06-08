@@ -238,7 +238,7 @@ pub fn acquire(params: AcquireParams<'_>) -> Result<UpdateLock, LockError> {
     // freshly-created file is `0664` (the design-pinned shape); we set
     // `umask` semantics via `OpenOptions`. The actual install of the
     // file at the right ownership (`sandbox:sandbox`) on a fresh-host
-    // first-run is the wrapping shell flow's job (`sudo -k -u sandbox
+    // first-run is the wrapping shell flow's job (`sudo -u sandbox
     // install -m 0664 /dev/null "$lockfile"`);
     // from Rust we open whatever the operator-side install
     // left in place and assert that we hold a writable FD.

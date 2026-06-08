@@ -244,7 +244,7 @@ pub struct DevModeReason {
 /// corrupted system install — same refusal either way), `None` when
 /// both artefacts are present.
 ///
-/// The state-file check uses `sudo -k test -e` because
+/// The state-file check uses `sudo -n test -e` because
 /// `/var/lib/sandboxd/<uid>/` is `0750 sandbox:sandbox` — an
 /// unprivileged operator cannot traverse it. The caller must have
 /// already warmed `sudo` credentials with `sudo -v` so this
@@ -254,7 +254,7 @@ pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> Option<DevModeR
 
     // The parent directory of the state file is 0750 sandbox:sandbox.
     // A non-root operator cannot `stat(2)` the file directly.
-    // Use `sudo -n -k test -e` so the kernel check runs as root without
+    // Use `sudo -n test -e` so the kernel check runs as root without
     // prompting for a password.  `-n` is non-interactive: if sudo would
     // need to prompt, it exits non-zero and writes "a password is required"
     // (or similar) to stderr — that case is a sudo auth failure, not a
@@ -1275,9 +1275,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
         ),
     );
 
-    // Warm sudo credentials once so subsequent `sudo -k ...` sub-commands
+    // Warm sudo credentials once so subsequent `sudo -n ...` sub-commands
     // can run non-interactively. We do this early — before the dev-mode
-    // state-file check — because `sudo -k test -e` needs live credentials.
+    // state-file check — because `sudo -n test -e` needs live credentials.
     match Command::new("sudo").args(["-v"]).status() {
         Ok(s) if s.success() => {
             log_step("sudo_warm", "status=ok");
