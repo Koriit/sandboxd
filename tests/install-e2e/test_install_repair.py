@@ -180,10 +180,15 @@ def test_repair_corrupted_users_conf_schema(
     # Break invariant: overwrite _schema_version with 0 in-place.
     # Use a temp file + atomic rename so the file is never empty during
     # the update (jq writes stdout, not in-place).
+    # Run the whole mutation as root in one shell: jq → same-dir temp →
+    # atomic rename. A single `sudo sh -c` (not a mktemp + two-sudo pipe)
+    # avoids the prior failure where the pipeline's exit status came from
+    # the final `mv` and masked an empty jq/tee, leaving users.conf empty.
     vm.shell(
-        "tmp=$(mktemp); "
-        "sudo jq '._schema_version = 0' /etc/sandboxd/users.conf | sudo tee \"$tmp\" > /dev/null; "
-        "sudo mv \"$tmp\" /etc/sandboxd/users.conf",
+        "sudo sh -c "
+        "'jq \"._schema_version = 0\" /etc/sandboxd/users.conf "
+        "> /etc/sandboxd/users.conf.tmp "
+        "&& mv /etc/sandboxd/users.conf.tmp /etc/sandboxd/users.conf'",
         check=True, timeout=15,
     )
     schema_broken = vm.shell(
