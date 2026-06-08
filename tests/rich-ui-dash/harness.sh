@@ -51,6 +51,29 @@ PRINT_FAILURE_REPORT_BLOCK=$(awk '
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
 
+# Extract install_health_check and maybe_emit_group_activation_hint.
+INSTALL_HEALTH_CHECK_BLOCK=$(awk '
+    /^install_health_check\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
+MAYBE_EMIT_HINT_BLOCK=$(awk '
+    /^maybe_emit_group_activation_hint\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
+# Extract run_provision (Step 16 — eager backend-image provisioning).
+# Uses single-function awk (with exit) so it captures only the one function
+# and does not accidentally pull in heredoc-embedded stubs that precede it.
+# Scenarios define _prov_maybe_force_fail inline to control failure injection.
+RUN_PROVISION_BLOCK=$(awk '
+    /^run_provision\(\)/ { in_block = 1 }
+    in_block { print }
+    in_block && /^}$/ { in_block = 0; exit }
+' "$INSTALL_SH")
+
 # ---------------------------------------------------------------------------
 # Extract uninstall-specific functions from uninstall.sh.
 # These use TMPDIR_UNINSTALL (not TMPDIR_INSTALL) so they cannot share the
@@ -980,6 +1003,43 @@ _run_uninstall_cleanup_scenario() {
     _rucs_cols="${4:-80}"
     _run_scenario "$_rucs_label" "$_rucs_snippet" "$_rucs_rows" "$_rucs_cols" \
         "$UNINSTALL_CLEANUP_BLOCK"
+}
+
+# Convenience wrapper: injects INSTALL_HEALTH_CHECK_BLOCK (install_health_check
+# from install.sh).  Scenarios must stub getcap, docker, systemctl, and jq.
+_run_health_check_scenario() {
+    _rhcs_label="$1"
+    _rhcs_snippet="$2"
+    _rhcs_rows="${3:-24}"
+    _rhcs_cols="${4:-80}"
+    _run_scenario "$_rhcs_label" "$_rhcs_snippet" "$_rhcs_rows" "$_rhcs_cols" \
+        "$INSTALL_HEALTH_CHECK_BLOCK"
+}
+
+# Convenience wrapper: injects MAYBE_EMIT_HINT_BLOCK (maybe_emit_group_activation_hint
+# from install.sh).  Scenarios must stub getent and id.
+_run_hint_scenario() {
+    _rhs_label="$1"
+    _rhs_snippet="$2"
+    _rhs_rows="${3:-24}"
+    _rhs_cols="${4:-80}"
+    _run_scenario "$_rhs_label" "$_rhs_snippet" "$_rhs_rows" "$_rhs_cols" \
+        "$MAYBE_EMIT_HINT_BLOCK"
+}
+
+# Convenience wrapper: injects RUN_PROVISION_BLOCK (run_provision from install.sh).
+# Scenarios must:
+#   - Define _prov_maybe_force_fail() inline (controls failure injection per-scenario).
+#   - Set NO_PROVISION, OPERATOR_NAME, and RICH_UI=0 (RICH_UI is already 1 from
+#     _run_scenario; override to 0 in plain-text scenarios to avoid TTY-writer calls).
+#   - Stub sg, sudo, and id as needed to control the operator/root code paths.
+_run_provision_scenario() {
+    _rps_label="$1"
+    _rps_snippet="$2"
+    _rps_rows="${3:-24}"
+    _rps_cols="${4:-80}"
+    _run_scenario "$_rps_label" "$_rps_snippet" "$_rps_rows" "$_rps_cols" \
+        "$RUN_PROVISION_BLOCK"
 }
 
 _run_cleanup_scenario "escape-seq: cleanup_tmpdir emits \\033[?25h when RICH_UI=1" '
@@ -2323,6 +2383,536 @@ case "$REMOVED_ITEMS" in
     *"third-item"*) : ;;
     *) printf "third item missing from REMOVED_ITEMS; got: %s\n" "$REMOVED_ITEMS" >&2; exit 1 ;;
 esac
+'
+
+# ---------------------------------------------------------------------------
+# install_health_check: healthy system returns 0 with empty _unhealthy
+# ---------------------------------------------------------------------------
+
+_run_health_check_scenario "install_health_check: all healthy returns 0, _unhealthy empty" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\\n" 1 > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+getcap() {
+    case "$1" in
+        *route-helper) printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1" ;;
+        *lima-helper)  printf "%s cap_setuid+ep\n" "$1" ;;
+        *)             printf "%s\n" "$1" ;;
+    esac
+}
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+jq() { printf "1\n"; }
+if ! install_health_check; then
+    printf "expected healthy (rc=0) but got unhealthy: %s\n" "$_unhealthy" >&2; exit 1
+fi
+case "${_unhealthy:-}" in
+    "") : ;;
+    *) printf "_unhealthy not empty: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# install_health_check: each single-broken invariant produces correct token
+# ---------------------------------------------------------------------------
+
+_run_health_check_scenario "install_health_check: H1 missing binary sets missing-binaries" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\\n" 1 > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+# Remove one binary to trigger H1.
+rm "$PLAN_DAEMON_PATH"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+getcap() { printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1"; }
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+jq() { printf "1\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"missing-binaries"*) : ;;
+    *) printf "expected missing-binaries in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+_run_health_check_scenario "install_health_check: H2 wrong route caps sets route-caps" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\\n" 1 > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+# getcap returns wrong caps for route-helper.
+getcap() {
+    case "$1" in
+        *route-helper) printf "%s cap_net_admin=eip\n" "$1" ;;
+        *)             printf "%s cap_setuid+ep\n" "$1" ;;
+    esac
+}
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+jq() { printf "1\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"route-caps"*) : ;;
+    *) printf "expected route-caps in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+_run_health_check_scenario "install_health_check: H3 wrong lima caps sets lima-caps" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\\n" 1 > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+# getcap returns correct caps for route-helper, wrong caps for lima-helper.
+getcap() {
+    case "$1" in
+        *route-helper) printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1" ;;
+        *lima-helper)  printf "%s cap_net_admin=eip\n" "$1" ;;
+        *)             printf "%s\n" "$1" ;;
+    esac
+}
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+jq() { printf "1\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"lima-caps"*) : ;;
+    *) printf "expected lima-caps in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+_run_health_check_scenario "install_health_check: H4 schema version 0 sets users-conf-schema" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\\n" 0 > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+getcap() { printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1"; }
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+# jq returns 0 (below min schema version 1).
+jq() { printf "0\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"users-conf-schema"*) : ;;
+    *) printf "expected users-conf-schema in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+_run_health_check_scenario "install_health_check: H4 non-numeric schema version (null) sets users-conf-schema" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{}\n" > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+getcap() { printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1"; }
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+# jq returns "null" (key absent) — previously slipped past the 2>/dev/null crutch.
+jq() { printf "null\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"users-conf-schema"*) : ;;
+    *) printf "expected users-conf-schema in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+_run_health_check_scenario "install_health_check: H5 missing gateway image sets gateway-image" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\\n" 1 > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+getcap() { printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1"; }
+# docker image inspect fails (image absent).
+docker() { return 1; }
+systemctl() { printf "active\n"; }
+jq() { printf "1\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"gateway-image"*) : ;;
+    *) printf "expected gateway-image in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+_run_health_check_scenario "install_health_check: H6 daemon inactive sets daemon-inactive" '
+_hc_d=$(mktemp -d)
+_hc_cleanup() { rm -rf "$_hc_d"; }; trap _hc_cleanup EXIT
+mkdir -p "$_hc_d/libexec" "$_hc_d/bin" "$_hc_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_hc_d/libexec/$_b"; chmod +x "$_hc_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_hc_d/bin/sandbox"; chmod +x "$_hc_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\\n" 1 > "$_hc_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_hc_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_hc_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_hc_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_hc_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_hc_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_hc_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+getcap() { printf "%s cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n" "$1"; }
+docker() { return 0; }
+# systemctl is-active returns "inactive".
+systemctl() { printf "inactive\n"; }
+jq() { printf "1\n"; }
+if install_health_check; then
+    printf "expected unhealthy (rc=1) but got healthy\n" >&2; exit 1
+fi
+case "$_unhealthy" in
+    *"daemon-inactive"*) : ;;
+    *) printf "expected daemon-inactive in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# maybe_emit_group_activation_hint: emits hint iff member but not active
+# ---------------------------------------------------------------------------
+
+_run_hint_scenario "maybe_emit_group_activation_hint: member not in session emits hint" '
+OPERATOR_NAME="alice"
+BLUE=""
+RESET=""
+# getent confirms sandbox group exists.
+getent() { return 0; }
+# id -nG alice: alice is a group-db member; id -nG: sandbox not in live session.
+id() {
+    case "$*" in
+        "-nG alice") printf "alice sandbox\n" ;;
+        "-nG")       printf "alice\n" ;;
+        *)           command id "$@" ;;
+    esac
+}
+out=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out" in
+    *"newgrp sandbox"*) : ;;
+    *) printf "expected newgrp hint in output; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+_run_hint_scenario "maybe_emit_group_activation_hint: member already active in session is silent" '
+OPERATOR_NAME="alice"
+BLUE=""
+RESET=""
+getent() { return 0; }
+# id -nG alice and id -nG both include sandbox (group already active in session).
+id() {
+    case "$*" in
+        "-nG alice") printf "alice sandbox\n" ;;
+        "-nG")       printf "alice sandbox\n" ;;
+        *)           command id "$@" ;;
+    esac
+}
+out=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out" in
+    "") : ;;
+    *) printf "expected no output when group active; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+_run_hint_scenario "maybe_emit_group_activation_hint: no operator name is silent" '
+OPERATOR_NAME=""
+BLUE=""
+RESET=""
+getent() { return 0; }
+id() { printf "root\n"; }
+out=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out" in
+    "") : ;;
+    *) printf "expected no output when OPERATOR_NAME empty; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+_run_hint_scenario "maybe_emit_group_activation_hint: sandbox group absent is silent" '
+OPERATOR_NAME="alice"
+BLUE=""
+RESET=""
+# getent fails — sandbox group does not exist yet.
+getent() { return 1; }
+id() { printf "alice sandbox\n"; }
+out=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out" in
+    "") : ;;
+    *) printf "expected no output when group absent; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+_run_hint_scenario "maybe_emit_group_activation_hint: operator not member of sandbox group is silent" '
+OPERATOR_NAME="alice"
+BLUE=""
+RESET=""
+getent() { return 0; }
+# id -nG alice: alice not yet added to sandbox group.
+id() {
+    case "$*" in
+        "-nG alice") printf "alice\n" ;;
+        "-nG")       printf "alice\n" ;;
+        *)           command id "$@" ;;
+    esac
+}
+out=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out" in
+    "") : ;;
+    *) printf "expected no output when operator not in group; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+'
+
+# B1 regression guard: hint must be reachable on the healthy-skip path, meaning
+# OPERATOR_NAME must be set before maybe_emit_group_activation_hint is called.
+_run_hint_scenario "maybe_emit_group_activation_hint: emits hint when called with OPERATOR_NAME already set" '
+OPERATOR_NAME="alice"
+BLUE=""
+RESET=""
+getent() { return 0; }
+# alice is a sandbox group member but sandbox is not in the live session.
+id() {
+    case "$*" in
+        "-nG alice") printf "alice sandbox\n" ;;
+        "-nG")       printf "alice\n" ;;
+        *)           command id "$@" ;;
+    esac
+}
+out=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out" in
+    *"newgrp sandbox"*) : ;;
+    *) printf "expected newgrp hint; got: %s\n" "$out" >&2; exit 1 ;;
+esac
+# Confirm the guard: with OPERATOR_NAME="" the hint must be silent.
+OPERATOR_NAME=""
+out2=$(maybe_emit_group_activation_hint 2>/dev/null)
+case "$out2" in
+    "") : ;;
+    *) printf "expected silence when OPERATOR_NAME empty; got: %s\n" "$out2" >&2; exit 1 ;;
+esac
+'
+
+# ---------------------------------------------------------------------------
+# run_provision — Step 16 eager backend-image provisioning
+# ---------------------------------------------------------------------------
+
+# Scenario: --no-provision=1 skips entirely — no sg/rebuild-image call, exits 0.
+_run_provision_scenario "run_provision: --no-provision skips all backends" '
+RICH_UI=0
+NO_PROVISION=1
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+# _prov_maybe_force_fail would succeed, but run_provision must return before
+# ever calling it when NO_PROVISION=1.
+_prov_maybe_force_fail() { return 0; }
+sg() { printf "sg called unexpectedly\n" >&2; exit 1; }
+sudo() { printf "sudo called unexpectedly\n" >&2; exit 1; }
+run_provision
+'
+
+# Scenario: no operator resolves — skips with reason=no-operator, no sg call, exits 0.
+_run_provision_scenario "run_provision: empty OPERATOR_NAME skips with reason=no-operator" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME=""
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+_prov_maybe_force_fail() { return 0; }
+sg() { printf "sg called without operator\n" >&2; exit 1; }
+sudo() { printf "sudo called without operator\n" >&2; exit 1; }
+run_provision
+'
+
+# Scenario: non-root operator path — sg is invoked without sudo prefix.
+# Both container and lima backends must be invoked.
+_run_provision_scenario "run_provision: non-root uses bare sg for both backends" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+_prov_maybe_force_fail() { return 0; }
+_sg_calls=""
+sg() {
+    # sg sandbox -c "..."  -> record the backend argument
+    _sg_arg="$*"
+    case "$_sg_arg" in
+        *"--backend container"*) _sg_calls="${_sg_calls}container " ;;
+        *"--backend lima"*)      _sg_calls="${_sg_calls}lima " ;;
+    esac
+    return 0
+}
+sudo() { printf "sudo called in non-root path\n" >&2; exit 1; }
+# Pretend euid != 0 by overriding id to return 1000.
+id() { printf "1000\n"; }
+run_provision
+case "$_sg_calls" in
+    *"container"*) : ;;
+    *) printf "container backend not invoked via sg\n" >&2; exit 1 ;;
+esac
+case "$_sg_calls" in
+    *"lima"*) : ;;
+    *) printf "lima backend not invoked via sg\n" >&2; exit 1 ;;
+esac
+'
+
+# Scenario: root path — sudo -u <operator> sg is invoked for both backends.
+_run_provision_scenario "run_provision: root uses sudo -u operator sg for both backends" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+_prov_maybe_force_fail() { return 0; }
+_sudo_calls=""
+sudo() {
+    # sudo -u alice sg sandbox -c "..."
+    _sudo_arg="$*"
+    case "$_sudo_arg" in
+        *"-u alice"*"--backend container"*) _sudo_calls="${_sudo_calls}container " ;;
+        *"-u alice"*"--backend lima"*)      _sudo_calls="${_sudo_calls}lima " ;;
+    esac
+    return 0
+}
+sg() { printf "bare sg called in root path\n" >&2; exit 1; }
+# Pretend euid == 0.
+id() { printf "0\n"; }
+run_provision
+case "$_sudo_calls" in
+    *"container"*) : ;;
+    *) printf "container backend not invoked via sudo sg\n" >&2; exit 1 ;;
+esac
+case "$_sudo_calls" in
+    *"lima"*) : ;;
+    *) printf "lima backend not invoked via sudo sg\n" >&2; exit 1 ;;
+esac
+'
+
+# Scenario: one backend fails rebuild-image — non-fatal; run_provision exits 0.
+_run_provision_scenario "run_provision: failing rebuild-image is non-fatal (exits 0)" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+# Inject failure for container backend only.
+_prov_maybe_force_fail() {
+    [ "$1" != "container" ]
+}
+sg() { return 0; }
+sudo() { return 0; }
+id() { printf "1000\n"; }
+# run_provision must exit 0 even with one backend failed.
+run_provision
+'
+
+# Scenario: both backends fail — still exits 0 (non-fatal).
+_run_provision_scenario "run_provision: all backends failing is non-fatal (exits 0)" '
+RICH_UI=0
+NO_PROVISION=0
+OPERATOR_NAME="alice"
+VERSION="0.0.0-test"
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
+# Force-fail every backend.
+_prov_maybe_force_fail() { return 1; }
+sg() { return 0; }
+sudo() { return 0; }
+id() { printf "1000\n"; }
+run_provision
 '
 
 # ---------------------------------------------------------------------------

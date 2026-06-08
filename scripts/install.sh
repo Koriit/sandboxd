@@ -132,6 +132,7 @@ YES=0
 VERBOSE=0
 QUIET=0
 NO_COLOR=0
+NO_PROVISION=0
 
 # Step-discovered state (consumed by the privileged child when writing install-state).
 ARCH=""
@@ -180,10 +181,14 @@ PLAN_UNIT=""                  # install | skip-identical
 PLAN_LEGACY_MIGRATE=""        # migrate | skip
 
 # Resolved in compute_plan so render_plan can display full paths/strings.
+PLAN_DAEMON_PATH="/usr/local/libexec/sandboxd/sandboxd"
+PLAN_CLI_PATH="/usr/local/bin/sandbox"
+PLAN_GUEST_PATH="/usr/local/libexec/sandboxd/sandbox-guest"
 PLAN_ROUTE_HELPER_PATH="/usr/local/libexec/sandboxd/sandbox-route-helper"
 PLAN_LIMA_HELPER_PATH="/usr/local/libexec/sandboxd/sandbox-lima-helper"
 PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
 PLAN_LIMA_CAPS_STR="cap_setuid+ep"
+PLAN_USERS_CONF_PATH="/etc/sandboxd/users.conf"
 PLAN_UNIT_DST="/etc/systemd/system/sandboxd.service"
 PLAN_USERS_CONF_CONTENT=""
 PLAN_BRIDGE_CONF_APPEND=""
@@ -219,7 +224,11 @@ docker-load-gateway
 migrate-legacy-state
 install-systemd-unit
 daemon-reload
+enable-start-daemon
 write-install-state"
+
+UI_PROVISION_PHASES="provision-lite
+provision-lima"
 
 # FIFO for phase commands from the consumer subshell to the main process
 # during run_priv_child.  Written by consumer (SET_PHASE N status), read
@@ -258,6 +267,9 @@ Options:
   --cosign-bundle <path>    Use a local sigstore bundle (requires --from).
   --source-url <url>        Override base URL for tarball download.
   --yes                     Skip the privileged-changes confirmation prompt.
+  --no-provision            Skip eager backend-image provisioning after install.
+                            Also relaxes the Lima/KVM prerequisites to warnings
+                            (useful in CI or environments without /dev/kvm).
   --verbose                 Echo every command before invocation.
   --quiet                   Suppress non-error output.
   --no-color                Force plain text output.
@@ -386,6 +398,10 @@ parse_args() {
                 YES=1
                 shift
                 ;;
+            --no-provision)
+                NO_PROVISION=1
+                shift
+                ;;
             --verbose)
                 VERBOSE=1
                 shift
@@ -464,6 +480,94 @@ detect_tty() {
 # ----------------------------------------------------------------------------
 # Step 5 — Pre-existing install detection.
 # ----------------------------------------------------------------------------
+
+# install_health_check — read-only triage of an already-installed sandboxd.
+#
+# Sets the global _unhealthy to a comma-separated list of reason tokens for
+# any failed checks (e.g. "route-caps,daemon-inactive").  Returns 0 if all
+# checks pass, 1 if any check fails.  Never calls die(); every probe
+# degrades to "unhealthy" rather than aborting.
+#
+# Must be called only after existing_ver is known (H5 uses it).  Relies on
+# PLAN_ROUTE_HELPER_PATH and PLAN_LIMA_HELPER_PATH (module-level constants).
+install_health_check() {
+    _unhealthy=""
+
+    # H1 — All install-path binaries are present and executable.
+    _hc_ok=1
+    for _hc_bin in \
+        "$PLAN_DAEMON_PATH" \
+        "$PLAN_CLI_PATH" \
+        "$PLAN_ROUTE_HELPER_PATH" \
+        "$PLAN_LIMA_HELPER_PATH" \
+        "$PLAN_GUEST_PATH"; do
+        if [ ! -x "$_hc_bin" ]; then
+            _hc_ok=0
+            break
+        fi
+    done
+    if [ "$_hc_ok" -eq 0 ]; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}missing-binaries"
+    fi
+
+    # H2 + H3 — Capability checks require the binaries to be present (H1 must
+    # pass) and getcap to be available.  A missing getcap is its own reason so
+    # the operator knows what to install.
+    if [ "$_hc_ok" -eq 1 ]; then
+        if command -v getcap >/dev/null 2>&1; then
+            # H2 — Route-helper has the required capabilities.
+            _hc_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | awk '{print $NF}')
+            if [ "$_hc_route_caps" != "$PLAN_ROUTE_CAPS_STR" ]; then
+                _unhealthy="${_unhealthy:+$_unhealthy,}route-caps"
+            fi
+
+            # H3 — Lima-helper has the required capabilities.
+            # getcap emits cap_setuid+ep; normalise '+' → '=' for comparison.
+            _hc_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
+            if [ "$_hc_lima_caps" != "cap_setuid=ep" ]; then
+                _unhealthy="${_unhealthy:+$_unhealthy,}lima-caps"
+            fi
+        else
+            _unhealthy="${_unhealthy:+$_unhealthy,}getcap-missing"
+        fi
+    fi
+
+    # H4 — users.conf schema version is at the daemon-minimum supported value.
+    # Daemon-min is DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA = 1
+    # (sandbox-core/src/users_conf.rs:202). A missing _schema_version reads
+    # as 0, which is below min and triggers unhealthy.
+    _hc_schema_min=1
+    _hc_schema_ver=""
+    if [ -r "$PLAN_USERS_CONF_PATH" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            _hc_schema_ver=$(jq -r '._schema_version // 0' "$PLAN_USERS_CONF_PATH" 2>/dev/null || true)
+        else
+            _hc_schema_ver=$(sed -n 's/.*"_schema_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+                "$PLAN_USERS_CONF_PATH" 2>/dev/null | head -n 1)
+        fi
+    fi
+    _hc_schema_ver="${_hc_schema_ver:-0}"
+    # Reject non-numeric values (e.g. jq returning "null") by treating them as 0.
+    case "$_hc_schema_ver" in
+        ''|*[!0-9]*) _hc_schema_ver=0 ;;
+    esac
+    if [ "$_hc_schema_ver" -lt "$_hc_schema_min" ]; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}users-conf-schema"
+    fi
+
+    # H5 — Gateway image for the installed version is present in Docker.
+    if ! docker image inspect "sandbox-gateway:${existing_ver}" >/dev/null 2>&1; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}gateway-image"
+    fi
+
+    # H6 — sandboxd daemon is active (not failed or inactive).
+    _hc_daemon_state=$(systemctl is-active sandboxd 2>/dev/null || true)
+    if [ "$_hc_daemon_state" != "active" ]; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}daemon-inactive"
+    fi
+
+    [ -z "$_unhealthy" ]
+}
 
 resolve_target_version() {
     if [ -n "$FROM" ] && [ "$EXPLICIT_VERSION" -eq 0 ]; then
@@ -562,13 +666,24 @@ detect_preexisting() {
                     ;;
                 *)
                     # status=complete (or absent / unknown) — already installed.
-                    log_ok "step=preexist version=$existing_ver action=skip"
-                    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
-                        printf '%b\n' "${GREEN}+${RESET} sandboxd $existing_ver is already installed" > "$SUMMARY_FILE"
+                    # Run a health check before deciding to skip or repair.
+                    if install_health_check; then
+                        log_ok "step=preexist version=$existing_ver action=skip health=ok"
+                        if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+                            printf '%b\n' "${GREEN}+${RESET} sandboxd $existing_ver is already installed" > "$SUMMARY_FILE"
+                        else
+                            emit "${GREEN}+${RESET} sandboxd $existing_ver is already installed"
+                        fi
+                        maybe_emit_group_activation_hint
+                        exit 0
                     else
-                        emit "${GREEN}+${RESET} sandboxd $existing_ver is already installed"
+                        log_warn "step=preexist version=$existing_ver action=repair health=unhealthy reasons=$_unhealthy"
+                        if [ "$RICH_UI" -eq 1 ]; then
+                            set_phase 1 "active" "repairing $existing_ver (unhealthy: $_unhealthy)"
+                        else
+                            emit "${YELLOW}!${RESET} sandboxd $existing_ver is installed but unhealthy ($_unhealthy); repairing."
+                        fi
                     fi
-                    exit 0
                     ;;
             esac
         else
@@ -615,25 +730,32 @@ check_prereqs() {
 
     missing=""
     add_missing() { missing="$missing $1"; }
+    # Warnings emitted when --no-provision relaxes a prereq from hard to advisory.
+    prov_warn=""
+    add_prov_warn() { prov_warn="$prov_warn $1"; }
 
     check_kernel_version || add_missing "kernel-5.8+"
 
     if command -v docker >/dev/null 2>&1; then
         if ! docker info >/dev/null 2>&1; then
-            # docker installed but daemon unreachable from this user;
-            # not fatal at this step (operator-group-add fixes it),
-            # but call it out. In rich mode the managed checklist screen
-            # owns stdout, so suppress the plain-text warning there.
-            if [ "$RICH_UI" -ne 1 ]; then
-                emit "${YELLOW}!${RESET} docker is installed but not reachable from this user."
-            fi
+            # docker installed but daemon unreachable — always a hard failure
+            # (both provisioning paths require a reachable Docker daemon).
+            add_missing "docker-unreachable"
         fi
     else
         add_missing "docker"
     fi
 
-    command -v limactl  >/dev/null 2>&1 || add_missing "lima"
-    command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_missing "qemu-system-$qemu_arch"
+    # Lima / KVM: hard-fail when provisioning is on (default); warn-only with --no-provision.
+    if [ "$NO_PROVISION" -eq 1 ]; then
+        command -v limactl >/dev/null 2>&1 || add_prov_warn "lima"
+        command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_prov_warn "qemu-system-$qemu_arch"
+        [ -e /dev/kvm ] || add_prov_warn "/dev/kvm"
+    else
+        command -v limactl >/dev/null 2>&1 || add_missing "lima"
+        command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_missing "qemu-system-$qemu_arch"
+        [ -e /dev/kvm ] || add_missing "/dev/kvm"
+    fi
     # We deliberately do NOT check for UEFI firmware (OVMF/AAVMF). It sits two
     # layers below us — sandboxd drives `limactl`, Lima drives QEMU, and QEMU
     # discovers its own firmware (via /usr/share/qemu/firmware/*.json and its
@@ -665,7 +787,12 @@ check_prereqs() {
                         emit "    - $m:    $mgr install $pkg"
                     fi
                 else
-                    emit "    - $m"
+                    hint=$(pkg_hint_for "$m")
+                    if [ -n "$hint" ]; then
+                        emit "    - $m:    $hint"
+                    else
+                        emit "    - $m"
+                    fi
                 fi
             done
             emit "  Install these, then re-run install.sh."
@@ -678,7 +805,15 @@ check_prereqs() {
         log_fail "step=prereq missing=$(printf '%s' "$missing" | tr ' ' ',')"
         exit 1
     fi
-    log_ok "step=prereq missing=none"
+    if [ -n "$prov_warn" ]; then
+        # --no-provision was set; Lima/KVM prereqs degrade to advisories.
+        for w in $prov_warn; do
+            emit "${YELLOW}!${RESET} $w not found — Lima backend will not be available until installed (--no-provision set)"
+        done
+        log_ok "step=prereq missing=none prov_warn=$(printf '%s' "$prov_warn" | tr ' ' ',')"
+    else
+        log_ok "step=prereq missing=none"
+    fi
 }
 
 # Detect the host's package manager from /etc/os-release's ID/ID_LIKE.
@@ -709,6 +844,7 @@ pkg_name_for() {
     case "$prereq" in
         docker)
             case "$mgr" in apt) echo docker.io ;; *) echo docker ;; esac ;;
+        docker-unreachable) return 1 ;;
         lima)
             echo lima ;;
         qemu-system-x86_64)
@@ -736,6 +872,7 @@ pkg_name_for() {
         jq|curl|tar) echo "$prereq" ;;
         sha256sum)   echo coreutils ;;
         kernel-5.8+) return 1 ;;
+        /dev/kvm)    return 1 ;;
         *)           echo "$prereq" ;;
     esac
 }
@@ -746,8 +883,10 @@ pkg_name_for() {
 # path.
 pkg_hint_for() {
     case "$1" in
-        docker) echo "# or follow https://docs.docker.com/engine/install/" ;;
-        lima)   echo "# or download from https://github.com/lima-vm/lima/releases" ;;
+        docker)             echo "# or follow https://docs.docker.com/engine/install/" ;;
+        docker-unreachable) echo "# daemon unreachable — add user to docker group: sudo usermod -aG docker \$USER" ;;
+        lima)               echo "# or download from https://github.com/lima-vm/lima/releases" ;;
+        /dev/kvm)           echo "# enable KVM: sudo modprobe kvm && sudo usermod -aG kvm \$USER" ;;
         *)      ;;
     esac
 }
@@ -1558,7 +1697,7 @@ fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
-_TOTAL_STEPS=13
+_TOTAL_STEPS=14
 # Tracks the label of the last successfully completed step (set by _step_ok).
 # Used by _write_checkpoint to populate last_completed_step correctly on
 # failure checkpoints (the failing step should appear in failed_step, not
@@ -2139,6 +2278,36 @@ _step_ok
 _write_checkpoint "daemon-reload"
 _priv_maybe_fail_after "daemon-reload"
 
+# ----- Step: enable and start sandboxd, wait for readiness -----
+_step_begin "enable-start-daemon"
+_priv_maybe_abort_at "enable-start-daemon"
+# Clear any crash-loop lockout from a prior failed install before (re)starting.
+systemctl reset-failed sandboxd >> "\$_LOG" 2>&1 || true
+if systemctl enable --now sandboxd >> "\$_LOG" 2>&1; then
+    _log "step=enable_start_daemon action=enable-now status=ok"
+else
+    _log "step=enable_start_daemon action=enable-now status=fail"
+    _step_fail
+fi
+# Readiness wait: poll up to ~30 iterations (~30s) for the socket + active state.
+_ready=0
+_i=0
+while [ "\$_i" -lt 30 ]; do
+    if systemctl is-active --quiet sandboxd && [ -S /run/sandbox/sandboxd.sock ]; then
+        _ready=1; break
+    fi
+    _i=\$((\$_i + 1))
+    sleep 1
+done
+if [ "\$_ready" -ne 1 ]; then
+    _log "step=enable_start_daemon action=readiness-wait status=fail"
+    _step_fail
+fi
+_log "step=enable_start_daemon action=ready status=ok"
+_step_ok
+_write_checkpoint "enable-start-daemon"
+_priv_maybe_fail_after "enable-start-daemon"
+
 # ----- Step: write install-state (final, status=complete) -----
 _step_begin "write-install-state"
 _priv_maybe_abort_at "write-install-state"
@@ -2508,26 +2677,145 @@ _print_failure_report() {
 }
 
 # ----------------------------------------------------------------------------
+# Step 16 — Eager backend-image provisioning (parent, group-activated).
+# ----------------------------------------------------------------------------
+
+# Production no-op stub — shadowed by the real definition inside BEGIN_TEST_ENV
+# when scripts are staged with --keep-test-env (harness / repair e2e).
+# shellcheck disable=SC2317,SC2329  # intentional no-op; shadowed by BEGIN_TEST_ENV definition
+_prov_maybe_force_fail() { :; }
+
+# BEGIN_TEST_ENV — stripped from published install.sh at docs-deploy time
+# Provides a deterministic failure-injection hook for provisioning tests.
+# Set SANDBOX_INSTALL_PROVISION_FORCE_FAIL=<backend> to force rebuild-image
+# to appear to fail for that backend (e.g. "container" or "lima").
+_prov_maybe_force_fail() {
+    _pmmf_backend="$1"
+    _pmmf_target="${SANDBOX_INSTALL_PROVISION_FORCE_FAIL:-}"
+    if [ -n "$_pmmf_target" ] && [ "$_pmmf_target" = "$_pmmf_backend" ]; then
+        return 1
+    fi
+    return 0
+}
+# END_TEST_ENV
+
+# run_provision — build both backend images (container then lima) as the operator,
+# with the sandbox group active. Runs in the parent after run_priv_child succeeds.
+# Non-fatal: a rebuild-image failure marks the phase failed and emits retry guidance,
+# but the overall install exits 0 (the daemon is up and provisioning is re-runnable).
+run_provision() {
+    if [ "$NO_PROVISION" -eq 1 ]; then
+        emit "${BLUE}...${RESET} provisioning skipped (--no-provision); run ${BLUE}sandbox rebuild-image${RESET} when ready"
+        log_ok "step=provision action=skip reason=no-provision"
+        return 0
+    fi
+
+    if [ -z "$OPERATOR_NAME" ]; then
+        emit "${YELLOW}!${RESET} no operator resolved; provisioning skipped — run ${BLUE}sandbox rebuild-image${RESET} as your operator user"
+        log_ok "step=provision action=skip reason=no-operator"
+        return 0
+    fi
+
+    if [ "$RICH_UI" -eq 1 ]; then
+        ui_init_phases "$UI_PROVISION_PHASES"
+        UI_CURRENT_HEADER="sandboxd $VERSION · provisioning"
+        ui_render_checklist
+    fi
+
+    log_ok "step=provision action=start operator=$OPERATOR_NAME"
+
+    _prov_failed_backends=""
+
+    for _prov_backend in container lima; do
+        case "$_prov_backend" in
+            container) _prov_phase=1 ;;
+            lima)      _prov_phase=2 ;;
+        esac
+
+        if [ "$_prov_backend" = "container" ]; then
+            set_phase "$_prov_phase" "active" "building $_prov_backend image (a few minutes)"
+        else
+            set_phase "$_prov_phase" "active" "building $_prov_backend image"
+        fi
+        if [ "$RICH_UI" -eq 1 ]; then
+            ui_animator_start
+        else
+            emit "${BLUE}...${RESET} building $_prov_backend image"
+        fi
+
+        _prov_ok=0
+        if _prov_maybe_force_fail "$_prov_backend"; then
+            if [ "$(id -u)" -eq 0 ]; then
+                # shellcheck disable=SC2024  # redirect is intentionally to parent's INSTALL_LOG
+                if sudo -u "$OPERATOR_NAME" sg sandbox -c \
+                    "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock /usr/local/bin/sandbox rebuild-image --backend $_prov_backend -y" \
+                    >> "$INSTALL_LOG" 2>&1; then
+                    _prov_ok=1
+                fi
+            else
+                if sg sandbox -c \
+                    "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock /usr/local/bin/sandbox rebuild-image --backend $_prov_backend -y" \
+                    >> "$INSTALL_LOG" 2>&1; then
+                    _prov_ok=1
+                fi
+            fi
+        fi
+
+        if [ "$RICH_UI" -eq 1 ]; then
+            ui_animator_stop
+        fi
+
+        if [ "$_prov_ok" -eq 1 ]; then
+            set_phase "$_prov_phase" "done"
+            emit "${GREEN}+${RESET} $_prov_backend image built"
+            log_ok "step=provision action=rebuild-image backend=$_prov_backend status=ok"
+        else
+            set_phase "$_prov_phase" "failed"
+            _prov_failed_backends="$_prov_failed_backends $_prov_backend"
+            emit "${YELLOW}!${RESET} Backend image provisioning incomplete: $_prov_backend"
+            emit "  The daemon is installed and running; this only affects first-session latency."
+            emit "  Retry: ${BLUE}sandbox rebuild-image --backend $_prov_backend${RESET}"
+            emit "  Provisioning log: $INSTALL_LOG"
+            log_warn "step=provision action=rebuild-image backend=$_prov_backend status=fail"
+        fi
+    done
+
+    if [ -n "$_prov_failed_backends" ]; then
+        log_warn "step=provision action=complete status=partial failed=$_prov_failed_backends"
+    else
+        log_ok "step=provision action=complete status=ok"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # Step 17 — Print next-steps.
 # ----------------------------------------------------------------------------
 
-print_next_steps() {
-    # Determine whether operator was added (read from install-state.json).
-    _ops_added=""
-    if [ -r "$STATE_PATH" ]; then
-        _ops_added=$(jq -r '.operators_added_to_group // [] | join(" ")' \
-            "$STATE_PATH" 2>/dev/null || true)
+# maybe_emit_group_activation_hint — emit the newgrp hint iff the operator is
+# a member of the sandbox group but the group is not active in this session.
+# Silent when: no operator is known, the sandbox group does not exist yet, the
+# operator is already in the group database but also has it active, or the
+# operator is not in the group at all.
+maybe_emit_group_activation_hint() {
+    [ -n "$OPERATOR_NAME" ] || return 0
+    getent group sandbox >/dev/null 2>&1 || return 0
+    # Member of the group? (group database; also covers primary group.)
+    if id -nG "$OPERATOR_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
+        # Active in THIS session? id -nG of the live process reflects the
+        # session's supplementary groups.
+        if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
+            emit "  Activate group membership: ${BLUE}log out and back in,${RESET} or ${BLUE}run: newgrp sandbox${RESET}"
+        fi
     fi
+}
 
+print_next_steps() {
     emit ""
     emit "${GREEN}+${RESET} sandboxd $VERSION installed."
     emit ""
     emit "Next:"
-    if [ -n "$_ops_added" ]; then
-        emit "  1. Activate group membership: ${BLUE}log out and back in,${RESET} or ${BLUE}run: newgrp sandbox${RESET}"
-    fi
-    emit "  2. Start the daemon:           ${BLUE}sudo systemctl enable --now sandboxd${RESET}"
-    emit "  3. Verify the install:         ${BLUE}sandbox doctor${RESET}"
+    maybe_emit_group_activation_hint
+    emit "  - Verify the install:         ${BLUE}sandbox doctor${RESET}"
     emit ""
     emit "Install state recorded at: $STATE_PATH"
     emit "Install log:               $INSTALL_LOG"
@@ -2560,6 +2848,11 @@ main() {
         UI_CURRENT_HEADER="sandboxd · acquiring"
         ui_render_checklist
     fi
+
+    # Detect operator identity before detect_preexisting so that
+    # maybe_emit_group_activation_hint has OPERATOR_NAME available on the
+    # healthy-skip path.
+    detect_operator
 
     set_phase 1 "active" "resolving version"
     resolve_target_version
@@ -2602,9 +2895,6 @@ main() {
         ui_animator_stop
     fi
 
-    # Detect operator identity (unprivileged parent).
-    detect_operator
-
     # Planning pass: compute the minimal action list.
     compute_plan
 
@@ -2621,6 +2911,11 @@ main() {
 
     # Execute the single privileged child.
     run_priv_child
+
+    # Build backend images as the operator (group-activated). Non-fatal: exits 0
+    # even if rebuild-image fails (daemon install succeeded; provisioning is
+    # independently re-runnable via sandbox rebuild-image).
+    run_provision
 
     # Capture the durable summary so it persists in scrollback after rmcup.
     # The EXIT trap (cleanup_tmpdir) will restore the primary screen and then
