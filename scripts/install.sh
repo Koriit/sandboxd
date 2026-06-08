@@ -180,10 +180,14 @@ PLAN_UNIT=""                  # install | skip-identical
 PLAN_LEGACY_MIGRATE=""        # migrate | skip
 
 # Resolved in compute_plan so render_plan can display full paths/strings.
+PLAN_DAEMON_PATH="/usr/local/libexec/sandboxd/sandboxd"
+PLAN_CLI_PATH="/usr/local/bin/sandbox"
+PLAN_GUEST_PATH="/usr/local/libexec/sandboxd/sandbox-guest"
 PLAN_ROUTE_HELPER_PATH="/usr/local/libexec/sandboxd/sandbox-route-helper"
 PLAN_LIMA_HELPER_PATH="/usr/local/libexec/sandboxd/sandbox-lima-helper"
 PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
 PLAN_LIMA_CAPS_STR="cap_setuid+ep"
+PLAN_USERS_CONF_PATH="/etc/sandboxd/users.conf"
 PLAN_UNIT_DST="/etc/systemd/system/sandboxd.service"
 PLAN_USERS_CONF_CONTENT=""
 PLAN_BRIDGE_CONF_APPEND=""
@@ -465,6 +469,81 @@ detect_tty() {
 # Step 5 — Pre-existing install detection.
 # ----------------------------------------------------------------------------
 
+# install_health_check — read-only triage of an already-installed sandboxd.
+#
+# Sets the global _unhealthy to a comma-separated list of reason tokens for
+# any failed checks (e.g. "route-caps,daemon-inactive").  Returns 0 if all
+# checks pass, 1 if any check fails.  Never calls die(); every probe
+# degrades to "unhealthy" rather than aborting.
+#
+# Must be called only after existing_ver is known (H5 uses it).  Relies on
+# PLAN_ROUTE_HELPER_PATH and PLAN_LIMA_HELPER_PATH (module-level constants).
+install_health_check() {
+    _unhealthy=""
+
+    # H1 — All install-path binaries are present and executable.
+    _hc_ok=1
+    for _hc_bin in \
+        "$PLAN_DAEMON_PATH" \
+        "$PLAN_CLI_PATH" \
+        "$PLAN_ROUTE_HELPER_PATH" \
+        "$PLAN_LIMA_HELPER_PATH" \
+        "$PLAN_GUEST_PATH"; do
+        if [ ! -x "$_hc_bin" ]; then
+            _hc_ok=0
+            break
+        fi
+    done
+    if [ "$_hc_ok" -eq 0 ]; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}missing-binaries"
+    fi
+
+    # H2 — Route-helper has the required capabilities.
+    _hc_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | awk '{print $NF}')
+    if [ "$_hc_route_caps" != "$PLAN_ROUTE_CAPS_STR" ]; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}route-caps"
+    fi
+
+    # H3 — Lima-helper has the required capabilities.
+    # getcap emits cap_setuid+ep; normalise '+' → '=' for comparison.
+    _hc_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
+    if [ "$_hc_lima_caps" != "cap_setuid=ep" ]; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}lima-caps"
+    fi
+
+    # H4 — users.conf schema version is at the daemon-minimum supported value.
+    # Daemon-min is DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA = 1
+    # (sandbox-core/src/users_conf.rs:202). A missing _schema_version reads
+    # as 0, which is below min and triggers unhealthy.
+    _hc_schema_min=1
+    _hc_schema_ver=""
+    if [ -r "$PLAN_USERS_CONF_PATH" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            _hc_schema_ver=$(jq -r '._schema_version // 0' "$PLAN_USERS_CONF_PATH" 2>/dev/null || true)
+        else
+            _hc_schema_ver=$(sed -n 's/.*"_schema_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+                "$PLAN_USERS_CONF_PATH" 2>/dev/null | head -n 1)
+        fi
+    fi
+    _hc_schema_ver="${_hc_schema_ver:-0}"
+    if [ "$_hc_schema_ver" -lt "$_hc_schema_min" ] 2>/dev/null; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}users-conf-schema"
+    fi
+
+    # H5 — Gateway image for the installed version is present in Docker.
+    if ! docker image inspect "sandbox-gateway:${existing_ver}" >/dev/null 2>&1; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}gateway-image"
+    fi
+
+    # H6 — sandboxd daemon is active (not failed or inactive).
+    _hc_daemon_state=$(systemctl is-active sandboxd 2>/dev/null || true)
+    if [ "$_hc_daemon_state" != "active" ]; then
+        _unhealthy="${_unhealthy:+$_unhealthy,}daemon-inactive"
+    fi
+
+    [ -z "$_unhealthy" ]
+}
+
 resolve_target_version() {
     if [ -n "$FROM" ] && [ "$EXPLICIT_VERSION" -eq 0 ]; then
         # `--from` with no `--version`: the tarball is the canonical source.
@@ -562,13 +641,25 @@ detect_preexisting() {
                     ;;
                 *)
                     # status=complete (or absent / unknown) — already installed.
-                    log_ok "step=preexist version=$existing_ver action=skip"
-                    if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
-                        printf '%b\n' "${GREEN}+${RESET} sandboxd $existing_ver is already installed" > "$SUMMARY_FILE"
+                    # Run a health check before deciding to skip or repair.
+                    if install_health_check; then
+                        log_ok "step=preexist version=$existing_ver action=skip health=ok"
+                        if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+                            printf '%b\n' "${GREEN}+${RESET} sandboxd $existing_ver is already installed" > "$SUMMARY_FILE"
+                        else
+                            emit "${GREEN}+${RESET} sandboxd $existing_ver is already installed"
+                        fi
+                        maybe_emit_group_activation_hint
+                        exit 0
                     else
-                        emit "${GREEN}+${RESET} sandboxd $existing_ver is already installed"
+                        log_warn "step=preexist version=$existing_ver action=repair health=unhealthy reasons=$_unhealthy"
+                        if [ "$RICH_UI" -eq 1 ]; then
+                            set_phase 1 "active" "repairing $existing_ver (unhealthy: $_unhealthy)"
+                        else
+                            emit "${YELLOW}!${RESET} sandboxd $existing_ver is installed but unhealthy ($_unhealthy); repairing."
+                        fi
+                        # fall through (return) into the normal install flow.
                     fi
-                    exit 0
                     ;;
             esac
         else
@@ -2511,21 +2602,30 @@ _print_failure_report() {
 # Step 17 — Print next-steps.
 # ----------------------------------------------------------------------------
 
-print_next_steps() {
-    # Determine whether operator was added (read from install-state.json).
-    _ops_added=""
-    if [ -r "$STATE_PATH" ]; then
-        _ops_added=$(jq -r '.operators_added_to_group // [] | join(" ")' \
-            "$STATE_PATH" 2>/dev/null || true)
+# maybe_emit_group_activation_hint — emit the newgrp hint iff the operator is
+# a member of the sandbox group but the group is not active in this session.
+# Silent when: no operator is known, the sandbox group does not exist yet, the
+# operator is already in the group database but also has it active, or the
+# operator is not in the group at all.
+maybe_emit_group_activation_hint() {
+    [ -n "$OPERATOR_NAME" ] || return 0
+    getent group sandbox >/dev/null 2>&1 || return 0
+    # Member of the group? (group database; also covers primary group.)
+    if id -nG "$OPERATOR_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
+        # Active in THIS session? id -nG of the live process reflects the
+        # session's supplementary groups.
+        if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
+            emit "  Activate group membership: ${BLUE}log out and back in,${RESET} or ${BLUE}run: newgrp sandbox${RESET}"
+        fi
     fi
+}
 
+print_next_steps() {
     emit ""
     emit "${GREEN}+${RESET} sandboxd $VERSION installed."
     emit ""
     emit "Next:"
-    if [ -n "$_ops_added" ]; then
-        emit "  1. Activate group membership: ${BLUE}log out and back in,${RESET} or ${BLUE}run: newgrp sandbox${RESET}"
-    fi
+    maybe_emit_group_activation_hint
     emit "  2. Start the daemon:           ${BLUE}sudo systemctl enable --now sandboxd${RESET}"
     emit "  3. Verify the install:         ${BLUE}sandbox doctor${RESET}"
     emit ""
