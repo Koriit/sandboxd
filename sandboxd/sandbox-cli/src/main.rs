@@ -1547,6 +1547,22 @@ fn display_sessions_table(sessions: &[SessionDto]) {
     write_sessions_table(&mut handle, sessions);
 }
 
+fn display_sessions_quiet(sessions: &[SessionDto]) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_sessions_quiet(&mut handle, sessions);
+}
+
+/// Render the quiet (`-q`) session list to an arbitrary writer: one bare
+/// session ID per line, no header, no table glyphs. Suitable for shell
+/// pipelines (`sandbox ps -q | xargs sandbox stop`). Pulled out of the
+/// command handler so unit tests can capture the output into a buffer.
+fn write_sessions_quiet(out: &mut dyn std::io::Write, sessions: &[SessionDto]) {
+    for s in sessions {
+        let _ = writeln!(out, "{}", s.id);
+    }
+}
+
 /// Render the `sandbox list` (a.k.a. `ps` / `ls`) table to an arbitrary
 /// writer. Pulled out of [`display_sessions_table`] so unit tests can
 /// capture the output into a buffer; production wraps `stdout`.
@@ -1938,25 +1954,20 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             let sessions: Vec<SessionDto> =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             if *quiet {
-                // Quiet mode: one bare session ID per line, suitable for
-                // use in shell pipelines (e.g. `sandbox ps -q | xargs sandbox stop`).
-                for s in &sessions {
-                    println!("{}", s.id);
-                }
+                display_sessions_quiet(&sessions);
             } else {
                 display_sessions_table(&sessions);
-                // Opportunistic reconcile of `~/.ssh/sandbox/` against the
-                // authoritative session list we just rendered (Spec §
-                // Architecture → CLI: persistent ssh-config → Reconcile on
-                // listing). Only fires on the full-list listing — never on
-                // `inspect`/`describe` single-id queries — and is guarded
-                // by `--no-reconcile` for tooling consumers that need
-                // strict read-only semantics. The daemon-unreachable case
-                // is silently skipped because we never reach this arm
-                // without a successful list response.
-                if !*no_reconcile {
-                    reconcile_ssh_sandbox_dir_silent(&sessions);
-                }
+            }
+            // Opportunistic reconcile of `~/.ssh/sandbox/` against the
+            // authoritative session list returned by the daemon. Runs
+            // regardless of quiet mode so that `-q` pipelines do not
+            // silently leave stale ssh-config entries behind. Guarded
+            // by `--no-reconcile` for tooling consumers that need
+            // strict read-only semantics. The daemon-unreachable case
+            // is silently skipped because we never reach this point
+            // without a successful list response.
+            if !*no_reconcile {
+                reconcile_ssh_sandbox_dir_silent(&sessions);
             }
         }
         Command::Rm { .. } => {
@@ -8771,6 +8782,60 @@ mod tests {
         write_sessions_table(&mut buf, &[]);
         let rendered = String::from_utf8(buf).expect("UTF-8");
         assert_eq!(rendered, "No sessions found.\n");
+    }
+
+    // -- quiet (-q) output shape ---------------------------------------------------
+
+    /// `-q` output must be one bare session ID per line with no header,
+    /// no table glyphs, and no trailing whitespace beyond the newline.
+    /// Contract pin so the pipeline-friendly shape (`sandbox ps -q | xargs
+    /// sandbox stop`) cannot silently regress.
+    #[test]
+    fn write_sessions_quiet_emits_one_id_per_line_no_header() {
+        let a = make_session_dto("0123456789ab", Some("alpha"), None, chrono::Utc::now());
+        let b = make_session_dto("ba9876543210", Some("beta"), None, chrono::Utc::now());
+        let mut buf = Vec::new();
+        write_sessions_quiet(&mut buf, &[a.clone(), b.clone()]);
+        let rendered = String::from_utf8(buf).expect("quiet output is UTF-8");
+
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly 2 lines for 2 sessions, got:\n{rendered}"
+        );
+        assert_eq!(
+            lines[0],
+            a.id.as_str(),
+            "first line must be the first session ID verbatim"
+        );
+        assert_eq!(
+            lines[1],
+            b.id.as_str(),
+            "second line must be the second session ID verbatim"
+        );
+        // No header or table glyphs: lines must not contain column names or
+        // box-drawing characters.
+        for line in &lines {
+            assert!(
+                !line.contains("ID") && !line.contains("STATE") && !line.contains("NAME"),
+                "quiet line must not contain table headers, got: {line}"
+            );
+        }
+    }
+
+    /// `-q` output for an empty session list must be completely empty
+    /// (no placeholder, no blank line) — empty output is the correct
+    /// signal for a pipeline that finds nothing to act on.
+    #[test]
+    fn write_sessions_quiet_empty_emits_nothing() {
+        let mut buf = Vec::new();
+        write_sessions_quiet(&mut buf, &[]);
+        let rendered = String::from_utf8(buf).expect("quiet output is UTF-8");
+        assert_eq!(
+            rendered, "",
+            "quiet mode with no sessions must produce empty output"
+        );
     }
 
     // -- describe/inspect rendering of cpus / memory must surface the

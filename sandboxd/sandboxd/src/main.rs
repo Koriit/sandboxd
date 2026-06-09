@@ -7,7 +7,7 @@ use std::time::Duration;
 use axum::{
     Extension, Json, Router,
     body::Bytes,
-    extract::{ConnectInfo, Path, Request, State, connect_info::Connected},
+    extract::{ConnectInfo, Path, Query, Request, State, connect_info::Connected},
     http::StatusCode,
     middleware::{Next, from_fn},
     response::IntoResponse,
@@ -4112,10 +4112,22 @@ async fn start_session(
     (StatusCode::OK, Json(dto)).into_response()
 }
 
+/// Query parameters accepted by `DELETE /sessions/{id}` (stop).
+#[derive(Debug, serde::Deserialize, Default)]
+struct StopParams {
+    /// When true, bypass the workspace-lock conflict check and proceed
+    /// with best-effort teardown even if an operation holds the lock.
+    /// Individual teardown-step errors are tolerated; the handler
+    /// succeeds as long as the session ends up in the Stopped state.
+    #[serde(default)]
+    force: bool,
+}
+
 async fn stop_session(
     State(state): State<Arc<AppState>>,
     Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
+    Query(params): Query<StopParams>,
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
@@ -4155,8 +4167,10 @@ async fn stop_session(
     let lock_mutex = workspace_lock_for(&state, &session.id);
     let lock_state = lock_mutex.lock().await;
     let session_name_or_id = session.name.as_deref().unwrap_or(session.id.as_ref());
-    if let Err(e) = lifecycle_lock_check(&lock_state, session_name_or_id) {
-        return error_response(e).into_response();
+    if !params.force {
+        if let Err(e) = lifecycle_lock_check(&lock_state, session_name_or_id) {
+            return error_response(e).into_response();
+        }
     }
 
     info!(session_id = %session.id, "stopping session");
@@ -4222,6 +4236,12 @@ async fn stop_session(
         let op_uid = session.operator_uid.unwrap_or(operator.uid);
         match runtime.stop(&handle, op_uid).await {
             Ok(()) => {}
+            Err(e) if params.force => {
+                // Best-effort: log the VM stop failure but continue to the
+                // state transition so the session ends up Stopped rather
+                // than stuck in Running with the lock still held.
+                warn!(session_id = %session.id, error = %e, "force-stop: VM stop failed (best-effort, continuing)");
+            }
             Err(e) => {
                 state.sessions_stopping.lock().await.remove(&session.id);
                 let _ = state
@@ -6679,6 +6699,8 @@ async fn restore_session_networking_lite(
 fn format_gateway_status(gateway: &GatewayManager, session_id: &SessionId) -> String {
     match gateway.gateway_status(session_id) {
         Ok(GatewayStatus::Healthy) => "healthy".to_string(),
+        // Retained for forward-compatibility with wire data from future/mixed-version
+        // deployments; `gateway_status` no longer emits `Starting` as of this version.
         Ok(GatewayStatus::Starting) => "starting".to_string(),
         Ok(GatewayStatus::Unhealthy(reason)) => format!("unhealthy: {reason}"),
         Ok(GatewayStatus::NotRunning) => "not_running".to_string(),
@@ -6755,15 +6777,10 @@ async fn session_health(
                 "healthy".to_string(),
                 "healthy".to_string(),
             ),
+            // Retained for forward-compatibility; `gateway_status` no longer
+            // emits `Starting` as of this version.
             Ok(GatewayStatus::Starting) => (
                 "running".to_string(),
-                // healthcheck.sh passes in `Starting`, so the in-
-                // container processes (Envoy admin /ready, mitmproxy,
-                // CoreDNS /health, deny-logger /health) are reporting
-                // healthy. The gap that flips us to `Starting` is
-                // `total_listeners_active == 0` — this surfaces as
-                // the listener-aware verdict and the per-component
-                // probes can stay `healthy`.
                 "starting".to_string(),
                 "healthy".to_string(),
                 "healthy".to_string(),
@@ -7670,15 +7687,11 @@ async fn reconcile_networking(state: &AppState) {
                 };
 
                 match gw_status {
-                    GatewayStatus::Healthy | GatewayStatus::Starting => {
-                        // Gateway is healthy or in the boot window
-                        // (Starting = container OK but no active
-                        // listener yet — typical pre-policy-apply or
-                        // post-LDS-rejection). Either way, network
-                        // reconciliation has no work to do; restart
-                        // logic for `Starting` is intentionally a
-                        // no-op (see gateway_status rustdoc).
-                    }
+                    // `Starting` is retained for forward-compatibility; it is no
+                    // longer emitted by `gateway_status` as of this version, but
+                    // if received it is treated identically to `Healthy` — network
+                    // reconciliation has no work to do in either case.
+                    GatewayStatus::Healthy | GatewayStatus::Starting => {}
                     status => {
                         warn!(
                             session_id = %session.id,
@@ -8092,18 +8105,13 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 GatewayStatus::Healthy => {
                     // Fallback probe agreed it's healthy — nothing to do.
                 }
+                // Retained for forward-compatibility; `gateway_status` no longer
+                // emits `Starting` as of this version. If received, treat it as
+                // a no-op (same as `Healthy`) — no restart attempt.
                 GatewayStatus::Starting => {
-                    // Container processes are healthy but Envoy has no
-                    // active listener yet — boot window before first
-                    // policy apply, or post-rejection LDS state.
-                    // Restarting here would loop indefinitely (the
-                    // bootstrap deny-all listener is rejected by Envoy
-                    // by design); the right recovery is for upstream
-                    // code (policy distributor) to re-apply the policy.
                     debug!(
                         session_id = %session.id,
-                        "gateway monitor: gateway in Starting state \
-                         (no active listener yet), no restart"
+                        "gateway monitor: gateway in Starting state (forward-compat arm), no restart"
                     );
                 }
                 GatewayStatus::NotRunning | GatewayStatus::Unhealthy(_) => {
@@ -11394,6 +11402,22 @@ mod tests {
             calls, 3,
             "persistent absence must still hit the deny path after exactly `attempts` tries"
         );
+    }
+
+    /// `?force=true` parses to `StopParams { force: true }`.
+    #[test]
+    fn integration_stop_params_force_true_parses() {
+        let params: StopParams =
+            serde_json::from_str(r#"{"force":true}"#).expect("force=true must parse");
+        assert!(params.force, "force=true must deserialise as true");
+    }
+
+    /// No fields present (the common case) defaults to `force: false`.
+    #[test]
+    fn integration_stop_params_empty_defaults_to_no_force() {
+        let params: StopParams =
+            serde_json::from_str("{}").expect("empty object must parse via Default");
+        assert!(!params.force, "omitted force must default to false");
     }
 
     #[tokio::test]

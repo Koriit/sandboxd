@@ -1304,25 +1304,52 @@ pub async fn run(args: UpdateArgs) -> i32 {
     }
 
     // Dev-mode detect / refuse.
+    //
+    // In read-only mode the install-state directory is 0750 sandbox:sandbox
+    // and there are no warm sudo credentials, so `is_dev_mode`'s
+    // `sudo -n test -e` will fail and fall back to an unprivileged stat that
+    // also fails — producing a false `state_missing = true`. When in
+    // read-only mode, `state_missing` alone is therefore not evidence of a
+    // dev environment; only a missing systemd unit is conclusive. We skip the
+    // refusal and let the caller degrade to `InstallState::unknown_with_host_arch()`.
     let install_state_path = resolve_state_path(".install-state.json");
-    if let Some(reason) = is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), &install_state_path) {
-        log_step(
-            "dev_mode_check",
-            &format!(
-                "is_dev=1 unit_missing={} state_missing={} action=refuse status=fail",
-                reason.unit_missing, reason.state_missing
-            ),
-        );
-        eprintln!("{}", dev_mode_refusal_text(&reason));
-        if operator_needs_group_activation() {
-            eprintln!(
-                "hint: you are in the `sandbox` group but it is not active in this session.\n\
-                 Run `newgrp sandbox` and retry, or log out and back in."
+    let dev_mode_reason = is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), &install_state_path);
+    let skip_refusal = args.is_read_only()
+        && dev_mode_reason
+            .as_ref()
+            .map(|r| !r.unit_missing)
+            .unwrap_or(false);
+    if let Some(ref reason) = dev_mode_reason {
+        if skip_refusal {
+            log_step(
+                "dev_mode_check",
+                &format!(
+                    "is_dev=unknown unit_missing=false state_missing={} \
+                     action=degrade_read_only status=ok",
+                    reason.state_missing
+                ),
             );
+        } else {
+            log_step(
+                "dev_mode_check",
+                &format!(
+                    "is_dev=1 unit_missing={} state_missing={} action=refuse status=fail",
+                    reason.unit_missing, reason.state_missing
+                ),
+            );
+            eprintln!("{}", dev_mode_refusal_text(reason));
+            if operator_needs_group_activation() {
+                eprintln!(
+                    "hint: you are in the `sandbox` group but it is not active in this session.\n\
+                     Run `newgrp sandbox` and retry, or log out and back in."
+                );
+            }
+            return 2i32;
         }
-        return 2i32;
     }
-    log_step("dev_mode_check", "is_dev=0 action=continue status=ok");
+    if dev_mode_reason.is_none() {
+        log_step("dev_mode_check", "is_dev=0 action=continue status=ok");
+    }
     // Emit group-activation hint when the operator is listed in the
     // `sandbox` group DB entry but the group is absent from their live
     // session — fires on the success path as well as any early-exit paths
@@ -4569,6 +4596,61 @@ mod tests {
         assert!(
             !a.is_read_only(),
             "default args (no --check / --dry-run) must not be a read-only mode"
+        );
+    }
+
+    /// Read-only mode (`--check` / `--dry-run`) must not refuse when the
+    /// install-state file is unreadable but the systemd unit exists.
+    ///
+    /// The install-state directory is `0750 sandbox:sandbox`. Without warm
+    /// sudo credentials (deliberately not acquired in read-only mode), both
+    /// `sudo -n test -e` and the unprivileged `path.exists()` fallback may
+    /// return false — making `is_dev_mode` report `state_missing = true` even
+    /// on a genuine system install. Refusing in that case would break every
+    /// `--check`/`--dry-run` invocation by a non-root operator.
+    #[test]
+    fn read_only_does_not_refuse_when_state_unreadable_and_unit_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("sandboxd.service");
+        let state = tmp.path().join(".install-state.json");
+        // Unit present, state absent → simulates 0750-unreadable state dir.
+        std::fs::write(&unit, b"[Unit]\n").unwrap();
+        let dev_mode_reason = is_dev_mode(&unit, &state);
+        // Sanity: is_dev_mode must fire (state_missing=true, unit_missing=false).
+        let reason = dev_mode_reason
+            .as_ref()
+            .expect("is_dev_mode must return Some when state is absent");
+        assert!(
+            !reason.unit_missing,
+            "unit_missing must be false (unit exists)"
+        );
+        assert!(
+            reason.state_missing,
+            "state_missing must be true (state absent)"
+        );
+        // Core assertion: the skip_refusal logic must evaluate to true for
+        // a read-only UpdateArgs under this condition.
+        let mut args = base_args();
+        args.check = true;
+        let skip_refusal = args.is_read_only()
+            && dev_mode_reason
+                .as_ref()
+                .map(|r| !r.unit_missing)
+                .unwrap_or(false);
+        assert!(
+            skip_refusal,
+            "read-only mode must not refuse when only state_missing=true and unit present"
+        );
+        // Stateful mode must NOT skip.
+        let stateful = base_args();
+        let skip_stateful = stateful.is_read_only()
+            && dev_mode_reason
+                .as_ref()
+                .map(|r| !r.unit_missing)
+                .unwrap_or(false);
+        assert!(
+            !skip_stateful,
+            "stateful mode must still refuse when state is missing"
         );
     }
 }
