@@ -2353,18 +2353,25 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // stripped by the binary-overwrite in the install step above, so
     // setcap must always run after installation even if the binary was
     // already present and skipped. Sequenced here — before daemon start —
-    // because the daemon hard-refuses to start without cap_setuid+ep on
+    // because the daemon hard-refuses to start without cap_setuid=ep on
     // the lima-helper; running setcap after start_daemon would guarantee
     // a start failure and trigger recovery.
+    //
+    // The `=ep` form is used for both the `setcap` invocation and the
+    // `getcap` output match. `setcap` accepts both `+ep` and `=ep` as
+    // input (they are equivalent), but `getcap` (libcap ≥2.42) always
+    // emits the `=` form — using `+ep` as a substring match against
+    // `getcap` output would never match, causing a spurious "not set"
+    // failure. The route-helper constant uses `=eip` for the same reason.
     {
         let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let lima_caps = "cap_setuid+ep";
+        let lima_caps = "cap_setuid=ep";
         let cur_out = Command::new("getcap").arg(lima_helper).output();
         let current = cur_out
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let already_set = current.contains(lima_caps);
+        let already_set = getcap_output_has_cap(&current, lima_caps);
         if already_set {
             log_step(
                 "install_lima_helper",
@@ -2416,17 +2423,17 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     }
 
     // Verify lima-helper capabilities.
-    // Post-install check: getcap must confirm cap_setuid+ep is present so
+    // Post-install check: getcap must confirm cap_setuid=ep is present so
     // the next session create does not fail with permission-denied at the
     // uid-map step.
     {
         let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let required_cap = "cap_setuid+ep";
+        let required_cap = "cap_setuid=ep";
         let verify_out = Command::new("getcap").arg(lima_helper).output();
         match verify_out {
             Ok(o) => {
                 let caps = String::from_utf8_lossy(&o.stdout);
-                if caps.contains(required_cap) {
+                if getcap_output_has_cap(&caps, required_cap) {
                     log_step(
                         "setcap_lima_helper",
                         &format!("caps={required_cap} verify=pass status=ok"),
@@ -2437,8 +2444,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                         &format!("caps={required_cap} verify=fail getcap={}", caps.trim()),
                     );
                     eprintln!(
-                        "sandbox update: cap_setuid+ep not set on {lima_helper} after setcap — \
-                         manual recovery: sudo setcap cap_setuid+ep {lima_helper}"
+                        "sandbox update: cap_setuid=ep not set on {lima_helper} after setcap — \
+                         manual recovery: sudo setcap cap_setuid=ep {lima_helper}"
                     );
                     eprint!(
                         "{}",
@@ -3113,6 +3120,17 @@ fn render_systemd_unit(template: &str, base_dir: &str) -> Result<Vec<u8>, String
     Ok(rendered.into_bytes())
 }
 
+/// Return `true` if `getcap` stdout contains the capability string `cap`.
+///
+/// `getcap` (libcap ≥2.42, as shipped on Ubuntu 22.04+) emits the `=` form:
+/// e.g. `"/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n"`.
+/// The `setcap` *input* syntax accepts both `cap_setuid+ep` and `cap_setuid=ep`,
+/// but getcap output always uses `=`. Matching against `+ep` would never
+/// succeed — use the `=` form for both constants and this check.
+fn getcap_output_has_cap(getcap_stdout: &str, cap: &str) -> bool {
+    getcap_stdout.contains(cap)
+}
+
 /// Format the recovery block printed after any stateful-step failure.
 ///
 /// Two modes:
@@ -3171,7 +3189,7 @@ fn recovery_guidance_ex(
                  \n\
                  After restoring, re-enable capabilities:\n\
                  \x20 sudo setcap cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip {route_helper}\n\
-                 \x20 sudo setcap cap_setuid+ep {lima_helper}\n\
+                 \x20 sudo setcap cap_setuid=ep {lima_helper}\n\
                  \n\
                  To retry the upgrade after fixing the issue above:\n\
                  \x20 sudo sandbox update --yes\n",
@@ -4701,6 +4719,42 @@ mod tests {
         assert!(
             !skip_stateful,
             "stateful mode must still refuse when state is missing"
+        );
+    }
+
+    /// `getcap_output_has_cap` must match the `=` form that libcap ≥2.42 emits
+    /// and must not match an uncapped or unrelated output line.
+    ///
+    /// libcap ≥2.42 (Ubuntu 22.04+) always prints the `=` form:
+    ///   `/path/to/binary cap_setuid=ep`
+    /// The `setcap` input syntax accepts `+ep` but `getcap` never emits it.
+    /// Matching `+ep` against `getcap` output would always return false —
+    /// confirming that only the `=ep` form works as a substring match here.
+    #[test]
+    fn getcap_output_has_cap_matches_equals_form() {
+        let realistic_output = "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n";
+
+        // The `=ep` form must match.
+        assert!(
+            getcap_output_has_cap(realistic_output, "cap_setuid=ep"),
+            "must match the getcap `=ep` output form"
+        );
+        // The `+ep` setcap-input form must NOT match getcap output.
+        assert!(
+            !getcap_output_has_cap(realistic_output, "cap_setuid+ep"),
+            "must not match the setcap `+ep` input form against getcap output"
+        );
+        // Empty/uncapped output (file has no caps, getcap prints nothing).
+        assert!(
+            !getcap_output_has_cap("", "cap_setuid=ep"),
+            "must not match empty getcap output"
+        );
+        // Unrelated caps line must not match.
+        let route_output = "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                            cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n";
+        assert!(
+            !getcap_output_has_cap(route_output, "cap_setuid=ep"),
+            "must not match when only unrelated caps are present"
         );
     }
 }
