@@ -895,15 +895,19 @@ if getent passwd sandbox >/dev/null 2>&1; then
        && [ "\$_actual_uid" != "\$SANDBOX_UID" ]; then
         _uid_ok=0
     fi
-    if [ "\$_gecos" = "sandboxd - isolated environment broker" ] \
-       && [ "\$_uid_ok" -eq 1 ]; then
+    # Remove if we created the account, OR if both guards confirm it is the
+    # genuine sandboxd account (covers upgrade-lineage hosts where the flag is
+    # false but the GECOS + uid match unambiguously).
+    if [ "\$WE_CREATED_SANDBOX_USER" = "true" ] \
+       || { [ "\$_gecos" = "sandboxd - isolated environment broker" ] \
+            && [ "\$_uid_ok" -eq 1 ]; }; then
         if [ "\$WE_CREATED_SANDBOX_USER" != "true" ]; then
             _log "step=userdel note=we-did-not-create-it removing-anyway reason=purge"
         fi
         userdel sandbox >> "\$_LOG" 2>&1 || { _log "step=userdel action=fail"; _step_fail; }
         _log "step=userdel action=remove"
     else
-        _log "step=userdel action=skip reason=gecos-mismatch-or-uid-mismatch gecos=\${_gecos} uid_ok=\${_uid_ok}"
+        _log "step=userdel action=skip reason=alien-account gecos_len=\${#_gecos} uid_ok=\${_uid_ok}"
     fi
 else
     _log "step=userdel action=skip reason=absent"
@@ -926,8 +930,12 @@ if [ -n "\$_all_ops" ]; then
     printf '%s\n' "\$_all_ops" | while IFS= read -r _op; do
         [ -n "\$_op" ] || continue
         if getent group sandbox 2>/dev/null | cut -d: -f4 | tr ',' '\n' | grep -qx "\$_op"; then
-            gpasswd -d "\$_op" sandbox >> "\$_LOG" 2>/dev/null || true
-            _log "step=group_revoke operator=\$_op"
+            gpasswd -d "\$_op" sandbox >> "\$_LOG" 2>/dev/null && _gp_rc=0 || _gp_rc=\$?
+            if [ "\$_gp_rc" -eq 0 ]; then
+                _log "step=group_revoke operator=\$_op action=remove"
+            else
+                _log "step=group_revoke operator=\$_op action=fail rc=\$_gp_rc"
+            fi
         fi
     done
 fi
