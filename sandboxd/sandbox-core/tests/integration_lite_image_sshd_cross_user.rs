@@ -226,7 +226,7 @@ fn integration_lite_image_sshd_accepts_staged_key_under_cross_user_uid() {
     let _image_cleanup = LiteImageCleanup { tag: tag.clone() };
 
     // Step 1: build the lite image via the production code path.
-    ensure_image(&version).expect("ensure_image must succeed for cross-user proof");
+    ensure_image(&version, std::env::temp_dir().as_path()).expect("ensure_image must succeed for cross-user proof");
 
     // Step 2: generate a fresh ed25519 keypair. The session-id slot
     // here is purely cosmetic — the in-container sshd does not look

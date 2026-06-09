@@ -313,7 +313,9 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
     // do not block the tokio worker thread for the duration of the
     // image build.
     let v = version.clone();
-    tokio::task::spawn_blocking(move || ensure_image(&v).expect("ensure_image"))
+    let base_dir = TempDir::new().expect("tempdir for daemon base_dir");
+    let base_dir_path = base_dir.path().to_path_buf();
+    tokio::task::spawn_blocking(move || ensure_image(&v, &base_dir_path).expect("ensure_image"))
         .await
         .expect("ensure_image join");
 
@@ -323,7 +325,6 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
 
     // Step 3: stage credential files into a host tempdir the test
     // owns; container bind-mounts them readonly.
-    let base_dir = TempDir::new().expect("tempdir for daemon base_dir");
     let stage_dir = TempDir::new().expect("tempdir for ssh staging");
     stage_ssh_credentials(
         stage_dir.path(),
