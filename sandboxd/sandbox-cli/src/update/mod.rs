@@ -2834,10 +2834,32 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // membership, socket reachability — are actually caught. The new binary
     // is exec'd directly; `SANDBOX_SOCKET` is planted explicitly because the
     // operator may not have it set in the environment that `sudo` inherited.
-    let doctor = Command::new("/usr/local/bin/sandbox")
-        .args(["doctor", "--verbose"])
-        .env("SANDBOX_SOCKET", "/run/sandbox/sandboxd.sock")
-        .output();
+    //
+    // When running as root under `sudo sandbox update`, de-escalate to the
+    // invoking operator via `sudo -u <operator> env SANDBOX_SOCKET=...`.
+    // This makes doctor's C4 (sandbox-group membership) resolve against the
+    // operator's actual groups rather than root's — which is never in the
+    // sandbox group. Fall back to the direct invocation when no operator can
+    // be determined (e.g. genuine root login with no SUDO_USER), so a
+    // completed upgrade is never stranded by a missing env var.
+    let sock = "/run/sandbox/sandboxd.sock";
+    let doctor = match sudo_user_operator() {
+        Some(operator) => Command::new("sudo")
+            .args([
+                "-u",
+                &operator,
+                "env",
+                &format!("SANDBOX_SOCKET={sock}"),
+                "/usr/local/bin/sandbox",
+                "doctor",
+                "--verbose",
+            ])
+            .output(),
+        None => Command::new("/usr/local/bin/sandbox")
+            .args(["doctor", "--verbose"])
+            .env("SANDBOX_SOCKET", sock)
+            .output(),
+    };
     match doctor {
         Ok(o) if o.status.success() => {
             log_step("doctor", "result=pass status=ok");
@@ -3129,6 +3151,24 @@ fn render_systemd_unit(template: &str, base_dir: &str) -> Result<Vec<u8>, String
 /// succeed — use the `=` form for both constants and this check.
 fn getcap_output_has_cap(getcap_stdout: &str, cap: &str) -> bool {
     getcap_stdout.contains(cap)
+}
+
+/// Return the operator username when this process was invoked through `sudo`.
+///
+/// `sudo` sets `SUDO_USER` to the uid of the user who ran `sudo <cmd>`.
+/// When `sandbox update` is invoked as `sudo sandbox update`, `SUDO_USER`
+/// is the operator whose environment doctor needs to check — group membership,
+/// socket reachability — rather than root's.
+///
+/// Returns `None` when not running under sudo, when `SUDO_USER` is empty, or
+/// when the value is not a valid (non-empty, non-"root") username.
+fn sudo_user_operator() -> Option<String> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    // Treat empty or the literal string "root" as "no operator to de-escalate to".
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    Some(user)
 }
 
 /// Format the recovery block printed after any stateful-step failure.
@@ -4756,5 +4796,39 @@ mod tests {
             !getcap_output_has_cap(route_output, "cap_setuid=ep"),
             "must not match when only unrelated caps are present"
         );
+    }
+
+    // sudo_user_operator reads SUDO_USER from the environment.
+    // These tests manipulate the process environment, so they must not run
+    // concurrently with other env-reading tests. Nextest isolates each test
+    // in its own process, so per-test env mutation is safe here.
+
+    #[test]
+    fn sudo_user_operator_returns_sudo_user_when_set() {
+        // SAFETY: test-only; nextest runs each test in its own process.
+        unsafe { std::env::set_var("SUDO_USER", "alice") };
+        assert_eq!(sudo_user_operator(), Some("alice".to_string()));
+        unsafe { std::env::remove_var("SUDO_USER") };
+    }
+
+    #[test]
+    fn sudo_user_operator_returns_none_when_unset() {
+        unsafe { std::env::remove_var("SUDO_USER") };
+        assert_eq!(sudo_user_operator(), None);
+    }
+
+    #[test]
+    fn sudo_user_operator_returns_none_for_root_sudo_user() {
+        // "root" as SUDO_USER means genuinely running as root without de-escalation target.
+        unsafe { std::env::set_var("SUDO_USER", "root") };
+        assert_eq!(sudo_user_operator(), None);
+        unsafe { std::env::remove_var("SUDO_USER") };
+    }
+
+    #[test]
+    fn sudo_user_operator_returns_none_for_empty_sudo_user() {
+        unsafe { std::env::set_var("SUDO_USER", "") };
+        assert_eq!(sudo_user_operator(), None);
+        unsafe { std::env::remove_var("SUDO_USER") };
     }
 }
