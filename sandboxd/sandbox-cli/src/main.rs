@@ -171,15 +171,21 @@ enum Command {
         /// Session name or ID.
         session: String,
     },
-    /// Stop a sandbox session.
+    /// Stop one or more sandbox sessions.
     Stop {
-        /// Session name or ID.
-        session: String,
+        /// Session names or IDs to stop. At least one is required.
+        #[arg(required = true)]
+        sessions: Vec<String>,
+        /// Force-stop: pass ?force=true to the daemon (bypasses
+        /// workspace-lock conflicts if the daemon supports it).
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
-    /// Remove a sandbox session.
+    /// Remove one or more sandbox sessions.
     Rm {
-        /// Session name or ID.
-        session: String,
+        /// Session names or IDs to remove. At least one is required.
+        #[arg(required = true)]
+        sessions: Vec<String>,
     },
     /// List sandbox sessions.
     Ps {
@@ -198,6 +204,10 @@ enum Command {
         /// daemon-reachable case.
         #[arg(long = "no-reconcile")]
         no_reconcile: bool,
+        /// Quiet: print only session IDs, one per line, to stdout.
+        /// Useful for scripting (`sandbox ps -q | xargs sandbox stop`).
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
     /// List sandbox sessions (alias for ps).
     Ls {
@@ -207,6 +217,10 @@ enum Command {
         /// See `sandbox ps --help` for the full reconcile semantics.
         #[arg(long = "no-reconcile")]
         no_reconcile: bool,
+        /// Quiet: print only session IDs, one per line, to stdout.
+        /// Useful for scripting (`sandbox ls -q | xargs sandbox rm`).
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
     /// Copy files between host and sandbox VM.
     ///
@@ -1261,11 +1275,13 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .uri(format!("/sessions/{session}/start"))
             .body(String::new())
             .expect("failed to build request"),
-        Command::Stop { session } => Request::builder()
-            .method("POST")
-            .uri(format!("/sessions/{session}/stop"))
-            .body(String::new())
-            .expect("failed to build request"),
+        // `sandbox stop` is intercepted in `main()` (see `handle_stop`)
+        // before `build_request` is reached: it loops over the variadic
+        // session list, issues one POST per session, and accumulates
+        // per-id outcomes. The multi-session shape does not fit the
+        // single-request `build_request` / `send_request` pipeline, so
+        // this arm returns `None` defensively.
+        Command::Stop { .. } => return None,
         // `sandbox rm` is intercepted in `main()` (see `handle_rm`)
         // before `build_request` is reached: it does a name→id
         // resolve, then a `DELETE /sessions/{id}`, then the local
@@ -1911,21 +1927,36 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
     }
 
     match command {
-        Command::Ps { no_reconcile } | Command::Ls { no_reconcile } => {
+        Command::Ps {
+            no_reconcile,
+            quiet,
+        }
+        | Command::Ls {
+            no_reconcile,
+            quiet,
+        } => {
             let sessions: Vec<SessionDto> =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
-            display_sessions_table(&sessions);
-            // Opportunistic reconcile of `~/.ssh/sandbox/` against the
-            // authoritative session list we just rendered (Spec §
-            // Architecture → CLI: persistent ssh-config → Reconcile on
-            // listing). Only fires on the full-list listing — never on
-            // `inspect`/`describe` single-id queries — and is guarded
-            // by `--no-reconcile` for tooling consumers that need
-            // strict read-only semantics. The daemon-unreachable case
-            // is silently skipped because we never reach this arm
-            // without a successful list response.
-            if !*no_reconcile {
-                reconcile_ssh_sandbox_dir_silent(&sessions);
+            if *quiet {
+                // Quiet mode: one bare session ID per line, suitable for
+                // use in shell pipelines (e.g. `sandbox ps -q | xargs sandbox stop`).
+                for s in &sessions {
+                    println!("{}", s.id);
+                }
+            } else {
+                display_sessions_table(&sessions);
+                // Opportunistic reconcile of `~/.ssh/sandbox/` against the
+                // authoritative session list we just rendered (Spec §
+                // Architecture → CLI: persistent ssh-config → Reconcile on
+                // listing). Only fires on the full-list listing — never on
+                // `inspect`/`describe` single-id queries — and is guarded
+                // by `--no-reconcile` for tooling consumers that need
+                // strict read-only semantics. The daemon-unreachable case
+                // is silently skipped because we never reach this arm
+                // without a successful list response.
+                if !*no_reconcile {
+                    reconcile_ssh_sandbox_dir_silent(&sessions);
+                }
             }
         }
         Command::Rm { .. } => {
@@ -1935,6 +1966,13 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             // reaches the generic response handler. Reaching this
             // arm is a dispatch bug.
             unreachable!("`sandbox rm` is handled client-side in main() before send_request");
+        }
+        Command::Stop { .. } => {
+            // `sandbox stop` is intercepted in `main()` (see
+            // `handle_stop`); the multi-session loop shape never
+            // reaches the generic response handler. Reaching this
+            // arm is a dispatch bug.
+            unreachable!("`sandbox stop` is handled client-side in main() before send_request");
         }
         Command::Create { .. } => {
             let session: SessionDto =
@@ -1946,12 +1984,6 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             let session: SessionDto =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             println!("Session started:");
-            display_session(&session);
-        }
-        Command::Stop { .. } => {
-            let session: SessionDto =
-                serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
-            println!("Session stopped:");
             display_session(&session);
         }
         Command::Exec { .. } => {
@@ -3119,22 +3151,60 @@ fn fail_drift_recovery(err: sandbox_cli::ssh_commands::DriftRecoveryError) -> ! 
     process::exit(1)
 }
 
-/// Handle `sandbox rm <session>` end-to-end so the local cleanup hook
-/// runs only after the daemon-side delete returns OK (Spec §
-/// Architecture → CLI: persistent ssh-config → Per-session entry
-/// removal). On error, prints to stderr and exits with code 1; on
-/// success, prints "Session removed." and exits 0.
-async fn handle_rm(socket_path: &str, session: &str) {
-    match handle_rm_inner(socket_path, session, None).await {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("{e}");
-            process::exit(1);
+/// Handle `sandbox stop [--force] <sessions...>` end-to-end.
+///
+/// For each session name or id in `sessions`, issues one `POST
+/// /sessions/{session}/stop` (appending `?force=true` when `force` is
+/// set). Outcomes are printed per-id as they arrive. Exits 0 only if
+/// every stop succeeded; exits 1 on the first failure that is
+/// accumulated — every session is attempted even when earlier ones fail
+/// so a multi-id invocation does not short-circuit mid-list.
+async fn handle_stop(socket_path: &str, sessions: &[String], force: bool) {
+    let mut any_failed = false;
+    for session in sessions {
+        let uri = if force {
+            format!("/sessions/{session}/stop?force=true")
+        } else {
+            format!("/sessions/{session}/stop")
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .body(String::new())
+            .expect("failed to build stop request");
+        match send_request(socket_path, req).await {
+            Err(e) => {
+                eprintln!("Error stopping `{session}`: {e}");
+                any_failed = true;
+            }
+            Ok((status, body)) => {
+                if status.is_success() {
+                    // Parse the returned SessionDto for the confirmation
+                    // line, but don't fail if the body is unexpected — the
+                    // stop already succeeded daemon-side.
+                    if let Ok(dto) = serde_json::from_str::<SessionDto>(&body) {
+                        println!("Session stopped:");
+                        display_session(&dto);
+                    } else {
+                        println!("Session `{session}` stopped.");
+                    }
+                } else {
+                    if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+                        eprintln!("Error stopping `{session}`: {}", api_err.error);
+                    } else {
+                        eprintln!("Error stopping `{session}` ({status}): {body}");
+                    }
+                    any_failed = true;
+                }
+            }
         }
+    }
+    if any_failed {
+        process::exit(1);
     }
 }
 
-/// Testable core of [`handle_rm`].
+/// Testable core of the rm dispatch path.
 ///
 /// Two-step shape:
 ///
@@ -6462,13 +6532,34 @@ async fn main() {
         return;
     }
 
+    // Handle stop specially — issues one POST per session so outcomes
+    // can be printed and failures accumulated without short-circuiting
+    // the remaining ids. See `handle_stop` for the full contract.
+    if let Command::Stop { sessions, force } = &cli.command {
+        handle_stop(&cli.socket, sessions, *force).await;
+        return;
+    }
+
     // Handle rm specially so the local
     // `~/.ssh/sandbox/sandbox-<id>{,.key}` cleanup runs only after the
     // daemon-side delete returns OK. Two-step shape: resolve to the
     // canonical id, DELETE, then `ssh_config::remove_session_entry`.
-    // See `handle_rm` for the full contract.
-    if let Command::Rm { session } = &cli.command {
-        handle_rm(&cli.socket, session).await;
+    // See `handle_rm` for the full contract. With variadic sessions,
+    // we loop and accumulate failures; exit 1 if any session failed.
+    if let Command::Rm { sessions } = &cli.command {
+        let mut any_failed = false;
+        for session in sessions {
+            match handle_rm_inner(&cli.socket, session, None).await {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    any_failed = true;
+                }
+            }
+        }
+        if any_failed {
+            process::exit(1);
+        }
         return;
     }
 
@@ -6706,6 +6797,9 @@ async fn main() {
             None,
         )
         .await;
+        if resolved == sandbox_core::BackendKind::Lima {
+            eprintln!("Creating sandbox VM — may take a few minutes…");
+        }
         build_create_request_body(&cli.command, resolved)
     } else {
         match build_request(&cli.command) {
@@ -6831,7 +6925,34 @@ mod tests {
     fn parse_stop() {
         let cli = Cli::parse_from(["sandbox", "stop", "my-session"]);
         match &cli.command {
-            Command::Stop { session } => assert_eq!(session, "my-session"),
+            Command::Stop { sessions, force } => {
+                assert_eq!(sessions, &["my-session"]);
+                assert!(!force);
+            }
+            _ => panic!("expected Stop command"),
+        }
+    }
+
+    #[test]
+    fn parse_stop_multiple_sessions() {
+        let cli = Cli::parse_from(["sandbox", "stop", "sess-a", "sess-b", "sess-c"]);
+        match &cli.command {
+            Command::Stop { sessions, force } => {
+                assert_eq!(sessions, &["sess-a", "sess-b", "sess-c"]);
+                assert!(!force);
+            }
+            _ => panic!("expected Stop command"),
+        }
+    }
+
+    #[test]
+    fn parse_stop_with_force() {
+        let cli = Cli::parse_from(["sandbox", "stop", "--force", "my-session"]);
+        match &cli.command {
+            Command::Stop { sessions, force } => {
+                assert_eq!(sessions, &["my-session"]);
+                assert!(force);
+            }
             _ => panic!("expected Stop command"),
         }
     }
@@ -6840,7 +6961,16 @@ mod tests {
     fn parse_rm() {
         let cli = Cli::parse_from(["sandbox", "rm", "my-session"]);
         match &cli.command {
-            Command::Rm { session } => assert_eq!(session, "my-session"),
+            Command::Rm { sessions } => assert_eq!(sessions, &["my-session"]),
+            _ => panic!("expected Rm command"),
+        }
+    }
+
+    #[test]
+    fn parse_rm_multiple_sessions() {
+        let cli = Cli::parse_from(["sandbox", "rm", "sess-a", "sess-b"]);
+        match &cli.command {
+            Command::Rm { sessions } => assert_eq!(sessions, &["sess-a", "sess-b"]),
             _ => panic!("expected Rm command"),
         }
     }
@@ -6851,7 +6981,20 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Ps {
-                no_reconcile: false
+                no_reconcile: false,
+                quiet: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_ps_quiet() {
+        let cli = Cli::parse_from(["sandbox", "ps", "-q"]);
+        assert!(matches!(
+            cli.command,
+            Command::Ps {
+                no_reconcile: false,
+                quiet: true,
             }
         ));
     }
@@ -6862,7 +7005,20 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Ls {
-                no_reconcile: false
+                no_reconcile: false,
+                quiet: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_ls_quiet() {
+        let cli = Cli::parse_from(["sandbox", "ls", "--quiet"]);
+        assert!(matches!(
+            cli.command,
+            Command::Ls {
+                no_reconcile: false,
+                quiet: true,
             }
         ));
     }
@@ -6870,13 +7026,25 @@ mod tests {
     #[test]
     fn parse_ls_no_reconcile() {
         let cli = Cli::parse_from(["sandbox", "ls", "--no-reconcile"]);
-        assert!(matches!(cli.command, Command::Ls { no_reconcile: true }));
+        assert!(matches!(
+            cli.command,
+            Command::Ls {
+                no_reconcile: true,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn parse_ps_no_reconcile() {
         let cli = Cli::parse_from(["sandbox", "ps", "--no-reconcile"]);
-        assert!(matches!(cli.command, Command::Ps { no_reconcile: true }));
+        assert!(matches!(
+            cli.command,
+            Command::Ps {
+                no_reconcile: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -7117,13 +7285,19 @@ mod tests {
     }
 
     #[test]
-    fn build_stop_request() {
+    fn build_stop_request_returns_none_for_dispatch_bypass() {
+        // `sandbox stop` is intercepted in `main()` via `handle_stop`,
+        // so the generic `build_request` pipeline is never reached.
+        // The multi-session loop with per-id outcomes lives in
+        // `handle_stop` and is not exercisable through `build_request`.
         let cmd = Command::Stop {
-            session: "abc".into(),
+            sessions: vec!["abc".into()],
+            force: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
-        assert_eq!(req.method(), "POST");
-        assert_eq!(req.uri(), "/sessions/abc/stop");
+        assert!(
+            build_request(&cmd).is_none(),
+            "Stop is intercepted in main() — build_request must return None"
+        );
     }
 
     #[test]
@@ -7137,7 +7311,7 @@ mod tests {
         // `handle_rm_keeps_local_entry_on_daemon_delete_failure`,
         // `handle_rm_keeps_local_entry_on_404_resolve`).
         let cmd = Command::Rm {
-            session: "abc".into(),
+            sessions: vec!["abc".into()],
         };
         assert!(
             build_request(&cmd).is_none(),
@@ -7149,6 +7323,7 @@ mod tests {
     fn build_ps_request() {
         let cmd = Command::Ps {
             no_reconcile: false,
+            quiet: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "GET");
@@ -7159,6 +7334,7 @@ mod tests {
     fn build_ls_request() {
         let cmd = Command::Ls {
             no_reconcile: false,
+            quiet: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "GET");

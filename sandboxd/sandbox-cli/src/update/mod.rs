@@ -1278,22 +1278,28 @@ pub async fn run(args: UpdateArgs) -> i32 {
     // Warm sudo credentials once so subsequent `sudo -n ...` sub-commands
     // can run non-interactively. We do this early — before the dev-mode
     // state-file check — because `sudo -n test -e` needs live credentials.
-    match Command::new("sudo").args(["-v"]).status() {
-        Ok(s) if s.success() => {
-            log_step("sudo_warm", "status=ok");
-        }
-        Ok(s) => {
-            log_step(
-                "sudo_warm",
-                &format!("status=fail code={}", s.code().unwrap_or(-1)),
-            );
-            eprintln!("sandbox update: `sudo -v` failed — cannot acquire operator privileges");
-            return 1i32;
-        }
-        Err(e) => {
-            log_step("sudo_warm", &format!("status=fail err=\"{e}\""));
-            eprintln!("sandbox update: failed to invoke sudo: {e}");
-            return 1i32;
+    //
+    // Read-only modes (--check / --dry-run) must never acquire privilege:
+    // they read what is visible to the calling user and degrade gracefully
+    // when a privileged read would be needed for richer output.
+    if !args.is_read_only() {
+        match Command::new("sudo").args(["-v"]).status() {
+            Ok(s) if s.success() => {
+                log_step("sudo_warm", "status=ok");
+            }
+            Ok(s) => {
+                log_step(
+                    "sudo_warm",
+                    &format!("status=fail code={}", s.code().unwrap_or(-1)),
+                );
+                eprintln!("sandbox update: `sudo -v` failed — cannot acquire operator privileges");
+                return 1i32;
+            }
+            Err(e) => {
+                log_step("sudo_warm", &format!("status=fail err=\"{e}\""));
+                eprintln!("sandbox update: failed to invoke sudo: {e}");
+                return 1i32;
+            }
         }
     }
 
@@ -4526,6 +4532,43 @@ mod tests {
             p,
             std::path::PathBuf::from("/var/lib/sandbox/sessions.db"),
             "on a dev host (no sandbox user) resolve_state_path must return the legacy path"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // A1 regression: read-only modes must never acquire privilege
+    // ---------------------------------------------------------------------------
+
+    /// `--check` and `--dry-run` are read-only modes; `is_read_only()` must
+    /// return `true` for both. The sudo warm is gated on `!is_read_only()`,
+    /// so these modes can never trigger a password prompt or abort when the
+    /// caller lacks sudo.
+    #[test]
+    fn is_read_only_true_for_check() {
+        let mut a = base_args();
+        a.check = true;
+        assert!(
+            a.is_read_only(),
+            "--check must be a read-only mode (is_read_only() == true)"
+        );
+    }
+
+    #[test]
+    fn is_read_only_true_for_dry_run() {
+        let mut a = base_args();
+        a.dry_run = true;
+        assert!(
+            a.is_read_only(),
+            "--dry-run must be a read-only mode (is_read_only() == true)"
+        );
+    }
+
+    #[test]
+    fn is_read_only_false_for_stateful_run() {
+        let a = base_args();
+        assert!(
+            !a.is_read_only(),
+            "default args (no --check / --dry-run) must not be a read-only mode"
         );
     }
 }
