@@ -259,7 +259,7 @@ async fn policy_preset_list_emits_every_builtin() {
     let (status, stdout, stderr) = run_sandbox(&["policy", "preset", "list"], None).await;
     assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
 
-    // The 10 ecosystem built-ins, plus the `ubuntu` distro preset.
+    // The 11 ecosystem built-ins (incl. `docker`), plus the `ubuntu` distro preset.
     let builtins = [
         "npm",
         "pypi",
@@ -267,6 +267,7 @@ async fn policy_preset_list_emits_every_builtin() {
         "goproxy",
         "maven",
         "gradle",
+        "docker",
         "dockerhub",
         "github",
         "github-repo",

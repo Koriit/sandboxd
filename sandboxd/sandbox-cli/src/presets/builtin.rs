@@ -11,12 +11,12 @@
 //!
 //! # Relationship to the design
 //!
-//! The first 10 entries cover ecosystem presets (npm, pypi, cargo,
-//! goproxy, maven, gradle, dockerhub) and the GitHub family. The plain
-//! `github` preset unifies interactive hosts + asset CDN under a single
-//! preset name; operators who need narrower scope use `github-repo` /
-//! `github-pr` instead. The 11th entry, `ubuntu`, is the first
-//! distro-level default-allow preset.
+//! The first 11 entries cover ecosystem presets (npm, pypi, cargo,
+//! goproxy, maven, gradle, dockerhub, docker) and the GitHub family. The
+//! plain `github` preset unifies interactive hosts + asset CDN under a
+//! single preset name; operators who need narrower scope use
+//! `github-repo` / `github-pr` instead. The 12th entry, `ubuntu`, is
+//! the first distro-level default-allow preset.
 //!
 //! # Determinism
 //!
@@ -100,6 +100,11 @@ pub const BUILTINS: &[BuiltinPreset] = &[
         name: "dockerhub",
         description: "Allow Docker Hub image pulls (registry-1.docker.io and friends).",
         expand: expand_dockerhub,
+    },
+    BuiltinPreset {
+        name: "docker",
+        description: "Allow Docker Engine installation (download.docker.com apt/yum repo + GPG key, get.docker.com install script). Compose with `dockerhub` for image pulls.",
+        expand: expand_docker,
     },
     // ----- GitHub family ------------------------
     BuiltinPreset {
@@ -227,6 +232,28 @@ fn expand_dockerhub(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetEr
         "auth.docker.io",
         "production.cloudflare.docker.com",
     ]))
+}
+
+fn expand_docker(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
+    // Docker Engine installation sources — separate from `dockerhub`
+    // (image pulls). Compose both presets together when an agent needs
+    // to install Docker AND pull images:
+    //   `--preset docker --preset dockerhub`
+    //
+    // Hosts covered:
+    //   - `download.docker.com` — apt/yum package repository, GPG key,
+    //     and package tarballs (all served from the same host).
+    //   - `get.docker.com`      — the convenience install script
+    //     (`curl -fsSL https://get.docker.com | sh`).
+    //
+    // Both hosts serve opaque package/script payloads whose URLs are
+    // not fixed, so `tls`-level (SNI verification, no HTTP path filter)
+    // is the appropriate assurance level here — the same posture used
+    // by the `ubuntu` preset's apt mirrors.
+    Ok(vec![
+        tls_rule("download.docker.com"),
+        tls_rule("get.docker.com"),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -787,9 +814,9 @@ mod tests {
     // ----- unparameterized presets -----------------------------------
 
     #[test]
-    fn builtins_has_eleven_entries() {
-        // 10 ecosystem presets + 1 `ubuntu` distro preset.
-        assert_eq!(BUILTINS.len(), 11);
+    fn builtins_has_twelve_entries() {
+        // 11 ecosystem presets (incl. `docker`) + 1 `ubuntu` distro preset.
+        assert_eq!(BUILTINS.len(), 12);
     }
 
     #[test]
@@ -1033,6 +1060,70 @@ mod tests {
             ],
         );
         assert_rules_round_trip(rules);
+    }
+
+    /// The `docker` preset (engine-install scope) emits two `tls`-level
+    /// rules: one for `download.docker.com` (apt/yum repo + GPG + packages)
+    /// and one for `get.docker.com` (convenience install script). Both are
+    /// TCP/443 TLS — the same posture `ubuntu` apt mirrors use.
+    #[test]
+    fn expand_docker_matches_spec() {
+        let rules = expand_builtin("docker", "docker:");
+        assert_eq!(
+            rules.len(),
+            2,
+            "docker preset must emit exactly two rules; got {} rules: {rules:?}",
+            rules.len()
+        );
+
+        // Rule 0: download.docker.com — tls.
+        let r0 = &rules[0];
+        match &r0.host {
+            Destination::Domain(d) => assert_eq!(d, "download.docker.com"),
+            other => panic!("expected Domain(download.docker.com), got {other:?}"),
+        }
+        assert_eq!(r0.port, 443);
+        assert_eq!(r0.protocol, Protocol::Tcp);
+        assert_eq!(r0.level, AssuranceLevel::Tls);
+
+        // Rule 1: get.docker.com — tls.
+        let r1 = &rules[1];
+        match &r1.host {
+            Destination::Domain(d) => assert_eq!(d, "get.docker.com"),
+            other => panic!("expected Domain(get.docker.com), got {other:?}"),
+        }
+        assert_eq!(r1.port, 443);
+        assert_eq!(r1.protocol, Protocol::Tcp);
+        assert_eq!(r1.level, AssuranceLevel::Tls);
+
+        assert_rules_round_trip(rules);
+    }
+
+    /// The `docker` preset must not overlap with `dockerhub`: their host
+    /// sets must be disjoint. This guards against accidentally whitelisting
+    /// a Docker Hub pull host under the engine-install preset.
+    #[test]
+    fn docker_and_dockerhub_presets_have_disjoint_hosts() {
+        use std::collections::HashSet;
+        let docker_hosts: HashSet<String> = expand_builtin("docker", "docker:")
+            .into_iter()
+            .filter_map(|r| match r.host {
+                Destination::Domain(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        let dockerhub_hosts: HashSet<String> = expand_builtin("dockerhub", "dockerhub:")
+            .into_iter()
+            .filter_map(|r| match r.host {
+                Destination::Domain(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        let overlap: Vec<&String> = docker_hosts.intersection(&dockerhub_hosts).collect();
+        assert!(
+            overlap.is_empty(),
+            "docker and dockerhub presets share hosts (would collide on compose): {overlap:?}"
+        );
     }
 
     // ----- ubuntu (unparameterized) -----------------------------------

@@ -313,34 +313,41 @@ Preset expansion happens entirely client-side — the daemon receives the fully-
 
 ### Built-in catalog
 
-Eleven built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata.
+Twelve built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata (the `show` output includes an `Example:` line with a ready-to-use `--preset` invocation).
 
 Unparameterized ecosystem presets:
 
-| Preset | Hosts |
-|---|---|
-| `npm:` | `registry.npmjs.org` |
-| `pypi:` | `pypi.org`, `files.pythonhosted.org` |
-| `cargo:` | `crates.io`, `index.crates.io`, `static.crates.io` |
-| `goproxy:` | `proxy.golang.org`, `sum.golang.org` |
-| `maven:` | `repo1.maven.org`, `repo.maven.apache.org` |
-| `gradle:` | `plugins.gradle.org`, `services.gradle.org`, `downloads.gradle.org` |
-| `dockerhub:` | `registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com` |
+| Preset      | Hosts                                                                        |
+| ----------- | ---------------------------------------------------------------------------- |
+| `npm`       | `registry.npmjs.org`                                                         |
+| `pypi`      | `pypi.org`, `files.pythonhosted.org`                                         |
+| `cargo`     | `crates.io`, `index.crates.io`, `static.crates.io`                           |
+| `goproxy`   | `proxy.golang.org`, `sum.golang.org`                                         |
+| `maven`     | `repo1.maven.org`, `repo.maven.apache.org`                                   |
+| `gradle`    | `plugins.gradle.org`, `services.gradle.org`, `downloads.gradle.org`          |
+| `dockerhub` | `registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com` |
+| `docker`    | `download.docker.com`, `get.docker.com`                                      |
 
-All of the above emit `http`-level rules with a `GET /**` + `HEAD /**` filter shape. Publishing (`npm publish`, `cargo publish`, ...) is out of scope for these presets — add a dedicated rule for the specific write endpoint if you need it.
+The first seven emit `http`-level rules with a `GET /**` + `HEAD /**` filter shape. Publishing (`npm publish`, `cargo publish`, ...) is out of scope for these presets — add a dedicated rule for the specific write endpoint if you need it.
+
+The `docker` preset uses `tls`-level rules (SNI verification, no HTTP path filter) because apt/yum package repositories and install scripts serve opaque payloads at varying paths. It covers only the Docker Engine installation sources — use it alongside `dockerhub` when an agent needs to both install Docker and pull images:
+
+```bash
+sandbox create --preset docker --preset dockerhub
+```
 
 GitHub family:
 
-| Preset | Purpose |
-|---|---|
-| `github:` | Broad GitHub access: `github.com` and `api.github.com` with `ANY /**`, plus read-only access to the asset CDN hosts (`codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`). |
-| `github-repo:repo=OWNER/REPO` | One-repo scope. Required repeatable `repo=owner/name` param — each value contributes its path filters. Covers git-pack URLs, the repo's REST API subtree, archive downloads, and raw-content reads. |
-| `github-pr:repo=OWNER/REPO,pr=N` | One-PR scope. Paired repeatable `repo=` / `pr=` params — both required, counts must match. Grants access to a single PR's metadata, comments, and files, nothing more (no git clone/fetch/push, no archive download). |
+| Preset                           | Purpose                                                                                                                                                                                                                                            |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `github:`                        | Broad GitHub access: `github.com` and `api.github.com` with `ANY /**`, plus read-only access to the asset CDN hosts (`codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`). |
+| `github-repo:repo=OWNER/REPO`    | One-repo scope. Required repeatable `repo=owner/name` param — each value contributes its path filters. Covers git-pack URLs, the repo's REST API subtree, archive downloads, and raw-content reads.                                                |
+| `github-pr:repo=OWNER/REPO,pr=N` | One-PR scope. Paired repeatable `repo=` / `pr=` params — both required, counts must match. Grants access to a single PR's metadata, comments, and files, nothing more (no git clone/fetch/push, no archive download).                              |
 
 OS / distro presets:
 
-| Preset | Purpose |
-|---|---|
+| Preset    | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ubuntu:` | Default-allow rules an Ubuntu sandbox needs to function. One NTP rule (UDP/123 to `ntp.ubuntu.com`, the canonical vendor pool — Canonical removed `time.ubuntu.com` from authoritative DNS) so `systemd-timesyncd` / `chrony` can sync the clock, plus two apt-mirror rules (HTTPS/443 to `archive.ubuntu.com` and `security.ubuntu.com`) so a stock 22.04+ `/etc/apt/sources.list` can run `apt update` and `apt install`. |
 
 Use `ubuntu:` whenever you boot a session against an Ubuntu image and need the host distro's own housekeeping (clock sync + mirror reads) to keep working — for example, when an agent's first action is `apt install build-essential`. The preset is intentionally minimal: it does not allow snap (`api.snapcraft.io`), livepatch (`livepatch.canonical.com`), or changelog fetches (`changelogs.ubuntu.com`); add explicit rules for those if your workload needs them. The preset is unparameterized like `npm:` / `pypi:` — there is no `ubuntu:release=...` or `ubuntu:mirror=...` knob in v1.
@@ -357,12 +364,12 @@ The authoritative host and filter lists live in the CLI source at `sandboxd/sand
 
 A preset invocation is a single string:
 
-```
+```text
 <name>[:key=val[,key=val,...]]
 ```
 
 - `<name>` is one of the preset names in `sandbox policy preset list`.
-- Unparameterized presets take a trailing colon with nothing after it: `'npm:'`, `'pypi:'`.
+- Unparameterized presets accept a bare name (`npm`) or a trailing colon (`npm:`); both are equivalent.
 - Parameters are `key=val` pairs separated by commas: `'github-repo:repo=foo/bar,repo=baz/qux'`.
 - **Values may not contain raw `,`, `:`, or `=`.** There is no escape mechanism — a forbidden character in a value is a hard error (see [`--preset` errors](/sandboxd/reference/cli/#preset-invocations)). In practice no built-in preset param needs any of those characters; design user presets around param shapes that avoid them.
 - Whitespace inside a value is preserved verbatim; no trimming.
@@ -423,7 +430,7 @@ sandbox create --name dev --preset 'my-internal:tenant=acme'
 - **Duplicate `name` across files** — hard error; the CLI refuses to run with both files on disk. Rename or delete one.
 - **User preset shadows a built-in** — hard error at the point where the shadowed name is *invoked* (not at load time, so a latent file cannot break unrelated commands). User configs cannot override built-ins under any circumstance. If you ship a `npm.json` user preset, it will fail on use:
 
-  ```
+  ```text
   Error: preset 'npm' is defined by both a built-in and a user file at
     /home/alice/.config/sandboxd/presets/npm.json
   user presets cannot shadow built-ins; rename or delete the user file.
@@ -437,7 +444,7 @@ Every rule's identity is its `(host, port)` pair. Across the effective policy �
 
 When a collision is detected, the CLI exits non-zero and prints one block per collision, listing every contributing source with its invocation string (for presets) or file path (for policy files):
 
-```
+```text
 Error: policy validation failed: duplicate destination (registry.npmjs.org, 443)
   - declared by policy file /tmp/policy.json
   - declared by preset invocation 'npm:' (built-in 'npm')
