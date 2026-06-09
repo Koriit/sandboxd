@@ -429,11 +429,16 @@ async fn integration_create_session_container_first_use_warning_surfaces() {
     let tag = TestImage::unique_tag("first-use");
     let _image_guard = TestImage::new(tag.clone());
 
+    // A per-test TempDir is the docker_home for both ensure_image calls so
+    // the Docker client config dir lands in an owned, writable location
+    // (not a shared /tmp that races with parallel test binaries).
+    let docker_home = TempDir::new().expect("per-test docker_home tempdir");
     // First call: image is absent; `ensure_image` must build it and
     // return `Built { warning }` carrying the design-verbatim notice.
     let first_outcome = tokio::task::spawn_blocking({
         let tag = tag.clone();
-        move || ensure_image(&tag)
+        let docker_home_path = docker_home.path().to_path_buf();
+        move || ensure_image(&tag, &docker_home_path)
     })
     .await
     .expect("spawn_blocking join")
@@ -467,7 +472,8 @@ async fn integration_create_session_container_first_use_warning_surfaces() {
     // Second call for the same tag: cache hit, no warning surfaced.
     let second_outcome = tokio::task::spawn_blocking({
         let tag = tag.clone();
-        move || ensure_image(&tag)
+        let docker_home_path = docker_home.path().to_path_buf();
+        move || ensure_image(&tag, &docker_home_path)
     })
     .await
     .expect("spawn_blocking join")

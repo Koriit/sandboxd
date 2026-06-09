@@ -165,8 +165,9 @@ fn integration_session_create_builds_lite_image_on_demand() {
         "test precondition: {tag} must not exist before the on-demand build"
     );
 
-    let outcome =
-        ensure_image(&version).expect("on-demand lite-image build must succeed on first call");
+    let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
+    let outcome = ensure_image(&version, docker_home.path())
+        .expect("on-demand lite-image build must succeed on first call");
 
     match outcome {
         EnsureImageOutcome::Built { .. } => { /* expected */ }

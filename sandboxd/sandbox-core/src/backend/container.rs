@@ -1747,6 +1747,13 @@ fn container_image_lock() -> &'static Mutex<()> {
 ///   typically pass `env!("CARGO_PKG_VERSION")`. Tests use unique
 ///   version-shaped strings (`test-build-<rand>`) to avoid colliding
 ///   with co-running tests.
+/// - `docker_home` is set as `HOME` (and `DOCKER_CONFIG` points at
+///   `{docker_home}/docker`) on the `docker build` subprocess so the
+///   Docker client config directory lands in a writable, daemon-owned
+///   location. Required when the process `HOME` is non-writable (e.g.
+///   `/nonexistent` for the `sandbox` system user under the systemd
+///   unit). Production callers pass the daemon base-dir; integration
+///   tests pass a tempdir they own.
 /// - The image-namespace lock is held across the inspect-then-build
 ///   sequence; concurrent calls with the same tag observe exactly one
 ///   `Built` outcome and `AlreadyPresent` for the rest.
@@ -1756,7 +1763,10 @@ fn container_image_lock() -> &'static Mutex<()> {
 ///   instead of a persistent `{runtime_dir}/images/lite/` staging path
 ///   because the staging surface has no purpose beyond the `docker build`
 ///   invocation, and a tempdir removes a runtime-dir dependency.
-pub fn ensure_image(daemon_version: &str) -> Result<EnsureImageOutcome, SandboxError> {
+pub fn ensure_image(
+    daemon_version: &str,
+    docker_home: &Path,
+) -> Result<EnsureImageOutcome, SandboxError> {
     let tag = lite_image_tag_for_version(daemon_version);
 
     let _guard = container_image_lock()
@@ -1772,7 +1782,7 @@ pub fn ensure_image(daemon_version: &str) -> Result<EnsureImageOutcome, SandboxE
     // missing, so there is nothing to cache-bust against; the
     // operator-driven `rebuild_lite_image` path is the place that
     // honors `--no-cache`.
-    build_lite_image(&tag, false)?;
+    build_lite_image(&tag, false, docker_home)?;
     Ok(EnsureImageOutcome::Built {
         warning: LITE_FIRST_USE_WARNING.to_string(),
     })
@@ -1817,7 +1827,12 @@ fn image_present(tag: &str) -> Result<bool, SandboxError> {
 /// rebuild path. `false` keeps the historical fast path (incremental
 /// cache enabled) for the missing-image build flow `ensure_image`
 /// uses.
-fn build_lite_image(tag: &str, no_cache: bool) -> Result<(), SandboxError> {
+///
+/// `docker_home` is set as `HOME` and used to derive `DOCKER_CONFIG`
+/// (`{docker_home}/docker`) on the subprocess so the Docker client
+/// never tries to create its config directory under a non-writable
+/// `HOME` (e.g. `/nonexistent` for the `sandbox` system user).
+fn build_lite_image(tag: &str, no_cache: bool, docker_home: &Path) -> Result<(), SandboxError> {
     let agent_src = guest_agent_path()?;
     if !agent_src.exists() {
         return Err(SandboxError::Internal(format!(
@@ -1848,6 +1863,12 @@ fn build_lite_image(tag: &str, no_cache: bool) -> Result<(), SandboxError> {
     })?;
 
     let mut cmd = std::process::Command::new("docker");
+    // Pin HOME and DOCKER_CONFIG to a writable daemon-owned directory.
+    // Docker's build client creates its config dir under $HOME; when the
+    // daemon runs as the `sandbox` system user (HOME=/nonexistent), that
+    // mkdir fails and the build aborts before any layer is pulled.
+    cmd.env("HOME", docker_home);
+    cmd.env("DOCKER_CONFIG", docker_home.join("docker"));
     cmd.arg("build");
     if no_cache {
         cmd.arg("--no-cache");
@@ -1883,6 +1904,11 @@ fn build_lite_image(tag: &str, no_cache: bool) -> Result<(), SandboxError> {
 /// incremental rebuilds when the operator just wants to pick up
 /// `sandbox-guest` changes without rebuilding every Dockerfile layer.
 ///
+/// `docker_home` is set as `HOME` and used to derive `DOCKER_CONFIG`
+/// on the subprocess — see [`ensure_image`] for the rationale.
+/// Production callers pass the daemon base-dir; integration tests
+/// pass a tempdir they own.
+///
 /// Reuses the same `container_image_lock()` mutex as [`ensure_image`]
 /// so concurrent ensure-and-rebuild paths cannot race; the lock is
 /// container-scoped and independent of Lima's `base_image_lock`, so
@@ -1893,7 +1919,11 @@ fn build_lite_image(tag: &str, no_cache: bool) -> Result<(), SandboxError> {
 /// `tokio::task::spawn_blocking` (CLAUDE.md `spawn_blocking`
 /// discipline) — this function shells out to `docker build` and may
 /// block for minutes.
-pub fn rebuild_lite_image(daemon_version: &str, no_cache: bool) -> Result<(), SandboxError> {
+pub fn rebuild_lite_image(
+    daemon_version: &str,
+    no_cache: bool,
+    docker_home: &Path,
+) -> Result<(), SandboxError> {
     let tag = lite_image_tag_for_version(daemon_version);
 
     let _guard = container_image_lock()
@@ -1901,7 +1931,7 @@ pub fn rebuild_lite_image(daemon_version: &str, no_cache: bool) -> Result<(), Sa
         .map_err(|_| SandboxError::Internal("container_image_lock poisoned".into()))?;
 
     info!(tag = %tag, no_cache, "rebuilding lite image (operator-requested)");
-    build_lite_image(&tag, no_cache)
+    build_lite_image(&tag, no_cache, docker_home)
 }
 
 // ---------------------------------------------------------------------------

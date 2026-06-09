@@ -38,6 +38,13 @@ RuntimeDirectoryMode=0750
 # remaining XDG-derived runtime paths to the runtime tmpfs.
 Environment=SANDBOX_LISTENER_DIR=/run/sandbox/listeners
 Environment=SANDBOX_EVENTS_DIR=/run/sandbox/events
+# Defense-in-depth: pin HOME to the daemon base-dir so any subprocess
+# (e.g. docker build) that tries to create a config directory under $HOME
+# lands on a writable, daemon-owned path rather than /nonexistent.
+# The primary fix is in container.rs (HOME/DOCKER_CONFIG set explicitly
+# on the docker Command), but this guards against any future subprocess
+# that consults HOME without being wrapped by the Rust build path.
+Environment=HOME=@SANDBOX_BASE_DIR@
 
 # Operators customize via `systemctl edit sandboxd` (drop-in override),
 # not by editing this file. See § 4.3.

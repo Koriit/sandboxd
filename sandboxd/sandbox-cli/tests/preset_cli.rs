@@ -259,7 +259,7 @@ async fn policy_preset_list_emits_every_builtin() {
     let (status, stdout, stderr) = run_sandbox(&["policy", "preset", "list"], None).await;
     assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
 
-    // The 10 ecosystem built-ins, plus the `ubuntu` distro preset.
+    // The 11 ecosystem built-ins (incl. `docker`), plus the `ubuntu` distro preset.
     let builtins = [
         "npm",
         "pypi",
@@ -267,6 +267,7 @@ async fn policy_preset_list_emits_every_builtin() {
         "goproxy",
         "maven",
         "gradle",
+        "docker",
         "dockerhub",
         "github",
         "github-repo",
@@ -288,7 +289,8 @@ async fn policy_preset_list_emits_every_builtin() {
 }
 
 /// `sandbox policy preset show github-repo` surfaces both the
-/// description and the `repo=owner/name` parameter schema.
+/// description and the `repo=owner/name` parameter schema, and prints
+/// an `Example:` line with the correct parameterized invocation.
 #[tokio::test]
 async fn policy_preset_show_github_repo_documents_repo_param() {
     let (status, stdout, stderr) =
@@ -306,6 +308,27 @@ async fn policy_preset_show_github_repo_documents_repo_param() {
     assert!(
         stdout.contains("owner/name"),
         "`show` missing `owner/name` shape docs. output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Example: --preset 'github-repo:repo=owner/name'"),
+        "`show` missing or wrong Example line for parameterized preset. output:\n{stdout}"
+    );
+}
+
+/// `sandbox policy preset show ubuntu` prints an `Example:` line with
+/// the bare (parameterless) preset name — no trailing colon required.
+#[tokio::test]
+async fn policy_preset_show_parameterless_preset_documents_example() {
+    let (status, stdout, stderr) = run_sandbox(&["policy", "preset", "show", "ubuntu"], None).await;
+    assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
+
+    assert!(
+        stdout.contains("ubuntu"),
+        "`show` missing preset name. output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Example: --preset 'ubuntu'"),
+        "`show` missing or wrong Example line for parameterless preset. output:\n{stdout}"
     );
 }
 

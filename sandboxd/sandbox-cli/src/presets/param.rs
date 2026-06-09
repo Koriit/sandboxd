@@ -1,5 +1,9 @@
 //! Parser for preset invocation strings of the form
-//! `'<name>:<key>=<val>,<key>=<val>,...'`.
+//! `'<name>[:<key>=<val>,<key>=<val>,...]'`.
+//!
+//! The colon separator is optional for parameterless presets: `ubuntu`
+//! and `ubuntu:` are both accepted and produce identical
+//! `ParsedInvocation` values (empty params, `raw` preserved verbatim).
 //!
 //! The parser is fail-loud on raw `,`, `:`, and `=` inside values:
 //! there is no escape mechanism, and a value containing any of those
@@ -9,7 +13,7 @@
 //! Grammar:
 //!
 //! ```text
-//! invocation  = name ":" [ params ]
+//! invocation  = name [ ":" [ params ] ]
 //! name        = any non-empty string not containing ":"
 //! params      = param ("," param)*
 //! param       = key "=" value
@@ -23,14 +27,15 @@
 
 use super::PresetError;
 
-/// Result of parsing a `'name:k=v,...'` invocation string.
+/// Result of parsing a `'name[:k=v,...]'` invocation string.
 ///
 /// The `raw` field preserves the caller's original string so it can be
 /// transmitted to the daemon as part of the `source_presets` field on
 /// create/update requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedInvocation {
-    /// The preset name (before the `:` separator).
+    /// The preset name (before the `:` separator, or the whole input
+    /// when no `:` is present).
     pub name: String,
     /// The `(key, value)` pairs, in the order they were provided.
     /// Repeated keys preserve their order of appearance.
@@ -45,16 +50,13 @@ impl ParsedInvocation {
     ///
     /// See the module-level docs for the grammar and error cases.
     pub fn parse(input: &str) -> Result<Self, PresetError> {
-        // Locate the first ':' — it separates name from params.
-        let Some(colon_idx) = input.find(':') else {
-            return Err(PresetError::MalformedInvocation {
-                raw: input.to_string(),
-                reason: "missing ':' separator between preset name and params".to_string(),
-            });
+        // A bare name with no `:` is valid — treat it as name + empty
+        // params. This allows `--preset ubuntu` as equivalent to
+        // `--preset ubuntu:`.
+        let (name, params_str) = match input.find(':') {
+            Some(colon_idx) => (&input[..colon_idx], &input[colon_idx + 1..]),
+            None => (input, ""),
         };
-
-        let name = &input[..colon_idx];
-        let params_str = &input[colon_idx + 1..];
 
         if name.is_empty() {
             return Err(PresetError::MalformedInvocation {
@@ -71,7 +73,9 @@ impl ParsedInvocation {
                     return Err(PresetError::MalformedInvocation {
                         raw: input.to_string(),
                         reason: format!(
-                            "param segment '{segment}' is missing '=' between key and value"
+                            "param segment '{segment}' is missing '=' between key and value; \
+                             use '{name}:key=value' for parameterized presets \
+                             or '{name}' for parameterless presets"
                         ),
                     });
                 };
@@ -130,6 +134,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_bare_name_no_colon() {
+        // A bare name without `:` is equivalent to `name:` — empty params.
+        let inv = ParsedInvocation::parse("ubuntu").expect("should parse");
+        assert_eq!(inv.name, "ubuntu");
+        assert!(inv.params.is_empty());
+        assert_eq!(inv.raw, "ubuntu");
+    }
+
+    #[test]
+    fn parse_bare_name_and_colon_form_are_equivalent() {
+        let bare = ParsedInvocation::parse("npm").expect("bare form");
+        let colon = ParsedInvocation::parse("npm:").expect("colon form");
+        assert_eq!(bare.name, colon.name);
+        assert_eq!(bare.params, colon.params);
+        // `raw` differs by design (it preserves the exact input).
+    }
+
+    #[test]
     fn parse_single_param() {
         let inv = ParsedInvocation::parse("name:k=v").expect("should parse");
         assert_eq!(inv.name, "name");
@@ -170,19 +192,13 @@ mod tests {
     // ----- error paths ------------------------------------------------
 
     #[test]
-    fn parse_empty_input_is_missing_colon() {
+    fn parse_empty_input_is_empty_name() {
         let err = ParsedInvocation::parse("").expect_err("should reject");
         assert!(matches!(err, PresetError::MalformedInvocation { .. }));
     }
 
     #[test]
-    fn parse_no_colon_is_error() {
-        let err = ParsedInvocation::parse("name").expect_err("should reject");
-        assert!(matches!(err, PresetError::MalformedInvocation { .. }));
-    }
-
-    #[test]
-    fn parse_empty_name_is_error() {
+    fn parse_empty_name_with_colon_is_error() {
         let err = ParsedInvocation::parse(":k=v").expect_err("should reject");
         assert!(matches!(err, PresetError::MalformedInvocation { .. }));
     }
@@ -283,6 +299,23 @@ mod tests {
         assert_eq!(
             rendered,
             "preset 'github-repo': param 'repo=foo/bar:extra' contains forbidden character ':' in value; preset params must not contain , : or ="
+        );
+    }
+
+    #[test]
+    fn malformed_param_error_suggests_both_forms() {
+        // A segment without '=' should hint at both the parameterized form
+        // (name:key=value) AND the bare parameterless form (name), so the
+        // user is not misled into thinking a colon is always required.
+        let err = ParsedInvocation::parse("github-repo:not-a-kv-pair").expect_err("should reject");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("github-repo:key=value"),
+            "error should mention the parameterized form; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("parameterless"),
+            "error should mention parameterless presets; got: {rendered}"
         );
     }
 }

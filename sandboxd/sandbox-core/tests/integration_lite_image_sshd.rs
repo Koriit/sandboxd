@@ -216,7 +216,9 @@ fn integration_lite_image_sshd_listens_on_127_0_0_1_port_22_as_sandbox_user() {
     let tag = format!("{LITE_IMAGE_REPOSITORY}:{version}");
 
     // Step 1: build the lite image via the production code path.
-    ensure_image(&version).expect("ensure_image must succeed for sshd contract test");
+    let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
+    ensure_image(&version, docker_home.path())
+        .expect("ensure_image must succeed for sshd contract test");
 
     // Step 2: launch a container under the production hardening profile.
     let container_name = unique_container_name("sshd");

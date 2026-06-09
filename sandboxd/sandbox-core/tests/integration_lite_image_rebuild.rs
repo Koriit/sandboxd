@@ -142,7 +142,9 @@ fn integration_lite_image_rebuild_fresh_tag_produces_image() {
     let version = unique_daemon_version("fresh");
     let _cleanup = LiteImageCleanup::new(&version);
 
-    rebuild_lite_image(&version, false).expect("rebuild_lite_image must succeed on fresh tag");
+    let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
+    rebuild_lite_image(&version, false, docker_home.path())
+        .expect("rebuild_lite_image must succeed on fresh tag");
 
     let tag = format!("{LITE_IMAGE_REPOSITORY}:{version}");
     assert!(
@@ -165,20 +167,21 @@ fn integration_lite_image_rebuild_after_ensure_image_succeeds() {
     let version = unique_daemon_version("post-ensure");
     let _cleanup = LiteImageCleanup::new(&version);
 
-    let first = ensure_image(&version).expect("ensure_image first call");
+    let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
+    let first = ensure_image(&version, docker_home.path()).expect("ensure_image first call");
     assert!(
         matches!(first, EnsureImageOutcome::Built { .. }),
         "ensure_image first call must build, got {first:?}",
     );
 
-    let second = ensure_image(&version).expect("ensure_image second call");
+    let second = ensure_image(&version, docker_home.path()).expect("ensure_image second call");
     assert_eq!(
         second,
         EnsureImageOutcome::AlreadyPresent,
         "ensure_image second call must skip the build",
     );
 
-    rebuild_lite_image(&version, false)
+    rebuild_lite_image(&version, false, docker_home.path())
         .expect("rebuild_lite_image must succeed after ensure_image");
 
     let tag = format!("{LITE_IMAGE_REPOSITORY}:{version}");
@@ -201,7 +204,9 @@ fn integration_lite_image_rebuild_with_no_cache_succeeds() {
     let version = unique_daemon_version("no-cache");
     let _cleanup = LiteImageCleanup::new(&version);
 
-    rebuild_lite_image(&version, true).expect("rebuild_lite_image with no_cache=true must succeed");
+    let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
+    rebuild_lite_image(&version, true, docker_home.path())
+        .expect("rebuild_lite_image with no_cache=true must succeed");
 
     let tag = format!("{LITE_IMAGE_REPOSITORY}:{version}");
     assert!(

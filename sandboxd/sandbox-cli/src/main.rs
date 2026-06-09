@@ -21,7 +21,7 @@ use sandbox_cli::backend::{
     render_isolation_warning, render_no_cache_rejection_for_container, resolve_backend,
 };
 use sandbox_cli::backends_cache::BackendsCache;
-use sandbox_cli::presets::{self, Catalog, ParsedInvocation, Preset, PresetSource};
+use sandbox_cli::presets::{self, Catalog, ParsedInvocation, Preset, PresetSource, UserPreset};
 
 /// CLI client for managing sandbox sessions.
 #[derive(Parser, Debug)]
@@ -2953,6 +2953,7 @@ fn print_preset_details(preset: &Preset) {
                     println!("  - {row}");
                 }
             }
+            println!("Example: --preset '{}'", builtin_invocation_example(b.name));
         }
         Preset::User(u) => {
             println!("Source: user: {}", u.source_path.display());
@@ -2976,6 +2977,7 @@ fn print_preset_details(preset: &Preset) {
                     println!("  - {}: string{}", p.name, flags_str);
                 }
             }
+            println!("Example: --preset '{}'", user_preset_invocation_example(u));
         }
     }
 }
@@ -2997,6 +2999,44 @@ fn builtin_param_schema(name: &str) -> Vec<&'static str> {
         ],
         // Unparameterized built-ins — every other entry in BUILTINS.
         _ => Vec::new(),
+    }
+}
+
+/// A canonical `--preset` invocation string for built-in presets, shown
+/// in the `Example:` line of `sandbox policy preset show`.
+///
+/// For parameterless presets the bare name is sufficient (P1 makes the
+/// trailing `:` optional). For parameterized presets, a concrete
+/// illustrative value is shown so operators can copy-paste and fill in
+/// the real values.
+///
+/// Keep in sync with the expander bodies in `presets::builtin`.
+fn builtin_invocation_example(name: &str) -> String {
+    match name {
+        "github-repo" => "github-repo:repo=owner/name".to_string(),
+        "github-pr" => "github-pr:repo=owner/name,pr=42".to_string(),
+        // All other built-ins are unparameterized; bare name suffices.
+        _ => name.to_string(),
+    }
+}
+
+/// Derive a `--preset` invocation example for a user preset.
+///
+/// For each required param, the example shows `param=<value>` with the
+/// param name as a placeholder. Optional params are omitted from the
+/// example to keep it minimal. If a preset has no required params the
+/// bare name is returned.
+fn user_preset_invocation_example(u: &UserPreset) -> String {
+    let required_params: Vec<String> = u
+        .params
+        .iter()
+        .filter(|p| p.required)
+        .map(|p| format!("{}=<value>", p.name))
+        .collect();
+    if required_params.is_empty() {
+        u.name.clone()
+    } else {
+        format!("{}:{}", u.name, required_params.join(","))
     }
 }
 

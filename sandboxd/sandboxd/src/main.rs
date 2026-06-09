@@ -1859,7 +1859,9 @@ async fn create_session(
     let mut warnings: Vec<String> = Vec::new();
     if backend_kind == BackendKind::Container {
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
-        match tokio::task::spawn_blocking(move || ensure_image(&daemon_version)).await {
+        let docker_home = state.base_dir.clone();
+        match tokio::task::spawn_blocking(move || ensure_image(&daemon_version, &docker_home)).await
+        {
             Ok(Ok(EnsureImageOutcome::AlreadyPresent)) => {}
             Ok(Ok(EnsureImageOutcome::Built { warning })) => {
                 // `warning` is `LITE_FIRST_USE_WARNING` verbatim per
@@ -7096,8 +7098,11 @@ async fn rebuild_image(
             // (the same image-namespace lock that `ensure_image` uses).
             let daemon_version = env!("CARGO_PKG_VERSION").to_string();
             let no_cache = req.no_cache;
-            match tokio::task::spawn_blocking(move || rebuild_lite_image(&daemon_version, no_cache))
-                .await
+            let docker_home = state.base_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                rebuild_lite_image(&daemon_version, no_cache, &docker_home)
+            })
+            .await
             {
                 Ok(Ok(())) => (StatusCode::OK, "lite image rebuilt").into_response(),
                 Ok(Err(e)) => error_response(e).into_response(),

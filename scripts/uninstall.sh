@@ -882,33 +882,73 @@ _priv_maybe_fail_after "\$_label"
 
 # ----- Step 8: purge-user -----
 _step_begin "purge-user"
-if [ "\$HAVE_STATE" -eq 1 ] \
-   && [ "\$WE_CREATED_SANDBOX_USER" = "true" ] \
-   && getent passwd sandbox >/dev/null 2>&1; then
-    userdel sandbox >> "\$_LOG" 2>&1 || { _log "step=userdel action=fail"; _step_fail; }
-    _log "step=userdel action=remove"
+if getent passwd sandbox >/dev/null 2>&1; then
+    # Guard: only remove the account if its GECOS field matches the one
+    # written by install.sh, confirming it is the genuine sandboxd account
+    # and not an unrelated 'sandbox' user that happened to exist on this host.
+    _gecos=\$(getent passwd sandbox | cut -d: -f5 2>/dev/null || true)
+    # Guard: if SANDBOX_UID was resolved in the parent, confirm it still matches
+    # (protects against a replacement account at a different uid).
+    _actual_uid=\$(id -u sandbox 2>/dev/null || true)
+    _uid_ok=1
+    if [ -n "\$SANDBOX_UID" ] && [ -n "\$_actual_uid" ] \
+       && [ "\$_actual_uid" != "\$SANDBOX_UID" ]; then
+        _uid_ok=0
+    fi
+    # Remove if we created the account, OR if both guards confirm it is the
+    # genuine sandboxd account (covers upgrade-lineage hosts where the flag is
+    # false but the GECOS + uid match unambiguously).
+    if [ "\$WE_CREATED_SANDBOX_USER" = "true" ] \
+       || { [ "\$_gecos" = "sandboxd - isolated environment broker" ] \
+            && [ "\$_uid_ok" -eq 1 ]; }; then
+        if [ "\$WE_CREATED_SANDBOX_USER" != "true" ]; then
+            _log "step=userdel note=we-did-not-create-it removing-anyway reason=purge"
+        fi
+        userdel sandbox >> "\$_LOG" 2>&1 || { _log "step=userdel action=fail"; _step_fail; }
+        _log "step=userdel action=remove"
+    else
+        _log "step=userdel action=skip reason=alien-account gecos_len=\${#_gecos} uid_ok=\${_uid_ok}"
+    fi
 else
-    _log "step=userdel action=skip reason=we-did-not-create-it-or-absent"
+    _log "step=userdel action=skip reason=absent"
 fi
 _step_ok
 _priv_maybe_fail_after "\$_label"
 
 # ----- Step 9: purge-group -----
 _step_begin "purge-group"
-if getent group sandbox >/dev/null 2>&1; then
-    groupdel sandbox >> "\$_LOG" 2>&1 || true
-    _log "step=groupdel action=remove"
-else
-    _log "step=groupdel action=skip reason=absent"
-fi
-if [ "\$HAVE_STATE" -eq 1 ] && [ -n "\$OPS_ADDED" ]; then
-    printf '%s\n' "\$OPS_ADDED" | while IFS= read -r _op; do
+# Revoke sandbox group membership for all current members before groupdel.
+# Derive the member list from getent rather than relying solely on OPS_ADDED —
+# the recorded list may be incomplete on upgrade-lineage hosts.
+_live_members=\$(getent group sandbox 2>/dev/null | cut -d: -f4 | tr ',' '\n' | awk 'NF' || true)
+# Merge recorded operators with live members so neither source is missed.
+_all_ops=\$(
+    { printf '%s\n' "\$OPS_ADDED"; printf '%s\n' "\$_live_members"; } \
+    | awk 'NF' | sort -u
+)
+if [ -n "\$_all_ops" ]; then
+    printf '%s\n' "\$_all_ops" | while IFS= read -r _op; do
         [ -n "\$_op" ] || continue
-        if id -nG "\$_op" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
-            gpasswd -d "\$_op" sandbox >> "\$_LOG" 2>/dev/null || true
-            _log "step=group_revoke operator=\$_op"
+        if getent group sandbox 2>/dev/null | cut -d: -f4 | tr ',' '\n' | grep -qx "\$_op"; then
+            gpasswd -d "\$_op" sandbox >> "\$_LOG" 2>/dev/null && _gp_rc=0 || _gp_rc=\$?
+            if [ "\$_gp_rc" -eq 0 ]; then
+                _log "step=group_revoke operator=\$_op action=remove"
+            else
+                _log "step=group_revoke operator=\$_op action=fail rc=\$_gp_rc"
+            fi
         fi
     done
+fi
+if getent group sandbox >/dev/null 2>&1; then
+    groupdel sandbox >> "\$_LOG" 2>&1 && _gd_rc=0 || _gd_rc=\$?
+    if [ "\$_gd_rc" -eq 0 ]; then
+        _log "step=groupdel action=remove"
+    else
+        _log "step=groupdel action=fail rc=\$_gd_rc"
+        _step_fail
+    fi
+else
+    _log "step=groupdel action=skip reason=absent"
 fi
 _step_ok
 _priv_maybe_fail_after "\$_label"
