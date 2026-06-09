@@ -648,10 +648,37 @@ pub(crate) enum GroupMembership {
     },
 }
 
-/// Production implementation of the group-membership resolver. Reads
-/// the current process's uid + supplementary GIDs via `nix::unistd`
-/// and looks up names via `getpwuid_r` / `getgrgid_r`.
+/// Production implementation of the group-membership resolver.
+///
+/// Determines whether the current user is a member of the `sandbox` group by
+/// consulting the user's *configured* group set — the union of the primary
+/// group from `/etc/passwd` and the supplementary groups from `/etc/group`,
+/// as returned by `getgrouplist(3)`. This is distinct from the live process
+/// groups returned by `getgroups(2)`, which reflect only the groups that were
+/// in effect when the process's session was established.
+///
+/// Using the configured set is correct because operators may run `newgrp
+/// sandbox`, which promotes `sandbox` to the primary group and silently drops
+/// it from the supplementary list — making a `getgroups`-based check
+/// false-negative even though the user is genuinely a member.
 fn real_group_resolver() -> Result<GroupMembership, String> {
+    resolve_group_membership_with_source(nix::unistd::getgrouplist)
+}
+
+/// Inner implementation of the group-membership resolver, parameterised over
+/// the `getgrouplist(3)` syscall so unit tests can inject an arbitrary
+/// configured-group set without touching `/etc/group`.
+///
+/// `groups_source` receives the current user's login name (as a C string)
+/// and primary GID, and must return the full configured GID list as
+/// `getgrouplist(3)` would — that is, the union of the primary GID and every
+/// supplementary GID present in `/etc/group` for that user.
+pub(crate) fn resolve_group_membership_with_source<F>(
+    groups_source: F,
+) -> Result<GroupMembership, String>
+where
+    F: Fn(&std::ffi::CStr, nix::unistd::Gid) -> Result<Vec<nix::unistd::Gid>, nix::errno::Errno>,
+{
     let uid = nix::unistd::Uid::current();
     let user = nix::unistd::User::from_uid(uid)
         .map_err(|e| format!("getpwuid_r: {e}"))?
@@ -661,25 +688,25 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
     let sandbox_group =
         nix::unistd::Group::from_name("sandbox").map_err(|e| format!("getgrnam_r: {e}"))?;
 
-    let groups = nix::unistd::getgroups().map_err(|e| format!("getgroups: {e}"))?;
-    let mut group_names: Vec<String> = Vec::with_capacity(groups.len());
-    for gid in &groups {
+    // Build the configured group set via the injected groups_source, which
+    // in production wraps getgrouplist(3). Reads /etc/group for supplementary
+    // groups and always includes the primary gid.
+    let username_c = std::ffi::CString::new(user.name.as_str())
+        .map_err(|e| format!("CString conversion: {e}"))?;
+    let configured_gids =
+        groups_source(&username_c, user.gid).map_err(|e| format!("getgrouplist: {e}"))?;
+
+    let mut group_names: Vec<String> = Vec::with_capacity(configured_gids.len());
+    for gid in &configured_gids {
         if let Ok(Some(group)) = nix::unistd::Group::from_gid(*gid) {
             group_names.push(group.name);
         }
-    }
-    // `getgroups` historically may omit the primary group; defend
-    // by adding the user's primary gid name when missing.
-    if let Ok(Some(primary)) = nix::unistd::Group::from_gid(user.gid)
-        && !group_names.iter().any(|n| n == &primary.name)
-    {
-        group_names.insert(0, primary.name);
     }
 
     match sandbox_group {
         None => Ok(GroupMembership::SandboxGroupAbsent),
         Some(sg) => {
-            if groups.contains(&sg.gid) || user.gid == sg.gid {
+            if configured_gids.contains(&sg.gid) {
                 let group_names_csv = group_names.join(",");
                 Ok(GroupMembership::Member {
                     user: user_name,
@@ -1964,6 +1991,86 @@ mod tests {
                 );
             }
             other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // A2 regression: configured group membership wins over live process groups
+    // ---------------------------------------------------------------------------
+
+    /// Verifies that `check_group_membership_with` maps a `Member` resolver
+    /// result to a `Pass` check row containing the username and group names.
+    /// This covers the outer predicate logic only; for the `getgrouplist`
+    /// injection path see `configured_member_not_in_live_groups_resolves_member`.
+    #[test]
+    fn group_check_passes_for_configured_member_not_in_live_groups() {
+        let row = check_group_membership_with(|| {
+            Ok(GroupMembership::Member {
+                user: "bob".to_string(),
+                group_names_csv: "sandbox".to_string(),
+            })
+        });
+        match row.outcome {
+            CheckOutcome::Pass { detail } => {
+                assert!(
+                    detail.contains("bob"),
+                    "pass detail must include username; got: {detail}"
+                );
+                assert!(
+                    detail.contains("sandbox"),
+                    "pass detail must include group name; got: {detail}"
+                );
+            }
+            other => {
+                panic!("expected Pass for configured member not in live groups, got {other:?}")
+            }
+        }
+    }
+
+    /// When a user runs `newgrp sandbox`, the shell promotes `sandbox` to the
+    /// primary group and drops it from the supplementary list. A live
+    /// `getgroups(2)` call would then not include the sandbox GID, giving a
+    /// false-negative. `resolve_group_membership_with_source` uses
+    /// `getgrouplist(3)` (via the injected `groups_source`) which reads
+    /// `/etc/group` regardless of the live session state.
+    ///
+    /// This test injects a `groups_source` that returns the sandbox GID
+    /// (simulating what `getgrouplist` returns for a properly configured user
+    /// even after `newgrp` has swapped the group to primary) and asserts that
+    /// the resolver produces `Member`, not `NotMember`.
+    ///
+    /// Requires a `sandbox` group on the host; skips with a message if absent
+    /// (such as in a minimal CI container where setup-dev-env has not been run).
+    #[test]
+    fn configured_member_not_in_live_groups_resolves_member() {
+        // Resolve the sandbox group's GID using the real system database.
+        // On a host where `make setup-dev-env` has been run this will succeed.
+        let sandbox_gid = match nix::unistd::Group::from_name("sandbox") {
+            Ok(Some(g)) => g.gid,
+            Ok(None) => {
+                // No sandbox group on this host — not an error in a minimal container.
+                eprintln!(
+                    "configured_member_not_in_live_groups_resolves_member: \
+                     skipped — no 'sandbox' group on this host"
+                );
+                return;
+            }
+            Err(e) => panic!("getgrnam_r failed: {e}"),
+        };
+
+        // Inject a groups_source that always returns [sandbox_gid], regardless
+        // of what getgroups(2) would show for the live process — simulating a
+        // user who is configured in /etc/group but whose live supplementary
+        // list no longer contains the GID because newgrp promoted it to primary.
+        let result =
+            resolve_group_membership_with_source(|_username, _primary_gid| Ok(vec![sandbox_gid]));
+
+        match result {
+            Ok(GroupMembership::Member { .. }) => {}
+            Ok(other) => {
+                panic!("expected Member when groups_source returns the sandbox GID, got {other:?}")
+            }
+            Err(e) => panic!("resolver returned error: {e}"),
         }
     }
 

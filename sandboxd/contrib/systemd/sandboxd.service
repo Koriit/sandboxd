@@ -14,9 +14,12 @@ Group=sandbox
 
 # Defense-in-depth for the unix socket mode: the daemon explicitly
 # chmod()s sandboxd.sock to 0660 immediately after bind(), but
-# UMask=0117 ensures the inode never even momentarily exists at a
-# more permissive mode under a pre-exec race. The daemon sets this via the socket-path mechanism.
-UMask=0117
+# UMask=0007 ensures the inode never even momentarily exists at a
+# more permissive mode under a pre-exec race. World bits are stripped
+# (no-world), which is sufficient for the socket race-defense; the
+# owner+group execute bits are preserved so the daemon can traverse
+# the directories it creates (session dirs, lite tempdirs).
+UMask=0007
 
 # RuntimeDirectory creates /run/sandbox (tmpfs) with correct ownership/modes.
 # The per-uid state directory /var/lib/sandboxd/<uid> is created explicitly
@@ -52,10 +55,23 @@ Restart=on-failure
 RestartSec=5s
 StartLimitBurst=5
 
-# Hardening — each directive has a one-line rationale in § 4.2.
-NoNewPrivileges=yes
+# Hardening — rationale for each directive below.
+#
+# NoNewPrivileges is intentionally absent: the daemon exec()s setcap helpers
+# (sandbox-route-helper, sandbox-lima-helper) that carry file capabilities.
+# Under NoNewPrivileges the kernel ignores file caps on execve, so the helpers
+# run without their caps and every privileged operation fails (route-helper
+# "setns: EPERM", lima-helper cannot setuid to the operator). The narrow
+# setcap-helper model is the security boundary here, not NNP.
+#
+# ProtectHome is intentionally absent: it masks /home at the mount-namespace
+# level for the entire service. The lima-helper setuid()s to the operator uid
+# before exec'ing limactl, but stays in the service's mount namespace, so
+# ~/.local/bin/limactl (Lima's default install path) becomes invisible.
+# BindReadOnlyPaths cannot glob, so per-operator binds do not scale. The
+# unprivileged daemon (running as the sandbox system user) already cannot read
+# operator home directories via POSIX permissions, making ProtectHome redundant.
 ProtectSystem=full
-ProtectHome=yes
 PrivateTmp=yes
 DeviceAllow=/dev/kvm rw
 

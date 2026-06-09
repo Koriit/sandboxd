@@ -31,20 +31,17 @@ pub enum GatewayStatus {
     /// `/healthcheck.sh` script returned 0), but Envoy has no active
     /// listener yet (`listener_manager.total_listeners_active == 0`).
     ///
-    /// This is the expected verdict during the boot window between
-    /// `create_gateway` returning and the first
-    /// `PolicyDistributor::distribute` call landing — the deny-all
-    /// bootstrap listener (empty `filter_chains`) is rejected by
-    /// Envoy at runtime, so no listener is active until policy is
-    /// applied. It is also the verdict if a policy-compiled listener
-    /// is rejected by LDS at apply time (an on-the-wire regression
-    /// that pre-#52 was masked as `Healthy`).
+    /// This variant is **no longer emitted by `gateway_status`**. The
+    /// nftables deny-all floor is installed at network-create time and
+    /// is unconditionally in place from t0, so a zero Envoy listener
+    /// count does not indicate a policy gap — traffic is already
+    /// blocked. `gateway_status` now reports `Healthy` as soon as all
+    /// components pass the healthcheck, regardless of listener count;
+    /// the listener count is demoted to a debug-level sub-field.
     ///
-    /// Recovery code paths (`gateway_monitor`, network reconciliation)
-    /// treat `Starting` as non-actionable — like `Healthy`, it does
-    /// not trigger a restart. The visibility this carries is for
-    /// external observers (CLI list, `/sessions/{id}/health`) and
-    /// future policy-distributor diagnostics.
+    /// The variant is retained in the enum so that existing `match`
+    /// arms in callers outside this crate (e.g. the daemon's
+    /// `sandboxd/src/main.rs`) continue to compile without change.
     Starting,
     /// At least one component reported unhealthy.
     Unhealthy(String),
@@ -845,33 +842,18 @@ impl GatewayManager {
 
     /// Check gateway health.
     ///
-    /// Two-stage probe:
+    /// Two-step probe:
     /// 1. Run the in-container `/healthcheck.sh` script (Envoy /ready,
     ///    CoreDNS /health, mitmproxy process, deny-logger /health).
     ///    A non-zero exit code yields `Unhealthy`.
-    /// 2. If healthcheck.sh succeeded, query Envoy admin
-    ///    `/stats?filter=listener_manager.total_listeners_active$&format=text`
-    ///    via `docker exec`. A value `>= 1` yields `Healthy`; a value
-    ///    of `0` yields `Starting`.
-    ///
-    /// The listener-active probe closes the gap between "container
-    /// processes are running" and "Envoy is actually serving traffic".
-    /// Pre-#52 the bootstrap deny-all listener (empty `filter_chains`)
-    /// is rejected by Envoy at runtime — `total_listeners_active` is
-    /// `0` until the first apply-policy lands a populated listener via
-    /// LDS — but `gateway_status` mis-reported `Healthy` throughout
-    /// that window and continued to mis-report `Healthy` if a
-    /// policy-compiled listener was rejected at runtime
-    /// (`lds.update_rejected` ticked but `total_listeners_active`
-    /// stayed at `0`). The two-stage probe surfaces both cases as
-    /// `Starting` instead, distinct from both `Healthy` and `Unhealthy`.
-    ///
-    /// If the listener-count probe itself fails (e.g. admin endpoint
-    /// transient error, container racing through restart), the verdict
-    /// degrades to `Healthy` rather than `Starting` to avoid a flap-
-    /// driven false positive — `Healthy` is the prior behaviour and
-    /// any persistent listener regression will fail the next probe
-    /// cycle anyway.
+    /// 2. If healthcheck.sh succeeded, query Envoy's
+    ///    `listener_manager.total_listeners_active` gauge via
+    ///    `gateway_listener_active_count` and log it at `debug` level for
+    ///    operator visibility. The nftables deny-all floor is in place from
+    ///    t0, so the container is safe to use as soon as step 1 passes —
+    ///    a listener count of zero does not indicate a policy gap. This
+    ///    method always returns `Healthy` once the healthcheck passes;
+    ///    `Starting` is never emitted.
     pub fn gateway_status(&self, session_id: &SessionId) -> Result<GatewayStatus, SandboxError> {
         let container_name = container_name(session_id);
 
@@ -921,19 +903,19 @@ impl GatewayManager {
             return Ok(GatewayStatus::Unhealthy(stdout));
         }
 
-        // Stage 2: probe Envoy's listener_manager.total_listeners_active.
-        // The container processes are healthy; we now distinguish
-        // `Healthy` (>= 1 active listener) from `Starting` (0 active
-        // listeners — boot window or LDS rejection).
-        match self.gateway_listener_active_count(session_id) {
-            Some(0) => Ok(GatewayStatus::Starting),
-            Some(_) => Ok(GatewayStatus::Healthy),
-            // Probe failure: fall through to `Healthy`. See the rustdoc
-            // above — flapping the verdict on a transient admin-endpoint
-            // hiccup would be worse than masking a single sample of a
-            // genuine problem (which surfaces on the next cycle).
-            None => Ok(GatewayStatus::Healthy),
-        }
+        // Stage 2: log the Envoy active-listener count for diagnostics.
+        // The nftables deny-all floor is in place from t0, so the
+        // container is safe to use as soon as the healthcheck passes —
+        // listener count zero does not indicate a policy gap. We record
+        // the count at debug level for operator visibility and always
+        // return Healthy from this point.
+        let listener_count = self.gateway_listener_active_count(session_id);
+        debug!(
+            session_id = %session_id,
+            active_listeners = ?listener_count,
+            "gateway healthcheck passed"
+        );
+        Ok(GatewayStatus::Healthy)
     }
 
     /// Return the value of Envoy's
@@ -942,9 +924,7 @@ impl GatewayManager {
     /// running, admin endpoint not yet ready, transient `docker exec`
     /// error, parse failure).
     ///
-    /// This is the load-bearing primitive for `gateway_status`'s
-    /// `Healthy` vs `Starting` arm — see that method's rustdoc for
-    /// the contract — and is exposed publicly for two reasons:
+    /// Exposed publicly for two reasons:
     ///   - Integration tests under `sandbox-core/tests/gateway_integration.rs`
     ///     assert the count directly to lock in the contract.
     ///   - Any future tooling that wants a raw "is Envoy serving?"

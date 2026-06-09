@@ -755,12 +755,29 @@ check_prereqs() {
     fi
 
     # Lima / KVM: hard-fail when provisioning is on (default); warn-only with --no-provision.
+    #
+    # limactl reachability: the sandbox-lima-helper does NOT use PATH to find
+    # limactl — it probes three absolute paths derived from the operator's passwd
+    # home (pw_dir) in order:
+    #   1. {pw_dir}/.local/bin/limactl   (Lima's default user-local install)
+    #   2. /usr/local/bin/limactl
+    #   3. /usr/bin/limactl
+    # _limactl_helper_reachable below probes the same three absolute candidates
+    # the helper uses at runtime, so install-time and runtime resolution stay
+    # in sync regardless of whether limactl appears on the operator's PATH.
+    _limactl_helper_reachable() {
+        _op_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+        for _p in "$_op_home/.local/bin/limactl" /usr/local/bin/limactl /usr/bin/limactl; do
+            [ -x "$_p" ] && return 0
+        done
+        return 1
+    }
     if [ "$NO_PROVISION" -eq 1 ]; then
-        command -v limactl >/dev/null 2>&1 || add_prov_warn "lima"
+        _limactl_helper_reachable || add_prov_warn "lima"
         command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_prov_warn "qemu-system-$qemu_arch"
         [ -e /dev/kvm ] || add_prov_warn "/dev/kvm"
     else
-        command -v limactl >/dev/null 2>&1 || add_missing "lima"
+        _limactl_helper_reachable || add_missing "lima"
         command -v "qemu-system-$qemu_arch" >/dev/null 2>&1 || add_missing "qemu-system-$qemu_arch"
         [ -e /dev/kvm ] || add_missing "/dev/kvm"
     fi

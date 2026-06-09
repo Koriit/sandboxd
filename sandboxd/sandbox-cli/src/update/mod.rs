@@ -206,9 +206,33 @@ pub fn detect_host_arch() -> String {
 }
 
 /// Read the install state file at `path`. Returns `Ok(None)` when the
-/// file is absent. Uses `sudo -n cat` because the parent directory is
-/// `0750 sandbox:sandbox` and the operator does not have read access.
+/// file is absent or unreadable via all available methods.
+///
+/// Read strategy (first success wins):
+/// 1. Direct unprivileged read via `std::fs::read`. Succeeds when the
+///    invoker owns the file or holds read permission on the path
+///    (e.g. the `sandbox` system user, or a dev whose uid owns the
+///    state dir). This is the only path available to users who cannot
+///    run `sudo`.
+/// 2. `sudo -n cat` fallback. Succeeds when the operator has warmed
+///    `sudo` credentials (e.g. the stateful update path that calls
+///    `sudo -v` up front) but cannot traverse the `0750 sandbox:sandbox`
+///    parent directory directly.
+/// 3. Both fail → `Ok(None)`. The caller is responsible for deciding
+///    whether that is an error or an acceptable degradation.
 pub fn read_install_state(path: &Path) -> std::io::Result<Option<InstallState>> {
+    // Direct read — no privilege required. Covers: file owner (sandbox
+    // system user), root, and any operator whose primary/supplementary
+    // groups grant read access to the state dir.
+    if let Ok(bytes) = std::fs::read(path) {
+        return match serde_json::from_slice::<InstallState>(&bytes) {
+            Ok(s) => Ok(Some(s)),
+            Err(_) => Ok(None),
+        };
+    }
+
+    // Privilege-escalated fallback — for operators who have warmed sudo
+    // credentials (stateful path) but cannot traverse the 0750 parent dir.
     let out = std::process::Command::new("sudo")
         .args(["-n", "cat", path.to_str().unwrap_or("")])
         .output()?;
@@ -1278,45 +1302,78 @@ pub async fn run(args: UpdateArgs) -> i32 {
     // Warm sudo credentials once so subsequent `sudo -n ...` sub-commands
     // can run non-interactively. We do this early — before the dev-mode
     // state-file check — because `sudo -n test -e` needs live credentials.
-    match Command::new("sudo").args(["-v"]).status() {
-        Ok(s) if s.success() => {
-            log_step("sudo_warm", "status=ok");
-        }
-        Ok(s) => {
-            log_step(
-                "sudo_warm",
-                &format!("status=fail code={}", s.code().unwrap_or(-1)),
-            );
-            eprintln!("sandbox update: `sudo -v` failed — cannot acquire operator privileges");
-            return 1i32;
-        }
-        Err(e) => {
-            log_step("sudo_warm", &format!("status=fail err=\"{e}\""));
-            eprintln!("sandbox update: failed to invoke sudo: {e}");
-            return 1i32;
+    //
+    // Read-only modes (--check / --dry-run) must never acquire privilege:
+    // they read what is visible to the calling user and degrade gracefully
+    // when a privileged read would be needed for richer output.
+    if !args.is_read_only() {
+        match Command::new("sudo").args(["-v"]).status() {
+            Ok(s) if s.success() => {
+                log_step("sudo_warm", "status=ok");
+            }
+            Ok(s) => {
+                log_step(
+                    "sudo_warm",
+                    &format!("status=fail code={}", s.code().unwrap_or(-1)),
+                );
+                eprintln!("sandbox update: `sudo -v` failed — cannot acquire operator privileges");
+                return 1i32;
+            }
+            Err(e) => {
+                log_step("sudo_warm", &format!("status=fail err=\"{e}\""));
+                eprintln!("sandbox update: failed to invoke sudo: {e}");
+                return 1i32;
+            }
         }
     }
 
     // Dev-mode detect / refuse.
+    //
+    // In read-only mode the install-state directory is 0750 sandbox:sandbox
+    // and there are no warm sudo credentials, so `is_dev_mode`'s
+    // `sudo -n test -e` will fail and fall back to an unprivileged stat that
+    // also fails — producing a false `state_missing = true`. When in
+    // read-only mode, `state_missing` alone is therefore not evidence of a
+    // dev environment; only a missing systemd unit is conclusive. We skip the
+    // refusal and let the caller degrade to `InstallState::unknown_with_host_arch()`.
     let install_state_path = resolve_state_path(".install-state.json");
-    if let Some(reason) = is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), &install_state_path) {
-        log_step(
-            "dev_mode_check",
-            &format!(
-                "is_dev=1 unit_missing={} state_missing={} action=refuse status=fail",
-                reason.unit_missing, reason.state_missing
-            ),
-        );
-        eprintln!("{}", dev_mode_refusal_text(&reason));
-        if operator_needs_group_activation() {
-            eprintln!(
-                "hint: you are in the `sandbox` group but it is not active in this session.\n\
-                 Run `newgrp sandbox` and retry, or log out and back in."
+    let dev_mode_reason = is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), &install_state_path);
+    let skip_refusal = args.is_read_only()
+        && dev_mode_reason
+            .as_ref()
+            .map(|r| !r.unit_missing)
+            .unwrap_or(false);
+    if let Some(ref reason) = dev_mode_reason {
+        if skip_refusal {
+            log_step(
+                "dev_mode_check",
+                &format!(
+                    "is_dev=unknown unit_missing=false state_missing={} \
+                     action=degrade_read_only status=ok",
+                    reason.state_missing
+                ),
             );
+        } else {
+            log_step(
+                "dev_mode_check",
+                &format!(
+                    "is_dev=1 unit_missing={} state_missing={} action=refuse status=fail",
+                    reason.unit_missing, reason.state_missing
+                ),
+            );
+            eprintln!("{}", dev_mode_refusal_text(reason));
+            if operator_needs_group_activation() {
+                eprintln!(
+                    "hint: you are in the `sandbox` group but it is not active in this session.\n\
+                     Run `newgrp sandbox` and retry, or log out and back in."
+                );
+            }
+            return 2i32;
         }
-        return 2i32;
     }
-    log_step("dev_mode_check", "is_dev=0 action=continue status=ok");
+    if dev_mode_reason.is_none() {
+        log_step("dev_mode_check", "is_dev=0 action=continue status=ok");
+    }
     // Emit group-activation hint when the operator is listed in the
     // `sandbox` group DB entry but the group is absent from their live
     // session — fires on the success path as well as any early-exit paths
@@ -2296,18 +2353,25 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // stripped by the binary-overwrite in the install step above, so
     // setcap must always run after installation even if the binary was
     // already present and skipped. Sequenced here — before daemon start —
-    // because the daemon hard-refuses to start without cap_setuid+ep on
+    // because the daemon hard-refuses to start without cap_setuid=ep on
     // the lima-helper; running setcap after start_daemon would guarantee
     // a start failure and trigger recovery.
+    //
+    // The `=ep` form is used for both the `setcap` invocation and the
+    // `getcap` output match. `setcap` accepts both `+ep` and `=ep` as
+    // input (they are equivalent), but `getcap` (libcap ≥2.42) always
+    // emits the `=` form — using `+ep` as a substring match against
+    // `getcap` output would never match, causing a spurious "not set"
+    // failure. The route-helper constant uses `=eip` for the same reason.
     {
         let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let lima_caps = "cap_setuid+ep";
+        let lima_caps = "cap_setuid=ep";
         let cur_out = Command::new("getcap").arg(lima_helper).output();
         let current = cur_out
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let already_set = current.contains(lima_caps);
+        let already_set = getcap_output_has_cap(&current, lima_caps);
         if already_set {
             log_step(
                 "install_lima_helper",
@@ -2359,17 +2423,17 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     }
 
     // Verify lima-helper capabilities.
-    // Post-install check: getcap must confirm cap_setuid+ep is present so
+    // Post-install check: getcap must confirm cap_setuid=ep is present so
     // the next session create does not fail with permission-denied at the
     // uid-map step.
     {
         let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let required_cap = "cap_setuid+ep";
+        let required_cap = "cap_setuid=ep";
         let verify_out = Command::new("getcap").arg(lima_helper).output();
         match verify_out {
             Ok(o) => {
                 let caps = String::from_utf8_lossy(&o.stdout);
-                if caps.contains(required_cap) {
+                if getcap_output_has_cap(&caps, required_cap) {
                     log_step(
                         "setcap_lima_helper",
                         &format!("caps={required_cap} verify=pass status=ok"),
@@ -2380,8 +2444,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                         &format!("caps={required_cap} verify=fail getcap={}", caps.trim()),
                     );
                     eprintln!(
-                        "sandbox update: cap_setuid+ep not set on {lima_helper} after setcap — \
-                         manual recovery: sudo setcap cap_setuid+ep {lima_helper}"
+                        "sandbox update: cap_setuid=ep not set on {lima_helper} after setcap — \
+                         manual recovery: sudo setcap cap_setuid=ep {lima_helper}"
                     );
                     eprint!(
                         "{}",
@@ -2770,10 +2834,32 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // membership, socket reachability — are actually caught. The new binary
     // is exec'd directly; `SANDBOX_SOCKET` is planted explicitly because the
     // operator may not have it set in the environment that `sudo` inherited.
-    let doctor = Command::new("/usr/local/bin/sandbox")
-        .args(["doctor", "--verbose"])
-        .env("SANDBOX_SOCKET", "/run/sandbox/sandboxd.sock")
-        .output();
+    //
+    // When running as root under `sudo sandbox update`, de-escalate to the
+    // invoking operator via `sudo -u <operator> env SANDBOX_SOCKET=...`.
+    // This makes doctor's C4 (sandbox-group membership) resolve against the
+    // operator's actual groups rather than root's — which is never in the
+    // sandbox group. Fall back to the direct invocation when no operator can
+    // be determined (e.g. genuine root login with no SUDO_USER), so a
+    // completed upgrade is never stranded by a missing env var.
+    let sock = "/run/sandbox/sandboxd.sock";
+    let doctor = match sudo_user_operator() {
+        Some(operator) => Command::new("sudo")
+            .args([
+                "-u",
+                &operator,
+                "env",
+                &format!("SANDBOX_SOCKET={sock}"),
+                "/usr/local/bin/sandbox",
+                "doctor",
+                "--verbose",
+            ])
+            .output(),
+        None => Command::new("/usr/local/bin/sandbox")
+            .args(["doctor", "--verbose"])
+            .env("SANDBOX_SOCKET", sock)
+            .output(),
+    };
     match doctor {
         Ok(o) if o.status.success() => {
             log_step("doctor", "result=pass status=ok");
@@ -3056,6 +3142,35 @@ fn render_systemd_unit(template: &str, base_dir: &str) -> Result<Vec<u8>, String
     Ok(rendered.into_bytes())
 }
 
+/// Return `true` if `getcap` stdout contains the capability string `cap`.
+///
+/// `getcap` (libcap ≥2.42, as shipped on Ubuntu 22.04+) emits the `=` form:
+/// e.g. `"/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n"`.
+/// The `setcap` *input* syntax accepts both `cap_setuid+ep` and `cap_setuid=ep`,
+/// but getcap output always uses `=`. Matching against `+ep` would never
+/// succeed — use the `=` form for both constants and this check.
+fn getcap_output_has_cap(getcap_stdout: &str, cap: &str) -> bool {
+    getcap_stdout.contains(cap)
+}
+
+/// Return the operator username when this process was invoked through `sudo`.
+///
+/// `sudo` sets `SUDO_USER` to the uid of the user who ran `sudo <cmd>`.
+/// When `sandbox update` is invoked as `sudo sandbox update`, `SUDO_USER`
+/// is the operator whose environment doctor needs to check — group membership,
+/// socket reachability — rather than root's.
+///
+/// Returns `None` when not running under sudo, when `SUDO_USER` is empty, or
+/// when the value is not a valid (non-empty, non-"root") username.
+fn sudo_user_operator() -> Option<String> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    // Treat empty or the literal string "root" as "no operator to de-escalate to".
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    Some(user)
+}
+
 /// Format the recovery block printed after any stateful-step failure.
 ///
 /// Two modes:
@@ -3114,7 +3229,7 @@ fn recovery_guidance_ex(
                  \n\
                  After restoring, re-enable capabilities:\n\
                  \x20 sudo setcap cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip {route_helper}\n\
-                 \x20 sudo setcap cap_setuid+ep {lima_helper}\n\
+                 \x20 sudo setcap cap_setuid=ep {lima_helper}\n\
                  \n\
                  To retry the upgrade after fixing the issue above:\n\
                  \x20 sudo sandbox update --yes\n",
@@ -4052,6 +4167,32 @@ mod tests {
         assert!(got.is_none());
     }
 
+    /// `read_install_state` parses a directly-readable state file without
+    /// needing `sudo`. Covers the direct-read-first path: a user who owns
+    /// the state file (e.g. the `sandbox` system user running
+    /// `sandbox update --check`) can read it without privilege escalation.
+    #[test]
+    fn install_state_read_returns_parsed_state_from_readable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(".install-state.json");
+        std::fs::write(
+            &p,
+            br#"{"installed_version":"0.1.5","installed_arch":"x86_64-unknown-linux-gnu","installed_at":"2026-01-01T00:00:00Z","installed_by_operator":"sandbox"}"#,
+        )
+        .unwrap();
+        let got = read_install_state(&p)
+            .expect("read_install_state must not error on a readable file")
+            .expect("read_install_state must return Some for a valid state file");
+        assert_eq!(
+            got.installed_version, "0.1.5",
+            "installed_version must round-trip from the state file"
+        );
+        assert_eq!(
+            got.installed_arch, "x86_64-unknown-linux-gnu",
+            "installed_arch must round-trip from the state file"
+        );
+    }
+
     /// `resolve_install_log_path` honours a non-empty
     /// `$SANDBOXD_INSTALL_LOG` value verbatim (the documented contract env
     /// override). Pure-function test — pinned against a synthetic
@@ -4527,5 +4668,167 @@ mod tests {
             std::path::PathBuf::from("/var/lib/sandbox/sessions.db"),
             "on a dev host (no sandbox user) resolve_state_path must return the legacy path"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // A1 regression: read-only modes must never acquire privilege
+    // ---------------------------------------------------------------------------
+
+    /// `--check` and `--dry-run` are read-only modes; `is_read_only()` must
+    /// return `true` for both. The sudo warm is gated on `!is_read_only()`,
+    /// so these modes can never trigger a password prompt or abort when the
+    /// caller lacks sudo.
+    #[test]
+    fn is_read_only_true_for_check() {
+        let mut a = base_args();
+        a.check = true;
+        assert!(
+            a.is_read_only(),
+            "--check must be a read-only mode (is_read_only() == true)"
+        );
+    }
+
+    #[test]
+    fn is_read_only_true_for_dry_run() {
+        let mut a = base_args();
+        a.dry_run = true;
+        assert!(
+            a.is_read_only(),
+            "--dry-run must be a read-only mode (is_read_only() == true)"
+        );
+    }
+
+    #[test]
+    fn is_read_only_false_for_stateful_run() {
+        let a = base_args();
+        assert!(
+            !a.is_read_only(),
+            "default args (no --check / --dry-run) must not be a read-only mode"
+        );
+    }
+
+    /// Read-only mode (`--check` / `--dry-run`) must not refuse when the
+    /// install-state file is unreadable but the systemd unit exists.
+    ///
+    /// The install-state directory is `0750 sandbox:sandbox`. Without warm
+    /// sudo credentials (deliberately not acquired in read-only mode), both
+    /// `sudo -n test -e` and the unprivileged `path.exists()` fallback may
+    /// return false — making `is_dev_mode` report `state_missing = true` even
+    /// on a genuine system install. Refusing in that case would break every
+    /// `--check`/`--dry-run` invocation by a non-root operator.
+    #[test]
+    fn read_only_does_not_refuse_when_state_unreadable_and_unit_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("sandboxd.service");
+        let state = tmp.path().join(".install-state.json");
+        // Unit present, state absent → simulates 0750-unreadable state dir.
+        std::fs::write(&unit, b"[Unit]\n").unwrap();
+        let dev_mode_reason = is_dev_mode(&unit, &state);
+        // Sanity: is_dev_mode must fire (state_missing=true, unit_missing=false).
+        let reason = dev_mode_reason
+            .as_ref()
+            .expect("is_dev_mode must return Some when state is absent");
+        assert!(
+            !reason.unit_missing,
+            "unit_missing must be false (unit exists)"
+        );
+        assert!(
+            reason.state_missing,
+            "state_missing must be true (state absent)"
+        );
+        // Core assertion: the skip_refusal logic must evaluate to true for
+        // a read-only UpdateArgs under this condition.
+        let mut args = base_args();
+        args.check = true;
+        let skip_refusal = args.is_read_only()
+            && dev_mode_reason
+                .as_ref()
+                .map(|r| !r.unit_missing)
+                .unwrap_or(false);
+        assert!(
+            skip_refusal,
+            "read-only mode must not refuse when only state_missing=true and unit present"
+        );
+        // Stateful mode must NOT skip.
+        let stateful = base_args();
+        let skip_stateful = stateful.is_read_only()
+            && dev_mode_reason
+                .as_ref()
+                .map(|r| !r.unit_missing)
+                .unwrap_or(false);
+        assert!(
+            !skip_stateful,
+            "stateful mode must still refuse when state is missing"
+        );
+    }
+
+    /// `getcap_output_has_cap` must match the `=` form that libcap ≥2.42 emits
+    /// and must not match an uncapped or unrelated output line.
+    ///
+    /// libcap ≥2.42 (Ubuntu 22.04+) always prints the `=` form:
+    ///   `/path/to/binary cap_setuid=ep`
+    /// The `setcap` input syntax accepts `+ep` but `getcap` never emits it.
+    /// Matching `+ep` against `getcap` output would always return false —
+    /// confirming that only the `=ep` form works as a substring match here.
+    #[test]
+    fn getcap_output_has_cap_matches_equals_form() {
+        let realistic_output = "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n";
+
+        // The `=ep` form must match.
+        assert!(
+            getcap_output_has_cap(realistic_output, "cap_setuid=ep"),
+            "must match the getcap `=ep` output form"
+        );
+        // The `+ep` setcap-input form must NOT match getcap output.
+        assert!(
+            !getcap_output_has_cap(realistic_output, "cap_setuid+ep"),
+            "must not match the setcap `+ep` input form against getcap output"
+        );
+        // Empty/uncapped output (file has no caps, getcap prints nothing).
+        assert!(
+            !getcap_output_has_cap("", "cap_setuid=ep"),
+            "must not match empty getcap output"
+        );
+        // Unrelated caps line must not match.
+        let route_output = "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                            cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n";
+        assert!(
+            !getcap_output_has_cap(route_output, "cap_setuid=ep"),
+            "must not match when only unrelated caps are present"
+        );
+    }
+
+    // sudo_user_operator reads SUDO_USER from the environment.
+    // These tests manipulate the process environment, so they must not run
+    // concurrently with other env-reading tests. Nextest isolates each test
+    // in its own process, so per-test env mutation is safe here.
+
+    #[test]
+    fn sudo_user_operator_returns_sudo_user_when_set() {
+        // SAFETY: test-only; nextest runs each test in its own process.
+        unsafe { std::env::set_var("SUDO_USER", "alice") };
+        assert_eq!(sudo_user_operator(), Some("alice".to_string()));
+        unsafe { std::env::remove_var("SUDO_USER") };
+    }
+
+    #[test]
+    fn sudo_user_operator_returns_none_when_unset() {
+        unsafe { std::env::remove_var("SUDO_USER") };
+        assert_eq!(sudo_user_operator(), None);
+    }
+
+    #[test]
+    fn sudo_user_operator_returns_none_for_root_sudo_user() {
+        // "root" as SUDO_USER means genuinely running as root without de-escalation target.
+        unsafe { std::env::set_var("SUDO_USER", "root") };
+        assert_eq!(sudo_user_operator(), None);
+        unsafe { std::env::remove_var("SUDO_USER") };
+    }
+
+    #[test]
+    fn sudo_user_operator_returns_none_for_empty_sudo_user() {
+        unsafe { std::env::set_var("SUDO_USER", "") };
+        assert_eq!(sudo_user_operator(), None);
+        unsafe { std::env::remove_var("SUDO_USER") };
     }
 }
