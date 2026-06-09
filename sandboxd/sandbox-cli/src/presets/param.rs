@@ -74,7 +74,8 @@ impl ParsedInvocation {
                         raw: input.to_string(),
                         reason: format!(
                             "param segment '{segment}' is missing '=' between key and value; \
-                             try '{name}:key=value'"
+                             use '{name}:key=value' for parameterized presets \
+                             or '{name}' for parameterless presets"
                         ),
                     });
                 };
@@ -302,14 +303,19 @@ mod tests {
     }
 
     #[test]
-    fn malformed_param_error_suggests_key_value_form() {
-        // A segment without '=' on a parameterized invocation should hint
-        // at the correct invocation syntax.
+    fn malformed_param_error_suggests_both_forms() {
+        // A segment without '=' should hint at both the parameterized form
+        // (name:key=value) AND the bare parameterless form (name), so the
+        // user is not misled into thinking a colon is always required.
         let err = ParsedInvocation::parse("github-repo:not-a-kv-pair").expect_err("should reject");
         let rendered = err.to_string();
         assert!(
             rendered.contains("github-repo:key=value"),
-            "error should suggest the correct form; got: {rendered}"
+            "error should mention the parameterized form; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("parameterless"),
+            "error should mention parameterless presets; got: {rendered}"
         );
     }
 }

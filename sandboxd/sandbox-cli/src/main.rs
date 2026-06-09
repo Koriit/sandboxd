@@ -3031,7 +3031,7 @@ fn user_preset_invocation_example(u: &UserPreset) -> String {
         .params
         .iter()
         .filter(|p| p.required)
-        .map(|p| format!("{}=<{}>", p.name, p.name))
+        .map(|p| format!("{}=<value>", p.name))
         .collect();
     if required_params.is_empty() {
         u.name.clone()
