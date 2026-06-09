@@ -253,7 +253,7 @@ const SOCKET_MODE: u32 = 0o660;
 /// the on-disk mode to verify it. Calling `set_permissions` immediately
 /// after the bind, before the accept loop starts, makes the contract
 /// hold regardless of umask and regardless of whether the operator
-/// remembered to set `UMask=0117` in the systemd drop-in.
+/// remembered to set `UMask=0007` in the systemd drop-in.
 ///
 /// A failure to chmod the socket is fatal: an unenforceable mode is a
 /// silent security regression we will not let through.
@@ -11153,7 +11153,7 @@ mod tests {
     // reads `stat(sock).mode & 0o777` against that constant. The
     // umask of the invoking process is unconstrained (dev shells run
     // at `022`; production systemd units may or may not carry
-    // `UMask=0117`), so the daemon has to chmod the inode itself
+    // `UMask=0007`), so the daemon has to chmod the inode itself
     // immediately after `bind()` returns. This test pins that
     // behavior independently of the umask the test binary was
     // launched under.

@@ -216,13 +216,44 @@ pub fn dump_migration_set() -> Vec<MigrationEntry> {
 /// `NamedTempFile::new_in(parent)` + `persist(path)`. Same-FS rename
 /// guarantees no half-written state — `rename(2)` is atomic when src
 /// and dst are on the same filesystem.
+///
+/// The tempfile is created with mode `0600` by default
+/// (`NamedTempFile::new_in` inherits the process umask, which in a
+/// root context is commonly `0022` — but callers must not depend on
+/// the umask). Before the rename this function forces the canonical
+/// daemon-config mode `0644 root:root` so the daemon can read the
+/// result at startup regardless of how it was invoked.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), MigrationError> {
+    use std::os::unix::fs::PermissionsExt;
+
     let parent = path.parent().ok_or_else(|| {
         MigrationError::Transform(format!("path has no parent directory: {}", path.display()))
     })?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
+
+    // Force 0644 unconditionally — this is the canonical mode for all
+    // daemon config files. NamedTempFile::new_in creates the inode at
+    // 0600; persist renames without changing the mode, so we must fix
+    // it before the rename lands at the destination path.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
+
+    // chown root:root makes the intent unambiguous: config files are
+    // owned by root regardless of the process uid at migration time.
+    // The `apply-config-migrations` subcommand is root-gated, so this
+    // runs as root in production. In unprivileged contexts (tests, dry
+    // runs) chown is a no-op: the caller already owns the tempfile and
+    // set_permissions above has already fixed the mode, which is the
+    // critical property. Attempting chown as non-root would return EPERM.
+    if nix::unistd::geteuid().is_root() {
+        use nix::unistd::{Gid, Uid, chown};
+        let root_uid = Uid::from_raw(0);
+        let root_gid = Gid::from_raw(0);
+        chown(tmp.path(), Some(root_uid), Some(root_gid))
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    }
+
     tmp.persist(path).map_err(|e| MigrationError::Io(e.error))?;
     Ok(())
 }
@@ -1092,5 +1123,40 @@ mod tests {
         // The test cannot yet drive a target_file mismatch (only one
         // variant exists today). The follow-up note above documents
         // what changes when a second TargetFile lands.
+    }
+
+    /// `atomic_write` must produce a file with mode `0644` regardless of
+    /// the process umask. `NamedTempFile::new_in` creates the inode at
+    /// `0600`; if `atomic_write` does not correct this before the rename
+    /// the daemon will be unable to read the migrated config at startup.
+    #[test]
+    fn atomic_write_produces_0644_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let dest = tmp_dir.path().join("users.conf");
+
+        // Seed an existing file at 0600 to confirm the output mode is
+        // forced rather than inherited from the destination inode.
+        std::fs::write(&dest, b"{}").expect("seed dest");
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).expect("seed 0600");
+
+        let content = b"{\"subnets\":[]}";
+        atomic_write(&dest, content).expect("atomic_write must succeed");
+
+        let mode = std::fs::metadata(&dest)
+            .expect("metadata after atomic_write")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o644,
+            "atomic_write must produce mode 0644, got {mode:#o}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read back"),
+            content,
+            "atomic_write must write the supplied bytes"
+        );
     }
 }
