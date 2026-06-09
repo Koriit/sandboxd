@@ -108,3 +108,43 @@ def test_container_backend_rebuild_image_under_systemd(
         f"sandboxd-lite image not found after rebuild-image succeeded\n"
         f"docker image ls output:\n{r_tag.stdout}\nstderr:\n{r_tag.stderr}"
     )
+
+    # Step 5 (optional probe): prove the Rust cmd.env("HOME", ...) is load-bearing.
+    # Inject Environment=HOME=/nonexistent via a systemd drop-in (overriding the
+    # defense-in-depth Environment=HOME=@SANDBOX_BASE_DIR@ line in the unit) to
+    # simulate the broken-HOME environment, then verify rebuild-image still
+    # succeeds. This proves the Rust-level fix does the work — not just the unit
+    # file. Skipped when the test user cannot sudo (shouldn't happen in the VM).
+    r_sudo = vm.shell("sudo -n true", timeout=5)
+    if r_sudo.returncode != 0:
+        return  # cannot create drop-in without sudo — skip
+
+    dropin_dir = "/etc/systemd/system/sandboxd.service.d"
+    dropin_path = f"{dropin_dir}/test-broken-home.conf"
+    vm.shell(f"sudo mkdir -p {dropin_dir}", check=True, timeout=5)
+    vm.shell(
+        f"printf '[Service]\\nEnvironment=HOME=/nonexistent\\n'"
+        f" | sudo tee {dropin_path} > /dev/null",
+        check=True, timeout=5,
+    )
+    try:
+        vm.shell("sudo systemctl daemon-reload", check=True, timeout=15)
+        vm.shell("sudo systemctl restart sandboxd", check=True, timeout=30)
+        wait_for_systemd_active(vm.name, "sandboxd", timeout=30)
+        wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=30)
+
+        r_dropin = vm.shell(
+            "sudo -u sandbox env"
+            " SANDBOX_SOCKET=/run/sandbox/sandboxd.sock"
+            " /usr/local/bin/sandbox rebuild-image --backend container",
+            timeout=300,
+        )
+        assert r_dropin.returncode == 0, (
+            f"rebuild-image failed even with Rust fix in place (drop-in injects "
+            f"HOME=/nonexistent to replicate the pre-fix environment)\n"
+            f"exit={r_dropin.returncode}\n"
+            f"stdout:\n{r_dropin.stdout}\nstderr:\n{r_dropin.stderr}"
+        )
+    finally:
+        vm.shell(f"sudo rm -f {dropin_path}", timeout=5)
+        vm.shell("sudo systemctl daemon-reload", timeout=15)
