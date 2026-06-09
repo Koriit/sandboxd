@@ -206,9 +206,33 @@ pub fn detect_host_arch() -> String {
 }
 
 /// Read the install state file at `path`. Returns `Ok(None)` when the
-/// file is absent. Uses `sudo -n cat` because the parent directory is
-/// `0750 sandbox:sandbox` and the operator does not have read access.
+/// file is absent or unreadable via all available methods.
+///
+/// Read strategy (first success wins):
+/// 1. Direct unprivileged read via `std::fs::read`. Succeeds when the
+///    invoker owns the file or holds read permission on the path
+///    (e.g. the `sandbox` system user, or a dev whose uid owns the
+///    state dir). This is the only path available to users who cannot
+///    run `sudo`.
+/// 2. `sudo -n cat` fallback. Succeeds when the operator has warmed
+///    `sudo` credentials (e.g. the stateful update path that calls
+///    `sudo -v` up front) but cannot traverse the `0750 sandbox:sandbox`
+///    parent directory directly.
+/// 3. Both fail → `Ok(None)`. The caller is responsible for deciding
+///    whether that is an error or an acceptable degradation.
 pub fn read_install_state(path: &Path) -> std::io::Result<Option<InstallState>> {
+    // Direct read — no privilege required. Covers: file owner (sandbox
+    // system user), root, and any operator whose primary/supplementary
+    // groups grant read access to the state dir.
+    if let Ok(bytes) = std::fs::read(path) {
+        return match serde_json::from_slice::<InstallState>(&bytes) {
+            Ok(s) => Ok(Some(s)),
+            Err(_) => Ok(None),
+        };
+    }
+
+    // Privilege-escalated fallback — for operators who have warmed sudo
+    // credentials (stateful path) but cannot traverse the 0750 parent dir.
     let out = std::process::Command::new("sudo")
         .args(["-n", "cat", path.to_str().unwrap_or("")])
         .output()?;
@@ -4083,6 +4107,32 @@ mod tests {
         let p = tmp.path().join("missing.json");
         let got = read_install_state(&p).unwrap();
         assert!(got.is_none());
+    }
+
+    /// `read_install_state` parses a directly-readable state file without
+    /// needing `sudo`. Covers the direct-read-first path: a user who owns
+    /// the state file (e.g. the `sandbox` system user running
+    /// `sandbox update --check`) can read it without privilege escalation.
+    #[test]
+    fn install_state_read_returns_parsed_state_from_readable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(".install-state.json");
+        std::fs::write(
+            &p,
+            br#"{"installed_version":"0.1.5","installed_arch":"x86_64-unknown-linux-gnu","installed_at":"2026-01-01T00:00:00Z","installed_by_operator":"sandbox"}"#,
+        )
+        .unwrap();
+        let got = read_install_state(&p)
+            .expect("read_install_state must not error on a readable file")
+            .expect("read_install_state must return Some for a valid state file");
+        assert_eq!(
+            got.installed_version, "0.1.5",
+            "installed_version must round-trip from the state file"
+        );
+        assert_eq!(
+            got.installed_arch, "x86_64-unknown-linux-gnu",
+            "installed_arch must round-trip from the state file"
+        );
     }
 
     /// `resolve_install_log_path` honours a non-empty
