@@ -143,7 +143,8 @@ fn integration_lite_image_rebuild_fresh_tag_produces_image() {
     let _cleanup = LiteImageCleanup::new(&version);
 
     let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
-    rebuild_lite_image(&version, false, docker_home.path()).expect("rebuild_lite_image must succeed on fresh tag");
+    rebuild_lite_image(&version, false, docker_home.path())
+        .expect("rebuild_lite_image must succeed on fresh tag");
 
     let tag = format!("{LITE_IMAGE_REPOSITORY}:{version}");
     assert!(
@@ -204,7 +205,8 @@ fn integration_lite_image_rebuild_with_no_cache_succeeds() {
     let _cleanup = LiteImageCleanup::new(&version);
 
     let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
-    rebuild_lite_image(&version, true, docker_home.path()).expect("rebuild_lite_image with no_cache=true must succeed");
+    rebuild_lite_image(&version, true, docker_home.path())
+        .expect("rebuild_lite_image with no_cache=true must succeed");
 
     let tag = format!("{LITE_IMAGE_REPOSITORY}:{version}");
     assert!(

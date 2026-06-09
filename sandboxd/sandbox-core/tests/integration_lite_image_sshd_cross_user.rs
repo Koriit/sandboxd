@@ -227,7 +227,8 @@ fn integration_lite_image_sshd_accepts_staged_key_under_cross_user_uid() {
 
     // Step 1: build the lite image via the production code path.
     let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
-    ensure_image(&version, docker_home.path()).expect("ensure_image must succeed for cross-user proof");
+    ensure_image(&version, docker_home.path())
+        .expect("ensure_image must succeed for cross-user proof");
 
     // Step 2: generate a fresh ed25519 keypair. The session-id slot
     // here is purely cosmetic — the in-container sshd does not look

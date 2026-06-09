@@ -155,7 +155,8 @@ fn integration_lite_image_build_first_use_emits_warning_and_tags_image() {
     let _cleanup = LiteImageCleanup::new(&version);
 
     let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
-    let outcome = ensure_image(&version, docker_home.path()).expect("ensure_image must succeed on first use");
+    let outcome =
+        ensure_image(&version, docker_home.path()).expect("ensure_image must succeed on first use");
 
     match outcome {
         EnsureImageOutcome::Built { warning } => {
@@ -186,13 +187,15 @@ fn integration_lite_image_build_second_call_skips_build() {
     let _cleanup = LiteImageCleanup::new(&version);
 
     let docker_home = tempfile::tempdir().expect("per-test docker_home tempdir");
-    let first = ensure_image(&version, docker_home.path()).expect("ensure_image must succeed on first call");
+    let first = ensure_image(&version, docker_home.path())
+        .expect("ensure_image must succeed on first call");
     assert!(
         matches!(first, EnsureImageOutcome::Built { .. }),
         "first call must report Built, got {first:?}"
     );
 
-    let second = ensure_image(&version, docker_home.path()).expect("ensure_image must succeed on second call");
+    let second = ensure_image(&version, docker_home.path())
+        .expect("ensure_image must succeed on second call");
     assert_eq!(
         second,
         EnsureImageOutcome::AlreadyPresent,

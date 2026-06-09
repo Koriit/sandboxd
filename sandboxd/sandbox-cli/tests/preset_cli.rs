@@ -319,8 +319,7 @@ async fn policy_preset_show_github_repo_documents_repo_param() {
 /// the bare (parameterless) preset name — no trailing colon required.
 #[tokio::test]
 async fn policy_preset_show_parameterless_preset_documents_example() {
-    let (status, stdout, stderr) =
-        run_sandbox(&["policy", "preset", "show", "ubuntu"], None).await;
+    let (status, stdout, stderr) = run_sandbox(&["policy", "preset", "show", "ubuntu"], None).await;
     assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
 
     assert!(

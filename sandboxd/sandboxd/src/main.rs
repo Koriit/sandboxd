@@ -1860,7 +1860,8 @@ async fn create_session(
     if backend_kind == BackendKind::Container {
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
         let docker_home = state.base_dir.clone();
-        match tokio::task::spawn_blocking(move || ensure_image(&daemon_version, &docker_home)).await {
+        match tokio::task::spawn_blocking(move || ensure_image(&daemon_version, &docker_home)).await
+        {
             Ok(Ok(EnsureImageOutcome::AlreadyPresent)) => {}
             Ok(Ok(EnsureImageOutcome::Built { warning })) => {
                 // `warning` is `LITE_FIRST_USE_WARNING` verbatim per
