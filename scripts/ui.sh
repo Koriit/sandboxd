@@ -494,7 +494,7 @@ _ui_animator_body() {
 
 # ui_animator_start — start the background detail-line animator.
 # Kills any running animator first. No-op when RICH_UI=0 or UI_TTY is empty.
-# Args: $1=detail_text
+# Args: $1=detail_text (optional; empty string is accepted)
 ui_animator_start() {
     [ "$RICH_UI" -eq 1 ] || return 0
     [ -n "$UI_TTY" ] || return 0
@@ -503,8 +503,8 @@ ui_animator_start() {
         wait "$UI_ANIM_PID" 2>/dev/null || true
         UI_ANIM_PID=0
     fi
-    UI_DETAIL_TEXT="$1"
-    _ui_animator_body "$1" &
+    UI_DETAIL_TEXT="${1:-}"
+    _ui_animator_body "${1:-}" &
     UI_ANIM_PID=$!
 }
 
@@ -603,7 +603,7 @@ _spinner_frame() {
 # spinner_start — begin a spinner animation in the background (rich mode only).
 # In plain mode this is a no-op; the calling code continues unchanged.
 spinner_start() {
-    _ss_label="$1"
+    _ss_label="${1:-}"
 
     # Both plain and rich mode: no background spinner.
     # In rich mode the Phase-6/8 animator owns the detail line; a separate

@@ -242,6 +242,10 @@ PHASE_CMD_FIFO=""
 _phase_reader_pid=0
 _consumer_pid=0
 
+# PID of the background tee process that mirrors fd 2 to the log.
+# 0 = no tee running (plain exec 2>> used or log not writable).
+_stderr_tee_pid=0
+
 # ----------------------------------------------------------------------------
 # Helper functions.
 # ----------------------------------------------------------------------------
@@ -329,6 +333,43 @@ ensure_install_log() {
     fi
 }
 
+# setup_stderr_log — redirect fd 2 so fatal shell errors (set -u aborts,
+# command stderr) are captured in the install log.
+#
+# Under the rich-UI alt-screen, stderr output is scribbled over and wiped on
+# exit, making failures impossible to diagnose from the log. This function
+# patches that gap.
+#
+# Strategy: if the log is writable from the current process, open a FIFO and
+# run a background `tee` so errors land in BOTH the log and the terminal.
+# If the log is not directly writable (e.g. the operator does not own it and
+# sudo -n is unavailable), fall back to log-only via `exec 2>>`.
+#
+# POSIX-portable — no bash `2> >(...)` process substitution. Called after
+# TMPDIR_INSTALL is set up; cleanup_tmpdir flushes the tee on EXIT.
+setup_stderr_log() {
+    [ -n "$TMPDIR_INSTALL" ] || return 0
+    if [ -w "$INSTALL_LOG" ]; then
+        # Log is writable: tee stderr to both terminal and log.
+        _sl_fifo="$TMPDIR_INSTALL/stderr.fifo"
+        mkfifo "$_sl_fifo"
+        tee -a "$INSTALL_LOG" < "$_sl_fifo" >&2 &
+        _stderr_tee_pid=$!
+        exec 2> "$_sl_fifo"
+    elif [ -e "$INSTALL_LOG" ] && sudo -n tee -a "$INSTALL_LOG" < /dev/null >/dev/null 2>&1; then
+        # Log exists but is only writable via sudo: use sudo tee for the mirror.
+        _sl_fifo="$TMPDIR_INSTALL/stderr.fifo"
+        mkfifo "$_sl_fifo"
+        # sudo doesn't affect shell redirects; run tee in a subshell whose
+        # stdin is the FIFO so the privilege escalation applies to tee's I/O.
+        ( sudo -n tee -a "$INSTALL_LOG" >&2 ) < "$_sl_fifo" &
+        _stderr_tee_pid=$!
+        exec 2> "$_sl_fifo"
+    fi
+    # If neither path works (e.g. no log yet and sudo not available), stderr
+    # stays on the terminal — diagnosability degrades gracefully.
+}
+
 cleanup_tmpdir() {
     _ct_exit=$?
     # Kill background processes that may still be running if we are aborting
@@ -341,6 +382,15 @@ cleanup_tmpdir() {
     if [ "$_phase_reader_pid" -gt 0 ]; then
         kill "$_phase_reader_pid" 2>/dev/null || true
         wait "$_phase_reader_pid" 2>/dev/null || true
+    fi
+    # Flush the stderr tee: restore fd 2 to the terminal (closing the FIFO
+    # write-end), then wait for the tee process to drain and exit.  Must happen
+    # before TMPDIR_INSTALL is removed (the FIFO lives there) and before
+    # ui_teardown (which uses fd 2 for rmcup).
+    if [ "$_stderr_tee_pid" -gt 0 ]; then
+        exec 2>/dev/tty || exec 2>/dev/null || true
+        wait "$_stderr_tee_pid" 2>/dev/null || true
+        _stderr_tee_pid=0
     fi
     ui_teardown
     if [ "$_ct_exit" -ne 0 ]; then
@@ -990,12 +1040,8 @@ cosign_bootstrap() {
     dest="$TMPDIR_INSTALL/cosign"
     source_kind="download"
 
-    # spinner_run handles plain-mode "begin / end" output and rich-mode
-    # spinner animation. Both paths run the curl in the same process context
-    # (background in rich, foreground in plain) — the curl exit code is
-    # propagated by spinner_run.
-    if spinner_run "downloading cosign ${COSIGN_VERSION}" \
-        curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$cosign_url" 2>/dev/null; then
+    download_with_bar "$cosign_url" "$dest"
+    if [ "$DOWNLOAD_BAR_FAILED" -eq 0 ]; then
         actual=$(sha256sum "$dest" | awk '{print $1}')
         if [ "$actual" != "$expected" ]; then
             die "cosign checksum mismatch (expected $expected got $actual)"
@@ -1052,9 +1098,9 @@ tarball_fetch() {
         download_with_bar "$tarball_url" "$tarball_dest"
         [ "$DOWNLOAD_BAR_FAILED" -eq 0 ] || die "failed to download $tarball_url"
 
-        # Sigstore bundle is small — plain curl, no bar.
-        curl -fsSL --retry 3 --retry-delay 2 -o "$bundle_dest" "$bundle_url" \
-            || die "failed to download $bundle_url"
+        # Sigstore bundle — also via download_with_bar for a consistent bar.
+        download_with_bar "$bundle_url" "$bundle_dest"
+        [ "$DOWNLOAD_BAR_FAILED" -eq 0 ] || die "failed to download $bundle_url"
 
         source_label="$tarball_url"
     fi
@@ -1703,6 +1749,11 @@ fi
 # lifetime so the parent read loop sees a single continuous stream
 # and does not hit spurious EOF between individual step writes.
 exec 3> "\$_FIFO"
+
+# Capture stderr into the log.  The child runs as root so the log is always
+# writable.  This ensures that set -u aborts and command error messages are
+# recorded even when the parent's UI hides the terminal's stderr stream.
+exec 2>> "\$_LOG"
 
 # EXIT trap: when set -e aborts mid-step (an unguarded command failure), the
 # child exits non-zero without ever calling _step_fail, so the parent never
@@ -2774,7 +2825,7 @@ run_provision() {
             set_phase "$_prov_phase" "active" "building $_prov_backend image" || true
         fi
         if [ "$RICH_UI" -eq 1 ]; then
-            ui_animator_start || true
+            ui_animator_start "building $_prov_backend image" || true
         else
             emit "${BLUE}...${RESET} building $_prov_backend image"
         fi
@@ -2878,6 +2929,7 @@ main() {
     ui_enter_alt_screen
 
     ensure_install_log
+    setup_stderr_log
 
     if [ "$RICH_UI" -eq 1 ]; then
         ui_init_phases "$UI_ACQUIRE_PHASES"
