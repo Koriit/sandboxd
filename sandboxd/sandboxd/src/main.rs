@@ -1470,7 +1470,9 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/exec", post(exec_in_session))
         .route(
             "/sessions/{id}/policy",
-            post(update_policy).delete(clear_policy),
+            get(get_policy_handler)
+                .post(update_policy)
+                .delete(clear_policy),
         )
         .route(
             "/sessions/{id}/workspace-lock",
@@ -4595,6 +4597,73 @@ async fn clear_policy(
     }
 }
 
+/// `GET /sessions/{id}/policy` -- fetch the current policy for a session
+/// as a bare [`Policy`] document.
+///
+/// Returns the flat expanded rule list that is currently applied to the
+/// session. The response shape is `{"version":"2.0.0","rules":[...]}` —
+/// exactly what `sandbox policy update --policy <file>` accepts — so
+/// dump → edit → apply round-trips losslessly. Note that `source_presets`
+/// (preset attribution metadata) is not part of the stored policy and is
+/// intentionally absent from the dump; only the expanded rule set is
+/// returned.
+///
+/// When no explicit policy has been set (fail-closed default), returns a
+/// valid empty policy document (`rules: []`). This is semantically
+/// consistent: an empty rule set is the deny-all default, and the caller
+/// gets an editable template rather than a 404.
+///
+/// The in-memory `session_policies` map is the runtime source of truth;
+/// the persistent store is consulted as a fallback so that a policy
+/// survives stop/start cycles (the map is cleared on stop).
+async fn get_policy_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    // Check in-memory map first — that is the runtime source of truth.
+    let policy_opt = {
+        let policies = state.session_policies.lock().await;
+        policies.get(&session.id).cloned()
+    };
+
+    // Fall back to the persistent store when the map entry is absent.
+    // This happens after a stop/start cycle: the map is cleared on stop
+    // but the store retains the policy for the next start's restoration.
+    let policy_opt = match policy_opt {
+        Some(p) => Some(p),
+        None => {
+            let store = Arc::clone(&state.store);
+            let session_id = session.id;
+            let caller = operator.name.clone();
+            match tokio::task::spawn_blocking(move || store.get_policy(&session_id, &caller)).await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => return error_response(e).into_response(),
+                Err(e) => {
+                    return error_response(SandboxError::Internal(format!(
+                        "store task panicked: {e}"
+                    )))
+                    .into_response();
+                }
+            }
+        }
+    };
+
+    let policy = policy_opt.unwrap_or_else(|| sandbox_core::Policy {
+        version: sandbox_core::policy::SCHEMA_VERSION.to_string(),
+        rules: vec![],
+    });
+
+    (StatusCode::OK, Json(policy)).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Workspace-lock handlers
 // ---------------------------------------------------------------------------
@@ -7209,10 +7278,12 @@ async fn version_handler() -> impl IntoResponse {
 ///   `kvm_writable`, `gateway_image_present`, `lite_image_present`,
 ///   `gateway_image_probe_failed`, `lite_image_probe_failed`,
 ///   `gateway_image_probe_error`, `lite_image_probe_error`,
-///   `users_conf_pool`. The `*_probe_failed` companions to the
-///   image-presence booleans distinguish "docker reports image
-///   absent" from "probe could not run" per the documented contract so
-///   doctor's C7/C8 can emit the right operator hint.
+///   `lima_base_image_present`, `lima_base_image_probe_failed`,
+///   `lima_base_image_probe_error`, `users_conf_pool`. The
+///   `*_probe_failed` companions to the image-presence booleans
+///   distinguish "image absent" from "probe could not run" per the
+///   documented contract so doctor's C7/C8/C14 can emit the right
+///   operator hint.
 /// - **Per-operator scoped data** (filtered by `caller_username`
 ///   from `OperatorIdentity`): `guest_version_drift`,
 ///   `substrate_orphans`.
@@ -7323,6 +7394,36 @@ async fn diagnostics_handler(
             ),
         }
     };
+
+    // Lima base-image probe: check whether the operator's base VM
+    // (`sandbox-base`) exists in their LIMA_HOME. Three outcomes per
+    // the documented contract — present, absent, or probe-failed — so
+    // doctor's C14 can emit the right operator hint. Any error
+    // (lima-helper unreachable, limactl missing/timeout, Lima backend
+    // not set up) becomes probe_failed, not a hard endpoint failure.
+    let lima_base_probe = {
+        let result = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(lima_mgr) => tokio::task::spawn_blocking(move || lima_mgr.check_base_image()).await,
+            Err(e) => {
+                // manager_for failed (e.g. LIMA_HOME provisioning
+                // error) — treat as a probe failure so C14 surfaces
+                // the "lima-helper reachable?" hint rather than
+                // silently reporting the image absent.
+                Ok(Err(e))
+            }
+        };
+        match result {
+            Ok(Ok(sandbox_core::BaseImageStatus::Missing)) => (false, None),
+            Ok(Ok(_)) => (true, None),
+            Ok(Err(e)) => (false, Some(format!("{e}"))),
+            Err(e) => (
+                false,
+                Some(format!("daemon-side probe task failed to run: {e}")),
+            ),
+        }
+    };
+    let lima_base_image_present = lima_base_probe.0;
+    let lima_base_image_probe_error = lima_base_probe.1;
 
     let gateway_image_present = gateway_probe.0;
     let lite_image_present = lite_probe.0;
@@ -7479,6 +7580,15 @@ async fn diagnostics_handler(
         "gateway_image_probe_error": gateway_image_probe_error,
         "lite_image_probe_failed": lite_image_probe_error.is_some(),
         "lite_image_probe_error": lite_image_probe_error,
+        // Lima base-image probe: same three-state contract as C7/C8.
+        // `lima_base_image_probe_failed` discriminates "image absent"
+        // (probe ran, base VM not found) from "probe could not run"
+        // (lima-helper unreachable, limactl missing, etc.). Old CLIs
+        // that omit these fields via `#[serde(default)]` degrade
+        // gracefully to the "absent" branch.
+        "lima_base_image_present": lima_base_image_present,
+        "lima_base_image_probe_failed": lima_base_image_probe_error.is_some(),
+        "lima_base_image_probe_error": lima_base_image_probe_error,
         "users_conf_pool": users_conf_pool,
         "guest_version_drift": guest_version_drift,
         "substrate_orphans": {
@@ -11435,5 +11545,123 @@ mod tests {
         .await;
         assert_eq!(result, None);
         assert_eq!(calls, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // policy dump round-trip fidelity
+    //
+    // The GET handler serialises a Policy as Json(policy); the CLI
+    // deserialises the response body back into a Policy.  These two steps
+    // must be perfectly invertible: serialize → deserialize must yield the
+    // original value with no loss.
+    //
+    // This test exercises a non-trivial Policy containing rules at multiple
+    // assurance levels (including Http with http_filters) to cover the
+    // flattened serde representation of AssuranceLevel.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn policy_dump_round_trip_serialize_deserialize_is_lossless() {
+        use sandbox_core::policy::SCHEMA_VERSION;
+        use sandbox_core::{
+            AssuranceLevel, Destination, HttpFilter, HttpMethod, Policy, PolicyRule, Protocol,
+        };
+
+        let original = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    host: Destination::Domain("api.github.com".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: Some("GitHub API".to_string()),
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![
+                            HttpFilter {
+                                method: HttpMethod::Get,
+                                path: "/repos/*".to_string(),
+                            },
+                            HttpFilter {
+                                method: HttpMethod::Post,
+                                path: "/repos/*/git/refs".to_string(),
+                            },
+                        ],
+                    },
+                },
+                PolicyRule {
+                    host: Destination::Domain("registry-1.docker.io".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: None,
+                    level: AssuranceLevel::Tls,
+                },
+                PolicyRule {
+                    host: Destination::Cidr("8.8.8.8".to_string()),
+                    port: 53,
+                    protocol: Protocol::Udp,
+                    reason: Some("DNS resolver".to_string()),
+                    level: AssuranceLevel::Transport,
+                },
+            ],
+        };
+
+        // Simulate the GET handler: Json(policy) serialises to a JSON body.
+        let serialized =
+            serde_json::to_string(&original).expect("Policy must always serialize to JSON");
+
+        // Simulate the CLI: serde_json::from_str::<Policy>(&body) parses the response.
+        let roundtripped: Policy =
+            serde_json::from_str(&serialized).expect("Policy must round-trip through JSON");
+
+        // Compare by re-serializing both to JSON — the canonical equality check
+        // for types that don't derive PartialEq due to Destination.
+        let original_json = serde_json::to_string(&original).expect("re-serialize original");
+        let roundtripped_json =
+            serde_json::to_string(&roundtripped).expect("re-serialize roundtripped");
+        assert_eq!(
+            original_json, roundtripped_json,
+            "Policy must survive a serialize → deserialize round-trip with no loss"
+        );
+
+        // Also verify that pretty-printed output (which the CLI emits to stdout/file)
+        // round-trips identically — the GET handler returns compact JSON, but the CLI
+        // re-serializes with to_string_pretty before writing.
+        let pretty =
+            serde_json::to_string_pretty(&original).expect("Policy must serialize (pretty)");
+        let from_pretty: Policy =
+            serde_json::from_str(&pretty).expect("Pretty JSON must round-trip");
+        let from_pretty_json =
+            serde_json::to_string(&from_pretty).expect("re-serialize from_pretty");
+        assert_eq!(
+            original_json, from_pretty_json,
+            "Policy must survive pretty-print serialize → deserialize round-trip"
+        );
+    }
+
+    #[test]
+    fn policy_dump_empty_policy_serializes_to_valid_apply_input() {
+        use sandbox_core::Policy;
+        use sandbox_core::policy::SCHEMA_VERSION;
+
+        // The no-policy case: the GET handler returns an empty Policy so
+        // the caller gets an editable template rather than a 404.
+        let empty = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![],
+        };
+
+        let serialized =
+            serde_json::to_string(&empty).expect("empty Policy must serialize to JSON");
+        let roundtripped: Policy =
+            serde_json::from_str(&serialized).expect("empty Policy must round-trip");
+
+        assert!(
+            roundtripped.rules.is_empty(),
+            "empty policy must round-trip with zero rules"
+        );
+        assert_eq!(
+            roundtripped.version, SCHEMA_VERSION,
+            "version must survive round-trip"
+        );
     }
 }
