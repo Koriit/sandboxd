@@ -2919,21 +2919,19 @@ run_provision() {
 # Step 17 — Print next-steps.
 # ----------------------------------------------------------------------------
 
-# maybe_emit_group_activation_hint — emit the newgrp hint iff the operator is
-# a member of the sandbox group but the group is not active in this session.
-# Silent when: no operator is known, the sandbox group does not exist yet, the
-# operator is already in the group database but also has it active, or the
-# operator is not in the group at all.
+# maybe_emit_group_activation_hint — emit the newgrp hint whenever the operator
+# is a member of the sandbox group, regardless of whether the group is active in
+# the install's own shell session. Existing shells opened before the install will
+# not pick up the new membership until the user runs newgrp or re-logs in, so the
+# hint is always relevant when the operator is in the group.
+# Silent when: no operator is known, the sandbox group does not exist yet, or the
+# operator is not a member of the group at all.
 maybe_emit_group_activation_hint() {
     [ -n "$OPERATOR_NAME" ] || return 0
     getent group sandbox >/dev/null 2>&1 || return 0
     # Member of the group? (group database; also covers primary group.)
     if id -nG "$OPERATOR_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
-        # Active in THIS session? id -nG of the live process reflects the
-        # session's supplementary groups.
-        if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
-            emit "  Activate group membership: ${BLUE}log out and back in,${RESET} or ${BLUE}run: newgrp sandbox${RESET}"
-        fi
+        emit "  Activate group in existing shells: ${BLUE}run: newgrp sandbox${RESET}, or log out and back in"
     fi
 }
 
