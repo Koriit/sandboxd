@@ -2856,19 +2856,32 @@ run_provision() {
         fi
 
         _prov_ok=0
+        _prov_tmp_log="$TMPDIR_INSTALL/rebuild-$_prov_backend.log"
         if _prov_maybe_force_fail "$_prov_backend"; then
             if [ "$(id -u)" -eq 0 ]; then
-                # shellcheck disable=SC2024  # redirect is intentionally to parent's INSTALL_LOG
+                # Root path: sudo drops to the operator; the redirect is
+                # opened by root so INSTALL_LOG is writable directly.
+                # shellcheck disable=SC2024  # redirect intentionally by root
                 if sudo -u "$OPERATOR_NAME" sg sandbox -c \
                     "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock /usr/local/bin/sandbox rebuild-image --backend $_prov_backend -y" \
                     >> "$INSTALL_LOG" 2>&1; then
                     _prov_ok=1
                 fi
             else
+                # Non-root operator path: the operator cannot open
+                # INSTALL_LOG (root:root 0644) for appending. Redirect to
+                # an operator-writable temp file, then fold that output into
+                # the durable install log via sudo tee (same mechanism as
+                # log_line's privileged path) after the rebuild completes.
                 if sg sandbox -c \
                     "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock /usr/local/bin/sandbox rebuild-image --backend $_prov_backend -y" \
-                    >> "$INSTALL_LOG" 2>&1; then
+                    > "$_prov_tmp_log" 2>&1; then
                     _prov_ok=1
+                fi
+                # Fold rebuild output into the install log regardless of
+                # success/failure so the record is durable.
+                if [ -s "$_prov_tmp_log" ]; then
+                    cat "$_prov_tmp_log" | sudo -n tee -a "$INSTALL_LOG" >/dev/null 2>&1 || true
                 fi
             fi
         fi
