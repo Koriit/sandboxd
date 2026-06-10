@@ -955,16 +955,56 @@ _priv_maybe_fail_after "\$_label"
 
 # ----- Step 10: purge-image -----
 _step_begin "purge-image"
-if [ -n "\$INSTALLED_VERSION" ] && command -v docker >/dev/null 2>&1; then
-    _img_tag="sandbox-gateway:\$INSTALLED_VERSION"
-    if docker image inspect "\$_img_tag" >/dev/null 2>&1; then
-        docker image rm "\$_img_tag" >> "\$_LOG" 2>&1 || true
-        _log "step=docker_rmi image=\$_img_tag"
+if command -v docker >/dev/null 2>&1; then
+    # Tear down any running session artifacts before removing the image.
+    # Active containers pin the image and cause the image rm to fail.
+    # Session IDs are exactly 12 lowercase hex characters [0-9a-f].
+    # Gateway containers:    sandbox-gw-<12hex>   (from gateway::container_name)
+    # Lite containers:       sandbox-<12hex>      (from backend/container.rs)
+    # Networks:              sandbox-net-<12hex>  (from network.rs)
+    # Docker --filter name= is a substring match; grep anchors to the exact
+    # scheme so unrelated containers/networks are never touched.
+    _gw_ctrs=\$(docker ps -a --filter 'name=sandbox-gw-' --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^sandbox-gw-[0-9a-f]{12}\$' || true)
+    _lite_ctrs=\$(docker ps -a --filter 'name=sandbox-' --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^sandbox-[0-9a-f]{12}\$' || true)
+    _nets=\$(docker network ls --filter 'name=sandbox-net-' --format '{{.Name}}' 2>/dev/null \
+        | grep -E '^sandbox-net-[0-9a-f]{12}\$' || true)
+
+    for _ctr in \$_gw_ctrs \$_lite_ctrs; do
+        [ -n "\$_ctr" ] || continue
+        docker stop "\$_ctr" >> "\$_LOG" 2>&1 && _stop_rc=0 || _stop_rc=\$?
+        docker rm -f "\$_ctr" >> "\$_LOG" 2>&1 && _rm_rc=0 || _rm_rc=\$?
+        if [ "\$_stop_rc" -eq 0 ] && [ "\$_rm_rc" -eq 0 ]; then
+            _log "step=docker_rm container=\$_ctr action=stop-rm"
+        else
+            _log "step=docker_rm container=\$_ctr action=fail stop_rc=\$_stop_rc rm_rc=\$_rm_rc"
+        fi
+    done
+
+    for _net in \$_nets; do
+        [ -n "\$_net" ] || continue
+        docker network rm "\$_net" >> "\$_LOG" 2>&1 && _net_rc=0 || _net_rc=\$?
+        if [ "\$_net_rc" -eq 0 ]; then
+            _log "step=docker_network_rm network=\$_net action=remove"
+        else
+            _log "step=docker_network_rm network=\$_net action=fail rc=\$_net_rc"
+        fi
+    done
+
+    if [ -n "\$INSTALLED_VERSION" ]; then
+        _img_tag="sandbox-gateway:\$INSTALLED_VERSION"
+        if docker image inspect "\$_img_tag" >/dev/null 2>&1; then
+            docker image rm "\$_img_tag" >> "\$_LOG" 2>&1 || true
+            _log "step=docker_rmi image=\$_img_tag"
+        else
+            _log "step=docker_rmi image=\$_img_tag action=skip reason=absent"
+        fi
     else
-        _log "step=docker_rmi image=\$_img_tag action=skip reason=absent"
+        _log "step=docker_rmi action=skip reason=no-version"
     fi
 else
-    _log "step=docker_rmi action=skip reason=no-version-or-docker"
+    _log "step=docker_rmi action=skip reason=no-docker"
 fi
 _step_ok
 _priv_maybe_fail_after "\$_label"
