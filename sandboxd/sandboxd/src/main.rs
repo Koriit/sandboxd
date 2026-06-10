@@ -4602,8 +4602,11 @@ async fn clear_policy(
 ///
 /// Returns the flat expanded rule list that is currently applied to the
 /// session. The response shape is `{"version":"2.0.0","rules":[...]}` —
-/// exactly what `POST /sessions/{id}/policy` accepts via the
-/// `--policy` flag — so dump → edit → apply round-trips losslessly.
+/// exactly what `sandbox policy update --policy <file>` accepts — so
+/// dump → edit → apply round-trips losslessly. Note that `source_presets`
+/// (preset attribution metadata) is not part of the stored policy and is
+/// intentionally absent from the dump; only the expanded rule set is
+/// returned.
 ///
 /// When no explicit policy has been set (fail-closed default), returns a
 /// valid empty policy document (`rules: []`). This is semantically

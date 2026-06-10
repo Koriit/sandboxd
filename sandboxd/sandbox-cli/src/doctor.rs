@@ -1102,8 +1102,9 @@ fn check_lima_base_image(
                 outcome: CheckOutcome::Skip {
                     detail,
                     hint: Some(
-                        "verify the lima backend is configured and the lima-helper is reachable; \
-                         restart sandboxd: sudo systemctl restart sandboxd"
+                        "if you intend to use the Lima (full) backend, verify the \
+                         lima-helper is installed and the backend is configured; \
+                         otherwise this check is safe to ignore"
                             .to_string(),
                     ),
                 },
@@ -2407,8 +2408,12 @@ mod tests {
                 );
                 let h = hint.expect("probe-failure must carry a hint");
                 assert!(
-                    h.contains("lima-helper is reachable"),
-                    "probe-failure hint must mention lima-helper reachability; got: {h}"
+                    h.contains("lima-helper"),
+                    "probe-failure hint must mention the lima-helper; got: {h}"
+                );
+                assert!(
+                    h.contains("safe to ignore"),
+                    "probe-failure hint must note it is safe to ignore on container-only hosts; got: {h}"
                 );
             }
             other => panic!("expected Skip, got {other:?}"),
@@ -2481,6 +2486,20 @@ mod tests {
         assert!(!parsed.lima_base_image_present);
         assert!(!parsed.lima_base_image_probe_failed);
         assert!(parsed.lima_base_image_probe_error.is_none());
+
+        // C14 on an older-daemon payload must render as the "not built yet"
+        // Skip — not probe_failed — locking the contract that absent fields
+        // parse as false and route through the absent-image branch, not the
+        // probe-failure branch.
+        let row = check_lima_base_image(Some(&parsed), true);
+        assert_eq!(row.id, "C14");
+        match row.outcome {
+            CheckOutcome::Skip { detail, .. } => assert!(
+                detail.contains("not built yet"),
+                "older-daemon payload must yield 'not built yet' Skip, got: {detail}"
+            ),
+            other => panic!("expected Skip for older-daemon payload, got {other:?}"),
+        }
     }
 
     /// `is_prod_install_signal` flips on the presence of the
