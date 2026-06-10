@@ -242,8 +242,8 @@ PHASE_CMD_FIFO=""
 _phase_reader_pid=0
 _consumer_pid=0
 
-# PID of the background tee process that mirrors fd 2 to the log.
-# 0 = no tee running (plain exec 2>> used or log not writable).
+# PID of the background tee process that mirrors fd 2 to the log via a FIFO.
+# Only non-zero on the sudo-tee path; the plain exec 2>> path never starts one.
 _stderr_tee_pid=0
 
 # ----------------------------------------------------------------------------
@@ -340,22 +340,28 @@ ensure_install_log() {
 # exit, making failures impossible to diagnose from the log. This function
 # patches that gap.
 #
-# Strategy: if the log is writable from the current process, open a FIFO and
-# run a background `tee` so errors land in BOTH the log and the terminal.
-# If the log is not directly writable (e.g. the operator does not own it and
-# sudo -n is unavailable), fall back to log-only via `exec 2>>`.
+# Strategy: use a plain regular-file append redirect (exec 2>>) whenever the
+# log is directly writable. A regular-file redirect never blocks regardless of
+# how many background processes — such as the UI animator — still have fd 2
+# open; the kernel simply writes bytes and returns. The old FIFO+tee approach
+# blocked in cleanup_tmpdir because the animator inherited the FIFO write-end
+# and tee would not see EOF until the animator was killed.
+#
+# When the log exists but is only writable via sudo, fall back to a FIFO+sudo-
+# tee pair. In that narrow case cleanup_tmpdir kills the animator before waiting
+# on the tee process so the wait is always bounded.
+#
+# Trade-off of the plain-append path: stderr goes to the log only, not also
+# live to the terminal. This is acceptable: the failure banner already points
+# to the log, and the log captures everything that matters for diagnosis.
 #
 # POSIX-portable — no bash `2> >(...)` process substitution. Called after
-# TMPDIR_INSTALL is set up; cleanup_tmpdir flushes the tee on EXIT.
+# TMPDIR_INSTALL is set up; cleanup_tmpdir flushes any tee on EXIT.
 setup_stderr_log() {
     [ -n "$TMPDIR_INSTALL" ] || return 0
     if [ -w "$INSTALL_LOG" ]; then
-        # Log is writable: tee stderr to both terminal and log.
-        _sl_fifo="$TMPDIR_INSTALL/stderr.fifo"
-        mkfifo "$_sl_fifo"
-        tee -a "$INSTALL_LOG" < "$_sl_fifo" >&2 &
-        _stderr_tee_pid=$!
-        exec 2> "$_sl_fifo"
+        # Log is directly writable: plain append redirect, no background process.
+        exec 2>>"$INSTALL_LOG"
     elif [ -e "$INSTALL_LOG" ] && sudo -n tee -a "$INSTALL_LOG" < /dev/null >/dev/null 2>&1; then
         # Log exists but is only writable via sudo: use sudo tee for the mirror.
         _sl_fifo="$TMPDIR_INSTALL/stderr.fifo"
@@ -383,12 +389,31 @@ cleanup_tmpdir() {
         kill "$_phase_reader_pid" 2>/dev/null || true
         wait "$_phase_reader_pid" 2>/dev/null || true
     fi
-    # Flush the stderr tee: restore fd 2 to the terminal (closing the FIFO
-    # write-end), then wait for the tee process to drain and exit.  Must happen
-    # before TMPDIR_INSTALL is removed (the FIFO lives there) and before
-    # ui_teardown (which uses fd 2 for rmcup).
+    # Kill the UI animator before touching the stderr tee. The animator holds
+    # fd 2 open; if stderr is routed through a FIFO (the sudo-tee path in
+    # setup_stderr_log), the animator's open write-end prevents tee from seeing
+    # EOF and the subsequent wait deadlocks. Killing it here is safe: ui_teardown
+    # below will no-op the animator stop if UI_ANIM_PID is already 0.
+    if [ "${UI_ANIM_PID:-0}" -gt 0 ]; then
+        kill "$UI_ANIM_PID" 2>/dev/null || true
+        wait "$UI_ANIM_PID" 2>/dev/null || true
+        UI_ANIM_PID=0
+    fi
+    # Flush the stderr tee (sudo-tee path only): restore fd 2 to the terminal
+    # (closing the FIFO write-end), then wait for the tee process to drain and
+    # exit. Must happen before TMPDIR_INSTALL is removed (the FIFO lives there)
+    # and before ui_teardown (which uses fd 2 for rmcup).
+    # The plain-append path (exec 2>>"$INSTALL_LOG") leaves _stderr_tee_pid=0
+    # and needs no special teardown here.
+    #
+    # Bounded wait: after closing the write-end, send SIGTERM to the tee
+    # process so it does not linger if another fd-2 holder slipped through.
+    # POSIX `wait` has no built-in timeout, so we kill first then wait — this
+    # is safe because by this point all writers (animator, consumer, reader)
+    # have already been killed above.
     if [ "$_stderr_tee_pid" -gt 0 ]; then
         exec 2>/dev/tty || exec 2>/dev/null || true
+        kill "$_stderr_tee_pid" 2>/dev/null || true
         wait "$_stderr_tee_pid" 2>/dev/null || true
         _stderr_tee_pid=0
     fi
