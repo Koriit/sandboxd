@@ -189,6 +189,9 @@ cleanup_tmpdir() {
     if [ -n "$SUMMARY_FILE" ] && [ -f "$SUMMARY_FILE" ]; then
         rm -f "$SUMMARY_FILE"
     fi
+    # Clear the sudo timestamp on exit so no usable credential cache lingers
+    # after uninstall completes or aborts.
+    sudo -K 2>/dev/null || true
 }
 
 # Phase lists for the rich-UI checklist.
@@ -1393,6 +1396,10 @@ main() {
         render_plan
     fi
     confirm_plan
+
+    # Invalidate any inherited sudo timestamp so the privileged batch always
+    # prompts for the password fresh, never silently piggybacks a cached credential.
+    sudo -k
 
     # ----- Remove screen -----
     write_priv_script
