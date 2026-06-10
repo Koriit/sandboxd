@@ -634,7 +634,8 @@ enum PolicyAction {
     Update {
         /// Session name or ID.
         session: String,
-        /// Path to the policy JSON file to apply.
+        /// Path to a policy JSON file to apply. Produce one with
+        /// `sandbox policy dump <session>`.
         #[arg(long, conflicts_with = "clear")]
         policy: Option<String>,
         /// Preset invocation(s) to apply on top of the optional
@@ -649,6 +650,28 @@ enum PolicyAction {
         /// Idempotent. Mutually exclusive with `--policy` and `--preset`.
         #[arg(long, conflicts_with = "policy", conflicts_with = "preset")]
         clear: bool,
+    },
+    /// Dump a session's current policy as round-trippable JSON.
+    ///
+    /// Fetches the flat expanded rule list from the daemon and prints it
+    /// as a `{"version":"2.0.0","rules":[...]}` document — exactly the
+    /// shape that `sandbox policy update --policy <file>` accepts.
+    ///
+    /// The output is the expanded rule set, not preset names; preset
+    /// attribution is not part of the stored policy and is intentionally
+    /// absent from the dump.
+    ///
+    /// Typical round-trip:
+    ///
+    ///     sandbox policy dump web > policy.json
+    ///     # edit policy.json
+    ///     sandbox policy update web --policy policy.json
+    Dump {
+        /// Session name or ID.
+        session: String,
+        /// Write JSON to this file instead of stdout.
+        #[arg(long, short = 'o')]
+        output: Option<String>,
     },
     /// Inspect the built-in and user-configured preset catalog (client-local).
     ///
@@ -1403,6 +1426,14 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                         .expect("failed to build request")
                 }
             }
+            PolicyAction::Dump { .. } => {
+                // Handled by `handle_policy_dump` in `main()` before
+                // `build_request` is reached.
+                unreachable!(
+                    "`sandbox policy dump ...` is handled client-side \
+                     in main() before build_request"
+                );
+            }
             PolicyAction::Preset { .. } => {
                 // Handled entirely client-side before `build_request` is
                 // ever called — see the dispatch in `main()`. Returning
@@ -2011,16 +2042,30 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             }
         }
         Command::Policy { action } => {
-            let result: serde_json::Value = serde_json::from_str(body)
-                .map_err(|e| format!("failed to parse policy response: {e}"))?;
-            if let Some(message) = result.get("message").and_then(|m| m.as_str()) {
-                println!("{message}");
-            } else {
-                // Fallback when the daemon response lacks a message field.
-                // Choose the verb by subcommand to keep output truthful.
-                match action {
-                    PolicyAction::Update { clear: true, .. } => println!("Policy cleared."),
-                    _ => println!("Policy updated."),
+            match action {
+                PolicyAction::Dump { .. } => {
+                    // Dump is handled client-side by `handle_policy_dump`
+                    // before the generic pipeline is reached.
+                    unreachable!(
+                        "`sandbox policy dump ...` is handled client-side \
+                         in main() before handle_response"
+                    );
+                }
+                _ => {
+                    let result: serde_json::Value = serde_json::from_str(body)
+                        .map_err(|e| format!("failed to parse policy response: {e}"))?;
+                    if let Some(message) = result.get("message").and_then(|m| m.as_str()) {
+                        println!("{message}");
+                    } else {
+                        // Fallback when the daemon response lacks a message field.
+                        // Choose the verb by subcommand to keep output truthful.
+                        match action {
+                            PolicyAction::Update { clear: true, .. } => {
+                                println!("Policy cleared.")
+                            }
+                            _ => println!("Policy updated."),
+                        }
+                    }
                 }
             }
         }
@@ -2905,6 +2950,56 @@ fn print_propagation_status(resp: &PropagationStatusResponse) {
 /// any real working set and fits on an 80-column terminal.
 fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
+}
+
+/// Handle the `sandbox policy dump [--output <file>]` subcommand.
+///
+/// Fetches `GET /sessions/{session}/policy` and emits the response as
+/// pretty-printed JSON. When `--output` is given the JSON is written to
+/// that path instead of stdout; the file is created or overwritten.
+async fn handle_policy_dump(socket_path: &str, session: &str, output: Option<&str>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/sessions/{session}/policy"))
+        .body(String::new())
+        .expect("failed to build request");
+
+    let (status, body) = match send_request(socket_path, req).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+            eprintln!("Error: {}", api_err.error);
+        } else {
+            eprintln!("Error ({status}): {body}");
+        }
+        process::exit(1);
+    }
+
+    let policy: Policy = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: failed to parse policy response: {e}");
+            process::exit(1);
+        }
+    };
+
+    let rendered = serde_json::to_string_pretty(&policy).expect("Policy always serializes to JSON");
+
+    match output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, rendered) {
+                eprintln!("Error: failed to write policy to '{path}': {e}");
+                process::exit(1);
+            }
+        }
+        None => println!("{rendered}"),
+    }
 }
 
 /// Render a [`Duration`] back into its shortest human-readable form.
@@ -6765,6 +6860,18 @@ async fn main() {
     } = &cli.command
     {
         handle_policy_status(&cli.socket, session, *wait, timeout).await;
+        return;
+    }
+
+    // `sandbox policy dump ...` fetches the current policy from the
+    // daemon and emits it as JSON. Route it before the generic pipeline
+    // so the output path (stdout vs. --output file) is handled here
+    // rather than inside the generic response handler.
+    if let Command::Policy {
+        action: PolicyAction::Dump { session, output },
+    } = &cli.command
+    {
+        handle_policy_dump(&cli.socket, session, output.as_deref()).await;
         return;
     }
 
