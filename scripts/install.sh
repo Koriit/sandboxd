@@ -431,6 +431,9 @@ cleanup_tmpdir() {
     if [ -n "$SUMMARY_FILE" ] && [ -f "$SUMMARY_FILE" ]; then
         rm -f "$SUMMARY_FILE"
     fi
+    # Clear the sudo timestamp on exit so no usable credential cache lingers
+    # after install completes or aborts.
+    sudo -K 2>/dev/null || true
 }
 
 # ----------------------------------------------------------------------------
@@ -3031,6 +3034,10 @@ main() {
         render_plan
     fi
     confirm_plan
+
+    # Invalidate any inherited sudo timestamp so the privileged batch always
+    # prompts for the password fresh, never silently piggybacks a cached credential.
+    sudo -k
 
     # Build the privileged child script.
     write_priv_script
