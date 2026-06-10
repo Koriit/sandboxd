@@ -2884,6 +2884,7 @@ run_provision() {
                 # Fold rebuild output into the install log regardless of
                 # success/failure so the record is durable.
                 if [ -s "$_prov_tmp_log" ]; then
+                    # shellcheck disable=SC2002  # cat needed: sudo doesn't affect redirects (SC2024)
                     cat "$_prov_tmp_log" | sudo -n tee -a "$INSTALL_LOG" >/dev/null 2>&1 || true
                 fi
             fi
