@@ -7209,10 +7209,12 @@ async fn version_handler() -> impl IntoResponse {
 ///   `kvm_writable`, `gateway_image_present`, `lite_image_present`,
 ///   `gateway_image_probe_failed`, `lite_image_probe_failed`,
 ///   `gateway_image_probe_error`, `lite_image_probe_error`,
-///   `users_conf_pool`. The `*_probe_failed` companions to the
-///   image-presence booleans distinguish "docker reports image
-///   absent" from "probe could not run" per the documented contract so
-///   doctor's C7/C8 can emit the right operator hint.
+///   `lima_base_image_present`, `lima_base_image_probe_failed`,
+///   `lima_base_image_probe_error`, `users_conf_pool`. The
+///   `*_probe_failed` companions to the image-presence booleans
+///   distinguish "image absent" from "probe could not run" per the
+///   documented contract so doctor's C7/C8/C14 can emit the right
+///   operator hint.
 /// - **Per-operator scoped data** (filtered by `caller_username`
 ///   from `OperatorIdentity`): `guest_version_drift`,
 ///   `substrate_orphans`.
@@ -7323,6 +7325,36 @@ async fn diagnostics_handler(
             ),
         }
     };
+
+    // Lima base-image probe: check whether the operator's base VM
+    // (`sandbox-base`) exists in their LIMA_HOME. Three outcomes per
+    // the documented contract — present, absent, or probe-failed — so
+    // doctor's C14 can emit the right operator hint. Any error
+    // (lima-helper unreachable, limactl missing/timeout, Lima backend
+    // not set up) becomes probe_failed, not a hard endpoint failure.
+    let lima_base_probe = {
+        let result = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(lima_mgr) => tokio::task::spawn_blocking(move || lima_mgr.check_base_image()).await,
+            Err(e) => {
+                // manager_for failed (e.g. LIMA_HOME provisioning
+                // error) — treat as a probe failure so C14 surfaces
+                // the "lima-helper reachable?" hint rather than
+                // silently reporting the image absent.
+                Ok(Err(e))
+            }
+        };
+        match result {
+            Ok(Ok(sandbox_core::BaseImageStatus::Missing)) => (false, None),
+            Ok(Ok(_)) => (true, None),
+            Ok(Err(e)) => (false, Some(format!("{e}"))),
+            Err(e) => (
+                false,
+                Some(format!("daemon-side probe task failed to run: {e}")),
+            ),
+        }
+    };
+    let lima_base_image_present = lima_base_probe.0;
+    let lima_base_image_probe_error = lima_base_probe.1;
 
     let gateway_image_present = gateway_probe.0;
     let lite_image_present = lite_probe.0;
@@ -7479,6 +7511,15 @@ async fn diagnostics_handler(
         "gateway_image_probe_error": gateway_image_probe_error,
         "lite_image_probe_failed": lite_image_probe_error.is_some(),
         "lite_image_probe_error": lite_image_probe_error,
+        // Lima base-image probe: same three-state contract as C7/C8.
+        // `lima_base_image_probe_failed` discriminates "image absent"
+        // (probe ran, base VM not found) from "probe could not run"
+        // (lima-helper unreachable, limactl missing, etc.). Old CLIs
+        // that omit these fields via `#[serde(default)]` degrade
+        // gracefully to the "absent" branch.
+        "lima_base_image_present": lima_base_image_present,
+        "lima_base_image_probe_failed": lima_base_image_probe_error.is_some(),
+        "lima_base_image_probe_error": lima_base_image_probe_error,
         "users_conf_pool": users_conf_pool,
         "guest_version_drift": guest_version_drift,
         "substrate_orphans": {

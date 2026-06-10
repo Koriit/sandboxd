@@ -278,13 +278,13 @@ const DOCTOR_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Phase 1 (serial, gating): C1, C2. If C2 fails the daemon-side
 /// checks short-circuit to `SKIPPED (requires daemon)`.
-/// Phase 2 (parallel): C3-C13 are spawned concurrently on a
+/// Phase 2 (parallel): C3-C14 are spawned concurrently on a
 /// [`tokio::task::JoinSet`]; the shared `/diagnostics` payload is
 /// fetched once before the fan-out and shared via `Arc`. After all
 /// tasks join, results are sorted by check id so the rendered output
 /// is byte-stable regardless of completion order.
 pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
-    let mut rows: Vec<CheckRow> = Vec::with_capacity(13);
+    let mut rows: Vec<CheckRow> = Vec::with_capacity(14);
 
     // Phase 1 — serial gating.
     let c1 = check_daemon_running(socket_path).await;
@@ -308,7 +308,7 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
 
     // Phase 2 — parallel fan-out. Diagnostics payload is fetched once
     // *before* the fan-out so the daemon-side checks (C6, C7, C8, C11,
-    // C12, C13) share a single HTTP round-trip via `Arc`.
+    // C12, C13, C14) share a single HTTP round-trip via `Arc`.
     let diagnostics: Arc<Option<DiagnosticsPayload>> = Arc::new(if socket_reachable {
         fetch_diagnostics(socket_path).await
     } else {
@@ -368,11 +368,16 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
             check_substrate_orphans(diag.as_ref().as_ref(), socket_reachable)
         });
     }
+    // C14
+    {
+        let diag = Arc::clone(&diagnostics);
+        set.spawn_blocking(move || check_lima_base_image(diag.as_ref().as_ref(), socket_reachable));
+    }
 
     // Drain the JoinSet; a panicking task surfaces as a `JoinError`
     // and is re-raised here so [`run`]'s `catch_unwind` boundary routes
     // it to exit code 2.
-    let mut parallel: Vec<CheckRow> = Vec::with_capacity(11);
+    let mut parallel: Vec<CheckRow> = Vec::with_capacity(12);
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(row) => parallel.push(row),
@@ -1047,6 +1052,87 @@ fn check_lite_image(diagnostics: Option<&DiagnosticsPayload>, socket_reachable: 
 }
 
 // ---------------------------------------------------------------------------
+// Individual checks — C14 (lima base image present)
+// ---------------------------------------------------------------------------
+
+/// C14 — lima base image present (informational).
+///
+/// The Lima base VM is built on first lima-backend session-create; an
+/// absent base image is the normal post-install state, not a failure.
+/// We render it as a `Skip` with the "not built yet" annotation.
+///
+/// All lima state comes from the daemon's `/diagnostics` payload — the CLI
+/// never calls `limactl` or the lima-helper directly.
+fn check_lima_base_image(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return CheckRow {
+            id: "C14",
+            name: "lima base image present",
+            outcome: CheckOutcome::Skip {
+                detail: "requires daemon".to_string(),
+                hint: None,
+            },
+        };
+    }
+    match diagnostics {
+        Some(d) if d.lima_base_image_present => CheckRow {
+            id: "C14",
+            name: "lima base image present",
+            outcome: CheckOutcome::Pass {
+                detail: sandbox_core::DEFAULT_BASE_VM_NAME.to_string(),
+            },
+        },
+        Some(d) if d.lima_base_image_probe_failed => {
+            // The probe could not run to a verdict (lima-helper
+            // unreachable, limactl missing/timeout, Lima backend not set
+            // up). C14 is informational so we render this as Skip — but
+            // with the probe-failure detail and hint rather than the
+            // "not built yet" wording, so the operator knows the
+            // infrastructure is the issue, not the image.
+            let detail = match d.lima_base_image_probe_error.as_deref() {
+                Some(err) if !err.is_empty() => format!("probe failed: {err}"),
+                _ => "probe failed".to_string(),
+            };
+            CheckRow {
+                id: "C14",
+                name: "lima base image present",
+                outcome: CheckOutcome::Skip {
+                    detail,
+                    hint: Some(
+                        "verify the lima backend is configured and the lima-helper is reachable; \
+                         restart sandboxd: sudo systemctl restart sandboxd"
+                            .to_string(),
+                    ),
+                },
+            }
+        }
+        Some(_) => CheckRow {
+            id: "C14",
+            name: "lima base image present",
+            outcome: CheckOutcome::Skip {
+                detail: "not built yet".to_string(),
+                hint: Some(
+                    "image is built on first Lima session create; or pre-build: \
+                     sandbox rebuild-image --backend lima"
+                        .to_string(),
+                ),
+            },
+        },
+        None => CheckRow {
+            id: "C14",
+            name: "lima base image present",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Individual checks — C9 (route-helper caps)
 // ---------------------------------------------------------------------------
 
@@ -1513,6 +1599,23 @@ pub(crate) struct DiagnosticsPayload {
     /// image probe.
     #[serde(default)]
     pub lite_image_probe_error: Option<String>,
+    /// `true` when the Lima base VM (`sandbox-base`) is present in the
+    /// operator's LIMA_HOME. `false` either when the VM has not been
+    /// built yet (normal post-install state) or when the probe could
+    /// not run to a verdict. `#[serde(default)]` keeps this readable
+    /// against an older daemon that omits the field.
+    #[serde(default)]
+    pub lima_base_image_present: bool,
+    /// `true` when the Lima base-image probe could not run to a verdict
+    /// (lima-helper unreachable, limactl missing/timeout, lima backend
+    /// not set up, etc.). C14 renders this as `Skip` so a probe
+    /// infrastructure problem does not masquerade as a missing image.
+    #[serde(default)]
+    pub lima_base_image_probe_failed: bool,
+    /// Operator-facing reason the Lima base-image probe failed. `None`
+    /// when the probe succeeded or when an older daemon omits the field.
+    #[serde(default)]
+    pub lima_base_image_probe_error: Option<String>,
     #[serde(default)]
     pub users_conf_pool: Option<UsersConfPoolDto>,
     #[serde(default)]
@@ -2090,6 +2193,9 @@ mod tests {
             gateway_image_probe_error: None,
             lite_image_probe_failed: false,
             lite_image_probe_error: None,
+            lima_base_image_present: false,
+            lima_base_image_probe_failed: false,
+            lima_base_image_probe_error: None,
             users_conf_pool: None,
             guest_version_drift: None,
             substrate_orphans: None,
@@ -2232,11 +2338,125 @@ mod tests {
         }
     }
 
+    /// C14 — probe ran, image present → Pass with the base-VM name.
+    #[test]
+    fn c14_passes_when_lima_base_image_present() {
+        let mut d = diag_default();
+        d.lima_base_image_present = true;
+        let row = check_lima_base_image(Some(&d), true);
+        assert_eq!(row.id, "C14");
+        match row.outcome {
+            CheckOutcome::Pass { detail } => {
+                assert!(
+                    detail.contains("sandbox-base"),
+                    "pass detail must include the base-VM name; got: {detail}"
+                );
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    /// C14 — probe ran, image absent → Skip with the "built on
+    /// first Lima session create" annotation (informational; no failure).
+    #[test]
+    fn c14_skips_with_first_create_hint_when_lima_base_image_absent_but_probe_ok() {
+        let d = diag_default();
+        let row = check_lima_base_image(Some(&d), true);
+        assert_eq!(row.id, "C14");
+        match row.outcome {
+            CheckOutcome::Skip { detail, hint } => {
+                assert!(
+                    detail.contains("not built yet"),
+                    "absent-image detail must say 'not built yet'; got: {detail}"
+                );
+                let h = hint.expect("absent image must carry a hint");
+                assert!(
+                    h.contains("first Lima session create"),
+                    "absent-image hint must reference 'first Lima session create'; got: {h}"
+                );
+                assert!(
+                    !h.contains("lima-helper is reachable"),
+                    "absent-image hint must not mention lima-helper reachability; got: {h}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    /// C14 — the `probe_failed` variant: lima base-image probe could not
+    /// run to a verdict. C14 stays Skip (informational), but the hint
+    /// switches to lima-helper / sandboxd reachability so an operator
+    /// doesn't waste time on `sandbox rebuild-image` when the infrastructure
+    /// is the actual problem.
+    #[test]
+    fn c14_skips_with_lima_hint_when_lima_base_probe_failed() {
+        let mut d = diag_default();
+        d.lima_base_image_probe_failed = true;
+        d.lima_base_image_probe_error = Some("lima-helper: exec format error".to_string());
+        let row = check_lima_base_image(Some(&d), true);
+        assert_eq!(row.id, "C14");
+        match row.outcome {
+            CheckOutcome::Skip { detail, hint } => {
+                assert!(
+                    detail.contains("probe failed"),
+                    "probe-failure detail must say 'probe failed'; got: {detail}"
+                );
+                assert!(
+                    detail.contains("lima-helper: exec format error"),
+                    "probe-failure detail must echo the operator-facing reason; got: {detail}"
+                );
+                let h = hint.expect("probe-failure must carry a hint");
+                assert!(
+                    h.contains("lima-helper is reachable"),
+                    "probe-failure hint must mention lima-helper reachability; got: {h}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    /// C14 — socket unreachable → Skip "requires daemon".
+    #[test]
+    fn c14_skips_requires_daemon_when_socket_unreachable() {
+        let row = check_lima_base_image(None, false);
+        assert_eq!(row.id, "C14");
+        match row.outcome {
+            CheckOutcome::Skip { detail, .. } => {
+                assert!(
+                    detail.contains("requires daemon"),
+                    "skip detail must say 'requires daemon'; got: {detail}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    /// C14 — socket reachable but diagnostics fetch failed → Skip
+    /// "/diagnostics probe failed".
+    #[test]
+    fn c14_skips_diagnostics_probe_failed_when_diagnostics_none_but_socket_reachable() {
+        let row = check_lima_base_image(None, true);
+        assert_eq!(row.id, "C14");
+        match row.outcome {
+            CheckOutcome::Skip { detail, hint } => {
+                assert!(
+                    detail.contains("/diagnostics probe failed"),
+                    "skip detail must say '/diagnostics probe failed'; got: {detail}"
+                );
+                assert!(
+                    hint.is_none(),
+                    "no hint expected for diagnostics-none branch"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
     /// `DiagnosticsPayload` tolerates a payload written by an older
     /// daemon that does not emit `gateway_image_probe_failed` /
-    /// `lite_image_probe_failed` / `*_probe_error`. The bool fields
-    /// default to `false` and the optional reasons stay `None`, so
-    /// C7/C8 render the legacy "absent-image" branches.
+    /// `lite_image_probe_failed` / `lima_base_image_*` / `*_probe_error`.
+    /// The bool fields default to `false` and the optional reasons stay
+    /// `None`, so C7/C8/C14 render the legacy "absent-image" branches.
     #[test]
     fn diagnostics_payload_back_compat_omitted_probe_failed_fields() {
         let body = serde_json::json!({
@@ -2258,6 +2478,9 @@ mod tests {
         assert!(parsed.gateway_image_probe_error.is_none());
         assert!(!parsed.lite_image_probe_failed);
         assert!(parsed.lite_image_probe_error.is_none());
+        assert!(!parsed.lima_base_image_present);
+        assert!(!parsed.lima_base_image_probe_failed);
+        assert!(parsed.lima_base_image_probe_error.is_none());
     }
 
     /// `is_prod_install_signal` flips on the presence of the
@@ -2315,7 +2538,7 @@ mod tests {
             // — the cascade is only testable when C2 is non-Pass.
             return;
         }
-        for id in ["C3", "C5", "C6", "C7", "C8", "C11", "C12", "C13"] {
+        for id in ["C3", "C5", "C6", "C7", "C8", "C11", "C12", "C13", "C14"] {
             let row = rows.iter().find(|r| r.id == id).expect("row present");
             assert!(
                 matches!(&row.outcome, CheckOutcome::Skip { .. }),
