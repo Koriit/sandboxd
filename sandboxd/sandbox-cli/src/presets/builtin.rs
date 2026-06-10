@@ -231,6 +231,7 @@ fn expand_dockerhub(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetEr
         "registry-1.docker.io",
         "auth.docker.io",
         "production.cloudflare.docker.com",
+        "production.cloudfront.docker.com",
     ]))
 }
 
@@ -1057,6 +1058,7 @@ mod tests {
                 "registry-1.docker.io",
                 "auth.docker.io",
                 "production.cloudflare.docker.com",
+                "production.cloudfront.docker.com",
             ],
         );
         assert_rules_round_trip(rules);
