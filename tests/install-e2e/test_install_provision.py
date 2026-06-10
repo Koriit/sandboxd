@@ -254,3 +254,104 @@ def test_install_with_provision_rich_ui(
         "ui_detect_tty gated out of rich mode for another reason.\n"
         f"Log tail:\n{log_r.stdout[-3000:]}"
     )
+
+
+def _install_sh_cmd_nonroot_with_provision(tarball_in_vm, *, vm, sigstore_stack):
+    """Build the install.sh invocation run AS THE OPERATOR (non-root), WITH provisioning.
+
+    The Lima VM's default user (``lima``) has passwordless sudo, so install.sh's
+    internal privileged child (``sudo sh /tmp/...priv-child.sh``) succeeds even
+    though the outer script runs unprivileged.  This mirrors the canonical
+    ``curl | sh`` install path: ``id -u`` inside install.sh returns a non-zero
+    uid, so ``run_provision`` takes the non-root branch and the bug manifests.
+
+    The sigstore trust-material env vars are still needed so install.sh's
+    ``sigstore_verify`` step can call cosign against the local stack.  Because
+    the outer invocation has no ``sudo``, the env vars reach install.sh through
+    the shell environment directly rather than via ``sudo VAR=val``.
+    """
+    ver = version_from_tarball(tarball_in_vm)
+    trust_env = stage_sigstore_trust_material_in_vm(vm, sigstore_stack)
+    env_prefix = " ".join(f"{k}={_sh_quote(v)}" for k, v in trust_env.items()) + " "
+    return " ".join([
+        f"{env_prefix}bash /tmp/install.sh",
+        f"--from {tarball_in_vm}",
+        f"--version {ver}",
+        "--yes",
+        "--no-color",
+        # NOTE: --no-provision is intentionally ABSENT — this is the bug trigger.
+    ])
+
+
+@pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
+@pytest.mark.timeout(1800)
+def test_install_nonroot_with_provision_container_backend(
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
+):
+    """Non-root (operator) install WITH provisioning actually builds the container image.
+
+    Regression guard for the silent no-op bug: when install.sh runs as a
+    non-root operator (``id -u != 0``), ``run_provision``'s ``sg sandbox -c
+    \'...\'`` redirected stdout/stderr to ``/var/log/sandbox-install.log`` which
+    is owned ``root:root 0644``.  The operator cannot append to that file, so the
+    redirect fails instantly with EACCES before the subprocess even starts, causing
+    both backend builds to silently exit with status=fail in the same second.
+
+    This test MUST FAIL on the unfixed installer (instant provision fail, no image
+    built) and PASS with the fix (container image present, log records status=ok).
+
+    Steps:
+    1. Fresh VM + install.sh run as the default ``lima`` user (no outer ``sudo``).
+    2. Assert install.sh exits 0.
+    3. Assert full install landed (binaries, caps, systemd unit, sandbox user).
+    4. Assert daemon is active and doctor passes.
+    5. Assert ``sandboxd-lite`` image is present in the Docker store, proving the
+       container provision step ran to completion and was not a silent no-op.
+    6. Assert the install log records ``backend=container status=ok`` — confirming
+       ``rebuild-image`` was not merely attempted but succeeded and was logged.
+    """
+    vm = vm_factory(distro_template)
+    tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
+
+    cmd = _install_sh_cmd_nonroot_with_provision(
+        tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack,
+    )
+
+    # Provision adds ~3-5 min on top of the normal install.
+    r = vm.shell(cmd, timeout=900)
+    assert r.returncode == 0, (
+        f"Non-root install.sh WITH provisioning failed (exit {r.returncode})\n"
+        f"stdout:\n{r.stdout}\n"
+        f"stderr:\n{r.stderr}"
+    )
+
+    # Standard post-install checks.
+    assert_full_install_landed(vm)
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
+    wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
+    assert_doctor_passes(vm)
+
+    # The container backend provision step must have built the lite image.
+    # On the unfixed installer the image is absent because the redirect EACCES
+    # aborts the subprocess before rebuild-image runs.
+    r_img = vm.shell(
+        "sudo -u sandbox docker image ls --format '{{.Repository}}:{{.Tag}}'"
+        " | grep sandboxd-lite",
+        timeout=30,
+    )
+    assert r_img.returncode == 0 and "sandboxd-lite" in r_img.stdout, (
+        "sandboxd-lite image not found after non-root install WITH provision — "
+        "container provision step was a silent no-op (EACCES redirect bug).\n"
+        f"docker image ls output:\n{r_img.stdout}"
+    )
+
+    # Verify the provision step was logged with status=ok.
+    # On the unfixed installer this line is absent (status=fail is logged instead).
+    log_r = vm.shell(
+        "sudo cat /var/log/sandbox-install.log", check=True, timeout=10,
+    )
+    assert "step=provision action=rebuild-image backend=container status=ok" in log_r.stdout, (
+        "Install log does not contain a successful container provision entry.\n"
+        "If status=fail is present instead, the EACCES redirect bug is still active.\n"
+        f"Log tail:\n{log_r.stdout[-3000:]}"
+    )
