@@ -570,8 +570,23 @@ pub fn resolve_latest_version_via_github() -> Result<String, String> {
 // Auto-download
 // ---------------------------------------------------------------------------
 
+/// Build the tarball and sigstore download URLs for a given release.
+///
+/// GitHub release download URLs use the git tag (`v`-prefixed) in the path
+/// segment but the bare semver in the asset filename:
+/// `{source_url}/v{version}/sandboxd-{version}-{arch}.tar.gz`.
+///
+/// Returns `(tarball_url, sigstore_url)`.
+pub fn release_asset_urls(source_url: &str, version: &str, arch: &str) -> (String, String) {
+    let tarball_name = format!("sandboxd-{version}-{arch}.tar.gz");
+    let sigstore_name = format!("{tarball_name}.sigstore");
+    let tarball_url = format!("{source_url}/v{version}/{tarball_name}");
+    let sigstore_url = format!("{source_url}/v{version}/{sigstore_name}");
+    (tarball_url, sigstore_url)
+}
+
 /// Download a release tarball and its `.sigstore` signature bundle from
-/// `{source_url}/{version}/sandboxd-{version}-{arch}.tar.gz`.
+/// `{source_url}/v{version}/sandboxd-{version}-{arch}.tar.gz`.
 ///
 /// Both the tarball and the `.sigstore` bundle are written into `dest_dir`.
 /// On success, returns the local paths `(tarball, sigstore)`.
@@ -594,8 +609,7 @@ pub fn download_tarball(
 
     let tarball_name = format!("sandboxd-{version}-{arch}.tar.gz");
     let sigstore_name = format!("{tarball_name}.sigstore");
-    let tarball_url = format!("{source_url}/{version}/{tarball_name}");
-    let sigstore_url = format!("{source_url}/{version}/{sigstore_name}");
+    let (tarball_url, sigstore_url) = release_asset_urls(source_url, version, arch);
 
     let tarball_path = dest_dir.join(&tarball_name);
     let sigstore_path = dest_dir.join(&sigstore_name);
@@ -799,6 +813,54 @@ mod tests {
         let m = peek_manifest_in_tarball(&tarball_path).expect("peek ok");
         assert_eq!(m.version, "9.9.9");
         assert_eq!(m.arch, "aarch64-unknown-linux-gnu");
+    }
+
+    /// Pins both halves of the release-asset URL contract:
+    /// - path segment uses the `v`-prefixed tag (`v{version}`)
+    /// - asset filename uses the bare version (`{version}`, no `v`)
+    ///
+    /// This test exists because the previous implementation used a bare version
+    /// in the path segment, producing 404s against GitHub Releases, which only
+    /// serves assets under the `v`-prefixed tag path.
+    #[test]
+    fn release_asset_urls_v_prefixed_tag_bare_filename() {
+        let source_url = "https://github.com/Koriit/sandboxd/releases/download";
+        let version = "0.1.8";
+        let arch = "x86_64-unknown-linux-gnu";
+
+        let (tarball_url, sigstore_url) = release_asset_urls(source_url, version, arch);
+
+        // Path segment must use the v-prefixed tag.
+        assert!(
+            tarball_url.contains("/v0.1.8/"),
+            "tarball URL path segment must be v-prefixed: {tarball_url}"
+        );
+        assert!(
+            sigstore_url.contains("/v0.1.8/"),
+            "sigstore URL path segment must be v-prefixed: {sigstore_url}"
+        );
+
+        // Filename must use the bare version (no v prefix).
+        let expected_tarball = "sandboxd-0.1.8-x86_64-unknown-linux-gnu.tar.gz";
+        let expected_sigstore = "sandboxd-0.1.8-x86_64-unknown-linux-gnu.tar.gz.sigstore";
+        assert!(
+            tarball_url.ends_with(expected_tarball),
+            "tarball filename must be bare-version: {tarball_url}"
+        );
+        assert!(
+            sigstore_url.ends_with(expected_sigstore),
+            "sigstore filename must be bare-version: {sigstore_url}"
+        );
+
+        // Full URLs must be exactly as expected.
+        assert_eq!(
+            tarball_url,
+            format!("{source_url}/v{version}/{expected_tarball}")
+        );
+        assert_eq!(
+            sigstore_url,
+            format!("{source_url}/v{version}/{expected_sigstore}")
+        );
     }
 
     #[test]
