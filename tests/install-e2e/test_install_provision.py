@@ -95,7 +95,32 @@ def _install_sh_cmd_with_provision_rich_ui(tarball_in_vm, *, vm, sigstore_stack)
     # under a pty and writes the transcript to /dev/null (we only care about
     # the exit code, and install.sh logs everything to /var/log/sandbox-install.log).
     # The outer timeout caps cleanup_tmpdir in case the hang regresses.
-    return f"timeout 1800 script -qec {_sh_quote(inner_cmd)} /dev/null"
+    #
+    # Two additional measures ensure ui_detect_tty sees a real terminal:
+    #
+    # 1. TERM=xterm-256color — limactl shell runs without a tty so TERM is
+    #    unset or "dumb" in the guest environment.  script(1) inherits this
+    #    and passes it to the child.  tput smcup/rmcup (required by
+    #    ui_detect_tty) silently fails on an unknown/dumb terminal, so
+    #    RICH_UI stays 0.  Setting a capable TERM before script runs fixes
+    #    the tput gate.
+    #
+    # 2. `stty rows 24 cols 80 </dev/tty` preamble — when script creates a
+    #    new pty with no terminal-size hint (none is available from the
+    #    caller because limactl shell has no tty), the kernel initialises
+    #    the pty with a 0×0 window.  ui_detect_tty reads the size via
+    #    `stty size </dev/tty`; if it returns "0 0" the row count is 0,
+    #    which fails the `>= RICH_UI_MIN_ROWS (9)` gate even though all
+    #    other conditions are met.  Running `stty rows 24 cols 80` as the
+    #    first thing inside the script session resizes the pty before
+    #    install.sh calls ui_detect_tty.
+    inner_cmd_with_setup = (
+        f"stty rows 24 cols 80 </dev/tty 2>/dev/null; {inner_cmd}"
+    )
+    return (
+        f"TERM=xterm-256color timeout 1800 "
+        f"script -qec {_sh_quote(inner_cmd_with_setup)} /dev/null"
+    )
 
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
@@ -259,28 +284,57 @@ def test_install_with_provision_rich_ui(
 def _install_sh_cmd_nonroot_with_provision(tarball_in_vm, *, vm, sigstore_stack):
     """Build the install.sh invocation run AS THE OPERATOR (non-root), WITH provisioning.
 
-    The Lima VM's default user (``lima``) has passwordless sudo, so install.sh's
-    internal privileged child (``sudo sh /tmp/...priv-child.sh``) succeeds even
-    though the outer script runs unprivileged.  This mirrors the canonical
-    ``curl | sh`` install path: ``id -u`` inside install.sh returns a non-zero
-    uid, so ``run_provision`` takes the non-root branch and the bug manifests.
+    The VM's default user (the host invoking user, e.g. ``olek``) has
+    passwordless sudo, so install.sh's internal privileged child
+    (``sudo sh /tmp/...priv-child.sh``) succeeds even though the outer script
+    runs unprivileged.  This mirrors the canonical ``curl | sh`` install path:
+    ``id -u`` inside install.sh returns a non-zero uid, so ``run_provision``
+    takes the non-root branch and the bug manifests.
 
     The sigstore trust-material env vars are still needed so install.sh's
     ``sigstore_verify`` step can call cosign against the local stack.  Because
     the outer invocation has no ``sudo``, the env vars reach install.sh through
     the shell environment directly rather than via ``sudo VAR=val``.
+
+    Docker group activation via ``sg docker -c``:
+    Lima multiplexes ``limactl shell`` over a persistent SSH ControlMaster
+    connection established before ``_install_prereqs`` ran ``usermod``.
+    Supplementary group membership is resolved at login time, so the
+    persistent connection's process still carries the pre-``usermod`` group
+    set — ``docker info`` gets EACCES even after ``usermod -aG docker <user>``.
+    Wrapping the install command in ``sg docker -c '...'`` re-evaluates group
+    membership for that specific invocation, giving install.sh a process whose
+    effective supplementary groups include ``docker`` without requiring a new
+    SSH session.  ``sg`` preserves the inherited environment (it is not a login
+    shell), so the ``SANDBOX_*`` env-var prefix placed before ``sg`` is visible
+    inside the ``-c`` command.
+
+    Quoting structure (three layers, outermost first):
+      1. Python builds a flat shell-script string.
+      2. ``vm.shell(cmd)`` → ``limactl shell <vm> -- sh -c '<cmd>'`` — the
+         shell evaluates the string.
+      3. ``sg docker -c '<inner>'`` — sg runs the inner string in a new shell
+         with the docker group active.
+    The env prefix (``K='v' ...``) sits at layer 2 (before ``sg``), so ``sg``
+    inherits the vars.  The ``-c`` argument for ``sg`` (layer 3) contains only
+    the bare ``bash /tmp/install.sh ...`` invocation; those tokens contain no
+    single quotes, so single-quoting the arg via ``_sh_quote`` is safe.
     """
     ver = version_from_tarball(tarball_in_vm)
     trust_env = stage_sigstore_trust_material_in_vm(vm, sigstore_stack)
     env_prefix = " ".join(f"{k}={_sh_quote(v)}" for k, v in trust_env.items()) + " "
-    return " ".join([
-        f"{env_prefix}bash /tmp/install.sh",
+    inner = " ".join([
+        "bash /tmp/install.sh",
         f"--from {tarball_in_vm}",
         f"--version {ver}",
         "--yes",
         "--no-color",
         # NOTE: --no-provision is intentionally ABSENT — this is the bug trigger.
     ])
+    # env_prefix before sg so the vars are in sg's environment (sg preserves
+    # inherited env); _sh_quote(inner) wraps the -c argument in single quotes
+    # (safe because inner contains no single quotes).
+    return f"{env_prefix}sg docker -c {_sh_quote(inner)}"
 
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])

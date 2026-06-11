@@ -1670,9 +1670,11 @@ confirm_plan() {
     fi
 
     if [ ! -e /dev/tty ] || { [ "$RICH_UI" -ne 1 ] && [ ! -t 1 ]; }; then
-        printf '%s\n' "Aborting: no terminal and --yes not passed." >&2
-        printf '%s\n' "  Re-run with --yes to proceed non-interactively:" >&2
-        printf '%s\n' "      install.sh --yes [other options]" >&2
+        # Stdout is not redirected (setup_stderr_log only redirects fd 2), so
+        # the abort reason reaches the user even in the headless curl|sh case.
+        printf '%s\n' "Aborting: no terminal and --yes not passed."
+        printf '%s\n' "  Re-run with --yes to proceed non-interactively:"
+        printf '%s\n' "      install.sh --yes [other options]"
         log_fail "step=confirm action=abort reason=no-tty"
         exit 1
     fi
