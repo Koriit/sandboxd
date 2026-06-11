@@ -327,6 +327,13 @@ elif [ "$portable_build" = "1" ]; then
     mkdir -p "$BUILD_CACHE/cargo-home/registry" \
              "$BUILD_CACHE/cargo-home/git" \
              "$BUILD_CACHE/rustup"
+    # Pre-create the target dir as the host user so the shared parent
+    # target/ is owned by the operator before the container runs as root.
+    # Without this, root's cargo would create target/ as root:root on a
+    # clean checkout, breaking later native host builds (cargo build
+    # --release writes to target/release, which requires creating a
+    # subdirectory inside the root-owned target/).
+    mkdir -p "$ROOT/sandboxd/${CARGO_TARGET_SUBDIR}"
     # apt state lives inside the throwaway container layer — bind-
     # mounting /var/cache/apt and /var/lib/apt over the image's
     # pre-populated dirs strips required subdirs (archives/partial,
@@ -401,6 +408,14 @@ elif [ "$portable_build" = "1" ]; then
             # Chown the produced artifacts so the host user can stage,
             # tar, and (eventually) clean them without sudo.
             chown -R "$HOST_UID:$HOST_GID" "/work/sandboxd/${CARGO_TARGET_SUBDIR}"
+            # Repair the parent target/ directory entry ownership if root
+            # created it (e.g. on a checkout poisoned before the mkdir-p
+            # pre-create above was added). Non-recursive: we only need the
+            # directory entry itself operator-owned so that native host
+            # builds can create subdirectories (e.g. target/release) inside
+            # it. A recursive chown over the full target/ tree on every
+            # build would be unnecessarily slow given its size.
+            chown "$HOST_UID:$HOST_GID" "/work/sandboxd/target"
         '
 else
     printf 'build-local-tarball.sh: cargo build --workspace --release (host) ...\n'
