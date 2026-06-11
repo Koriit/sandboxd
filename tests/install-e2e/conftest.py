@@ -856,6 +856,25 @@ def _install_prereqs(vm):
         "set -eux; sudo systemctl enable --now docker",
         check=True, timeout=120,
     )
+    # Add the operator user to the docker group so that a non-root
+    # install.sh invocation (no outer `sudo`) can reach the Docker daemon
+    # via `docker info`.  The Docker socket is root:docker 0660, so without
+    # group membership the prerequisite check fires `docker-unreachable`.
+    #
+    # We derive the username via vm_invoking_user() rather than hardcoding
+    # it: Lima maps the host's invoking user onto the guest, so the in-VM
+    # username matches `$USER` on the host (not necessarily "lima").
+    # vm_invoking_user() runs `whoami` inside the VM through `limactl shell`
+    # (the same execution path the non-root install uses), so the name it
+    # returns is guaranteed to match.
+    #
+    # Each vm.shell() call is a fresh `limactl shell` session, so the group
+    # addition is active in all subsequent calls — no newgrp/relogin needed.
+    _operator = vm_invoking_user(vm)
+    vm.shell(
+        f"sudo usermod -aG docker {_operator}",
+        check=True, timeout=30,
+    )
 
 
 def _stage_scripts(vm, built_dir: Path) -> None:
