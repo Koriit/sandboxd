@@ -3834,4 +3834,101 @@ WantedBy=multi-user.target";
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Owner-marker write→read round-trip tests
+    // -----------------------------------------------------------------------
+    //
+    // These tests exercise write_owner_marker and run_read_owner_marker
+    // directly, using a tempdir as the lima_home. No limactl, no VM, no
+    // uid pivot needed. They run in the default nextest profile.
+    //
+    // The production contract:
+    //   write_owner_marker(lima_home, vm, owner) writes "{lima_home}{vm}/sandboxd-owner"
+    //   run_read_owner_marker reads it back and writes to stdout, exit 0 on success.
+    //   A missing file → EXIT_GENERIC (non-zero) so the daemon maps it to None.
+
+    /// After write_owner_marker writes the marker file, reading the file
+    /// directly yields the exact CIDR string. This pins the persistence
+    /// contract: the correct path, no truncation, no trailing bytes.
+    #[test]
+    fn owner_marker_write_persists_cidr_string() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // lima_home must end with '/' (the helper formats the path as
+        // "{lima_home}{vm}/sandboxd-owner").
+        let lima_home = format!("{}/", tmp.path().display());
+        let vm = "sandbox-abc123def456";
+        let owner = "10.220.0.0/20";
+
+        // Create the instance dir the way limactl would.
+        std::fs::create_dir_all(tmp.path().join(vm)).expect("create instance dir");
+
+        write_owner_marker(&lima_home, vm, owner).expect("write_owner_marker must succeed");
+
+        // Verify the file exists at the expected path with the exact content.
+        let marker_path = tmp.path().join(vm).join("sandboxd-owner");
+        assert!(marker_path.exists(), "marker file must exist after write");
+        let on_disk = std::fs::read_to_string(&marker_path).expect("read marker file");
+        assert_eq!(
+            on_disk, owner,
+            "marker must contain exactly the CIDR string (no truncation, no trailing bytes)"
+        );
+    }
+
+    /// read_owner_marker round-trips: after writing a marker, the read path
+    /// (run_read_owner_marker) exits 0 — confirming the read gate recognises
+    /// a present, well-formed marker. The CIDR content is already verified
+    /// by the write test; here we confirm the exit-code contract.
+    #[test]
+    fn owner_marker_read_present_marker_exits_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lima_home = format!("{}/", tmp.path().display());
+        let vm = "sandbox-abc123def456";
+        let owner = "10.220.0.0/20";
+
+        std::fs::create_dir_all(tmp.path().join(vm)).expect("create instance dir");
+        write_owner_marker(&lima_home, vm, owner).expect("write marker");
+
+        let exit = run_read_owner_marker(1000, &lima_home, vm);
+        assert_eq!(
+            exit,
+            std::process::ExitCode::SUCCESS,
+            "read_owner_marker must exit 0 when the marker file is present"
+        );
+    }
+
+    /// A missing marker file must produce a non-zero exit code. The daemon
+    /// treats any non-zero/empty-stdout exit as "None → legacy VM" and reaps
+    /// within its own LIMA_HOME by name+live-set only.
+    #[test]
+    fn owner_marker_read_absent_marker_exits_nonzero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lima_home = format!("{}/", tmp.path().display());
+        let vm = "sandbox-abc123def456";
+
+        // Create the instance dir but do NOT write a marker.
+        std::fs::create_dir_all(tmp.path().join(vm)).expect("create instance dir");
+
+        let exit = run_read_owner_marker(1000, &lima_home, vm);
+        assert_ne!(
+            exit,
+            std::process::ExitCode::SUCCESS,
+            "absent marker must produce a non-zero exit so the daemon maps it to None"
+        );
+    }
+
+    /// write_owner_marker must return Err (not panic) when the instance
+    /// directory does not exist — this simulates the case where limactl
+    /// failed before creating the instance dir, and we skip the marker write.
+    #[test]
+    fn owner_marker_write_missing_instance_dir_returns_err() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lima_home = format!("{}/", tmp.path().display());
+        // Do NOT create the instance dir.
+        let result = write_owner_marker(&lima_home, "sandbox-abc123def456", "10.209.0.0/20");
+        assert!(
+            result.is_err(),
+            "write to a non-existent instance dir must return Err (not panic)"
+        );
+    }
 }
