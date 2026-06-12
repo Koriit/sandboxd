@@ -759,14 +759,31 @@ def vm_factory(request, built_scripts):
     (success or failure). On failure, the install log + journalctl
     snapshot is harvested to tests/install-e2e/logs/<test>/<vm>/.
     """
+    # Each entry is (vm_name, vm_or_none). The name is registered before
+    # lima_start so a disk-full crash mid-create still triggers cleanup.
+    # The VM object is None when lima_start raised; _harvest_logs is skipped
+    # for those entries because the VM may not be reachable via shell.
     created = []
     test_name = request.node.name.replace("/", "_").replace(":", "_")[:80]
 
     def _factory(template, *, install_prereqs=True, install_scripts=True):
         name = lima_vm_name()
+        # Register for cleanup BEFORE lima_start can fail.
+        # If lima_start raises after limactl has already written the
+        # multi-GB disk image, the VM dir exists on disk but was never
+        # appended to `created`. This caused the sb-iet-5651a265 2.8 GB
+        # leak: the teardown loop never saw the name and lima_delete was
+        # never called.
+        created.append((name, None))
+
         lima_start(name, template)
+
         vm = VM(name=name, distro=template)
-        created.append(vm)
+        # Replace the placeholder None with the fully-constructed VM.
+        for i, (n, _) in enumerate(created):
+            if n == name:
+                created[i] = (name, vm)
+                break
 
         if install_prereqs:
             _install_prereqs(vm)
@@ -781,10 +798,12 @@ def vm_factory(request, built_scripts):
     # --- teardown ---
     rep = getattr(request.node, "rep_call", None)
     failed = rep is not None and rep.failed
-    for vm in created:
-        if failed:
-            _harvest_logs(vm, LOGS_DIR / test_name / vm.name)
-        lima_delete(vm.name)
+    for vm_name, vm in created:
+        if failed and vm is not None:
+            # Only harvest logs when the VM was fully started; a VM whose
+            # lima_start raised may not be reachable via shell.
+            _harvest_logs(vm, LOGS_DIR / test_name / vm_name)
+        lima_delete(vm_name)
 
 
 def _install_prereqs(vm):
