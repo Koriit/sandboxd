@@ -8841,6 +8841,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
     }
 
+    // Lima VM orphan cleanup: runs in parallel with the Docker reaper
+    // (both are post-reconcile, both are startup-only).
+    //
+    // Enumerates operator uids from the daemon-owned FS tree (not from
+    // session rows — that is the [L-1] gap `reconcile` leaves open) and
+    // removes `sandbox-{id}` VMs whose session id is absent from the live
+    // set. The owner marker (`sandboxd-owner`) file is consulted so a
+    // shared-LIMA_HOME edge case doesn't cause cross-daemon reaping.
+    {
+        let pool_str = format!(
+            "{}/{}",
+            allocation_pool.base(),
+            allocation_pool.prefix_len()
+        );
+        let _ = tokio::task::spawn_blocking({
+            let registry = lima_registry.clone();
+            let live = live_session_ids.clone();
+            move || {
+                sandbox_core::reap_lima_orphans(&registry, &live, &pool_str)
+            }
+        })
+        .await;
+    }
+
     // Hydrate the in-memory policy map from SQLite **before**
     // `reconcile_networking` runs.  Gateway restoration inside the
     // reconciliation loop calls `reapply_session_policy`, which looks

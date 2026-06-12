@@ -93,8 +93,10 @@ pub use lds_ack::{
 };
 pub use lima::{
     BaseImageMeta, BaseImageStatus, DEFAULT_BASE_VM_NAME, GUEST_BINARY_PATH_OVERRIDE_ENV,
-    LimaManager, LimaManagerRegistry, PRODUCTION_GUEST_BINARY_PATH, SANDBOXD_STATE_ROOT, VmInfo,
-    VmStatus, ensure_operator_lima_home, guest_agent_path, operator_lima_home, vm_name,
+    LimaManager, LimaManagerRegistry, LimaReaperReport, PRODUCTION_GUEST_BINARY_PATH,
+    SANDBOXD_STATE_ROOT, VmInfo, VmStatus, ensure_operator_lima_home,
+    enumerate_operator_uids_from_fs, guest_agent_path, operator_lima_home, reap_lima_orphans,
+    vm_name,
 };
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{

@@ -219,6 +219,222 @@ pub fn operator_lima_home(op_uid: u32) -> PathBuf {
     operator_lima_home_inner(SANDBOXD_STATE_ROOT, daemon_uid, op_uid)
 }
 
+/// Resolve the per-daemon root directory for Lima state:
+/// `{state_root}/{daemon_uid}/`.
+///
+/// The daemon (uid `sandbox`) owns this directory and can enumerate its
+/// immediate subdirectories to discover operator uids. This is the root
+/// that `enumerate_operator_uids_from_fs` scans.
+///
+/// Respects the `test-env-override` state root redirect.
+fn daemon_lima_root() -> PathBuf {
+    let daemon_uid = nix::unistd::Uid::current().as_raw();
+    let state_root = {
+        #[cfg(feature = "test-env-override")]
+        if let Ok(root) = std::env::var(STATE_ROOT_OVERRIDE_ENV)
+            && !root.is_empty()
+        {
+            root
+        } else {
+            SANDBOXD_STATE_ROOT.to_string()
+        }
+        #[cfg(not(feature = "test-env-override"))]
+        SANDBOXD_STATE_ROOT.to_string()
+    };
+    PathBuf::from(format!("{state_root}/{daemon_uid}"))
+}
+
+/// Enumerate operator uids by scanning the daemon-owned filesystem tree.
+///
+/// The daemon (uid `sandbox`) can `readdir` the tree it owns:
+/// `{state_root}/{daemon_uid}/` — any immediate numeric subdir that also
+/// contains a `lima/` child is an operator uid.
+///
+/// This is the resolution for the [L-1] gap in `reconcile()`: `reconcile`
+/// only enumerates op_uids from session rows, missing operators whose sessions
+/// have all been deleted. This function discovers op_uids from the filesystem
+/// regardless of session-row state, closing the orphan-VM leak.
+///
+/// Non-numeric subdirs and subdirs without a `lima/` child are silently
+/// skipped. Read errors log at `warn!` and return an empty list.
+pub fn enumerate_operator_uids_from_fs() -> Vec<u32> {
+    let root = daemon_lima_root();
+    let mut result = Vec::new();
+
+    let rd = match std::fs::read_dir(&root) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // State root not yet created — no operators exist yet.
+            return result;
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %root.display(),
+                error = %e,
+                "enumerate_operator_uids_from_fs: failed to read daemon root; \
+                 skipping Lima orphan scan"
+            );
+            return result;
+        }
+    };
+
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Parse as a u32 uid.
+        let Ok(uid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        // Skip root op-uid (would be rejected by the helper anyway).
+        if uid == 0 {
+            continue;
+        }
+        // Verify the `lima/` sub-directory exists — without it there are
+        // no VMs to enumerate, and `get_or_create` would provision an empty
+        // LIMA_HOME unnecessarily.
+        let lima_child = entry.path().join("lima");
+        if lima_child.is_dir() {
+            result.push(uid);
+        }
+    }
+
+    result
+}
+
+/// Tally of VMs reaped by a single [`reap_lima_orphans`] pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LimaReaperReport {
+    pub vms_reaped: u32,
+    pub vms_skipped_foreign: u32,
+    pub vms_skipped_live: u32,
+    pub op_uids_scanned: u32,
+}
+
+/// Enumerate and reap orphaned Lima VMs at daemon startup.
+///
+/// This runs AFTER `reconcile()` (which is state-only) and parallel to
+/// `reap_orphans` (the Docker reaper). It closes the [L-1] gap:
+/// `reconcile` only enumerates op_uids from session rows, so operators
+/// whose last session was deleted never have their VMs cleaned up.
+///
+/// Algorithm:
+/// 1. Enumerate op_uids from the daemon-owned FS tree (not from session rows).
+/// 2. For each op_uid: `registry.get_or_create(op_uid)` → `mgr.list_vms()`.
+/// 3. For each VM whose session_id is NOT in `live`:
+///    - Read the owner marker via the helper (post-pivot read).
+///    - If marker == my pool OR marker absent: reap.
+///    - If marker present but != my pool: skip (foreign VM in shared LIMA_HOME).
+/// 4. Best-effort and idempotent: per-VM and per-operator errors log at `warn!`
+///    and continue.
+pub fn reap_lima_orphans(
+    registry: &LimaManagerRegistry,
+    live: &std::collections::HashSet<crate::session::SessionId>,
+    my_pool: &str,
+) -> LimaReaperReport {
+    let mut report = LimaReaperReport::default();
+    let op_uids = enumerate_operator_uids_from_fs();
+
+    for op_uid in op_uids {
+        report.op_uids_scanned += 1;
+        let mgr = match registry.get_or_create(op_uid) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    op_uid,
+                    error = %e,
+                    "lima orphan reaper: failed to get/create manager for operator; skipping"
+                );
+                continue;
+            }
+        };
+
+        let vms = match mgr.list_vms() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    op_uid,
+                    error = %e,
+                    "lima orphan reaper: failed to list VMs for operator; skipping"
+                );
+                continue;
+            }
+        };
+
+        for vm in &vms {
+            let Some(sid) = vm.session_id else {
+                // No session id parseable from name (e.g. base VM `sandbox-base`).
+                // The base VM is naturally protected because `sandbox-base` doesn't
+                // parse as 12-hex — `list_vms` still includes it but session_id is None.
+                continue;
+            };
+
+            if live.contains(&sid) {
+                report.vms_skipped_live += 1;
+                continue;
+            }
+
+            // VM is not live. Check the owner marker before reaping.
+            let marker = mgr.read_owner_marker(&sid);
+            match marker.as_deref() {
+                Some(pool) if pool != my_pool => {
+                    // Marker present but belongs to a different daemon.
+                    // Normal deployments never hit this (each daemon has its
+                    // own LIMA_HOME tree), but guard against a shared-LIMA_HOME
+                    // edge case.
+                    tracing::info!(
+                        op_uid,
+                        vm = %vm.name,
+                        session_id = %sid,
+                        marker_pool = %pool,
+                        "lima orphan reaper: VM marker belongs to a different daemon pool; skipping"
+                    );
+                    report.vms_skipped_foreign += 1;
+                    continue;
+                }
+                _ => {
+                    // Marker present and matches my pool → reap.
+                    // Marker absent → legacy VM in my own LIMA_HOME tree;
+                    // name + live-set scoping is sufficient.
+                }
+            }
+
+            // Reap the VM.
+            match mgr.delete_vm(&sid) {
+                Ok(()) => {
+                    tracing::info!(
+                        op_uid,
+                        vm = %vm.name,
+                        session_id = %sid,
+                        "lima orphan reaper: removed VM with no owning session"
+                    );
+                    report.vms_reaped += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        op_uid,
+                        vm = %vm.name,
+                        session_id = %sid,
+                        error = %e,
+                        "lima orphan reaper: failed to delete VM; continuing"
+                    );
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        vms_reaped = report.vms_reaped,
+        vms_skipped_foreign = report.vms_skipped_foreign,
+        vms_skipped_live = report.vms_skipped_live,
+        op_uids_scanned = report.op_uids_scanned,
+        "lima orphan reaper: pass complete"
+    );
+
+    report
+}
+
 /// Ensure `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/` exists and carries
 /// the correct POSIX ACL so helper-pivoted `limactl` (running as `op_uid`)
 /// can write into it.
@@ -4643,5 +4859,79 @@ mod tests {
             2,
             "registry must have two entries after concurrent distinct-uid creates"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // enumerate_operator_uids_from_fs tests
+    // -----------------------------------------------------------------------
+    //
+    // These tests use the test-env-override state-root redirect so they do
+    // not touch `/var/lib/sandboxd/`. The daemon-uid segment is derived from
+    // `getuid()` in production; here we rely on `daemon_lima_root()` which
+    // reads the same env var redirect.
+
+    #[test]
+    #[cfg(feature = "test-env-override")]
+    fn enumerate_operator_uids_returns_numeric_subdirs_with_lima_child() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let root = tmp.path();
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        // Create two valid operator entries and one invalid one.
+        let op1 = root.join(daemon_uid.to_string()).join("1001").join("lima");
+        let op2 = root.join(daemon_uid.to_string()).join("1002").join("lima");
+        // Non-numeric dir — must be skipped.
+        let non_num = root.join(daemon_uid.to_string()).join("notanumber").join("lima");
+        // Numeric dir without lima/ — must be skipped.
+        let no_lima = root.join(daemon_uid.to_string()).join("1003").join("other");
+
+        for dir in [&op1, &op2, &non_num, &no_lima] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+
+        // Point the enumerator at our tempdir.
+        // SAFETY: test-only, single-threaded at this point in the test.
+        unsafe { std::env::set_var(STATE_ROOT_OVERRIDE_ENV, root.to_str().unwrap()) };
+        let uids = enumerate_operator_uids_from_fs();
+        unsafe { std::env::remove_var(STATE_ROOT_OVERRIDE_ENV) };
+
+        let mut sorted = uids.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1001u32, 1002]);
+    }
+
+    #[test]
+    #[cfg(feature = "test-env-override")]
+    fn enumerate_operator_uids_returns_empty_when_root_absent() {
+        // A state root that does not exist on disk should yield an empty list,
+        // not an error or panic.
+        // SAFETY: test-only, single-threaded at this point.
+        unsafe { std::env::set_var(STATE_ROOT_OVERRIDE_ENV, "/tmp/this-dir-does-not-exist-12345") };
+        let uids = enumerate_operator_uids_from_fs();
+        unsafe { std::env::remove_var(STATE_ROOT_OVERRIDE_ENV) };
+        assert!(uids.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "test-env-override")]
+    fn enumerate_operator_uids_skips_root_uid() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let root = tmp.path();
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        // uid 0 should always be skipped.
+        let op0 = root.join(daemon_uid.to_string()).join("0").join("lima");
+        let op1001 = root.join(daemon_uid.to_string()).join("1001").join("lima");
+        for dir in [&op0, &op1001] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+
+        // SAFETY: test-only, single-threaded at this point in the test.
+        unsafe { std::env::set_var(STATE_ROOT_OVERRIDE_ENV, root.to_str().unwrap()) };
+        let uids = enumerate_operator_uids_from_fs();
+        unsafe { std::env::remove_var(STATE_ROOT_OVERRIDE_ENV) };
+
+        assert!(!uids.contains(&0), "uid 0 must be excluded");
+        assert!(uids.contains(&1001), "uid 1001 must be included");
     }
 }
