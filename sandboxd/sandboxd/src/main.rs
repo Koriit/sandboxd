@@ -2306,6 +2306,15 @@ async fn create_session(
                 // ownership. Travels as `Some((uid, gid))` here because
                 // the supervisor-fork pattern requires both halves.
                 operator_identity: Some((operator.uid, operator.gid)),
+                // Pool CIDR stamped as `sandboxd.owner=<pool>` on the
+                // container and home volume so the orphan reaper can
+                // attribute them to this daemon even after the session
+                // network has been torn down.
+                owner_pool: Some(format!(
+                    "{}/{}",
+                    state.users_conf_pool.cidr.base(),
+                    state.users_conf_pool.cidr.prefix_len()
+                )),
             };
             state
                 .container_runtime
@@ -2486,8 +2495,13 @@ async fn create_session(
             let ni = network_info.clone();
             let ca = ca_dir.clone();
             let dns = initial_dns_policy.map(|s| s.to_string());
+            let pool = format!(
+                "{}/{}",
+                state.users_conf_pool.cidr.base(),
+                state.users_conf_pool.cidr.prefix_len()
+            );
             match tokio::task::spawn_blocking(move || {
-                gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+                gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
             })
             .await
             {
@@ -6068,8 +6082,13 @@ async fn setup_session_networking(
         let ni = network_info.clone();
         let ca = ca_dir.to_path_buf();
         let dns = initial_dns_policy.map(|s| s.to_string());
+        let pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
         match tokio::task::spawn_blocking(move || {
-            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
         })
         .await
         {
@@ -6572,8 +6591,13 @@ async fn restore_session_networking(
         let ni = network_info.clone();
         let ca = ca_dir.clone();
         let dns = initial_dns_policy.map(|s| s.to_string());
+        let pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
         match tokio::task::spawn_blocking(move || {
-            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
         })
         .await
         {
@@ -6725,8 +6749,13 @@ async fn restore_session_networking_lite(
         let ni = network_info.clone();
         let ca = ca_dir.clone();
         let dns = initial_dns_policy.map(|s| s.to_string());
+        let pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
         match tokio::task::spawn_blocking(move || {
-            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
         })
         .await
         {
@@ -7896,12 +7925,18 @@ async fn reconcile_networking(state: &AppState) {
                         let ni = network_info.clone();
                         let ca_owned = ca_ref.map(|p| p.to_path_buf());
                         let init_dns_owned = init_dns.map(|s| s.to_string());
+                        let pool = format!(
+                            "{}/{}",
+                            state.users_conf_pool.cidr.base(),
+                            state.users_conf_pool.cidr.prefix_len()
+                        );
                         let restart_result = tokio::task::spawn_blocking(move || {
                             gw.restart_gateway(
                                 &sid,
                                 &ni,
                                 ca_owned.as_deref(),
                                 init_dns_owned.as_deref(),
+                                Some(&pool),
                             )
                         })
                         .await;
@@ -8313,12 +8348,18 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     let ni = network_info.clone();
                     let ca_owned = ca_ref.map(|p| p.to_path_buf());
                     let init_dns_owned = init_dns.map(|s| s.to_string());
+                    let pool = format!(
+                        "{}/{}",
+                        state.users_conf_pool.cidr.base(),
+                        state.users_conf_pool.cidr.prefix_len()
+                    );
                     let restart_result = tokio::task::spawn_blocking(move || {
                         gw.restart_gateway(
                             &sid,
                             &ni,
                             ca_owned.as_deref(),
                             init_dns_owned.as_deref(),
+                            Some(&pool),
                         )
                     })
                     .await;
@@ -8652,9 +8693,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // matched at startup (see `resolve_allocation_pool` above). The
     // legacy default-pool constructor is no longer reachable from
     // production startup — `users.conf` is the single source of truth.
+    let pool_cidr_str = format!(
+        "{}/{}",
+        allocation_pool.base(),
+        allocation_pool.prefix_len()
+    );
     let network = Arc::new(NetworkManager::new(
         allocation_pool.base(),
         allocation_pool.prefix_len(),
+        pool_cidr_str,
     )?);
     let gateway = Arc::new(GatewayManager::new());
 
@@ -10688,7 +10735,7 @@ mod tests {
         // fatal for the helper, which is exactly what this test pins.
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
+            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string())
                 .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
@@ -10789,7 +10836,7 @@ mod tests {
 
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
+            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string())
                 .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
@@ -10947,7 +10994,7 @@ mod tests {
 
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
+            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string())
                 .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());

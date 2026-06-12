@@ -142,6 +142,7 @@ impl TestNetwork {
             // launch wrapper.
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         }
     }
 }

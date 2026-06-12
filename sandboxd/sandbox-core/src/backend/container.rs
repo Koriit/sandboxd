@@ -330,6 +330,18 @@ pub struct ContainerNetwork {
     /// `None(gid)` mismatch is structurally meaningless and a future
     /// refactor that allows the asymmetric shape should be challenged.
     pub operator_identity: Option<(u32, u32)>,
+    /// Canonical pool CIDR (`<base>/<prefix>`, e.g. `10.209.0.0/20`)
+    /// stamped as `sandboxd.owner=<pool>` on every Docker resource the
+    /// runtime creates for this session (container, home volume). The
+    /// daemon's orphan reaper filters by this label to distinguish
+    /// resources belonging to this daemon from those belonging to a
+    /// co-deployed daemon with a disjoint pool.
+    ///
+    /// `None` on legacy synthetic fixtures (pre-upgrade integration tests)
+    /// that do not exercise the owner-label path — the resource then has
+    /// no `sandboxd.owner` label and is handled by the legacy dual-anchor
+    /// fallback in the reaper.
+    pub owner_pool: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +648,7 @@ fn build_create_argv(
     let pids_arg = PIDS_LIMIT.to_string();
     let dns_arg = network.gateway_ip.to_string();
     let ip_arg = network.container_ip.to_string();
-    let label_arg = format!("sandbox.session_id={session_id}");
+    let session_label_arg = format!("sandbox.session_id={session_id}");
     let home_mount = format!("type=volume,src={home_volume},dst=/home/sandbox");
     let workspace_mount = network.workspace_bind.as_ref().map(|bind| {
         // The bind target is the operator-resolved `guest_path`,
@@ -715,14 +727,24 @@ fn build_create_argv(
         "--restart".to_string(),
         "no".to_string(),
         "--label".to_string(),
-        label_arg,
+        session_label_arg,
+    ];
+
+    // Stamp the daemon-pool owner label when the session was registered with
+    // a pool CIDR. Absent on legacy fixtures (pre-upgrade integration tests).
+    if let Some(pool) = &network.owner_pool {
+        args.push("--label".to_string());
+        args.push(format!("sandboxd.owner={pool}"));
+    }
+
+    args.extend([
         "--mount".to_string(),
         home_mount,
         // Bind-mount of the daemon-staged guest binary — read-only,
         // overlays the in-image baked `/usr/local/bin/sandbox-guest`.
         "-v".to_string(),
         guest_bind_mount,
-    ];
+    ]);
 
     if let Some(mount) = workspace_mount {
         args.push("--mount".to_string());
@@ -845,6 +867,35 @@ impl SessionRuntime for ContainerRuntime {
             cpus,
             &self.guest_bind_source,
         );
+
+        // Explicitly pre-create the home volume with ownership labels so the
+        // orphan reaper can attribute it to this daemon even after the session
+        // network has been torn down (Stopped sessions release their network
+        // while retaining the container and volume). The `docker volume create`
+        // command is idempotent: if the volume already exists (start-after-stop
+        // path) it returns the name and exits 0, and the labels on the existing
+        // volume are NOT overwritten — which is fine; a pre-existing volume was
+        // already created by us in a prior create() call.
+        {
+            let volume_name = home_volume_name(session_id);
+            let mut vol_args: Vec<String> = vec![
+                "volume".to_string(),
+                "create".to_string(),
+                "--label".to_string(),
+                format!("sandbox.session_id={session_id}"),
+            ];
+            if let Some(pool) = &network.owner_pool {
+                vol_args.push("--label".to_string());
+                vol_args.push(format!("sandboxd.owner={pool}"));
+            }
+            vol_args.push(volume_name.clone());
+            run_docker(&vol_args, "docker volume create (home volume pre-create)").await?;
+            debug!(
+                session_id = %session_id,
+                volume = %volume_name,
+                "ContainerRuntime: home volume pre-created with owner labels"
+            );
+        }
 
         // When the operator's uid differs from the uid baked into the lite
         // image (`LITE_IMAGE_HOME_UID` = 1000), Docker's volume
@@ -2020,6 +2071,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
         rt.register_session(sid, net.clone());
         let got = rt.lookup_session(&sid).expect("registered");
@@ -2059,6 +2111,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
         rt.register_session(sid, net);
         let got = rt.lookup_session(&sid).expect("registered");
@@ -2125,6 +2178,7 @@ mod tests {
             ca_host_path: Some(host_path.clone()),
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
 
         let args = build_ca_mount_args(&net);
@@ -2181,6 +2235,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
         assert!(
             build_ca_mount_args(&no_ca).is_empty(),
@@ -2209,6 +2264,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
@@ -2288,6 +2344,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
@@ -2458,6 +2515,7 @@ mod tests {
                 ca_host_path: None,
                 ssh_host_dir: None,
                 operator_identity: None,
+                owner_pool: None,
             },
         );
         // `hardened: false` so we move past `SessionSpec::validate` (which
@@ -2477,6 +2535,7 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
+            owner_pool: None,
         };
 
         let err = rt
@@ -2513,6 +2572,7 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
+            owner_pool: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_zero).unwrap();
         assert_eq!(mem, 2048, "0 → default_memory_mb");
@@ -2530,6 +2590,7 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
+            owner_pool: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_explicit).unwrap();
         assert_eq!(mem, 4096);
@@ -2551,6 +2612,7 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
+            owner_pool: None,
         };
         let (_mem, cpus) = rt.resource_ceilings(&spec_fractional).unwrap();
         assert!(
@@ -2671,6 +2733,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: Some(dir.clone()),
             operator_identity: None,
+            owner_pool: None,
         };
 
         let args = build_ssh_mount_args(&net);
@@ -2725,6 +2788,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
         assert!(build_ssh_mount_args(&net).is_empty());
     }
@@ -2930,6 +2994,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         };
         let (uid, gid) = effective_container_user(network.operator_identity, 1000, 1000);
         let guest_bind_source =
@@ -2976,6 +3041,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: Some(ssh_dir.clone()),
             operator_identity: None,
+            owner_pool: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");

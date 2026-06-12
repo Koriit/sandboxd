@@ -133,6 +133,7 @@ impl TestNetwork {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: None,
+            owner_pool: None,
         }
     }
 }
