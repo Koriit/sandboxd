@@ -32,7 +32,8 @@ use std::time::Duration;
 #[test]
 fn integration_gateway_lifecycle() {
     // Use 10.209.3.0/24 to avoid collisions with other tests.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 3, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 3, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -173,7 +174,8 @@ fn integration_gateway_lifecycle() {
 #[test]
 fn integration_gateway_nftables_injection_standalone() {
     // Use 10.209.4.0/24 to avoid collisions.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 4, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 4, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -297,7 +299,8 @@ fn integration_gateway_nftables_injection_standalone() {
 #[test]
 fn integration_gateway_lds_listener_and_atomic_rewrite() {
     // Use 10.209.5.0/24 to avoid collisions with other tests.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 5, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 5, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -828,7 +831,8 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
 #[test]
 fn integration_wait_for_lds_ack_observes_real_envoy_ack() {
     // 10.209.8.0/24 — distinct from the other gateway tests.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 8, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 8, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -983,7 +987,8 @@ fn integration_wait_for_lds_ack_observes_real_envoy_ack() {
 fn integration_gateway_container_has_events_bind_mount() {
     // Use 10.209.6.0/24 to avoid collisions with the other gateway
     // tests in this file.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 6, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 6, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -1098,7 +1103,8 @@ fn integration_gateway_container_has_events_bind_mount() {
 fn integration_gateway_keep_session_events_preserves_events_dir() {
     // Use 10.209.7.0/24 to avoid collisions with the other gateway
     // tests in this file.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 7, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 7, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -1204,7 +1210,8 @@ fn integration_gateway_keep_session_events_preserves_events_dir() {
 #[test]
 fn integration_apply_policy_through_real_gateway() {
     // Distinct subnet to avoid collisions with the other gateway tests.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 7, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 7, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -1511,7 +1518,8 @@ fn integration_apply_policy_through_real_gateway() {
 /// `integration_gateway_status_witnesses_active_listener`).
 #[test]
 fn integration_distribute_returns_err_when_gateway_rejects_policy() {
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 9, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 9, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -1647,7 +1655,8 @@ fn integration_distribute_returns_err_when_gateway_rejects_policy() {
 #[test]
 fn integration_gateway_status_witnesses_active_listener() {
     // Distinct subnet to avoid collisions with the other gateway tests.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 8, 0), 24, "test-pool".to_string()).unwrap();
+    let net_mgr =
+        NetworkManager::new(Ipv4Addr::new(10, 209, 8, 0), 24, "test-pool".to_string()).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 

@@ -297,7 +297,6 @@ impl DockerOps for CliDockerOps {
             Err(e) => Err(e),
         }
     }
-
 }
 
 /// `docker <args>` with the standard 60s wall-clock timeout, returning
@@ -413,9 +412,7 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
         Ok(names) => {
             let classified: Vec<(String, SessionId)> = names
                 .into_iter()
-                .filter_map(|name| {
-                    parse_home_volume_session_id(&name).map(|sid| (name, sid))
-                })
+                .filter_map(|name| parse_home_volume_session_id(&name).map(|sid| (name, sid)))
                 .collect();
             let (_keep, reap) = partition_orphans(classified, live);
             for (name, sid) in reap {
@@ -452,9 +449,7 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
         Ok(names) => {
             let classified: Vec<(String, SessionId)> = names
                 .into_iter()
-                .filter_map(|name| {
-                    parse_network_session_id(&name).map(|sid| (name, sid))
-                })
+                .filter_map(|name| parse_network_session_id(&name).map(|sid| (name, sid)))
                 .collect();
             let (_keep, reap) = partition_orphans(classified, live);
             for (name, sid) in reap {
@@ -938,5 +933,4 @@ mod tests {
         assert!(parse_one_per_line("").is_empty());
         assert!(parse_one_per_line("\n\n   \n").is_empty());
     }
-
 }

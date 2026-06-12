@@ -8641,7 +8641,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lima_registry = Arc::new(LimaManagerRegistry::new(
         base_vm_name,
         lima_helper_path,
-        format!("{}/{}", allocation_pool.base(), allocation_pool.prefix_len()),
+        format!(
+            "{}/{}",
+            allocation_pool.base(),
+            allocation_pool.prefix_len()
+        ),
     ));
 
     // Build the Lima runtime backed by the registry and register it in
@@ -8864,9 +8868,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::task::spawn_blocking({
             let registry = lima_registry.clone();
             let live = live_session_ids.clone();
-            move || {
-                sandbox_core::reap_lima_orphans(&registry, &live, &pool_str)
-            }
+            move || sandbox_core::reap_lima_orphans(&registry, &live, &pool_str)
         })
         .await;
     }
@@ -10789,8 +10791,12 @@ mod tests {
         // fatal for the helper, which is exactly what this test pins.
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string())
-                .expect("construct NetworkManager"),
+            NetworkManager::new(
+                Ipv4Addr::new(10, 209, 0, 0),
+                24,
+                "10.209.0.0/24".to_string(),
+            )
+            .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
 
@@ -10890,8 +10896,12 @@ mod tests {
 
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string())
-                .expect("construct NetworkManager"),
+            NetworkManager::new(
+                Ipv4Addr::new(10, 209, 0, 0),
+                24,
+                "10.209.0.0/24".to_string(),
+            )
+            .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
 
@@ -11048,8 +11058,12 @@ mod tests {
 
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string())
-                .expect("construct NetworkManager"),
+            NetworkManager::new(
+                Ipv4Addr::new(10, 209, 0, 0),
+                24,
+                "10.209.0.0/24".to_string(),
+            )
+            .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
 

@@ -849,7 +849,13 @@ impl GatewayManager {
         }
 
         // Create fresh container with full setup.
-        self.create_gateway(session_id, network_info, ca_dir, initial_dns_policy, owner_pool)
+        self.create_gateway(
+            session_id,
+            network_info,
+            ca_dir,
+            initial_dns_policy,
+            owner_pool,
+        )
     }
 
     /// Check gateway health.

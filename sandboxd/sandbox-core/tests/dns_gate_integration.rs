@@ -144,7 +144,12 @@ impl GateService for ProdLikeGateService {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_dns_gate_propagate_and_ack_round_trip() {
     // Distinct subnet — avoid collisions with the other gateway integration tests.
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 11, 0), 24, "10.209.11.0/24".to_string()).unwrap();
+    let net_mgr = NetworkManager::new(
+        Ipv4Addr::new(10, 209, 11, 0),
+        24,
+        "10.209.11.0/24".to_string(),
+    )
+    .unwrap();
     let gw_mgr = Arc::new(GatewayManager::new());
     let session_id = SessionId::generate();
 
@@ -155,7 +160,12 @@ async fn integration_dns_gate_propagate_and_ack_round_trip() {
     let cleanup = |panic_msg: String| -> ! {
         let gw = gw_mgr.clone();
         let sid = session_id;
-        let net = NetworkManager::new(Ipv4Addr::new(10, 209, 11, 0), 24, "10.209.11.0/24".to_string()).unwrap();
+        let net = NetworkManager::new(
+            Ipv4Addr::new(10, 209, 11, 0),
+            24,
+            "10.209.11.0/24".to_string(),
+        )
+        .unwrap();
         let _ = gw.stop_gateway(&sid);
         let _ = net.delete_network(&sid);
         panic!("{}", panic_msg);
@@ -301,7 +311,12 @@ async fn integration_dns_gate_propagate_and_ack_round_trip() {
 /// `DaemonGateService::service`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_dns_gate_unknown_session_when_no_policy() {
-    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 12, 0), 24, "10.209.12.0/24".to_string()).unwrap();
+    let net_mgr = NetworkManager::new(
+        Ipv4Addr::new(10, 209, 12, 0),
+        24,
+        "10.209.12.0/24".to_string(),
+    )
+    .unwrap();
     let gw_mgr = Arc::new(GatewayManager::new());
     let session_id = SessionId::generate();
     let network_info = net_mgr.create_network(&session_id).unwrap();

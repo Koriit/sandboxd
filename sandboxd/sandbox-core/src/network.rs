@@ -214,7 +214,11 @@ impl NetworkManager {
     /// Owner pool defaults to `10.209.0.0/24` — used only in unit tests that
     /// don't exercise the owner-label path.
     pub fn with_defaults() -> Result<Self, SandboxError> {
-        Self::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string())
+        Self::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
     }
 
     /// Rebuild allocator state from existing `NetworkInfo` entries.
@@ -804,7 +808,12 @@ mod tests {
 
     #[test]
     fn test_network_info_fields() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string()).unwrap();
+        let mgr = NetworkManager::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
+        .unwrap();
 
         let session_id = SessionId::generate();
 
@@ -869,7 +878,12 @@ mod tests {
 
     #[test]
     fn test_restore_from_infos() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string()).unwrap();
+        let mgr = NetworkManager::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
+        .unwrap();
 
         let id1 = SessionId::generate();
         let id2 = SessionId::generate();
@@ -924,7 +938,12 @@ mod tests {
 
     #[test]
     fn test_network_info_not_found() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string()).unwrap();
+        let mgr = NetworkManager::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
+        .unwrap();
 
         let result = mgr.network_info(&SessionId::generate()).unwrap();
         assert!(result.is_none());

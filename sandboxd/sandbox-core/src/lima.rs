@@ -423,13 +423,11 @@ pub fn reap_lima_orphans(
         for vm in &vms {
             // Only read the owner marker if we have a session_id — the base
             // VM has no parseable sid and its marker is irrelevant.
-            let marker = vm.session_id.as_ref().and_then(|sid| mgr.read_owner_marker(sid));
-            let decision = decide_lima_vm(
-                vm.session_id.as_ref(),
-                marker.as_deref(),
-                live,
-                my_pool,
-            );
+            let marker = vm
+                .session_id
+                .as_ref()
+                .and_then(|sid| mgr.read_owner_marker(sid));
+            let decision = decide_lima_vm(vm.session_id.as_ref(), marker.as_deref(), live, my_pool);
 
             match decision {
                 LimaVmDecision::SkipNoSessionId => {}
@@ -448,7 +446,9 @@ pub fn reap_lima_orphans(
                 LimaVmDecision::Reap => {
                     // session_id is guaranteed Some here because SkipNoSessionId
                     // is the only None branch and we matched on Reap.
-                    let sid = vm.session_id.expect("Reap decision requires Some(session_id)");
+                    let sid = vm
+                        .session_id
+                        .expect("Reap decision requires Some(session_id)");
                     match mgr.delete_vm(&sid) {
                         Ok(()) => {
                             tracing::info!(
@@ -662,7 +662,12 @@ impl LimaManagerRegistry {
     /// Production code uses [`Self::new`].  Tests inject a closure that
     /// provisions into a caller-owned tmpdir so registry unit tests remain
     /// hermetic and do not touch `/var/lib/sandboxd/`.
-    pub fn new_with_provisioner<F>(base_vm_name: String, helper_path: PathBuf, owner_pool: String, provision: F) -> Self
+    pub fn new_with_provisioner<F>(
+        base_vm_name: String,
+        helper_path: PathBuf,
+        owner_pool: String,
+        provision: F,
+    ) -> Self
     where
         F: Fn(u32) -> Result<PathBuf, SandboxError> + Send + Sync + 'static,
     {
@@ -4931,7 +4936,10 @@ mod tests {
         let op1 = root.join(daemon_uid.to_string()).join("1001").join("lima");
         let op2 = root.join(daemon_uid.to_string()).join("1002").join("lima");
         // Non-numeric dir — must be skipped.
-        let non_num = root.join(daemon_uid.to_string()).join("notanumber").join("lima");
+        let non_num = root
+            .join(daemon_uid.to_string())
+            .join("notanumber")
+            .join("lima");
         // Numeric dir without lima/ — must be skipped.
         let no_lima = root.join(daemon_uid.to_string()).join("1003").join("other");
 
@@ -4956,7 +4964,12 @@ mod tests {
         // A state root that does not exist on disk should yield an empty list,
         // not an error or panic.
         // SAFETY: test-only, single-threaded at this point.
-        unsafe { std::env::set_var(STATE_ROOT_OVERRIDE_ENV, "/tmp/this-dir-does-not-exist-12345") };
+        unsafe {
+            std::env::set_var(
+                STATE_ROOT_OVERRIDE_ENV,
+                "/tmp/this-dir-does-not-exist-12345",
+            )
+        };
         let uids = enumerate_operator_uids_from_fs();
         unsafe { std::env::remove_var(STATE_ROOT_OVERRIDE_ENV) };
         assert!(uids.is_empty());

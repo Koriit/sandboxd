@@ -250,7 +250,8 @@ impl GatewaySession {
     /// which is what these tests need (one gateway + one side
     /// container per test).
     fn create(subnet_base: Ipv4Addr) -> Self {
-        let net_mgr = NetworkManager::new(subnet_base, 24, "test-pool".to_string()).expect("network manager should build");
+        let net_mgr = NetworkManager::new(subnet_base, 24, "test-pool".to_string())
+            .expect("network manager should build");
         let gw_mgr = Arc::new(GatewayManager::new());
         let session_id = SessionId::generate();
 

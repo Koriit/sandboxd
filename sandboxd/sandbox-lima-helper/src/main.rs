@@ -181,8 +181,7 @@ static VM_MAC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$").unwrap());
 /// CIDR string charset: digits, dots, slashes only, 1-18 chars.
 /// Further validated structurally in `validate_cidr_owner`.
-static CIDR_CHARSET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[0-9./]{1,18}$").unwrap());
+static CIDR_CHARSET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9./]{1,18}$").unwrap());
 
 // ---------------------------------------------------------------------------
 // test-env-override seams
@@ -587,12 +586,8 @@ fn run() -> ExitCode {
         // install-guest-agent precedent which also sequences steps rather than
         // execvpe-replacing the process. The exec approach cannot be used here
         // because a post-exec file write is impossible after process replacement.
-        Subcommand::Create(a) => {
-            run_create_with_marker(&limactl_path, a, &lima_home, &env_block)
-        }
-        Subcommand::Clone(a) => {
-            run_clone_with_marker(&limactl_path, a, &lima_home, &env_block)
-        }
+        Subcommand::Create(a) => run_create_with_marker(&limactl_path, a, &lima_home, &env_block),
+        Subcommand::Clone(a) => run_clone_with_marker(&limactl_path, a, &lima_home, &env_block),
         _ => exec_limactl(&limactl_path, &subcommand, &env_block),
     }
 }
@@ -937,7 +932,10 @@ fn parse_read_owner_marker(args: &[OsString]) -> Result<Subcommand, String> {
     f.check_no_extra()?;
 
     let op_uid = parse_u32("--op-uid", &op_uid_s)?;
-    Ok(Subcommand::ReadOwnerMarker(ReadOwnerMarkerArgs { op_uid, vm }))
+    Ok(Subcommand::ReadOwnerMarker(ReadOwnerMarkerArgs {
+        op_uid,
+        vm,
+    }))
 }
 
 // --- run-rsync ---
@@ -2044,11 +2042,7 @@ fn run_read_user_key(op_uid: u32, lima_home: &str) -> ExitCode {
 /// belt-and-suspenders NUL/PATH_MAX/absolute/no-`..` checks on the
 /// composed path. The `owner` value has been CIDR-charset-validated
 /// (digits, dots, slashes, ≤18 chars only) before the privilege pivot.
-fn write_owner_marker(
-    lima_home: &str,
-    vm: &str,
-    owner: &str,
-) -> Result<(), ExitCode> {
+fn write_owner_marker(lima_home: &str, vm: &str, owner: &str) -> Result<(), ExitCode> {
     use std::io::Write;
 
     let marker_path = format!("{lima_home}{vm}/sandboxd-owner");
@@ -2145,9 +2139,7 @@ fn run_read_owner_marker(op_uid: u32, lima_home: &str, vm: &str) -> ExitCode {
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
             if let Err(e) = handle.write_all(contents.as_bytes()) {
-                eprintln!(
-                    "sandbox-lima-helper: read-owner-marker: write to stdout failed: {e}"
-                );
+                eprintln!("sandbox-lima-helper: read-owner-marker: write to stdout failed: {e}");
                 return ExitCode::from(EXIT_GENERIC);
             }
             ExitCode::SUCCESS
