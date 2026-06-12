@@ -65,6 +65,7 @@ fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
         std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
         nix::unistd::Uid::current().as_raw(),
         DEFAULT_BASE_VM_NAME.to_string(),
+        "test-pool".to_string(),
     );
     let wrapper_path: PathBuf = mgr
         .ensure_qemu_wrapper_for_test()

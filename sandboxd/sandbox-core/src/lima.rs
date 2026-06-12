@@ -36,6 +36,10 @@ const DELETE_VM_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for `limactl list`.
 const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Timeout for the `read-owner-marker` helper subcommand. This is a simple
+/// file read — no limactl invocation, no network, no long-running process.
+const READ_OWNER_MARKER_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Timeout for `limactl create` when building the base image. The base
 /// image build path downloads the Ubuntu 24.04 cloud-image qcow2
 /// (`ubuntu-24.04-server-cloudimg-amd64.img`, ~580 MiB) on first use.
@@ -215,6 +219,341 @@ pub fn operator_lima_home(op_uid: u32) -> PathBuf {
     operator_lima_home_inner(SANDBOXD_STATE_ROOT, daemon_uid, op_uid)
 }
 
+/// Resolve the per-daemon root directory for Lima state:
+/// `{state_root}/{daemon_uid}/`.
+///
+/// The daemon (uid `sandbox`) owns this directory and can enumerate its
+/// immediate subdirectories to discover operator uids. This is the root
+/// that `enumerate_operator_uids_from_fs` scans.
+///
+/// Respects the `test-env-override` state root redirect.
+fn daemon_lima_root() -> PathBuf {
+    let daemon_uid = nix::unistd::Uid::current().as_raw();
+    let state_root = {
+        #[cfg(feature = "test-env-override")]
+        if let Ok(root) = std::env::var(STATE_ROOT_OVERRIDE_ENV)
+            && !root.is_empty()
+        {
+            root
+        } else {
+            SANDBOXD_STATE_ROOT.to_string()
+        }
+        #[cfg(not(feature = "test-env-override"))]
+        SANDBOXD_STATE_ROOT.to_string()
+    };
+    PathBuf::from(format!("{state_root}/{daemon_uid}"))
+}
+
+/// Enumerate operator uids by scanning the daemon-owned filesystem tree.
+///
+/// The daemon (uid `sandbox`) can `readdir` the tree it owns:
+/// `{state_root}/{daemon_uid}/` — any immediate numeric subdir that also
+/// contains a `lima/` child is an operator uid.
+///
+/// This is the resolution for the [L-1] gap in `reconcile()`: `reconcile`
+/// only enumerates op_uids from session rows, missing operators whose sessions
+/// have all been deleted. This function discovers op_uids from the filesystem
+/// regardless of session-row state, closing the orphan-VM leak.
+///
+/// Non-numeric subdirs and subdirs without a `lima/` child are silently
+/// skipped. Read errors log at `warn!` and return an empty list.
+pub fn enumerate_operator_uids_from_fs() -> Vec<u32> {
+    let root = daemon_lima_root();
+    let mut result = Vec::new();
+
+    let rd = match std::fs::read_dir(&root) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // State root not yet created — no operators exist yet.
+            return result;
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %root.display(),
+                error = %e,
+                "enumerate_operator_uids_from_fs: failed to read daemon root; \
+                 skipping Lima orphan scan"
+            );
+            return result;
+        }
+    };
+
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Parse as a u32 uid.
+        let Ok(uid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        // Skip root op-uid (would be rejected by the helper anyway).
+        if uid == 0 {
+            continue;
+        }
+        // Verify the `lima/` sub-directory exists — without it there are
+        // no VMs to enumerate, and `get_or_create` would provision an empty
+        // LIMA_HOME unnecessarily.
+        let lima_child = entry.path().join("lima");
+        if lima_child.is_dir() {
+            result.push(uid);
+        }
+    }
+
+    result
+}
+
+/// Tally of VMs reaped by a single [`reap_lima_orphans`] pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LimaReaperReport {
+    pub vms_reaped: u32,
+    pub vms_skipped_foreign: u32,
+    pub vms_skipped_live: u32,
+    pub op_uids_scanned: u32,
+}
+
+/// Decision produced by [`decide_lima_vm`] for a single VM entry.
+///
+/// Extracted into its own type so the classification logic can be unit-tested
+/// independently of the I/O that executes the decision (delete_vm, logging).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimaVmDecision {
+    /// VM should be reaped: orphaned (not in live set) and owned by this daemon.
+    Reap,
+    /// VM is in the live set — skip unconditionally.
+    SkipLive,
+    /// VM has no parseable session id (e.g. base image `sandbox-base`) — skip.
+    SkipNoSessionId,
+    /// VM's owner marker belongs to a different daemon pool — skip to avoid
+    /// cross-daemon reaping in a shared-LIMA_HOME edge case.
+    SkipForeignMarker { marker_pool: String },
+}
+
+/// Classify a single Lima VM for the orphan reaper.
+///
+/// Pure function over `(session_id, marker, live, my_pool)` with no I/O.
+/// Extracted from [`reap_lima_orphans`] so the classification logic can be
+/// tested without a real Lima helper, real VMs, or real registry.
+///
+/// Decision rules (in priority order):
+/// 1. `session_id` is `None` → [`LimaVmDecision::SkipNoSessionId`]
+///    (base image VMs whose names don't parse as 12-hex).
+/// 2. `session_id` is in `live` → [`LimaVmDecision::SkipLive`].
+/// 3. `marker` is `Some(pool)` and `pool != my_pool` →
+///    [`LimaVmDecision::SkipForeignMarker`]
+///    (shared-LIMA_HOME defense: a VM belonging to another daemon).
+/// 4. Otherwise (marker matches my_pool, or marker is absent for a legacy VM
+///    within the daemon's own LIMA_HOME tree) → [`LimaVmDecision::Reap`].
+pub fn decide_lima_vm(
+    session_id: Option<&crate::session::SessionId>,
+    marker: Option<&str>,
+    live: &std::collections::HashSet<crate::session::SessionId>,
+    my_pool: &str,
+) -> LimaVmDecision {
+    let Some(sid) = session_id else {
+        return LimaVmDecision::SkipNoSessionId;
+    };
+    if live.contains(sid) {
+        return LimaVmDecision::SkipLive;
+    }
+    if let Some(pool) = marker {
+        if pool != my_pool {
+            return LimaVmDecision::SkipForeignMarker {
+                marker_pool: pool.to_string(),
+            };
+        }
+    }
+    LimaVmDecision::Reap
+}
+
+/// Per-operator Lima I/O operations the reaper needs. Extracted as a trait
+/// so the `reap_lima_orphans` core loop can be tested over fakes without a
+/// real `LimaManager`, real helper binary, or real VMs.
+///
+/// Production wiring uses [`RegistryLimaReaperOps`]; tests inject a
+/// [`crate::lima::FakeLimaReaperOps`] (cfg(test)).
+pub trait LimaReaperOps {
+    /// List sandbox-prefixed VMs for an operator uid. Returns `None` on any
+    /// error so the caller skips the uid and continues.
+    fn list_vms(&self, op_uid: u32) -> Option<Vec<VmInfo>>;
+
+    /// Read the owner marker for a VM. Returns `None` when absent or on error.
+    fn read_marker(&self, op_uid: u32, session_id: &crate::session::SessionId) -> Option<String>;
+
+    /// Delete a VM. Returns `Err` on failure; the caller logs and continues.
+    fn delete_vm(
+        &self,
+        op_uid: u32,
+        session_id: &crate::session::SessionId,
+    ) -> Result<(), SandboxError>;
+}
+
+/// Production [`LimaReaperOps`] backed by the real [`LimaManagerRegistry`].
+pub struct RegistryLimaReaperOps<'a> {
+    registry: &'a LimaManagerRegistry,
+}
+
+impl<'a> RegistryLimaReaperOps<'a> {
+    fn new(registry: &'a LimaManagerRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+impl LimaReaperOps for RegistryLimaReaperOps<'_> {
+    fn list_vms(&self, op_uid: u32) -> Option<Vec<VmInfo>> {
+        // `get_or_create` runs `ensure_operator_lima_home` (mkdir +
+        // setfacl shell-out, ~10 s timeout) on the first call for this uid.
+        // For uids found on disk but no longer in passwd (deleted operator)
+        // this resolves in a fast NSS lookup error before touching the FS.
+        let mgr = match self.registry.get_or_create(op_uid) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    op_uid,
+                    error = %e,
+                    "lima orphan reaper: failed to get/create manager for operator; skipping"
+                );
+                return None;
+            }
+        };
+        match mgr.list_vms() {
+            Ok(vms) => Some(vms),
+            Err(e) => {
+                tracing::warn!(
+                    op_uid,
+                    error = %e,
+                    "lima orphan reaper: failed to list VMs for operator; skipping"
+                );
+                None
+            }
+        }
+    }
+
+    fn read_marker(&self, op_uid: u32, session_id: &crate::session::SessionId) -> Option<String> {
+        let mgr = self.registry.get_or_create(op_uid).ok()?;
+        mgr.read_owner_marker(session_id)
+    }
+
+    fn delete_vm(
+        &self,
+        op_uid: u32,
+        session_id: &crate::session::SessionId,
+    ) -> Result<(), SandboxError> {
+        let mgr = self.registry.get_or_create(op_uid).map_err(|e| {
+            SandboxError::Internal(format!(
+                "lima orphan reaper: failed to get manager for op {op_uid}: {e}"
+            ))
+        })?;
+        mgr.delete_vm(session_id)
+    }
+}
+
+/// Core loop of the Lima orphan reaper, parametrised over injected I/O ops.
+///
+/// Takes an explicit `op_uids` slice (the caller decides how to enumerate
+/// them — production passes the FS-scanned set; tests inject a fixed list).
+/// All per-VM I/O is dispatched through `ops` so the loop is hermetically
+/// testable without a real helper or VMs.
+pub fn reap_lima_orphans_inner(
+    op_uids: &[u32],
+    ops: &dyn LimaReaperOps,
+    live: &std::collections::HashSet<crate::session::SessionId>,
+    my_pool: &str,
+) -> LimaReaperReport {
+    let mut report = LimaReaperReport::default();
+
+    for &op_uid in op_uids {
+        report.op_uids_scanned += 1;
+        let vms = match ops.list_vms(op_uid) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        for vm in &vms {
+            // Only read the owner marker when we have a session_id.
+            let marker = vm
+                .session_id
+                .as_ref()
+                .and_then(|sid| ops.read_marker(op_uid, sid));
+            let decision = decide_lima_vm(vm.session_id.as_ref(), marker.as_deref(), live, my_pool);
+
+            match decision {
+                LimaVmDecision::SkipNoSessionId => {}
+                LimaVmDecision::SkipLive => {
+                    report.vms_skipped_live += 1;
+                }
+                LimaVmDecision::SkipForeignMarker { ref marker_pool } => {
+                    tracing::info!(
+                        op_uid,
+                        vm = %vm.name,
+                        marker_pool = %marker_pool,
+                        "lima orphan reaper: VM marker belongs to a different daemon pool; skipping"
+                    );
+                    report.vms_skipped_foreign += 1;
+                }
+                LimaVmDecision::Reap => {
+                    let sid = vm
+                        .session_id
+                        .expect("Reap decision requires Some(session_id)");
+                    match ops.delete_vm(op_uid, &sid) {
+                        Ok(()) => {
+                            tracing::info!(
+                                op_uid,
+                                vm = %vm.name,
+                                session_id = %sid,
+                                "lima orphan reaper: removed VM with no owning session"
+                            );
+                            report.vms_reaped += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                op_uid,
+                                vm = %vm.name,
+                                session_id = %sid,
+                                error = %e,
+                                "lima orphan reaper: failed to delete VM; continuing"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        vms_reaped = report.vms_reaped,
+        vms_skipped_foreign = report.vms_skipped_foreign,
+        vms_skipped_live = report.vms_skipped_live,
+        op_uids_scanned = report.op_uids_scanned,
+        "lima orphan reaper: pass complete"
+    );
+
+    report
+}
+
+/// Enumerate and reap orphaned Lima VMs at daemon startup.
+///
+/// This runs AFTER `reconcile()` (which is state-only) and parallel to
+/// `reap_orphans` (the Docker reaper). It closes the [L-1] gap:
+/// `reconcile` only enumerates op_uids from session rows, so operators
+/// whose last session was deleted never have their VMs cleaned up.
+///
+/// Algorithm:
+/// 1. Enumerate op_uids from the daemon-owned FS tree (not from session rows).
+/// 2. For each op_uid: dispatch via [`RegistryLimaReaperOps`] to list/reap.
+/// 3. For each VM: classify via [`decide_lima_vm`], then execute the decision.
+/// 4. Best-effort and idempotent: per-VM and per-operator errors log at `warn!`
+///    and continue.
+pub fn reap_lima_orphans(
+    registry: &LimaManagerRegistry,
+    live: &std::collections::HashSet<crate::session::SessionId>,
+    my_pool: &str,
+) -> LimaReaperReport {
+    let op_uids = enumerate_operator_uids_from_fs();
+    let ops = RegistryLimaReaperOps::new(registry);
+    reap_lima_orphans_inner(&op_uids, &ops, live, my_pool)
+}
+
 /// Ensure `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/` exists and carries
 /// the correct POSIX ACL so helper-pivoted `limactl` (running as `op_uid`)
 /// can write into it.
@@ -345,6 +684,12 @@ pub struct LimaManagerRegistry {
     helper_path: PathBuf,
     /// Golden-image base VM name shared across all per-operator managers.
     base_vm_name: String,
+    /// Canonical pool CIDR string (`<base>/<prefix>`) stamped as
+    /// `sandboxd.owner=<pool>` via the `--owner` flag on `create`/`clone`
+    /// helper calls. The marker is written into each VM's instance dir so
+    /// the Lima orphan reaper can attribute VMs to this daemon. Shared
+    /// across all per-operator managers (same daemon = same pool).
+    owner_pool: String,
     /// Provisioning function: creates the per-operator LIMA_HOME directory
     /// and applies the POSIX ACL.  Production wiring uses
     /// `ensure_operator_lima_home`; tests inject a closure that provisions
@@ -364,11 +709,15 @@ impl LimaManagerRegistry {
     /// at daemon startup by `resolve_lima_helper_path()`.
     ///
     /// `base_vm_name` is the Lima instance name for the golden base image.
-    pub fn new(base_vm_name: String, helper_path: PathBuf) -> Self {
+    ///
+    /// `owner_pool` is the canonical pool CIDR string stamped via `--owner`
+    /// on every `create`/`clone` helper call.
+    pub fn new(base_vm_name: String, helper_path: PathBuf, owner_pool: String) -> Self {
         Self {
             managers: Mutex::new(HashMap::new()),
             helper_path,
             base_vm_name,
+            owner_pool,
             provision_lima_home: Box::new(ensure_operator_lima_home),
         }
     }
@@ -382,7 +731,12 @@ impl LimaManagerRegistry {
     /// Production code uses [`Self::new`].  Tests inject a closure that
     /// provisions into a caller-owned tmpdir so registry unit tests remain
     /// hermetic and do not touch `/var/lib/sandboxd/`.
-    pub fn new_with_provisioner<F>(base_vm_name: String, helper_path: PathBuf, provision: F) -> Self
+    pub fn new_with_provisioner<F>(
+        base_vm_name: String,
+        helper_path: PathBuf,
+        owner_pool: String,
+        provision: F,
+    ) -> Self
     where
         F: Fn(u32) -> Result<PathBuf, SandboxError> + Send + Sync + 'static,
     {
@@ -390,6 +744,7 @@ impl LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
             helper_path,
             base_vm_name,
+            owner_pool,
             provision_lima_home: Box::new(provision),
         }
     }
@@ -440,6 +795,7 @@ impl LimaManagerRegistry {
             self.helper_path.clone(),
             op_uid,
             self.base_vm_name.clone(),
+            self.owner_pool.clone(),
         ));
 
         // Re-lock and insert, using entry().or_insert_with so that a
@@ -645,6 +1001,12 @@ pub struct LimaManager {
     /// and test daemons don't collide on a single user-global Lima
     /// instance.
     base_vm_name: String,
+    /// Canonical pool CIDR string (`<base>/<prefix>`) passed as `--owner`
+    /// to every `create` and `clone` helper invocation so the helper writes
+    /// `{lima_home}{vm}/sandboxd-owner` after a successful limactl run.
+    /// The Lima orphan reaper reads this marker to attribute VMs to this
+    /// daemon without relying on LIMA_HOME isolation alone.
+    owner_pool: String,
     /// Serialises concurrent `build_base_image` calls for this operator.
     /// A single `Arc<LimaManager>` is shared across all callers for the
     /// same operator (vended by `LimaManagerRegistry`), so two concurrent
@@ -669,12 +1031,19 @@ impl LimaManager {
     /// `base_vm_name` is the Lima instance name for the golden base image
     /// this manager owns. Production callers pass the validated value of
     /// `SANDBOX_BASE_VM_NAME`; tests typically pass [`DEFAULT_BASE_VM_NAME`].
-    pub fn new(base_dir: PathBuf, helper_path: PathBuf, op_uid: u32, base_vm_name: String) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        helper_path: PathBuf,
+        op_uid: u32,
+        base_vm_name: String,
+        owner_pool: String,
+    ) -> Self {
         Self {
             base_dir,
             helper_path,
             op_uid,
             base_vm_name,
+            owner_pool,
             build_lock: std::sync::Mutex::new(()),
         }
     }
@@ -693,6 +1062,7 @@ impl LimaManager {
             helper_path,
             op_uid,
             base_vm_name,
+            owner_pool: "test-pool".to_string(),
             build_lock: std::sync::Mutex::new(()),
         }
     }
@@ -849,7 +1219,14 @@ impl LimaManager {
 
         let result = self.run_helper(
             "create",
-            &["--vm", &vm_name, "--yaml", &template_str],
+            &[
+                "--vm",
+                &vm_name,
+                "--yaml",
+                &template_str,
+                "--owner",
+                &self.owner_pool,
+            ],
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create",
         );
@@ -900,7 +1277,14 @@ impl LimaManager {
 
         let result = self.run_helper(
             "create",
-            &["--vm", &vm_name, "--yaml", &staged_str],
+            &[
+                "--vm",
+                &vm_name,
+                "--yaml",
+                &staged_str,
+                "--owner",
+                &self.owner_pool,
+            ],
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create (custom template)",
         );
@@ -1040,6 +1424,44 @@ impl LimaManager {
 
         info!(session_id = %session_id, vm = %vm_name, "VM deleted");
         Ok(())
+    }
+
+    /// Read the owner marker for a VM and return the pool CIDR string, or
+    /// `None` if the marker is absent (legacy VM created before this feature).
+    ///
+    /// The marker file (`{lima_home}{vm}/sandboxd-owner`) lives inside the
+    /// operator-owned 0700 instance directory. The daemon cannot read it
+    /// directly — this method goes through the helper's `read-owner-marker`
+    /// subcommand, which runs post-pivot as the operator uid.
+    ///
+    /// Returns `None` on non-zero exit (absent marker or I/O error) or empty
+    /// stdout. The Lima orphan reaper treats `None` as "legacy, fall back to
+    /// name + live-set scoping within this daemon's own LIMA_HOME."
+    pub fn read_owner_marker(&self, session_id: &SessionId) -> Option<String> {
+        let vm_name = vm_name(session_id);
+        let output = match self.run_helper(
+            "read-owner-marker",
+            &["--vm", &vm_name],
+            READ_OWNER_MARKER_TIMEOUT,
+            "sandbox-lima-helper read-owner-marker",
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    vm = %vm_name,
+                    error = %e,
+                    "read_owner_marker: helper invocation failed"
+                );
+                return None;
+            }
+        };
+        if !output.status.success() {
+            // Non-zero exit: absent marker (expected for legacy VMs).
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
     }
 
     /// Best-effort cleanup of a partial Lima instance directory.
@@ -1344,7 +1766,14 @@ impl LimaManager {
         info!("creating base VM");
         let output = self.run_helper(
             "create",
-            &["--vm", &self.base_vm_name, "--yaml", &template_str],
+            &[
+                "--vm",
+                &self.base_vm_name,
+                "--yaml",
+                &template_str,
+                "--owner",
+                &self.owner_pool,
+            ],
             BASE_CREATE_TIMEOUT,
             "sandbox-lima-helper create (base image)",
         )?;
@@ -1567,6 +1996,8 @@ impl LimaManager {
                     &memory_gib_s,
                     "--disk",
                     &disk_s,
+                    "--owner",
+                    &self.owner_pool,
                 ],
                 CLONE_VM_TIMEOUT,
                 "sandbox-lima-helper clone",
@@ -4370,6 +4801,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4390,6 +4822,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4412,6 +4845,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4457,6 +4891,7 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4509,6 +4944,7 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4546,6 +4982,418 @@ mod tests {
             registry.len(),
             2,
             "registry must have two entries after concurrent distinct-uid creates"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // enumerate_operator_uids_from_fs tests
+    // -----------------------------------------------------------------------
+    //
+    // These tests use the test-env-override state-root redirect so they do
+    // not touch `/var/lib/sandboxd/`. The daemon-uid segment is derived from
+    // `getuid()` in production; here we rely on `daemon_lima_root()` which
+    // reads the same env var redirect.
+
+    #[test]
+    #[cfg(feature = "test-env-override")]
+    fn enumerate_operator_uids_returns_numeric_subdirs_with_lima_child() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let root = tmp.path();
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        // Create two valid operator entries and one invalid one.
+        let op1 = root.join(daemon_uid.to_string()).join("1001").join("lima");
+        let op2 = root.join(daemon_uid.to_string()).join("1002").join("lima");
+        // Non-numeric dir — must be skipped.
+        let non_num = root
+            .join(daemon_uid.to_string())
+            .join("notanumber")
+            .join("lima");
+        // Numeric dir without lima/ — must be skipped.
+        let no_lima = root.join(daemon_uid.to_string()).join("1003").join("other");
+
+        for dir in [&op1, &op2, &non_num, &no_lima] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+
+        // Point the enumerator at our tempdir.
+        // SAFETY: test-only, single-threaded at this point in the test.
+        unsafe { std::env::set_var(STATE_ROOT_OVERRIDE_ENV, root.to_str().unwrap()) };
+        let uids = enumerate_operator_uids_from_fs();
+        unsafe { std::env::remove_var(STATE_ROOT_OVERRIDE_ENV) };
+
+        let mut sorted = uids.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1001u32, 1002]);
+    }
+
+    #[test]
+    #[cfg(feature = "test-env-override")]
+    fn enumerate_operator_uids_returns_empty_when_root_absent() {
+        // A state root that does not exist on disk should yield an empty list,
+        // not an error or panic.
+        // SAFETY: test-only, single-threaded at this point.
+        unsafe {
+            std::env::set_var(
+                STATE_ROOT_OVERRIDE_ENV,
+                "/tmp/this-dir-does-not-exist-12345",
+            )
+        };
+        let uids = enumerate_operator_uids_from_fs();
+        unsafe { std::env::remove_var(STATE_ROOT_OVERRIDE_ENV) };
+        assert!(uids.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "test-env-override")]
+    fn enumerate_operator_uids_skips_root_uid() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let root = tmp.path();
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        // uid 0 should always be skipped.
+        let op0 = root.join(daemon_uid.to_string()).join("0").join("lima");
+        let op1001 = root.join(daemon_uid.to_string()).join("1001").join("lima");
+        for dir in [&op0, &op1001] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+
+        // SAFETY: test-only, single-threaded at this point in the test.
+        unsafe { std::env::set_var(STATE_ROOT_OVERRIDE_ENV, root.to_str().unwrap()) };
+        let uids = enumerate_operator_uids_from_fs();
+        unsafe { std::env::remove_var(STATE_ROOT_OVERRIDE_ENV) };
+
+        assert!(!uids.contains(&0), "uid 0 must be excluded");
+        assert!(uids.contains(&1001), "uid 1001 must be included");
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_lima_vm tests — pure classification logic, no I/O
+    // -----------------------------------------------------------------------
+
+    fn test_sid(hex: &str) -> SessionId {
+        SessionId::parse(hex).expect("12-hex session id")
+    }
+
+    fn test_live(sids: &[&str]) -> std::collections::HashSet<SessionId> {
+        sids.iter().map(|s| test_sid(s)).collect()
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_no_session_id() {
+        // Base image VMs have session_id == None.
+        let live = test_live(&[]);
+        assert_eq!(
+            decide_lima_vm(None, None, &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipNoSessionId
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_live_session() {
+        let sid = test_sid("aabbccddeeff");
+        let live = test_live(&["aabbccddeeff"]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.209.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipLive
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_live_session_regardless_of_marker() {
+        // A live session is never reaped, even if marker is absent.
+        let sid = test_sid("aabbccddeeff");
+        let live = test_live(&["aabbccddeeff"]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), None, &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipLive
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_reaps_orphan_with_matching_marker() {
+        let sid = test_sid("112233445566");
+        let live = test_live(&[]); // not in live set
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.209.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::Reap
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_reaps_orphan_with_absent_marker() {
+        // Absent marker = legacy VM in our own LIMA_HOME. Name + live-set
+        // scoping is sufficient: still ours to reap.
+        let sid = test_sid("112233445566");
+        let live = test_live(&[]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), None, &live, "10.209.0.0/20"),
+            LimaVmDecision::Reap
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_foreign_marker() {
+        // Marker present and != my_pool → belongs to a different daemon.
+        // Do NOT reap even though the session is absent from our live set.
+        let sid = test_sid("112233445566");
+        let live = test_live(&[]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.220.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipForeignMarker {
+                marker_pool: "10.220.0.0/20".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_live_takes_priority_over_foreign_marker() {
+        // If a session is live, it's skipped before the marker is even checked.
+        let sid = test_sid("aabbccddeeff");
+        let live = test_live(&["aabbccddeeff"]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.220.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipLive
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reap_lima_orphans_inner orchestration tests
+    // -----------------------------------------------------------------------
+    //
+    // These tests drive the full enumerate→list→decide→delete flow over
+    // injected fakes (no real Lima helper, no VMs, no /dev/kvm). They verify
+    // the glue that decide_lima_vm unit tests cannot cover: that the
+    // orchestration correctly wires op-uid enumeration, marker lookup, and
+    // delete dispatch together.
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// In-memory fake for [`LimaReaperOps`]. Drives the orchestration loop
+    /// with canned VMs and markers; records which VMs were deleted.
+    struct FakeLimaReaperOps {
+        /// op_uid → list of VMs that belong to that operator.
+        vms: HashMap<u32, Vec<VmInfo>>,
+        /// (op_uid, session_id_str) → Option<pool_cidr>. `None` = absent marker.
+        markers: HashMap<(u32, String), Option<String>>,
+        /// Collects (op_uid, session_id_str) pairs for every delete_vm call.
+        deleted: Mutex<Vec<(u32, String)>>,
+        /// Set of (op_uid, session_id_str) whose delete_vm should return Err.
+        fail_delete: std::collections::HashSet<(u32, String)>,
+    }
+
+    impl FakeLimaReaperOps {
+        fn new() -> Self {
+            Self {
+                vms: HashMap::new(),
+                markers: HashMap::new(),
+                deleted: Mutex::new(Vec::new()),
+                fail_delete: std::collections::HashSet::new(),
+            }
+        }
+
+        /// Register a VM for an operator.
+        fn add_vm(mut self, op_uid: u32, name: &str, sid: Option<&str>) -> Self {
+            let session_id = sid.and_then(|s| SessionId::parse(s).ok());
+            self.vms.entry(op_uid).or_default().push(VmInfo {
+                name: name.to_string(),
+                status: VmStatus::Stopped,
+                session_id,
+            });
+            self
+        }
+
+        /// Register a marker for a VM (None = absent marker).
+        fn set_marker(mut self, op_uid: u32, sid: &str, pool: Option<&str>) -> Self {
+            self.markers
+                .insert((op_uid, sid.to_string()), pool.map(|s| s.to_string()));
+            self
+        }
+
+        /// Mark a delete as failing (returns Err).
+        fn fail_on_delete(mut self, op_uid: u32, sid: &str) -> Self {
+            self.fail_delete.insert((op_uid, sid.to_string()));
+            self
+        }
+
+        fn deleted_vms(&self) -> Vec<(u32, String)> {
+            self.deleted.lock().expect("mutex").clone()
+        }
+    }
+
+    impl LimaReaperOps for FakeLimaReaperOps {
+        fn list_vms(&self, op_uid: u32) -> Option<Vec<VmInfo>> {
+            Some(self.vms.get(&op_uid).cloned().unwrap_or_default())
+        }
+
+        fn read_marker(&self, op_uid: u32, session_id: &SessionId) -> Option<String> {
+            // Look up the marker. Key present with None = explicitly absent;
+            // key absent = not registered = treat as absent marker.
+            self.markers
+                .get(&(op_uid, session_id.to_string()))
+                .and_then(|v| v.clone())
+        }
+
+        fn delete_vm(&self, op_uid: u32, session_id: &SessionId) -> Result<(), SandboxError> {
+            let key = (op_uid, session_id.to_string());
+            if self.fail_delete.contains(&key) {
+                return Err(SandboxError::Lima(format!(
+                    "fake delete_vm failed for op={op_uid} sid={session_id}"
+                )));
+            }
+            self.deleted.lock().expect("mutex").push(key);
+            Ok(())
+        }
+    }
+
+    const MY_POOL: &str = "10.209.0.0/20";
+    const FOREIGN_POOL: &str = "10.220.0.0/20";
+
+    // SIDs used across orchestration tests.
+    const OWN_ORPHAN_SID: &str = "aa0000000001";
+    const FOREIGN_SID: &str = "bb0000000002";
+    const LIVE_SID: &str = "cc0000000003";
+    const ABSENT_MARKER_SID: &str = "dd0000000004";
+
+    fn orchestration_fake() -> FakeLimaReaperOps {
+        FakeLimaReaperOps::new()
+            // op 1001: owns four VMs across different cases
+            .add_vm(
+                1001,
+                &format!("sandbox-{OWN_ORPHAN_SID}"),
+                Some(OWN_ORPHAN_SID),
+            )
+            .add_vm(1001, &format!("sandbox-{FOREIGN_SID}"), Some(FOREIGN_SID))
+            .add_vm(1001, &format!("sandbox-{LIVE_SID}"), Some(LIVE_SID))
+            .add_vm(
+                1001,
+                &format!("sandbox-{ABSENT_MARKER_SID}"),
+                Some(ABSENT_MARKER_SID),
+            )
+            .add_vm(1001, "sandbox-base", None) // base image — no session id
+            // Markers
+            .set_marker(1001, OWN_ORPHAN_SID, Some(MY_POOL))
+            .set_marker(1001, FOREIGN_SID, Some(FOREIGN_POOL))
+        // LIVE_SID and ABSENT_MARKER_SID: no marker registered
+    }
+
+    /// An orphan whose marker == my pool must be deleted (own orphan).
+    #[test]
+    fn reap_lima_orphans_inner_reaps_own_orphan_with_matching_marker() {
+        let fake = orchestration_fake();
+        let live = test_live(&[LIVE_SID]);
+        let report = reap_lima_orphans_inner(&[1001], &fake, &live, MY_POOL);
+
+        assert_eq!(report.vms_reaped, 2, "own orphan + absent-marker orphan");
+        let deleted = fake.deleted_vms();
+        assert!(
+            deleted.iter().any(|(_, s)| s == OWN_ORPHAN_SID),
+            "own orphan with matching marker must be deleted; deleted={deleted:?}"
+        );
+    }
+
+    /// A VM with a FOREIGN marker must NOT be deleted (coexistence guarantee).
+    #[test]
+    fn reap_lima_orphans_inner_skips_foreign_marker() {
+        let fake = orchestration_fake();
+        let live = test_live(&[LIVE_SID]);
+        let report = reap_lima_orphans_inner(&[1001], &fake, &live, MY_POOL);
+
+        assert_eq!(report.vms_skipped_foreign, 1);
+        let deleted = fake.deleted_vms();
+        assert!(
+            !deleted.iter().any(|(_, s)| s == FOREIGN_SID),
+            "foreign-marker VM must NOT be deleted; deleted={deleted:?}"
+        );
+    }
+
+    /// A VM whose session is in the live set must NOT be deleted.
+    #[test]
+    fn reap_lima_orphans_inner_skips_live_vm() {
+        let fake = orchestration_fake();
+        let live = test_live(&[LIVE_SID]);
+        let report = reap_lima_orphans_inner(&[1001], &fake, &live, MY_POOL);
+
+        assert_eq!(report.vms_skipped_live, 1);
+        let deleted = fake.deleted_vms();
+        assert!(
+            !deleted.iter().any(|(_, s)| s == LIVE_SID),
+            "live VM must NOT be deleted; deleted={deleted:?}"
+        );
+    }
+
+    /// An absent-marker orphan within our own LIMA_HOME is reaped.
+    /// This is the legacy-VM path: marker absent = assume ours.
+    #[test]
+    fn reap_lima_orphans_inner_reaps_absent_marker_orphan() {
+        let fake = orchestration_fake();
+        let live = test_live(&[LIVE_SID]);
+        let _report = reap_lima_orphans_inner(&[1001], &fake, &live, MY_POOL);
+
+        let deleted = fake.deleted_vms();
+        assert!(
+            deleted.iter().any(|(_, s)| s == ABSENT_MARKER_SID),
+            "absent-marker orphan within own LIMA_HOME must be reaped; deleted={deleted:?}"
+        );
+    }
+
+    /// An operator with NO live session rows in the DB must still have its VMs
+    /// enumerated — this is the [L-1] gap fix. The test passes op_uid 1002
+    /// (an operator whose only VM is orphaned and has no session rows) and
+    /// verifies the orphan IS reaped.
+    #[test]
+    fn reap_lima_orphans_inner_reaps_orphaned_operator_with_no_live_sessions() {
+        const ORPHANED_OP_SID: &str = "ee0000000005";
+        let fake = FakeLimaReaperOps::new()
+            .add_vm(
+                1002,
+                &format!("sandbox-{ORPHANED_OP_SID}"),
+                Some(ORPHANED_OP_SID),
+            )
+            .set_marker(1002, ORPHANED_OP_SID, Some(MY_POOL));
+
+        // Live set is empty — simulates an operator whose last session was
+        // deleted from the DB but whose Lima VM was never cleaned up.
+        let live = test_live(&[]);
+        let report = reap_lima_orphans_inner(&[1002], &fake, &live, MY_POOL);
+
+        assert_eq!(
+            report.vms_reaped, 1,
+            "orphaned operator's VM must be reaped even with no session rows"
+        );
+        let deleted = fake.deleted_vms();
+        assert!(
+            deleted.iter().any(|(_, s)| s == ORPHANED_OP_SID),
+            "VM for op with no session rows must appear in deleted list; deleted={deleted:?}"
+        );
+    }
+
+    /// A delete failure must be logged and skipped, not abort the sweep.
+    /// The report must not count the failed delete as reaped.
+    #[test]
+    fn reap_lima_orphans_inner_continues_on_delete_failure() {
+        const SID_A: &str = "ff0000000006";
+        const SID_B: &str = "fe0000000007";
+        let fake = FakeLimaReaperOps::new()
+            .add_vm(1003, &format!("sandbox-{SID_A}"), Some(SID_A))
+            .add_vm(1003, &format!("sandbox-{SID_B}"), Some(SID_B))
+            .set_marker(1003, SID_A, Some(MY_POOL))
+            .set_marker(1003, SID_B, Some(MY_POOL))
+            .fail_on_delete(1003, SID_A);
+
+        let live = test_live(&[]);
+        let report = reap_lima_orphans_inner(&[1003], &fake, &live, MY_POOL);
+
+        // SID_A fails to delete; SID_B succeeds.
+        assert_eq!(
+            report.vms_reaped, 1,
+            "only SID_B should be counted as reaped"
+        );
+        let deleted = fake.deleted_vms();
+        assert!(
+            deleted.iter().any(|(_, s)| s == SID_B),
+            "SID_B must be deleted; deleted={deleted:?}"
         );
     }
 }

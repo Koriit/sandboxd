@@ -20,10 +20,10 @@ There is no alternate path out for application traffic. The VM's data NIC routes
 
 Each VM has two network interfaces, with very different roles:
 
-| Interface | Type | Carries | Reaches |
-|---|---|---|---|
-| `eth0` | SLIRP (QEMU user-mode networking) | Lima's SSH management channel | The host, via QEMU's in-process TCP/IP stack |
-| `eth1` | TAP on the per-session Docker bridge | All application traffic | The gateway container — and nothing else |
+| Interface | Type                                 | Carries                       | Reaches                                      |
+| --------- | ------------------------------------ | ----------------------------- | -------------------------------------------- |
+| `eth0`    | SLIRP (QEMU user-mode networking)    | Lima's SSH management channel | The host, via QEMU's in-process TCP/IP stack |
+| `eth1`    | TAP on the per-session Docker bridge | All application traffic       | The gateway container — and nothing else     |
 
 `eth0` exists because Lima needs an SSH channel to the VM and SLIRP provides one without requiring TAP devices or root on the host. It is **not** a path for user workloads: the guest installs a default route over `eth1` with a lower metric than SLIRP's, so any `connect()` from an application inside the VM goes out through the gateway, not through SLIRP. The SLIRP interface is effectively invisible to applications running inside the VM.
 
@@ -35,12 +35,12 @@ This matters for the threat model: the policy layer (DNS filtering, nftables, En
 
 When you create a session, sandboxd allocates a `/28` subnet from a configurable base (default `10.209.0.0/24`). A `/24` holds 16 concurrent sessions. The dev-install template at `contrib/users.conf.example` overrides this to `10.209.0.0/20` (256 concurrent sessions) for additional headroom; either works because `users.conf` overrides the in-code default.
 
-| Address in the `/28` | Role |
-|---|---|
-| `.1` | Docker bridge gateway (the bridge itself) |
-| `.2` | Gateway container |
-| `.3` | VM data NIC |
-| `.4`–`.14` | Unused |
+| Address in the `/28` | Role                                      |
+| -------------------- | ----------------------------------------- |
+| `.1`                 | Docker bridge gateway (the bridge itself) |
+| `.2`                 | Gateway container                         |
+| `.3`                 | VM data NIC                               |
+| `.4`–`.14`           | Unused                                    |
 
 Because each session has its own bridge — a separate L2 segment — sessions cannot see each other's traffic. The gateway container attaches only to that session's bridge, so it has no visibility into the host network or other sessions either.
 
@@ -48,14 +48,14 @@ Because each session has its own bridge — a separate L2 segment — sessions c
 
 Session IDs are 12 lowercase hex characters. Every per-session resource has a fixed name shape derived from the session id:
 
-| Resource | Name | Anchor |
-|---|---|---|
-| Docker network | `sandbox-net-{session_id}` | reaper/parser symmetry |
-| Bridge interface | `sb-{session_id}` (3 + 12 = 15) | IFNAMSIZ |
-| Gateway container | `sandbox-gw-{session_id}` | reaper/parser symmetry |
-| TAP device | `tb-{session_id}` (3 + 12 = 15) | IFNAMSIZ |
-| Lima VM / lite container | `sandbox-{session_id}` | reaper/parser symmetry |
-| Per-session home volume | `sandbox-home-{session_id}` | reaper/parser symmetry |
+| Resource                 | Name                            | Anchor                 |
+| ------------------------ | ------------------------------- | ---------------------- |
+| Docker network           | `sandbox-net-{session_id}`      | reaper/parser symmetry |
+| Bridge interface         | `sb-{session_id}` (3 + 12 = 15) | IFNAMSIZ               |
+| Gateway container        | `sandbox-gw-{session_id}`       | reaper/parser symmetry |
+| TAP device               | `tb-{session_id}` (3 + 12 = 15) | IFNAMSIZ               |
+| Lima VM / lite container | `sandbox-{session_id}`          | reaper/parser symmetry |
+| Per-session home volume  | `sandbox-home-{session_id}`     | reaper/parser symmetry |
 
 Two distinct constraint chains pin these names. Refactors that touch a prefix or the session-id width must understand which chain they're crossing — the failure modes are different, and both are silent.
 
@@ -90,28 +90,28 @@ These prefixes are *not* IFNAMSIZ-bound — they're Docker resource names, not k
 
 The current contract is that `sandbox-` is the namespace root, the second segment selects the resource kind (no second segment = VM/container, `gw-` = gateway, `net-` = network, `home-` = volume), and the suffix is always a 12-hex session id. Stay inside that shape.
 
-#### Dual-anchor enforcement (CIDR pool)
+#### Owner-label enforcement (primary anchor)
 
-The name-prefix anchor above is the first ownership check the reaper runs: "name says sandboxd's." On a host running a single sandboxd that is sufficient. On a host running two sandboxds — prod plus a dev test, two parallel test runs, a dev build coexisting with a stale prod prefix — it is not, because every sandboxd uses the same `sandbox-`, `sandbox-home-`, and `sandbox-net-` prefixes. Without a second anchor each daemon's reaper would mass-delete the other's resources on next boot.
+The name-prefix anchor above is necessary but not sufficient on a host running two sandboxd daemons — prod plus a dev test, two parallel test runs, a dev build coexisting with a stale prod prefix — because every sandboxd uses the same `sandbox-`, `sandbox-home-`, and `sandbox-net-` prefixes. Without a second anchor each daemon's reaper would mass-delete the other's resources on next boot.
 
-The second anchor is the daemon's `NetworkManager` allocator pool. The pool is resolved from `users.conf` at startup (`sandboxd/sandboxd/src/main.rs::resolve_allocation_pool`) and pinned for the lifetime of the daemon. Networks whose IPAM-reported IPv4 subnets do not lie fully inside the pool are skipped — "name says sandboxd's, *and* CIDR says **this** sandboxd's." Containers and home volumes inherit the gate transitively: if a network for a given session id is not reapable under the CIDR check, the matching `sandbox-{id}` and `sandbox-home-{id}` resources are also left alone.
+The second anchor is an explicit Docker owner label stamped on every resource at creation time: `sandboxd.owner=<pool-cidr>` (e.g. `sandboxd.owner=10.209.0.0/20`). The pool CIDR is resolved from `users.conf` at startup (`sandboxd/sandboxd/src/main.rs::resolve_allocation_pool`) and used in all `docker create`, `docker network create`, and `docker volume create` calls. The reaper filters its Docker listings by this label — `docker ps --filter label=sandboxd.owner=<my-pool>` — so it only ever sees its own resources. A co-deployed daemon with a different pool CIDR produces resources with a different label value and is fully invisible to this daemon's reaper.
 
-The CIDR check is fail-closed. Networks with no IPv4 IPAM data, malformed `docker network inspect` output, partial in-pool overlap (e.g. one /28 in-pool, one /28 out-of-pool), or any IPv4 subnet outside the pool are all skipped — the reaper removes only what it can prove is `this sandboxd's`. The inverse rule (reaping on partial in-pool overlap or trusting an empty IPAM block as in-pool) would let a transient `docker network inspect` hiccup mass-delete a neighboring sandboxd's resources, which is the exact failure mode this anchor exists to prevent.
+This label-based ownership is intrinsic to each resource: a container or home volume retains its `sandboxd.owner` label even after its session network has been torn down (as happens when a session is Stopped). A Stopped session's `sandbox-{id}` container and `sandbox-home-{id}` volume remain attributable and are protected by the live set or reaped as orphans, resolving the former "STOP gate" where network teardown left resources attributable only by name.
 
 #### Threat model — multi-daemon co-existence
 
-A misconfigured second sandboxd on the same host cannot mass-delete this sandboxd's resources. The CIDR anchor scopes the reaper's reach to the daemon's own allocator pool; any operator who runs two daemons must give each its own pool (operationally, a separate `users.conf` subnet). Two daemons sharing the same pool will still collide at allocation time — that is an operator configuration gap (`docs/operator/`, future), not a kernel-level isolation property. Kernel-level packet-path isolation between two sandboxds on the same host is out of scope for the reaper anchor; this is metadata-only.
+Two sandboxd daemons on the same host coexist safely when configured with disjoint CIDR pools (one `users.conf` subnet each). The `sandboxd.owner` label makes each daemon's resource set disjoint at the Docker metadata layer; the filtered listings ensure neither daemon ever sees the other's resources. Two daemons sharing the same pool will still collide at subnet allocation time — that is an operator configuration error, not a kernel-level isolation property.
 
 #### Cross-references
 
 - Producer: `sandbox-core/src/lima.rs::vm_name` and `VM_NAME_PREFIX` (also reused for the lite container's name).
-- Producer: `sandbox-core/src/backend/container.rs::home_volume_name` and the `format!("sandbox-{session_id}")` literal at `container.rs:438`.
-- Producer: `sandbox-core/src/network.rs::create_network` (sets `bridge_name = "sb-{session_id}"`, `docker_network_name = "sandbox-net-{session_id}"`, and the `com.docker.network.bridge.name` label).
+- Producer: `sandbox-core/src/backend/container.rs::home_volume_name` and the `format!("sandbox-{session_id}")` literal.
+- Producer: `sandbox-core/src/network.rs::create_network` (sets `bridge_name = "sb-{session_id}"`, `docker_network_name = "sandbox-net-{session_id}"`, `sandboxd.owner=<pool>`, and the `com.docker.network.bridge.name` label).
 - Producer: `sandbox-core/src/qmp.rs::tap_name_for_session`.
 - Authoritative parser: `sandbox-core/src/lima.rs::parse_session_id_from_name`.
 - Reaper consumers: `sandbox-core/src/backend/orphan_reaper.rs::parse_container_session_id` (delegates to the lima parser), `parse_home_volume_session_id`, `parse_network_session_id`, plus the `HOME_VOLUME_PREFIX` and `NETWORK_PREFIX` constants.
-- Length guards: `network.rs:805-813` (bridge IFNAMSIZ), `qmp.rs:451-459` (TAP IFNAMSIZ).
-- Dual-anchor enforcement: `sandbox-core/src/backend/orphan_reaper.rs::DockerOps::inspect_network_ipam` and `ipam_subnets_in_pool` are the IPAM probe and CIDR-pool gate; the daemon-startup wiring lives at `sandboxd/sandboxd/src/main.rs` (the `reap_orphans` call alongside the resolved `allocation_pool`).
+- Length guards: `network.rs` (bridge IFNAMSIZ), `qmp.rs` (TAP IFNAMSIZ).
+- Owner-label wiring: `sandbox-core/src/backend/orphan_reaper.rs::DockerOps::list_owned_*` methods add `--filter label=sandboxd.owner=<pool>` to every listing; the daemon-startup wiring lives at `sandboxd/sandboxd/src/main.rs` (the `reap_orphans` call alongside the resolved `allocation_pool`).
 
 ## The gateway
 
@@ -121,11 +121,11 @@ The gateway container is the session's single exit. It runs five cooperating pro
 
 The gateway holds three nftables tables, each with a distinct role:
 
-| Table | Purpose |
-|---|---|
-| `sandbox` | Deny-all baseline — forward chain drops everything |
-| `sandbox_dnat` | PREROUTING — DNS to CoreDNS; policy-allowed TCP DNATs to Envoy; policy-allowed UDP exits direct to upstream; non-allowed TCP DNATs to the nft-deny-logger; non-allowed UDP is dropped at nft (with NFLOG copy for audit) |
-| `sandbox_policy` | Envoy-egress allow list — IPs learned from DNS responses plus policy CIDRs |
+| Table            | Purpose                                                                                                                                                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `sandbox`        | Deny-all baseline — forward chain drops everything                                                                                                                                                                       |
+| `sandbox_dnat`   | PREROUTING — DNS to CoreDNS; policy-allowed TCP DNATs to Envoy; policy-allowed UDP exits direct to upstream; non-allowed TCP DNATs to the nft-deny-logger; non-allowed UDP is dropped at nft (with NFLOG copy for audit) |
+| `sandbox_policy` | Envoy-egress allow list — IPs learned from DNS responses plus policy CIDRs                                                                                                                                               |
 
 `sandbox_dnat` carries two concat sets, `policy_allow_tcp` and `policy_allow_udp`, keyed on `(destination-IP, destination-port)`. The two protocols take different paths after the set match:
 
@@ -138,13 +138,13 @@ The deny-all baseline in the `sandbox` table is the safety net: even if `sandbox
 
 ### Five processes
 
-| Component | What it does |
-|---|---|
-| **CoreDNS** | Answers all DNS queries; returns `NXDOMAIN` for anything the policy does not list |
-| **Envoy** | Receives redirected TCP; routes connections per the policy's assurance level |
-| **mitmproxy** | Terminates TLS with the per-session CA for HTTP-level inspection |
-| **nft-deny-logger** | Emits a structured `deny` event per blocked attempt. TCP-deny is a DNAT-redirect to `:10001`, where the listener recovers the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted socket and RST-closes. UDP-deny is observed-only via NFLOG group 1: the kernel drops the datagram and emits a netlink message carrying the original 5-tuple, which the logger parses without ever receiving the packet itself. Healthcheck on `:10003` |
-| **nft-allow-logger** | Emits a structured `allow` event per new allowed UDP flow. Subscribes to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group, filters for UDP, and writes one JSONL line per `NFCT_T_NEW` event. Per-flow granularity, not per-packet. Healthcheck on `:10004` |
+| Component            | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **CoreDNS**          | Answers all DNS queries; returns `NXDOMAIN` for anything the policy does not list                                                                                                                                                                                                                                                                                                                                                               |
+| **Envoy**            | Receives redirected TCP; routes connections per the policy's assurance level                                                                                                                                                                                                                                                                                                                                                                    |
+| **mitmproxy**        | Terminates TLS with the per-session CA for HTTP-level inspection                                                                                                                                                                                                                                                                                                                                                                                |
+| **nft-deny-logger**  | Emits a structured `deny` event per blocked attempt. TCP-deny is a DNAT-redirect to `:10001`, where the listener recovers the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted socket and RST-closes. UDP-deny is observed-only via NFLOG group 1: the kernel drops the datagram and emits a netlink message carrying the original 5-tuple, which the logger parses without ever receiving the packet itself. Healthcheck on `:10003` |
+| **nft-allow-logger** | Emits a structured `allow` event per new allowed UDP flow. Subscribes to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group, filters for UDP, and writes one JSONL line per `NFCT_T_NEW` event. Per-flow granularity, not per-packet. Healthcheck on `:10004`                                                                                                                                                                      |
 
 Both `nft-` loggers source their data from the kernel/nft layer rather than userland L7 streams; the prefix in their names is deliberate. They observe protocol-level facts (5-tuple, verdict, timestamp), not payload content.
 

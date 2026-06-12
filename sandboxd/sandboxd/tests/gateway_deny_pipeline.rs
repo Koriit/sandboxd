@@ -250,7 +250,8 @@ impl GatewaySession {
     /// which is what these tests need (one gateway + one side
     /// container per test).
     fn create(subnet_base: Ipv4Addr) -> Self {
-        let net_mgr = NetworkManager::new(subnet_base, 24).expect("network manager should build");
+        let net_mgr = NetworkManager::new(subnet_base, 24, "test-pool".to_string())
+            .expect("network manager should build");
         let gw_mgr = Arc::new(GatewayManager::new());
         let session_id = SessionId::generate();
 
@@ -258,7 +259,7 @@ impl GatewaySession {
             .create_network(&session_id)
             .expect("create_network should succeed");
 
-        if let Err(e) = gw_mgr.create_gateway(&session_id, &network_info, None, None) {
+        if let Err(e) = gw_mgr.create_gateway(&session_id, &network_info, None, None, None) {
             // Best-effort cleanup on create-time failure; Drop also
             // runs but panicking before Drop gets to commit the fields
             // means Drop will not run on the partially-initialised
@@ -1080,7 +1081,7 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
                     let sid = monitor_sid;
                     let network_info = monitor_network_info.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        gw_mgr.restart_gateway(&sid, &network_info, None, None)
+                        gw_mgr.restart_gateway(&sid, &network_info, None, None, None)
                     })
                     .await;
                     // Re-apply the session's policy to the fresh

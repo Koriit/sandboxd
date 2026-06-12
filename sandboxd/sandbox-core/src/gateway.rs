@@ -338,6 +338,7 @@ impl GatewayManager {
         network_info: &NetworkInfo,
         ca_dir: Option<&Path>,
         initial_dns_policy: Option<&str>,
+        owner_pool: Option<&str>,
     ) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
 
@@ -566,8 +567,18 @@ impl GatewayManager {
             "unless-stopped".to_string(),
             "--label".to_string(),
             format!("sandbox.session_id={session_id}"),
-            gateway_image_tag_for_version(env!("CARGO_PKG_VERSION")),
         ]);
+
+        // Stamp the daemon-pool owner label so the orphan reaper can
+        // distinguish this daemon's gateway from a co-deployed daemon's
+        // — gateway containers are excluded from reaping by name-prefix
+        // parsing, but the label aids diagnostics and future tooling.
+        if let Some(pool) = owner_pool {
+            args.push("--label".to_string());
+            args.push(format!("sandboxd.owner={pool}"));
+        }
+
+        args.push(gateway_image_tag_for_version(env!("CARGO_PKG_VERSION")));
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = run_with_timeout(
@@ -821,6 +832,7 @@ impl GatewayManager {
         network_info: &NetworkInfo,
         ca_dir: Option<&Path>,
         initial_dns_policy: Option<&str>,
+        owner_pool: Option<&str>,
     ) -> Result<(), SandboxError> {
         info!(
             session_id = %session_id,
@@ -837,7 +849,13 @@ impl GatewayManager {
         }
 
         // Create fresh container with full setup.
-        self.create_gateway(session_id, network_info, ca_dir, initial_dns_policy)
+        self.create_gateway(
+            session_id,
+            network_info,
+            ca_dir,
+            initial_dns_policy,
+            owner_pool,
+        )
     }
 
     /// Check gateway health.

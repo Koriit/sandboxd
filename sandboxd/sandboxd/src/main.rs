@@ -2031,9 +2031,19 @@ async fn create_session(
         }};
     }
 
-    // Helper closure: cleanup network + CA only (VM not yet created).
+    // Helper closure: cleanup container+volume (best-effort), then network + CA.
+    // Ordering hygiene: remove container and volume BEFORE the network so the
+    // network rm never races a still-attached container. The container and
+    // volume carry the owner label and are reapable regardless of order, but
+    // removing them first avoids "network has active endpoints" log noise.
     macro_rules! cleanup_net_ca_and_return {
         ($state:expr, $session_id:expr, $err_resp:expr) => {{
+            let runtime = runtime_for(&*$state, backend_kind);
+            let handle = RuntimeHandle::from_session_id(&$session_id);
+            // Best-effort container+volume removal before network teardown.
+            // On early-failure paths (e.g. IP parse, CA key gen) no container
+            // or VM has been created yet, so this is an intentional no-op.
+            let _ = runtime.delete(&handle, operator.uid).await;
             let network = $state.network.clone();
             let base_dir = $state.base_dir.clone();
             let sid = $session_id;
@@ -2306,6 +2316,15 @@ async fn create_session(
                 // ownership. Travels as `Some((uid, gid))` here because
                 // the supervisor-fork pattern requires both halves.
                 operator_identity: Some((operator.uid, operator.gid)),
+                // Pool CIDR stamped as `sandboxd.owner=<pool>` on the
+                // container and home volume so the orphan reaper can
+                // attribute them to this daemon even after the session
+                // network has been torn down.
+                owner_pool: Some(format!(
+                    "{}/{}",
+                    state.users_conf_pool.cidr.base(),
+                    state.users_conf_pool.cidr.prefix_len()
+                )),
             };
             state
                 .container_runtime
@@ -2436,12 +2455,24 @@ async fn create_session(
         // which the network manager swallows).
         macro_rules! cleanup_lite_gateway_and_return {
             ($err_resp:expr) => {{
-                teardown_session_networking_parts(
-                    &session_id,
-                    &state.gateway,
-                    &state.network,
-                    &state.ingestors,
-                )
+                // Ordering hygiene: stop gateway + abort ingestor first, but
+                // do NOT remove the network here. The network removal is done
+                // by cleanup_and_return! after the container and home volume
+                // are removed, so the network rm never races a still-attached
+                // container ("active endpoints" log noise).
+                {
+                    let mut guard = state.ingestors.lock().await;
+                    if let Some(ingestor) = guard.remove(&session_id) {
+                        ingestor.abort();
+                    }
+                }
+                let gw = state.gateway.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = gw.stop_gateway(&sid) {
+                        warn!(%sid, error = %e, "cleanup_lite_gateway: failed to stop gateway (best-effort)");
+                    }
+                })
                 .await;
                 cleanup_and_return!(state, session_id, $err_resp);
             }};
@@ -2486,8 +2517,13 @@ async fn create_session(
             let ni = network_info.clone();
             let ca = ca_dir.clone();
             let dns = initial_dns_policy.map(|s| s.to_string());
+            let pool = format!(
+                "{}/{}",
+                state.users_conf_pool.cidr.base(),
+                state.users_conf_pool.cidr.prefix_len()
+            );
             match tokio::task::spawn_blocking(move || {
-                gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+                gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
             })
             .await
             {
@@ -6068,8 +6104,13 @@ async fn setup_session_networking(
         let ni = network_info.clone();
         let ca = ca_dir.to_path_buf();
         let dns = initial_dns_policy.map(|s| s.to_string());
+        let pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
         match tokio::task::spawn_blocking(move || {
-            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
         })
         .await
         {
@@ -6572,8 +6613,13 @@ async fn restore_session_networking(
         let ni = network_info.clone();
         let ca = ca_dir.clone();
         let dns = initial_dns_policy.map(|s| s.to_string());
+        let pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
         match tokio::task::spawn_blocking(move || {
-            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
         })
         .await
         {
@@ -6725,8 +6771,13 @@ async fn restore_session_networking_lite(
         let ni = network_info.clone();
         let ca = ca_dir.clone();
         let dns = initial_dns_policy.map(|s| s.to_string());
+        let pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
         match tokio::task::spawn_blocking(move || {
-            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref(), Some(&pool))
         })
         .await
         {
@@ -7896,12 +7947,18 @@ async fn reconcile_networking(state: &AppState) {
                         let ni = network_info.clone();
                         let ca_owned = ca_ref.map(|p| p.to_path_buf());
                         let init_dns_owned = init_dns.map(|s| s.to_string());
+                        let pool = format!(
+                            "{}/{}",
+                            state.users_conf_pool.cidr.base(),
+                            state.users_conf_pool.cidr.prefix_len()
+                        );
                         let restart_result = tokio::task::spawn_blocking(move || {
                             gw.restart_gateway(
                                 &sid,
                                 &ni,
                                 ca_owned.as_deref(),
                                 init_dns_owned.as_deref(),
+                                Some(&pool),
                             )
                         })
                         .await;
@@ -8313,12 +8370,18 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     let ni = network_info.clone();
                     let ca_owned = ca_ref.map(|p| p.to_path_buf());
                     let init_dns_owned = init_dns.map(|s| s.to_string());
+                    let pool = format!(
+                        "{}/{}",
+                        state.users_conf_pool.cidr.base(),
+                        state.users_conf_pool.cidr.prefix_len()
+                    );
                     let restart_result = tokio::task::spawn_blocking(move || {
                         gw.restart_gateway(
                             &sid,
                             &ni,
                             ca_owned.as_deref(),
                             init_dns_owned.as_deref(),
+                            Some(&pool),
                         )
                     })
                     .await;
@@ -8575,7 +8638,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the per-operator LimaManager registry. One LimaManager per
     // operator uid, created lazily on first session-create. All limactl
     // operations go through sandbox-lima-helper (pivoted to operator uid).
-    let lima_registry = Arc::new(LimaManagerRegistry::new(base_vm_name, lima_helper_path));
+    let lima_registry = Arc::new(LimaManagerRegistry::new(
+        base_vm_name,
+        lima_helper_path,
+        format!(
+            "{}/{}",
+            allocation_pool.base(),
+            allocation_pool.prefix_len()
+        ),
+    ));
 
     // Build the Lima runtime backed by the registry and register it in
     // the backend dispatch table. The same Arc<LimaRuntime> is held both
@@ -8652,9 +8723,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // matched at startup (see `resolve_allocation_pool` above). The
     // legacy default-pool constructor is no longer reachable from
     // production startup — `users.conf` is the single source of truth.
+    let pool_cidr_str = format!(
+        "{}/{}",
+        allocation_pool.base(),
+        allocation_pool.prefix_len()
+    );
     let network = Arc::new(NetworkManager::new(
         allocation_pool.base(),
         allocation_pool.prefix_len(),
+        pool_cidr_str,
     )?);
     let gateway = Arc::new(GatewayManager::new());
 
@@ -8767,7 +8844,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dual-anchor model.
     {
         let docker_ops = CliDockerOps;
+        // `let _ =` is intentional: ReaperReport is logged inside reap_orphans.
         let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
+    }
+
+    // Lima VM orphan cleanup: runs in parallel with the Docker reaper
+    // (both are post-reconcile, both are startup-only).
+    //
+    // Enumerates operator uids from the daemon-owned FS tree (not from
+    // session rows — that is the [L-1] gap `reconcile` leaves open) and
+    // removes `sandbox-{id}` VMs whose session id is absent from the live
+    // set. The owner marker (`sandboxd-owner`) file is consulted so a
+    // shared-LIMA_HOME edge case doesn't cause cross-daemon reaping.
+    {
+        let pool_str = format!(
+            "{}/{}",
+            allocation_pool.base(),
+            allocation_pool.prefix_len()
+        );
+        // `let _ =` is intentional: LimaReaperReport is logged inside
+        // reap_lima_orphans; the outer spawn_blocking result is discarded
+        // because a join-error here (thread panics) should not abort startup.
+        let _ = tokio::task::spawn_blocking({
+            let registry = lima_registry.clone();
+            let live = live_session_ids.clone();
+            move || sandbox_core::reap_lima_orphans(&registry, &live, &pool_str)
+        })
+        .await;
     }
 
     // Hydrate the in-memory policy map from SQLite **before**
@@ -10688,8 +10791,12 @@ mod tests {
         // fatal for the helper, which is exactly what this test pins.
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
-                .expect("construct NetworkManager"),
+            NetworkManager::new(
+                Ipv4Addr::new(10, 209, 0, 0),
+                24,
+                "10.209.0.0/24".to_string(),
+            )
+            .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
 
@@ -10789,8 +10896,12 @@ mod tests {
 
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
-                .expect("construct NetworkManager"),
+            NetworkManager::new(
+                Ipv4Addr::new(10, 209, 0, 0),
+                24,
+                "10.209.0.0/24".to_string(),
+            )
+            .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
 
@@ -10947,8 +11058,12 @@ mod tests {
 
         let gateway = Arc::new(GatewayManager::new());
         let network = Arc::new(
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
-                .expect("construct NetworkManager"),
+            NetworkManager::new(
+                Ipv4Addr::new(10, 209, 0, 0),
+                24,
+                "10.209.0.0/24".to_string(),
+            )
+            .expect("construct NetworkManager"),
         );
         let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
 

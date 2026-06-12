@@ -184,23 +184,41 @@ pub struct NetworkManager {
     subnet_allocator: Mutex<SubnetAllocator>,
     /// Maps session_id -> (block_index, NetworkInfo) for active networks.
     networks: Mutex<std::collections::HashMap<SessionId, (u16, NetworkInfo)>>,
+    /// Canonical pool CIDR string (`<base>/<prefix>`, e.g. `10.209.0.0/20`)
+    /// stamped as `sandboxd.owner=<pool>` on every Docker resource this daemon
+    /// creates. Used by the orphan reaper to distinguish resources belonging to
+    /// this daemon from those belonging to a co-deployed daemon with a disjoint
+    /// pool.
+    pub owner_pool: String,
 }
 
 impl NetworkManager {
     /// Create a new `NetworkManager` with the given base range.
     ///
+    /// `owner_pool` is the canonical CIDR string (`<base>/<prefix>`) stamped
+    /// as `sandboxd.owner=<pool>` on every Docker resource created by this
+    /// daemon. Pass the same value as `allocation_pool`'s canonical form:
+    /// `format!("{}/{}", pool.base(), pool.prefix_len())`.
+    ///
     /// Default: `10.209.0.0/24` provides 16 /28 subnets.
-    pub fn new(base: Ipv4Addr, prefix_len: u8) -> Result<Self, SandboxError> {
+    pub fn new(base: Ipv4Addr, prefix_len: u8, owner_pool: String) -> Result<Self, SandboxError> {
         let allocator = SubnetAllocator::new(base, prefix_len)?;
         Ok(Self {
             subnet_allocator: Mutex::new(allocator),
             networks: Mutex::new(std::collections::HashMap::new()),
+            owner_pool,
         })
     }
 
     /// Create a new `NetworkManager` with the default base range `10.209.0.0/24`.
+    /// Owner pool defaults to `10.209.0.0/24` — used only in unit tests that
+    /// don't exercise the owner-label path.
     pub fn with_defaults() -> Result<Self, SandboxError> {
-        Self::new(Ipv4Addr::new(10, 209, 0, 0), 24)
+        Self::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
     }
 
     /// Rebuild allocator state from existing `NetworkInfo` entries.
@@ -293,6 +311,7 @@ impl NetworkManager {
                 "creating Docker bridge network"
             );
 
+            let owner_label = format!("sandboxd.owner={}", self.owner_pool);
             let output = run_with_timeout(
                 Command::new("docker").args([
                     "network",
@@ -303,6 +322,8 @@ impl NetworkManager {
                     &subnet,
                     "--label",
                     &format!("sandbox.session_id={session_id}"),
+                    "--label",
+                    &owner_label,
                     "--opt",
                     &format!("com.docker.network.bridge.name={bridge_name}"),
                     &docker_network_name,
@@ -787,7 +808,12 @@ mod tests {
 
     #[test]
     fn test_network_info_fields() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
+        .unwrap();
 
         let session_id = SessionId::generate();
 
@@ -852,7 +878,12 @@ mod tests {
 
     #[test]
     fn test_restore_from_infos() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
+        .unwrap();
 
         let id1 = SessionId::generate();
         let id2 = SessionId::generate();
@@ -907,7 +938,12 @@ mod tests {
 
     #[test]
     fn test_network_info_not_found() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(
+            Ipv4Addr::new(10, 209, 0, 0),
+            24,
+            "10.209.0.0/24".to_string(),
+        )
+        .unwrap();
 
         let result = mgr.network_info(&SessionId::generate()).unwrap();
         assert!(result.is_none());
