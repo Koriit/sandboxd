@@ -12,7 +12,7 @@ use sandbox_core::session::SessionId;
 #[test]
 fn test_docker_create_and_delete_network() {
     // Use 10.209.1.0/24 to avoid collisions with the labels test.
-    let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 1, 0), 24).unwrap();
+    let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 1, 0), 24, "10.209.1.0/24".to_string()).unwrap();
     let session_id = SessionId::generate();
 
     // Create network.
@@ -71,7 +71,7 @@ fn test_docker_create_and_delete_network() {
 #[test]
 fn test_docker_network_labels() {
     // Use 10.209.2.0/24 to avoid collisions with the create/delete test.
-    let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 2, 0), 24).unwrap();
+    let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 2, 0), 24, "10.209.2.0/24".to_string()).unwrap();
     let session_id = SessionId::generate();
 
     let info = mgr.create_network(&session_id).unwrap();

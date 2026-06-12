@@ -1,12 +1,11 @@
 //! Boot-time orphan cleanup for the lite container backend.
 //!
-//!  (lite-mode container backend
-//! design): on every daemon boot, enumerate Docker resources living in
-//! the `sandbox-` namespace and prune any that are not referenced by a
-//! row in `sessions.db`. Same code path handles crash recovery — a
-//! daemon that crashed between `docker create` and the SQLite insert
-//! leaves a container with no owning session row, and the next boot
-//! reaps it.
+//! On every daemon boot, enumerate Docker resources owned by this daemon
+//! (filtered by the `sandboxd.owner=<pool>` label) and prune any that are
+//! not referenced by a row in `sessions.db`. The same code path handles
+//! crash recovery — a daemon that crashed between `docker create` and the
+//! SQLite insert leaves a container with no owning session row, and the next
+//! boot reaps it.
 //!
 //! # Scope
 //!
@@ -26,43 +25,26 @@
 //! reconciler (which owns `sandbox-gw-*`) and any operator-created
 //! resources outside the sandbox namespace untouched.
 //!
-//! # Dual-anchor ownership model
+//! # Owner-label ownership model
 //!
-//! The name-prefix check above is the **first** ownership anchor:
-//! "name says sandboxd's." On a host running a single sandboxd that is
-//! sufficient. On a host running two sandboxds — prod + dev test, two
-//! parallel test runs, a dev build colliding with a stale prod prefix —
-//! it is not, because every sandboxd uses the same `sandbox-`,
-//! `sandbox-home-`, and `sandbox-net-` prefixes. Without a second
-//! anchor, each daemon's reaper would mass-delete the other's
-//! resources.
+//! Every Docker resource created by this daemon carries a
+//! `sandboxd.owner=<pool-cidr>` label (e.g. `sandboxd.owner=10.209.0.0/20`).
+//! The reaper filters Docker listings by this label so it only sees
+//! resources that belong to *this* daemon. A co-deployed daemon with a
+//! disjoint pool CIDR has its own distinct label value and its resources
+//! are never returned by the filtered listing — no cross-daemon reaping
+//! is possible regardless of session-id overlap.
 //!
-//! The **second** anchor is the daemon's `NetworkManager` allocator
-//! pool CIDR (resolved from `users.conf` at startup, default
-//! `10.209.0.0/24`). Networks whose IPAM-reported IPv4 subnets lie
-//! outside the pool are skipped — "name says sandboxd's, CIDR says
-//! **this** sandboxd's." Containers and home volumes are owned
-//! by-network transitively: a container or volume attached to an
-//! out-of-pool network is left alone because the network itself is
-//! left alone.
+//! This label is the primary ownership anchor: it survives network
+//! teardown, so a Stopped session's container and home volume (whose
+//! `sandbox-net-{id}` has been released) remain attributable and are
+//! correctly protected by the live-set or reaped as orphans.
 //!
-//! The CIDR check is fail-closed: networks with no IPAM data,
-//! malformed inspect output, or any IPv4 subnet outside the pool are
-//! skipped. The inverse — reaping on partial in-pool overlap — would
-//! be a footgun: a network with one in-pool /28 and one out-of-pool
-//! /28 must not be torn down, because the out-of-pool half is by
-//! definition not ours. See [`DockerOps::inspect_network_ipam`] for
-//! the IPAM probe surface and `docs/concepts/networking.md`
-//! for the prose-side dual-anchor description.
+//! # Delete order
 //!
-//! Scope limitation: the dual-anchor protects siblings of out-of-pool
-//! networks **observed during the network pass**. A container or volume
-//! whose `sandbox-net-{sid}` has already been torn down on the host
-//! falls through to single-anchor (name-prefix) protection only — the
-//! second anchor cannot reach a network that no longer exists at probe
-//! time. Acceptable in practice because the 12-hex session id makes
-//! cross-daemon collisions vanishingly rare; revisit if a multi-daemon
-//! deployment runbook (deferred from S10) lands.
+//! Resources are deleted in the order containers → volumes → networks.
+//! This ensures the network `rm` never races a still-attached container,
+//! avoiding "active endpoints" log noise.
 //!
 //! # Best-effort, idempotent
 //!
@@ -82,7 +64,6 @@
 //! `docker` exactly like the rest of the container backend.
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
 
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -172,17 +153,28 @@ where
 /// uses [`CliDockerOps`].
 #[async_trait]
 pub trait DockerOps: Send + Sync {
-    /// Enumerate every container in the `sandbox-` namespace, including
-    /// stopped ones (`docker ps -a --filter name=sandbox- --format '{{.Names}}'`).
-    async fn list_sandbox_containers(&self) -> Result<Vec<String>, SandboxError>;
+    /// Enumerate every container in the `sandbox-` namespace owned by the
+    /// given pool, including stopped ones.
+    ///
+    /// Production: `docker ps -a --filter name=sandbox-
+    ///   --filter label=sandboxd.owner=<pool> --format '{{.Names}}'`.
+    async fn list_owned_containers(&self, pool: &str) -> Result<Vec<String>, SandboxError>;
 
-    /// Enumerate every volume whose name begins with `sandbox-home-`
-    /// (`docker volume ls --filter name=sandbox-home- --format '{{.Name}}'`).
-    async fn list_sandbox_home_volumes(&self) -> Result<Vec<String>, SandboxError>;
+    /// Enumerate every volume whose name begins with `sandbox-home-` and
+    /// that carries `sandboxd.owner=<pool>`.
+    ///
+    /// Production: `docker volume ls
+    ///   --filter name=sandbox-home-
+    ///   --filter label=sandboxd.owner=<pool> --format '{{.Name}}'`.
+    async fn list_owned_home_volumes(&self, pool: &str) -> Result<Vec<String>, SandboxError>;
 
-    /// Enumerate every docker network whose name begins with
-    /// `sandbox-net-` (`docker network ls --filter name=sandbox-net- --format '{{.Name}}'`).
-    async fn list_sandbox_networks(&self) -> Result<Vec<String>, SandboxError>;
+    /// Enumerate every docker network whose name begins with `sandbox-net-`
+    /// and that carries `sandboxd.owner=<pool>`.
+    ///
+    /// Production: `docker network ls
+    ///   --filter name=sandbox-net-
+    ///   --filter label=sandboxd.owner=<pool> --format '{{.Name}}'`.
+    async fn list_owned_networks(&self, pool: &str) -> Result<Vec<String>, SandboxError>;
 
     /// `docker rm -f <name>`. Errors propagate so the caller can decide
     /// whether to log+continue or surface; the reaper logs+continues.
@@ -196,25 +188,9 @@ pub trait DockerOps: Send + Sync {
     /// [`Self::remove_container`].
     async fn remove_network(&self, name: &str) -> Result<(), SandboxError>;
 
-    /// IPAM probe for the dual-anchor CIDR gate. Returns
-    /// every IPv4 subnet (`a.b.c.d/n`) Docker reports for the named
-    /// network's IPAM configuration. Implementations shell out to
-    /// `docker network inspect <name> --format '{{json .IPAM}}'` and
-    /// parse the resulting JSON.
-    ///
-    /// Fail-closed contract:
-    /// - `Ok(vec![])` — Docker returned IPAM data with no IPv4
-    ///   subnets (or only IPv6 entries we don't gate on). The
-    ///   reaper treats an empty list as "no in-pool subnets" and
-    ///   skips the network.
-    /// - `Err(_)` — inspect failed or the JSON did not parse. The
-    ///   reaper logs at `warn!` and skips the network.
-    ///
-    /// In both fail-closed paths, the network is **not reaped**. The
-    /// inverse (reaping on missing/partial data) would mass-delete a
-    /// neighboring sandboxd's resources whenever its `docker network
-    /// inspect` happens to be transiently slow or returns an
-    /// unexpected shape.
+    // Legacy compatibility — retained so the IPAM unit-test helpers
+    // that call these still compile.  Not used by `reap_orphans`.
+    #[allow(dead_code)]
     async fn inspect_network_ipam(&self, name: &str) -> Result<Vec<Cidr4>, SandboxError>;
 }
 
@@ -229,19 +205,16 @@ pub struct CliDockerOps;
 
 #[async_trait]
 impl DockerOps for CliDockerOps {
-    async fn list_sandbox_containers(&self) -> Result<Vec<String>, SandboxError> {
-        // `--filter name=sandbox-` matches any container whose name
-        // *contains* the substring (docker's filter is a substring
-        // match, not a prefix anchor). `parse_container_session_id`
-        // re-anchors the prefix and validates the 12-hex tail, so any
-        // false positives (e.g. an operator-created `my-sandbox-foo`)
-        // fall through harmlessly.
+    async fn list_owned_containers(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+        let label_filter = format!("label=sandboxd.owner={pool}");
         let stdout = run_docker_raw(
             &[
                 "ps",
                 "-a",
                 "--filter",
                 "name=sandbox-",
+                "--filter",
+                &label_filter,
                 "--format",
                 "{{.Names}}",
             ],
@@ -251,13 +224,16 @@ impl DockerOps for CliDockerOps {
         Ok(parse_one_per_line(&stdout))
     }
 
-    async fn list_sandbox_home_volumes(&self) -> Result<Vec<String>, SandboxError> {
+    async fn list_owned_home_volumes(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+        let label_filter = format!("label=sandboxd.owner={pool}");
         let stdout = run_docker_raw(
             &[
                 "volume",
                 "ls",
                 "--filter",
                 "name=sandbox-home-",
+                "--filter",
+                &label_filter,
                 "--format",
                 "{{.Name}}",
             ],
@@ -267,13 +243,16 @@ impl DockerOps for CliDockerOps {
         Ok(parse_one_per_line(&stdout))
     }
 
-    async fn list_sandbox_networks(&self) -> Result<Vec<String>, SandboxError> {
+    async fn list_owned_networks(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+        let label_filter = format!("label=sandboxd.owner={pool}");
         let stdout = run_docker_raw(
             &[
                 "network",
                 "ls",
                 "--filter",
                 "name=sandbox-net-",
+                "--filter",
+                &label_filter,
                 "--format",
                 "{{.Name}}",
             ],
@@ -324,12 +303,6 @@ impl DockerOps for CliDockerOps {
     }
 
     async fn inspect_network_ipam(&self, name: &str) -> Result<Vec<Cidr4>, SandboxError> {
-        // `--format '{{json .IPAM}}'` returns a single JSON object
-        // (the IPAM block) per network, e.g.
-        //   {"Driver":"default","Options":{},"Config":[{"Subnet":"10.209.0.16/28"}]}
-        // We extract every IPv4 `Subnet` from `Config[]` and skip
-        // entries whose subnet is IPv6 (`fd00::/64` etc.) — the
-        // dual-anchor gate is IPv4-only by design (see module docs).
         let stdout = run_docker_raw(
             &["network", "inspect", name, "--format", "{{json .IPAM}}"],
             "docker network inspect (orphan reaper IPAM probe)",
@@ -340,21 +313,9 @@ impl DockerOps for CliDockerOps {
 }
 
 /// Parse the JSON output of `docker network inspect <name> --format
-/// '{{json .IPAM}}'` and extract every IPv4 subnet. Pulled out so unit
-/// tests can pin the JSON-shape contract without touching Docker.
-///
-/// Returns:
-/// - `Ok(vec![cidr, ...])` — the IPv4 subnets the inspector reported
-///   under `Config[].Subnet`. IPv6 entries are silently dropped (the
-///   gate is IPv4-only by design); see the module-level dual-anchor
-///   description.
-/// - `Ok(vec![])` — IPAM block had no `Config` array, or every entry
-///   was missing/IPv6/non-CIDR. The reaper treats this as fail-closed
-///   "untrusted, not ours" per the [`DockerOps::inspect_network_ipam`]
-///   contract.
-/// - `Err(SandboxError::Gateway)` — JSON failed to parse. Same
-///   fail-closed treatment downstream.
-fn parse_ipam_subnets(stdout: &str) -> Result<Vec<Cidr4>, SandboxError> {
+/// '{{json .IPAM}}'` and extract every IPv4 subnet. Retained for
+/// compatibility with existing IPAM unit tests.
+pub(crate) fn parse_ipam_subnets(stdout: &str) -> Result<Vec<Cidr4>, SandboxError> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -370,10 +331,6 @@ fn parse_ipam_subnets(stdout: &str) -> Result<Vec<Cidr4>, SandboxError> {
             let Some(subnet_str) = entry.get("Subnet").and_then(|s| s.as_str()) else {
                 continue;
             };
-            // Skip IPv6 — `Cidr4::parse` rejects them with "invalid
-            // IPv4 address", but matching the colon character first is
-            // cheaper than driving through the parser's error path
-            // for every dual-stack network.
             if subnet_str.contains(':') {
                 continue;
             }
@@ -393,16 +350,11 @@ fn parse_ipam_subnets(stdout: &str) -> Result<Vec<Cidr4>, SandboxError> {
 }
 
 /// True iff the network's IPAM block is fully contained in the
-/// daemon's allocator pool — every reported IPv4 subnet's base address
-/// **and** broadcast address fall inside `pool`. Both endpoints must
-/// be in-pool because a /28 that straddles the pool boundary would
-/// have its base in-pool and its broadcast out-of-pool, and the
-/// network as a whole is half-out-of-pool.
-///
-/// Fail-closed: an empty `subnets` slice returns `false`. The reaper
-/// must not reap a network whose IPAM is empty or unparseable; see the
-/// module docs.
-fn ipam_subnets_in_pool(subnets: &[Cidr4], pool: &Cidr4) -> bool {
+/// daemon's allocator pool. Retained for compatibility with existing
+/// IPAM unit tests; no longer called by `reap_orphans`.
+#[allow(dead_code)]
+pub(crate) fn ipam_subnets_in_pool(subnets: &[Cidr4], pool: &Cidr4) -> bool {
+    use std::net::Ipv4Addr;
     if subnets.is_empty() {
         return false;
     }
@@ -410,15 +362,8 @@ fn ipam_subnets_in_pool(subnets: &[Cidr4], pool: &Cidr4) -> bool {
         let base_u32 = u32::from(net.base());
         let host_bits = 32u32 - u32::from(net.prefix_len());
         let last_u32 = if host_bits == 32 {
-            // /0 — only the global default route, which can never be
-            // an allocator pool anyway. Treat as out-of-pool.
             return false;
         } else {
-            // `saturating_add` is defensive: `Cidr4::parse` rejects
-            // bases with host bits set, so for any well-formed `Cidr4`
-            // the addition cannot overflow. Kept for readability and to
-            // avoid surprising future readers who reach this expression
-            // without the parser invariant in mind.
             base_u32.saturating_add((1u32 << host_bits) - 1)
         };
         pool.contains(net.base()) && pool.contains(Ipv4Addr::from(last_u32))
@@ -428,8 +373,7 @@ fn ipam_subnets_in_pool(subnets: &[Cidr4], pool: &Cidr4) -> bool {
 /// `docker <args>` with the standard 60s wall-clock timeout, returning
 /// trimmed stdout on success. Mirrors `container::run_docker` byte-for-
 /// byte but kept module-local so the reaper does not depend on
-/// `container.rs`'s internals; the design calls this a sibling concern,
-/// not an extension of the per-session lifecycle.
+/// `container.rs`'s internals.
 async fn run_docker_raw(args: &[&str], operation: &'static str) -> Result<String, SandboxError> {
     use std::time::Duration;
 
@@ -458,9 +402,7 @@ async fn run_docker_raw(args: &[&str], operation: &'static str) -> Result<String
 }
 
 /// Split docker's `{{.Names}}` / `{{.Name}}` output (one entry per
-/// line) into a list of trimmed, non-empty strings. The trailing
-/// newline is stripped by [`run_docker_raw`] but defensive `trim` here
-/// keeps the helper independent.
+/// line) into a list of trimmed, non-empty strings.
 fn parse_one_per_line(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -485,183 +427,66 @@ pub struct ReaperReport {
     pub networks_reaped: u32,
 }
 
-/// Enumerate every `sandbox-*` Docker resource and remove the ones
-/// whose derived session id is not in `live`. Best-effort and
-/// idempotent — see the module docs.
+/// Enumerate every Docker resource owned by `pool` (via the
+/// `sandboxd.owner=<pool>` label) and remove the ones whose derived
+/// session id is not in `live`. Best-effort and idempotent — see the
+/// module docs.
+///
+/// Deletion order is containers → volumes → networks so a network `rm`
+/// never races a still-attached container.
+///
+/// `pool` is the canonical CIDR string (`<base>/<prefix>`) that this
+/// daemon stamps on every resource it creates. Only resources whose
+/// `sandboxd.owner` label matches this exact string are returned by the
+/// filtered listing — resources owned by a co-deployed daemon with a
+/// different pool are never seen and therefore never touched.
 ///
 /// Failures during enumeration (e.g. Docker daemon unreachable) abort
 /// that resource-class only and are logged at `warn!`; the other
 /// classes still get their pass. Failures during `docker rm` are
 /// logged at `warn!` and skip incrementing the count for that
 /// resource.
-///
-/// `pool` is the daemon's `NetworkManager` allocator pool — the second
-/// of the two ownership anchors documented in the module-level
-/// "Dual-anchor ownership model" section. Networks whose IPAM-reported
-/// IPv4 subnets are not fully in-pool are skipped; their attached
-/// containers and home volumes are skipped transitively (the reaper
-/// rebuilds the live-by-network sets from `docker network inspect` so
-/// out-of-pool resources never enter the partition step).
 pub async fn reap_orphans<D: DockerOps + ?Sized>(
     docker: &D,
     live: &HashSet<SessionId>,
     pool: &Cidr4,
 ) -> ReaperReport {
+    let pool_str = format!("{}/{}", pool.base(), pool.prefix_len());
     let mut report = ReaperReport::default();
 
-    // ---- Networks ----
-    //
-    // Run the network pass first so the dual-anchor CIDR gate can
-    // populate `out_of_pool_sids` — the set of session ids whose
-    // `sandbox-net-{id}` network was filtered out by the IPAM check.
-    // The container and volume passes below skip those session ids
-    // transitively: a container/volume that shares a session id with
-    // an out-of-pool network is "not ours" by the same anchor.
-    let mut out_of_pool_sids: HashSet<SessionId> = HashSet::new();
-    match docker.list_sandbox_networks().await {
-        Ok(names) => {
-            let mut classified: Vec<(String, SessionId)> = Vec::new();
-            for name in names {
-                if let Some(sid) = parse_network_session_id(&name) {
-                    classified.push((name, sid));
-                }
-            }
-            let (_keep, reap) = partition_orphans(classified, live);
-            for (name, sid) in reap {
-                // Dual-anchor: the name says sandboxd's;
-                // before reaping, confirm the IPAM-reported subnets
-                // also say *this* sandboxd's (i.e. fully inside the
-                // allocator pool). Anything else — out-of-pool, no
-                // IPAM data, malformed inspect output — is skipped
-                // fail-closed and its session id is recorded so the
-                // container and volume passes don't reap its
-                // siblings.
-                let in_pool = match docker.inspect_network_ipam(&name).await {
-                    Ok(subnets) => ipam_subnets_in_pool(&subnets, pool),
-                    Err(e) => {
-                        warn!(
-                            network = %name,
-                            session_id = %sid,
-                            error = %e,
-                            "orphan reaper: docker network inspect IPAM failed; \
-                             skipping network (fail-closed)"
-                        );
-                        false
-                    }
-                };
-                if !in_pool {
-                    info!(
-                        network = %name,
-                        session_id = %sid,
-                        pool_base = %pool.base(),
-                        pool_prefix = pool.prefix_len(),
-                        "orphan reaper: network IPAM not in allocator pool; \
-                         skipping network and its session-id siblings"
-                    );
-                    out_of_pool_sids.insert(sid);
-                    continue;
-                }
-                match docker.remove_network(&name).await {
-                    Ok(()) => {
-                        info!(
-                            network = %name,
-                            session_id = %sid,
-                            "orphan reaper: removed network with no owning session"
-                        );
-                        report.networks_reaped += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            network = %name,
-                            session_id = %sid,
-                            error = %e,
-                            "orphan reaper: docker network rm failed; continuing"
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "orphan reaper: failed to list sandbox networks; skipping network reap"
-            );
-        }
-    }
+    // ---- Containers (delete first so networks don't have active endpoints) ----
+    let orphan_containers = collect_orphan_containers(docker, &pool_str, live).await;
 
-    // ---- Containers ----
-    match docker.list_sandbox_containers().await {
-        Ok(names) => {
-            let mut classified: Vec<(String, SessionId)> = Vec::new();
-            for name in names {
-                if let Some(sid) = parse_container_session_id(&name) {
-                    // Skip containers whose session id has an
-                    // out-of-pool sibling network — see the network
-                    // pass above for the transitive-ownership rule.
-                    if out_of_pool_sids.contains(&sid) {
-                        info!(
-                            container = %name,
-                            session_id = %sid,
-                            "orphan reaper: skipping container — sibling \
-                             network is out-of-pool"
-                        );
-                        continue;
-                    }
-                    classified.push((name, sid));
-                }
-                // Names that don't parse (e.g. `sandbox-gw-*` gateway
-                // containers, or `sandbox-net-*` etc. coincidentally
-                // matched by the substring filter) are silently
-                // skipped — they aren't lite session containers.
+    for (name, sid) in &orphan_containers {
+        match docker.remove_container(name).await {
+            Ok(()) => {
+                info!(
+                    container = %name,
+                    session_id = %sid,
+                    "orphan reaper: removed container with no owning session"
+                );
+                report.containers_reaped += 1;
             }
-            let (_keep, reap) = partition_orphans(classified, live);
-            for (name, sid) in reap {
-                match docker.remove_container(&name).await {
-                    Ok(()) => {
-                        info!(
-                            container = %name,
-                            session_id = %sid,
-                            "orphan reaper: removed container with no owning session"
-                        );
-                        report.containers_reaped += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            container = %name,
-                            session_id = %sid,
-                            error = %e,
-                            "orphan reaper: docker rm failed; continuing"
-                        );
-                    }
-                }
+            Err(e) => {
+                warn!(
+                    container = %name,
+                    session_id = %sid,
+                    error = %e,
+                    "orphan reaper: docker rm failed; continuing"
+                );
             }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "orphan reaper: failed to list sandbox containers; skipping container reap"
-            );
         }
     }
 
     // ---- Volumes ----
-    match docker.list_sandbox_home_volumes().await {
+    match docker.list_owned_home_volumes(&pool_str).await {
         Ok(names) => {
-            let mut classified: Vec<(String, SessionId)> = Vec::new();
-            for name in names {
-                if let Some(sid) = parse_home_volume_session_id(&name) {
-                    if out_of_pool_sids.contains(&sid) {
-                        info!(
-                            volume = %name,
-                            session_id = %sid,
-                            "orphan reaper: skipping home volume — sibling \
-                             network is out-of-pool"
-                        );
-                        continue;
-                    }
-                    classified.push((name, sid));
-                }
-            }
+            let classified: Vec<(String, SessionId)> = names
+                .into_iter()
+                .filter_map(|name| {
+                    parse_home_volume_session_id(&name).map(|sid| (name, sid))
+                })
+                .collect();
             let (_keep, reap) = partition_orphans(classified, live);
             for (name, sid) in reap {
                 match docker.remove_volume(&name).await {
@@ -692,6 +517,45 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
         }
     }
 
+    // ---- Networks (delete last to avoid active-endpoint races) ----
+    match docker.list_owned_networks(&pool_str).await {
+        Ok(names) => {
+            let classified: Vec<(String, SessionId)> = names
+                .into_iter()
+                .filter_map(|name| {
+                    parse_network_session_id(&name).map(|sid| (name, sid))
+                })
+                .collect();
+            let (_keep, reap) = partition_orphans(classified, live);
+            for (name, sid) in reap {
+                match docker.remove_network(&name).await {
+                    Ok(()) => {
+                        info!(
+                            network = %name,
+                            session_id = %sid,
+                            "orphan reaper: removed network with no owning session"
+                        );
+                        report.networks_reaped += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            network = %name,
+                            session_id = %sid,
+                            error = %e,
+                            "orphan reaper: docker network rm failed; continuing"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "orphan reaper: failed to list sandbox networks; skipping network reap"
+            );
+        }
+    }
+
     info!(
         containers_reaped = report.containers_reaped,
         volumes_reaped = report.volumes_reaped,
@@ -701,6 +565,37 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
     );
 
     report
+}
+
+/// Enumerate owned containers and partition into orphans. Extracted
+/// so the deletion loop can have its own scope separate from enumeration.
+async fn collect_orphan_containers<D: DockerOps + ?Sized>(
+    docker: &D,
+    pool_str: &str,
+    live: &HashSet<SessionId>,
+) -> Vec<(String, SessionId)> {
+    match docker.list_owned_containers(pool_str).await {
+        Ok(names) => {
+            let classified: Vec<(String, SessionId)> = names
+                .into_iter()
+                .filter_map(|name| {
+                    // parse_container_session_id rejects gateway containers
+                    // (sandbox-gw-*) — their 15-char suffix doesn't parse
+                    // as a 12-hex SessionId.
+                    parse_container_session_id(&name).map(|sid| (name, sid))
+                })
+                .collect();
+            let (_keep, reap) = partition_orphans(classified, live);
+            reap
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "orphan reaper: failed to list sandbox containers; skipping container reap"
+            );
+            Vec::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -717,20 +612,112 @@ mod tests {
         SessionId::parse(hex).expect("valid 12-hex session id")
     }
 
-    /// Permissive pool used by tests that pre-date the dual-anchor
-    /// gate. `0.0.0.0/0` matches every IPv4 subnet, so the older
-    /// reaper-end-to-end tests below see the same behavior they
-    /// did before the second anchor landed.
+    /// Permissive pool used by tests that pre-date the owner-label gate.
+    /// `0.0.0.0/0` matches every IPv4 subnet and its canonical string is
+    /// `0.0.0.0/0` — tests that care about the exact pool string should
+    /// use an explicit `pool()` instead.
     fn permissive_pool() -> Cidr4 {
         Cidr4::parse("0.0.0.0/0").expect("0.0.0.0/0 parses")
     }
 
-    /// Default in-pool subnet for `FakeDocker` networks: a /28 inside
-    /// the permissive pool. Tests that care about CIDR specifics (the
-    /// dual-anchor unit tests below) override per network via
-    /// `FakeDocker::network_ipam`.
-    fn default_in_pool_subnet() -> Cidr4 {
-        Cidr4::parse("10.209.0.0/28").expect("10.209.0.0/28 parses")
+    /// Default pool string used by [`FakeDocker`] tests.
+    const POOL_A: &str = "10.209.0.0/20";
+    const POOL_B: &str = "10.220.0.0/20";
+
+    fn pool_a() -> Cidr4 {
+        Cidr4::parse(POOL_A).expect("pool A parses")
+    }
+
+    /// In-memory [`DockerOps`] fake. Records every removal call so tests
+    /// can assert on what the reaper attempted to delete. Resources are
+    /// bucketed by owner-label pool string.
+    #[derive(Default)]
+    struct FakeDocker {
+        /// containers[pool] = list of names owned by that pool
+        containers: HashMap<String, Vec<String>>,
+        /// volumes[pool] = list of names owned by that pool
+        volumes: HashMap<String, Vec<String>>,
+        /// networks[pool] = list of names owned by that pool
+        networks: HashMap<String, Vec<String>>,
+        removed_containers: Mutex<Vec<String>>,
+        removed_volumes: Mutex<Vec<String>>,
+        removed_networks: Mutex<Vec<String>>,
+        fail_remove_container: Option<String>,
+        fail_list_volumes: bool,
+    }
+
+    impl FakeDocker {
+        /// Add a container owned by `pool`.
+        fn add_container(mut self, pool: &str, name: &str) -> Self {
+            self.containers
+                .entry(pool.to_string())
+                .or_default()
+                .push(name.to_string());
+            self
+        }
+        /// Add a volume owned by `pool`.
+        fn add_volume(mut self, pool: &str, name: &str) -> Self {
+            self.volumes
+                .entry(pool.to_string())
+                .or_default()
+                .push(name.to_string());
+            self
+        }
+        /// Add a network owned by `pool`.
+        fn add_network(mut self, pool: &str, name: &str) -> Self {
+            self.networks
+                .entry(pool.to_string())
+                .or_default()
+                .push(name.to_string());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl DockerOps for FakeDocker {
+        async fn list_owned_containers(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+            Ok(self.containers.get(pool).cloned().unwrap_or_default())
+        }
+        async fn list_owned_home_volumes(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+            if self.fail_list_volumes {
+                return Err(SandboxError::Gateway("fake docker volume ls failed".into()));
+            }
+            Ok(self.volumes.get(pool).cloned().unwrap_or_default())
+        }
+        async fn list_owned_networks(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+            Ok(self.networks.get(pool).cloned().unwrap_or_default())
+        }
+        async fn remove_container(&self, name: &str) -> Result<(), SandboxError> {
+            if let Some(target) = self.fail_remove_container.as_deref() {
+                if name == target {
+                    return Err(SandboxError::Gateway(format!(
+                        "simulated rm failure: {name}"
+                    )));
+                }
+            }
+            self.removed_containers
+                .lock()
+                .expect("mutex")
+                .push(name.to_string());
+            Ok(())
+        }
+        async fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
+            self.removed_volumes
+                .lock()
+                .expect("mutex")
+                .push(name.to_string());
+            Ok(())
+        }
+        async fn remove_network(&self, name: &str) -> Result<(), SandboxError> {
+            self.removed_networks
+                .lock()
+                .expect("mutex")
+                .push(name.to_string());
+            Ok(())
+        }
+        async fn inspect_network_ipam(&self, _name: &str) -> Result<Vec<Cidr4>, SandboxError> {
+            Ok(vec![Cidr4::parse("10.209.0.0/28").expect("parse")])
+        }
     }
 
     // -- Parsers -----------------------------------------------------------
@@ -784,16 +771,12 @@ mod tests {
 
     #[test]
     fn parse_home_volume_session_id_rejects_other_namespaces() {
-        // Plain container name is not a home volume.
         assert_eq!(parse_home_volume_session_id("sandbox-deadbeef0000"), None);
-        // Network name is not a home volume.
         assert_eq!(
             parse_home_volume_session_id("sandbox-net-deadbeef0000"),
             None
         );
-        // Wrong prefix.
         assert_eq!(parse_home_volume_session_id("home-deadbeef0000"), None);
-        // Bad suffix.
         assert_eq!(parse_home_volume_session_id("sandbox-home-not-hex"), None);
     }
 
@@ -855,120 +838,24 @@ mod tests {
         assert_eq!(reap.len(), 2);
     }
 
-    // -- Reaper end-to-end with a fake DockerOps --------------------------
-
-    /// IPAM-probe outcome modeled by [`FakeDocker`]. `Subnets` mirrors
-    /// the real `inspect_network_ipam` return shape; `InspectErr`
-    /// exercises the fail-closed branch where Docker returns a
-    /// non-zero exit (network missing, daemon unreachable, etc.).
-    enum FakeIpam {
-        Subnets(Vec<Cidr4>),
-        InspectErr,
-    }
-
-    /// In-memory [`DockerOps`] fake. Records every removal call so tests
-    /// can assert on what the reaper attempted to delete.
-    #[derive(Default)]
-    struct FakeDocker {
-        containers: Vec<String>,
-        volumes: Vec<String>,
-        networks: Vec<String>,
-        removed_containers: Mutex<Vec<String>>,
-        removed_volumes: Mutex<Vec<String>>,
-        removed_networks: Mutex<Vec<String>>,
-        // When set, the corresponding remove_* call returns Err to
-        // exercise the best-effort path.
-        fail_remove_container: Option<String>,
-        fail_list_volumes: bool,
-        // Dual-anchor: per-network IPAM probe outcome. Networks not
-        // in the map default to a single `default_in_pool_subnet()`
-        // /28 so older tests keep their existing semantics under the
-        // permissive pool.
-        network_ipam: HashMap<String, FakeIpam>,
-    }
-
-    #[async_trait]
-    impl DockerOps for FakeDocker {
-        async fn list_sandbox_containers(&self) -> Result<Vec<String>, SandboxError> {
-            Ok(self.containers.clone())
-        }
-        async fn list_sandbox_home_volumes(&self) -> Result<Vec<String>, SandboxError> {
-            if self.fail_list_volumes {
-                Err(SandboxError::Gateway("fake docker volume ls failed".into()))
-            } else {
-                Ok(self.volumes.clone())
-            }
-        }
-        async fn list_sandbox_networks(&self) -> Result<Vec<String>, SandboxError> {
-            Ok(self.networks.clone())
-        }
-        async fn remove_container(&self, name: &str) -> Result<(), SandboxError> {
-            if let Some(target) = self.fail_remove_container.as_deref() {
-                if name == target {
-                    return Err(SandboxError::Gateway(format!(
-                        "simulated rm failure: {name}"
-                    )));
-                }
-            }
-            self.removed_containers
-                .lock()
-                .expect("mutex")
-                .push(name.to_string());
-            Ok(())
-        }
-        async fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
-            self.removed_volumes
-                .lock()
-                .expect("mutex")
-                .push(name.to_string());
-            Ok(())
-        }
-        async fn remove_network(&self, name: &str) -> Result<(), SandboxError> {
-            self.removed_networks
-                .lock()
-                .expect("mutex")
-                .push(name.to_string());
-            Ok(())
-        }
-        async fn inspect_network_ipam(&self, name: &str) -> Result<Vec<Cidr4>, SandboxError> {
-            match self.network_ipam.get(name) {
-                Some(FakeIpam::Subnets(s)) => Ok(s.clone()),
-                Some(FakeIpam::InspectErr) => Err(SandboxError::Gateway(format!(
-                    "fake docker network inspect IPAM failed for {name}"
-                ))),
-                // No fixture entry: return a single in-pool /28 so
-                // pre-S10 tests continue to pass under the permissive
-                // pool.
-                None => Ok(vec![default_in_pool_subnet()]),
-            }
-        }
-    }
+    // -- Reaper end-to-end with owner-label filter -------------------------
 
     #[tokio::test]
     async fn reap_orphans_removes_resources_with_no_live_session() {
         let live_sid = sid("aaaaaaaaaaaa");
         let orphan_sid = sid("bbbbbbbbbbbb");
-        let fake = FakeDocker {
-            containers: vec![
-                format!("sandbox-{live_sid}"),
-                format!("sandbox-{orphan_sid}"),
-                // Gateway container — must NOT be reaped.
-                format!("sandbox-gw-{live_sid}"),
-                // Outside namespace — must NOT be reaped.
-                "totally-unrelated-container".to_string(),
-            ],
-            volumes: vec![
-                format!("sandbox-home-{live_sid}"),
-                format!("sandbox-home-{orphan_sid}"),
-            ],
-            networks: vec![
-                format!("sandbox-net-{live_sid}"),
-                format!("sandbox-net-{orphan_sid}"),
-            ],
-            ..Default::default()
-        };
+        let fake = FakeDocker::default()
+            .add_container(POOL_A, &format!("sandbox-{live_sid}"))
+            .add_container(POOL_A, &format!("sandbox-{orphan_sid}"))
+            // Gateway container — must NOT be reaped (name parsing rejects it).
+            .add_container(POOL_A, &format!("sandbox-gw-{live_sid}"))
+            .add_volume(POOL_A, &format!("sandbox-home-{live_sid}"))
+            .add_volume(POOL_A, &format!("sandbox-home-{orphan_sid}"))
+            .add_network(POOL_A, &format!("sandbox-net-{live_sid}"))
+            .add_network(POOL_A, &format!("sandbox-net-{orphan_sid}"));
+
         let live: HashSet<SessionId> = [live_sid].into_iter().collect();
-        let report = reap_orphans(&fake, &live, &permissive_pool()).await;
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
 
         assert_eq!(report.containers_reaped, 1);
         assert_eq!(report.volumes_reaped, 1);
@@ -987,14 +874,13 @@ mod tests {
     #[tokio::test]
     async fn reap_orphans_clean_state_is_no_op() {
         let live_sid = sid("aaaaaaaaaaaa");
-        let fake = FakeDocker {
-            containers: vec![format!("sandbox-{live_sid}")],
-            volumes: vec![format!("sandbox-home-{live_sid}")],
-            networks: vec![format!("sandbox-net-{live_sid}")],
-            ..Default::default()
-        };
+        let fake = FakeDocker::default()
+            .add_container(POOL_A, &format!("sandbox-{live_sid}"))
+            .add_volume(POOL_A, &format!("sandbox-home-{live_sid}"))
+            .add_network(POOL_A, &format!("sandbox-net-{live_sid}"));
+
         let live: HashSet<SessionId> = [live_sid].into_iter().collect();
-        let report = reap_orphans(&fake, &live, &permissive_pool()).await;
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
 
         assert_eq!(report, ReaperReport::default());
         assert!(fake.removed_containers.lock().expect("mutex").is_empty());
@@ -1006,7 +892,7 @@ mod tests {
     async fn reap_orphans_empty_inputs_is_a_noop() {
         let fake = FakeDocker::default();
         let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &permissive_pool()).await;
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
         assert_eq!(report, ReaperReport::default());
     }
 
@@ -1015,21 +901,17 @@ mod tests {
         // Every container name listed is *not* a lite session container
         // — gateway, namespace-foreign, and non-hex suffix entries
         // should all be ignored, leaving the report empty.
-        let fake = FakeDocker {
-            containers: vec![
-                "sandbox-gw-aaaaaaaaaaaa".to_string(),
-                "sandbox-not-hex-here".to_string(),
-                "totally-unrelated".to_string(),
-            ],
-            volumes: vec![
-                "sandbox-home-not-hex".to_string(),
-                "sandbox-other-volume".to_string(),
-            ],
-            networks: vec!["sandbox-net-not-hex".to_string(), "bridge".to_string()],
-            ..Default::default()
-        };
+        let fake = FakeDocker::default()
+            .add_container(POOL_A, "sandbox-gw-aaaaaaaaaaaa")
+            .add_container(POOL_A, "sandbox-not-hex-here")
+            .add_container(POOL_A, "totally-unrelated")
+            .add_volume(POOL_A, "sandbox-home-not-hex")
+            .add_volume(POOL_A, "sandbox-other-volume")
+            .add_network(POOL_A, "sandbox-net-not-hex")
+            .add_network(POOL_A, "bridge");
+
         let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &permissive_pool()).await;
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
         assert_eq!(report, ReaperReport::default());
     }
 
@@ -1037,15 +919,13 @@ mod tests {
     async fn reap_orphans_continues_on_individual_remove_failure() {
         let orphan_a = sid("aaaaaaaaaaaa");
         let orphan_b = sid("bbbbbbbbbbbb");
-        let fake = FakeDocker {
-            containers: vec![format!("sandbox-{orphan_a}"), format!("sandbox-{orphan_b}")],
-            // Make the *first* removal fail; the reaper must still
-            // attempt — and succeed on — the second.
-            fail_remove_container: Some(format!("sandbox-{orphan_a}")),
-            ..Default::default()
-        };
+        let mut fake = FakeDocker::default()
+            .add_container(POOL_A, &format!("sandbox-{orphan_a}"))
+            .add_container(POOL_A, &format!("sandbox-{orphan_b}"));
+        fake.fail_remove_container = Some(format!("sandbox-{orphan_a}"));
+
         let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &permissive_pool()).await;
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
         // Only one of the two reaps succeeded.
         assert_eq!(report.containers_reaped, 1);
         let removed = fake.removed_containers.lock().expect("mutex").clone();
@@ -1055,20 +935,68 @@ mod tests {
     #[tokio::test]
     async fn reap_orphans_continues_on_list_failure_for_one_class() {
         let orphan = sid("aaaaaaaaaaaa");
-        let fake = FakeDocker {
-            // Containers list works.
-            containers: vec![format!("sandbox-{orphan}")],
-            // Volume list fails — must not abort the container or
-            // network passes.
-            fail_list_volumes: true,
-            networks: vec![format!("sandbox-net-{orphan}")],
-            ..Default::default()
-        };
+        let mut fake = FakeDocker::default()
+            .add_container(POOL_A, &format!("sandbox-{orphan}"))
+            .add_network(POOL_A, &format!("sandbox-net-{orphan}"));
+        // Volume list fails — must not abort the container or network passes.
+        fake.fail_list_volumes = true;
+
         let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &permissive_pool()).await;
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
         assert_eq!(report.containers_reaped, 1);
         assert_eq!(report.volumes_reaped, 0);
         assert_eq!(report.networks_reaped, 1);
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_does_not_touch_neighbor_daemon_resources() {
+        // Resources owned by pool B must NOT be reaped when pool A runs its reaper.
+        let orphan_a = sid("aaaaaaaaaaaa");
+        let orphan_b = sid("bbbbbbbbbbbb");
+        let fake = FakeDocker::default()
+            // Pool A: orphan (should be reaped)
+            .add_container(POOL_A, &format!("sandbox-{orphan_a}"))
+            .add_volume(POOL_A, &format!("sandbox-home-{orphan_a}"))
+            .add_network(POOL_A, &format!("sandbox-net-{orphan_a}"))
+            // Pool B: orphan (must NOT be reaped by A's reaper)
+            .add_container(POOL_B, &format!("sandbox-{orphan_b}"))
+            .add_volume(POOL_B, &format!("sandbox-home-{orphan_b}"))
+            .add_network(POOL_B, &format!("sandbox-net-{orphan_b}"));
+
+        let live: HashSet<SessionId> = HashSet::new();
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
+
+        // Only pool A resources were reaped.
+        assert_eq!(report.containers_reaped, 1);
+        assert_eq!(report.volumes_reaped, 1);
+        assert_eq!(report.networks_reaped, 1);
+
+        let removed_containers = fake.removed_containers.lock().expect("mutex").clone();
+        assert!(!removed_containers.contains(&format!("sandbox-{orphan_b}")));
+
+        let removed_volumes = fake.removed_volumes.lock().expect("mutex").clone();
+        assert!(!removed_volumes.contains(&format!("sandbox-home-{orphan_b}")));
+
+        let removed_networks = fake.removed_networks.lock().expect("mutex").clone();
+        assert!(!removed_networks.contains(&format!("sandbox-net-{orphan_b}")));
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_reaps_network_less_orphan_with_label() {
+        // A Stopped session: container + volume present, network gone.
+        // With the owner label, these are still provably ours and reapable.
+        let orphan_sid = sid("cccccccccccc");
+        let fake = FakeDocker::default()
+            .add_container(POOL_A, &format!("sandbox-{orphan_sid}"))
+            .add_volume(POOL_A, &format!("sandbox-home-{orphan_sid}"));
+        // No network entry — the network was already released.
+
+        let live: HashSet<SessionId> = HashSet::new();
+        let report = reap_orphans(&fake, &live, &pool_a()).await;
+
+        assert_eq!(report.containers_reaped, 1);
+        assert_eq!(report.volumes_reaped, 1);
+        assert_eq!(report.networks_reaped, 0);
     }
 
     // -- run_docker_raw stdout parser -------------------------------------
@@ -1092,12 +1020,10 @@ mod tests {
         assert!(parse_one_per_line("\n\n   \n").is_empty());
     }
 
-    // -- Dual-anchor IPAM helpers ------------------------------------------
+    // -- Legacy IPAM helpers (retained for unit test coverage) ------------
 
     #[test]
     fn parse_ipam_subnets_extracts_ipv4_subnets() {
-        // Shape mirrors the real `docker network inspect --format '{{json .IPAM}}'`
-        // output for a single-subnet bridge network.
         let stdout = r#"{"Driver":"default","Options":{},"Config":[{"Subnet":"10.209.0.16/28","Gateway":"10.209.0.17"}]}"#;
         let subnets = parse_ipam_subnets(stdout).expect("parse ok");
         assert_eq!(subnets.len(), 1);
@@ -1107,7 +1033,6 @@ mod tests {
 
     #[test]
     fn parse_ipam_subnets_drops_ipv6_entries() {
-        // Dual-stack network — the gate is IPv4-only by design.
         let stdout =
             r#"{"Driver":"default","Config":[{"Subnet":"10.209.0.32/28"},{"Subnet":"fd00::/64"}]}"#;
         let subnets = parse_ipam_subnets(stdout).expect("parse ok");
@@ -1117,26 +1042,9 @@ mod tests {
 
     #[test]
     fn parse_ipam_subnets_empty_config_returns_empty_vec() {
-        // No `Config` array at all — fail-closed input.
         let stdout = r#"{"Driver":"default","Options":{}}"#;
         let subnets = parse_ipam_subnets(stdout).expect("parse ok");
         assert!(subnets.is_empty());
-    }
-
-    #[test]
-    fn parse_ipam_subnets_ipv6_only_config_returns_empty_vec() {
-        // IPv6-only Config — every entry is dropped by the IPv4 filter,
-        // so the parser returns an empty `Vec<Cidr4>` and the gate
-        // upstream then fails closed. The `integration_reaper_skips_
-        // network_with_missing_ipam` integration test exercises the
-        // same path through real Docker; this hermetic test pins the
-        // parser contract directly.
-        let stdout = r#"{"Driver":"default","Config":[{"Subnet":"fd00::/64"}]}"#;
-        let subnets = parse_ipam_subnets(stdout).expect("parse ok");
-        assert!(
-            subnets.is_empty(),
-            "IPv6-only Config must yield empty IPv4 subnet list (fail-closed end-to-end)"
-        );
     }
 
     #[test]
@@ -1168,130 +1076,5 @@ mod tests {
         let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
         let net = Cidr4::parse("192.168.99.0/24").expect("parse");
         assert!(!ipam_subnets_in_pool(&[net], &pool));
-    }
-
-    #[test]
-    fn ipam_subnets_in_pool_partial_overlap_is_fail_closed() {
-        // `/24` straddles the `/28` pool boundary — base in-pool but
-        // broadcast out. Reaping a half-out-of-pool network would be a
-        // footgun (see module docs).
-        let pool = Cidr4::parse("10.209.0.0/28").expect("parse");
-        let net = Cidr4::parse("10.209.0.0/24").expect("parse");
-        assert!(!ipam_subnets_in_pool(&[net], &pool));
-    }
-
-    #[test]
-    fn ipam_subnets_in_pool_all_or_nothing_across_multi_subnet_network() {
-        let pool = Cidr4::parse("10.209.0.0/20").expect("parse");
-        let in_pool_a = Cidr4::parse("10.209.0.0/28").expect("parse");
-        let in_pool_b = Cidr4::parse("10.209.1.0/28").expect("parse");
-        let out_of_pool = Cidr4::parse("192.168.99.0/28").expect("parse");
-
-        // All inside → in-pool.
-        assert!(ipam_subnets_in_pool(&[in_pool_a, in_pool_b], &pool));
-        // Any outside → not in-pool (fail-closed against partial trust).
-        assert!(!ipam_subnets_in_pool(&[in_pool_a, out_of_pool], &pool));
-    }
-
-    // -- Dual-anchor reaper-end-to-end -------------------------------------
-
-    #[tokio::test]
-    async fn reap_orphans_skips_network_with_out_of_pool_ipam() {
-        let orphan_sid = sid("bbbbbbbbbbbb");
-        let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
-        let mut ipam = HashMap::new();
-        ipam.insert(
-            format!("sandbox-net-{orphan_sid}"),
-            // A second sandboxd's network — same prefix, different
-            // CIDR pool. Must NOT be reaped.
-            FakeIpam::Subnets(vec![Cidr4::parse("192.168.99.0/28").expect("parse")]),
-        );
-        let fake = FakeDocker {
-            containers: vec![format!("sandbox-{orphan_sid}")],
-            volumes: vec![format!("sandbox-home-{orphan_sid}")],
-            networks: vec![format!("sandbox-net-{orphan_sid}")],
-            network_ipam: ipam,
-            ..Default::default()
-        };
-        let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &pool).await;
-
-        assert_eq!(report, ReaperReport::default());
-        // Transitive ownership: container and volume sharing the
-        // out-of-pool network's session id must also be left intact.
-        assert!(fake.removed_containers.lock().expect("mutex").is_empty());
-        assert!(fake.removed_volumes.lock().expect("mutex").is_empty());
-        assert!(fake.removed_networks.lock().expect("mutex").is_empty());
-    }
-
-    #[tokio::test]
-    async fn reap_orphans_reaps_network_with_in_pool_ipam() {
-        let orphan_sid = sid("bbbbbbbbbbbb");
-        let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
-        let mut ipam = HashMap::new();
-        ipam.insert(
-            format!("sandbox-net-{orphan_sid}"),
-            FakeIpam::Subnets(vec![Cidr4::parse("10.209.0.16/28").expect("parse")]),
-        );
-        let fake = FakeDocker {
-            containers: vec![format!("sandbox-{orphan_sid}")],
-            volumes: vec![format!("sandbox-home-{orphan_sid}")],
-            networks: vec![format!("sandbox-net-{orphan_sid}")],
-            network_ipam: ipam,
-            ..Default::default()
-        };
-        let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &pool).await;
-        assert_eq!(report.containers_reaped, 1);
-        assert_eq!(report.volumes_reaped, 1);
-        assert_eq!(report.networks_reaped, 1);
-    }
-
-    #[tokio::test]
-    async fn reap_orphans_skips_network_when_inspect_errors() {
-        // Fail-closed on inspect errors — the network is left alone
-        // (and its container/volume siblings too) so a transient
-        // Docker hiccup does not mass-delete a neighbor's resources.
-        let orphan_sid = sid("bbbbbbbbbbbb");
-        let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
-        let mut ipam = HashMap::new();
-        ipam.insert(format!("sandbox-net-{orphan_sid}"), FakeIpam::InspectErr);
-        let fake = FakeDocker {
-            containers: vec![format!("sandbox-{orphan_sid}")],
-            volumes: vec![format!("sandbox-home-{orphan_sid}")],
-            networks: vec![format!("sandbox-net-{orphan_sid}")],
-            network_ipam: ipam,
-            ..Default::default()
-        };
-        let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &pool).await;
-        assert_eq!(report, ReaperReport::default());
-        assert!(fake.removed_containers.lock().expect("mutex").is_empty());
-        assert!(fake.removed_volumes.lock().expect("mutex").is_empty());
-        assert!(fake.removed_networks.lock().expect("mutex").is_empty());
-    }
-
-    #[tokio::test]
-    async fn reap_orphans_skips_network_with_empty_ipam_data() {
-        // Inspect succeeds but reports no IPv4 subnets (e.g. an
-        // operator-created IPv6-only network coincidentally named
-        // `sandbox-net-{12hex}`). Fail-closed.
-        let orphan_sid = sid("bbbbbbbbbbbb");
-        let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
-        let mut ipam = HashMap::new();
-        ipam.insert(
-            format!("sandbox-net-{orphan_sid}"),
-            FakeIpam::Subnets(vec![]),
-        );
-        let fake = FakeDocker {
-            containers: vec![format!("sandbox-{orphan_sid}")],
-            volumes: vec![format!("sandbox-home-{orphan_sid}")],
-            networks: vec![format!("sandbox-net-{orphan_sid}")],
-            network_ipam: ipam,
-            ..Default::default()
-        };
-        let live: HashSet<SessionId> = HashSet::new();
-        let report = reap_orphans(&fake, &live, &pool).await;
-        assert_eq!(report, ReaperReport::default());
     }
 }

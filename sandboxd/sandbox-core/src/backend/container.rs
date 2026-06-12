@@ -2535,7 +2535,6 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
-            owner_pool: None,
         };
 
         let err = rt
@@ -2572,7 +2571,6 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
-            owner_pool: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_zero).unwrap();
         assert_eq!(mem, 2048, "0 → default_memory_mb");
@@ -2590,7 +2588,6 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
-            owner_pool: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_explicit).unwrap();
         assert_eq!(mem, 4096);
@@ -2612,7 +2609,6 @@ mod tests {
             disk_gb: None,
             no_cache: None,
             operator_identity: None,
-            owner_pool: None,
         };
         let (_mem, cpus) = rt.resource_ceilings(&spec_fractional).unwrap();
         assert!(
@@ -2949,6 +2945,7 @@ mod tests {
             ca_host_path: None,
             ssh_host_dir: None,
             operator_identity: Some((2001, 2002)),
+            owner_pool: None,
         };
         // Choose the effective pair the way `ContainerRuntime::create`
         // does (defaults `1000:1000`).

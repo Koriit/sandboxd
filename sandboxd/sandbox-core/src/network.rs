@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_network_info_fields() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string()).unwrap();
 
         let session_id = SessionId::generate();
 
@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_restore_from_infos() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string()).unwrap();
 
         let id1 = SessionId::generate();
         let id2 = SessionId::generate();
@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_network_info_not_found() {
-        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24, "10.209.0.0/24".to_string()).unwrap();
 
         let result = mgr.network_info(&SessionId::generate()).unwrap();
         assert!(result.is_none());
