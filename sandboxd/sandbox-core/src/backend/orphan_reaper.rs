@@ -188,11 +188,6 @@ pub trait DockerOps: Send + Sync {
     /// `docker network rm <name>`. Same error contract as
     /// [`Self::remove_container`].
     async fn remove_network(&self, name: &str) -> Result<(), SandboxError>;
-
-    // Legacy compatibility — retained so the IPAM unit-test helpers
-    // that call these still compile.  Not used by `reap_orphans`.
-    #[allow(dead_code)]
-    async fn inspect_network_ipam(&self, name: &str) -> Result<Vec<Cidr4>, SandboxError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -303,72 +298,6 @@ impl DockerOps for CliDockerOps {
         }
     }
 
-    async fn inspect_network_ipam(&self, name: &str) -> Result<Vec<Cidr4>, SandboxError> {
-        let stdout = run_docker_raw(
-            &["network", "inspect", name, "--format", "{{json .IPAM}}"],
-            "docker network inspect (orphan reaper IPAM probe)",
-        )
-        .await?;
-        parse_ipam_subnets(&stdout)
-    }
-}
-
-/// Parse the JSON output of `docker network inspect <name> --format
-/// '{{json .IPAM}}'` and extract every IPv4 subnet. Retained for
-/// compatibility with existing IPAM unit tests.
-pub(crate) fn parse_ipam_subnets(stdout: &str) -> Result<Vec<Cidr4>, SandboxError> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-        SandboxError::Gateway(format!(
-            "docker network inspect IPAM JSON parse failed: {e}"
-        ))
-    })?;
-    let mut out = Vec::new();
-    if let Some(configs) = value.get("Config").and_then(|c| c.as_array()) {
-        for entry in configs {
-            let Some(subnet_str) = entry.get("Subnet").and_then(|s| s.as_str()) else {
-                continue;
-            };
-            if subnet_str.contains(':') {
-                continue;
-            }
-            match Cidr4::parse(subnet_str) {
-                Ok(c) => out.push(c),
-                Err(reason) => {
-                    warn!(
-                        subnet = %subnet_str,
-                        reason = %reason,
-                        "orphan reaper: skipping malformed IPv4 subnet in IPAM output"
-                    );
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// True iff the network's IPAM block is fully contained in the
-/// daemon's allocator pool. Retained for compatibility with existing
-/// IPAM unit tests; no longer called by `reap_orphans`.
-#[allow(dead_code)]
-pub(crate) fn ipam_subnets_in_pool(subnets: &[Cidr4], pool: &Cidr4) -> bool {
-    use std::net::Ipv4Addr;
-    if subnets.is_empty() {
-        return false;
-    }
-    subnets.iter().all(|net| {
-        let base_u32 = u32::from(net.base());
-        let host_bits = 32u32 - u32::from(net.prefix_len());
-        let last_u32 = if host_bits == 32 {
-            return false;
-        } else {
-            base_u32.saturating_add((1u32 << host_bits) - 1)
-        };
-        pool.contains(net.base()) && pool.contains(Ipv4Addr::from(last_u32))
-    })
 }
 
 /// `docker <args>` with the standard 60s wall-clock timeout, returning
@@ -613,14 +542,6 @@ mod tests {
         SessionId::parse(hex).expect("valid 12-hex session id")
     }
 
-    /// Permissive pool used by tests that pre-date the owner-label gate.
-    /// `0.0.0.0/0` matches every IPv4 subnet and its canonical string is
-    /// `0.0.0.0/0` — tests that care about the exact pool string should
-    /// use an explicit `pool()` instead.
-    fn permissive_pool() -> Cidr4 {
-        Cidr4::parse("0.0.0.0/0").expect("0.0.0.0/0 parses")
-    }
-
     /// Default pool string used by [`FakeDocker`] tests.
     const POOL_A: &str = "10.209.0.0/20";
     const POOL_B: &str = "10.220.0.0/20";
@@ -715,9 +636,6 @@ mod tests {
                 .expect("mutex")
                 .push(name.to_string());
             Ok(())
-        }
-        async fn inspect_network_ipam(&self, _name: &str) -> Result<Vec<Cidr4>, SandboxError> {
-            Ok(vec![Cidr4::parse("10.209.0.0/28").expect("parse")])
         }
     }
 
@@ -1021,61 +939,4 @@ mod tests {
         assert!(parse_one_per_line("\n\n   \n").is_empty());
     }
 
-    // -- Legacy IPAM helpers (retained for unit test coverage) ------------
-
-    #[test]
-    fn parse_ipam_subnets_extracts_ipv4_subnets() {
-        let stdout = r#"{"Driver":"default","Options":{},"Config":[{"Subnet":"10.209.0.16/28","Gateway":"10.209.0.17"}]}"#;
-        let subnets = parse_ipam_subnets(stdout).expect("parse ok");
-        assert_eq!(subnets.len(), 1);
-        assert_eq!(subnets[0].base().to_string(), "10.209.0.16");
-        assert_eq!(subnets[0].prefix_len(), 28);
-    }
-
-    #[test]
-    fn parse_ipam_subnets_drops_ipv6_entries() {
-        let stdout =
-            r#"{"Driver":"default","Config":[{"Subnet":"10.209.0.32/28"},{"Subnet":"fd00::/64"}]}"#;
-        let subnets = parse_ipam_subnets(stdout).expect("parse ok");
-        assert_eq!(subnets.len(), 1);
-        assert_eq!(subnets[0].base().to_string(), "10.209.0.32");
-    }
-
-    #[test]
-    fn parse_ipam_subnets_empty_config_returns_empty_vec() {
-        let stdout = r#"{"Driver":"default","Options":{}}"#;
-        let subnets = parse_ipam_subnets(stdout).expect("parse ok");
-        assert!(subnets.is_empty());
-    }
-
-    #[test]
-    fn parse_ipam_subnets_empty_input_returns_empty_vec() {
-        assert!(parse_ipam_subnets("").expect("parse ok").is_empty());
-    }
-
-    #[test]
-    fn parse_ipam_subnets_malformed_json_errors() {
-        let stdout = "not json {";
-        assert!(parse_ipam_subnets(stdout).is_err());
-    }
-
-    #[test]
-    fn ipam_subnets_in_pool_empty_subnets_is_fail_closed() {
-        let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
-        assert!(!ipam_subnets_in_pool(&[], &pool));
-    }
-
-    #[test]
-    fn ipam_subnets_in_pool_single_subnet_inside_pool() {
-        let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
-        let net = Cidr4::parse("10.209.0.16/28").expect("parse");
-        assert!(ipam_subnets_in_pool(&[net], &pool));
-    }
-
-    #[test]
-    fn ipam_subnets_in_pool_single_subnet_outside_pool() {
-        let pool = Cidr4::parse("10.209.0.0/24").expect("parse");
-        let net = Cidr4::parse("192.168.99.0/24").expect("parse");
-        assert!(!ipam_subnets_in_pool(&[net], &pool));
-    }
 }

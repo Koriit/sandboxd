@@ -312,6 +312,60 @@ pub struct LimaReaperReport {
     pub op_uids_scanned: u32,
 }
 
+/// Decision produced by [`decide_lima_vm`] for a single VM entry.
+///
+/// Extracted into its own type so the classification logic can be unit-tested
+/// independently of the I/O that executes the decision (delete_vm, logging).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimaVmDecision {
+    /// VM should be reaped: orphaned (not in live set) and owned by this daemon.
+    Reap,
+    /// VM is in the live set — skip unconditionally.
+    SkipLive,
+    /// VM has no parseable session id (e.g. base image `sandbox-base`) — skip.
+    SkipNoSessionId,
+    /// VM's owner marker belongs to a different daemon pool — skip to avoid
+    /// cross-daemon reaping in a shared-LIMA_HOME edge case.
+    SkipForeignMarker { marker_pool: String },
+}
+
+/// Classify a single Lima VM for the orphan reaper.
+///
+/// Pure function over `(session_id, marker, live, my_pool)` with no I/O.
+/// Extracted from [`reap_lima_orphans`] so the classification logic can be
+/// tested without a real Lima helper, real VMs, or real registry.
+///
+/// Decision rules (in priority order):
+/// 1. `session_id` is `None` → [`LimaVmDecision::SkipNoSessionId`]
+///    (base image VMs whose names don't parse as 12-hex).
+/// 2. `session_id` is in `live` → [`LimaVmDecision::SkipLive`].
+/// 3. `marker` is `Some(pool)` and `pool != my_pool` →
+///    [`LimaVmDecision::SkipForeignMarker`]
+///    (shared-LIMA_HOME defense: a VM belonging to another daemon).
+/// 4. Otherwise (marker matches my_pool, or marker is absent for a legacy VM
+///    within the daemon's own LIMA_HOME tree) → [`LimaVmDecision::Reap`].
+pub fn decide_lima_vm(
+    session_id: Option<&crate::session::SessionId>,
+    marker: Option<&str>,
+    live: &std::collections::HashSet<crate::session::SessionId>,
+    my_pool: &str,
+) -> LimaVmDecision {
+    let Some(sid) = session_id else {
+        return LimaVmDecision::SkipNoSessionId;
+    };
+    if live.contains(sid) {
+        return LimaVmDecision::SkipLive;
+    }
+    if let Some(pool) = marker {
+        if pool != my_pool {
+            return LimaVmDecision::SkipForeignMarker {
+                marker_pool: pool.to_string(),
+            };
+        }
+    }
+    LimaVmDecision::Reap
+}
+
 /// Enumerate and reap orphaned Lima VMs at daemon startup.
 ///
 /// This runs AFTER `reconcile()` (which is state-only) and parallel to
@@ -322,10 +376,7 @@ pub struct LimaReaperReport {
 /// Algorithm:
 /// 1. Enumerate op_uids from the daemon-owned FS tree (not from session rows).
 /// 2. For each op_uid: `registry.get_or_create(op_uid)` → `mgr.list_vms()`.
-/// 3. For each VM whose session_id is NOT in `live`:
-///    - Read the owner marker via the helper (post-pivot read).
-///    - If marker == my pool OR marker absent: reap.
-///    - If marker present but != my pool: skip (foreign VM in shared LIMA_HOME).
+/// 3. For each VM: classify via [`decide_lima_vm`], then execute the decision.
 /// 4. Best-effort and idempotent: per-VM and per-operator errors log at `warn!`
 ///    and continue.
 pub fn reap_lima_orphans(
@@ -338,6 +389,13 @@ pub fn reap_lima_orphans(
 
     for op_uid in op_uids {
         report.op_uids_scanned += 1;
+        // `get_or_create` runs `ensure_operator_lima_home` (mkdir +
+        // setfacl shell-out, ~10 s timeout) on the first call for this uid.
+        // For uids found on disk but no longer in passwd (deleted operator)
+        // this resolves in a fast NSS lookup error before touching the FS.
+        // A future improvement: expose a read-only list_vms path that skips
+        // provisioning for the reap sweep. For now, the startup cost is
+        // bounded by the number of historical operator uids on disk.
         let mgr = match registry.get_or_create(op_uid) {
             Ok(m) => m,
             Err(e) => {
@@ -363,62 +421,54 @@ pub fn reap_lima_orphans(
         };
 
         for vm in &vms {
-            let Some(sid) = vm.session_id else {
-                // No session id parseable from name (e.g. base VM `sandbox-base`).
-                // The base VM is naturally protected because `sandbox-base` doesn't
-                // parse as 12-hex — `list_vms` still includes it but session_id is None.
-                continue;
-            };
+            // Only read the owner marker if we have a session_id — the base
+            // VM has no parseable sid and its marker is irrelevant.
+            let marker = vm.session_id.as_ref().and_then(|sid| mgr.read_owner_marker(sid));
+            let decision = decide_lima_vm(
+                vm.session_id.as_ref(),
+                marker.as_deref(),
+                live,
+                my_pool,
+            );
 
-            if live.contains(&sid) {
-                report.vms_skipped_live += 1;
-                continue;
-            }
-
-            // VM is not live. Check the owner marker before reaping.
-            let marker = mgr.read_owner_marker(&sid);
-            match marker.as_deref() {
-                Some(pool) if pool != my_pool => {
-                    // Marker present but belongs to a different daemon.
-                    // Normal deployments never hit this (each daemon has its
-                    // own LIMA_HOME tree), but guard against a shared-LIMA_HOME
-                    // edge case.
+            match decision {
+                LimaVmDecision::SkipNoSessionId => {}
+                LimaVmDecision::SkipLive => {
+                    report.vms_skipped_live += 1;
+                }
+                LimaVmDecision::SkipForeignMarker { ref marker_pool } => {
                     tracing::info!(
                         op_uid,
                         vm = %vm.name,
-                        session_id = %sid,
-                        marker_pool = %pool,
+                        marker_pool = %marker_pool,
                         "lima orphan reaper: VM marker belongs to a different daemon pool; skipping"
                     );
                     report.vms_skipped_foreign += 1;
-                    continue;
                 }
-                _ => {
-                    // Marker present and matches my pool → reap.
-                    // Marker absent → legacy VM in my own LIMA_HOME tree;
-                    // name + live-set scoping is sufficient.
-                }
-            }
-
-            // Reap the VM.
-            match mgr.delete_vm(&sid) {
-                Ok(()) => {
-                    tracing::info!(
-                        op_uid,
-                        vm = %vm.name,
-                        session_id = %sid,
-                        "lima orphan reaper: removed VM with no owning session"
-                    );
-                    report.vms_reaped += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        op_uid,
-                        vm = %vm.name,
-                        session_id = %sid,
-                        error = %e,
-                        "lima orphan reaper: failed to delete VM; continuing"
-                    );
+                LimaVmDecision::Reap => {
+                    // session_id is guaranteed Some here because SkipNoSessionId
+                    // is the only None branch and we matched on Reap.
+                    let sid = vm.session_id.expect("Reap decision requires Some(session_id)");
+                    match mgr.delete_vm(&sid) {
+                        Ok(()) => {
+                            tracing::info!(
+                                op_uid,
+                                vm = %vm.name,
+                                session_id = %sid,
+                                "lima orphan reaper: removed VM with no owning session"
+                            );
+                            report.vms_reaped += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                op_uid,
+                                vm = %vm.name,
+                                session_id = %sid,
+                                error = %e,
+                                "lima orphan reaper: failed to delete VM; continuing"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -4933,5 +4983,95 @@ mod tests {
 
         assert!(!uids.contains(&0), "uid 0 must be excluded");
         assert!(uids.contains(&1001), "uid 1001 must be included");
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_lima_vm tests — pure classification logic, no I/O
+    // -----------------------------------------------------------------------
+
+    fn test_sid(hex: &str) -> SessionId {
+        SessionId::parse(hex).expect("12-hex session id")
+    }
+
+    fn test_live(sids: &[&str]) -> std::collections::HashSet<SessionId> {
+        sids.iter().map(|s| test_sid(s)).collect()
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_no_session_id() {
+        // Base image VMs have session_id == None.
+        let live = test_live(&[]);
+        assert_eq!(
+            decide_lima_vm(None, None, &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipNoSessionId
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_live_session() {
+        let sid = test_sid("aabbccddeeff");
+        let live = test_live(&["aabbccddeeff"]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.209.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipLive
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_live_session_regardless_of_marker() {
+        // A live session is never reaped, even if marker is absent.
+        let sid = test_sid("aabbccddeeff");
+        let live = test_live(&["aabbccddeeff"]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), None, &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipLive
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_reaps_orphan_with_matching_marker() {
+        let sid = test_sid("112233445566");
+        let live = test_live(&[]); // not in live set
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.209.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::Reap
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_reaps_orphan_with_absent_marker() {
+        // Absent marker = legacy VM in our own LIMA_HOME. Name + live-set
+        // scoping is sufficient: still ours to reap.
+        let sid = test_sid("112233445566");
+        let live = test_live(&[]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), None, &live, "10.209.0.0/20"),
+            LimaVmDecision::Reap
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_skips_foreign_marker() {
+        // Marker present and != my_pool → belongs to a different daemon.
+        // Do NOT reap even though the session is absent from our live set.
+        let sid = test_sid("112233445566");
+        let live = test_live(&[]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.220.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipForeignMarker {
+                marker_pool: "10.220.0.0/20".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decide_lima_vm_live_takes_priority_over_foreign_marker() {
+        // If a session is live, it's skipped before the marker is even checked.
+        let sid = test_sid("aabbccddeeff");
+        let live = test_live(&["aabbccddeeff"]);
+        assert_eq!(
+            decide_lima_vm(Some(&sid), Some("10.220.0.0/20"), &live, "10.209.0.0/20"),
+            LimaVmDecision::SkipLive
+        );
     }
 }

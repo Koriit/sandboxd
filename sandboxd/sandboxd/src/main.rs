@@ -2041,6 +2041,8 @@ async fn create_session(
             let runtime = runtime_for(&*$state, backend_kind);
             let handle = RuntimeHandle::from_session_id(&$session_id);
             // Best-effort container+volume removal before network teardown.
+            // On early-failure paths (e.g. IP parse, CA key gen) no container
+            // or VM has been created yet, so this is an intentional no-op.
             let _ = runtime.delete(&handle, operator.uid).await;
             let network = $state.network.clone();
             let base_dir = $state.base_dir.clone();
@@ -8838,6 +8840,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dual-anchor model.
     {
         let docker_ops = CliDockerOps;
+        // `let _ =` is intentional: ReaperReport is logged inside reap_orphans.
         let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
     }
 
@@ -8855,6 +8858,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allocation_pool.base(),
             allocation_pool.prefix_len()
         );
+        // `let _ =` is intentional: LimaReaperReport is logged inside
+        // reap_lima_orphans; the outer spawn_blocking result is discarded
+        // because a join-error here (thread panics) should not abort startup.
         let _ = tokio::task::spawn_blocking({
             let registry = lima_registry.clone();
             let live = live_session_ids.clone();
