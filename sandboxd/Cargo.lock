@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-cli"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "chrono",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "base64",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-event-emitter"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "serde",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guest"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "sandbox-core",
  "serde",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-lima-helper"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "caps",
  "libc",
@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-nft-allow-logger"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "clap",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-nft-deny-logger"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "clap",
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-route-helper"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "caps",
  "chrono",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxd"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-stream",
  "axum",
