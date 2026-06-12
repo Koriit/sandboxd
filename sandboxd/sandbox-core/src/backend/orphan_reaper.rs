@@ -25,7 +25,7 @@
 //! reconciler (which owns `sandbox-gw-*`) and any operator-created
 //! resources outside the sandbox namespace untouched.
 //!
-//! # Owner-label ownership model
+//! # Owner-label ownership model (primary coexistence anchor)
 //!
 //! Every Docker resource created by this daemon carries a
 //! `sandboxd.owner=<pool-cidr>` label (e.g. `sandboxd.owner=10.209.0.0/20`).
@@ -38,7 +38,8 @@
 //! This label is the primary ownership anchor: it survives network
 //! teardown, so a Stopped session's container and home volume (whose
 //! `sandbox-net-{id}` has been released) remain attributable and are
-//! correctly protected by the live-set or reaped as orphans.
+//! correctly protected by the live-set or reaped as orphans. See
+//! `docs/concepts/networking.md` for the full coexistence prose.
 //!
 //! # Delete order
 //!
