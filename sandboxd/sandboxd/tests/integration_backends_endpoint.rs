@@ -32,6 +32,7 @@ async fn integration_backends_endpoint_lists_registered_backends_in_stable_order
     let registry = Arc::new(LimaManagerRegistry::new(
         DEFAULT_BASE_VM_NAME.to_string(),
         std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        "test-pool".to_string(),
     ));
     let lima = LimaRuntime::new(registry);
 

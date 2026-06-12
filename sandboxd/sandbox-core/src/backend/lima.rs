@@ -603,6 +603,7 @@ mod tests {
         let registry = Arc::new(crate::lima::LimaManagerRegistry::new(
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
         ));
         LimaRuntime::new(registry)
     }
@@ -753,6 +754,7 @@ mod tests {
         let registry = Arc::new(crate::lima::LimaManagerRegistry::new(
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
             helper.clone(),
+            "test-pool".to_string(),
         ));
         let rt = LimaRuntime::new(Arc::clone(&registry));
         assert!(

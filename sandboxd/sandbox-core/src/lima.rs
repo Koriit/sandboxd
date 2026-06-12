@@ -36,6 +36,10 @@ const DELETE_VM_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for `limactl list`.
 const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Timeout for the `read-owner-marker` helper subcommand. This is a simple
+/// file read — no limactl invocation, no network, no long-running process.
+const READ_OWNER_MARKER_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Timeout for `limactl create` when building the base image. The base
 /// image build path downloads the Ubuntu 24.04 cloud-image qcow2
 /// (`ubuntu-24.04-server-cloudimg-amd64.img`, ~580 MiB) on first use.
@@ -345,6 +349,12 @@ pub struct LimaManagerRegistry {
     helper_path: PathBuf,
     /// Golden-image base VM name shared across all per-operator managers.
     base_vm_name: String,
+    /// Canonical pool CIDR string (`<base>/<prefix>`) stamped as
+    /// `sandboxd.owner=<pool>` via the `--owner` flag on `create`/`clone`
+    /// helper calls. The marker is written into each VM's instance dir so
+    /// the Lima orphan reaper can attribute VMs to this daemon. Shared
+    /// across all per-operator managers (same daemon = same pool).
+    owner_pool: String,
     /// Provisioning function: creates the per-operator LIMA_HOME directory
     /// and applies the POSIX ACL.  Production wiring uses
     /// `ensure_operator_lima_home`; tests inject a closure that provisions
@@ -364,11 +374,15 @@ impl LimaManagerRegistry {
     /// at daemon startup by `resolve_lima_helper_path()`.
     ///
     /// `base_vm_name` is the Lima instance name for the golden base image.
-    pub fn new(base_vm_name: String, helper_path: PathBuf) -> Self {
+    ///
+    /// `owner_pool` is the canonical pool CIDR string stamped via `--owner`
+    /// on every `create`/`clone` helper call.
+    pub fn new(base_vm_name: String, helper_path: PathBuf, owner_pool: String) -> Self {
         Self {
             managers: Mutex::new(HashMap::new()),
             helper_path,
             base_vm_name,
+            owner_pool,
             provision_lima_home: Box::new(ensure_operator_lima_home),
         }
     }
@@ -382,7 +396,7 @@ impl LimaManagerRegistry {
     /// Production code uses [`Self::new`].  Tests inject a closure that
     /// provisions into a caller-owned tmpdir so registry unit tests remain
     /// hermetic and do not touch `/var/lib/sandboxd/`.
-    pub fn new_with_provisioner<F>(base_vm_name: String, helper_path: PathBuf, provision: F) -> Self
+    pub fn new_with_provisioner<F>(base_vm_name: String, helper_path: PathBuf, owner_pool: String, provision: F) -> Self
     where
         F: Fn(u32) -> Result<PathBuf, SandboxError> + Send + Sync + 'static,
     {
@@ -390,6 +404,7 @@ impl LimaManagerRegistry {
             managers: Mutex::new(HashMap::new()),
             helper_path,
             base_vm_name,
+            owner_pool,
             provision_lima_home: Box::new(provision),
         }
     }
@@ -440,6 +455,7 @@ impl LimaManagerRegistry {
             self.helper_path.clone(),
             op_uid,
             self.base_vm_name.clone(),
+            self.owner_pool.clone(),
         ));
 
         // Re-lock and insert, using entry().or_insert_with so that a
@@ -645,6 +661,12 @@ pub struct LimaManager {
     /// and test daemons don't collide on a single user-global Lima
     /// instance.
     base_vm_name: String,
+    /// Canonical pool CIDR string (`<base>/<prefix>`) passed as `--owner`
+    /// to every `create` and `clone` helper invocation so the helper writes
+    /// `{lima_home}{vm}/sandboxd-owner` after a successful limactl run.
+    /// The Lima orphan reaper reads this marker to attribute VMs to this
+    /// daemon without relying on LIMA_HOME isolation alone.
+    owner_pool: String,
     /// Serialises concurrent `build_base_image` calls for this operator.
     /// A single `Arc<LimaManager>` is shared across all callers for the
     /// same operator (vended by `LimaManagerRegistry`), so two concurrent
@@ -669,12 +691,19 @@ impl LimaManager {
     /// `base_vm_name` is the Lima instance name for the golden base image
     /// this manager owns. Production callers pass the validated value of
     /// `SANDBOX_BASE_VM_NAME`; tests typically pass [`DEFAULT_BASE_VM_NAME`].
-    pub fn new(base_dir: PathBuf, helper_path: PathBuf, op_uid: u32, base_vm_name: String) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        helper_path: PathBuf,
+        op_uid: u32,
+        base_vm_name: String,
+        owner_pool: String,
+    ) -> Self {
         Self {
             base_dir,
             helper_path,
             op_uid,
             base_vm_name,
+            owner_pool,
             build_lock: std::sync::Mutex::new(()),
         }
     }
@@ -693,6 +722,7 @@ impl LimaManager {
             helper_path,
             op_uid,
             base_vm_name,
+            owner_pool: "test-pool".to_string(),
             build_lock: std::sync::Mutex::new(()),
         }
     }
@@ -849,7 +879,14 @@ impl LimaManager {
 
         let result = self.run_helper(
             "create",
-            &["--vm", &vm_name, "--yaml", &template_str],
+            &[
+                "--vm",
+                &vm_name,
+                "--yaml",
+                &template_str,
+                "--owner",
+                &self.owner_pool,
+            ],
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create",
         );
@@ -900,7 +937,14 @@ impl LimaManager {
 
         let result = self.run_helper(
             "create",
-            &["--vm", &vm_name, "--yaml", &staged_str],
+            &[
+                "--vm",
+                &vm_name,
+                "--yaml",
+                &staged_str,
+                "--owner",
+                &self.owner_pool,
+            ],
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create (custom template)",
         );
@@ -1040,6 +1084,44 @@ impl LimaManager {
 
         info!(session_id = %session_id, vm = %vm_name, "VM deleted");
         Ok(())
+    }
+
+    /// Read the owner marker for a VM and return the pool CIDR string, or
+    /// `None` if the marker is absent (legacy VM created before this feature).
+    ///
+    /// The marker file (`{lima_home}{vm}/sandboxd-owner`) lives inside the
+    /// operator-owned 0700 instance directory. The daemon cannot read it
+    /// directly — this method goes through the helper's `read-owner-marker`
+    /// subcommand, which runs post-pivot as the operator uid.
+    ///
+    /// Returns `None` on non-zero exit (absent marker or I/O error) or empty
+    /// stdout. The Lima orphan reaper treats `None` as "legacy, fall back to
+    /// name + live-set scoping within this daemon's own LIMA_HOME."
+    pub fn read_owner_marker(&self, session_id: &SessionId) -> Option<String> {
+        let vm_name = vm_name(session_id);
+        let output = match self.run_helper(
+            "read-owner-marker",
+            &["--vm", &vm_name],
+            READ_OWNER_MARKER_TIMEOUT,
+            "sandbox-lima-helper read-owner-marker",
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    vm = %vm_name,
+                    error = %e,
+                    "read_owner_marker: helper invocation failed"
+                );
+                return None;
+            }
+        };
+        if !output.status.success() {
+            // Non-zero exit: absent marker (expected for legacy VMs).
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
     }
 
     /// Best-effort cleanup of a partial Lima instance directory.
@@ -1344,7 +1426,14 @@ impl LimaManager {
         info!("creating base VM");
         let output = self.run_helper(
             "create",
-            &["--vm", &self.base_vm_name, "--yaml", &template_str],
+            &[
+                "--vm",
+                &self.base_vm_name,
+                "--yaml",
+                &template_str,
+                "--owner",
+                &self.owner_pool,
+            ],
             BASE_CREATE_TIMEOUT,
             "sandbox-lima-helper create (base image)",
         )?;
@@ -1567,6 +1656,8 @@ impl LimaManager {
                     &memory_gib_s,
                     "--disk",
                     &disk_s,
+                    "--owner",
+                    &self.owner_pool,
                 ],
                 CLONE_VM_TIMEOUT,
                 "sandbox-lima-helper clone",
@@ -4370,6 +4461,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4390,6 +4482,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4412,6 +4505,7 @@ mod tests {
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4457,6 +4551,7 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -4509,6 +4604,7 @@ mod tests {
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
             PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },

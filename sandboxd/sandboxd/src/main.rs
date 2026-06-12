@@ -8636,7 +8636,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the per-operator LimaManager registry. One LimaManager per
     // operator uid, created lazily on first session-create. All limactl
     // operations go through sandbox-lima-helper (pivoted to operator uid).
-    let lima_registry = Arc::new(LimaManagerRegistry::new(base_vm_name, lima_helper_path));
+    let lima_registry = Arc::new(LimaManagerRegistry::new(
+        base_vm_name,
+        lima_helper_path,
+        format!("{}/{}", allocation_pool.base(), allocation_pool.prefix_len()),
+    ));
 
     // Build the Lima runtime backed by the registry and register it in
     // the backend dispatch table. The same Arc<LimaRuntime> is held both

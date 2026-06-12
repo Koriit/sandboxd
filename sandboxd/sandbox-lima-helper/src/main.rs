@@ -8,9 +8,9 @@
 //! sandbox-lima-helper <subcommand> [flags...]
 //! ```
 //!
-//! Eleven subcommands: `create`, `start`, `clone`, `stop`, `delete`,
+//! Twelve subcommands: `create`, `start`, `clone`, `stop`, `delete`,
 //! `copy`, `guest-socat`, `install-guest-agent`, `list-json`,
-//! `read-user-key`, `run-rsync`. Every
+//! `read-user-key`, `run-rsync`, `read-owner-marker`. Every
 //! flag the helper passes to limactl is hardcoded per subcommand;
 //! the daemon contributes only the typed flag values (no pass-through).
 //!
@@ -179,6 +179,10 @@ static BRIDGE_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_\-]{1,15}$").unwrap());
 static VM_MAC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$").unwrap());
+/// CIDR string charset: digits, dots, slashes only, 1-18 chars.
+/// Further validated structurally in `validate_cidr_owner`.
+static CIDR_CHARSET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9./]{1,18}$").unwrap());
 
 // ---------------------------------------------------------------------------
 // test-env-override seams
@@ -256,6 +260,11 @@ struct CreateArgs {
     op_uid: u32,
     vm: String,
     yaml: String,
+    /// Pool CIDR written to `{lima_home}{vm}/sandboxd-owner` after limactl
+    /// create succeeds. Required so the Lima orphan reaper can attribute the
+    /// VM to this daemon. Validated as a CIDR string (charset + parse) before
+    /// the privilege pivot; written post-pivot as the operator uid.
+    owner: String,
 }
 
 struct StartArgs {
@@ -277,6 +286,9 @@ struct CloneArgs {
     cpus: u32,
     memory_gib: u32,
     disk_gib: u32,
+    /// Pool CIDR written to `{lima_home}{vm}/sandboxd-owner` after limactl
+    /// clone succeeds. Same contract as `CreateArgs::owner`.
+    owner: String,
 }
 
 struct StopArgs {
@@ -314,6 +326,17 @@ struct ReadUserKeyArgs {
     op_uid: u32,
 }
 
+/// Arguments for the `read-owner-marker` subcommand.
+///
+/// Reads `{lima_home}{vm}/sandboxd-owner` post-pivot and writes its contents
+/// to stdout. The daemon calls this to check ownership before reaping an
+/// orphaned Lima VM — the daemon cannot read the operator-owned 0700 instance
+/// directory directly.
+struct ReadOwnerMarkerArgs {
+    op_uid: u32,
+    vm: String,
+}
+
 /// Arguments for the `run-rsync` subcommand.
 ///
 /// The daemon calls this after pivoting to the operator uid so rsync
@@ -346,6 +369,7 @@ enum Subcommand {
     ListJson(ListJsonArgs),
     ReadUserKey(ReadUserKeyArgs),
     RunRsync(RunRsyncArgs),
+    ReadOwnerMarker(ReadOwnerMarkerArgs),
 }
 
 impl Subcommand {
@@ -362,6 +386,7 @@ impl Subcommand {
             Subcommand::ListJson(a) => a.op_uid,
             Subcommand::ReadUserKey(a) => a.op_uid,
             Subcommand::RunRsync(a) => a.op_uid,
+            Subcommand::ReadOwnerMarker(a) => a.op_uid,
         }
     }
 }
@@ -500,8 +525,9 @@ fn run() -> ExitCode {
     // require a usable limactl at this point.
     let limactl_path = if matches!(
         subcommand,
-        Subcommand::ReadUserKey(_) | Subcommand::RunRsync(_)
+        Subcommand::ReadUserKey(_) | Subcommand::RunRsync(_) | Subcommand::ReadOwnerMarker(_)
     ) {
+        // These subcommands read/write files directly and do not exec limactl.
         String::new()
     } else {
         match resolve_limactl_path(&pw_dir) {
@@ -546,13 +572,27 @@ fn run() -> ExitCode {
     unsafe { libc::umask(0o077) };
 
     // Step 11 — exec (or step-sequence for install-guest-agent,
-    // stdout-write for read-user-key, or execvpe-rsync for run-rsync).
+    // stdout-write for read-user-key, or execvpe-rsync for run-rsync,
+    // run-then-write for create/clone, or file-read for read-owner-marker).
     match &subcommand {
         Subcommand::InstallGuestAgent(a) => {
             run_install_guest_agent(&limactl_path, &a.vm, &env_block)
         }
         Subcommand::ReadUserKey(_) => run_read_user_key(op_uid_raw, &lima_home),
         Subcommand::RunRsync(a) => run_rsync(a, &env_block),
+        Subcommand::ReadOwnerMarker(a) => run_read_owner_marker(op_uid_raw, &lima_home, &a.vm),
+        // Create and Clone: run limactl as a child (not execvpe-replace) then
+        // write the owner marker on success. This is a deliberate departure
+        // from the other subcommands that exec_limactl; it mirrors the
+        // install-guest-agent precedent which also sequences steps rather than
+        // execvpe-replacing the process. The exec approach cannot be used here
+        // because a post-exec file write is impossible after process replacement.
+        Subcommand::Create(a) => {
+            run_create_with_marker(&limactl_path, a, &lima_home, &env_block)
+        }
+        Subcommand::Clone(a) => {
+            run_clone_with_marker(&limactl_path, a, &lima_home, &env_block)
+        }
         _ => exec_limactl(&limactl_path, &subcommand, &env_block),
     }
 }
@@ -581,6 +621,7 @@ fn parse_argv(args: &[OsString]) -> Result<Subcommand, String> {
         "list-json" => parse_list_json(&args[2..]),
         "read-user-key" => parse_read_user_key(&args[2..]),
         "run-rsync" => parse_run_rsync(&args[2..]),
+        "read-owner-marker" => parse_read_owner_marker(&args[2..]),
         other => Err(format!("unknown subcommand: {other}")),
     }
 }
@@ -728,10 +769,16 @@ fn parse_create(args: &[OsString]) -> Result<Subcommand, String> {
     let op_uid_s = require_flag("--op-uid", f.take_string("--op-uid")?)?;
     let vm = require_flag("--vm", f.take_string("--vm")?)?;
     let yaml = require_flag("--yaml", f.take_string("--yaml")?)?;
+    let owner = require_flag("--owner", f.take_string("--owner")?)?;
     f.check_no_extra()?;
 
     let op_uid = parse_u32("--op-uid", &op_uid_s)?;
-    Ok(Subcommand::Create(CreateArgs { op_uid, vm, yaml }))
+    Ok(Subcommand::Create(CreateArgs {
+        op_uid,
+        vm,
+        yaml,
+        owner,
+    }))
 }
 
 // --- start ---
@@ -776,6 +823,7 @@ fn parse_clone(args: &[OsString]) -> Result<Subcommand, String> {
     let cpus_s = require_flag("--cpus", f.take_string("--cpus")?)?;
     let memory_s = require_flag("--memory", f.take_string("--memory")?)?;
     let disk_s = require_flag("--disk", f.take_string("--disk")?)?;
+    let owner = require_flag("--owner", f.take_string("--owner")?)?;
     f.check_no_extra()?;
 
     let op_uid = parse_u32("--op-uid", &op_uid_s)?;
@@ -789,6 +837,7 @@ fn parse_clone(args: &[OsString]) -> Result<Subcommand, String> {
         cpus,
         memory_gib,
         disk_gib,
+        owner,
     }))
 }
 
@@ -879,6 +928,18 @@ fn parse_read_user_key(args: &[OsString]) -> Result<Subcommand, String> {
     Ok(Subcommand::ReadUserKey(ReadUserKeyArgs { op_uid }))
 }
 
+// --- read-owner-marker ---
+
+fn parse_read_owner_marker(args: &[OsString]) -> Result<Subcommand, String> {
+    let mut f = FlagSet::new(args);
+    let op_uid_s = require_flag("--op-uid", f.take_string("--op-uid")?)?;
+    let vm = require_flag("--vm", f.take_string("--vm")?)?;
+    f.check_no_extra()?;
+
+    let op_uid = parse_u32("--op-uid", &op_uid_s)?;
+    Ok(Subcommand::ReadOwnerMarker(ReadOwnerMarkerArgs { op_uid, vm }))
+}
+
 // --- run-rsync ---
 
 fn parse_run_rsync(args: &[OsString]) -> Result<Subcommand, String> {
@@ -914,6 +975,7 @@ fn validate_subcommand(sub: &Subcommand) -> Result<(), (u8, String)> {
         Subcommand::Create(a) => {
             validate_vm_name(&a.vm)?;
             validate_path_arg("--yaml", &a.yaml)?;
+            validate_cidr_owner("--owner", &a.owner)?;
         }
         Subcommand::Start(a) => {
             validate_vm_name(&a.vm)?;
@@ -930,6 +992,7 @@ fn validate_subcommand(sub: &Subcommand) -> Result<(), (u8, String)> {
             validate_range("--cpus", a.cpus, 1, 64)?;
             validate_range("--memory", a.memory_gib, 1, 256)?;
             validate_range("--disk", a.disk_gib, 1, 1024)?;
+            validate_cidr_owner("--owner", &a.owner)?;
         }
         Subcommand::Stop(a) => {
             validate_vm_name(&a.vm)?;
@@ -951,6 +1014,9 @@ fn validate_subcommand(sub: &Subcommand) -> Result<(), (u8, String)> {
         }
         Subcommand::ReadUserKey(_) => {
             // No path/vm validation needed.
+        }
+        Subcommand::ReadOwnerMarker(a) => {
+            validate_vm_name(&a.vm)?;
         }
         Subcommand::RunRsync(a) => {
             validate_run_rsync_args(a)?;
@@ -1057,6 +1123,66 @@ pub fn validate_path_arg(flag: &str, path: &str) -> Result<(), (u8, String)> {
             return Err((
                 EXIT_BAD_ARGS,
                 format!("invalid path arg: {flag} must not contain '..' components"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a pool CIDR string supplied as `--owner <cidr>`.
+///
+/// Two-stage check:
+/// 1. Charset: only `[0-9./]`, length 1-18 — rejects newlines, NUL,
+///    shell metacharacters, and any byte that could escape from the
+///    marker file.
+/// 2. Structural: must be exactly `<dotted-quad>/<prefix>` where the
+///    prefix is an integer 0-32.
+///
+/// The CIDR value is written as-is into `{lima_home}{vm}/sandboxd-owner`
+/// (mode 0600), so constraining it to the CIDR charset prevents any
+/// injection into the file contents.
+pub fn validate_cidr_owner(flag: &str, value: &str) -> Result<(), (u8, String)> {
+    if !CIDR_CHARSET_RE.is_match(value) {
+        return Err((
+            EXIT_BAD_ARGS,
+            format!(
+                "invalid {flag} value '{value}': must be a CIDR string (digits, dots, \
+                 slashes only, ≤18 chars)"
+            ),
+        ));
+    }
+    // Structural parse: exactly one slash, dotted-quad before, prefix 0-32 after.
+    let Some((addr_part, prefix_part)) = value.split_once('/') else {
+        return Err((
+            EXIT_BAD_ARGS,
+            format!("invalid {flag} value '{value}': missing '/' (expected a.b.c.d/n)"),
+        ));
+    };
+    // Validate IPv4 address (four octets, each 0-255).
+    let octets: Vec<&str> = addr_part.split('.').collect();
+    if octets.len() != 4
+        || octets
+            .iter()
+            .any(|o| o.parse::<u8>().is_err() || o.is_empty())
+    {
+        return Err((
+            EXIT_BAD_ARGS,
+            format!(
+                "invalid {flag} value '{value}': address part '{addr_part}' is not a \
+                 valid IPv4 dotted-quad"
+            ),
+        ));
+    }
+    // Validate prefix length.
+    match prefix_part.parse::<u8>() {
+        Ok(p) if p <= 32 => {}
+        _ => {
+            return Err((
+                EXIT_BAD_ARGS,
+                format!(
+                    "invalid {flag} value '{value}': prefix '{prefix_part}' is not \
+                     an integer 0-32"
+                ),
             ));
         }
     }
@@ -1601,17 +1727,41 @@ fn exec_limactl(limactl: &str, sub: &Subcommand, env_block: &[CString]) -> ExitC
     ExitCode::from(EXIT_GENERIC)
 }
 
+/// Build the create argv for `run_create_with_marker` (no `--owner`; that is
+/// consumed by the helper, not passed to limactl).
+fn build_create_argv(limactl: &str, a: &CreateArgs) -> Vec<String> {
+    vec![
+        limactl.to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        a.vm.clone(),
+        a.yaml.clone(),
+        "--tty=false".to_string(),
+    ]
+}
+
+/// Build the clone argv for `run_clone_with_marker`.
+fn build_clone_argv(limactl: &str, a: &CloneArgs) -> Vec<String> {
+    vec![
+        limactl.to_string(),
+        "clone".to_string(),
+        a.base.clone(),
+        a.vm.clone(),
+        format!("--cpus={}", a.cpus),
+        format!("--memory={}", a.memory_gib),
+        format!("--disk={}", a.disk_gib),
+        "--tty=false".to_string(),
+    ]
+}
+
 /// Build the limactl argv (argv[0] is the limactl path itself).
+/// Create and Clone are excluded — they go through run_create_with_marker /
+/// run_clone_with_marker and never reach exec_limactl.
 fn build_limactl_argv(limactl: &str, sub: &Subcommand) -> Vec<String> {
     match sub {
-        Subcommand::Create(a) => vec![
-            limactl.to_string(),
-            "create".to_string(),
-            "--name".to_string(),
-            a.vm.clone(),
-            a.yaml.clone(),
-            "--tty=false".to_string(),
-        ],
+        Subcommand::Create(_) => {
+            unreachable!("create uses run_create_with_marker, not exec_limactl")
+        }
         Subcommand::Start(a) => vec![
             limactl.to_string(),
             "start".to_string(),
@@ -1619,16 +1769,9 @@ fn build_limactl_argv(limactl: &str, sub: &Subcommand) -> Vec<String> {
             format!("--timeout={}s", a.start_timeout_s),
             "--tty=false".to_string(),
         ],
-        Subcommand::Clone(a) => vec![
-            limactl.to_string(),
-            "clone".to_string(),
-            a.base.clone(),
-            a.vm.clone(),
-            format!("--cpus={}", a.cpus),
-            format!("--memory={}", a.memory_gib),
-            format!("--disk={}", a.disk_gib),
-            "--tty=false".to_string(),
-        ],
+        Subcommand::Clone(_) => {
+            unreachable!("clone uses run_clone_with_marker, not exec_limactl")
+        }
         Subcommand::Stop(a) => {
             if a.force {
                 vec![
@@ -1683,6 +1826,9 @@ fn build_limactl_argv(limactl: &str, sub: &Subcommand) -> Vec<String> {
         }
         Subcommand::RunRsync(_) => {
             unreachable!("run-rsync does not use exec_limactl")
+        }
+        Subcommand::ReadOwnerMarker(_) => {
+            unreachable!("read-owner-marker does not use exec_limactl")
         }
     }
 }
@@ -1872,6 +2018,148 @@ fn run_read_user_key(op_uid: u32, lima_home: &str) -> ExitCode {
         Err(e) => {
             eprintln!(
                 "sandbox-lima-helper: read-user-key: failed to read {key_path} \
+                 (op_uid={op_uid}): {e}"
+            );
+            ExitCode::from(EXIT_GENERIC)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// create/clone with owner-marker write (step 11, special case)
+// ---------------------------------------------------------------------------
+
+/// Write the owner marker file `{lima_home}{vm}/sandboxd-owner` containing
+/// the pool CIDR string.
+///
+/// Called post-pivot (as the operator uid) after `limactl create` or
+/// `limactl clone` succeeds. The instance directory is operator-owned
+/// 0700, so only the operator can write into it — which is exactly what
+/// we are after having done `setresuid(op_uid)`.
+///
+/// Security: the path is composed from helper-constructed `lima_home`
+/// (kernel-checked caller_uid + validated op_uid) and `vm` which has
+/// passed `validate_vm_name` (`^[a-zA-Z0-9_\-]{1,64}$`, no leading dash,
+/// no `/`, no `.`). The `validate_path_arg` call below provides
+/// belt-and-suspenders NUL/PATH_MAX/absolute/no-`..` checks on the
+/// composed path. The `owner` value has been CIDR-charset-validated
+/// (digits, dots, slashes, ≤18 chars only) before the privilege pivot.
+fn write_owner_marker(
+    lima_home: &str,
+    vm: &str,
+    owner: &str,
+) -> Result<(), ExitCode> {
+    use std::io::Write;
+
+    let marker_path = format!("{lima_home}{vm}/sandboxd-owner");
+
+    // Belt-and-suspenders: validate the composed path (NUL, PATH_MAX, absolute, no ..).
+    if let Err((_code, msg)) = validate_path_arg("sandboxd-owner path", &marker_path) {
+        eprintln!("sandbox-lima-helper: write_owner_marker: composed path rejected: {msg}");
+        return Err(ExitCode::from(EXIT_BAD_ARGS));
+    }
+
+    // Write the CIDR string (mode 0600 inherited from the pre-exec umask 0o077).
+    match std::fs::File::create(&marker_path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(owner.as_bytes()) {
+                eprintln!(
+                    "sandbox-lima-helper: write_owner_marker: failed to write {marker_path}: {e}"
+                );
+                return Err(ExitCode::from(EXIT_GENERIC));
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "sandbox-lima-helper: write_owner_marker: failed to create {marker_path}: {e}"
+            );
+            return Err(ExitCode::from(EXIT_GENERIC));
+        }
+    }
+    Ok(())
+}
+
+/// Run `limactl create` as a child process (not execvpe-replace), then on
+/// success write the `sandboxd-owner` marker file.
+///
+/// This is the deliberate exec→child-process conversion described in the
+/// implementation notes. `exec_limactl` cannot be used here because
+/// `execvpe` replaces the process image and a post-exec write is impossible.
+/// The approach follows the `run_install_guest_agent` precedent which also
+/// sequences steps rather than exec-replacing.
+fn run_create_with_marker(
+    limactl: &str,
+    a: &CreateArgs,
+    lima_home: &str,
+    env_block: &[CString],
+) -> ExitCode {
+    let argv = build_create_argv(limactl, a);
+    if let Err(code) = run_step_labeled(&argv, env_block, "limactl create") {
+        return code;
+    }
+    if let Err(code) = write_owner_marker(lima_home, &a.vm, &a.owner) {
+        return code;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Run `limactl clone` as a child process, then write the marker.
+/// Same rationale as `run_create_with_marker`.
+fn run_clone_with_marker(
+    limactl: &str,
+    a: &CloneArgs,
+    lima_home: &str,
+    env_block: &[CString],
+) -> ExitCode {
+    let argv = build_clone_argv(limactl, a);
+    if let Err(code) = run_step_labeled(&argv, env_block, "limactl clone") {
+        return code;
+    }
+    if let Err(code) = write_owner_marker(lima_home, &a.vm, &a.owner) {
+        return code;
+    }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// read-owner-marker implementation (step 11, special case)
+// ---------------------------------------------------------------------------
+
+/// Read `{lima_home}{vm}/sandboxd-owner` and write its contents to stdout.
+///
+/// Called after `setresuid(op_uid)` so the operator-owned 0700 instance
+/// directory is traversable and the 0600 marker file is readable. The daemon
+/// cannot read this file directly (it is "other" relative to the operator-owned
+/// dir) — this helper subcommand is the mandatory read path.
+///
+/// Returns exit code 0 with the CIDR string on stdout on success.
+/// Returns non-zero on missing file or any I/O error — the daemon treats
+/// non-zero / empty stdout as "no marker" (legacy VM or unowned; reap within
+/// own LIMA_HOME via name+live-set only).
+fn run_read_owner_marker(op_uid: u32, lima_home: &str, vm: &str) -> ExitCode {
+    use std::io::Write;
+
+    let marker_path = format!("{lima_home}{vm}/sandboxd-owner");
+    match std::fs::read_to_string(&marker_path) {
+        Ok(contents) => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            if let Err(e) = handle.write_all(contents.as_bytes()) {
+                eprintln!(
+                    "sandbox-lima-helper: read-owner-marker: write to stdout failed: {e}"
+                );
+                return ExitCode::from(EXIT_GENERIC);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Absent marker: legacy VM created before this feature landed.
+            // Exit non-zero; the daemon treats this as "no marker".
+            ExitCode::from(EXIT_GENERIC)
+        }
+        Err(e) => {
+            eprintln!(
+                "sandbox-lima-helper: read-owner-marker: failed to read {marker_path} \
                  (op_uid={op_uid}): {e}"
             );
             ExitCode::from(EXIT_GENERIC)
@@ -2107,6 +2395,8 @@ WantedBy=multi-user.target";
             "sandbox-abc",
             "--yaml",
             "/etc/lima/base.yaml",
+            "--owner",
+            "10.209.0.0/20",
         ]);
         let sub = parse_argv(&args).expect("valid create args");
         let Subcommand::Create(a) = sub else {
@@ -2115,11 +2405,35 @@ WantedBy=multi-user.target";
         assert_eq!(a.op_uid, 1000);
         assert_eq!(a.vm, "sandbox-abc");
         assert_eq!(a.yaml, "/etc/lima/base.yaml");
+        assert_eq!(a.owner, "10.209.0.0/20");
     }
 
     #[test]
     fn parse_create_missing_yaml_fails() {
-        let args = os_args(&["create", "--op-uid", "1000", "--vm", "sandbox-abc"]);
+        let args = os_args(&[
+            "create",
+            "--op-uid",
+            "1000",
+            "--vm",
+            "sandbox-abc",
+            "--owner",
+            "10.209.0.0/20",
+        ]);
+        assert!(parse_argv(&args).is_err());
+    }
+
+    #[test]
+    fn parse_create_missing_owner_fails() {
+        let args = os_args(&[
+            "create",
+            "--op-uid",
+            "1000",
+            "--vm",
+            "sandbox-abc",
+            "--yaml",
+            "/etc/lima/base.yaml",
+        ]);
+        // --owner is now required
         assert!(parse_argv(&args).is_err());
     }
 
@@ -2133,6 +2447,8 @@ WantedBy=multi-user.target";
             "sandbox-abc",
             "--yaml",
             "/etc/lima/base.yaml",
+            "--owner",
+            "10.209.0.0/20",
             "--extra",
             "value",
         ]);
@@ -2151,8 +2467,112 @@ WantedBy=multi-user.target";
             "sandbox-abc",
             "--yaml",
             "/etc/lima/base.yaml",
+            "--owner",
+            "10.209.0.0/20",
         ]);
         assert!(parse_argv(&args).is_err());
+    }
+
+    // -- validate_cidr_owner --------------------------------------------------
+
+    #[test]
+    fn validate_cidr_owner_accepts_canonical_cidr() {
+        assert!(validate_cidr_owner("--owner", "10.209.0.0/20").is_ok());
+        assert!(validate_cidr_owner("--owner", "0.0.0.0/0").is_ok());
+        assert!(validate_cidr_owner("--owner", "255.255.255.0/24").is_ok());
+    }
+
+    #[test]
+    fn validate_cidr_owner_rejects_missing_slash() {
+        assert!(validate_cidr_owner("--owner", "10.209.0.0").is_err());
+    }
+
+    #[test]
+    fn validate_cidr_owner_rejects_bad_prefix() {
+        assert!(validate_cidr_owner("--owner", "10.0.0.0/33").is_err());
+        assert!(validate_cidr_owner("--owner", "10.0.0.0/abc").is_err());
+    }
+
+    #[test]
+    fn validate_cidr_owner_rejects_bad_address() {
+        assert!(validate_cidr_owner("--owner", "10.256.0.0/24").is_err());
+        assert!(validate_cidr_owner("--owner", "not-an-ip/24").is_err());
+    }
+
+    #[test]
+    fn validate_cidr_owner_rejects_bad_charset() {
+        // newline, space, shell metacharacter — all must be rejected
+        assert!(validate_cidr_owner("--owner", "10.0.0.0/24\n").is_err());
+        assert!(validate_cidr_owner("--owner", "10.0.0.0 /24").is_err());
+        assert!(validate_cidr_owner("--owner", "10.0.0.0/24;rm -rf /").is_err());
+    }
+
+    // -- parse_read_owner_marker ----------------------------------------------
+
+    #[test]
+    fn parse_read_owner_marker_accepts_valid_args() {
+        let args = os_args(&[
+            "read-owner-marker",
+            "--op-uid",
+            "1000",
+            "--vm",
+            "sandbox-abc123def456",
+        ]);
+        let sub = parse_argv(&args).expect("valid read-owner-marker args");
+        let Subcommand::ReadOwnerMarker(a) = sub else {
+            panic!("expected ReadOwnerMarker")
+        };
+        assert_eq!(a.op_uid, 1000);
+        assert_eq!(a.vm, "sandbox-abc123def456");
+    }
+
+    #[test]
+    fn parse_read_owner_marker_missing_vm_fails() {
+        let args = os_args(&["read-owner-marker", "--op-uid", "1000"]);
+        assert!(parse_argv(&args).is_err());
+    }
+
+    // -- build_create_argv / build_clone_argv (owner not passed to limactl) --
+
+    #[test]
+    fn build_create_argv_does_not_include_owner() {
+        // --owner is consumed by the helper and must NOT be forwarded to limactl.
+        let a = CreateArgs {
+            op_uid: 1000,
+            vm: "sandbox-test".to_string(),
+            yaml: "/tmp/test.yaml".to_string(),
+            owner: "10.209.0.0/20".to_string(),
+        };
+        let argv = build_create_argv("/usr/bin/limactl", &a);
+        assert!(
+            !argv.iter().any(|s| s.contains("owner")),
+            "owner must not appear in limactl argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|s| s.contains("10.209.0.0")),
+            "CIDR must not appear in limactl argv: {argv:?}"
+        );
+        assert!(argv.contains(&"create".to_string()));
+        assert!(argv.contains(&"--name".to_string()));
+    }
+
+    #[test]
+    fn build_clone_argv_does_not_include_owner() {
+        let a = CloneArgs {
+            op_uid: 1000,
+            base: "sandbox-base".to_string(),
+            vm: "sandbox-test".to_string(),
+            cpus: 2,
+            memory_gib: 4,
+            disk_gib: 20,
+            owner: "10.209.0.0/20".to_string(),
+        };
+        let argv = build_clone_argv("/usr/bin/limactl", &a);
+        assert!(
+            !argv.iter().any(|s| s.contains("owner")),
+            "owner must not appear in limactl argv: {argv:?}"
+        );
+        assert!(argv.contains(&"clone".to_string()));
     }
 
     #[test]
@@ -2235,6 +2655,8 @@ WantedBy=multi-user.target";
             "8",
             "--disk",
             "50",
+            "--owner",
+            "10.209.0.0/20",
         ]);
         let sub = parse_argv(&args).expect("valid clone args");
         let Subcommand::Clone(a) = sub else {
@@ -2243,6 +2665,7 @@ WantedBy=multi-user.target";
         assert_eq!(a.cpus, 4);
         assert_eq!(a.memory_gib, 8);
         assert_eq!(a.disk_gib, 50);
+        assert_eq!(a.owner, "10.209.0.0/20");
     }
 
     #[test]
@@ -2611,12 +3034,16 @@ WantedBy=multi-user.target";
 
     #[test]
     fn create_argv_correct() {
-        let sub = Subcommand::Create(CreateArgs {
+        // create uses build_create_argv (not build_limactl_argv) since it is
+        // now a run-then-write operation. --owner is consumed by the helper
+        // and must NOT appear in the limactl argv.
+        let a = CreateArgs {
             op_uid: 1000,
             vm: "sandbox-abc".to_string(),
             yaml: "/etc/lima/base.yaml".to_string(),
-        });
-        let argv = build_limactl_argv("/usr/local/bin/limactl", &sub);
+            owner: "10.209.0.0/20".to_string(),
+        };
+        let argv = build_create_argv("/usr/local/bin/limactl", &a);
         assert_eq!(
             argv,
             vec![
@@ -2736,15 +3163,18 @@ WantedBy=multi-user.target";
 
     #[test]
     fn clone_argv_correct() {
-        let sub = Subcommand::Clone(CloneArgs {
+        // clone uses build_clone_argv (not build_limactl_argv) since it is
+        // now a run-then-write operation. --owner is consumed by the helper.
+        let a = CloneArgs {
             op_uid: 1000,
             base: "sandbox-base".to_string(),
             vm: "sandbox-abc".to_string(),
             cpus: 4,
             memory_gib: 8,
             disk_gib: 50,
-        });
-        let argv = build_limactl_argv("/usr/bin/limactl", &sub);
+            owner: "10.209.0.0/20".to_string(),
+        };
+        let argv = build_clone_argv("/usr/bin/limactl", &a);
         assert_eq!(
             argv,
             vec![

@@ -442,6 +442,7 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
     let lima_registry = Arc::new(LimaManagerRegistry::new(
         "sandbox-base-test".to_string(),
         std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        "test-pool".to_string(),
     ));
     let proxy_state = Arc::new(ProxyState {
         store,
