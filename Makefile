@@ -143,7 +143,7 @@ TEST ?=
 # `usermod -aG sandbox-test` but not yet re-logged-in does not have the
 # group active in their shell. Wrapping pytest in `sg sandbox-test`
 # activates the group for the subprocess without requiring a re-login.
-test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-prod-cap install-guest-prod
+test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap install-guest-prod
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color -m \"not lima\" -k \"not [lima]\" $(TEST)"; \
@@ -162,7 +162,7 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # `usermod -aG sandbox-test` but not yet re-logged-in does not have the
 # group active in their shell. Wrapping pytest in `sg sandbox-test`
 # activates the group for the subprocess without requiring a re-login.
-test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-prod-cap install-guest-prod
+test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap install-guest-prod
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
 	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $(TEST)"; \
