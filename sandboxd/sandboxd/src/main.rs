@@ -2031,9 +2031,17 @@ async fn create_session(
         }};
     }
 
-    // Helper closure: cleanup network + CA only (VM not yet created).
+    // Helper closure: cleanup container+volume (best-effort), then network + CA.
+    // Ordering hygiene: remove container and volume BEFORE the network so the
+    // network rm never races a still-attached container. The container and
+    // volume carry the owner label and are reapable regardless of order, but
+    // removing them first avoids "network has active endpoints" log noise.
     macro_rules! cleanup_net_ca_and_return {
         ($state:expr, $session_id:expr, $err_resp:expr) => {{
+            let runtime = runtime_for(&*$state, backend_kind);
+            let handle = RuntimeHandle::from_session_id(&$session_id);
+            // Best-effort container+volume removal before network teardown.
+            let _ = runtime.delete(&handle, operator.uid).await;
             let network = $state.network.clone();
             let base_dir = $state.base_dir.clone();
             let sid = $session_id;
@@ -2445,12 +2453,24 @@ async fn create_session(
         // which the network manager swallows).
         macro_rules! cleanup_lite_gateway_and_return {
             ($err_resp:expr) => {{
-                teardown_session_networking_parts(
-                    &session_id,
-                    &state.gateway,
-                    &state.network,
-                    &state.ingestors,
-                )
+                // Ordering hygiene: stop gateway + abort ingestor first, but
+                // do NOT remove the network here. The network removal is done
+                // by cleanup_and_return! after the container and home volume
+                // are removed, so the network rm never races a still-attached
+                // container ("active endpoints" log noise).
+                {
+                    let mut guard = state.ingestors.lock().await;
+                    if let Some(ingestor) = guard.remove(&session_id) {
+                        ingestor.abort();
+                    }
+                }
+                let gw = state.gateway.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = gw.stop_gateway(&sid) {
+                        warn!(%sid, error = %e, "cleanup_lite_gateway: failed to stop gateway (best-effort)");
+                    }
+                })
                 .await;
                 cleanup_and_return!(state, session_id, $err_resp);
             }};

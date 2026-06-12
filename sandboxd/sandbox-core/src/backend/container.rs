@@ -1028,6 +1028,15 @@ impl SessionRuntime for ContainerRuntime {
     /// nonexistent container, and `docker volume rm` against a
     /// nonexistent volume, both surface as "No such ..." in stderr —
     /// translated to `Ok(())`.
+    ///
+    /// # Contract
+    ///
+    /// This method removes the **container and home volume only** — it
+    /// never touches the session's Docker network. The network is removed
+    /// separately by the caller (typically via
+    /// `NetworkManager::delete_network` or `remove_docker_network`) AFTER
+    /// this method returns, so the network rm never races a still-attached
+    /// container endpoint.
     async fn delete(&self, handle: &RuntimeHandle, _operator_uid: u32) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
         let container_name = handle.as_str().to_string();
