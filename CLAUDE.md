@@ -153,11 +153,13 @@ Session state persists across daemon restarts in `{base_dir}/sessions.db` (SQLit
 
 ## Releasing
 
-Cutting a `vX.Y.Z` release means bumping **all 9 workspace crate versions
-in lockstep** (the tag must match `Cargo.toml`, and the version drives the
-runtime gateway/lite image tags), then committing on `master` and pushing
-the tag — which fires the signed-artifact pipeline. Full procedure and
-rationale: [docs/internal/releasing.md](docs/internal/releasing.md).
+Cutting a `vX.Y.Z` release means bumping the single
+`[workspace.package].version` in `sandboxd/Cargo.toml` (every crate
+inherits it via `version.workspace = true`; the tag must match it, and it
+drives the runtime gateway/lite image tags), then committing on `master`
+and pushing the tag — which fires the signed-artifact pipeline. Full
+procedure and rationale:
+[docs/internal/releasing.md](docs/internal/releasing.md).
 
 ## graphify
 

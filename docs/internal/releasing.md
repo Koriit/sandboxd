@@ -9,36 +9,41 @@ the release.
 
 ## Bump the workspace version before tagging
 
-The tag must match the crate version or the workflow's first step fails.
-Steps:
+There is **one** version for the whole workspace. Every crate inherits
+it via `version.workspace = true`, so the single source of truth is the
+`[workspace.package].version` field in the workspace root
+`sandboxd/Cargo.toml`. Releasing:
 
-1. Bump the `version` field to `X.Y.Z` in **every** workspace member's
-   `Cargo.toml` — all 9 crates, in lockstep, never just one:
-   `sandboxd`, `sandbox-cli`, `sandbox-core`, `sandbox-guest`,
-   `sandbox-event-emitter`, `sandbox-lima-helper`, `sandbox-route-helper`,
-   `sandbox-nft-allow-logger`, `sandbox-nft-deny-logger`. (The `version`
-   is each crate's own field — there is no inherited `workspace.package`
-   version.)
+1. Edit `sandboxd/Cargo.toml` → `[workspace.package]` → `version =
+   "X.Y.Z"`. That one line is the entire bump — do **not** add per-crate
+   `version` fields back to the members.
 2. Refresh `Cargo.lock`: from `sandboxd/`, run any cargo command
-   (`cargo check --workspace` or `cargo metadata`) so the 9 member
-   `version` entries update. Confirm the lock diff touches *only* those
-   9 lines — no external-dependency churn.
+   (`cargo check --workspace` or `cargo metadata`) so the member
+   `version` entries update.
 3. Commit on `master` (the release process commits to `master`
    directly, not a branch), then `git tag vX.Y.Z` and
    `git push origin master vX.Y.Z`.
 
-## Why all 9 must match
+## Why the version is centralised
 
-- The workflow sanity-checks the pushed tag against
-  `sandboxd/sandboxd/Cargo.toml`'s `version` and aborts on mismatch
-  (`release.yml`, "Resolve version" step).
-- The version is the daemon's compile-time `CARGO_PKG_VERSION`, which at
-  runtime composes the `sandbox-gateway:<version>` and
-  `sandboxd-lite:<version>` image tags (the daemon refuses `:latest`).
-  `make gateway-image` / `make lite-image` tag from `sandbox-core`'s
-  version. If the daemon, the gateway image, and the tarball `MANIFEST`
-  disagree on the version string, `sandbox session create` can't find
-  its gateway image.
+The version is each crate's compile-time `CARGO_PKG_VERSION`, and three
+things must agree on it byte-for-byte:
 
-So a half-bumped workspace (some crates `0.1.2`, others `0.1.0`) is a
-latent break even when it compiles. Bump all 9 or none.
+- The release workflow sanity-checks the pushed tag against
+  `[workspace.package].version` in `sandboxd/Cargo.toml` and aborts on
+  mismatch (`release.yml`, "Resolve version" step).
+- The daemon composes the `sandbox-gateway:<version>` and
+  `sandboxd-lite:<version>` image tags from its `CARGO_PKG_VERSION` at
+  runtime (it refuses `:latest`). `make gateway-image` / `make
+  lite-image` tag from the same `[workspace.package].version`. If the
+  daemon, the gateway image, and the tarball `MANIFEST` disagree,
+  `sandbox session create` can't find its gateway image.
+- `sandbox-core::guest::SANDBOX_GUEST_VERSION` (stamped into
+  `sessions.guest_binary_version`) is just `CARGO_PKG_VERSION` — the
+  guest binary shares the one workspace version, so there is no separate
+  guest-version bookkeeping.
+
+Because every crate inherits the single `[workspace.package].version`, a
+half-bumped workspace is structurally impossible: bump that one field
+and the daemon, every helper, the images, and the guest stamp all move
+together.

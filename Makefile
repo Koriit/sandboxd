@@ -226,13 +226,14 @@ test-install-e2e-quick: $(INSTALL_E2E_VENV_STAMP)
 # can `COPY sandboxd/` into its builder. `.dockerignore` at the repo root
 # keeps `sandboxd/target/` and other heavy directories out of the context
 # upload.
-# The gateway image is tagged with the workspace's `sandbox-core`
-# package version so the daemon's `CARGO_PKG_VERSION` (used at runtime
-# to compose `sandbox-gateway:<version>`) and the image actually built
-# here agree byte-for-byte. The daemon refuses to compose
+# The gateway image is tagged with the shared workspace version
+# (`[workspace.package].version`, which every crate inherits via
+# `version.workspace = true`) so the daemon's `CARGO_PKG_VERSION` (used
+# at runtime to compose `sandbox-gateway:<version>`) and the image
+# actually built here agree byte-for-byte. The daemon refuses to compose
 # `sandbox-gateway:latest`; pinning here is what makes
 # `make gateway-image && sandbox session create` work end-to-end.
-GATEWAY_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/sandbox-core/Cargo.toml)
+GATEWAY_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/Cargo.toml)
 
 gateway-image:
 	docker build -t sandbox-gateway:$(GATEWAY_VERSION) -f networking/gateway/Dockerfile .
@@ -252,10 +253,10 @@ gateway-image:
 # the runtime build keeps the dev image and the user-built image
 # byte-identical (modulo the sandbox-guest binary itself), so dev
 # testing reflects what users actually run. The image is tagged with
-# the `sandbox-core` package version because the daemon's
-# `CARGO_PKG_VERSION` (used at run-time) is sourced from the same
-# package.
-LITE_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/sandbox-core/Cargo.toml)
+# the shared workspace version (`[workspace.package].version`) because
+# the daemon's `CARGO_PKG_VERSION` (used at run-time) is sourced from
+# that same inherited version.
+LITE_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/Cargo.toml)
 
 lite-image:
 	cd sandboxd && cargo build --release --workspace
