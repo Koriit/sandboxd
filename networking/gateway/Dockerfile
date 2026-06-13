@@ -48,7 +48,7 @@ RUN go mod download \
 # Both packages are built in a single `cargo build` invocation so the
 # shared `sandbox-event-emitter` lib crate is compiled once. Two `-p`
 # flags collapse to one cache layer instead of two; the resulting
-# binaries are installed side-by-side in `/out/` for stage 3 to copy.
+# binaries are installed side-by-side in `/out/` for stage 4 to copy.
 FROM rust:1.88-bookworm AS nft-loggers-builder
 
 WORKDIR /src
@@ -63,32 +63,28 @@ RUN cargo build --release \
     && install -D -m 0755 target/release/sandbox-nft-deny-logger /out/sandbox-nft-deny-logger \
     && install -D -m 0755 target/release/sandbox-nft-allow-logger /out/sandbox-nft-allow-logger
 
-# ---------- Stage 3: Runtime image ----------
+# ---------- Stage 3: Envoy binary source ----------
+# Pinned to an explicit version for reproducibility.
+# This FROM line is tracked by Dependabot (docker ecosystem).
+FROM envoyproxy/envoy:v1.38.2 AS envoy
+
+# ---------- Stage 4: Runtime image ----------
 FROM debian:bookworm-slim
 
 # Versions — pinned for reproducibility
 ARG MITMPROXY_VERSION=11.1.3
 ARG TARGETARCH=amd64
 
-# ---------- install envoy from official apt repo ----------
+# ---------- base packages ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        gnupg \
         nftables \
         procps \
-        wget \
-    && mkdir -p /etc/apt/keyrings \
-    && wget -qO- https://apt.envoyproxy.io/signing.key \
-        | gpg --dearmor -o /etc/apt/keyrings/envoy-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/envoy-keyring.gpg] \
-        https://apt.envoyproxy.io bookworm main" \
-        > /etc/apt/sources.list.d/envoy.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends envoy \
-    && apt-get purge -y gnupg wget \
-    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+
+# ---------- install Envoy (copied from pinned official image) ----------
+COPY --from=envoy /usr/local/bin/envoy /usr/local/bin/envoy
 
 # ---------- install custom CoreDNS with sandboxpolicy plugin ----------
 COPY --from=coredns-builder /coredns /usr/local/bin/coredns
