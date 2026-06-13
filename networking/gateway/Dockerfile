@@ -19,7 +19,7 @@
 # target); `.dockerignore` prunes heavyweight directories.
 
 # ---------- Stage 1: Build custom CoreDNS with sandboxpolicy plugin ----------
-FROM golang:1.22 AS coredns-builder
+FROM golang:1.25 AS coredns-builder
 
 WORKDIR /build
 
