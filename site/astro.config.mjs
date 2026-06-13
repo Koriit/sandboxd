@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import { unified } from '@astrojs/markdown-remark';
 import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
 import rehypeMermaid from 'rehype-mermaid';
@@ -57,19 +58,24 @@ export default defineConfig({
       type: 'shiki',
       excludeLangs: ['mermaid'],
     },
-    rehypePlugins: [
-      [
-        rehypeMermaid,
-        {
-          strategy: mermaidStrategy,
-          // Emits a <picture> element with both light and dark SVGs so the
-          // diagram follows the user's color-scheme preference, which
-          // Starlight's dark/light toggle drives. Only meaningful under
-          // Playwright-based strategies; ignored for `pre-mermaid`.
-          dark: true,
-        },
+    // Astro 6.4 introduced a pluggable Markdown pipeline; plugins are now
+    // declared on the unified() processor rather than the deprecated top-level
+    // markdown.rehypePlugins array (removed in Astro 8.0).
+    processor: unified({
+      rehypePlugins: [
+        [
+          rehypeMermaid,
+          {
+            strategy: mermaidStrategy,
+            // Emits a <picture> element with both light and dark SVGs so the
+            // diagram follows the user's color-scheme preference, which
+            // Starlight's dark/light toggle drives. Only meaningful under
+            // Playwright-based strategies; ignored for `pre-mermaid`.
+            dark: true,
+          },
+        ],
       ],
-    ],
+    }),
   },
 
   integrations: [
