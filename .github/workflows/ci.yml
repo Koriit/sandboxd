@@ -37,6 +37,33 @@ jobs:
       - name: Test
         run: make test
 
+  # Go build, vet, and test for the CoreDNS plugin in networking/coredns-plugin/.
+  # The plugin is otherwise only compiled incidentally inside the gateway image
+  # docker build (integration job) — this job gives the Go code a fast,
+  # dedicated CI gate so a build break or failing test reliably fails CI.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: networking/coredns-plugin/go.mod
+          cache-dependency-path: networking/coredns-plugin/go.sum
+
+      - name: Build
+        run: go build ./...
+        working-directory: networking/coredns-plugin
+
+      - name: Vet
+        run: go vet ./...
+        working-directory: networking/coredns-plugin
+
+      - name: Test
+        run: go test ./...
+        working-directory: networking/coredns-plugin
+
   # Shellcheck for the install / uninstall scripts and their shared engine.
   # All four scripts must pass POSIX-sh (`-s sh`) plus stylistic warnings
   # (`-S style`). `-x` enables cross-file source-following so shellcheck
