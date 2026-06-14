@@ -67,30 +67,35 @@ SANDBOX_BIN = CARGO_WORKSPACE / "target" / "debug" / "sandbox"
 
 # Rust source-of-truth files we extract values from at test-collection time
 # so the harness never drifts out of step with the daemon it drives.
-SANDBOX_CORE_CARGO_TOML = CARGO_WORKSPACE / "sandbox-core" / "Cargo.toml"
+WORKSPACE_CARGO_TOML = CARGO_WORKSPACE / "Cargo.toml"
 SANDBOX_CORE_USERS_CONF_RS = CARGO_WORKSPACE / "sandbox-core" / "src" / "users_conf.rs"
 
 
 def _read_workspace_version() -> str:
-    """Extract `sandbox-core`'s package version from its Cargo.toml.
+    """Extract the workspace version from the root Cargo.toml.
 
     This is the same value the Makefile's `gateway-image` target passes
     to `docker build -t sandbox-gateway:<version>` and the daemon's
     `CARGO_PKG_VERSION` at run-time. Reading the Cargo.toml directly
     keeps the preflight check working on hosts without a Rust toolchain
     (e.g. operators who only need to inspect an already-built image).
+
+    Individual crate manifests use `version.workspace = true` and carry no
+    standalone `version = "..."` line, so we read the workspace root manifest
+    where `[workspace.package] version = "X.Y.Z"` is the single source of truth.
     """
-    if not SANDBOX_CORE_CARGO_TOML.exists():
+    if not WORKSPACE_CARGO_TOML.exists():
         raise RuntimeError(
-            f"Cannot read workspace version: {SANDBOX_CORE_CARGO_TOML} not found"
+            f"Cannot read workspace version: {WORKSPACE_CARGO_TOML} not found"
         )
-    text = SANDBOX_CORE_CARGO_TOML.read_text()
-    # Match the first `version = "X.Y.Z"` under `[package]` — Cargo.toml's
-    # package section is the first table, so the first match is correct.
+    text = WORKSPACE_CARGO_TOML.read_text()
+    # Match the first `version = "X.Y.Z"` line — in the workspace root
+    # Cargo.toml this appears under [workspace.package] and is the only
+    # such line.
     matches = re.findall(r'(?m)^\s*version\s*=\s*"([^"]+)"', text)
     if not matches:
         raise RuntimeError(
-            f"Cannot extract version from {SANDBOX_CORE_CARGO_TOML}: "
+            f"Cannot extract version from {WORKSPACE_CARGO_TOML}: "
             f"no `version = \"...\"` line found"
         )
     return matches[0]

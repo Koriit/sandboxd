@@ -72,7 +72,7 @@ FROM envoyproxy/envoy:v1.38.2 AS envoy
 FROM debian:bookworm-slim
 
 # Versions — pinned for reproducibility
-ARG MITMPROXY_VERSION=11.1.3
+ARG MITMPROXY_VERSION=12.2.3
 ARG TARGETARCH=amd64
 
 # ---------- base packages ----------

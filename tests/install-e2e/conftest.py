@@ -695,13 +695,28 @@ def release_tarball_x86_64_bumped_chain(
 
 
 def _read_workspace_version() -> str:
-    cargo_toml = PROJECT_ROOT / "sandboxd" / "sandboxd" / "Cargo.toml"
-    for line in cargo_toml.read_text().splitlines():
-        if line.startswith("version"):
-            parts = line.split('"')
-            if len(parts) >= 2:
-                return parts[1]
-    raise AssertionError("could not parse workspace version")
+    """Extract the workspace version from the root Cargo.toml.
+
+    Individual crate manifests use `version.workspace = true` and carry no
+    standalone `version = "..."` line, so we read the workspace root manifest
+    where `[workspace.package] version = "X.Y.Z"` is the single source of truth.
+    """
+    cargo_toml = PROJECT_ROOT / "sandboxd" / "Cargo.toml"
+    if not cargo_toml.exists():
+        raise RuntimeError(
+            f"Cannot read workspace version: {cargo_toml} not found"
+        )
+    text = cargo_toml.read_text()
+    # Match the first `version = "X.Y.Z"` line — in the workspace root
+    # Cargo.toml this appears under [workspace.package] and is the only
+    # such line.
+    matches = re.findall(r'(?m)^\s*version\s*=\s*"([^"]+)"', text)
+    if not matches:
+        raise RuntimeError(
+            f"Cannot extract version from {cargo_toml}: "
+            f"no `version = \"...\"` line found"
+        )
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
