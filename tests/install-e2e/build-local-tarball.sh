@@ -90,9 +90,9 @@ mkdir -p "$OUT_DIR"
 # ----------------------------------------------------------------------------
 
 BASE_VER=$(awk -F'"' '/^version/ { print $2; exit }' \
-    "$ROOT/sandboxd/sandboxd/Cargo.toml")
+    "$ROOT/sandboxd/Cargo.toml")
 if [ -z "$BASE_VER" ]; then
-    printf 'build-local-tarball.sh: could not read version from sandboxd/sandboxd/Cargo.toml\n' >&2
+    printf 'build-local-tarball.sh: could not read version from sandboxd/Cargo.toml\n' >&2
     exit 1
 fi
 
@@ -124,12 +124,12 @@ fi
 # ----------------------------------------------------------------------------
 # Cargo.toml version bump + restore.
 #
-# The crates do not inherit `package.version` from the workspace root —
-# each crate's `Cargo.toml` carries its own literal `version = "X.Y.Z"`.
-# To produce a binary whose `CARGO_PKG_VERSION` differs from the
-# committed source, we sed-rewrite every crate's literal in place, run
-# the build, then restore the originals via a trap that fires on EXIT
-# (success or failure).
+# Every crate inherits its version from the workspace root via
+# `version.workspace = true`.  To produce a binary whose
+# `CARGO_PKG_VERSION` differs from the committed source, we
+# sed-rewrite every crate's `Cargo.toml` to carry a literal
+# `version = "X.Y.Z"` temporarily, run the build, then restore the
+# originals via a trap that fires on EXIT (success or failure).
 #
 # The trap is installed unconditionally — it is a no-op when no files
 # have been rewritten. We use `cp -p` so the saved copy preserves the
