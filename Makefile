@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
+.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
 
@@ -203,6 +203,12 @@ $(INSTALL_E2E_VENV_STAMP): tests/install-e2e/pyproject.toml
 test-install-e2e: $(INSTALL_E2E_VENV_STAMP)
 	cd tests/install-e2e && . .venv/bin/activate && \
 	  python -m pytest -v -rs --durations=20 --timeout=600 $(TEST)
+
+# Re-run only the tests that failed in the previous run (reads .pytest_cache/).
+# Falls back to running all tests when no failures are cached.
+test-install-e2e-lf: $(INSTALL_E2E_VENV_STAMP)
+	cd tests/install-e2e && . .venv/bin/activate && \
+	  python -m pytest -v -rs --durations=20 --timeout=600 --lf $(TEST)
 
 # Single happy-path smoke for fast confidence in the install path
 # (~5-7 min wall clock — one Lima VM, ubuntu-22.04 only). Threads
