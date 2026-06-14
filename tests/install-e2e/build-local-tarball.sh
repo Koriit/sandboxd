@@ -48,7 +48,7 @@
 #   SANDBOX_RELEASE_PORTABLE_BUILD  see above (auto if unset)
 #   SANDBOX_RELEASE_BUMP_VERSION   build the workspace at this synthetic
 #                                  version instead of the current
-#                                  CARGO_PKG_VERSION. Every crate's
+#                                  CARGO_PKG_VERSION. The workspace root
 #                                  Cargo.toml is sed-rewritten before the
 #                                  build and restored on EXIT (trap).
 #                                  Output dir flips to
@@ -124,15 +124,16 @@ fi
 # ----------------------------------------------------------------------------
 # Cargo.toml version bump + restore.
 #
-# Every crate inherits its version from the workspace root via
+# All crates inherit their version from the workspace root via
 # `version.workspace = true`.  To produce a binary whose
 # `CARGO_PKG_VERSION` differs from the committed source, we
-# sed-rewrite every crate's `Cargo.toml` to carry a literal
-# `version = "X.Y.Z"` temporarily, run the build, then restore the
-# originals via a trap that fires on EXIT (success or failure).
+# sed-rewrite the workspace root `Cargo.toml` (the single source of
+# the `version = "X.Y.Z"` literal) temporarily, run the build, then
+# restore the original via a trap that fires on EXIT (success or
+# failure).
 #
-# The trap is installed unconditionally — it is a no-op when no files
-# have been rewritten. We use `cp -p` so the saved copy preserves the
+# The trap is installed unconditionally — it is a no-op when no file
+# has been rewritten. We use `cp -p` so the saved copy preserves the
 # original mtime; restoring it that way prevents stale cargo cache
 # fingerprints from drifting incremental-build accounting.
 # ----------------------------------------------------------------------------
@@ -142,16 +143,13 @@ fi
 # SANDBOX_RELEASE_BUMP_VERSION equal to the on-disk version is a no-op.
 BUMP_SNAPSHOT_DIR=""
 BUMP_LOCK_SNAPSHOT=""
+WORKSPACE_CARGO_TOML="$ROOT/sandboxd/Cargo.toml"
 if [ -n "${SANDBOX_RELEASE_BUMP_VERSION:-}" ] \
    && [ "$SANDBOX_RELEASE_BUMP_VERSION" != "$BASE_VER" ]; then
     BUMP_SNAPSHOT_DIR=$(mktemp -d)
-    # Find every crate Cargo.toml under sandboxd/ (excludes the
-    # workspace root because the root file does not carry a literal
-    # `version = "X.Y.Z"` — version lives in each crate).
-    BUMP_FILES=$(find "$ROOT/sandboxd" -mindepth 2 -maxdepth 2 \
-        -name Cargo.toml -print)
-    if [ -z "$BUMP_FILES" ]; then
-        printf 'build-local-tarball.sh: bump requested but no crate Cargo.toml found\n' >&2
+    if [ ! -f "$WORKSPACE_CARGO_TOML" ]; then
+        printf 'build-local-tarball.sh: workspace root Cargo.toml not found: %s\n' \
+            "$WORKSPACE_CARGO_TOML" >&2
         exit 1
     fi
     # Cargo.lock is overwritten by `cargo build` to reflect the bumped
@@ -169,17 +167,11 @@ restore_cargo_versions() {
     if [ -z "$BUMP_SNAPSHOT_DIR" ] || [ ! -d "$BUMP_SNAPSHOT_DIR" ]; then
         return 0
     fi
-    # Walk the snapshot dir; each saved file's basename encodes the
-    # original crate name. We sed-restored the literal version, but
-    # the safest restore is to copy the snapshot file back verbatim.
-    for snap in "$BUMP_SNAPSHOT_DIR"/*.cargo-toml; do
-        [ -f "$snap" ] || continue
-        crate=$(basename "$snap" .cargo-toml)
-        dst="$ROOT/sandboxd/$crate/Cargo.toml"
-        if [ -f "$dst" ]; then
-            cp -p "$snap" "$dst"
-        fi
-    done
+    # Restore the workspace root Cargo.toml from its snapshot.
+    snap="$BUMP_SNAPSHOT_DIR/workspace-root.cargo-toml"
+    if [ -f "$snap" ]; then
+        cp -p "$snap" "$WORKSPACE_CARGO_TOML"
+    fi
     # Restore Cargo.lock too — `cargo build` would have rewritten it
     # with the bumped versions during the build.
     if [ -n "$BUMP_LOCK_SNAPSHOT" ] && [ -f "$BUMP_LOCK_SNAPSHOT" ]; then
@@ -194,29 +186,21 @@ restore_cargo_versions() {
 trap restore_cargo_versions EXIT INT TERM
 
 if [ -n "$BUMP_SNAPSHOT_DIR" ]; then
-    printf 'build-local-tarball.sh: rewriting Cargo.toml version=%s -> %s in every crate\n' \
+    printf 'build-local-tarball.sh: rewriting workspace root Cargo.toml version=%s -> %s\n' \
         "$BASE_VER" "$VER"
-    # POSIX sh has no arrays; iterate the newline-delimited list via a
-    # heredoc-fed `while` (no pipe — a pipe forks a subshell and the
-    # `exit 1` inside the loop would not terminate the outer script).
-    while IFS= read -r f; do
-        [ -n "$f" ] || continue
-        crate=$(basename "$(dirname "$f")")
-        cp -p "$f" "$BUMP_SNAPSHOT_DIR/${crate}.cargo-toml"
-        # Match the first `version = "..."` line (the package version
-        # always lives in the file's first 10 lines, before any
-        # `[dependencies]` or other tables that might carry their own
-        # `version = "..."` for deps). We anchor to `^version`.
-        sed -i.bak -e "0,/^version = \"[^\"]*\"\$/{s/^version = \"[^\"]*\"\$/version = \"${VER}\"/}" "$f"
-        rm -f "${f}.bak"
-        # Confirm the rewrite landed.
-        if ! grep -q "^version = \"${VER}\"\$" "$f"; then
-            printf 'build-local-tarball.sh: failed to rewrite version in %s\n' "$f" >&2
-            exit 1
-        fi
-    done <<EOF
-$BUMP_FILES
-EOF
+    cp -p "$WORKSPACE_CARGO_TOML" "$BUMP_SNAPSHOT_DIR/workspace-root.cargo-toml"
+    # The workspace root has exactly one `version = "X.Y.Z"` line,
+    # under `[workspace.package]`. A first-match replacement is safe
+    # and sufficient; no dependency version lines carry this pattern.
+    sed -i.bak -e "0,/^version = \"[^\"]*\"\$/{s/^version = \"[^\"]*\"\$/version = \"${VER}\"/}" \
+        "$WORKSPACE_CARGO_TOML"
+    rm -f "${WORKSPACE_CARGO_TOML}.bak"
+    # Confirm the rewrite landed.
+    if ! grep -q "^version = \"${VER}\"\$" "$WORKSPACE_CARGO_TOML"; then
+        printf 'build-local-tarball.sh: failed to rewrite version in %s\n' \
+            "$WORKSPACE_CARGO_TOML" >&2
+        exit 1
+    fi
 fi
 
 # ----------------------------------------------------------------------------
