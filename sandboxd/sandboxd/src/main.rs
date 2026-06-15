@@ -2369,6 +2369,7 @@ async fn create_session(
                 // symmetry with the Lima path and to keep the gate
                 // explicit at the call site.
                 operator_identity: Some((operator.uid, operator.gid)),
+                lima_unrestricted_slirp_for_provisioning: false,
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -3090,6 +3091,7 @@ async fn create_session(
                 // runtime drops back to the legacy spawn-as-daemon
                 // shape — pre-V008 rows or fixture-test paths.
                 operator_identity: Some((operator.uid, operator.gid)),
+                lima_unrestricted_slirp_for_provisioning: false,
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -3138,6 +3140,7 @@ async fn create_session(
                 for_user: Some(operator.name.clone()),
                 // See the matching note on the fast-path branch above.
                 operator_identity: Some((operator.uid, operator.gid)),
+                lima_unrestricted_slirp_for_provisioning: true,
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -3256,6 +3259,85 @@ async fn create_session(
             // Best-effort teardown of any partial networking state.
             teardown_session_networking(&session_id, &state).await;
             return error_response(e).into_response();
+        }
+    }
+
+    if !use_cache {
+        let runtime = runtime_for(&state, BackendKind::Lima);
+        let handle = RuntimeHandle::from_session_id(&session_id);
+
+        if let Err(e) = runtime.stop(&handle, operator.uid).await {
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            teardown_session_networking(&session_id, &state).await;
+            return error_response(e).into_response();
+        }
+
+        let restart_args = RuntimeStartArgs {
+            lima_bridge: Some(network_info.bridge_name.clone()),
+            lima_mac: Some(vm_mac.clone()),
+            lima_config: Some(config.clone()),
+            for_user: Some(operator.name.clone()),
+            operator_identity: Some((operator.uid, operator.gid)),
+            lima_unrestricted_slirp_for_provisioning: false,
+        };
+        if let Err(e) = runtime.start(&handle, &restart_args).await {
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            teardown_session_networking(&session_id, &state).await;
+            return error_response(e).into_response();
+        }
+
+        {
+            const MAX_PING_ATTEMPTS: u32 = 15;
+            let mut last_err: Option<SandboxError> = None;
+            let mut succeeded = false;
+            for attempt in 1..=MAX_PING_ATTEMPTS {
+                match state.guest.ping(&session_id).await {
+                    Ok(true) => {
+                        info!(%session_id, attempts = attempt, "guest agent responded to ping after provisioning restart");
+                        succeeded = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        let err = SandboxError::Internal(
+                            "guest agent returned unexpected response to ping after provisioning restart"
+                                .into(),
+                        );
+                        error!(%session_id, "guest agent ping after provisioning restart: unexpected response");
+                        let _ = state.store.update_state(
+                            &session_id,
+                            &operator.name,
+                            SessionState::Error,
+                        );
+                        teardown_session_networking(&session_id, &state).await;
+                        return error_response(err).into_response();
+                    }
+                    Err(e) => {
+                        debug!(%session_id, attempt, error = %e, "guest agent ping after provisioning restart failed, retrying");
+                        last_err = Some(e);
+                        if attempt < MAX_PING_ATTEMPTS {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+            if !succeeded {
+                let e = last_err.unwrap_or_else(|| {
+                    SandboxError::Internal(
+                        "guest agent ping after provisioning restart failed after all attempts"
+                            .into(),
+                    )
+                });
+                error!(%session_id, error = %e, "guest agent ping after provisioning restart failed after all attempts");
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(e).into_response();
+            }
         }
     }
 
@@ -4036,6 +4118,7 @@ async fn start_session(
                 (Some(uid), Some(gid)) => Some((uid, gid)),
                 _ => None,
             },
+            lima_unrestricted_slirp_for_provisioning: false,
         };
         match runtime.start(&handle, &args).await {
             Ok(()) => {}

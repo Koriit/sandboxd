@@ -921,7 +921,7 @@ EXTRA_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
 # `restrict=on` before QEMU sees the argv.  Base-image builds have no
 # sandbox bridge yet and intentionally keep unrestricted slirp for package
 # installation during provisioning.
-if [ -n "$SANDBOX_DOCKER_BRIDGE" ]; then
+if [ -n "$SANDBOX_DOCKER_BRIDGE" ] && [ "$SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING" != "1" ]; then
     remaining=$#
     while [ "$remaining" -gt 0 ]; do
         arg="$1"
@@ -1360,6 +1360,7 @@ impl LimaManager {
         config: &SessionConfig,
         bridge_name: Option<&str>,
         vm_mac: Option<&str>,
+        unrestricted_slirp_for_provisioning: bool,
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
@@ -1403,6 +1404,9 @@ impl LimaManager {
             extra.push(&bridge_owned);
             extra.push("--vm-mac");
             extra.push(&mac_owned);
+            if unrestricted_slirp_for_provisioning {
+                extra.push("--unrestricted-slirp-for-provisioning");
+            }
         }
 
         let output = self.run_helper(
@@ -3971,6 +3975,10 @@ mod tests {
         assert!(
             QEMU_WRAPPER_SCRIPT.contains("netdev=\"$restricted_netdev,restrict=on\""),
             "wrapper must add restrict=on to Lima's slirp management NIC"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING"),
+            "wrapper must support a first-boot provisioning escape hatch"
         );
     }
 

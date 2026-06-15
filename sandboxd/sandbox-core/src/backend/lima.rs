@@ -250,6 +250,7 @@ impl SessionRuntime for LimaRuntime {
         let manager = self.registry.get_or_create(op_uid)?;
         let bridge = args.lima_bridge.clone();
         let mac = args.lima_mac.clone();
+        let unrestricted_slirp_for_provisioning = args.lima_unrestricted_slirp_for_provisioning;
         let config = match &args.lima_config {
             Some(cfg) => cfg.clone(),
             None => {
@@ -263,7 +264,13 @@ impl SessionRuntime for LimaRuntime {
         };
 
         tokio::task::spawn_blocking(move || {
-            manager.start_vm(&session_id, &config, bridge.as_deref(), mac.as_deref())
+            manager.start_vm(
+                &session_id,
+                &config,
+                bridge.as_deref(),
+                mac.as_deref(),
+                unrestricted_slirp_for_provisioning,
+            )
         })
         .await
         .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))??;
