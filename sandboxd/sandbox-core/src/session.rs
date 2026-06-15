@@ -406,8 +406,7 @@ impl WorkspaceMode {
     pub fn parse_flag(value: &str) -> Result<Self, String> {
         // Normalization: trim leading/trailing ASCII whitespace from the
         // whole input. Internal whitespace is preserved into the path
-        // and will be caught by the absolute-path or existence checks
-        // downstream.
+        // and will be caught by the absolute-path checks downstream.
         let input = value.trim();
         if input.is_empty() {
             return Err(format!(
@@ -532,28 +531,10 @@ fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
 /// [`parse_host_guest_pair`]; the `local:` mode does not accept a
 /// security-model token (the corresponding step A in `parse_shared`
 /// is skipped here). After the classifier resolves the host/guest
-/// pair, the SF-11 directory-required check rejects single-file
-/// or missing host paths with a pointer at `sandbox cp`.
+/// pair. Host filesystem validation belongs at the CLI/helper boundary,
+/// because the daemon may not be able to see operator-owned paths.
 fn parse_local(rest: &str) -> Result<WorkspaceMode, String> {
     let (host_path, guest_path) = parse_host_guest_pair(rest, "local")?;
-
-    // SF-11 — `local:`-only directory-required check. A regular-file
-    // `host_path` (or any other non-directory) is rejected with the
-    // explicit pointer at `sandbox cp`. The check is intentionally
-    // `unwrap_or(false)`: any metadata failure (ENOENT, EACCES, …)
-    // resolves to "not a directory" so the operator sees the same
-    // crisp error regardless of the underlying syscall failure.
-    let is_dir = std::fs::metadata(&host_path)
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
-    if !is_dir {
-        return Err(format!(
-            "host_path must be a directory for `local:`; to seed a single file, \
-             use `sandbox cp <file> <session>:<path>` after creating the session. \
-             (Got: {host_path:?})"
-        ));
-    }
-
     Ok(WorkspaceMode::Local {
         host_path,
         guest_path,
@@ -602,8 +583,7 @@ fn parse_host_guest_pair(rest: &str, mode_label: &str) -> Result<(String, String
 /// `mode_label` is the user-facing prefix used in error messages
 /// (`"shared"` or `"local"`). Returns the resolved `(host_path,
 /// guest_path)` pair after `~` expansion (guest side), trailing-slash
-/// normalisation, absolute-path enforcement, and the host-path-exists
-/// check.
+/// normalisation, and absolute-path enforcement.
 fn parse_host_guest_pair_from_tokens(
     mut tokens: Vec<String>,
     mode_label: &str,
@@ -665,19 +645,6 @@ fn parse_host_guest_pair_from_tokens(
         }
         None => host_path.clone(),
     };
-
-    // Host path existence is checked at parse time per the historical
-    // contract: surfacing typos at the CLI before the request hits
-    // the daemon is part of what makes the operator-facing error path
-    // friendly. The daemon-side parse re-runs the same check; on the
-    // daemon's host the operator's typed path resolves to the same
-    // filesystem entry (or it doesn't, and the daemon emits the same
-    // error verbatim).
-    if !Path::new(&host_path).exists() {
-        return Err(format!(
-            "{mode_label} workspace host_path does not exist: {host_path:?}"
-        ));
-    }
 
     Ok((host_path, guest_path))
 }
@@ -1546,7 +1513,6 @@ mod tests {
 
     #[test]
     fn parse_flag_shared_host_only_defaults_guest_to_host() {
-        // `/tmp` is guaranteed to exist on every host the test runs on.
         let mode = WorkspaceMode::parse_flag("shared:/tmp").unwrap();
         assert_eq!(mode, shared("/tmp", "/tmp", None));
     }
@@ -1739,13 +1705,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_flag_shared_relative_guest_path_errors() {
+    fn parse_flag_shared_unclassified_trailing_token_folds_into_host() {
         // `rel/guest` does not start with `/` or `~`, so step B does
         // NOT classify it as a guest path. Instead it falls through
-        // step C and merges into the host path
-        // (`/tmp:rel/guest`), which fails the host-path-exists check.
-        let err = WorkspaceMode::parse_flag("shared:/tmp:rel/guest").unwrap_err();
-        assert!(err.contains("does not exist"), "err = {err}");
+        // step C and merges into the host path (`/tmp:rel/guest`).
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:rel/guest").unwrap();
+        assert_eq!(mode, shared("/tmp:rel/guest", "/tmp:rel/guest", None));
     }
 
     #[test]
@@ -1797,9 +1762,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_flag_shared_nonexistent_path_errors() {
-        let err = WorkspaceMode::parse_flag("shared:/nonexistent/path/xyzzy").unwrap_err();
-        assert!(err.contains("does not exist"), "err = {err}");
+    fn parse_flag_shared_nonexistent_path_is_syntax_only() {
+        let mode = WorkspaceMode::parse_flag("shared:/nonexistent/path/xyzzy").unwrap();
+        assert_eq!(
+            mode,
+            shared("/nonexistent/path/xyzzy", "/nonexistent/path/xyzzy", None,)
+        );
     }
 
     #[test]
@@ -2048,8 +2016,7 @@ mod tests {
 
     #[test]
     fn parse_flag_local_host_only_defaults_guest_to_host() {
-        // `host=/srv/repo, guest=/srv/repo`. `/tmp` is guaranteed to
-        // exist and be a directory on every host the test runs on.
+        // `host=/tmp, guest=/tmp`.
         let mode = WorkspaceMode::parse_flag("local:/tmp").unwrap();
         assert_eq!(mode, local("/tmp", "/tmp"));
     }
@@ -2093,19 +2060,18 @@ mod tests {
     fn parse_flag_local_security_model_suffix_is_folded_into_host() {
         // `local:/srv/repo:none` → no `:none` security-model strip
         // (mode is `local`, not `shared`); step C folds the trailing
-        // `:none` into `host_path=/srv/repo:none`; host-path-exists
-        // check rejects.
-        let err = WorkspaceMode::parse_flag("local:/srv/repo:none").unwrap_err();
-        assert!(err.contains("does not exist"), "err = {err}");
+        // `:none` into `host_path=/srv/repo:none`.
+        let mode = WorkspaceMode::parse_flag("local:/srv/repo:none").unwrap();
+        assert_eq!(mode, local("/srv/repo:none", "/srv/repo:none"));
     }
 
     #[test]
     fn parse_flag_local_unclassified_trailing_token_folds_into_host() {
         // `local:/srv/repo:bogus` → tokens [/srv/repo, bogus]; step B
         // skips (no `/` or `~` prefix); step C folds into
-        // `host_path=/srv/repo:bogus`; host-path-exists rejects.
-        let err = WorkspaceMode::parse_flag("local:/srv/repo:bogus").unwrap_err();
-        assert!(err.contains("does not exist"), "err = {err}");
+        // `host_path=/srv/repo:bogus`.
+        let mode = WorkspaceMode::parse_flag("local:/srv/repo:bogus").unwrap();
+        assert_eq!(mode, local("/srv/repo:bogus", "/srv/repo:bogus"));
     }
 
     #[test]
@@ -2156,16 +2122,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_flag_local_nonexistent_host_path_errors() {
-        let err = WorkspaceMode::parse_flag("local:/nonexistent/path/xyzzy").unwrap_err();
-        assert!(err.contains("does not exist"), "err = {err}");
+    fn parse_flag_local_nonexistent_host_path_is_syntax_only() {
+        let mode = WorkspaceMode::parse_flag("local:/nonexistent/path/xyzzy").unwrap();
+        assert_eq!(
+            mode,
+            local("/nonexistent/path/xyzzy", "/nonexistent/path/xyzzy")
+        );
     }
 
-    /// SF-11 — `local:` requires `host_path` to be a directory. A
-    /// regular-file `host_path` is rejected with the explicit pointer
-    /// at `sandbox cp`.
     #[test]
-    fn parse_flag_local_regular_file_host_path_errors() {
+    fn parse_flag_local_regular_file_host_path_is_syntax_only() {
         // Build a tempfile under a unique-per-test path so we don't
         // race with other tests on the same host.
         let dir = std::env::temp_dir();
@@ -2177,31 +2143,23 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
 
         let input = format!("local:{path_str}");
-        let err = WorkspaceMode::parse_flag(&input).unwrap_err();
-        // The error must name the `sandbox cp` recovery and
-        // require directory-ness explicitly.
-        assert!(
-            err.contains("must be a directory for `local:`"),
-            "err = {err}"
-        );
-        assert!(
-            err.contains("sandbox cp"),
-            "err must point at `sandbox cp` for single-file seeding: {err}"
-        );
+        let mode = WorkspaceMode::parse_flag(&input).unwrap();
+        assert_eq!(mode, local(&path_str, &path_str));
 
         // Cleanup; failure is non-fatal (temp dir is reaped anyway).
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn parse_flag_local_nonexistent_path_rejected_before_directory_check() {
-        // A path that does not exist is rejected by the host-path-exists
-        // check in step D (shared with the `shared:` parser) — the
-        // SF-11 directory check fires only on existing non-directory
-        // paths. The user-facing error is "does not exist" rather than
-        // the directory-required hint.
-        let err = WorkspaceMode::parse_flag("local:/definitely/not/a/real/path").unwrap_err();
-        assert!(err.contains("does not exist"), "err = {err}");
+    fn parse_flag_local_nonexistent_path_keeps_daemon_parse_filesystem_free() {
+        // The daemon may run as another user and may not be able to see
+        // the operator's host path. Existence and directory checks live
+        // at the CLI/helper boundary instead of in the shared parser.
+        let mode = WorkspaceMode::parse_flag("local:/definitely/not/a/real/path").unwrap();
+        assert_eq!(
+            mode,
+            local("/definitely/not/a/real/path", "/definitely/not/a/real/path",)
+        );
     }
 
     // -- Serde round-trip + legacy-record recovery (`Local`) ---------------

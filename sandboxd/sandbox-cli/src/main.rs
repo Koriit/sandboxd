@@ -960,10 +960,9 @@ fn expand_and_merge_presets(
 /// `parse_flag` is the authoritative grammar gate downstream.
 ///
 /// On `$HOME`-unset or expanded-path-does-not-exist, returns a friendly
-/// error string suitable for printing as an `Error: ...` line. The
-/// host-path existence check is part of the historical CLI contract:
-/// surfacing typos before the request hits the daemon keeps the
-/// operator-facing error path short.
+/// error string suitable for printing as an `Error: ...` line. General
+/// host-path validation for parsed workspace modes happens in
+/// [`validate_workspace_host_path_for_create`].
 fn expand_host_tilde_in_workspace_flag(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     // Find the mode prefix (everything before the first `:`); if there
@@ -1019,6 +1018,41 @@ fn expand_host_tilde_in_workspace_flag(value: &str) -> Result<String, String> {
         rebuilt.push_str(t);
     }
     Ok(rebuilt)
+}
+
+/// Validate operator-host paths before `sandbox create` reaches the daemon.
+///
+/// The daemon may run as another user and may not be able to see the
+/// operator's workspace tree, so `WorkspaceMode::parse_flag` intentionally
+/// stays filesystem-free. The CLI is the boundary that can fail fast on
+/// typos while helper/backend code remains the final authority at use time.
+fn validate_workspace_host_path_for_create(
+    mode: &sandbox_core::WorkspaceMode,
+) -> Result<(), String> {
+    match mode {
+        sandbox_core::WorkspaceMode::Shared { host_path, .. } => {
+            if !Path::new(host_path).exists() {
+                return Err(format!(
+                    "shared workspace host_path does not exist: {host_path:?}"
+                ));
+            }
+            Ok(())
+        }
+        sandbox_core::WorkspaceMode::Local { host_path, .. } => {
+            match std::fs::metadata(host_path) {
+                Ok(metadata) if metadata.is_dir() => Ok(()),
+                Ok(_) => Err(format!(
+                    "host_path must be a directory for `local:`; to seed a single file, \
+                 use `sandbox cp <file> <session>:<path>` after creating the session. \
+                 (Got: {host_path:?})"
+                )),
+                Err(_) => Err(format!(
+                    "local workspace host_path does not exist: {host_path:?}"
+                )),
+            }
+        }
+        sandbox_core::WorkspaceMode::Clone { .. } => Ok(()),
+    }
 }
 
 /// CLI-side gate for `--no-gitignore`: only meaningful when paired
@@ -1217,7 +1251,14 @@ fn build_create_request_body(
                 process::exit(1);
             }
         };
-        if let Err(e) = sandbox_core::WorkspaceMode::parse_flag(&expanded) {
+        let mode = match sandbox_core::WorkspaceMode::parse_flag(&expanded) {
+            Ok(mode) => mode,
+            Err(e) => {
+                eprintln!("Error: --workspace {e}");
+                process::exit(1);
+            }
+        };
+        if let Err(e) = validate_workspace_host_path_for_create(&mode) {
             eprintln!("Error: --workspace {e}");
             process::exit(1);
         }
@@ -8235,6 +8276,64 @@ mod tests {
             err,
             "--no-gitignore is only meaningful for local: workspaces; this session uses <empty>:"
         );
+    }
+
+    #[test]
+    fn validate_workspace_host_path_accepts_existing_shared_path() {
+        let mode = sandbox_core::WorkspaceMode::parse_flag("shared:/tmp").unwrap();
+        assert_eq!(validate_workspace_host_path_for_create(&mode), Ok(()));
+    }
+
+    #[test]
+    fn validate_workspace_host_path_rejects_missing_shared_path() {
+        let missing = std::env::temp_dir().join(format!(
+            "sandbox-missing-shared-host-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let missing = missing.to_string_lossy().to_string();
+        let mode = sandbox_core::WorkspaceMode::parse_flag(&format!("shared:{missing}")).unwrap();
+
+        let err = validate_workspace_host_path_for_create(&mode)
+            .expect_err("missing shared path must reject in the CLI");
+        assert!(err.contains("shared workspace host_path does not exist"));
+        assert!(err.contains(&missing), "err = {err}");
+    }
+
+    #[test]
+    fn validate_workspace_host_path_rejects_missing_local_path() {
+        let missing = std::env::temp_dir().join(format!(
+            "sandbox-missing-local-host-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let missing = missing.to_string_lossy().to_string();
+        let mode = sandbox_core::WorkspaceMode::parse_flag(&format!("local:{missing}")).unwrap();
+
+        let err = validate_workspace_host_path_for_create(&mode)
+            .expect_err("missing local path must reject in the CLI");
+        assert!(err.contains("local workspace host_path does not exist"));
+        assert!(err.contains(&missing), "err = {err}");
+    }
+
+    #[test]
+    fn validate_workspace_host_path_rejects_local_file_path() {
+        let path = std::env::temp_dir().join(format!(
+            "sandbox-local-file-host-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"single-file payload").expect("write temp file");
+        let path = path.to_string_lossy().to_string();
+        let mode = sandbox_core::WorkspaceMode::parse_flag(&format!("local:{path}")).unwrap();
+
+        let err = validate_workspace_host_path_for_create(&mode)
+            .expect_err("local file path must reject in the CLI");
+        assert!(err.contains("must be a directory for `local:`"));
+        assert!(err.contains("sandbox cp"));
+        assert!(err.contains(&path), "err = {err}");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
