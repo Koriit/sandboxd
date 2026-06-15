@@ -313,7 +313,7 @@ Preset expansion happens entirely client-side — the daemon receives the fully-
 
 ### Built-in catalog
 
-Twelve built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata (the `show` output includes an `Example:` line with a ready-to-use `--preset` invocation).
+Thirteen built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata (the `show` output includes an `Example:` line with a ready-to-use `--preset` invocation).
 
 Unparameterized ecosystem presets:
 
@@ -334,6 +334,18 @@ The `docker` preset uses `tls`-level rules (SNI verification, no HTTP path filte
 
 ```bash
 sandbox create --preset docker --preset dockerhub
+```
+
+Coding-agent presets:
+
+| Preset    | Purpose                                                                                                                                                                                                                            |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claude:` | Claude Code installation and API access. Allows `GET`/`HEAD`/`POST` to `platform.claude.com` and `api.anthropic.com`, `GET`/`HEAD /install.sh` on `claude.ai`, and `GET`/`HEAD /claude-code-releases/**` on `downloads.claude.ai`. |
+
+Use `claude:` when the sandbox needs to install or run Claude Code:
+
+```bash
+sandbox create --preset 'claude:'
 ```
 
 GitHub family:

@@ -922,6 +922,8 @@ sandbox policy preset list
 
 ```
 cargo	built-in
+claude	built-in
+docker	built-in
 dockerhub	built-in
 github	built-in
 github-pr	built-in

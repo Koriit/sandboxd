@@ -11,11 +11,11 @@
 //!
 //! # Relationship to the design
 //!
-//! The first 11 entries cover ecosystem presets (npm, pypi, cargo,
-//! goproxy, maven, gradle, dockerhub, docker) and the GitHub family. The
-//! plain `github` preset unifies interactive hosts + asset CDN under a
-//! single preset name; operators who need narrower scope use
-//! `github-repo` / `github-pr` instead. The 12th entry, `ubuntu`, is
+//! The catalog covers ecosystem presets (npm, pypi, cargo, goproxy,
+//! maven, gradle, dockerhub, docker), coding-agent presets (`claude`),
+//! and the GitHub family. The plain `github` preset unifies interactive
+//! hosts + asset CDN under a single preset name; operators who need
+//! narrower scope use `github-repo` / `github-pr` instead. `ubuntu` is
 //! the first distro-level default-allow preset.
 //!
 //! # Determinism
@@ -105,6 +105,12 @@ pub const BUILTINS: &[BuiltinPreset] = &[
         name: "docker",
         description: "Allow Docker Engine installation (download.docker.com apt/yum repo + GPG key, get.docker.com install script). Compose with `dockerhub` for image pulls.",
         expand: expand_docker,
+    },
+    // ----- Coding-agent presets -----------------
+    BuiltinPreset {
+        name: "claude",
+        description: "Allow Claude Code installation and API access (Anthropic/Claude hosts).",
+        expand: expand_claude,
     },
     // ----- GitHub family ------------------------
     BuiltinPreset {
@@ -254,6 +260,57 @@ fn expand_docker(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError
     Ok(vec![
         tls_rule("download.docker.com"),
         tls_rule("get.docker.com"),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// claude (unparameterized)
+// ---------------------------------------------------------------------------
+
+fn get_head_post_all_paths() -> Vec<HttpFilter> {
+    vec![
+        HttpFilter {
+            method: HttpMethod::Get,
+            path: "/**".to_string(),
+        },
+        HttpFilter {
+            method: HttpMethod::Head,
+            path: "/**".to_string(),
+        },
+        HttpFilter {
+            method: HttpMethod::Post,
+            path: "/**".to_string(),
+        },
+    ]
+}
+
+fn get_head_paths(paths: &[&str]) -> Vec<HttpFilter> {
+    paths
+        .iter()
+        .flat_map(|path| {
+            [
+                HttpFilter {
+                    method: HttpMethod::Get,
+                    path: (*path).to_string(),
+                },
+                HttpFilter {
+                    method: HttpMethod::Head,
+                    path: (*path).to_string(),
+                },
+            ]
+        })
+        .collect()
+}
+
+fn expand_claude(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
+    Ok(vec![
+        http_rule("platform.claude.com", get_head_post_all_paths()),
+        http_rule("api.anthropic.com", get_head_post_all_paths()),
+        http_rule("claude.ai", get_head_paths(&["/install.sh"])),
+        http_rule(
+            "downloads.claude.ai",
+            get_head_paths(&["/claude-code-releases/**"]),
+        ),
     ])
 }
 
@@ -815,9 +872,9 @@ mod tests {
     // ----- unparameterized presets -----------------------------------
 
     #[test]
-    fn builtins_has_twelve_entries() {
-        // 11 ecosystem presets (incl. `docker`) + 1 `ubuntu` distro preset.
-        assert_eq!(BUILTINS.len(), 12);
+    fn builtins_has_thirteen_entries() {
+        // 11 ecosystem/GitHub presets + `claude` + `ubuntu`.
+        assert_eq!(BUILTINS.len(), 13);
     }
 
     #[test]
@@ -1126,6 +1183,73 @@ mod tests {
             overlap.is_empty(),
             "docker and dockerhub presets share hosts (would collide on compose): {overlap:?}"
         );
+    }
+
+    // ----- claude (unparameterized) -----------------------------------
+
+    #[test]
+    fn expand_claude_matches_spec() {
+        let rules = expand_builtin("claude", "claude:");
+        assert_eq!(
+            rules.len(),
+            4,
+            "claude preset must emit four host rules; got {} rules: {rules:?}",
+            rules.len()
+        );
+
+        let expected = [
+            (
+                "platform.claude.com",
+                vec![
+                    (HttpMethod::Get, "/**"),
+                    (HttpMethod::Head, "/**"),
+                    (HttpMethod::Post, "/**"),
+                ],
+            ),
+            (
+                "api.anthropic.com",
+                vec![
+                    (HttpMethod::Get, "/**"),
+                    (HttpMethod::Head, "/**"),
+                    (HttpMethod::Post, "/**"),
+                ],
+            ),
+            (
+                "claude.ai",
+                vec![
+                    (HttpMethod::Get, "/install.sh"),
+                    (HttpMethod::Head, "/install.sh"),
+                ],
+            ),
+            (
+                "downloads.claude.ai",
+                vec![
+                    (HttpMethod::Get, "/claude-code-releases/**"),
+                    (HttpMethod::Head, "/claude-code-releases/**"),
+                ],
+            ),
+        ];
+
+        for (rule, (expected_host, expected_filters)) in rules.iter().zip(expected) {
+            assert_eq!(rule.port, 443);
+            assert_eq!(rule.protocol, Protocol::Tcp);
+            match &rule.host {
+                Destination::Domain(d) => assert_eq!(d, expected_host),
+                other => panic!("expected Domain({expected_host}), got {other:?}"),
+            }
+            match &rule.level {
+                AssuranceLevel::Http { http_filters } => {
+                    let actual: Vec<(HttpMethod, &str)> = http_filters
+                        .iter()
+                        .map(|f| (f.method, f.path.as_str()))
+                        .collect();
+                    assert_eq!(actual, expected_filters);
+                }
+                other => panic!("expected Http level, got {other:?}"),
+            }
+        }
+
+        assert_rules_round_trip(rules);
     }
 
     // ----- ubuntu (unparameterized) -----------------------------------

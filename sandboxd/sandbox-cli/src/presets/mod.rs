@@ -581,14 +581,12 @@ mod tests {
     }
 
     #[test]
-    fn list_includes_all_twelve_builtins_sorted() {
+    fn list_includes_all_thirteen_builtins_sorted() {
         let xdg = empty_xdg_override();
         let catalog = Catalog::load(Some(xdg.path())).expect("empty dir loads clean");
         let summaries = catalog.list();
-        // The catalog ships 12 built-ins (11 ecosystem presets incl. `docker`
-        // plus the `ubuntu` distro preset). No user presets in the empty
-        // override dir.
-        assert_eq!(summaries.len(), 12);
+        // The catalog ships 13 built-ins. No user presets in the empty override dir.
+        assert_eq!(summaries.len(), 13);
         // Alphabetical sort.
         let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
         let mut sorted = names.clone();
@@ -679,7 +677,7 @@ mod tests {
         let catalog = Catalog::load(Some(xdg.path())).expect("load succeeds");
 
         let summaries = catalog.list();
-        assert_eq!(summaries.len(), 13, "12 built-ins + 1 user preset");
+        assert_eq!(summaries.len(), 14, "13 built-ins + 1 user preset");
         let user_summary = summaries
             .iter()
             .find(|s| s.name == "my-internal")
