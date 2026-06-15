@@ -2012,7 +2012,7 @@ impl LimaManager {
     ) -> Result<(), SandboxError> {
         let target = vm_name(&session_id);
         let cpus_s = cpus.to_string();
-        let memory_gib_s = mib_to_gib_string(memory_mb);
+        let memory_gib_s = mib_to_ceil_gib(memory_mb).to_string();
         let disk_s = disk_gb.to_string();
 
         info!(
@@ -2951,6 +2951,11 @@ fn mib_to_gib_string(mib: u32) -> String {
     }
 }
 
+/// Convert MiB to a whole GiB count for Lima CLI flags.
+fn mib_to_ceil_gib(mib: u32) -> u32 {
+    mib.div_ceil(1024)
+}
+
 /// Encode a byte slice as a lowercase hexadecimal string.
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -3876,6 +3881,14 @@ mod tests {
         assert_eq!(mib_to_gib_string(16384), "16");
         assert_eq!(mib_to_gib_string(1536), "1.5");
         assert_eq!(mib_to_gib_string(2560), "2.5");
+    }
+
+    #[test]
+    fn test_mib_to_ceil_gib() {
+        assert_eq!(mib_to_ceil_gib(1024), 1);
+        assert_eq!(mib_to_ceil_gib(4096), 4);
+        assert_eq!(mib_to_ceil_gib(10000), 10);
+        assert_eq!(mib_to_ceil_gib(1536), 2);
     }
 
     // -- Guest agent service unit tests --------------------------------------
