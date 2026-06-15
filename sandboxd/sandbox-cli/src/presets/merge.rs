@@ -2,7 +2,7 @@
 //!
 //! The [`mod@super::expand`] module per invocation is intentionally permissive —
 //! two presets may legitimately emit
-//! overlapping `(host, port)` rows (e.g. `github:` and
+//! overlapping `(host, port)` rows (e.g. `github` and
 //! `github-repo:repo=foo/bar` both declare `api.github.com:443`), and
 //! user-preset repeatable fan-out can produce intra-preset duplicates
 //! too.  [`merge_effective`] is the gate that catches either shape and
@@ -301,14 +301,14 @@ mod tests {
         let file = policy_of(file_rules.clone());
         let file_path = PathBuf::from("/tmp/policy.json");
 
-        // github: and npm: do not overlap with each other nor with the
+        // github and npm do not overlap with each other nor with the
         // file rule, so this should be a clean extend.
-        let expansions = pre_expand(&catalog, &["github:", "npm:"]);
+        let expansions = pre_expand(&catalog, &["github", "npm"]);
 
         let merged = merge_effective(Some(&file), Some(&file_path), &catalog, &expansions)
             .expect("clean merge should succeed");
 
-        // Order: file rules first, then github: rules, then npm: rules.
+        // Order: file rules first, then github rules, then npm rules.
         assert_eq!(merged.version, SCHEMA_VERSION);
         assert!(
             merged.rules.len() > file_rules.len(),
@@ -320,21 +320,21 @@ mod tests {
             other => panic!("expected the file's Domain first, got {other:?}"),
         }
         // The merged list must contain the npm registry host somewhere
-        // (proves npm:'s rule was included).
+        // (proves npm's rule was included).
         assert!(
             merged.rules.iter().any(|r| matches!(
                 &r.host,
                 Destination::Domain(d) if d == "registry.npmjs.org"
             )),
-            "npm: rules must be present in merged output"
+            "npm rules must be present in merged output"
         );
-        // ...and the github hosts (proves github:'s rules were included).
+        // ...and the github hosts (proves github's rules were included).
         assert!(
             merged.rules.iter().any(|r| matches!(
                 &r.host,
                 Destination::Domain(d) if d == "github.com"
             )),
-            "github: rules must be present in merged output"
+            "github rules must be present in merged output"
         );
     }
 
@@ -343,10 +343,10 @@ mod tests {
     #[test]
     fn two_presets_overlap_emits_duplicate_destination_naming_both_invocations() {
         let (catalog, _xdg) = empty_catalog();
-        // github: and github-repo:repo=foo/bar both declare
+        // github and github-repo:repo=foo/bar both declare
         // api.github.com:443 (and github.com:443).  This is a
         // multi-collision case that exercises the N-block path.
-        let expansions = pre_expand(&catalog, &["github:", "github-repo:repo=foo/bar"]);
+        let expansions = pre_expand(&catalog, &["github", "github-repo:repo=foo/bar"]);
 
         let err = merge_effective(None, None, &catalog, &expansions)
             .expect_err("overlapping presets must error");
@@ -355,7 +355,7 @@ mod tests {
 
         // Both collisions must be listed — github.com:443 AND
         // api.github.com:443.  Order follows first-seen order of the
-        // destination in the merged list, which is github:'s order
+        // destination in the merged list, which is github's order
         // (GITHUB_INTERACTIVE_HOSTS = ["github.com", "api.github.com"]).
         assert!(
             rendered.contains("duplicate destination (github.com, 443)"),
@@ -368,8 +368,8 @@ mod tests {
         // Each collision block names both preset invocations with the
         // required wording.
         assert!(
-            rendered.contains("declared by preset invocation 'github:' (built-in 'github')"),
-            "error must attribute to github: invocation, got:\n{rendered}"
+            rendered.contains("declared by preset invocation 'github' (built-in 'github')"),
+            "error must attribute to github invocation, got:\n{rendered}"
         );
         assert!(
             rendered.contains(
@@ -384,19 +384,19 @@ mod tests {
     #[test]
     fn file_and_preset_overlap_names_both_sources_golden_string() {
         let (catalog, _xdg) = empty_catalog();
-        // File declares api.github.com:443 at tls, github: declares it
+        // File declares api.github.com:443 at tls, github declares it
         // at http with the same (host, port) — a strict duplicate.
         let file = policy_of(vec![tls_rule("api.github.com", 443)]);
         let file_path = PathBuf::from("/etc/sandboxd/policy.json");
 
-        // Only one collision is *guaranteed* here — github: actually
+        // Only one collision is *guaranteed* here — github actually
         // emits github.com:443 too, but the file does not, so only
         // api.github.com has two sources.  That means the error is a
         // single-collision `DuplicateDestination`.
         //
-        // (github.com:443 is single-source inside github:, not a
+        // (github.com:443 is single-source inside github, not a
         // collision.)
-        let expansions = pre_expand(&catalog, &["github:"]);
+        let expansions = pre_expand(&catalog, &["github"]);
 
         let err = merge_effective(Some(&file), Some(&file_path), &catalog, &expansions)
             .expect_err("file/preset overlap must error");
@@ -407,7 +407,7 @@ mod tests {
         // preset invocation second.
         assert_eq!(
             err.to_string(),
-            "policy validation failed: duplicate destination (api.github.com, 443)\n  - declared by policy file /etc/sandboxd/policy.json\n  - declared by preset invocation 'github:' (built-in 'github')"
+            "policy validation failed: duplicate destination (api.github.com, 443)\n  - declared by policy file /etc/sandboxd/policy.json\n  - declared by preset invocation 'github' (built-in 'github')"
         );
     }
 
@@ -668,7 +668,7 @@ mod tests {
                     },
                     RuleSource::Builtin {
                         name: "github".to_string(),
-                        invocation: "github:".to_string(),
+                        invocation: "github".to_string(),
                     },
                 ],
             },
@@ -678,7 +678,7 @@ mod tests {
                 sources: vec![
                     RuleSource::Builtin {
                         name: "github".to_string(),
-                        invocation: "github:".to_string(),
+                        invocation: "github".to_string(),
                     },
                     RuleSource::Builtin {
                         name: "github-repo".to_string(),
@@ -691,10 +691,10 @@ mod tests {
             err.to_string(),
             "policy validation failed: duplicate destination (github.com, 443)\n  \
              - declared by policy file /etc/sandboxd/p.json\n  \
-             - declared by preset invocation 'github:' (built-in 'github')\n\
+             - declared by preset invocation 'github' (built-in 'github')\n\
              \n\
              policy validation failed: duplicate destination (api.github.com, 443)\n  \
-             - declared by preset invocation 'github:' (built-in 'github')\n  \
+             - declared by preset invocation 'github' (built-in 'github')\n  \
              - declared by preset invocation 'github-repo:repo=foo/bar' (built-in 'github-repo')"
         );
     }
@@ -731,7 +731,7 @@ mod tests {
         // collision the file source must render as "inline policy".
         let (catalog, _xdg) = empty_catalog();
         let file = policy_of(vec![tls_rule("api.github.com", 443)]);
-        let expansions = pre_expand(&catalog, &["github:"]);
+        let expansions = pre_expand(&catalog, &["github"]);
 
         let err = merge_effective(Some(&file), None, &catalog, &expansions)
             .expect_err("file/preset overlap must error");
@@ -741,7 +741,7 @@ mod tests {
             "missing inline-policy attribution, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("declared by preset invocation 'github:' (built-in 'github')"),
+            rendered.contains("declared by preset invocation 'github' (built-in 'github')"),
             "missing preset attribution, got:\n{rendered}"
         );
     }

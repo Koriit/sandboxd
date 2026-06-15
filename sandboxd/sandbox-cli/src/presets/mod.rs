@@ -346,7 +346,7 @@ pub enum PresetError {
     DuplicateDestination(Box<DuplicateDestination>),
 
     /// Two or more *distinct* `(host, port)` identities each had more
-    /// than one contributing source — e.g. `github:` and
+    /// than one contributing source — e.g. `github` and
     /// `github-repo:repo=foo/bar` overlap on both `github.com:443` and
     /// `api.github.com:443`. Reported as a single error (one block per
     /// collision) rather than surfacing them incrementally, so the
@@ -581,14 +581,12 @@ mod tests {
     }
 
     #[test]
-    fn list_includes_all_twelve_builtins_sorted() {
+    fn list_includes_all_thirteen_builtins_sorted() {
         let xdg = empty_xdg_override();
         let catalog = Catalog::load(Some(xdg.path())).expect("empty dir loads clean");
         let summaries = catalog.list();
-        // The catalog ships 12 built-ins (11 ecosystem presets incl. `docker`
-        // plus the `ubuntu` distro preset). No user presets in the empty
-        // override dir.
-        assert_eq!(summaries.len(), 12);
+        // The catalog ships 13 built-ins. No user presets in the empty override dir.
+        assert_eq!(summaries.len(), 13);
         // Alphabetical sort.
         let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
         let mut sorted = names.clone();
@@ -679,7 +677,7 @@ mod tests {
         let catalog = Catalog::load(Some(xdg.path())).expect("load succeeds");
 
         let summaries = catalog.list();
-        assert_eq!(summaries.len(), 13, "12 built-ins + 1 user preset");
+        assert_eq!(summaries.len(), 14, "13 built-ins + 1 user preset");
         let user_summary = summaries
             .iter()
             .find(|s| s.name == "my-internal")
@@ -719,7 +717,7 @@ mod tests {
             sources: vec![
                 RuleSource::Builtin {
                     name: "github".to_string(),
-                    invocation: "github:".to_string(),
+                    invocation: "github".to_string(),
                 },
                 RuleSource::PolicyFile {
                     path: PathBuf::from("/path/to/policy.json"),
@@ -728,7 +726,7 @@ mod tests {
         }));
         assert_eq!(
             err.to_string(),
-            "policy validation failed: duplicate destination (api.github.com, 443)\n  - declared by preset invocation 'github:' (built-in 'github')\n  - declared by policy file /path/to/policy.json"
+            "policy validation failed: duplicate destination (api.github.com, 443)\n  - declared by preset invocation 'github' (built-in 'github')\n  - declared by policy file /path/to/policy.json"
         );
     }
 

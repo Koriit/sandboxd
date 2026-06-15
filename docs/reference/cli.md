@@ -97,7 +97,7 @@ Syntax:
 --preset '<name>[:key=val[,key=val,...]]'
 ```
 
-- `<name>` is the preset to apply, e.g. `npm`, `github-repo`. A bare name requires a trailing colon: `'npm:'`.
+- `<name>` is the preset to apply, e.g. `npm`, `github-repo`. Unparameterized presets use the bare name (`npm`); the legacy trailing-colon form (`npm:`) is still accepted.
 - Each `key=val` segment supplies one parameter. Keys and values are separated by `=`; segments are separated by `,`.
 - Values may not contain a raw `,`, `:`, or `=`. There is no escape mechanism — a forbidden character in a value is a hard error. In practice no built-in preset param needs any of those characters, and user presets should pick param shapes that avoid them.
 - Repeated keys stack in invocation order (e.g. `'github-repo:repo=foo/bar,repo=baz/qux'` passes two repos).
@@ -105,7 +105,7 @@ Syntax:
 The flag is repeatable so multiple presets can be stacked on one command line:
 
 ```bash
-sandbox create --name dev --preset 'npm:' --preset 'pypi:'
+sandbox create --name dev --preset 'npm' --preset 'pypi'
 ```
 
 Interaction with `--policy`:
@@ -115,16 +115,16 @@ Interaction with `--policy`:
 
 Errors (text-identical to the CLI's `Error: <...>` line on stderr, exit code 1):
 
-- **Unknown preset** — `--preset 'foo:'` where `foo` is neither a built-in nor a user-configured preset:
+- **Unknown preset** — `--preset 'foo'` where `foo` is neither a built-in nor a user-configured preset:
 
   ```
   Error: unknown preset 'foo'
   ```
 
-- **Malformed invocation** — missing `:` separator, empty name, or a param segment missing `=`:
+- **Malformed invocation** — empty name or a param segment missing `=`:
 
   ```
-  Error: malformed preset invocation 'npm': missing ':' separator between preset name and params
+  Error: malformed preset invocation 'github-repo:repo': param segment 'repo' is missing '=' between key and value; use 'github-repo:key=value' for parameterized presets or 'github-repo' for parameterless presets
   ```
 
 - **Forbidden character in value** — a raw `,`, `:`, or `=` inside a value:
@@ -138,7 +138,7 @@ Errors (text-identical to the CLI's `Error: <...>` line on stderr, exit code 1):
   ```
   Error: policy validation failed: duplicate destination (registry.npmjs.org, 443)
     - declared by policy file /tmp/policy.json
-    - declared by preset invocation 'npm:' (built-in 'npm')
+    - declared by preset invocation 'npm' (built-in 'npm')
   ```
 
 See the [Presets guide](/sandboxd/guides/network-policies/#presets) for the built-in catalog and user-preset file format, and [`sandbox policy preset`](#sandbox-policy-preset) below for the client-local inspection subcommands.
@@ -148,7 +148,7 @@ Example:
 ```bash
 # Create a session whose agent can fetch npm packages and clone one GitHub repo.
 sandbox create --name dev \
-    --preset 'npm:' \
+    --preset 'npm' \
     --preset 'github-repo:repo=rust-lang/rustlings'
 ```
 
@@ -879,11 +879,11 @@ sandbox policy update feedfacecafe --policy restricted-policy.json
 
 # Apply presets on top of an existing policy file
 sandbox policy update dev --policy policy.json \
-    --preset 'npm:' \
+    --preset 'npm' \
     --preset 'github-repo:repo=rust-lang/rustlings'
 
 # Apply presets with no file policy (presets become the whole effective policy)
-sandbox policy update dev --preset 'cargo:'
+sandbox policy update dev --preset 'cargo'
 
 # Drop the active policy and return the session to fail-closed
 sandbox policy update my-sandbox --clear
@@ -922,6 +922,8 @@ sandbox policy preset list
 
 ```
 cargo	built-in
+claude	built-in
+docker	built-in
 dockerhub	built-in
 github	built-in
 github-pr	built-in
@@ -1014,7 +1016,7 @@ Errors are the same set as [`--preset`](#preset-invocations) (unknown preset, ma
 Example — an unparameterized preset:
 
 ```bash
-sandbox policy preset expand 'npm:'
+sandbox policy preset expand 'npm'
 ```
 
 ```json

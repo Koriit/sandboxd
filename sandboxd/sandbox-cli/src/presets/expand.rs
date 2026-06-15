@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn builtin_preset_dispatches_to_fn_pointer() {
         let (catalog, _xdg) = empty_catalog();
-        let rules = expand(&catalog, &parse("npm:")).expect("npm should expand");
+        let rules = expand(&catalog, &parse("npm")).expect("npm should expand");
         assert_eq!(rules.len(), 1);
     }
 

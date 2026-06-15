@@ -11,12 +11,12 @@
 //!
 //! # Relationship to the design
 //!
-//! The first 11 entries cover ecosystem presets (npm, pypi, cargo,
-//! goproxy, maven, gradle, dockerhub, docker) and the GitHub family. The
-//! plain `github` preset unifies interactive hosts + asset CDN under a
-//! single preset name; operators who need narrower scope use
-//! `github-repo` / `github-pr` instead. The 12th entry, `ubuntu`, is
-//! the first distro-level default-allow preset.
+//! The catalog covers ecosystem presets (npm, pypi, cargo, goproxy,
+//! maven, gradle, dockerhub, docker), coding-agent presets (`claude`),
+//! and the GitHub family. The plain `github` preset unifies interactive
+//! hosts + read-only download hosts under a single preset name;
+//! operators who need narrower scope use `github-repo` / `github-pr`
+//! instead. `ubuntu` is the first distro-level default-allow preset.
 //!
 //! # Determinism
 //!
@@ -106,10 +106,16 @@ pub const BUILTINS: &[BuiltinPreset] = &[
         description: "Allow Docker Engine installation (download.docker.com apt/yum repo + GPG key, get.docker.com install script). Compose with `dockerhub` for image pulls.",
         expand: expand_docker,
     },
+    // ----- Coding-agent presets -----------------
+    BuiltinPreset {
+        name: "claude",
+        description: "Allow Claude Code installation and API access (Anthropic/Claude hosts).",
+        expand: expand_claude,
+    },
     // ----- GitHub family ------------------------
     BuiltinPreset {
         name: "github",
-        description: "Allow broad GitHub access (github.com, api.github.com interactive + asset CDN).",
+        description: "Allow broad GitHub access (github.com, api.github.com interactive + read-only download hosts).",
         expand: expand_github,
     },
     BuiltinPreset {
@@ -169,7 +175,7 @@ fn tls_rule(host: &str) -> PolicyRule {
 
 /// Emit one `http`-level rule per host in `hosts`, all sharing the
 /// same method-filter shape. Used by every consume-only preset and
-/// by the asset-CDN half of `github:`.
+/// by the read-only half of `github`.
 fn consume_rules(hosts: &[&str]) -> Vec<PolicyRule> {
     hosts
         .iter()
@@ -258,6 +264,57 @@ fn expand_docker(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError
 }
 
 // ---------------------------------------------------------------------------
+// claude (unparameterized)
+// ---------------------------------------------------------------------------
+
+fn get_head_post_all_paths() -> Vec<HttpFilter> {
+    vec![
+        HttpFilter {
+            method: HttpMethod::Get,
+            path: "/**".to_string(),
+        },
+        HttpFilter {
+            method: HttpMethod::Head,
+            path: "/**".to_string(),
+        },
+        HttpFilter {
+            method: HttpMethod::Post,
+            path: "/**".to_string(),
+        },
+    ]
+}
+
+fn get_head_paths(paths: &[&str]) -> Vec<HttpFilter> {
+    paths
+        .iter()
+        .flat_map(|path| {
+            [
+                HttpFilter {
+                    method: HttpMethod::Get,
+                    path: (*path).to_string(),
+                },
+                HttpFilter {
+                    method: HttpMethod::Head,
+                    path: (*path).to_string(),
+                },
+            ]
+        })
+        .collect()
+}
+
+fn expand_claude(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
+    Ok(vec![
+        http_rule("platform.claude.com", get_head_post_all_paths()),
+        http_rule("api.anthropic.com", get_head_post_all_paths()),
+        http_rule("claude.ai", get_head_paths(&["/install.sh"])),
+        http_rule(
+            "downloads.claude.ai",
+            get_head_paths(&["/claude-code-releases/**"]),
+        ),
+    ])
+}
+
+// ---------------------------------------------------------------------------
 // github (unparameterized, mixed-posture)
 // ---------------------------------------------------------------------------
 
@@ -265,9 +322,11 @@ fn expand_docker(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError
 /// workflows (push, REST API writes, OAuth) routinely POST.
 const GITHUB_INTERACTIVE_HOSTS: &[&str] = &["github.com", "api.github.com"];
 
-/// GitHub asset-CDN hosts — read-only posture (`GET /**`, `HEAD /**`).
-/// No legitimate workflow POSTs to a tarball or raw-file CDN.
-const GITHUB_ASSET_CDN_HOSTS: &[&str] = &[
+/// GitHub read-only hosts — read-only posture (`GET /**`, `HEAD /**`).
+/// No legitimate workflow POSTs to a tarball, raw-file CDN, or GitHub
+/// CLI package repository.
+const GITHUB_READ_ONLY_HOSTS: &[&str] = &[
+    "cli.github.com",
     "codeload.github.com",
     "objects.githubusercontent.com",
     "raw.githubusercontent.com",
@@ -276,11 +335,11 @@ const GITHUB_ASSET_CDN_HOSTS: &[&str] = &[
 
 fn expand_github(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
     let mut rules =
-        Vec::with_capacity(GITHUB_INTERACTIVE_HOSTS.len() + GITHUB_ASSET_CDN_HOSTS.len());
+        Vec::with_capacity(GITHUB_INTERACTIVE_HOSTS.len() + GITHUB_READ_ONLY_HOSTS.len());
     for host in GITHUB_INTERACTIVE_HOSTS {
         rules.push(http_rule(host, method::any_all_paths()));
     }
-    for host in GITHUB_ASSET_CDN_HOSTS {
+    for host in GITHUB_READ_ONLY_HOSTS {
         rules.push(http_rule(host, method::get_head()));
     }
     Ok(rules)
@@ -815,9 +874,9 @@ mod tests {
     // ----- unparameterized presets -----------------------------------
 
     #[test]
-    fn builtins_has_twelve_entries() {
-        // 11 ecosystem presets (incl. `docker`) + 1 `ubuntu` distro preset.
-        assert_eq!(BUILTINS.len(), 12);
+    fn builtins_has_thirteen_entries() {
+        // 11 ecosystem/GitHub presets + `claude` + `ubuntu`.
+        assert_eq!(BUILTINS.len(), 13);
     }
 
     #[test]
@@ -835,21 +894,21 @@ mod tests {
 
     #[test]
     fn expand_npm_matches_spec() {
-        let rules = expand_builtin("npm", "npm:");
+        let rules = expand_builtin("npm", "npm");
         assert_consume_posture(&rules, &["registry.npmjs.org"]);
         assert_rules_round_trip(rules);
     }
 
     #[test]
     fn expand_pypi_matches_spec() {
-        let rules = expand_builtin("pypi", "pypi:");
+        let rules = expand_builtin("pypi", "pypi");
         assert_consume_posture(&rules, &["pypi.org", "files.pythonhosted.org"]);
         assert_rules_round_trip(rules);
     }
 
     #[test]
     fn expand_cargo_matches_spec() {
-        let rules = expand_builtin("cargo", "cargo:");
+        let rules = expand_builtin("cargo", "cargo");
         assert_consume_posture(
             &rules,
             &["crates.io", "index.crates.io", "static.crates.io"],
@@ -965,7 +1024,7 @@ mod tests {
         // preset emits Domain + Http rules exclusively (asserted by
         // `expand_cargo_matches_spec` above), so a single match arm
         // covers every rule.
-        let rules = expand_builtin("cargo", "cargo:");
+        let rules = expand_builtin("cargo", "cargo");
         let preset_methods: BTreeMap<String, BTreeSet<String>> = rules
             .iter()
             .filter_map(|r| match (&r.host, &r.level) {
@@ -1128,6 +1187,73 @@ mod tests {
         );
     }
 
+    // ----- claude (unparameterized) -----------------------------------
+
+    #[test]
+    fn expand_claude_matches_spec() {
+        let rules = expand_builtin("claude", "claude");
+        assert_eq!(
+            rules.len(),
+            4,
+            "claude preset must emit four host rules; got {} rules: {rules:?}",
+            rules.len()
+        );
+
+        let expected = [
+            (
+                "platform.claude.com",
+                vec![
+                    (HttpMethod::Get, "/**"),
+                    (HttpMethod::Head, "/**"),
+                    (HttpMethod::Post, "/**"),
+                ],
+            ),
+            (
+                "api.anthropic.com",
+                vec![
+                    (HttpMethod::Get, "/**"),
+                    (HttpMethod::Head, "/**"),
+                    (HttpMethod::Post, "/**"),
+                ],
+            ),
+            (
+                "claude.ai",
+                vec![
+                    (HttpMethod::Get, "/install.sh"),
+                    (HttpMethod::Head, "/install.sh"),
+                ],
+            ),
+            (
+                "downloads.claude.ai",
+                vec![
+                    (HttpMethod::Get, "/claude-code-releases/**"),
+                    (HttpMethod::Head, "/claude-code-releases/**"),
+                ],
+            ),
+        ];
+
+        for (rule, (expected_host, expected_filters)) in rules.iter().zip(expected) {
+            assert_eq!(rule.port, 443);
+            assert_eq!(rule.protocol, Protocol::Tcp);
+            match &rule.host {
+                Destination::Domain(d) => assert_eq!(d, expected_host),
+                other => panic!("expected Domain({expected_host}), got {other:?}"),
+            }
+            match &rule.level {
+                AssuranceLevel::Http { http_filters } => {
+                    let actual: Vec<(HttpMethod, &str)> = http_filters
+                        .iter()
+                        .map(|f| (f.method, f.path.as_str()))
+                        .collect();
+                    assert_eq!(actual, expected_filters);
+                }
+                other => panic!("expected Http level, got {other:?}"),
+            }
+        }
+
+        assert_rules_round_trip(rules);
+    }
+
     // ----- ubuntu (unparameterized) -----------------------------------
 
     /// The `ubuntu` preset is structurally distinct from every other
@@ -1139,7 +1265,7 @@ mod tests {
     /// loudly.
     #[test]
     fn expand_ubuntu_matches_spec() {
-        let rules = expand_builtin("ubuntu", "ubuntu:");
+        let rules = expand_builtin("ubuntu", "ubuntu");
 
         // One NTP rule + two apt rules, in source-order. The preset
         // emits in a fixed sequence (UBUNTU_NTP_HOSTS then
@@ -1200,7 +1326,7 @@ mod tests {
     #[test]
     fn ubuntu_preset_rules_are_unique_by_host_port() {
         use std::collections::HashSet;
-        let rules = expand_builtin("ubuntu", "ubuntu:");
+        let rules = expand_builtin("ubuntu", "ubuntu");
         let mut seen: HashSet<(String, u16)> = HashSet::new();
         for r in &rules {
             let key = (r.host.to_string(), r.port);
@@ -1212,12 +1338,12 @@ mod tests {
     }
 
     #[test]
-    fn expand_github_interactive_hosts_use_any_asset_cdn_uses_get_head() {
-        // Expects two rows under `github:`:
+    fn expand_github_interactive_hosts_use_any_read_only_hosts_use_get_head() {
+        // Expects two rows under `github`:
         //   interactive → ANY /**
-        //   asset CDN   → GET /**, HEAD /**
-        let rules = expand_builtin("github", "github:");
-        assert_eq!(rules.len(), 6);
+        //   read-only   → GET /**, HEAD /**
+        let rules = expand_builtin("github", "github");
+        assert_eq!(rules.len(), 7);
 
         // First two rules are the interactive hosts — ANY /** posture.
         for (rule, host) in rules[..2]
@@ -1240,14 +1366,15 @@ mod tests {
             }
         }
 
-        // Remaining four rules are the asset CDN hosts — GET/HEAD posture.
-        let asset_hosts = [
+        // Remaining rules are read-only hosts — GET/HEAD posture.
+        let read_only_hosts = [
+            "cli.github.com",
             "codeload.github.com",
             "objects.githubusercontent.com",
             "raw.githubusercontent.com",
             "release-assets.githubusercontent.com",
         ];
-        for (rule, host) in rules[2..].iter().zip(asset_hosts.iter()) {
+        for (rule, host) in rules[2..].iter().zip(read_only_hosts.iter()) {
             match &rule.host {
                 Destination::Domain(d) => assert_eq!(d, host),
                 other => panic!("expected Domain, got {other:?}"),

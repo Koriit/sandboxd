@@ -313,7 +313,7 @@ Preset expansion happens entirely client-side — the daemon receives the fully-
 
 ### Built-in catalog
 
-Twelve built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata (the `show` output includes an `Example:` line with a ready-to-use `--preset` invocation).
+Thirteen built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata (the `show` output includes an `Example:` line with a ready-to-use `--preset` invocation).
 
 Unparameterized ecosystem presets:
 
@@ -336,11 +336,23 @@ The `docker` preset uses `tls`-level rules (SNI verification, no HTTP path filte
 sandbox create --preset docker --preset dockerhub
 ```
 
+Coding-agent presets:
+
+| Preset    | Purpose                                                                                                                                                                                                                            |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claude`  | Claude Code installation and API access. Allows `GET`/`HEAD`/`POST` to `platform.claude.com` and `api.anthropic.com`, `GET`/`HEAD /install.sh` on `claude.ai`, and `GET`/`HEAD /claude-code-releases/**` on `downloads.claude.ai`. |
+
+Use `claude` when the sandbox needs to install or run Claude Code:
+
+```bash
+sandbox create --preset 'claude'
+```
+
 GitHub family:
 
 | Preset                           | Purpose                                                                                                                                                                                                                                            |
 | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `github:`                        | Broad GitHub access: `github.com` and `api.github.com` with `ANY /**`, plus read-only access to the asset CDN hosts (`codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`). |
+| `github`                         | Broad GitHub access: `github.com` and `api.github.com` with `ANY /**`, plus read-only access to `cli.github.com` and the asset CDN hosts (`codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`). |
 | `github-repo:repo=OWNER/REPO`    | One-repo scope. Required repeatable `repo=owner/name` param — each value contributes its path filters. Covers git-pack URLs, the repo's REST API subtree, archive downloads, and raw-content reads.                                                |
 | `github-pr:repo=OWNER/REPO,pr=N` | One-PR scope. Paired repeatable `repo=` / `pr=` params — both required, counts must match. Grants access to a single PR's metadata, comments, and files, nothing more (no git clone/fetch/push, no archive download).                              |
 
@@ -348,15 +360,15 @@ OS / distro presets:
 
 | Preset    | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ubuntu:` | Default-allow rules an Ubuntu sandbox needs to function. One NTP rule (UDP/123 to `ntp.ubuntu.com`, the canonical vendor pool — Canonical removed `time.ubuntu.com` from authoritative DNS) so `systemd-timesyncd` / `chrony` can sync the clock, plus two apt-mirror rules (HTTPS/443 to `archive.ubuntu.com` and `security.ubuntu.com`) so a stock 22.04+ `/etc/apt/sources.list` can run `apt update` and `apt install`. |
+| `ubuntu`  | Default-allow rules an Ubuntu sandbox needs to function. One NTP rule (UDP/123 to `ntp.ubuntu.com`, the canonical vendor pool — Canonical removed `time.ubuntu.com` from authoritative DNS) so `systemd-timesyncd` / `chrony` can sync the clock, plus two apt-mirror rules (HTTPS/443 to `archive.ubuntu.com` and `security.ubuntu.com`) so a stock 22.04+ `/etc/apt/sources.list` can run `apt update` and `apt install`. |
 
-Use `ubuntu:` whenever you boot a session against an Ubuntu image and need the host distro's own housekeeping (clock sync + mirror reads) to keep working — for example, when an agent's first action is `apt install build-essential`. The preset is intentionally minimal: it does not allow snap (`api.snapcraft.io`), livepatch (`livepatch.canonical.com`), or changelog fetches (`changelogs.ubuntu.com`); add explicit rules for those if your workload needs them. The preset is unparameterized like `npm:` / `pypi:` — there is no `ubuntu:release=...` or `ubuntu:mirror=...` knob in v1.
+Use `ubuntu` whenever you boot a session against an Ubuntu image and need the host distro's own housekeeping (clock sync + mirror reads) to keep working — for example, when an agent's first action is `apt install build-essential`. The preset is intentionally minimal: it does not allow snap (`api.snapcraft.io`), livepatch (`livepatch.canonical.com`), or changelog fetches (`changelogs.ubuntu.com`); add explicit rules for those if your workload needs them. The preset is unparameterized like `npm` / `pypi` — there is no `ubuntu:release=...` or `ubuntu:mirror=...` knob in v1.
 
 ```bash
-sandbox create --image ubuntu --preset 'ubuntu:'
+sandbox create --image ubuntu --preset 'ubuntu'
 ```
 
-Stack `ubuntu:` alongside any number of ecosystem or GitHub presets — for example `--preset 'ubuntu:' --preset 'npm:' --preset 'github-repo:repo=acme/widget'` to give an agent a working clock + apt + npm registry + one repo's git-pack URLs.
+Stack `ubuntu` alongside any number of ecosystem or GitHub presets — for example `--preset 'ubuntu' --preset 'npm' --preset 'github-repo:repo=acme/widget'` to give an agent a working clock + apt + npm registry + one repo's git-pack URLs.
 
 The authoritative host and filter lists live in the CLI source at `sandboxd/sandbox-cli/src/presets/builtin.rs`; the exact shape of each expansion is also visible on demand via `sandbox policy preset expand '<invocation>'`.
 
@@ -447,7 +459,7 @@ When a collision is detected, the CLI exits non-zero and prints one block per co
 ```text
 Error: policy validation failed: duplicate destination (registry.npmjs.org, 443)
   - declared by policy file /tmp/policy.json
-  - declared by preset invocation 'npm:' (built-in 'npm')
+  - declared by preset invocation 'npm' (built-in 'npm')
 ```
 
 N-way collisions list all N contributing sources, not just the first pair. Multiple distinct collisions in one invocation are reported as one error with several blocks separated by blank lines, so you can fix the whole set in a single pass.
@@ -458,16 +470,16 @@ Fixing a collision: either remove the overlapping rule from the policy file, dro
 
 ```bash
 # 1. Dry-run: see exactly what rules a preset will add to the effective policy.
-sandbox policy preset expand 'npm:'
+sandbox policy preset expand 'npm'
 
 # 2. Apply presets at session creation.
 sandbox create --name my-agent \
-    --preset 'npm:' \
-    --preset 'pypi:'
+    --preset 'npm' \
+    --preset 'pypi'
 
 # 3. Or update an existing session's policy — presets merge on top of any --policy file.
 sandbox policy update my-agent \
-    --preset 'cargo:' \
+    --preset 'cargo' \
     --preset 'github-repo:repo=rust-lang/rustlings'
 ```
 

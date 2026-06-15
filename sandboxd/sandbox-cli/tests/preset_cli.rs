@@ -8,7 +8,7 @@
 //!   [`policy_preset_show_github_repo_documents_repo_param`],
 //!   [`policy_preset_expand_github_repo_emits_valid_policy`], and
 //!   [`policy_preset_expand_unknown_preset_exits_nonzero`].
-//! - `sandbox policy update <sid> --preset 'npm:' --clear` — clap-level
+//! - `sandbox policy update <sid> --preset 'npm' --clear` — clap-level
 //!   mutual exclusion. Covered by
 //!   [`policy_update_preset_plus_clear_is_parse_error`].
 //! - `sandbox create --policy ... --preset ... --preset ...` and
@@ -386,7 +386,7 @@ async fn policy_preset_expand_unknown_preset_exits_nonzero() {
     );
 }
 
-/// `sandbox policy update <sid> --preset 'npm:' --clear` is rejected
+/// `sandbox policy update <sid> --preset 'npm' --clear` is rejected
 /// by clap — `--preset` and `--clear` are mutually exclusive per D-7.
 /// Verifies the mutual-exclusion lives at parse time (so the daemon
 /// never sees a malformed invocation) rather than at dispatch time.
@@ -398,7 +398,7 @@ async fn policy_update_preset_plus_clear_is_parse_error() {
             "update",
             "my-session",
             "--preset",
-            "npm:",
+            "npm",
             "--clear",
         ],
         None,
@@ -422,11 +422,11 @@ async fn policy_update_preset_plus_clear_is_parse_error() {
 // End-to-end body-construction tests (fake daemon)
 // ---------------------------------------------------------------------------
 
-/// `sandbox create --policy p.json --preset 'npm:' --preset 'pypi:'`
+/// `sandbox create --policy p.json --preset 'npm' --preset 'pypi'`
 /// builds a POST body with:
 /// - `policy.rules` containing the merged set (policy-file rules first,
 ///   then the preset rules in invocation order).
-/// - `source_presets = ["npm:", "pypi:"]` as a sibling field.
+/// - `source_presets = ["npm", "pypi"]` as a sibling field.
 #[tokio::test]
 async fn create_with_policy_and_two_presets_posts_merged_body() {
     // Write a minimal policy file with one rule the presets will
@@ -459,9 +459,9 @@ async fn create_with_policy_and_two_presets_posts_merged_body() {
             "--policy",
             policy_path.to_str().unwrap(),
             "--preset",
-            "npm:",
+            "npm",
             "--preset",
-            "pypi:",
+            "pypi",
             "-y",
         ],
         Some(&sock),
@@ -503,10 +503,10 @@ async fn create_with_policy_and_two_presets_posts_merged_body() {
         .as_array()
         .expect("source_presets must be an array");
     let sps_strs: Vec<&str> = sps.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(sps_strs, vec!["npm:", "pypi:"]);
+    assert_eq!(sps_strs, vec!["npm", "pypi"]);
 }
 
-/// `sandbox policy update <sid> --preset 'cargo:'` builds a POST body
+/// `sandbox policy update <sid> --preset 'cargo'` builds a POST body
 /// via the `UpdatePolicyRequest` DTO shape: top-level Policy fields
 /// (`version`, `rules`) flattened plus a sibling `source_presets`
 /// array.
@@ -515,7 +515,7 @@ async fn policy_update_with_preset_posts_merged_body() {
     let (_dtmp, sock, captured) = spawn_fake_daemon_for_policy_update().await;
 
     let (status, stdout, stderr) = run_sandbox(
-        &["policy", "update", "my-session", "--preset", "cargo:"],
+        &["policy", "update", "my-session", "--preset", "cargo"],
         Some(&sock),
     )
     .await;
@@ -550,7 +550,7 @@ async fn policy_update_with_preset_posts_merged_body() {
         .as_array()
         .expect("source_presets must be an array");
     let sps_strs: Vec<&str> = sps.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(sps_strs, vec!["cargo:"]);
+    assert_eq!(sps_strs, vec!["cargo"]);
 }
 
 /// `sandbox policy update <sid>` with no `--policy`, no `--preset`,
@@ -577,8 +577,8 @@ async fn policy_update_with_no_flags_errors_with_three_option_guidance() {
 }
 
 /// Integration-style test mirroring the cross-check the design asks for:
-/// a create request with only `--preset 'npm:'` produces a daemon-side
-/// body that carries `source_presets: ["npm:"]` AND a policy whose
+/// a create request with only `--preset 'npm'` produces a daemon-side
+/// body that carries `source_presets: ["npm"]` AND a policy whose
 /// rules include the npm registry host.
 ///
 /// This is the "daemon sees the wire shape the design specifies" test.
@@ -588,7 +588,7 @@ async fn create_with_npm_preset_ships_source_presets() {
     let (_dtmp, sock, captured) = spawn_fake_daemon_for_create().await;
 
     let (status, stdout, stderr) =
-        run_sandbox(&["create", "--preset", "npm:", "-y"], Some(&sock)).await;
+        run_sandbox(&["create", "--preset", "npm", "-y"], Some(&sock)).await;
     assert!(
         status.success(),
         "exit: {status:?}\nstdout: {stdout}\nstderr: {stderr}"
@@ -601,7 +601,7 @@ async fn create_with_npm_preset_ships_source_presets() {
         .expect("fake daemon never saw the create request");
     let parsed: Value = serde_json::from_str(&body).unwrap();
 
-    assert_eq!(parsed["source_presets"], json!(["npm:"]));
+    assert_eq!(parsed["source_presets"], json!(["npm"]));
 
     let rules = parsed["policy"]["rules"]
         .as_array()

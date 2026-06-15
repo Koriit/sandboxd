@@ -79,7 +79,7 @@ enum Command {
         policy: Option<String>,
         /// Preset invocation(s) to apply on top of the optional
         /// `--policy` file. Repeatable. Each invocation has the form
-        /// `'<name>[:key=value[,key=value,...]]'` (e.g. `npm:`,
+        /// `'<name>[:key=value[,key=value,...]]'` (e.g. `npm`,
         /// `github-repo:repo=foo/bar`). Presets expand client-side
         /// into rules that merge with the policy file; the composed
         /// effective policy is sent to the daemon, along with the
