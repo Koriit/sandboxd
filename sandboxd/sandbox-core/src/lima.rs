@@ -871,16 +871,16 @@ const QEMU_WRAPPER_SCRIPT: &str = r#"#!/bin/sh
 #
 # Always:
 # 1. Adds a PCIe root-port so that NIC hot-add via QMP works on q35 machines.
-#
 # When SANDBOX_DOCKER_BRIDGE is set:
-# 2. Adds a second NIC connected to the Docker bridge via qemu-bridge-helper.
+# 2. Restricts Lima's management slirp NIC to host-initiated forwards only.
+# 3. Adds a second NIC connected to the Docker bridge via qemu-bridge-helper.
 #
 # When SANDBOX_QEMU_HARDENED=1:
-# 3. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
+# 4. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
 #    and adds virtio-rng for guest entropy.
 #
 # When SANDBOX_QEMU_MEMORY_MB and SANDBOX_QEMU_CPUS are set:
-# 4. Applies cgroup resource limits via systemd-run.
+# 5. Applies cgroup resource limits via systemd-run.
 
 # Find the real QEMU binary, excluding this wrapper's directory to prevent
 # infinite recursion if Lima prepends it to PATH.
@@ -914,7 +914,50 @@ EXTRA_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
 # QEMU resolves the helper via its compile-time libexecdir default
 # (different on Ubuntu/Debian (/usr/lib/qemu/) vs RHEL/Fedora
 # (/usr/libexec/)); sandboxd does not pin the path.
+# Lima's mandatory management NIC is QEMU user-mode/slirp.  It is needed
+# for host-initiated SSH/readiness forwards, but guest-initiated traffic
+# through it would bypass the sandbox gateway when bridge networking is
+# active.  In that mode, normalize every `-netdev user,...` backend to
+# `restrict=on` before QEMU sees the argv.  Base-image builds have no
+# sandbox bridge yet and intentionally keep unrestricted slirp for package
+# installation during provisioning.
 if [ -n "$SANDBOX_DOCKER_BRIDGE" ]; then
+    remaining=$#
+    while [ "$remaining" -gt 0 ]; do
+        arg="$1"
+        shift
+        remaining=$((remaining - 1))
+
+        if [ "$arg" = "-netdev" ] && [ "$remaining" -gt 0 ]; then
+            netdev="$1"
+            shift
+            remaining=$((remaining - 1))
+
+            case "$netdev" in
+                user|user,*)
+                    IFS=,
+                    restricted_netdev=""
+                    for field in $netdev; do
+                        case "$field" in
+                            restrict=*) continue ;;
+                        esac
+                        if [ -z "$restricted_netdev" ]; then
+                            restricted_netdev="$field"
+                        else
+                            restricted_netdev="$restricted_netdev,$field"
+                        fi
+                    done
+                    unset IFS
+                    netdev="$restricted_netdev,restrict=on"
+                    ;;
+            esac
+
+            set -- "$@" "$arg" "$netdev"
+        else
+            set -- "$@" "$arg"
+        fi
+    done
+
     EXTRA_ARGS="$EXTRA_ARGS \
         -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \
         -device virtio-net-pci,netdev=net_sandbox,mac=$SANDBOX_VM_MAC,bus=pcie-hotplug-port"
@@ -3903,6 +3946,18 @@ mod tests {
         assert!(
             QEMU_WRAPPER_SCRIPT.contains("SANDBOX_VM_MAC"),
             "wrapper must use SANDBOX_VM_MAC for the NIC MAC address"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_restricts_slirp_netdev() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("user|user,*)"),
+            "wrapper must inspect QEMU -netdev user backends"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("netdev=\"$restricted_netdev,restrict=on\""),
+            "wrapper must add restrict=on to Lima's slirp management NIC"
         );
     }
 

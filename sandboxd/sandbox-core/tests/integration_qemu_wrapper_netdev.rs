@@ -1,5 +1,5 @@
-//! Integration test: the QEMU wrapper script emits a `-netdev bridge,…`
-//! argv that contains **no** `helper=` parameter.
+//! Integration test: the QEMU wrapper script emits hardened `-netdev`
+//! argv for both Lima's management slirp NIC and the sandbox bridge NIC.
 //!
 //! The wrapper script's bridge-networking branch was simplified in the
 //! daemon-productionization revision: QEMU now resolves
@@ -44,7 +44,10 @@ use sandbox_core::lima::{DEFAULT_BASE_VM_NAME, LimaManager};
 /// CI runners that have Docker but not Lima). The caller skips gracefully
 /// via `eprintln!` + `return` rather than panicking, consistent with the
 /// soft-skip pattern used in `integration_guest_refresh_lima_backend`.
-fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
+fn capture_wrapper_argv_with_user_netdev(
+    bridge_name: Option<&str>,
+    user_netdev: &str,
+) -> Option<String> {
     let dir = tempfile::TempDir::new().expect("tempdir");
 
     // The LimaManager constructor no longer probes PATH for limactl
@@ -98,18 +101,21 @@ fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let output = Command::new(&wrapper_path)
+    let mut command = Command::new(&wrapper_path);
+    command
         .env("PATH", &path)
-        .env("SANDBOX_DOCKER_BRIDGE", bridge_name)
-        .env("SANDBOX_VM_MAC", "52:54:00:12:34:56")
         // Cgroup-limit env vars are intentionally absent so the
         // wrapper takes the direct-exec branch (not the
         // systemd-run-wrapped branch); the bridge argv composition is
         // identical on both branches but the direct path is the
         // simplest to capture.
-        .arg("-machine-not-help")
-        .output()
-        .expect("run wrapper script");
+        .args(["-netdev", user_netdev, "-machine-not-help"]);
+    if let Some(bridge) = bridge_name {
+        command
+            .env("SANDBOX_DOCKER_BRIDGE", bridge)
+            .env("SANDBOX_VM_MAC", "52:54:00:12:34:56");
+    }
+    let output = command.output().expect("run wrapper script");
 
     if !output.status.success() {
         panic!(
@@ -121,6 +127,74 @@ fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
     }
 
     Some(String::from_utf8(output.stdout).expect("argv must be utf-8"))
+}
+
+fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
+    capture_wrapper_argv_with_user_netdev(
+        Some(bridge_name),
+        "user,id=net0,hostfwd=tcp:127.0.0.1:0-:22",
+    )
+}
+
+#[test]
+fn integration_qemu_wrapper_restricts_management_slirp_netdev() {
+    let Some(argv) = capture_wrapper_argv("sandbox-test-br") else {
+        eprintln!(
+            "integration_qemu_wrapper_restricts_management_slirp_netdev: limactl not on PATH — skipping. \
+             Lima is not installed on this CI runner."
+        );
+        return;
+    };
+
+    assert!(
+        argv.contains("user,id=net0,hostfwd=tcp:127.0.0.1:0-:22,restrict=on"),
+        "wrapper must add `restrict=on` to Lima's management slirp netdev while preserving hostfwd; argv=\n{argv}"
+    );
+}
+
+#[test]
+fn integration_qemu_wrapper_overrides_existing_restrict_value() {
+    let Some(argv) = capture_wrapper_argv_with_user_netdev(
+        Some("sandbox-test-br"),
+        "user,id=net0,hostfwd=tcp:127.0.0.1:0-:22,restrict=off",
+    ) else {
+        eprintln!(
+            "integration_qemu_wrapper_overrides_existing_restrict_value: limactl not on PATH — skipping. \
+             Lima is not installed on this CI runner."
+        );
+        return;
+    };
+
+    assert!(
+        argv.contains("user,id=net0,hostfwd=tcp:127.0.0.1:0-:22,restrict=on"),
+        "wrapper must replace existing user-netdev restrict values with restrict=on; argv=\n{argv}"
+    );
+    assert!(
+        !argv.contains("restrict=off"),
+        "wrapper must not preserve an unrestricted slirp setting; argv=\n{argv}"
+    );
+}
+
+#[test]
+fn integration_qemu_wrapper_leaves_base_image_slirp_unrestricted_without_bridge() {
+    let Some(argv) =
+        capture_wrapper_argv_with_user_netdev(None, "user,id=net0,hostfwd=tcp:127.0.0.1:0-:22")
+    else {
+        eprintln!(
+            "integration_qemu_wrapper_leaves_base_image_slirp_unrestricted_without_bridge: limactl not on PATH — skipping. \
+             Lima is not installed on this CI runner."
+        );
+        return;
+    };
+
+    assert!(
+        argv.contains("user,id=net0,hostfwd=tcp:127.0.0.1:0-:22"),
+        "wrapper must preserve base-image slirp netdev when no sandbox bridge is active; argv=\n{argv}"
+    );
+    assert!(
+        !argv.contains("restrict=on"),
+        "wrapper must not restrict base-image slirp before the sandbox bridge exists; argv=\n{argv}"
+    );
 }
 
 #[test]

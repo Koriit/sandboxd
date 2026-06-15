@@ -555,6 +555,142 @@ def test_denied_traffic(sandbox_cli, backend):
             sandbox_cli("rm", "net-deny-test", timeout=120)
 
 
+@pytest.mark.lima
+@pytest.mark.timeout(600)
+def test_lima_slirp_route_fallback_cannot_bypass_gateway(sandbox_cli):
+    """Deleting the gateway default route must not expose Lima slirp egress."""
+    session_id = None
+    session_name = "net-slirp-bypass-test"
+    try:
+        result = sandbox_cli(
+            "create", *make_create_args("lima", session_name),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, session_name, "Running", timeout=10)
+
+        network = inspect_session_network(sandbox_cli, session_name)
+        gateway_ip = network["gateway_ip"]
+        session_ip = network["session_ip"]
+
+        slirp_iface_result = sandbox_cli(
+            "exec", session_name, "--",
+            "bash", "-c",
+            (
+                f"SESSION_IP={shlex.quote(session_ip)}; "
+                "ip -o -4 addr show scope global | "
+                "awk -v session_ip=\"$SESSION_IP\" "
+                "'$4 !~ \"^\" session_ip \"/\" "
+                "{ sub(/:$/, \"\", $2); print $2; found=1; exit } "
+                "END { exit found ? 0 : 1 }'"
+            ),
+            timeout=60,
+        )
+        assert slirp_iface_result.returncode == 0, (
+            "failed to identify Lima's management slirp interface.\n"
+            f"stdout: {slirp_iface_result.stdout}"
+            f"stderr: {slirp_iface_result.stderr}"
+        )
+        slirp_iface = slirp_iface_result.stdout.strip().splitlines()[0]
+
+        route_before = sandbox_cli(
+            "exec", session_name, "--",
+            "ip", "route", "show", "default",
+            timeout=60,
+        )
+        assert route_before.returncode == 0, (
+            f"failed to read default routes before mutation.\n"
+            f"stdout: {route_before.stdout}\nstderr: {route_before.stderr}"
+        )
+        assert f"via {gateway_ip}" in route_before.stdout, (
+            f"gateway default route via {gateway_ip} was not present before mutation.\n"
+            f"routes:\n{route_before.stdout}"
+        )
+
+        delete_gateway_route = sandbox_cli(
+            "exec", session_name, "--",
+            "sudo", "ip", "route", "del", "default", "via", gateway_ip,
+            timeout=60,
+        )
+        assert delete_gateway_route.returncode == 0, (
+            f"failed to delete gateway default route via {gateway_ip}.\n"
+            f"stdout: {delete_gateway_route.stdout}\nstderr: {delete_gateway_route.stderr}"
+        )
+
+        route_after = sandbox_cli(
+            "exec", session_name, "--",
+            "ip", "route", "show", "default",
+            timeout=60,
+        )
+        assert route_after.returncode == 0, (
+            f"failed to read default routes after mutation.\n"
+            f"stdout: {route_after.stdout}\nstderr: {route_after.stderr}"
+        )
+        assert f"via {gateway_ip}" not in route_after.stdout, (
+            f"gateway default route via {gateway_ip} was still present after deletion.\n"
+            f"routes:\n{route_after.stdout}"
+        )
+        slirp_default_after = [
+            line for line in route_after.stdout.splitlines()
+            if line.startswith("default ") and f" dev {slirp_iface}" in line
+        ]
+        if not slirp_default_after:
+            add_slirp_route = sandbox_cli(
+                "exec", session_name, "--",
+                "sudo", "ip", "route", "replace", "default",
+                "via", "192.168.5.2", "dev", slirp_iface, "metric", "1",
+                timeout=60,
+            )
+            assert add_slirp_route.returncode == 0, (
+                "failed to install a preferred route through Lima's "
+                f"management slirp interface {slirp_iface}.\n"
+                f"stdout: {add_slirp_route.stdout}"
+                f"stderr: {add_slirp_route.stderr}\n"
+                f"routes before:\n{route_before.stdout}"
+                f"routes after deleting gateway default:\n{route_after.stdout}"
+            )
+
+            route_after = sandbox_cli(
+                "exec", session_name, "--",
+                "ip", "route", "show", "default",
+                timeout=60,
+            )
+            assert route_after.returncode == 0, (
+                "failed to read default routes after installing the slirp "
+                "fallback route.\n"
+                f"stdout: {route_after.stdout}"
+                f"stderr: {route_after.stderr}"
+            )
+            assert f" dev {slirp_iface}" in route_after.stdout, (
+                "expected a default route through Lima's management slirp "
+                f"interface {slirp_iface}.\n"
+                f"routes:\n{route_after.stdout}"
+            )
+
+        bypass_probe = sandbox_cli(
+            "exec", session_name, "--",
+            "timeout", "5", "bash", "-c", "</dev/tcp/1.1.1.1/443",
+            timeout=30,
+        )
+        assert bypass_probe.returncode != 0, (
+            "Lima management slirp allowed guest-initiated internet egress "
+            "after the sandbox gateway default route was deleted.\n"
+            f"stdout: {bypass_probe.stdout}\nstderr: {bypass_probe.stderr}\n"
+            f"routes before:\n{route_before.stdout}\nroutes after:\n{route_after.stdout}\n"
+            f"{capture_lima_logs(session_id)}"
+        )
+
+        sandbox_cli("rm", session_name, timeout=120)
+        session_id = None
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", session_name, timeout=120)
+
+
 @pytest.mark.timeout(600)
 def test_dns_interception(sandbox_cli, backend):
     """Verify DNS queries from the VM go through the gateway's CoreDNS.
