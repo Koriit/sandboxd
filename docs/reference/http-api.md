@@ -98,7 +98,7 @@ Request body (all fields optional):
   "disk_gb": 20,
   "template": "/path/to/lima.yaml",
   "policy": { "version": "2.0.0", "rules": [] },
-  "source_presets": ["npm:", "github-repo:repo=foo/bar"],
+  "source_presets": ["npm", "github-repo:repo=foo/bar"],
   "repo": "https://github.com/example/app.git",
   "boot_cmd": "make setup",
   "workspace": "shared:/home/you/project",

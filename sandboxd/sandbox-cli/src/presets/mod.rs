@@ -346,7 +346,7 @@ pub enum PresetError {
     DuplicateDestination(Box<DuplicateDestination>),
 
     /// Two or more *distinct* `(host, port)` identities each had more
-    /// than one contributing source — e.g. `github:` and
+    /// than one contributing source — e.g. `github` and
     /// `github-repo:repo=foo/bar` overlap on both `github.com:443` and
     /// `api.github.com:443`. Reported as a single error (one block per
     /// collision) rather than surfacing them incrementally, so the
@@ -717,7 +717,7 @@ mod tests {
             sources: vec![
                 RuleSource::Builtin {
                     name: "github".to_string(),
-                    invocation: "github:".to_string(),
+                    invocation: "github".to_string(),
                 },
                 RuleSource::PolicyFile {
                     path: PathBuf::from("/path/to/policy.json"),
@@ -726,7 +726,7 @@ mod tests {
         }));
         assert_eq!(
             err.to_string(),
-            "policy validation failed: duplicate destination (api.github.com, 443)\n  - declared by preset invocation 'github:' (built-in 'github')\n  - declared by policy file /path/to/policy.json"
+            "policy validation failed: duplicate destination (api.github.com, 443)\n  - declared by preset invocation 'github' (built-in 'github')\n  - declared by policy file /path/to/policy.json"
         );
     }
 

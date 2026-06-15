@@ -3,9 +3,9 @@
 //!
 //! Every consume-only preset (`npm`, `pypi`, `cargo`, `goproxy`,
 //! `maven`, `gradle`, `dockerhub`, and the GitHub asset-CDN hosts
-//! under `github:`) shares the same `GET /**` + `HEAD /**` filter
+//! under `github`) shares the same `GET /**` + `HEAD /**` filter
 //! posture. The interactive GitHub hosts (`github.com`,
-//! `api.github.com` under `github:`) share a single `ANY /**` filter.
+//! `api.github.com` under `github`) share a single `ANY /**` filter.
 //! Keeping these as named constructors (instead of inlining the
 //! two-element / one-element `Vec` literals at every call site)
 //! prevents accidental drift — a typo that turns one preset's `/**`
@@ -41,7 +41,7 @@ pub fn get_head() -> Vec<HttpFilter> {
 
 /// The interactive-surface posture: `[ANY /**]`.
 ///
-/// Used by the plain `github:` preset on `github.com` and
+/// Used by the plain `github` preset on `github.com` and
 /// `api.github.com`, where legitimate workflows routinely POST
 /// (git-receive-pack, REST API writes, OAuth). Method-level
 /// enforcement is traded for mitmproxy's per-request audit log — a

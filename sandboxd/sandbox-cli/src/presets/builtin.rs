@@ -14,9 +14,9 @@
 //! The catalog covers ecosystem presets (npm, pypi, cargo, goproxy,
 //! maven, gradle, dockerhub, docker), coding-agent presets (`claude`),
 //! and the GitHub family. The plain `github` preset unifies interactive
-//! hosts + asset CDN under a single preset name; operators who need
-//! narrower scope use `github-repo` / `github-pr` instead. `ubuntu` is
-//! the first distro-level default-allow preset.
+//! hosts + read-only download hosts under a single preset name;
+//! operators who need narrower scope use `github-repo` / `github-pr`
+//! instead. `ubuntu` is the first distro-level default-allow preset.
 //!
 //! # Determinism
 //!
@@ -115,7 +115,7 @@ pub const BUILTINS: &[BuiltinPreset] = &[
     // ----- GitHub family ------------------------
     BuiltinPreset {
         name: "github",
-        description: "Allow broad GitHub access (github.com, api.github.com interactive + asset CDN).",
+        description: "Allow broad GitHub access (github.com, api.github.com interactive + read-only download hosts).",
         expand: expand_github,
     },
     BuiltinPreset {
@@ -175,7 +175,7 @@ fn tls_rule(host: &str) -> PolicyRule {
 
 /// Emit one `http`-level rule per host in `hosts`, all sharing the
 /// same method-filter shape. Used by every consume-only preset and
-/// by the asset-CDN half of `github:`.
+/// by the read-only half of `github`.
 fn consume_rules(hosts: &[&str]) -> Vec<PolicyRule> {
     hosts
         .iter()
@@ -322,9 +322,11 @@ fn expand_claude(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError
 /// workflows (push, REST API writes, OAuth) routinely POST.
 const GITHUB_INTERACTIVE_HOSTS: &[&str] = &["github.com", "api.github.com"];
 
-/// GitHub asset-CDN hosts — read-only posture (`GET /**`, `HEAD /**`).
-/// No legitimate workflow POSTs to a tarball or raw-file CDN.
-const GITHUB_ASSET_CDN_HOSTS: &[&str] = &[
+/// GitHub read-only hosts — read-only posture (`GET /**`, `HEAD /**`).
+/// No legitimate workflow POSTs to a tarball, raw-file CDN, or GitHub
+/// CLI package repository.
+const GITHUB_READ_ONLY_HOSTS: &[&str] = &[
+    "cli.github.com",
     "codeload.github.com",
     "objects.githubusercontent.com",
     "raw.githubusercontent.com",
@@ -333,11 +335,11 @@ const GITHUB_ASSET_CDN_HOSTS: &[&str] = &[
 
 fn expand_github(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
     let mut rules =
-        Vec::with_capacity(GITHUB_INTERACTIVE_HOSTS.len() + GITHUB_ASSET_CDN_HOSTS.len());
+        Vec::with_capacity(GITHUB_INTERACTIVE_HOSTS.len() + GITHUB_READ_ONLY_HOSTS.len());
     for host in GITHUB_INTERACTIVE_HOSTS {
         rules.push(http_rule(host, method::any_all_paths()));
     }
-    for host in GITHUB_ASSET_CDN_HOSTS {
+    for host in GITHUB_READ_ONLY_HOSTS {
         rules.push(http_rule(host, method::get_head()));
     }
     Ok(rules)
@@ -892,21 +894,21 @@ mod tests {
 
     #[test]
     fn expand_npm_matches_spec() {
-        let rules = expand_builtin("npm", "npm:");
+        let rules = expand_builtin("npm", "npm");
         assert_consume_posture(&rules, &["registry.npmjs.org"]);
         assert_rules_round_trip(rules);
     }
 
     #[test]
     fn expand_pypi_matches_spec() {
-        let rules = expand_builtin("pypi", "pypi:");
+        let rules = expand_builtin("pypi", "pypi");
         assert_consume_posture(&rules, &["pypi.org", "files.pythonhosted.org"]);
         assert_rules_round_trip(rules);
     }
 
     #[test]
     fn expand_cargo_matches_spec() {
-        let rules = expand_builtin("cargo", "cargo:");
+        let rules = expand_builtin("cargo", "cargo");
         assert_consume_posture(
             &rules,
             &["crates.io", "index.crates.io", "static.crates.io"],
@@ -1022,7 +1024,7 @@ mod tests {
         // preset emits Domain + Http rules exclusively (asserted by
         // `expand_cargo_matches_spec` above), so a single match arm
         // covers every rule.
-        let rules = expand_builtin("cargo", "cargo:");
+        let rules = expand_builtin("cargo", "cargo");
         let preset_methods: BTreeMap<String, BTreeSet<String>> = rules
             .iter()
             .filter_map(|r| match (&r.host, &r.level) {
@@ -1189,7 +1191,7 @@ mod tests {
 
     #[test]
     fn expand_claude_matches_spec() {
-        let rules = expand_builtin("claude", "claude:");
+        let rules = expand_builtin("claude", "claude");
         assert_eq!(
             rules.len(),
             4,
@@ -1263,7 +1265,7 @@ mod tests {
     /// loudly.
     #[test]
     fn expand_ubuntu_matches_spec() {
-        let rules = expand_builtin("ubuntu", "ubuntu:");
+        let rules = expand_builtin("ubuntu", "ubuntu");
 
         // One NTP rule + two apt rules, in source-order. The preset
         // emits in a fixed sequence (UBUNTU_NTP_HOSTS then
@@ -1324,7 +1326,7 @@ mod tests {
     #[test]
     fn ubuntu_preset_rules_are_unique_by_host_port() {
         use std::collections::HashSet;
-        let rules = expand_builtin("ubuntu", "ubuntu:");
+        let rules = expand_builtin("ubuntu", "ubuntu");
         let mut seen: HashSet<(String, u16)> = HashSet::new();
         for r in &rules {
             let key = (r.host.to_string(), r.port);
@@ -1336,12 +1338,12 @@ mod tests {
     }
 
     #[test]
-    fn expand_github_interactive_hosts_use_any_asset_cdn_uses_get_head() {
-        // Expects two rows under `github:`:
+    fn expand_github_interactive_hosts_use_any_read_only_hosts_use_get_head() {
+        // Expects two rows under `github`:
         //   interactive → ANY /**
-        //   asset CDN   → GET /**, HEAD /**
-        let rules = expand_builtin("github", "github:");
-        assert_eq!(rules.len(), 6);
+        //   read-only   → GET /**, HEAD /**
+        let rules = expand_builtin("github", "github");
+        assert_eq!(rules.len(), 7);
 
         // First two rules are the interactive hosts — ANY /** posture.
         for (rule, host) in rules[..2]
@@ -1364,14 +1366,15 @@ mod tests {
             }
         }
 
-        // Remaining four rules are the asset CDN hosts — GET/HEAD posture.
-        let asset_hosts = [
+        // Remaining rules are read-only hosts — GET/HEAD posture.
+        let read_only_hosts = [
+            "cli.github.com",
             "codeload.github.com",
             "objects.githubusercontent.com",
             "raw.githubusercontent.com",
             "release-assets.githubusercontent.com",
         ];
-        for (rule, host) in rules[2..].iter().zip(asset_hosts.iter()) {
+        for (rule, host) in rules[2..].iter().zip(read_only_hosts.iter()) {
             match &rule.host {
                 Destination::Domain(d) => assert_eq!(d, host),
                 other => panic!("expected Domain, got {other:?}"),
