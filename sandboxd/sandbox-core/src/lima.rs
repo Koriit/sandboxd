@@ -922,41 +922,43 @@ EXTRA_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
 # sandbox bridge yet and intentionally keep unrestricted slirp for package
 # installation during provisioning.
 if [ -n "$SANDBOX_DOCKER_BRIDGE" ]; then
-    remaining=$#
-    while [ "$remaining" -gt 0 ]; do
-        arg="$1"
-        shift
-        remaining=$((remaining - 1))
-
-        if [ "$arg" = "-netdev" ] && [ "$remaining" -gt 0 ]; then
-            netdev="$1"
+    if [ "$SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING" != "1" ]; then
+        remaining=$#
+        while [ "$remaining" -gt 0 ]; do
+            arg="$1"
             shift
             remaining=$((remaining - 1))
 
-            case "$netdev" in
-                user|user,*)
-                    IFS=,
-                    restricted_netdev=""
-                    for field in $netdev; do
-                        case "$field" in
-                            restrict=*) continue ;;
-                        esac
-                        if [ -z "$restricted_netdev" ]; then
-                            restricted_netdev="$field"
-                        else
-                            restricted_netdev="$restricted_netdev,$field"
-                        fi
-                    done
-                    unset IFS
-                    netdev="$restricted_netdev,restrict=on"
-                    ;;
-            esac
+            if [ "$arg" = "-netdev" ] && [ "$remaining" -gt 0 ]; then
+                netdev="$1"
+                shift
+                remaining=$((remaining - 1))
 
-            set -- "$@" "$arg" "$netdev"
-        else
-            set -- "$@" "$arg"
-        fi
-    done
+                case "$netdev" in
+                    user|user,*)
+                        IFS=,
+                        restricted_netdev=""
+                        for field in $netdev; do
+                            case "$field" in
+                                restrict=*) continue ;;
+                            esac
+                            if [ -z "$restricted_netdev" ]; then
+                                restricted_netdev="$field"
+                            else
+                                restricted_netdev="$restricted_netdev,$field"
+                            fi
+                        done
+                        unset IFS
+                        netdev="$restricted_netdev,restrict=on"
+                        ;;
+                esac
+
+                set -- "$@" "$arg" "$netdev"
+            else
+                set -- "$@" "$arg"
+            fi
+        done
+    fi
 
     EXTRA_ARGS="$EXTRA_ARGS \
         -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \
@@ -1360,6 +1362,7 @@ impl LimaManager {
         config: &SessionConfig,
         bridge_name: Option<&str>,
         vm_mac: Option<&str>,
+        unrestricted_slirp_for_provisioning: bool,
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
@@ -1403,6 +1406,9 @@ impl LimaManager {
             extra.push(&bridge_owned);
             extra.push("--vm-mac");
             extra.push(&mac_owned);
+            if unrestricted_slirp_for_provisioning {
+                extra.push("--unrestricted-slirp-for-provisioning");
+            }
         }
 
         let output = self.run_helper(
@@ -3971,6 +3977,10 @@ mod tests {
         assert!(
             QEMU_WRAPPER_SCRIPT.contains("netdev=\"$restricted_netdev,restrict=on\""),
             "wrapper must add restrict=on to Lima's slirp management NIC"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING"),
+            "wrapper must support a first-boot provisioning escape hatch"
         );
     }
 

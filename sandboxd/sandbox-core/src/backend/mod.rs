@@ -132,6 +132,12 @@ pub struct RuntimeStartArgs {
     /// pre-V008 record where the daemon didn't yet capture peercred, or
     /// a fixture-test row that omits it.
     pub operator_identity: Option<(u32, u32)>,
+    /// Lima: allow the management slirp NIC to stay unrestricted for this
+    /// start. Used only for first-boot `limactl create` sessions whose
+    /// cloud-init provisioning still needs guest-initiated network access
+    /// before the sandbox gateway is configured. Callers must restart the VM
+    /// without this flag before exposing the session as ready.
+    pub lima_unrestricted_slirp_for_provisioning: bool,
 }
 
 /// Opaque per-backend handle to a created session, returned by
@@ -378,6 +384,11 @@ mod tests {
         assert!(args.lima_mac.is_none());
         assert!(args.lima_config.is_none());
         assert!(args.for_user.is_none());
+        assert!(
+            !args.lima_unrestricted_slirp_for_provisioning,
+            "lima_unrestricted_slirp_for_provisioning must default to false — \
+             sessions must never start with slirp unrestricted"
+        );
     }
 
     /// `RuntimeStartArgs` is `Clone` so handlers can capture it before

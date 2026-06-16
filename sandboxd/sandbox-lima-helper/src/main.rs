@@ -276,6 +276,7 @@ struct StartArgs {
     start_timeout_s: u32,
     bridge_name: Option<String>,
     vm_mac: Option<String>,
+    unrestricted_slirp_for_provisioning: bool,
 }
 
 struct CloneArgs {
@@ -789,6 +790,8 @@ fn parse_start(args: &[OsString]) -> Result<Subcommand, String> {
     let start_timeout_s_s = require_flag("--start-timeout-s", f.take_string("--start-timeout-s")?)?;
     let bridge_name = f.take_string("--bridge-name")?;
     let vm_mac = f.take_string("--vm-mac")?;
+    let unrestricted_slirp_for_provisioning =
+        f.take_bool("--unrestricted-slirp-for-provisioning")?;
     f.check_no_extra()?;
 
     let op_uid = parse_u32("--op-uid", &op_uid_s)?;
@@ -805,6 +808,7 @@ fn parse_start(args: &[OsString]) -> Result<Subcommand, String> {
         start_timeout_s,
         bridge_name,
         vm_mac,
+        unrestricted_slirp_for_provisioning,
     }))
 }
 
@@ -983,6 +987,13 @@ fn validate_subcommand(sub: &Subcommand) -> Result<(), (u8, String)> {
             validate_range("--cpus", a.cpus, 1, 64)?;
             validate_range("--start-timeout-s", a.start_timeout_s, 1, 600)?;
             validate_bridge_mac_pair(a.bridge_name.as_deref(), a.vm_mac.as_deref())?;
+            if a.unrestricted_slirp_for_provisioning && a.bridge_name.is_none() {
+                return Err((
+                    EXIT_BAD_ARGS,
+                    "--unrestricted-slirp-for-provisioning requires --bridge-name/--vm-mac"
+                        .to_string(),
+                ));
+            }
         }
         Subcommand::Clone(a) => {
             validate_vm_name(&a.base)?;
@@ -1662,10 +1673,14 @@ fn build_env_block(sub: &Subcommand, lima_home: &str, op_home: &str, op_uid: u32
             }
         }
         if let (Some(bridge), Some(mac)) = (&a.bridge_name, &a.vm_mac) {
-            for kv in &[
+            let mut bridge_env = vec![
                 format!("SANDBOX_DOCKER_BRIDGE={bridge}"),
                 format!("SANDBOX_VM_MAC={mac}"),
-            ] {
+            ];
+            if a.unrestricted_slirp_for_provisioning {
+                bridge_env.push("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING=1".to_string());
+            }
+            for kv in &bridge_env {
                 if let Ok(c) = CString::new(kv.as_str()) {
                     env.push(c);
                 }
@@ -3197,6 +3212,7 @@ WantedBy=multi-user.target";
             start_timeout_s: 300,
             bridge_name: None,
             vm_mac: None,
+            unrestricted_slirp_for_provisioning: false,
         });
         let argv = build_limactl_argv("/usr/bin/limactl", &sub);
         assert_eq!(
@@ -3318,6 +3334,7 @@ WantedBy=multi-user.target";
             start_timeout_s: 300,
             bridge_name: Some("br0".to_string()),
             vm_mac: Some("02:00:00:00:00:01".to_string()),
+            unrestricted_slirp_for_provisioning: false,
         });
         let env = build_env_block(
             &sub,
@@ -3359,6 +3376,7 @@ WantedBy=multi-user.target";
             start_timeout_s: 300,
             bridge_name: None,
             vm_mac: None,
+            unrestricted_slirp_for_provisioning: false,
         });
         let env = build_env_block(
             &sub,
@@ -3418,6 +3436,7 @@ WantedBy=multi-user.target";
             start_timeout_s: 300,
             bridge_name: Some("br0".to_string()),
             vm_mac: Some("02:00:00:00:00:01".to_string()),
+            unrestricted_slirp_for_provisioning: false,
         });
         let env = build_env_block(
             &sub,

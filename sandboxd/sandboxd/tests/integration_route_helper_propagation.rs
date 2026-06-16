@@ -425,6 +425,7 @@ async fn integration_route_helper_for_user_falls_through_lima() {
         // Lima call site under test does not exercise the spawn-helper
         // dispatch (no operator pair captured).
         operator_identity: None,
+        lima_unrestricted_slirp_for_provisioning: false,
     };
     // Sanity: the field shape is symmetric to the container path; the
     // type compiles with `for_user` present. If a future change drops

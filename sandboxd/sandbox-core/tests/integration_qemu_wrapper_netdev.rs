@@ -136,6 +136,69 @@ fn capture_wrapper_argv(bridge_name: &str) -> Option<String> {
     )
 }
 
+/// Variant that also sets arbitrary extra environment variables before
+/// executing the wrapper. Used by tests that need to exercise env-driven
+/// branches (e.g. `SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING`) on top
+/// of the standard bridge + user-netdev setup.
+fn capture_wrapper_argv_with_extra_env(
+    bridge_name: Option<&str>,
+    user_netdev: &str,
+    extra_env: &[(&str, &str)],
+) -> Option<String> {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+
+    let lima_home = dir.path().join("lima");
+    std::fs::create_dir_all(&lima_home).expect("create lima_home");
+    let mgr = LimaManager::new(
+        lima_home,
+        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        nix::unistd::Uid::current().as_raw(),
+        DEFAULT_BASE_VM_NAME.to_string(),
+        "test-pool".to_string(),
+    );
+    let wrapper_path: PathBuf = mgr
+        .ensure_qemu_wrapper_for_test()
+        .expect("write wrapper script");
+
+    let stub_dir = dir.path().join("stub-bin");
+    std::fs::create_dir(&stub_dir).expect("create stub bin dir");
+    let stub_path = stub_dir.join("qemu-system-x86_64");
+    std::fs::write(&stub_path, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 0\n").expect("write stub");
+    std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod stub");
+
+    let path = format!(
+        "{}:{}",
+        stub_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut command = Command::new(&wrapper_path);
+    command
+        .env("PATH", &path)
+        .args(["-netdev", user_netdev, "-machine-not-help"]);
+    if let Some(bridge) = bridge_name {
+        command
+            .env("SANDBOX_DOCKER_BRIDGE", bridge)
+            .env("SANDBOX_VM_MAC", "52:54:00:12:34:56");
+    }
+    for (key, val) in extra_env {
+        command.env(key, val);
+    }
+    let output = command.output().expect("run wrapper script");
+
+    if !output.status.success() {
+        panic!(
+            "wrapper exited non-zero (status={:?}); stdout=\n{}\nstderr=\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Some(String::from_utf8(output.stdout).expect("argv must be utf-8"))
+}
+
 #[test]
 fn integration_qemu_wrapper_restricts_management_slirp_netdev() {
     let Some(argv) = capture_wrapper_argv("sandbox-test-br") else {
@@ -238,5 +301,46 @@ fn integration_qemu_wrapper_no_helper_param_in_netdev() {
     assert!(
         !argv.contains(",helper"),
         "wrapper must NOT emit a `,helper` continuation in the netdev arg; argv=\n{argv}"
+    );
+}
+
+#[test]
+fn integration_qemu_wrapper_provisioning_escape_hatch_disables_restriction() {
+    // When a sandbox bridge is active AND the provisioning escape hatch env
+    // var is set, the wrapper must NOT add `restrict=on` to the slirp netdev.
+    // This path is taken during the first-boot provisioning start (before the
+    // VM is stopped and restarted with the bridge NIC and full restriction).
+    let Some(argv) = capture_wrapper_argv_with_extra_env(
+        Some("sandbox-test-br"),
+        "user,id=net0,hostfwd=tcp:127.0.0.1:0-:22",
+        &[("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING", "1")],
+    ) else {
+        eprintln!(
+            "integration_qemu_wrapper_provisioning_escape_hatch_disables_restriction: limactl not on PATH — skipping. \
+             Lima is not installed on this CI runner."
+        );
+        return;
+    };
+
+    // The load-bearing assertions: `restrict=on` must NOT appear when the
+    // escape hatch is active, but the bridge NIC must still be injected so
+    // the daemon can configure the gateway-facing interface.
+    assert!(
+        !argv.contains("restrict=on"),
+        "wrapper must NOT add `restrict=on` when SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING=1 \
+         is set, even with an active bridge; argv=\n{argv}"
+    );
+    assert!(
+        argv.contains("-netdev\nbridge,id=net_sandbox,br=sandbox-test-br"),
+        "wrapper must still add the sandbox bridge netdev while the provisioning escape hatch is active; argv=\n{argv}"
+    );
+    assert!(
+        argv.contains("virtio-net-pci,netdev=net_sandbox,mac=52:54:00:12:34:56"),
+        "wrapper must still add the sandbox bridge NIC while the provisioning escape hatch is active; argv=\n{argv}"
+    );
+    // Confirm the original netdev arg is passed through unchanged.
+    assert!(
+        argv.contains("user,id=net0,hostfwd=tcp:127.0.0.1:0-:22"),
+        "wrapper must pass the slirp netdev through unchanged when the escape hatch is active; argv=\n{argv}"
     );
 }
