@@ -2195,6 +2195,8 @@ provision:
     #     "command not found" from the remote shell. The host-side
     #     rsync must be present too, but that is the operator's
     #     concern.
+    #   - docker.io: provides the in-VM `docker` CLI without adding
+    #     Docker Inc.'s external apt repository to sandbox sessions.
     #
     # Wrapped in a retry loop because Lima's user-mode networking
     # (SLIRP) can drop packets under concurrent fetches and apt
@@ -2204,10 +2206,11 @@ provision:
     # (cloud-init's per_boot doesn't abort on script failure).
     if ! command -v socat &>/dev/null \
         || ! command -v git &>/dev/null \
-        || ! command -v rsync &>/dev/null; then
+        || ! command -v rsync &>/dev/null \
+        || ! command -v docker &>/dev/null; then
       attempt=1
       max_attempts=3
-      until apt-get update -qq && apt-get install -y socat git rsync; do
+      until apt-get update -qq && apt-get install -y socat git rsync docker.io; do
         if [ "$attempt" -ge "$max_attempts" ]; then
           echo "[sandbox-provision] apt-baseline failed after $max_attempts attempts" >&2
           exit 1
@@ -2226,26 +2229,11 @@ provision:
   script: |
     #!/bin/bash
     set -eux -o pipefail
-    export DEBIAN_FRONTEND=noninteractive
     echo "[sandbox-provision] step=docker start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Install Docker via official convenience script. Retry up to 3
-    # times: the get.docker.com script does its own apt-get update +
-    # install internally, and a single transient apt fetch failure
-    # (e.g. EAGAIN from too many parallel HTTP fetches against
-    # download.docker.com) would otherwise stamp a docker-less base
-    # image as golden.
-    if ! command -v docker &>/dev/null; then
-      attempt=1
-      max_attempts=3
-      until curl -fsSL https://get.docker.com | sh; do
-        if [ "$attempt" -ge "$max_attempts" ]; then
-          echo "[sandbox-provision] docker install failed after $max_attempts attempts" >&2
-          exit 1
-        fi
-        echo "[sandbox-provision] docker install attempt=$attempt failed, retrying" >&2
-        attempt=$((attempt + 1))
-        sleep 5
-      done
+    # Docker itself is installed by the apt-baseline step via Ubuntu's
+    # `docker.io` package. Keep this separate step for the membership
+    # side effect and idempotent repair on older base images.
+    if command -v docker &>/dev/null; then
       usermod -aG docker sandbox
     fi
     echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
@@ -2494,18 +2482,18 @@ provision:
     echo "[sandbox-provision] step=apt-baseline start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Baseline packages required by sandboxd's session contract:
     # socat (guest-agent bridge), git (`--repo` + remote helper),
-    # rsync (`sandbox sync`). The base image already installs
-    # these — this block is a defence-in-depth no-op when the VM
-    # was cloned from an up-to-date base, and a recovery path when
-    # it wasn't (e.g. the image was rebuilt without rsync before
-    # the base-image tooling caught up). See base template for
-    # retry rationale.
+    # rsync (`sandbox sync`), docker.io (in-VM `docker` CLI). The base
+    # image already installs these — this block is a defence-in-depth
+    # no-op when the VM was cloned from an up-to-date base, and a
+    # recovery path when it wasn't. See base template for retry
+    # rationale.
     if ! command -v socat &>/dev/null \
         || ! command -v git &>/dev/null \
-        || ! command -v rsync &>/dev/null; then
+        || ! command -v rsync &>/dev/null \
+        || ! command -v docker &>/dev/null; then
       attempt=1
       max_attempts=3
-      until apt-get update -qq && apt-get install -y socat git rsync; do
+      until apt-get update -qq && apt-get install -y socat git rsync docker.io; do
         if [ "$attempt" -ge "$max_attempts" ]; then
           echo "[sandbox-provision] apt-baseline failed after $max_attempts attempts" >&2
           exit 1
@@ -2524,22 +2512,11 @@ provision:
   script: |
     #!/bin/bash
     set -eux -o pipefail
-    export DEBIAN_FRONTEND=noninteractive
     echo "[sandbox-provision] step=docker start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Install Docker via official convenience script. See base
-    # template above for retry rationale.
-    if ! command -v docker &>/dev/null; then
-      attempt=1
-      max_attempts=3
-      until curl -fsSL https://get.docker.com | sh; do
-        if [ "$attempt" -ge "$max_attempts" ]; then
-          echo "[sandbox-provision] docker install failed after $max_attempts attempts" >&2
-          exit 1
-        fi
-        echo "[sandbox-provision] docker install attempt=$attempt failed, retrying" >&2
-        attempt=$((attempt + 1))
-        sleep 5
-      done
+    # Docker itself is installed by the apt-baseline step via Ubuntu's
+    # `docker.io` package. Keep this separate step for the membership
+    # side effect and idempotent repair on older base images.
+    if command -v docker &>/dev/null; then
       usermod -aG docker sandbox
     fi
     echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
@@ -3090,12 +3067,13 @@ mod tests {
             "template should grant passwordless sudo"
         );
         assert!(
-            template.contains("apt-get") && template.contains("install -y socat git rsync"),
-            "template should install the socat / git / rsync baseline"
+            template.contains("apt-get")
+                && template.contains("install -y socat git rsync docker.io"),
+            "template should install the socat / git / rsync / docker baseline"
         );
         assert!(
-            template.contains("get.docker.com"),
-            "template should install Docker"
+            !template.contains("get.docker.com"),
+            "template must not install Docker from get.docker.com"
         );
         assert!(
             template.contains("usermod -aG docker sandbox"),
@@ -4292,12 +4270,13 @@ mod tests {
             "base template should grant passwordless sudo"
         );
         assert!(
-            template.contains("apt-get") && template.contains("install -y socat git rsync"),
-            "base template should install the socat / git / rsync baseline"
+            template.contains("apt-get")
+                && template.contains("install -y socat git rsync docker.io"),
+            "base template should install the socat / git / rsync / docker baseline"
         );
         assert!(
-            template.contains("get.docker.com"),
-            "base template should install Docker"
+            !template.contains("get.docker.com"),
+            "base template must not install Docker from get.docker.com"
         );
         assert!(
             template.contains("usermod -aG docker sandbox"),
