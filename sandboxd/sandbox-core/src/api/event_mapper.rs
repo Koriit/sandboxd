@@ -328,6 +328,7 @@ impl From<HealthComponent> for HealthComponentDto {
     fn from(component: HealthComponent) -> Self {
         match component {
             HealthComponent::DenyLogger => HealthComponentDto::DenyLogger,
+            HealthComponent::AllowLogger => HealthComponentDto::AllowLogger,
             HealthComponent::Envoy => HealthComponentDto::Envoy,
             HealthComponent::Mitmproxy => HealthComponentDto::Mitmproxy,
             HealthComponent::Coredns => HealthComponentDto::Coredns,

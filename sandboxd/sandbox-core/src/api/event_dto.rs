@@ -303,12 +303,14 @@ pub enum PolicyApplyStatusDto {
 
 /// Wire value of `health_degraded` / `health_restored` `component`.
 ///
-/// The wire format enumerates gateway subcomponents: `deny-logger`, `envoy`,
-/// `mitmproxy`, `coredns`. Note the kebab-case on `deny-logger`.
+/// The wire format enumerates gateway subcomponents: `deny-logger`,
+/// `allow-logger`, `envoy`, `mitmproxy`, `coredns`. Note the kebab-case on the
+/// logger names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HealthComponentDto {
     DenyLogger,
+    AllowLogger,
     Envoy,
     Mitmproxy,
     Coredns,
