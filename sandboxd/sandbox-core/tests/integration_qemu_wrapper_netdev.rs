@@ -322,12 +322,21 @@ fn integration_qemu_wrapper_provisioning_escape_hatch_disables_restriction() {
         return;
     };
 
-    // The load-bearing assertion: `restrict=on` must NOT appear when the
-    // escape hatch is active, even though a bridge is set.
+    // The load-bearing assertions: `restrict=on` must NOT appear when the
+    // escape hatch is active, but the bridge NIC must still be injected so
+    // the daemon can configure the gateway-facing interface.
     assert!(
         !argv.contains("restrict=on"),
         "wrapper must NOT add `restrict=on` when SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING=1 \
          is set, even with an active bridge; argv=\n{argv}"
+    );
+    assert!(
+        argv.contains("-netdev\nbridge,id=net_sandbox,br=sandbox-test-br"),
+        "wrapper must still add the sandbox bridge netdev while the provisioning escape hatch is active; argv=\n{argv}"
+    );
+    assert!(
+        argv.contains("virtio-net-pci,netdev=net_sandbox,mac=52:54:00:12:34:56"),
+        "wrapper must still add the sandbox bridge NIC while the provisioning escape hatch is active; argv=\n{argv}"
     );
     // Confirm the original netdev arg is passed through unchanged.
     assert!(

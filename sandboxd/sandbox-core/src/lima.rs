@@ -921,42 +921,44 @@ EXTRA_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
 # `restrict=on` before QEMU sees the argv.  Base-image builds have no
 # sandbox bridge yet and intentionally keep unrestricted slirp for package
 # installation during provisioning.
-if [ -n "$SANDBOX_DOCKER_BRIDGE" ] && [ "$SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING" != "1" ]; then
-    remaining=$#
-    while [ "$remaining" -gt 0 ]; do
-        arg="$1"
-        shift
-        remaining=$((remaining - 1))
-
-        if [ "$arg" = "-netdev" ] && [ "$remaining" -gt 0 ]; then
-            netdev="$1"
+if [ -n "$SANDBOX_DOCKER_BRIDGE" ]; then
+    if [ "$SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING" != "1" ]; then
+        remaining=$#
+        while [ "$remaining" -gt 0 ]; do
+            arg="$1"
             shift
             remaining=$((remaining - 1))
 
-            case "$netdev" in
-                user|user,*)
-                    IFS=,
-                    restricted_netdev=""
-                    for field in $netdev; do
-                        case "$field" in
-                            restrict=*) continue ;;
-                        esac
-                        if [ -z "$restricted_netdev" ]; then
-                            restricted_netdev="$field"
-                        else
-                            restricted_netdev="$restricted_netdev,$field"
-                        fi
-                    done
-                    unset IFS
-                    netdev="$restricted_netdev,restrict=on"
-                    ;;
-            esac
+            if [ "$arg" = "-netdev" ] && [ "$remaining" -gt 0 ]; then
+                netdev="$1"
+                shift
+                remaining=$((remaining - 1))
 
-            set -- "$@" "$arg" "$netdev"
-        else
-            set -- "$@" "$arg"
-        fi
-    done
+                case "$netdev" in
+                    user|user,*)
+                        IFS=,
+                        restricted_netdev=""
+                        for field in $netdev; do
+                            case "$field" in
+                                restrict=*) continue ;;
+                            esac
+                            if [ -z "$restricted_netdev" ]; then
+                                restricted_netdev="$field"
+                            else
+                                restricted_netdev="$restricted_netdev,$field"
+                            fi
+                        done
+                        unset IFS
+                        netdev="$restricted_netdev,restrict=on"
+                        ;;
+                esac
+
+                set -- "$@" "$arg" "$netdev"
+            else
+                set -- "$@" "$arg"
+            fi
+        done
+    fi
 
     EXTRA_ARGS="$EXTRA_ARGS \
         -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \
