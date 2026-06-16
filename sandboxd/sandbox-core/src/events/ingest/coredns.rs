@@ -6,14 +6,17 @@
 //! the `client_ip` used by the ingestor for session attribution.
 //!
 //! Source of truth for the on-disk shape: `networking/coredns-plugin/
-//! events.go`. Every field name below (`timestamp`, `layer`, `event`,
-//! `query`, `qtype`, `client_ip`, `resolved_ips`, `reason`) is authored
-//! there.
+//! events.go`. Query events carry `timestamp`, `layer`, `event`, `query`,
+//! `qtype`, `client_ip`, and either `resolved_ips` or `reason`.
+//! `dns_gate_*` telemetry records intentionally omit `qtype` and `client_ip`;
+//! they are recognised and skipped because the traffic event model has no DNS
+//! gate variant.
 //!
 //! # Shape conventions
 //!
 //! - `layer` must equal `"dns"`.
-//! - `event` must be `"query_allowed"` or `"query_denied"`.
+//! - Traffic `event` must be `"query_allowed"` or `"query_denied"`.
+//! - `dns_gate_*` events are known telemetry records and are skipped.
 //! - `query_allowed` always carries `resolved_ips: []` (never omitted,
 //!   even when the upstream returned `NODATA`) — this is the contract
 //!   documented in `events.go`'s `EmitQueryAllowed` doc comment.
@@ -39,8 +42,10 @@ struct RawDnsRecord {
     layer: String,
     event: String,
     query: String,
-    qtype: String,
-    client_ip: String,
+    #[serde(default)]
+    qtype: Option<String>,
+    #[serde(default)]
+    client_ip: Option<String>,
     /// Present on `query_allowed`; absent on `query_denied`.
     #[serde(default)]
     resolved_ips: Option<Vec<String>>,
@@ -80,7 +85,7 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, SandboxError> {
 }
 
 /// Parse one JSONL line emitted by the CoreDNS policy plugin.
-pub fn parse_coredns_line(line: &str) -> Result<ParsedDnsEvent, SandboxError> {
+pub fn parse_coredns_line(line: &str) -> Result<Option<ParsedDnsEvent>, SandboxError> {
     let raw: RawDnsRecord = serde_json::from_str(line).map_err(|e| {
         SandboxError::Internal(format!(
             "coredns record: failed to parse JSON: {e}; line = {line:?}"
@@ -94,8 +99,20 @@ pub fn parse_coredns_line(line: &str) -> Result<ParsedDnsEvent, SandboxError> {
         )));
     }
 
+    if raw.event.starts_with("dns_gate_") {
+        return Ok(None);
+    }
+
     let timestamp = parse_timestamp(&raw.timestamp)?;
-    let client_ip = parse_ipv4("client_ip", &raw.client_ip)?;
+    let client_ip = parse_ipv4(
+        "client_ip",
+        raw.client_ip.as_deref().ok_or_else(|| {
+            SandboxError::Internal("coredns record: query event missing `client_ip` field".into())
+        })?,
+    )?;
+    let qtype = raw.qtype.ok_or_else(|| {
+        SandboxError::Internal("coredns record: query event missing `qtype` field".into())
+    })?;
 
     let dns_event = match raw.event.as_str() {
         "query_allowed" => {
@@ -109,7 +126,7 @@ pub fn parse_coredns_line(line: &str) -> Result<ParsedDnsEvent, SandboxError> {
             }
             DnsEvent::QueryAllowed {
                 query: raw.query,
-                qtype: raw.qtype,
+                qtype,
                 resolved_ips,
             }
         }
@@ -121,7 +138,7 @@ pub fn parse_coredns_line(line: &str) -> Result<ParsedDnsEvent, SandboxError> {
             })?;
             DnsEvent::QueryDenied {
                 query: raw.query,
-                qtype: raw.qtype,
+                qtype,
                 reason,
             }
         }
@@ -132,11 +149,11 @@ pub fn parse_coredns_line(line: &str) -> Result<ParsedDnsEvent, SandboxError> {
         }
     };
 
-    Ok(ParsedDnsEvent {
+    Ok(Some(ParsedDnsEvent {
         timestamp,
         client_ip,
         traffic: TrafficEvent::Dns(dns_event),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -146,7 +163,7 @@ mod tests {
     #[test]
     fn parses_query_allowed_with_resolved_ips() {
         let line = r#"{"timestamp":"2026-04-22T09:45:00.123Z","layer":"dns","event":"query_allowed","query":"api.example.com","qtype":"A","client_ip":"10.0.0.42","resolved_ips":["93.184.216.34","93.184.216.35"]}"#;
-        let parsed = parse_coredns_line(line).unwrap();
+        let parsed = parse_coredns_line(line).unwrap().unwrap();
         assert_eq!(parsed.client_ip, "10.0.0.42".parse::<Ipv4Addr>().unwrap());
         match parsed.traffic {
             TrafficEvent::Dns(DnsEvent::QueryAllowed {
@@ -172,7 +189,7 @@ mod tests {
     fn parses_query_allowed_with_empty_resolved_ips() {
         // NODATA path from upstream — plugin emits `resolved_ips: []`.
         let line = r#"{"timestamp":"2026-04-22T09:45:00.123Z","layer":"dns","event":"query_allowed","query":"api.example.com","qtype":"A","client_ip":"10.0.0.42","resolved_ips":[]}"#;
-        let parsed = parse_coredns_line(line).unwrap();
+        let parsed = parse_coredns_line(line).unwrap().unwrap();
         match parsed.traffic {
             TrafficEvent::Dns(DnsEvent::QueryAllowed { resolved_ips, .. }) => {
                 assert!(resolved_ips.is_empty());
@@ -184,7 +201,7 @@ mod tests {
     #[test]
     fn parses_query_denied_with_reason() {
         let line = r#"{"timestamp":"2026-04-22T09:45:00.123Z","layer":"dns","event":"query_denied","query":"blocked.example.com","qtype":"AAAA","client_ip":"10.0.0.42","reason":"AAAA stripped"}"#;
-        let parsed = parse_coredns_line(line).unwrap();
+        let parsed = parse_coredns_line(line).unwrap().unwrap();
         assert_eq!(parsed.client_ip, "10.0.0.42".parse::<Ipv4Addr>().unwrap());
         match parsed.traffic {
             TrafficEvent::Dns(DnsEvent::QueryDenied {
@@ -244,7 +261,7 @@ mod tests {
     #[test]
     fn timestamp_is_parsed_as_utc() {
         let line = r#"{"timestamp":"2026-04-22T09:45:00.123Z","layer":"dns","event":"query_allowed","query":"x","qtype":"A","client_ip":"10.0.0.42","resolved_ips":[]}"#;
-        let parsed = parse_coredns_line(line).unwrap();
+        let parsed = parse_coredns_line(line).unwrap().unwrap();
         let expected = chrono::DateTime::parse_from_rfc3339("2026-04-22T09:45:00.123Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -262,12 +279,18 @@ mod tests {
         // Not written by the Go producer today, but a hand-authored test
         // fixture should still parse — we default to `[]`.
         let line = r#"{"timestamp":"2026-04-22T09:45:00.123Z","layer":"dns","event":"query_allowed","query":"x","qtype":"A","client_ip":"10.0.0.42"}"#;
-        let parsed = parse_coredns_line(line).unwrap();
+        let parsed = parse_coredns_line(line).unwrap().unwrap();
         match parsed.traffic {
             TrafficEvent::Dns(DnsEvent::QueryAllowed { resolved_ips, .. }) => {
                 assert!(resolved_ips.is_empty());
             }
             other => panic!("expected QueryAllowed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn skips_dns_gate_outcome_without_qtype_or_client_ip() {
+        let line = r#"{"timestamp":"2026-06-16T08:37:23.607Z","layer":"dns","event":"dns_gate_ok","query":"ntp.ubuntu.com","outcome":"ok","correlation_id":"c1","elapsed_ms":392}"#;
+        assert!(parse_coredns_line(line).unwrap().is_none());
     }
 }
