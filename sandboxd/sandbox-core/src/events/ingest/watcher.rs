@@ -46,7 +46,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::events::ingest::coredns::{ParsedDnsEvent, parse_coredns_line};
+use crate::events::ingest::coredns::parse_coredns_line;
 use crate::events::ingest::envoy::{ParsedEnvoyEvent, parse_envoy_line};
 use crate::events::ingest::jsonl_reader::JsonlTailer;
 use crate::events::ingest::mitmproxy::{ParsedMitmEvent, parse_mitmproxy_line};
@@ -404,8 +404,11 @@ fn dispatch_line(
     let parsed: Result<(DateTime<Utc>, Option<std::net::Ipv4Addr>, TrafficEvent), _> = match layer {
         Layer::Envoy => parse_envoy_line(line)
             .map(|p: ParsedEnvoyEvent| (p.timestamp, Some(p.src_ip), p.traffic)),
-        Layer::Coredns => parse_coredns_line(line)
-            .map(|p: ParsedDnsEvent| (p.timestamp, Some(p.client_ip), p.traffic)),
+        Layer::Coredns => match parse_coredns_line(line) {
+            Ok(Some(p)) => Ok((p.timestamp, Some(p.client_ip), p.traffic)),
+            Ok(None) => return,
+            Err(e) => Err(e),
+        },
         Layer::Mitmproxy => parse_mitmproxy_line(line)
             // client_ip on mitmproxy events is the gateway's upstream-socket
             // source (set by the kernel for Envoy's connect to 127.0.0.1:18080),
