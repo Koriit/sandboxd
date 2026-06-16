@@ -394,10 +394,12 @@ pub enum PolicyApplyStatus {
 /// Subcomponent for [`LifecycleEvent::HealthDegraded`] /
 /// [`LifecycleEvent::HealthRestored`].
 ///
-/// Gateway subcomponents: `deny-logger`, `envoy`, `mitmproxy`, `coredns`.
+/// Gateway subcomponents: `deny-logger`, `allow-logger`, `envoy`, `mitmproxy`,
+/// `coredns`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HealthComponent {
     DenyLogger,
+    AllowLogger,
     Envoy,
     Mitmproxy,
     Coredns,
@@ -929,6 +931,20 @@ mod tests {
         let json = round_trip_lifecycle(event, "health_degraded");
         // Kebab-case literal.
         assert_eq!(json["component"], "deny-logger");
+        assert_eq!(json["reason"], "healthcheck timeout");
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_health_degraded_allow_logger() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::HealthDegraded {
+                component: HealthComponent::AllowLogger,
+                reason: "healthcheck timeout".into(),
+            },
+        };
+        let json = round_trip_lifecycle(event, "health_degraded");
+        assert_eq!(json["component"], "allow-logger");
         assert_eq!(json["reason"], "healthcheck timeout");
     }
 

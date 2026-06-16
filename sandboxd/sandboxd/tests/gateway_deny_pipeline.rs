@@ -906,7 +906,7 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
         gateway_ip,
     );
 
-    // All four MONITORED_COMPONENTS must be healthy before we start
+    // All five MONITORED_COMPONENTS must be healthy before we start
     // killing things — otherwise the baseline is confused with the
     // test's own post-kill signal.
     //
@@ -919,9 +919,15 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
     // grace window.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let all_healthy = ["envoy", "coredns", "mitmproxy", "deny-logger"]
-            .iter()
-            .all(|c| gw.gw_mgr.component_health(&gw.session_id, c) == "healthy");
+        let all_healthy = [
+            "envoy",
+            "coredns",
+            "mitmproxy",
+            "allow-logger",
+            "deny-logger",
+        ]
+        .iter()
+        .all(|c| gw.gw_mgr.component_health(&gw.session_id, c) == "healthy");
         if all_healthy {
             break;
         }
@@ -974,6 +980,7 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
             ("envoy", HealthComponent::Envoy),
             ("coredns", HealthComponent::Coredns),
             ("mitmproxy", HealthComponent::Mitmproxy),
+            ("allow-logger", HealthComponent::AllowLogger),
             ("deny-logger", HealthComponent::DenyLogger),
         ];
         // Pre-seed every component as healthy so the first unhealthy

@@ -281,6 +281,12 @@ pub const NFT_NFLOG_DENY_GROUP: u16 = 1;
 /// probe.
 pub const GATEWAY_DENY_LOGGER_HEALTH_PORT: u16 = 10003;
 
+/// TCP port exposing the allow-logger's `/health` endpoint inside the gateway
+/// container. **Not** in any DNAT set — reached only from inside the container
+/// via `docker exec`-driven healthchecks and sandboxd's `component_health`
+/// probe.
+pub const GATEWAY_ALLOW_LOGGER_HEALTH_PORT: u16 = 10004;
+
 /// Name of the nftables concat set (inside both `sandbox_dnat` and
 /// `sandbox_policy`) that holds `(ipv4_addr . inet_service)` allow tuples
 /// for TCP destinations.
@@ -1427,12 +1433,13 @@ pub fn container_name(session_id: &SessionId) -> String {
 /// [`component_probe`] with a human-readable log/display name.
 ///
 /// Order is the startup wait order — matches the historical sequence
-/// (Envoy → CoreDNS → mitmproxy) with deny-logger appended last so a
-/// deny-logger failure surfaces only once the other components are up.
+/// (Envoy → CoreDNS → mitmproxy) with nft-loggers appended last so a
+/// logger failure surfaces only once the other components are up.
 pub const KNOWN_COMPONENTS: &[(&str, &str)] = &[
     ("envoy", "Envoy"),
     ("coredns", "CoreDNS"),
     ("mitmproxy", "mitmproxy"),
+    ("allow-logger", "allow-logger"),
     ("deny-logger", "deny-logger"),
 ];
 
@@ -1444,8 +1451,8 @@ pub const KNOWN_COMPONENTS: &[(&str, &str)] = &[
 /// (startup readiness wait) — keeping both paths on the identical
 /// probe command per component.
 ///
-/// The deny-logger probe uses `sh -c` to discover the gateway bridge
-/// IP at runtime via `hostname -i`, because the deny-logger listeners
+/// The nft-logger probes use `sh -c` to discover the gateway bridge
+/// IP at runtime via `hostname -i`, because their health listeners
 /// bind on that address rather than 127.0.0.1 (PREROUTING DNAT to
 /// loopback is dropped by the kernel as a martian destination unless
 /// `route_localnet=1` is set, which the gateway container does not
@@ -1460,6 +1467,11 @@ pub fn component_probe(component: &str) -> Option<&'static [&'static str]> {
             "sh",
             "-c",
             "curl -sf \"http://$(hostname -i | awk '{print $1}'):10003/health\"",
+        ]),
+        "allow-logger" => Some(&[
+            "sh",
+            "-c",
+            "curl -sf \"http://$(hostname -i | awk '{print $1}'):10004/health\"",
         ]),
         _ => None,
     }
@@ -1618,10 +1630,10 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
 /// - `:10001` — deny-logger TCP listener (VM TCP that *didn't* match any
 ///   policy allow tuple)
 ///
-/// Plus `:10003` — the deny-logger's `/health` endpoint. This one is **not**
-/// reachable from the VM subnet (no DNAT rule), only from inside the
+/// Plus `:10003` / `:10004` — the nft-loggers' `/health` endpoints. These are
+/// **not** reachable from the VM subnet (no DNAT rule), only from inside the
 /// container via `docker exec`-driven healthchecks and sandboxd's
-/// `component_health` probe. We still open it on the input chain so those
+/// `component_health` probe. We still open them on the input chain so those
 /// in-container probes work even though they route via loopback + bridge.
 ///
 /// The input chain must accept traffic on each of these ports, otherwise
@@ -1653,6 +1665,9 @@ table inet sandbox {{
 
         # Allow deny-logger /health probe (in-container only; no DNAT for it)
         tcp dport {GATEWAY_DENY_LOGGER_HEALTH_PORT} accept
+
+        # Allow allow-logger /health probe (in-container only; no DNAT for it)
+        tcp dport {GATEWAY_ALLOW_LOGGER_HEALTH_PORT} accept
 
         # Reject everything else (fast failure)
         reject
@@ -1784,6 +1799,32 @@ mod tests {
     }
 
     #[test]
+    fn component_probe_allow_logger_uses_gateway_bridge_ip_not_loopback() {
+        let probe = component_probe("allow-logger").expect("allow-logger must be a known probe");
+
+        assert_eq!(
+            probe.first().copied(),
+            Some("sh"),
+            "allow-logger probe must go through `sh -c` so hostname discovery \
+             happens inside the gateway container, not on the host"
+        );
+        assert!(
+            probe.iter().any(|arg| arg.contains("hostname -i")),
+            "allow-logger probe must discover the bridge IP via `hostname -i` \
+             (matches healthcheck.sh and entrypoint.sh)"
+        );
+        assert!(
+            probe.iter().any(|arg| arg.contains(":10004/health")),
+            "allow-logger probe must hit the health listener on port 10004"
+        );
+        assert!(
+            !probe.iter().any(|arg| arg.contains("127.0.0.1:10004")),
+            "allow-logger probe must NOT hardcode 127.0.0.1 — the listener \
+             binds on the gateway bridge IP"
+        );
+    }
+
+    #[test]
     fn known_components_contain_deny_logger_last() {
         // wait_for_components iterates KNOWN_COMPONENTS in order, so
         // the ordering guarantee matters: deny-logger last means a
@@ -1794,7 +1835,13 @@ mod tests {
         let labels: Vec<&str> = KNOWN_COMPONENTS.iter().map(|(l, _)| *l).collect();
         assert_eq!(
             labels,
-            vec!["envoy", "coredns", "mitmproxy", "deny-logger"],
+            vec![
+                "envoy",
+                "coredns",
+                "mitmproxy",
+                "allow-logger",
+                "deny-logger"
+            ],
             "KNOWN_COMPONENTS order is load-bearing — deny-logger must be last"
         );
     }
@@ -2198,15 +2245,15 @@ mod tests {
     }
 
     #[test]
-    fn generate_input_allow_ruleset_admits_10001_and_10003_but_not_10002() {
+    fn generate_input_allow_ruleset_admits_logger_health_ports_but_not_10002() {
         // The deny-logger listens on TWO ports inside the gateway
         // container — TCP :10001 (denied VM TCP DNATted here) and
         // :10003 (the `/health` endpoint). The previous UDP listener
         // on :10002 is gone; UDP deny is NFLOG-driven and has no
         // userland listener. The input chain must admit :10001 and
-        // :10003 but MUST NOT admit `:10002` — opening the port back
-        // up would only paper over a regression that re-introduced the
-        // listener.
+        // :10003, plus the allow-logger's :10004 `/health` endpoint,
+        // but MUST NOT admit `:10002` — opening the port back up would
+        // only paper over a regression that re-introduced the listener.
         let ruleset = generate_input_allow_ruleset("10.209.0.0/28");
 
         assert!(
@@ -2222,6 +2269,12 @@ mod tests {
         assert!(
             ruleset.contains("tcp dport 10003"),
             "deny-logger /health endpoint port :10003 must be admitted by \
+             the input chain so HEALTHCHECK and sandboxd's component_health \
+             probe succeed:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains("tcp dport 10004"),
+            "allow-logger /health endpoint port :10004 must be admitted by \
              the input chain so HEALTHCHECK and sandboxd's component_health \
              probe succeed:\n{ruleset}"
         );

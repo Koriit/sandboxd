@@ -8133,16 +8133,15 @@ async fn reconcile_networking(state: &AppState) {
 /// [`sandbox_core::HealthComponent`] used on
 /// `health_degraded`/`health_restored` events.
 ///
-/// `deny-logger` polls the `:10003/health` endpoint on the gateway
-/// bridge IP — its data-path listeners on :10001/:10002 are bound on
-/// the bridge IP as well (not 127.0.0.1), because DNAT to loopback
-/// would be dropped as a martian destination. The in-container
-/// probe discovers the bridge IP via `hostname -i` (see
-/// `gateway::component_probe` and the container's `healthcheck.sh`).
+/// The nft-loggers poll `:10003/health` and `:10004/health` on the gateway
+/// bridge IP. The in-container probe discovers the bridge IP via
+/// `hostname -i` (see `gateway::component_probe` and the container's
+/// `healthcheck.sh`).
 const MONITORED_COMPONENTS: &[(&str, HealthComponent)] = &[
     ("envoy", HealthComponent::Envoy),
     ("coredns", HealthComponent::Coredns),
     ("mitmproxy", HealthComponent::Mitmproxy),
+    ("allow-logger", HealthComponent::AllowLogger),
     ("deny-logger", HealthComponent::DenyLogger),
 ];
 
@@ -10794,6 +10793,22 @@ mod tests {
     }
 
     #[test]
+    fn monitored_components_includes_allow_logger() {
+        // Regression guard: allow-logger is a first-class monitored
+        // subcomponent (it audits allowed UDP flows and has a /health
+        // endpoint), so its liveness MUST participate in
+        // `health_degraded` / `health_restored` events.
+        assert!(
+            MONITORED_COMPONENTS
+                .iter()
+                .any(|(label, component)| *label == "allow-logger"
+                    && *component == HealthComponent::AllowLogger),
+            "MONITORED_COMPONENTS must contain (\"allow-logger\", \
+             HealthComponent::AllowLogger)"
+        );
+    }
+
+    #[test]
     fn monitored_components_covers_every_health_component_variant() {
         // Every `HealthComponent` variant must appear in
         // MONITORED_COMPONENTS — otherwise the enum carries a variant
@@ -10805,7 +10820,7 @@ mod tests {
             .iter()
             .map(|(_, component)| *component)
             .collect();
-        for variant in [DenyLogger, Envoy, Mitmproxy, Coredns] {
+        for variant in [DenyLogger, AllowLogger, Envoy, Mitmproxy, Coredns] {
             assert!(
                 monitored.contains(&variant),
                 "HealthComponent::{variant:?} is not present in \
