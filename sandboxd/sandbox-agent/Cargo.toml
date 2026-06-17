@@ -36,6 +36,19 @@ tokio = { workspace = true }
 # gating pattern).
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+# serde + serde_json: wire-protocol serialization (newline-delimited JSON frames
+# over the broker channel). Scoped to macOS so the Linux stub remains dep-free.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# regex: VM-name and path validation on the agent side, mirroring the lima-helper.
+regex = "1"
+# serde_yaml: structural YAML parsing for lima.yaml shape validation. String-
+# based line matching cannot reliably detect flow-style, quoted keys, or
+# anchors/aliases — all reachable via a YAML serializer in a buggy daemon.
+# Parsing to serde_yaml::Value normalises all serialisation styles so the
+# shape assertions are robust by construction. Scoped to macOS (same TCB
+# rationale as serde/serde_json above).
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile.workspace = true

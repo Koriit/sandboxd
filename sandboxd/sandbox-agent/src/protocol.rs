@@ -1,0 +1,320 @@
+// NON-FEATURES — DO NOT ADD without revisiting the trust model.
+//
+// * No argv pass-through to limactl. Every flag the agent passes to limactl
+//   is hardcoded inside this crate per operation variant; the daemon contributes
+//   only the typed field values, never a raw argv vector or shell string.
+//
+// * No shell. The agent never invokes a shell and never constructs a command
+//   line from caller-supplied strings.
+//
+// * No `~` or env-var expansion of caller-supplied values.
+//
+// * No path outside the agent's own LIMA_HOME. Every path in every op variant
+//   is validated as absolute with no `..` components and confined to the
+//   agent's own per-operator LIMA_HOME subtree before the agent acts on it.
+//
+// * No operation not in this enum. The enum is closed — a future operation
+//   requires a new reviewed variant. Unrecognised JSON is deserialized as an
+//   error and the request is rejected.
+//
+// * No acting on a uid other than the agent's own. The agent reads its uid
+//   from `getuid()` and rejects any request whose `op_uid` does not match.
+//
+// * No agent-constructed networking. The daemon renders the complete lima.yaml
+//   and passes it as the Create payload; the agent validates its shape and
+//   writes it verbatim. It never assembles networking configuration from typed
+//   fields.
+//
+// * No cross-session safety decision rests on agent-reported state. The daemon
+//   uses the agent's op results (exit codes, marker content) for its own
+//   session bookkeeping, but cross-session isolation rests on per-uid LIMA_HOME
+//   and the socket_vmnet slot/segment topology — never on a claim the agent
+//   makes about what it did.
+
+//! Broker wire protocol — the typed message set that crosses the broker
+//! channel between the daemon and each per-operator agent.
+//!
+//! # Framing model
+//!
+//! The protocol distinguishes two framing modes over the same underlying Unix
+//! stream:
+//!
+//! ## One-shot (all ops except `GuestSocat`)
+//!
+//! ```text
+//! daemon → agent: JSON(BrokerRequest)\n
+//! agent → daemon: JSON(BrokerResponse)\n
+//! ```
+//!
+//! Both sides write a single newline-terminated JSON object and then wait for
+//! the peer's reply. The stream is not pipelined — a new request is sent only
+//! after the previous response has been received.
+//!
+//! ## Streaming (`GuestSocat`)
+//!
+//! `GuestSocat` opens a long-lived bidirectional byte-pump to the in-VM guest
+//! agent. Its framing is distinct from one-shot request/response:
+//!
+//! ```text
+//! daemon → agent: JSON(BrokerRequest { op: GuestSocat { vm } })\n
+//! agent → daemon: JSON(BrokerResponse::StreamOpen)\n
+//! [bidirectional raw byte stream until either side closes]
+//! ```
+//!
+//! After `StreamOpen`, the stream carries raw bytes — the agent splices its
+//! stdin/stdout to `limactl shell <vm> -- socat - TCP:127.0.0.1:5123` and
+//! copies between the broker connection and the socat process until either end
+//! closes. There is no further framing; the agent and daemon each close their
+//! half of the stream to signal EOF to the other.
+//!
+//! The daemon treats `StreamOpen` as the signal to begin raw-byte I/O; any
+//! further `BrokerResponse` JSON on the stream after `StreamOpen` would be a
+//! protocol error (the agent must not write any more framed data after sending
+//! `StreamOpen`).
+//!
+//! # Relationship to `LimaOp<'a>` in `sandbox-core`
+//!
+//! `sandbox-core::lima::LimaOp<'a>` is the in-process, borrowed representation
+//! of a Lima operation — its fields borrow from the call-site's owned data and
+//! are not serde-serializable. `BrokerOp` here is the owned, serde-serializable
+//! counterpart that crosses the wire.
+//!
+//! The two types are structurally isomorphic for the shared op variants.
+//! `BrokerOp` additionally carries `RestrictOnVerify` (a post-boot verification
+//! op that has no `LimaOp` equivalent — it reads the wrapper marker / queries
+//! QMP) and `GuestSocat` as a named variant (in `LimaOp` this is handled via
+//! a separate `guest_socat` async method, not a `run` variant).
+//!
+//! The daemon maps `LimaOp<'a>` → `BrokerOp` for serialization; the agent
+//! deserializes `BrokerOp` and re-validates every field independently before
+//! constructing the hardcoded `limactl` argv. The daemon maps `BrokerOp` ←
+//! the typed executor-seam call; neither mapping is via raw string construction.
+
+use serde::{Deserialize, Serialize};
+
+/// A single request from the daemon to the agent.
+///
+/// Serialized as `{"request_id": <u64>, "op": <BrokerOp>}\n` (newline-delimited JSON).
+/// The `request_id` is an opaque monotonic counter chosen by the daemon; the
+/// agent echoes it in the matching `BrokerResponse` so the daemon can correlate
+/// responses if the channel ever carries concurrent one-shots (currently it does
+/// not, but the id is included for forward-compatibility and debugging).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BrokerRequest {
+    /// Monotonic request identifier, echoed in the response.
+    pub request_id: u64,
+    /// The typed operation to perform.
+    pub op: BrokerOp,
+}
+
+/// A response from the agent to the daemon.
+///
+/// Serialized as `{"request_id": <u64>, "result": <BrokerResult>}\n`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BrokerResponse {
+    /// Echo of the matching `BrokerRequest::request_id`.
+    pub request_id: u64,
+    /// The operation result.
+    pub result: BrokerResult,
+}
+
+/// The outcome of a one-shot brokered operation.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrokerResult {
+    /// Operation succeeded. `stdout` and `stderr` carry the raw captured output
+    /// from the limactl child (UTF-8 lossy; may be empty).
+    Ok {
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
+    /// The agent rejected the request due to a validation failure. The daemon
+    /// must treat this as a hard error and not retry with the same payload.
+    /// `reason` is a human-readable description for diagnostics.
+    Rejected { reason: String },
+    /// `limactl` was invoked but exited with a non-zero status. This is
+    /// distinct from `Ok { exit_code != 0 }` only for clarity — both carry
+    /// the same fields; the daemon treats non-zero exit codes uniformly.
+    Failed {
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
+    /// The `GuestSocat` streaming op is open. After this response the stream
+    /// carries raw bytes; there are no further framed messages.
+    StreamOpen,
+    /// The `RestrictOnVerify` check passed — `restrict=on` is confirmed on the
+    /// management netdev for the named VM.
+    RestrictConfirmed { vm: String, netdev_token: String },
+    /// The `RestrictOnVerify` check failed — the wrapper marker is absent or
+    /// does not contain `restrict=on`, or QMP verification failed.
+    /// The daemon must tear the VM down and fail the session.
+    RestrictNotConfirmed { vm: String, reason: String },
+}
+
+/// The closed set of operations the agent may perform.
+///
+/// Each variant carries typed, named fields — no raw argv, no shell strings.
+/// The agent constructs the `limactl` command line from these fields with
+/// hardcoded flags; it never passes caller-supplied strings directly to a shell
+/// or to `exec` as part of an argv that was not fully composed by the agent.
+///
+/// Variants marked with `op_uid` carry the daemon-asserted operator uid for
+/// belt-and-suspenders cross-checking (the agent independently verifies this
+/// matches its own `getuid()` — see `validation::validate_op_uid`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "subcommand", rename_all = "snake_case")]
+pub enum BrokerOp {
+    /// Create a new Lima VM instance from a daemon-rendered `lima.yaml`.
+    ///
+    /// The agent validates the YAML's shape (socket_vmnet-only NICs, no extra
+    /// NICs beyond the mandatory management NIC, no vmType override, qemu-wrapper
+    /// path absolute and no `..`) and writes it verbatim to
+    /// `{lima_home}/{vm}/lima.yaml` before running `limactl create`.
+    ///
+    /// After `limactl create` succeeds, the agent writes the owner marker to
+    /// `{lima_home}/{vm}/sandboxd-owner`.
+    Create {
+        op_uid: u32,
+        vm: String,
+        /// The complete rendered `lima.yaml` content. The agent validates shape
+        /// and writes it verbatim; it does not assemble or modify the content.
+        lima_yaml: String,
+        /// Pool CIDR written to `{lima_home}/{vm}/sandboxd-owner` after create.
+        owner: String,
+        /// Absolute path to the sandboxd-shipped qemu-wrapper. The agent asserts
+        /// the wrapper is present and executable before running `limactl create`.
+        qemu_wrapper: String,
+    },
+    /// Start (boot) an existing Lima VM instance.
+    Start {
+        op_uid: u32,
+        vm: String,
+        /// Absolute path to the sandboxd-shipped qemu-wrapper. The agent asserts
+        /// the wrapper is present and executable before invoking limactl.
+        qemu_wrapper: String,
+        /// Whether the VM is a hardened session ("1") or a base-image build ("0").
+        hardened: bool,
+        memory_mb: u32,
+        cpus: u32,
+        start_timeout_s: u32,
+        /// Optional bridge NIC: (bridge_name, vm_mac). Both fields must be
+        /// supplied together or both must be absent.
+        bridge: Option<BridgePair>,
+        /// When true, the qemu-wrapper allows unrestricted slirp during
+        /// provisioning. Only valid together with `bridge`.
+        unrestricted_slirp_for_provisioning: bool,
+    },
+    /// Stop a running Lima VM instance.
+    Stop {
+        op_uid: u32,
+        vm: String,
+        force: bool,
+    },
+    /// Delete a Lima VM instance (always `--force`).
+    Delete { op_uid: u32, vm: String },
+    /// Clone a Lima VM instance from a base image.
+    Clone {
+        op_uid: u32,
+        base: String,
+        vm: String,
+        cpus: u32,
+        memory_gib: u32,
+        disk_gb: u32,
+        owner: String,
+    },
+    /// List all Lima instances as JSON (`limactl list --json`).
+    ListJson { op_uid: u32 },
+    /// Install the sandbox-guest binary and systemd unit into a running VM.
+    InstallGuestAgent { op_uid: u32, vm: String },
+    /// Read the operator's Lima SSH private key from `{lima_home}/_config/user`.
+    ReadUserKey { op_uid: u32 },
+    /// Run rsync to push a host workspace into the VM (or container).
+    RunRsync {
+        op_uid: u32,
+        /// "lima" or "container" — selects the rsync remote-shell transport.
+        backend: String,
+        session_name: String,
+        host_path: String,
+        guest_path: String,
+        no_gitignore: bool,
+    },
+    /// Read `{lima_home}/{vm}/sandboxd-owner` and return its contents.
+    ReadOwnerMarker { op_uid: u32, vm: String },
+    /// Copy a file between host and VM using `limactl copy`.
+    Copy {
+        op_uid: u32,
+        src: String,
+        dst: String,
+    },
+    /// Open a long-lived bidirectional stream to the in-VM guest agent.
+    ///
+    /// After the agent sends `BrokerResult::StreamOpen`, the stream transitions
+    /// to raw byte-pump mode (see module-level framing documentation). The
+    /// agent splices its end of the broker connection to
+    /// `limactl shell <vm> -- socat - TCP:127.0.0.1:5123`.
+    GuestSocat { op_uid: u32, vm: String },
+    /// Post-boot `restrict=on` verification.
+    ///
+    /// The agent reads the qemu-wrapper marker file at
+    /// `{lima_home}/{vm}/sandboxd-restrict-marker` — written by the wrapper
+    /// after it successfully injected `restrict=on` into the management netdev
+    /// — and confirms the marker contains `restrict=on`. If the marker is absent
+    /// or does not contain `restrict=on`, the agent responds with
+    /// `BrokerResult::RestrictNotConfirmed`.
+    ///
+    /// This op rides the broker channel because the QEMU process and its
+    /// associated files are operator-owned and unreadable by the `_sandbox`
+    /// daemon; the daemon cannot perform this check directly.
+    ///
+    /// Same own-uid + VM-name re-validation as every other op.
+    RestrictOnVerify { op_uid: u32, vm: String },
+}
+
+/// Bridge NIC pair (bridge_name + vm_mac). Both fields are validated
+/// separately by the agent — bridge name regex and MAC unicast-bit check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgePair {
+    pub bridge_name: String,
+    pub vm_mac: String,
+}
+
+impl BrokerOp {
+    /// The `op_uid` field common to all variants.
+    ///
+    /// The agent calls this to extract the daemon-asserted target uid for
+    /// comparison against its own `getuid()`.
+    pub fn op_uid(&self) -> u32 {
+        match self {
+            BrokerOp::Create { op_uid, .. }
+            | BrokerOp::Start { op_uid, .. }
+            | BrokerOp::Stop { op_uid, .. }
+            | BrokerOp::Delete { op_uid, .. }
+            | BrokerOp::Clone { op_uid, .. }
+            | BrokerOp::ListJson { op_uid }
+            | BrokerOp::InstallGuestAgent { op_uid, .. }
+            | BrokerOp::ReadUserKey { op_uid }
+            | BrokerOp::RunRsync { op_uid, .. }
+            | BrokerOp::ReadOwnerMarker { op_uid, .. }
+            | BrokerOp::Copy { op_uid, .. }
+            | BrokerOp::GuestSocat { op_uid, .. }
+            | BrokerOp::RestrictOnVerify { op_uid, .. } => *op_uid,
+        }
+    }
+}
+
+/// The name of the wrapper marker file written by the qemu-wrapper after it
+/// successfully injects `restrict=on` into the management netdev argv.
+///
+/// Path: `{lima_home}/{vm}/sandboxd-restrict-marker`.
+/// Contents: the full rewritten `-netdev user,...` token including `restrict=on`.
+///
+/// The `RestrictOnVerify` op reads this file and confirms the token contains
+/// `restrict=on`. Absence of the file means the wrapper did not run or failed
+/// to inject the flag; the daemon must tear the VM down.
+pub const RESTRICT_MARKER_FILENAME: &str = "sandboxd-restrict-marker";
+
+/// Substring that must be present in the restrict marker file contents for the
+/// `RestrictOnVerify` check to pass.
+pub const RESTRICT_ON_MARKER: &str = "restrict=on";

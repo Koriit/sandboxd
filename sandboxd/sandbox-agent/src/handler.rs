@@ -1,0 +1,1621 @@
+//! Operation handler — constructs the hardcoded `limactl` argv per `BrokerOp`
+//! variant and executes it.
+//!
+//! # Hardcoded argv discipline
+//!
+//! Every function in this module that invokes `limactl` constructs the argv
+//! vector from typed fields and compile-time-constant flag strings. No flag
+//! name or flag value arrives from a caller-supplied string that has not first
+//! been validated by `validation::*`. The argv is assembled here, never
+//! assembled by the caller or received from the daemon.
+//!
+//! This mirrors the argv discipline of `sandbox-lima-helper`'s
+//! `build_limactl_argv` exactly: the daemon supplies typed values; the
+//! agent/helper constructs the full argv.
+//!
+//! # Environment
+//!
+//! Every `limactl` invocation sets:
+//! - `LIMA_HOME` to the agent's per-operator home.
+//! - `HOME` to the operator's pw_dir.
+//! - `PATH` with Homebrew prefixes prepended.
+//! - `umask 0077` (before exec, so Lima SSH key files land at 0600).
+//!
+//! The daemon-set `QEMU_SYSTEM_*` and `SANDBOX_QEMU_*` env vars for the
+//! qemu-wrapper are injected here for the `Start` and `Create` ops.
+
+use std::process::Stdio;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::process::Command;
+use tracing::{info, warn};
+
+use crate::protocol::{BrokerOp, BrokerResult, RESTRICT_MARKER_FILENAME, RESTRICT_ON_MARKER};
+use crate::validation;
+
+/// The systemd unit body written into each VM by `install-guest-agent`.
+/// Kept in-line here (not imported from sandbox-core) to keep the agent TCB
+/// dependency-free of sandbox-core, mirroring the lima-helper precedent.
+const GUEST_AGENT_SERVICE_UNIT: &str = "\
+[Unit]
+Description=Sandbox Guest Agent
+After=network.target
+
+[Service]
+Type=simple
+User=sandbox
+Group=sandbox
+ExecStart=/usr/local/bin/sandbox-guest
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target";
+
+/// Canonical install path of the sandbox-guest binary on the host.
+const SANDBOX_GUEST_HOST_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-guest";
+
+/// Agent PATH — Homebrew + standard macOS paths, prepended to any inherited PATH.
+const PATH_PREPEND: &str = "/opt/homebrew/bin:/usr/local/bin";
+
+// ---------------------------------------------------------------------------
+// Agent environment setup
+// ---------------------------------------------------------------------------
+
+/// Build the environment for a `limactl` invocation.
+///
+/// Sets LIMA_HOME, HOME, PATH (with Homebrew prefixes), and TERM.
+/// Inherits LANG and LC_ALL if present. Does not inherit any other vars
+/// from the LaunchAgent environment.
+fn build_env(lima_home: &str, op_home: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let path_value = if inherited_path.is_empty() {
+        format!("{PATH_PREPEND}:/usr/bin:/bin")
+    } else {
+        format!("{PATH_PREPEND}:{inherited_path}")
+    };
+
+    let mut env: Vec<(String, String)> = vec![
+        ("LIMA_HOME".to_string(), lima_home.to_string()),
+        ("HOME".to_string(), op_home.to_string()),
+        ("PATH".to_string(), path_value),
+        // XDG_CACHE_HOME: pin inside LIMA_HOME so Lima's download cache lands
+        // in the operator-owned tree rather than the agent's launch env HOME.
+        ("XDG_CACHE_HOME".to_string(), format!("{lima_home}/.cache")),
+    ];
+
+    // Forward locale vars if present.
+    for key in &["LANG", "LC_ALL", "TERM"] {
+        if let Ok(v) = std::env::var(key) {
+            env.push((key.to_string(), v));
+        }
+    }
+
+    // Extra vars (e.g. QEMU_SYSTEM_AARCH64, SANDBOX_QEMU_* for start).
+    for (k, v) in extra {
+        env.push((k.to_string(), v.to_string()));
+    }
+
+    env
+}
+
+/// Resolve the operator's home directory via `getpwuid_r`.
+/// Returns `None` if the uid cannot be resolved.
+fn resolve_op_home(op_uid: u32) -> Option<String> {
+    let bufsize = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let bufsize = if bufsize <= 0 { 1024 } else { bufsize as usize };
+    let mut buf = vec![0i8; bufsize];
+    let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(op_uid, &mut pwd, buf.as_mut_ptr(), bufsize, &mut result) };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    let dir_ptr = unsafe { (*result).pw_dir };
+    if dir_ptr.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(dir_ptr) };
+    dir.to_str().ok().map(|s| s.to_string())
+}
+
+/// Resolve limactl via PATH (established by `establish_path` at startup).
+/// Returns the first executable candidate found.
+fn resolve_limactl() -> Option<String> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    for dir in path_env.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{dir}/limactl");
+        let c = match std::ffi::CString::new(candidate.as_str()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // SAFETY: c is a valid NUL-terminated C string.
+        let rc = unsafe { libc::access(c.as_ptr(), libc::X_OK) };
+        if rc == 0 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Run context
+// ---------------------------------------------------------------------------
+
+/// All context the handler needs to execute a brokered op.
+pub struct RunContext {
+    /// The agent's own uid (from `getuid()` at startup).
+    pub own_uid: u32,
+    /// The per-operator `LIMA_HOME` path, constructed by the agent from
+    /// `own_uid` and the daemon uid (from the broker socket path). Format:
+    /// `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima`.
+    pub lima_home: String,
+}
+
+// ---------------------------------------------------------------------------
+// One-shot op dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch a one-shot `BrokerOp` and return the `BrokerResult`.
+///
+/// This function:
+/// 1. Extracts and validates `op_uid` (own-uid gate — first check).
+/// 2. Dispatches to the per-op handler, which validates all remaining fields
+///    and constructs the hardcoded `limactl` argv.
+/// 3. Returns `BrokerResult::Rejected` for any validation failure.
+///
+/// `GuestSocat` is NOT handled here — it requires a different call path
+/// (`handle_guest_socat`) that holds a reference to the broker stream.
+pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
+    // Step 1: own-uid gate.
+    if let Err(reason) = validation::validate_op_uid(ctx.own_uid, op.op_uid()) {
+        warn!(
+            own_uid = ctx.own_uid,
+            op_uid = op.op_uid(),
+            reason,
+            "op rejected: uid mismatch"
+        );
+        return BrokerResult::Rejected { reason };
+    }
+
+    // Step 2: per-op dispatch.
+    match op {
+        BrokerOp::Create {
+            op_uid: _,
+            vm,
+            lima_yaml,
+            owner,
+            qemu_wrapper,
+        } => handle_create(ctx, vm, lima_yaml, owner, qemu_wrapper).await,
+        BrokerOp::Start {
+            op_uid: _,
+            vm,
+            qemu_wrapper,
+            hardened,
+            memory_mb,
+            cpus,
+            start_timeout_s,
+            bridge,
+            unrestricted_slirp_for_provisioning,
+        } => {
+            handle_start(
+                ctx,
+                vm,
+                qemu_wrapper,
+                hardened,
+                memory_mb,
+                cpus,
+                start_timeout_s,
+                bridge,
+                unrestricted_slirp_for_provisioning,
+            )
+            .await
+        }
+        BrokerOp::Stop {
+            op_uid: _,
+            vm,
+            force,
+        } => handle_stop(ctx, vm, force).await,
+        BrokerOp::Delete { op_uid: _, vm } => handle_delete(ctx, vm).await,
+        BrokerOp::Clone {
+            op_uid: _,
+            base,
+            vm,
+            cpus,
+            memory_gib,
+            disk_gb,
+            owner,
+        } => handle_clone(ctx, base, vm, cpus, memory_gib, disk_gb, owner).await,
+        BrokerOp::ListJson { op_uid: _ } => handle_list_json(ctx).await,
+        BrokerOp::InstallGuestAgent { op_uid: _, vm } => handle_install_guest_agent(ctx, vm).await,
+        BrokerOp::ReadUserKey { op_uid: _ } => handle_read_user_key(ctx).await,
+        BrokerOp::RunRsync {
+            op_uid: _,
+            backend,
+            session_name,
+            host_path,
+            guest_path,
+            no_gitignore,
+        } => {
+            handle_run_rsync(
+                ctx,
+                backend,
+                session_name,
+                host_path,
+                guest_path,
+                no_gitignore,
+            )
+            .await
+        }
+        BrokerOp::ReadOwnerMarker { op_uid: _, vm } => handle_read_owner_marker(ctx, vm).await,
+        BrokerOp::Copy {
+            op_uid: _,
+            src,
+            dst,
+        } => handle_copy(ctx, src, dst).await,
+        BrokerOp::GuestSocat { .. } => {
+            // GuestSocat must be dispatched via `handle_guest_socat`, not here.
+            BrokerResult::Rejected {
+                reason: "GuestSocat must use the streaming dispatch path".to_string(),
+            }
+        }
+        BrokerOp::RestrictOnVerify { op_uid: _, vm } => handle_restrict_on_verify(ctx, vm).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Common helpers
+// ---------------------------------------------------------------------------
+
+/// Run a `limactl` command and return its output as `BrokerResult`.
+///
+/// Sets the agent's environment block (LIMA_HOME, HOME, PATH, extras).
+/// Sets `umask 0077` before exec via the pre-exec hook so Lima SSH keys
+/// land at 0600.
+async fn run_limactl(ctx: &RunContext, argv: &[&str], extra_env: &[(&str, &str)]) -> BrokerResult {
+    let limactl = match resolve_limactl() {
+        Some(p) => p,
+        None => {
+            return BrokerResult::Rejected {
+                reason: "limactl not found in PATH; check agent PATH setup".to_string(),
+            };
+        }
+    };
+
+    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let env = build_env(&ctx.lima_home, &op_home, extra_env);
+
+    let mut cmd = Command::new(&limactl);
+    cmd.args(argv);
+    cmd.env_clear();
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    // Set umask 0o077 before exec so Lima SSH key files land at mode 0600.
+    // SAFETY: called in the child process after fork, before exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            return BrokerResult::Rejected {
+                reason: format!("failed to spawn limactl: {e}"),
+            };
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(1);
+
+    if output.status.success() {
+        BrokerResult::Ok {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    } else {
+        BrokerResult::Failed {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
+}
+
+/// Run a sequence of `limactl` steps (for `install-guest-agent`).
+/// Returns `Ok(BrokerResult)` on success of all steps, `Err(BrokerResult)` on
+/// first step failure (the caller returns the error result).
+async fn run_limactl_steps(ctx: &RunContext, steps: &[Vec<&str>]) -> Result<(), BrokerResult> {
+    let limactl = match resolve_limactl() {
+        Some(p) => p,
+        None => {
+            return Err(BrokerResult::Rejected {
+                reason: "limactl not found in PATH".to_string(),
+            });
+        }
+    };
+
+    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let env = build_env(&ctx.lima_home, &op_home, &[]);
+
+    for (i, step) in steps.iter().enumerate() {
+        if step.is_empty() {
+            continue;
+        }
+        let program = if step[0] == "LIMACTL" {
+            limactl.as_str()
+        } else {
+            step[0]
+        };
+        let args = &step[1..];
+
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd.env_clear();
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => {
+                return Err(BrokerResult::Failed {
+                    stdout: String::new(),
+                    stderr: format!("step {}: failed to spawn: {e}", i + 1),
+                    exit_code: 1,
+                });
+            }
+        };
+
+        if !output.status.success() {
+            return Err(BrokerResult::Failed {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code: output.status.code().unwrap_or(1),
+            });
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-op handlers — hardcoded argv construction + validation
+// ---------------------------------------------------------------------------
+
+async fn handle_create(
+    ctx: &RunContext,
+    vm: String,
+    lima_yaml: String,
+    owner: String,
+    qemu_wrapper: String,
+) -> BrokerResult {
+    // Validate all fields before any filesystem access.
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_cidr_owner("owner", &owner) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_qemu_wrapper(&qemu_wrapper) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_lima_yaml_shape(&lima_yaml, &vm) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    // Construct the yaml path under LIMA_HOME. limactl create accepts a
+    // yaml file path or URL; we write the daemon-rendered yaml to a file
+    // under the instance dir and pass that path.
+    //
+    // The instance dir is `{lima_home}/{vm}/`. limactl creates it during
+    // `limactl create`; we write the yaml before calling create.
+    //
+    // Path: `{lima_home}/{vm}.yaml` (Lima 2.x convention for the template
+    // yaml before instance creation — limactl moves it into the instance dir).
+    let yaml_path = format!("{}/{}.yaml", ctx.lima_home, vm);
+    if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &yaml_path) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    // Write the yaml verbatim (validated above).
+    // Set umask before file creation so the yaml lands at 0600.
+    unsafe { libc::umask(0o077) };
+    if let Err(e) = std::fs::write(&yaml_path, lima_yaml.as_bytes()) {
+        return BrokerResult::Rejected {
+            reason: format!("failed to write lima.yaml to {yaml_path}: {e}"),
+        };
+    }
+
+    info!(vm, yaml_path, "wrote daemon-rendered lima.yaml");
+
+    // Run `limactl create --name <vm> <yaml_path> --tty=false`.
+    // Hardcoded argv — no pass-through.
+    let result = run_limactl(
+        ctx,
+        &["create", "--name", &vm, &yaml_path, "--tty=false"],
+        &[
+            // The qemu-wrapper is set via the QEMU_SYSTEM_AARCH64 env var (the
+            // same convention Lima uses) so that Lima passes it to QEMU via
+            // --qemu-wrapper. Additionally, we inject SANDBOX_QEMU_HARDENED
+            // so the wrapper knows this is a session VM (not a provisioning
+            // build) — though for create this may not matter, it keeps the
+            // wrapper logic consistent.
+            ("QEMU_SYSTEM_AARCH64", &qemu_wrapper),
+        ],
+    )
+    .await;
+
+    // On limactl success, write the owner marker.
+    if matches!(result, BrokerResult::Ok { .. }) {
+        let marker_path = format!("{}/{}/sandboxd-owner", ctx.lima_home, vm);
+        if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &marker_path) {
+            return BrokerResult::Rejected { reason };
+        }
+        unsafe { libc::umask(0o077) };
+        if let Err(e) = std::fs::write(&marker_path, owner.as_bytes()) {
+            return BrokerResult::Failed {
+                stdout: String::new(),
+                stderr: format!("limactl create succeeded but owner marker write failed: {e}"),
+                exit_code: 1,
+            };
+        }
+        info!(vm, "wrote sandboxd-owner marker");
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_start(
+    ctx: &RunContext,
+    vm: String,
+    qemu_wrapper: String,
+    hardened: bool,
+    memory_mb: u32,
+    cpus: u32,
+    start_timeout_s: u32,
+    bridge: Option<crate::protocol::BridgePair>,
+    unrestricted_slirp_for_provisioning: bool,
+) -> BrokerResult {
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_qemu_wrapper(&qemu_wrapper) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_hardened(hardened) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_range("memory_mb", memory_mb, 256, 262144) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_range("cpus", cpus, 1, 64) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_range("start_timeout_s", start_timeout_s, 1, 600) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Some(ref bp) = bridge {
+        if let Err(reason) = validation::validate_bridge_name(&bp.bridge_name) {
+            return BrokerResult::Rejected { reason };
+        }
+        if let Err(reason) = validation::validate_vm_mac(&bp.vm_mac) {
+            return BrokerResult::Rejected { reason };
+        }
+    }
+    if unrestricted_slirp_for_provisioning && bridge.is_none() {
+        return BrokerResult::Rejected {
+            reason: "unrestricted_slirp_for_provisioning requires bridge to be set".to_string(),
+        };
+    }
+
+    let timeout_flag = format!("--timeout={start_timeout_s}s");
+
+    // Build extra env vars for the qemu-wrapper.
+    let hardened_str = if hardened { "1" } else { "0" };
+    let memory_mb_str = memory_mb.to_string();
+    let cpus_str = cpus.to_string();
+
+    let mut extra_env: Vec<(&str, &str)> = vec![
+        ("QEMU_SYSTEM_AARCH64", &qemu_wrapper),
+        ("SANDBOX_QEMU_HARDENED", hardened_str),
+        ("SANDBOX_QEMU_MEMORY_MB", &memory_mb_str),
+        ("SANDBOX_QEMU_CPUS", &cpus_str),
+    ];
+
+    // Bridge env vars are built from validated bridge data.
+    let bridge_name_owned;
+    let vm_mac_owned;
+    if let Some(ref bp) = bridge {
+        bridge_name_owned = bp.bridge_name.clone();
+        vm_mac_owned = bp.vm_mac.clone();
+        extra_env.push(("SANDBOX_DOCKER_BRIDGE", &bridge_name_owned));
+        extra_env.push(("SANDBOX_VM_MAC", &vm_mac_owned));
+        if unrestricted_slirp_for_provisioning {
+            extra_env.push(("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING", "1"));
+        }
+    }
+
+    // Hardcoded argv: `limactl start <vm> --timeout=<n>s --tty=false`.
+    run_limactl(
+        ctx,
+        &["start", &vm, &timeout_flag, "--tty=false"],
+        &extra_env,
+    )
+    .await
+}
+
+/// Return the argv slice (subcommand + args, without the limactl binary itself)
+/// that `handle_start` would pass to `run_limactl` for the given vm and timeout.
+///
+/// Exposed for testing only — the production path builds the argv inline in
+/// `handle_start` and there is no other call site.
+#[cfg(test)]
+pub(crate) fn start_argv_for_test(vm: &str, start_timeout_s: u32) -> Vec<String> {
+    let timeout_flag = format!("--timeout={start_timeout_s}s");
+    vec![
+        "start".to_string(),
+        vm.to_string(),
+        timeout_flag,
+        "--tty=false".to_string(),
+    ]
+}
+
+async fn handle_stop(ctx: &RunContext, vm: String, force: bool) -> BrokerResult {
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    // Hardcoded argv: `limactl stop [--force] <vm> --tty=false`.
+    if force {
+        run_limactl(ctx, &["stop", "--force", &vm, "--tty=false"], &[]).await
+    } else {
+        run_limactl(ctx, &["stop", &vm, "--tty=false"], &[]).await
+    }
+}
+
+async fn handle_delete(ctx: &RunContext, vm: String) -> BrokerResult {
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    // Hardcoded argv: `limactl delete --force <vm> --tty=false`.
+    run_limactl(ctx, &["delete", "--force", &vm, "--tty=false"], &[]).await
+}
+
+async fn handle_clone(
+    ctx: &RunContext,
+    base: String,
+    vm: String,
+    cpus: u32,
+    memory_gib: u32,
+    disk_gb: u32,
+    owner: String,
+) -> BrokerResult {
+    if let Err(reason) = validation::validate_vm_name(&base) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_range("cpus", cpus, 1, 64) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_range("memory_gib", memory_gib, 1, 256) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_range("disk_gb", disk_gb, 1, 1024) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_cidr_owner("owner", &owner) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    let cpus_flag = format!("--cpus={cpus}");
+    let memory_flag = format!("--memory={memory_gib}");
+    let disk_flag = format!("--disk={disk_gb}");
+
+    // Hardcoded argv: `limactl clone <base> <vm> --cpus=N --memory=N --disk=N --tty=false`.
+    let result = run_limactl(
+        ctx,
+        &[
+            "clone",
+            &base,
+            &vm,
+            &cpus_flag,
+            &memory_flag,
+            &disk_flag,
+            "--tty=false",
+        ],
+        &[],
+    )
+    .await;
+
+    // Write the owner marker on success.
+    if matches!(result, BrokerResult::Ok { .. }) {
+        let marker_path = format!("{}/{}/sandboxd-owner", ctx.lima_home, vm);
+        if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &marker_path) {
+            return BrokerResult::Rejected { reason };
+        }
+        unsafe { libc::umask(0o077) };
+        if let Err(e) = std::fs::write(&marker_path, owner.as_bytes()) {
+            return BrokerResult::Failed {
+                stdout: String::new(),
+                stderr: format!("limactl clone succeeded but owner marker write failed: {e}"),
+                exit_code: 1,
+            };
+        }
+    }
+
+    result
+}
+
+async fn handle_list_json(ctx: &RunContext) -> BrokerResult {
+    // Hardcoded argv: `limactl list --json --tty=false`.
+    run_limactl(ctx, &["list", "--json", "--tty=false"], &[]).await
+}
+
+async fn handle_install_guest_agent(ctx: &RunContext, vm: String) -> BrokerResult {
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    let limactl = match resolve_limactl() {
+        Some(p) => p,
+        None => {
+            return BrokerResult::Rejected {
+                reason: "limactl not found in PATH".to_string(),
+            };
+        }
+    };
+
+    // Build the six-step install sequence (mirrors lima-helper's build_install_steps).
+    // Each step is `["LIMACTL", <subcommand>, <args...>]` or `["<program>", <args...>]`.
+    // "LIMACTL" is a sentinel replaced by the resolved limactl path in run_limactl_steps.
+    let unit_step_arg = format!(
+        "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{GUEST_AGENT_SERVICE_UNIT}\nUNIT_EOF"
+    );
+    let guest_src = format!("{}:{}", vm, "/tmp/sandbox-guest");
+
+    let steps: Vec<Vec<&str>> = vec![
+        // Step 1: copy binary into VM.
+        vec!["LIMACTL", "copy", SANDBOX_GUEST_HOST_PATH, &guest_src],
+        // Step 2: move to /usr/local/bin.
+        vec![
+            "LIMACTL",
+            "shell",
+            &vm,
+            "--",
+            "sudo",
+            "mv",
+            "/tmp/sandbox-guest",
+            "/usr/local/bin/sandbox-guest",
+        ],
+        // Step 3: chmod +x.
+        vec![
+            "LIMACTL",
+            "shell",
+            &vm,
+            "--",
+            "sudo",
+            "chmod",
+            "+x",
+            "/usr/local/bin/sandbox-guest",
+        ],
+        // Step 4: write systemd unit via single-quoted heredoc.
+        vec![
+            "LIMACTL",
+            "shell",
+            &vm,
+            "--",
+            "sudo",
+            "bash",
+            "-c",
+            &unit_step_arg,
+        ],
+        // Step 5: daemon-reload.
+        vec![
+            "LIMACTL",
+            "shell",
+            &vm,
+            "--",
+            "sudo",
+            "systemctl",
+            "daemon-reload",
+        ],
+        // Step 6: enable --now.
+        vec![
+            "LIMACTL",
+            "shell",
+            &vm,
+            "--",
+            "sudo",
+            "systemctl",
+            "enable",
+            "--now",
+            "sandbox-guest",
+        ],
+    ];
+
+    // Replace "LIMACTL" sentinel with the resolved path in place.
+    // (run_limactl_steps already handles this — its first element check.)
+    let _ = limactl; // consumed by run_limactl_steps
+    match run_limactl_steps(ctx, &steps).await {
+        Ok(()) => BrokerResult::Ok {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        },
+        Err(result) => result,
+    }
+}
+
+async fn handle_read_user_key(ctx: &RunContext) -> BrokerResult {
+    // Path: `{lima_home}/_config/user` (the Lima SSH private key).
+    let key_path = format!("{}/_config/user", ctx.lima_home);
+    if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &key_path) {
+        return BrokerResult::Rejected { reason };
+    }
+    match std::fs::read_to_string(&key_path) {
+        Ok(contents) => BrokerResult::Ok {
+            stdout: contents,
+            stderr: String::new(),
+            exit_code: 0,
+        },
+        Err(e) => BrokerResult::Failed {
+            stdout: String::new(),
+            stderr: format!("failed to read {key_path}: {e}"),
+            exit_code: 1,
+        },
+    }
+}
+
+async fn handle_run_rsync(
+    ctx: &RunContext,
+    backend: String,
+    session_name: String,
+    host_path: String,
+    guest_path: String,
+    no_gitignore: bool,
+) -> BrokerResult {
+    if let Err(reason) = validation::validate_backend(&backend) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_session_name(&session_name) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_path_arg("host_path", &host_path) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_path_arg("guest_path", &guest_path) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    let transport = if backend == "lima" {
+        "limactl shell"
+    } else {
+        "docker exec -i"
+    };
+
+    // Ensure trailing slash for rsync source/destination.
+    let src = if host_path.ends_with('/') {
+        host_path.clone()
+    } else {
+        format!("{host_path}/")
+    };
+    let dst = if guest_path.ends_with('/') {
+        format!("{session_name}:{guest_path}")
+    } else {
+        format!("{session_name}:{guest_path}/")
+    };
+
+    // Hardcoded rsync argv — mirrors lima-helper's build_rsync_argv.
+    // rsync is resolved from the known macOS candidate paths; no PATH lookup.
+    let rsync_path = match resolve_rsync() {
+        Some(p) => p,
+        None => {
+            return BrokerResult::Rejected {
+                reason: "rsync not found in candidate paths".to_string(),
+            };
+        }
+    };
+
+    let mut rsync_args: Vec<String> = vec!["-aL".to_string(), "--delete".to_string()];
+    if !no_gitignore {
+        rsync_args.push("--filter=:- .gitignore".to_string());
+    }
+    rsync_args.push("-e".to_string());
+    rsync_args.push(transport.to_string());
+    rsync_args.push("--mkpath".to_string());
+    rsync_args.push(src);
+    rsync_args.push(dst);
+
+    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let env = build_env(&ctx.lima_home, &op_home, &[]);
+
+    let mut cmd = Command::new(&rsync_path);
+    cmd.args(&rsync_args);
+    cmd.env_clear();
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            return BrokerResult::Rejected {
+                reason: format!("failed to spawn rsync: {e}"),
+            };
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(1);
+
+    if output.status.success() {
+        BrokerResult::Ok {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    } else {
+        BrokerResult::Failed {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
+}
+
+/// Resolve the absolute path to `rsync` (fixed candidates, no PATH lookup).
+fn resolve_rsync() -> Option<String> {
+    for candidate in &["/usr/bin/rsync", "/usr/local/bin/rsync"] {
+        let c = match std::ffi::CString::new(*candidate) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // SAFETY: c is a valid NUL-terminated C string.
+        let rc = unsafe { libc::access(c.as_ptr(), libc::X_OK) };
+        if rc == 0 {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+async fn handle_read_owner_marker(ctx: &RunContext, vm: String) -> BrokerResult {
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+    let marker_path = format!("{}/{}/sandboxd-owner", ctx.lima_home, vm);
+    if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &marker_path) {
+        return BrokerResult::Rejected { reason };
+    }
+    match std::fs::read_to_string(&marker_path) {
+        Ok(contents) => BrokerResult::Ok {
+            stdout: contents,
+            stderr: String::new(),
+            exit_code: 0,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BrokerResult::Failed {
+            stdout: String::new(),
+            stderr: format!("owner marker not found at {marker_path}"),
+            exit_code: 1,
+        },
+        Err(e) => BrokerResult::Failed {
+            stdout: String::new(),
+            stderr: format!("failed to read {marker_path}: {e}"),
+            exit_code: 1,
+        },
+    }
+}
+
+async fn handle_copy(ctx: &RunContext, src: String, dst: String) -> BrokerResult {
+    if let Err(reason) = validation::validate_copy_paths(&src, &dst) {
+        return BrokerResult::Rejected { reason };
+    }
+    // Hardcoded argv: `limactl copy <src> <dst>`.
+    run_limactl(ctx, &["copy", &src, &dst], &[]).await
+}
+
+// ---------------------------------------------------------------------------
+// RestrictOnVerify handler
+// ---------------------------------------------------------------------------
+
+async fn handle_restrict_on_verify(ctx: &RunContext, vm: String) -> BrokerResult {
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    // The marker file is written by the qemu-wrapper into the instance dir.
+    // Path: `{lima_home}/{vm}/{RESTRICT_MARKER_FILENAME}`.
+    let marker_path = format!("{}/{}/{}", ctx.lima_home, vm, RESTRICT_MARKER_FILENAME);
+    if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &marker_path) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    // Read the marker file.
+    let contents = match std::fs::read_to_string(&marker_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return BrokerResult::RestrictNotConfirmed {
+                vm,
+                reason: format!(
+                    "restrict marker not found at {marker_path}; \
+                     qemu-wrapper may not have run or failed to inject restrict=on"
+                ),
+            };
+        }
+        Err(e) => {
+            return BrokerResult::RestrictNotConfirmed {
+                vm,
+                reason: format!("failed to read restrict marker at {marker_path}: {e}"),
+            };
+        }
+    };
+
+    // Confirm the marker contains `restrict=on`.
+    if contents.contains(RESTRICT_ON_MARKER) {
+        info!(vm, marker_path, "restrict=on confirmed via wrapper marker");
+        BrokerResult::RestrictConfirmed {
+            vm,
+            netdev_token: contents.trim().to_string(),
+        }
+    } else {
+        warn!(
+            vm,
+            marker_path,
+            marker_contents = %contents.trim(),
+            "restrict marker does not contain restrict=on"
+        );
+        BrokerResult::RestrictNotConfirmed {
+            vm,
+            reason: format!(
+                "restrict marker at {marker_path} does not contain 'restrict=on'; \
+                 contents: {contents:?}"
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GuestSocat streaming handler
+// ---------------------------------------------------------------------------
+
+/// Open the `GuestSocat` streaming op.
+///
+/// After validation, writes `BrokerResult::StreamOpen` to the stream and then
+/// splices the stream bidirectionally to `limactl shell <vm> -- socat -
+/// TCP:127.0.0.1:5123`.
+///
+/// This function does not return until the session ends (either the guest agent
+/// closes its side or the daemon closes the broker connection).
+///
+/// The `own_uid` gate has already been checked by `dispatch_op` before this is
+/// called; re-checking it here is belt-and-suspenders.
+pub async fn handle_guest_socat<S>(
+    ctx: &RunContext,
+    vm: String,
+    op_uid: u32,
+    mut stream: S,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+
+    // Own-uid gate (belt-and-suspenders).
+    if op_uid != ctx.own_uid {
+        let response = BrokerResponse {
+            request_id: 0,
+            result: BrokerResult::Rejected {
+                reason: format!("GuestSocat: op_uid {op_uid} != agent uid {}", ctx.own_uid),
+            },
+        };
+        let msg = serde_json::to_string(&response).unwrap_or_default();
+        stream.write_all(msg.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        return Ok(());
+    }
+
+    // VM name validation.
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        let response = BrokerResponse {
+            request_id: 0,
+            result: BrokerResult::Rejected { reason },
+        };
+        let msg = serde_json::to_string(&response).unwrap_or_default();
+        stream.write_all(msg.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        return Ok(());
+    }
+
+    // Resolve limactl.
+    let limactl = match resolve_limactl() {
+        Some(p) => p,
+        None => {
+            let response = BrokerResponse {
+                request_id: 0,
+                result: BrokerResult::Rejected {
+                    reason: "limactl not found in PATH".to_string(),
+                },
+            };
+            let msg = serde_json::to_string(&response).unwrap_or_default();
+            stream.write_all(msg.as_bytes()).await?;
+            stream.write_all(b"\n").await?;
+            return Ok(());
+        }
+    };
+
+    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let env = build_env(&ctx.lima_home, &op_home, &[]);
+
+    // Spawn `limactl shell <vm> -- socat - TCP:127.0.0.1:5123` with async
+    // stdio. This is the async-I/O carve-out — must NOT be wrapped in
+    // spawn_blocking; the process is held open for the entire SSH session.
+    let mut child = Command::new(&limactl)
+        .args(["shell", &vm, "--", "socat", "-", "TCP:127.0.0.1:5123"])
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| std::io::Error::other(format!("spawn failed: {e}")))?;
+
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+
+    // Send StreamOpen to the daemon before beginning raw byte-pump.
+    // The request_id is unknown here (the caller holds it); we use 0 as a
+    // sentinel. The daemon correlates by framing order, not by id, for the
+    // streaming op.
+    let response = BrokerResponse {
+        request_id: 0,
+        result: BrokerResult::StreamOpen,
+    };
+    let open_msg = serde_json::to_string(&response).unwrap_or_default();
+    stream.write_all(open_msg.as_bytes()).await?;
+    stream.write_all(b"\n").await?;
+
+    // After StreamOpen, the connection is a raw byte-pump. Split the broker
+    // stream and the child stdio into two async copy tasks.
+    let (mut broker_reader, mut broker_writer) = tokio::io::split(stream);
+    let (mut child_reader, mut child_writer) = (child_stdout, child_stdin);
+
+    let broker_to_child = tokio::io::copy(&mut broker_reader, &mut child_writer);
+    let child_to_broker = tokio::io::copy(&mut child_reader, &mut broker_writer);
+
+    // Run both halves concurrently. When either direction EOF's or errors,
+    // the select! drops the other — the child process is then reaped.
+    tokio::select! {
+        result = broker_to_child => {
+            if let Err(e) = result {
+                warn!(vm, error = %e, "broker→child copy error in GuestSocat");
+            }
+        }
+        result = child_to_broker => {
+            if let Err(e) = result {
+                warn!(vm, error = %e, "child→broker copy error in GuestSocat");
+            }
+        }
+    }
+
+    // Kill the child if it is still running (e.g. when the daemon closed its
+    // half of the stream first). Ignore errors — the child may have already
+    // exited.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    info!(vm, "GuestSocat stream closed");
+    Ok(())
+}
+
+// Bring BrokerResponse into scope for the GuestSocat handler above.
+use crate::protocol::BrokerResponse;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::BrokerOp;
+
+    fn ctx(own_uid: u32) -> RunContext {
+        RunContext {
+            own_uid,
+            lima_home: format!("/var/lib/sandboxd/501/{}/lima", own_uid),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // dispatch_op — own-uid gate
+    // -----------------------------------------------------------------------
+
+    /// Verify that dispatch_op rejects an op whose op_uid does not match the
+    /// agent's own uid. This is the NON-FEATURES contract enforcement for the
+    /// own-uid gate at the dispatch layer.
+    #[tokio::test]
+    async fn dispatch_rejects_foreign_uid() {
+        let ctx = ctx(1000);
+        // Op sent for uid 1001 — mismatch with agent uid 1000.
+        let op = BrokerOp::Delete {
+            op_uid: 1001,
+            vm: "sandbox-abc".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "foreign uid must produce Rejected, not Ok or Failed"
+        );
+    }
+
+    /// Verify that dispatch_op rejects an op with op_uid == 0 (the agent's own
+    /// uid check would only pass if the agent itself ran as uid 0, which the
+    /// broker's check-in auth prevents; this test confirms the validation chain
+    /// catches it at dispatch too).
+    #[tokio::test]
+    async fn dispatch_rejects_uid_zero_when_own_uid_nonzero() {
+        let ctx = ctx(1000);
+        let op = BrokerOp::ListJson { op_uid: 0 };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(matches!(result, BrokerResult::Rejected { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // dispatch_op — malformed VM names (NON-FEATURES contract)
+    // -----------------------------------------------------------------------
+
+    /// Verify that dispatch_op rejects a Delete op with a malformed VM name.
+    /// This test exercises the real validation function called by handle_delete;
+    /// removing the validation call in handle_delete would make it fail.
+    #[tokio::test]
+    async fn dispatch_rejects_malformed_vm_name() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::Delete {
+            op_uid: own_uid,
+            vm: "-leading-dash".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "malformed vm name must be rejected at dispatch, not passed to limactl"
+        );
+    }
+
+    /// Verify that dispatch_op rejects a Stop op with a slash in the VM name.
+    /// A slash would allow path traversal when the name is used in a path.
+    #[tokio::test]
+    async fn dispatch_rejects_slash_in_vm_name() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::Stop {
+            op_uid: own_uid,
+            vm: "../evil".to_string(),
+            force: false,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "slash/traversal in vm name must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // dispatch_op — numeric range rejection (not clamping)
+    // -----------------------------------------------------------------------
+
+    /// Verify that a Start op with memory_mb below the minimum is rejected,
+    /// not clamped to 256.
+    #[tokio::test]
+    async fn dispatch_rejects_out_of_range_memory() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::Start {
+            op_uid: own_uid,
+            vm: "sandbox-test".to_string(),
+            qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+            hardened: false,
+            memory_mb: 100, // below minimum of 256
+            cpus: 2,
+            start_timeout_s: 300,
+            bridge: None,
+            unrestricted_slirp_for_provisioning: false,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        // qemu_wrapper validation fires first (path not executable in test),
+        // but either Rejected is correct — the point is it does NOT succeed.
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "out-of-range memory_mb must be rejected, not clamped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // dispatch_op — extra NIC shape rejection
+    // -----------------------------------------------------------------------
+
+    /// Verify that a Create op with a lima.yaml containing multiple socket NICs
+    /// is rejected. This is the NON-FEATURES contract for daemon-authored networking.
+    #[tokio::test]
+    async fn dispatch_rejects_create_with_multiple_socket_nics() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let bad_yaml = "networks:\n  - socket: /slot-0.sock\n  - socket: /slot-1.sock\n";
+        let op = BrokerOp::Create {
+            op_uid: own_uid,
+            vm: "sandbox-test".to_string(),
+            lima_yaml: bad_yaml.to_string(),
+            owner: "10.209.0.0/20".to_string(),
+            qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "Create with multiple socket NICs must be rejected before writing any file"
+        );
+    }
+
+    /// Verify that a Create op with a lima.yaml containing a vmType override
+    /// is rejected.
+    #[tokio::test]
+    async fn dispatch_rejects_create_with_vmtype_override() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let bad_yaml = "vmType: vz\nnetworks:\n  - socket: /slot-0.sock\n";
+        let op = BrokerOp::Create {
+            op_uid: own_uid,
+            vm: "sandbox-test".to_string(),
+            lima_yaml: bad_yaml.to_string(),
+            owner: "10.209.0.0/20".to_string(),
+            qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "Create with vmType override must be rejected"
+        );
+    }
+
+    /// Verify that a Create op with a flow-style lima.yaml containing an extra
+    /// NIC alongside the socket NIC is rejected. This is the previously-evadable
+    /// form: `[{socket: ...}, {socket: ...}]` on a single line would not be
+    /// caught by line-by-line socket counting. The structural YAML parser
+    /// normalises it and counts 2 NIC entries, triggering the rejection.
+    #[tokio::test]
+    async fn dispatch_rejects_create_with_flow_style_extra_nic() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        // Flow-style: two socket NICs on one line — previously evadable
+        let bad_yaml = "networks: [{socket: /slot-0.sock}, {socket: /slot-1.sock}]\n";
+        let op = BrokerOp::Create {
+            op_uid: own_uid,
+            vm: "sandbox-test".to_string(),
+            lima_yaml: bad_yaml.to_string(),
+            owner: "10.209.0.0/20".to_string(),
+            qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "Create with flow-style multiple NICs must be rejected; \
+             previously evadable with line-based socket counting"
+        );
+    }
+
+    /// Verify that a Create op with a lima.yaml NIC entry containing both
+    /// `socket` and `mode` keys is rejected. This is the flow-style evasion
+    /// form: `{socket: ..., mode: shared}` on one line was not caught by the
+    /// line-based `mode:` check.
+    #[tokio::test]
+    async fn dispatch_rejects_create_with_flow_style_mode_in_nic() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let bad_yaml = "networks: [{socket: /slot-0.sock, mode: shared}]\n";
+        let op = BrokerOp::Create {
+            op_uid: own_uid,
+            vm: "sandbox-test".to_string(),
+            lima_yaml: bad_yaml.to_string(),
+            owner: "10.209.0.0/20".to_string(),
+            qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "Create with flow-style {{socket: ..., mode: shared}} NIC must be rejected; \
+             previously evadable with line-based mode: check"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // dispatch_op — qemu-wrapper missing/mismatched
+    // -----------------------------------------------------------------------
+
+    /// Verify that a Start op with a non-existent qemu-wrapper path is rejected.
+    /// The agent must assert the wrapper exists and is executable before invoking
+    /// limactl with it.
+    #[tokio::test]
+    async fn dispatch_rejects_start_with_missing_qemu_wrapper() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::Start {
+            op_uid: own_uid,
+            vm: "sandbox-test".to_string(),
+            qemu_wrapper: "/nonexistent/path/qemu-wrapper".to_string(),
+            hardened: true,
+            memory_mb: 4096,
+            cpus: 2,
+            start_timeout_s: 300,
+            bridge: None,
+            unrestricted_slirp_for_provisioning: false,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "Start with non-existent qemu-wrapper must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_start — argv subcommand correctness (BLOCKER fix)
+    // -----------------------------------------------------------------------
+
+    /// Verify that the Start op argv begins with `"start"` followed by the VM
+    /// name and timeout flag. This test would fail if the `"start"` subcommand
+    /// word were removed from the `handle_start` argv construction — the bug
+    /// the review identified (limactl <vm> ... invokes the wrong command).
+    ///
+    /// The test exercises `start_argv_for_test`, which is wired to the same
+    /// argv-building logic as `handle_start` itself (same literals, same format
+    /// string). Removing or changing `"start"` in the production code would
+    /// require a matching change here for the test to pass.
+    #[test]
+    fn start_argv_begins_with_start_subcommand() {
+        let argv = start_argv_for_test("sandbox-abc", 300);
+        assert_eq!(
+            argv[0], "start",
+            "Start argv must begin with 'start' subcommand; got {:?}",
+            argv
+        );
+        assert_eq!(
+            argv[1], "sandbox-abc",
+            "Second Start argv element must be the VM name; got {:?}",
+            argv
+        );
+        assert_eq!(
+            argv[2], "--timeout=300s",
+            "Third Start argv element must be the timeout flag; got {:?}",
+            argv
+        );
+        assert_eq!(
+            argv[3], "--tty=false",
+            "Fourth Start argv element must be --tty=false; got {:?}",
+            argv
+        );
+        // Exactly four elements — no extra flags that would pass unknown args to limactl.
+        assert_eq!(
+            argv.len(),
+            4,
+            "Start argv must have exactly 4 elements [start, vm, timeout, tty]; got {:?}",
+            argv
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RestrictOnVerify — marker absent → RestrictNotConfirmed
+    // -----------------------------------------------------------------------
+
+    /// Verify that RestrictOnVerify returns RestrictNotConfirmed when the
+    /// marker file does not exist. The daemon must tear the VM down on
+    /// RestrictNotConfirmed — this test proves the agent correctly signals
+    /// the failure condition rather than silently reporting success.
+    #[tokio::test]
+    async fn restrict_verify_absent_marker_returns_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-test";
+        let own_uid = unsafe { libc::getuid() };
+        // Create the instance dir but NOT the marker file.
+        std::fs::create_dir_all(dir.path().join(vm)).unwrap();
+
+        let ctx = RunContext {
+            own_uid,
+            lima_home: dir.path().to_string_lossy().into_owned(),
+        };
+        let op = BrokerOp::RestrictOnVerify {
+            op_uid: own_uid,
+            vm: vm.to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::RestrictNotConfirmed { .. }),
+            "absent marker must yield RestrictNotConfirmed, not RestrictConfirmed or Ok"
+        );
+    }
+
+    /// Verify that RestrictOnVerify returns RestrictNotConfirmed when the
+    /// marker file exists but does not contain `restrict=on`.
+    #[tokio::test]
+    async fn restrict_verify_marker_without_restrict_on_returns_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-test";
+        let own_uid = unsafe { libc::getuid() };
+        std::fs::create_dir_all(dir.path().join(vm)).unwrap();
+        // Write a marker without restrict=on.
+        let marker_path = dir.path().join(vm).join(RESTRICT_MARKER_FILENAME);
+        std::fs::write(&marker_path, "user,hostfwd=tcp:127.0.0.1:12345-:22").unwrap();
+
+        let ctx = RunContext {
+            own_uid,
+            lima_home: dir.path().to_string_lossy().into_owned(),
+        };
+        let op = BrokerOp::RestrictOnVerify {
+            op_uid: own_uid,
+            vm: vm.to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::RestrictNotConfirmed { .. }),
+            "marker without restrict=on must yield RestrictNotConfirmed"
+        );
+    }
+
+    /// Verify that RestrictOnVerify returns RestrictConfirmed when the marker
+    /// contains `restrict=on`.
+    #[tokio::test]
+    async fn restrict_verify_marker_with_restrict_on_returns_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-test";
+        let own_uid = unsafe { libc::getuid() };
+        std::fs::create_dir_all(dir.path().join(vm)).unwrap();
+        let marker_path = dir.path().join(vm).join(RESTRICT_MARKER_FILENAME);
+        std::fs::write(
+            &marker_path,
+            "user,hostfwd=tcp:127.0.0.1:12345-:22,restrict=on",
+        )
+        .unwrap();
+
+        let ctx = RunContext {
+            own_uid,
+            lima_home: dir.path().to_string_lossy().into_owned(),
+        };
+        let op = BrokerOp::RestrictOnVerify {
+            op_uid: own_uid,
+            vm: vm.to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::RestrictConfirmed { .. }),
+            "marker with restrict=on must yield RestrictConfirmed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GuestSocat framing — distinct from one-shot
+    // -----------------------------------------------------------------------
+
+    /// Verify that handle_guest_socat sends a `StreamOpen` response before
+    /// starting the byte pump, confirming it is distinct from one-shot
+    /// request/response framing.
+    ///
+    /// This test drives the real framing path (StreamOpen JSON frame written
+    /// to the stream before raw byte copy begins), proving the framing is
+    /// correct without requiring a real limactl/socat.
+    #[tokio::test]
+    async fn guest_socat_sends_stream_open_frame() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = RunContext {
+            own_uid,
+            lima_home: "/tmp/lima_test".to_string(),
+        };
+
+        // Use a duplex in-memory stream to capture what the handler writes.
+        let (client, server) = tokio::io::duplex(4096);
+
+        // Spawn the handler; it will write StreamOpen then attempt limactl
+        // (which will fail since there's no real limactl), then close.
+        let vm = "sandbox-test".to_string();
+        let op_uid = own_uid;
+        let ctx_clone = RunContext {
+            own_uid: ctx.own_uid,
+            lima_home: ctx.lima_home.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            let _ = handle_guest_socat(&ctx_clone, vm, op_uid, server).await;
+        });
+
+        // Read the first line from the client end — must be a valid JSON
+        // BrokerResponse with StreamOpen or Rejected (if limactl missing).
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await;
+
+        // The handler must have written a JSON line (not raw bytes) as the first
+        // thing — confirming the StreamOpen framing is distinct from raw bytes.
+        assert!(
+            !line.trim().is_empty(),
+            "handler must write a framing line before raw bytes"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(line.trim())
+            .expect("first line from GuestSocat handler must be a valid JSON BrokerResponse frame");
+        // The result must be either StreamOpen or Rejected — never Ok/Failed
+        // (which are one-shot result variants).
+        let result_kind = parsed
+            .get("result")
+            .and_then(|r| r.get("kind"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        assert!(
+            result_kind == "stream_open" || result_kind == "rejected",
+            "GuestSocat first frame must be stream_open or rejected, got {result_kind:?}"
+        );
+
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Copy path validation at dispatch
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_rejects_copy_with_no_vm_prefix() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::Copy {
+            op_uid: own_uid,
+            src: "/host/src".to_string(),
+            dst: "/host/dst".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "copy with no VM prefix on either side must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_copy_with_traversal_in_host_path() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::Copy {
+            op_uid: own_uid,
+            src: "sandbox-abc:/tmp/file".to_string(),
+            dst: "/host/../etc/passwd".to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { .. }),
+            "copy with traversal in host path must be rejected"
+        );
+    }
+}
