@@ -1,7 +1,6 @@
 .obsidian/
 .stfolder/
 /.tasks/*
-!/.tasks/specs/
 .trash/
 *.swp
 .venv/
@@ -23,6 +22,7 @@ __pycache__/
 .claude/scheduled_tasks.lock
 .claude/pr_msg.md
 .claude/commit_msg.txt
+.claude/worktrees/
 
 # graphify knowledge-graph artefacts (project-level tooling — generated)
 /graphify-out/
