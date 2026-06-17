@@ -746,7 +746,10 @@ fn free_kb_at(path: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(&probe) {
         Ok(s) => {
             let block_kb = s.fragment_size() / 1024;
-            s.blocks_available().saturating_mul(block_kb.max(1))
+            // `blocks_available()` returns `u64` on Linux, `u32` on macOS;
+            // cast to `u64` so the expression type is uniform across platforms.
+            let blocks = s.blocks_available() as u64;
+            blocks.saturating_mul(block_kb.max(1))
         }
         Err(_) => 0,
     }

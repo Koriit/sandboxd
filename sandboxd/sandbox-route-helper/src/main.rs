@@ -102,354 +102,334 @@
 //! is the load-bearing signal for both operators and the integration
 //! tests; assertions key on substrings of the messages emitted here.
 
-use std::ffi::OsString;
-use std::net::Ipv4Addr;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::process::{Command, ExitCode};
-
-use nix::errno::Errno;
-use nix::ifaddrs::getifaddrs;
-use nix::sched::{CloneFlags, setns};
-use nix::unistd::{Uid, User};
-use sandbox_core::users_conf::{SubnetEntry, load_users_config_route_helper};
-
+#[cfg(target_os = "linux")]
 mod audit;
+#[cfg(target_os = "linux")]
 mod pair_check;
 
-use audit::{AuditOutcome, AuditRecord, Decision};
-use pair_check::{Verdict, pair_check};
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::ffi::OsString;
+    use std::net::Ipv4Addr;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::{Command, ExitCode};
 
-/// Fault-injection env var for the `Err(non-ENOENT)` arms of
-/// `User::from_uid` / `User::from_name`. Honored only in
-/// `test-env-override` builds (privilege story: a cap'd binary that let
-/// an attacker steer libc errors via env would be a step backwards from
-/// the production hardening).
-///
-/// Format: `<site>:<errno>` where `<site>` is `caller_uid` (targets the
-/// `User::from_uid` lookup) or `for_user` (targets the `User::from_name`
-/// lookup), and `<errno>` is the base-10 integer errno value to return.
-/// Unparseable values are treated as "no injection".
-///
-/// `getpwuid_r` / `getpwnam_r` can legitimately return errnos other
-/// than `ENOENT` under environment conditions (NSS service down,
-/// `EIO`, `EINTR`, `ENOMEM`, ...) that cannot be reproduced
-/// deterministically in a hermetic test. This env var is the seam that
-/// lets the integration tests cover the `caller-uid-resolution-error`
-/// and `for-user-resolution-error` audit branches independently.
-#[cfg(feature = "test-env-override")]
-const SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR_ENV: &str =
-    "SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR";
+    use nix::errno::Errno;
+    use nix::ifaddrs::getifaddrs;
+    use nix::sched::{CloneFlags, setns};
+    use nix::unistd::{Uid, User};
+    use sandbox_core::users_conf::{SubnetEntry, load_users_config_route_helper};
 
-/// Which site the injected errno targets.
-#[cfg(feature = "test-env-override")]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InjectionSite {
-    CallerUid,
-    ForUser,
-}
+    use super::audit::{AuditOutcome, AuditRecord, Decision};
+    use super::pair_check::{Verdict, pair_check};
 
-/// Parse the env-var value `"<site>:<errno>"` and return the injected
-/// errno iff `site` matches `want`. Returns `None` in production builds
-/// unconditionally.
-#[cfg(feature = "test-env-override")]
-fn injected_user_resolution_errno(want: InjectionSite) -> Option<Errno> {
-    let raw = std::env::var(SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR_ENV).ok()?;
-    let (site, errno_str) = raw.split_once(':')?;
-    let parsed_site = match site {
-        "caller_uid" => InjectionSite::CallerUid,
-        "for_user" => InjectionSite::ForUser,
-        _ => return None,
-    };
-    if parsed_site != want {
-        return None;
+    /// Fault-injection env var for the `Err(non-ENOENT)` arms of
+    /// `User::from_uid` / `User::from_name`. Honored only in
+    /// `test-env-override` builds (privilege story: a cap'd binary that let
+    /// an attacker steer libc errors via env would be a step backwards from
+    /// the production hardening).
+    ///
+    /// Format: `<site>:<errno>` where `<site>` is `caller_uid` (targets the
+    /// `User::from_uid` lookup) or `for_user` (targets the `User::from_name`
+    /// lookup), and `<errno>` is the base-10 integer errno value to return.
+    /// Unparseable values are treated as "no injection".
+    ///
+    /// `getpwuid_r` / `getpwnam_r` can legitimately return errnos other
+    /// than `ENOENT` under environment conditions (NSS service down,
+    /// `EIO`, `EINTR`, `ENOMEM`, ...) that cannot be reproduced
+    /// deterministically in a hermetic test. This env var is the seam that
+    /// lets the integration tests cover the `caller-uid-resolution-error`
+    /// and `for-user-resolution-error` audit branches independently.
+    #[cfg(feature = "test-env-override")]
+    pub(super) const SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR_ENV: &str =
+        "SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR";
+
+    /// Which site the injected errno targets.
+    #[cfg(feature = "test-env-override")]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum InjectionSite {
+        CallerUid,
+        ForUser,
     }
-    errno_str.parse::<i32>().ok().map(Errno::from_raw)
-}
-#[cfg(not(feature = "test-env-override"))]
-#[derive(Clone, Copy)]
-enum InjectionSite {
-    CallerUid,
-    ForUser,
-}
-#[cfg(not(feature = "test-env-override"))]
-fn injected_user_resolution_errno(_want: InjectionSite) -> Option<Errno> {
-    None
-}
 
-/// `User::from_uid` with the `test-env-override` fault-injection seam.
-/// Production builds inline to a direct call.
-fn resolve_user_from_uid(uid: Uid) -> Result<Option<User>, Errno> {
-    if let Some(errno) = injected_user_resolution_errno(InjectionSite::CallerUid) {
-        return Err(errno);
+    /// Parse the env-var value `"<site>:<errno>"` and return the injected
+    /// errno iff `site` matches `want`. Returns `None` in production builds
+    /// unconditionally.
+    #[cfg(feature = "test-env-override")]
+    pub(super) fn injected_user_resolution_errno(want: InjectionSite) -> Option<Errno> {
+        let raw = std::env::var(SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR_ENV).ok()?;
+        let (site, errno_str) = raw.split_once(':')?;
+        let parsed_site = match site {
+            "caller_uid" => InjectionSite::CallerUid,
+            "for_user" => InjectionSite::ForUser,
+            _ => return None,
+        };
+        if parsed_site != want {
+            return None;
+        }
+        errno_str.parse::<i32>().ok().map(Errno::from_raw)
     }
-    User::from_uid(uid)
-}
-
-/// `User::from_name` with the `test-env-override` fault-injection seam.
-/// Production builds inline to a direct call.
-fn resolve_user_from_name(name: &str) -> Result<Option<User>, Errno> {
-    if let Some(errno) = injected_user_resolution_errno(InjectionSite::ForUser) {
-        return Err(errno);
+    #[cfg(not(feature = "test-env-override"))]
+    #[derive(Clone, Copy)]
+    pub(super) enum InjectionSite {
+        CallerUid,
+        ForUser,
     }
-    User::from_name(name)
-}
-
-/// Single deny exit code per the design — the stderr reason carries the
-/// "what went wrong" payload, distinct codes per step would only
-/// invite scripts to grow ad-hoc dependencies on internal step
-/// numbering.
-const DENY_EXIT: u8 = 1;
-
-fn main() -> ExitCode {
-    run()
-}
-
-/// Render the pool field for an audit record.
-/// CIDR string form (e.g. `"10.209.0.0/20"`).
-fn pool_string(subnet: &SubnetEntry) -> String {
-    format!("{}/{}", subnet.cidr.base(), subnet.cidr.prefix_len())
-}
-
-/// Emit an audit record. The per-decision asymmetry (allow vs. deny on
-/// write failure) lives here, in one place, so the security contract is
-/// grep-able.
-///
-/// On allow-path write failure: log to stderr, return — the caller
-/// proceeds with the routing install. On deny-path write failure: log
-/// to stderr; the caller will already be on its way to exiting
-/// `DENY_EXIT`, so no extra escalation is needed at *this* call site,
-/// but for paths where the caller would otherwise have exited `0`
-/// (impossible by construction here, but the type prevents accidental
-/// regression), the return-value distinction is preserved.
-fn emit_audit(record: &AuditRecord<'_>) -> AuditOutcome {
-    let path = audit::audit_log_path();
-    audit::write_record(&path, record)
-}
-
-/// Deny path: write the audit-deny record (with stderr escalation
-/// if the write fails), print the stderr reason, and return
-/// `DENY_EXIT`. Used by every deny branch in `run`.
-fn deny_with_audit(
-    reason_tag: &'static str,
-    stderr_msg: &str,
-    caller: &str,
-    for_user: &str,
-    pool: Option<&str>,
-    gateway_ip: &str,
-    pid: i32,
-) -> ExitCode {
-    let outcome = emit_audit(&AuditRecord {
-        decision: Decision::Denied { reason: reason_tag },
-        caller,
-        for_user,
-        pool,
-        gateway_ip,
-        pid,
-    });
-    eprintln!("sandbox-route-helper: {stderr_msg}");
-    if let AuditOutcome::WriteFailed(err) = outcome {
-        // Deny-path escalation: shows the operator that the audit record is missing.
-        // The deny itself is unconditional (the exit code below stays `DENY_EXIT`);
-        // the escalation only adds the operator-visible signal that the audit trail
-        // evaporated.
-        eprintln!("sandbox-route-helper: audit log write failed: {err}");
+    #[cfg(not(feature = "test-env-override"))]
+    pub(super) fn injected_user_resolution_errno(_want: InjectionSite) -> Option<Errno> {
+        None
     }
-    ExitCode::from(DENY_EXIT)
-}
 
-/// Allow-path post-success audit.
-/// stderr but DOES NOT block the allow (routing-path-availability wins).
-fn allow_audit(caller: &str, for_user: &str, pool: Option<&str>, gateway_ip: &str, pid: i32) {
-    let outcome = emit_audit(&AuditRecord {
-        decision: Decision::Allowed,
-        caller,
-        for_user,
-        pool,
-        gateway_ip,
-        pid,
-    });
-    if let AuditOutcome::WriteFailed(err) = outcome {
-        eprintln!("sandbox-route-helper: audit log write failed: {err}");
+    /// `User::from_uid` with the `test-env-override` fault-injection seam.
+    /// Production builds inline to a direct call.
+    fn resolve_user_from_uid(uid: Uid) -> Result<Option<User>, Errno> {
+        if let Some(errno) = injected_user_resolution_errno(InjectionSite::CallerUid) {
+            return Err(errno);
+        }
+        User::from_uid(uid)
     }
-}
 
-/// Top-level orchestration. Each branch decides allow / deny and writes
-/// an audit record before returning the `ExitCode`. No deny branch
-/// reaches netns mutation (steps 5–7); pair-check denials and gateway-IP
-/// denials short-circuit early.
-fn run() -> ExitCode {
-    let args: Vec<OsString> = std::env::args_os().collect();
-    let parsed = match parse_argv(&args) {
-        Ok(p) => p,
-        Err(e) => {
-            // Argv-parse failures pre-date the audit-log contract: the
-            // helper cannot even name a caller/for-user pair, so no
-            // record can be written that conforms to the schema. Match
-            // the pre-change behavior — stderr + DENY_EXIT.
-            eprintln!("sandbox-route-helper: {e}");
-            return ExitCode::from(DENY_EXIT);
+    /// `User::from_name` with the `test-env-override` fault-injection seam.
+    /// Production builds inline to a direct call.
+    fn resolve_user_from_name(name: &str) -> Result<Option<User>, Errno> {
+        if let Some(errno) = injected_user_resolution_errno(InjectionSite::ForUser) {
+            return Err(errno);
         }
-    };
-    let ParsedArgs {
-        container_pid,
-        gateway_ip,
-        for_user_arg,
-    } = parsed;
-    let gateway_ip_str = gateway_ip.to_string();
+        User::from_name(name)
+    }
 
-    // Step 1 — caller identity. STRICT resolution —
-    // unresolvable uid is a deny path, not a stderr-clarity hint. The
-    // pair-check below needs both identities reliably; falling back to
-    // numeric-only comparison would allow a request whose `for_user`
-    // resolves to the same uid as `caller` (e.g. via NSS misconfig) to
-    // sneak through pair-check on a name-mismatch.
-    let caller_uid = Uid::current();
-    let caller_name = match resolve_user_from_uid(caller_uid) {
-        Ok(Some(u)) => u.name,
-        // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
-        // as an error instead of Ok(None)); collapse with Ok(None) for
-        // stable audit classification across libc versions. Mirrors the
-        // `User::from_name` arm below for the `--for-user` lookup.
-        Ok(None) | Err(Errno::ENOENT) => {
-            let raw = caller_uid.as_raw();
-            let msg = format!("caller uid {raw} does not resolve to a username");
-            // No `caller` name to put in the audit record — fall back
-            // to `uid:<n>` so the deny is still recorded with as much
-            // identity as the helper could establish. The deny is
-            // unconditional regardless of audit-record completeness.
-            let placeholder = format!("uid:{raw}");
-            let for_user_for_audit = for_user_arg.as_deref().unwrap_or(placeholder.as_str());
-            return deny_with_audit(
-                "caller-uid-unresolvable",
-                &msg,
-                &placeholder,
-                for_user_for_audit,
-                None,
-                &gateway_ip_str,
-                container_pid,
-            );
-        }
-        Err(e) => {
-            let raw = caller_uid.as_raw();
-            let msg = format!("username resolution failed for uid {raw}: {e}");
-            let placeholder = format!("uid:{raw}");
-            let for_user_for_audit = for_user_arg.as_deref().unwrap_or(placeholder.as_str());
-            return deny_with_audit(
-                "caller-uid-resolution-error",
-                &msg,
-                &placeholder,
-                for_user_for_audit,
-                None,
-                &gateway_ip_str,
-                container_pid,
-            );
-        }
-    };
+    /// Single deny exit code per the design — the stderr reason carries the
+    /// "what went wrong" payload, distinct codes per step would only
+    /// invite scripts to grow ad-hoc dependencies on internal step
+    /// numbering.
+    const DENY_EXIT: u8 = 1;
 
-    // `--for-user` defaults to the caller's name when omitted,
-    // so direct-CLI helper invocations remain meaningful.
-    let for_user = for_user_arg.unwrap_or_else(|| caller_name.clone());
+    /// Render the pool field for an audit record.
+    /// CIDR string form (e.g. `"10.209.0.0/20"`).
+    fn pool_string(subnet: &SubnetEntry) -> String {
+        format!("{}/{}", subnet.cidr.base(), subnet.cidr.prefix_len())
+    }
 
-    // Resolve `--for-user` to a uid strictly. An unresolvable for-user
-    // name is a deny path.
-    let for_user_uid = match resolve_user_from_name(&for_user) {
-        Ok(Some(u)) => u.uid.as_raw(),
-        // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
-        // as an error instead of Ok(None)); collapse with Ok(None) for
-        // stable audit classification across libc versions.
-        Ok(None) | Err(Errno::ENOENT) => {
-            let msg = format!("--for-user {for_user} does not resolve to a uid");
-            return deny_with_audit(
-                "for-user-unresolvable",
-                &msg,
-                &caller_name,
-                &for_user,
-                None,
-                &gateway_ip_str,
-                container_pid,
-            );
-        }
-        Err(e) => {
-            let msg = format!("username resolution failed for {for_user}: {e}");
-            return deny_with_audit(
-                "for-user-resolution-error",
-                &msg,
-                &caller_name,
-                &for_user,
-                None,
-                &gateway_ip_str,
-                container_pid,
-            );
-        }
-    };
+    /// Emit an audit record. The per-decision asymmetry (allow vs. deny on
+    /// write failure) lives here, in one place, so the security contract is
+    /// grep-able.
+    ///
+    /// On allow-path write failure: log to stderr, return — the caller
+    /// proceeds with the routing install. On deny-path write failure: log
+    /// to stderr; the caller will already be on its way to exiting
+    /// `DENY_EXIT`, so no extra escalation is needed at *this* call site,
+    /// but for paths where the caller would otherwise have exited `0`
+    /// (impossible by construction here, but the type prevents accidental
+    /// regression), the return-value distinction is preserved.
+    fn emit_audit(record: &AuditRecord<'_>) -> AuditOutcome {
+        let path = super::audit::audit_log_path();
+        super::audit::write_record(&path, record)
+    }
 
-    // Step 3 — load users.conf and locate the gateway-IP's subnet.
-    // `load_users_config_route_helper` ignores `SANDBOX_USERS_CONF` in
-    // default builds and reads `/etc/sandboxd/users.conf`
-    // unconditionally; only `test-env-override` builds honor the env
-    // var. See the crate-level docstring + `route_helper_users_conf_path`.
-    let config = match load_users_config_route_helper() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = e.to_string();
-            return deny_with_audit(
-                "users-conf-load-failed",
-                &msg,
-                &caller_name,
-                &for_user,
-                None,
-                &gateway_ip_str,
-                container_pid,
-            );
+    /// Deny path: write the audit-deny record (with stderr escalation
+    /// if the write fails), print the stderr reason, and return
+    /// `DENY_EXIT`. Used by every deny branch in `run`.
+    fn deny_with_audit(
+        reason_tag: &'static str,
+        stderr_msg: &str,
+        caller: &str,
+        for_user: &str,
+        pool: Option<&str>,
+        gateway_ip: &str,
+        pid: i32,
+    ) -> ExitCode {
+        let outcome = emit_audit(&AuditRecord {
+            decision: Decision::Denied { reason: reason_tag },
+            caller,
+            for_user,
+            pool,
+            gateway_ip,
+            pid,
+        });
+        eprintln!("sandbox-route-helper: {stderr_msg}");
+        if let AuditOutcome::WriteFailed(err) = outcome {
+            // Deny-path escalation: shows the operator that the audit record is missing.
+            // The deny itself is unconditional (the exit code below stays `DENY_EXIT`);
+            // the escalation only adds the operator-visible signal that the audit trail
+            // evaporated.
+            eprintln!("sandbox-route-helper: audit log write failed: {err}");
         }
-    };
-    let subnet = match config.find_subnet_by_gateway_ip(gateway_ip) {
-        Some(s) => s,
-        None => {
-            let msg = format!("gateway ip {gateway_ip} not in any subnet");
-            return deny_with_audit(
-                "gateway-ip not in any subnet",
-                &msg,
-                &caller_name,
-                &for_user,
-                None,
-                &gateway_ip_str,
-                container_pid,
-            );
-        }
-    };
-    let pool = pool_string(subnet);
+        ExitCode::from(DENY_EXIT)
+    }
 
-    // Step 4 — pair-membership check per the membership check. Both caller
-    // and for-user uids must appear in the pool's `allow_users` (each
-    // resolved numerically via `SubnetEntry::allows_uid`). On mismatch,
-    // exit DENY_EXIT with stderr naming both identities.
-    let verdict = pair_check(subnet, caller_uid.as_raw(), for_user_uid);
-    if verdict == Verdict::Denied {
-        let msg =
-            format!("pair-check failed: caller={caller_name} for-user={for_user} pool={pool}");
-        return deny_with_audit(
-            "pair-check failed",
-            &msg,
-            &caller_name,
-            &for_user,
-            Some(&pool),
-            &gateway_ip_str,
+    /// Allow-path post-success audit.
+    /// stderr but DOES NOT block the allow (routing-path-availability wins).
+    fn allow_audit(caller: &str, for_user: &str, pool: Option<&str>, gateway_ip: &str, pid: i32) {
+        let outcome = emit_audit(&AuditRecord {
+            decision: Decision::Allowed,
+            caller,
+            for_user,
+            pool,
+            gateway_ip,
+            pid,
+        });
+        if let AuditOutcome::WriteFailed(err) = outcome {
+            eprintln!("sandbox-route-helper: audit log write failed: {err}");
+        }
+    }
+
+    /// Top-level orchestration. Each branch decides allow / deny and writes
+    /// an audit record before returning the `ExitCode`. No deny branch
+    /// reaches netns mutation (steps 5–7); pair-check denials and gateway-IP
+    /// denials short-circuit early.
+    pub fn run() -> ExitCode {
+        let args: Vec<OsString> = std::env::args_os().collect();
+        let parsed = match parse_argv(&args) {
+            Ok(p) => p,
+            Err(e) => {
+                // Argv-parse failures pre-date the audit-log contract: the
+                // helper cannot even name a caller/for-user pair, so no
+                // record can be written that conforms to the schema. Match
+                // the pre-change behavior — stderr + DENY_EXIT.
+                eprintln!("sandbox-route-helper: {e}");
+                return ExitCode::from(DENY_EXIT);
+            }
+        };
+        let ParsedArgs {
             container_pid,
-        );
-    }
+            gateway_ip,
+            for_user_arg,
+        } = parsed;
+        let gateway_ip_str = gateway_ip.to_string();
 
-    // Step 5 — pidfd_open + setns(CLONE_NEWNET). Using a pidfd, not a
-    // /proc/<pid>/ns/net path, closes the PID-recycle TOCTOU window:
-    // pidfd_open binds to the *thread-group leader* identity at open
-    // time, so a recycled pid in the meantime cannot redirect the
-    // setns target.
-    let pidfd = match pidfd_open(container_pid) {
-        Ok(fd) => fd,
-        Err(errno) => {
-            let msg = format_pidfd_error(container_pid, errno);
+        // Step 1 — caller identity. STRICT resolution —
+        // unresolvable uid is a deny path, not a stderr-clarity hint. The
+        // pair-check below needs both identities reliably; falling back to
+        // numeric-only comparison would allow a request whose `for_user`
+        // resolves to the same uid as `caller` (e.g. via NSS misconfig) to
+        // sneak through pair-check on a name-mismatch.
+        let caller_uid = Uid::current();
+        let caller_name = match resolve_user_from_uid(caller_uid) {
+            Ok(Some(u)) => u.name,
+            // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
+            // as an error instead of Ok(None)); collapse with Ok(None) for
+            // stable audit classification across libc versions. Mirrors the
+            // `User::from_name` arm below for the `--for-user` lookup.
+            Ok(None) | Err(Errno::ENOENT) => {
+                let raw = caller_uid.as_raw();
+                let msg = format!("caller uid {raw} does not resolve to a username");
+                // No `caller` name to put in the audit record — fall back
+                // to `uid:<n>` so the deny is still recorded with as much
+                // identity as the helper could establish. The deny is
+                // unconditional regardless of audit-record completeness.
+                let placeholder = format!("uid:{raw}");
+                let for_user_for_audit = for_user_arg.as_deref().unwrap_or(placeholder.as_str());
+                return deny_with_audit(
+                    "caller-uid-unresolvable",
+                    &msg,
+                    &placeholder,
+                    for_user_for_audit,
+                    None,
+                    &gateway_ip_str,
+                    container_pid,
+                );
+            }
+            Err(e) => {
+                let raw = caller_uid.as_raw();
+                let msg = format!("username resolution failed for uid {raw}: {e}");
+                let placeholder = format!("uid:{raw}");
+                let for_user_for_audit = for_user_arg.as_deref().unwrap_or(placeholder.as_str());
+                return deny_with_audit(
+                    "caller-uid-resolution-error",
+                    &msg,
+                    &placeholder,
+                    for_user_for_audit,
+                    None,
+                    &gateway_ip_str,
+                    container_pid,
+                );
+            }
+        };
+
+        // `--for-user` defaults to the caller's name when omitted,
+        // so direct-CLI helper invocations remain meaningful.
+        let for_user = for_user_arg.unwrap_or_else(|| caller_name.clone());
+
+        // Resolve `--for-user` to a uid strictly. An unresolvable for-user
+        // name is a deny path.
+        let for_user_uid = match resolve_user_from_name(&for_user) {
+            Ok(Some(u)) => u.uid.as_raw(),
+            // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
+            // as an error instead of Ok(None)); collapse with Ok(None) for
+            // stable audit classification across libc versions.
+            Ok(None) | Err(Errno::ENOENT) => {
+                let msg = format!("--for-user {for_user} does not resolve to a uid");
+                return deny_with_audit(
+                    "for-user-unresolvable",
+                    &msg,
+                    &caller_name,
+                    &for_user,
+                    None,
+                    &gateway_ip_str,
+                    container_pid,
+                );
+            }
+            Err(e) => {
+                let msg = format!("username resolution failed for {for_user}: {e}");
+                return deny_with_audit(
+                    "for-user-resolution-error",
+                    &msg,
+                    &caller_name,
+                    &for_user,
+                    None,
+                    &gateway_ip_str,
+                    container_pid,
+                );
+            }
+        };
+
+        // Step 3 — load users.conf and locate the gateway-IP's subnet.
+        // `load_users_config_route_helper` ignores `SANDBOX_USERS_CONF` in
+        // default builds and reads `/etc/sandboxd/users.conf`
+        // unconditionally; only `test-env-override` builds honor the env
+        // var. See the crate-level docstring + `route_helper_users_conf_path`.
+        let config = match load_users_config_route_helper() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                return deny_with_audit(
+                    "users-conf-load-failed",
+                    &msg,
+                    &caller_name,
+                    &for_user,
+                    None,
+                    &gateway_ip_str,
+                    container_pid,
+                );
+            }
+        };
+        let subnet = match config.find_subnet_by_gateway_ip(gateway_ip) {
+            Some(s) => s,
+            None => {
+                let msg = format!("gateway ip {gateway_ip} not in any subnet");
+                return deny_with_audit(
+                    "gateway-ip not in any subnet",
+                    &msg,
+                    &caller_name,
+                    &for_user,
+                    None,
+                    &gateway_ip_str,
+                    container_pid,
+                );
+            }
+        };
+        let pool = pool_string(subnet);
+
+        // Step 4 — pair-membership check per the membership check. Both caller
+        // and for-user uids must appear in the pool's `allow_users` (each
+        // resolved numerically via `SubnetEntry::allows_uid`). On mismatch,
+        // exit DENY_EXIT with stderr naming both identities.
+        let verdict = pair_check(subnet, caller_uid.as_raw(), for_user_uid);
+        if verdict == Verdict::Denied {
+            let msg =
+                format!("pair-check failed: caller={caller_name} for-user={for_user} pool={pool}");
             return deny_with_audit(
-                "pidfd-open-failed",
+                "pair-check failed",
                 &msg,
                 &caller_name,
                 &for_user,
@@ -458,328 +438,361 @@ fn run() -> ExitCode {
                 container_pid,
             );
         }
-    };
-    if let Err(err) = setns(&pidfd, CloneFlags::CLONE_NEWNET) {
-        // Drop the pidfd before returning so we don't leak it across
-        // the deny path. It would close on process exit either way,
-        // but explicit close keeps the fd lifecycle obvious.
-        drop_pidfd(pidfd);
-        let msg = format!("setns failed: {err}");
-        return deny_with_audit(
-            "setns-failed",
-            &msg,
+
+        // Step 5 — pidfd_open + setns(CLONE_NEWNET). Using a pidfd, not a
+        // /proc/<pid>/ns/net path, closes the PID-recycle TOCTOU window:
+        // pidfd_open binds to the *thread-group leader* identity at open
+        // time, so a recycled pid in the meantime cannot redirect the
+        // setns target.
+        let pidfd = match pidfd_open(container_pid) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                let msg = format_pidfd_error(container_pid, errno);
+                return deny_with_audit(
+                    "pidfd-open-failed",
+                    &msg,
+                    &caller_name,
+                    &for_user,
+                    Some(&pool),
+                    &gateway_ip_str,
+                    container_pid,
+                );
+            }
+        };
+        if let Err(err) = setns(&pidfd, CloneFlags::CLONE_NEWNET) {
+            // Drop the pidfd before returning so we don't leak it across
+            // the deny path. It would close on process exit either way,
+            // but explicit close keeps the fd lifecycle obvious.
+            drop_pidfd(pidfd);
+            let msg = format!("setns failed: {err}");
+            return deny_with_audit(
+                "setns-failed",
+                &msg,
+                &caller_name,
+                &for_user,
+                Some(&pool),
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+
+        // After this point, the helper's /proc/self/ns/net symlink points
+        // at the container's netns. getifaddrs() and the subsequent ip(8)
+        // invocation operate inside it.
+
+        // Step 6 — every IPv4 address on every non-lo interface must live
+        // inside the caller's subnet. A single outside-subnet address
+        // denies (cross-user MITM closure).
+        if let Err(msg) = enforce_netns_addresses_in_subnet(subnet) {
+            return deny_with_audit(
+                "netns-address-outside-subnet",
+                &msg,
+                &caller_name,
+                &for_user,
+                Some(&pool),
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+
+        // Step 7 — install the default route inside the netns.
+        if let Err(msg) = install_default_route(gateway_ip) {
+            return deny_with_audit(
+                "route-install-failed",
+                &msg,
+                &caller_name,
+                &for_user,
+                Some(&pool),
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+
+        // Step 8 — allow path. Record the audit line, then operator-facing
+        // confirmation. Audit-log write failure on the allow path is a
+        // stderr-only signal — routing-path-availability wins.
+        allow_audit(
             &caller_name,
             &for_user,
             Some(&pool),
             &gateway_ip_str,
             container_pid,
         );
+        println!("sandbox-route-helper: route installed for pid {container_pid} via {gateway_ip}");
+        ExitCode::SUCCESS
     }
 
-    // After this point, the helper's /proc/self/ns/net symlink points
-    // at the container's netns. getifaddrs() and the subsequent ip(8)
-    // invocation operate inside it.
+    // ---------------------------------------------------------------------------
+    // Argv parsing
+    // ---------------------------------------------------------------------------
 
-    // Step 6 — every IPv4 address on every non-lo interface must live
-    // inside the caller's subnet. A single outside-subnet address
-    // denies (cross-user MITM closure).
-    if let Err(msg) = enforce_netns_addresses_in_subnet(subnet) {
-        return deny_with_audit(
-            "netns-address-outside-subnet",
-            &msg,
-            &caller_name,
-            &for_user,
-            Some(&pool),
-            &gateway_ip_str,
-            container_pid,
+    /// Parsed argv. `for_user_arg` is `None` if `--for-user` was omitted —
+    /// the caller defaults it to `name(getuid())` and defaults to the caller username, which
+    /// preserves the pre-existing direct-CLI invocation shape.
+    struct ParsedArgs {
+        container_pid: i32,
+        gateway_ip: Ipv4Addr,
+        for_user_arg: Option<String>,
+    }
+
+    /// Parse argv: optional `--for-user <name>` before the two positional
+    /// args. `argv[0]` is the program name.
+    ///
+    /// Hand-rolled — pulling `clap` into the cap'd helper
+    /// would inflate the TCB by several thousand lines that have to be
+    /// reviewed for the privilege story. The flag accepts both
+    /// `--for-user <name>` (two-arg form) and `--for-user=<name>` (one-arg
+    /// form); both shapes show up in practice.
+    fn parse_argv(args: &[OsString]) -> Result<ParsedArgs, String> {
+        const USAGE: &str =
+            "usage: sandbox-route-helper [--for-user <name>] <container_pid> <gateway_ip>";
+
+        // Walk argv left-to-right, consuming `--for-user` (and value) where
+        // it appears. Anything that is not the flag is a positional. We
+        // intentionally do NOT accept `--for-user` after the positionals,
+        // because the daemon emits it before them and an
+        // after-positionals form would create two ways to spell the same
+        // intent for no benefit.
+        let mut for_user_arg: Option<String> = None;
+        let mut positionals: Vec<&OsString> = Vec::with_capacity(2);
+
+        // argv[0] is the program name; skip it.
+        let mut iter = args.iter().enumerate().skip(1).peekable();
+        let mut accepting_flags = true;
+
+        while let Some((_idx, arg)) = iter.next() {
+            let arg_str = arg.to_string_lossy();
+            if accepting_flags && arg_str == "--for-user" {
+                // Two-argument form: --for-user NAME
+                let Some((_, value)) = iter.next() else {
+                    return Err(format!("{USAGE} (missing value after --for-user)"));
+                };
+                if for_user_arg.is_some() {
+                    return Err(format!("{USAGE} (--for-user specified more than once)"));
+                }
+                let name = value.to_string_lossy().into_owned();
+                if name.is_empty() {
+                    return Err(format!("{USAGE} (--for-user value must be non-empty)"));
+                }
+                if name.starts_with("--") {
+                    // Guard against the daemon accidentally passing
+                    // `--for-user --some-other-flag`: the value would
+                    // shadow a missing arg and tank pair-check later.
+                    return Err(format!(
+                        "{USAGE} (--for-user value looks like a flag: {name})"
+                    ));
+                }
+                for_user_arg = Some(name);
+            } else if accepting_flags && let Some(rest) = arg_str.strip_prefix("--for-user=") {
+                // Single-argument form: --for-user=NAME
+                if for_user_arg.is_some() {
+                    return Err(format!("{USAGE} (--for-user specified more than once)"));
+                }
+                if rest.is_empty() {
+                    return Err(format!("{USAGE} (--for-user value must be non-empty)"));
+                }
+                for_user_arg = Some(rest.to_string());
+            } else if accepting_flags && arg_str == "--" {
+                // End-of-flags sentinel — everything after this is
+                // positional. The daemon never emits this; it's a hook for
+                // operator debugging.
+                accepting_flags = false;
+            } else if accepting_flags && arg_str.starts_with("--") {
+                // Unknown flag. Reject — the helper deliberately does not
+                // accept arbitrary flags, and silently treating an unknown
+                // `--something` as a positional would hide typos in daemon-
+                // emitted argv.
+                return Err(format!("{USAGE} (unrecognised flag: {arg_str})"));
+            } else {
+                positionals.push(arg);
+            }
+        }
+
+        if positionals.len() != 2 {
+            return Err(USAGE.to_string());
+        }
+
+        let pid_arg = positionals[0].to_string_lossy();
+        let pid: i32 = pid_arg
+            .parse()
+            .ok()
+            .filter(|n: &i32| *n >= 1)
+            .ok_or_else(|| format!("invalid container pid: {pid_arg}"))?;
+
+        let ip_arg = positionals[1].to_string_lossy();
+        let gateway_ip: Ipv4Addr = ip_arg
+            .parse()
+            .map_err(|_| format!("invalid gateway ip: {ip_arg}"))?;
+
+        Ok(ParsedArgs {
+            container_pid: pid,
+            gateway_ip,
+            for_user_arg,
+        })
+    }
+
+    // ---------------------------------------------------------------------------
+    // pidfd_open — direct libc syscall (nix 0.29 does not expose it)
+    // ---------------------------------------------------------------------------
+
+    /// Open a pidfd referring to `pid`. Returns an `OwnedFd` so the close
+    /// is RAII; on error returns the captured `errno` so the caller can
+    /// distinguish ESRCH (pid gone) from EINVAL (kernel too old) etc.
+    ///
+    /// `pidfd_open(2)` is Linux 5.3+. If the running kernel is older the
+    /// syscall returns -1 with errno=ENOSYS, which surfaces here as the
+    /// raw errno. The kernel-floor check is documentation-only (Phase 2D);
+    /// at runtime an old kernel just produces a deny.
+    fn pidfd_open(pid: i32) -> Result<OwnedFd, i32> {
+        // SAFETY: `libc::syscall` returns -1 on error with errno set; on
+        // success it returns a non-negative file descriptor that we
+        // immediately wrap in `OwnedFd` to take ownership. The flags
+        // argument is 0 — the only currently-defined flag is
+        // `PIDFD_NONBLOCK` (Linux 5.10+) which we don't need here.
+        // nix-rust/nix#2748: pidfd_open wrapper not yet provided; using libc::syscall as a deliberate gap.
+        let raw: libc::c_long =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
+        if raw < 0 {
+            // SAFETY: errno is thread-local and set by the failed syscall
+            // immediately above. No intervening libc call has had a chance
+            // to clobber it.
+            let errno = unsafe { *libc::__errno_location() };
+            return Err(errno);
+        }
+        // SAFETY: `raw` is a non-negative kernel-issued fd we have
+        // exclusive ownership of.
+        let fd = i32::try_from(raw).expect(
+            "pidfd_open returned a non-negative fd; kernel-allocated fd numbers fit in i32",
         );
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    // Step 7 — install the default route inside the netns.
-    if let Err(msg) = install_default_route(gateway_ip) {
-        return deny_with_audit(
-            "route-install-failed",
-            &msg,
-            &caller_name,
-            &for_user,
-            Some(&pool),
-            &gateway_ip_str,
-            container_pid,
-        );
+    /// Render a `pidfd_open` errno into the helper's stderr phrasing.
+    /// ESRCH gets the dedicated "not found" message that the design calls
+    /// out; everything else surfaces the errno verbatim (callers reading
+    /// stderr can look the symbol up).
+    fn format_pidfd_error(pid: i32, errno: i32) -> String {
+        if errno == libc::ESRCH {
+            format!("container pid {pid} not found")
+        } else {
+            format!("pidfd_open({pid}) failed: errno {errno}")
+        }
     }
 
-    // Step 8 — allow path. Record the audit line, then operator-facing
-    // confirmation. Audit-log write failure on the allow path is a
-    // stderr-only signal — routing-path-availability wins.
-    allow_audit(
-        &caller_name,
-        &for_user,
-        Some(&pool),
-        &gateway_ip_str,
-        container_pid,
-    );
-    println!("sandbox-route-helper: route installed for pid {container_pid} via {gateway_ip}");
-    ExitCode::SUCCESS
-}
+    /// Explicit drop site so the deny path's intent is grep-able. Function
+    /// exists purely for documentation; calling `drop()` directly would
+    /// achieve the same close.
+    fn drop_pidfd(fd: OwnedFd) {
+        drop(fd);
+    }
 
-// ---------------------------------------------------------------------------
-// Argv parsing
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // Step 6 — netns address enforcement
+    // ---------------------------------------------------------------------------
 
-/// Parsed argv. `for_user_arg` is `None` if `--for-user` was omitted —
-/// the caller defaults it to `name(getuid())` and defaults to the caller username, which
-/// preserves the pre-existing direct-CLI invocation shape.
-struct ParsedArgs {
-    container_pid: i32,
-    gateway_ip: Ipv4Addr,
-    for_user_arg: Option<String>,
-}
-
-/// Parse argv: optional `--for-user <name>` before the two positional
-/// args. `argv[0]` is the program name.
-///
-/// Hand-rolled — pulling `clap` into the cap'd helper
-/// would inflate the TCB by several thousand lines that have to be
-/// reviewed for the privilege story. The flag accepts both
-/// `--for-user <name>` (two-arg form) and `--for-user=<name>` (one-arg
-/// form); both shapes show up in practice.
-fn parse_argv(args: &[OsString]) -> Result<ParsedArgs, String> {
-    const USAGE: &str =
-        "usage: sandbox-route-helper [--for-user <name>] <container_pid> <gateway_ip>";
-
-    // Walk argv left-to-right, consuming `--for-user` (and value) where
-    // it appears. Anything that is not the flag is a positional. We
-    // intentionally do NOT accept `--for-user` after the positionals,
-    // because the daemon emits it before them and an
-    // after-positionals form would create two ways to spell the same
-    // intent for no benefit.
-    let mut for_user_arg: Option<String> = None;
-    let mut positionals: Vec<&OsString> = Vec::with_capacity(2);
-
-    // argv[0] is the program name; skip it.
-    let mut iter = args.iter().enumerate().skip(1).peekable();
-    let mut accepting_flags = true;
-
-    while let Some((_idx, arg)) = iter.next() {
-        let arg_str = arg.to_string_lossy();
-        if accepting_flags && arg_str == "--for-user" {
-            // Two-argument form: --for-user NAME
-            let Some((_, value)) = iter.next() else {
-                return Err(format!("{USAGE} (missing value after --for-user)"));
+    /// Verify that every IPv4 address bound to a non-`lo` interface inside
+    /// the (already-entered) netns falls inside the caller's subnet.
+    ///
+    /// IPv6 addresses are ignored: the project is IPv4-only today (no IPv6
+    /// in the Lima setup), and the design is explicit that IPv6 enforcement
+    /// is deferred. Interfaces without an address (e.g. an unconfigured
+    /// `eth0` that hasn't yet had an IP assigned) are skipped — they have
+    /// no address to validate.
+    ///
+    /// An interface count of zero non-lo entries trivially passes; the
+    /// step-7 `ip route replace` would then fail at the kernel level
+    /// (nothing to attach the default route to), which is the natural
+    /// surface for that misconfiguration. Adding an explicit "must have at
+    /// least one non-lo address" check would over-specify what the design
+    /// asks of step 6.
+    fn enforce_netns_addresses_in_subnet(subnet: &SubnetEntry) -> Result<(), String> {
+        let iter = getifaddrs().map_err(|err| format!("getifaddrs failed: {err}"))?;
+        for ifaddr in iter {
+            if ifaddr.interface_name == "lo" {
+                continue;
+            }
+            let Some(addr) = ifaddr.address else {
+                // Interface present but no address bound — nothing to check.
+                continue;
             };
-            if for_user_arg.is_some() {
-                return Err(format!("{USAGE} (--for-user specified more than once)"));
-            }
-            let name = value.to_string_lossy().into_owned();
-            if name.is_empty() {
-                return Err(format!("{USAGE} (--for-user value must be non-empty)"));
-            }
-            if name.starts_with("--") {
-                // Guard against the daemon accidentally passing
-                // `--for-user --some-other-flag`: the value would
-                // shadow a missing arg and tank pair-check later.
+            let Some(sock) = addr.as_sockaddr_in() else {
+                // Not IPv4 (most commonly an IPv6 address or a link-layer
+                // AF_PACKET entry); skip.
+                continue;
+            };
+            // `SockaddrIn::ip()` already returns a `std::net::Ipv4Addr`
+            // in nix 0.29 — no conversion needed.
+            let ip = sock.ip();
+            if !subnet.cidr.contains(ip) {
                 return Err(format!(
-                    "{USAGE} (--for-user value looks like a flag: {name})"
+                    "netns address {} on {} outside caller subnet {}/{}",
+                    ip,
+                    ifaddr.interface_name,
+                    subnet.cidr.base(),
+                    subnet.cidr.prefix_len(),
                 ));
             }
-            for_user_arg = Some(name);
-        } else if accepting_flags && let Some(rest) = arg_str.strip_prefix("--for-user=") {
-            // Single-argument form: --for-user=NAME
-            if for_user_arg.is_some() {
-                return Err(format!("{USAGE} (--for-user specified more than once)"));
-            }
-            if rest.is_empty() {
-                return Err(format!("{USAGE} (--for-user value must be non-empty)"));
-            }
-            for_user_arg = Some(rest.to_string());
-        } else if accepting_flags && arg_str == "--" {
-            // End-of-flags sentinel — everything after this is
-            // positional. The daemon never emits this; it's a hook for
-            // operator debugging.
-            accepting_flags = false;
-        } else if accepting_flags && arg_str.starts_with("--") {
-            // Unknown flag. Reject — the helper deliberately does not
-            // accept arbitrary flags, and silently treating an unknown
-            // `--something` as a positional would hide typos in daemon-
-            // emitted argv.
-            return Err(format!("{USAGE} (unrecognised flag: {arg_str})"));
-        } else {
-            positionals.push(arg);
         }
+        Ok(())
     }
 
-    if positionals.len() != 2 {
-        return Err(USAGE.to_string());
-    }
+    // ---------------------------------------------------------------------------
+    // Step 7 — install default route
+    // ---------------------------------------------------------------------------
 
-    let pid_arg = positionals[0].to_string_lossy();
-    let pid: i32 = pid_arg
-        .parse()
-        .ok()
-        .filter(|n: &i32| *n >= 1)
-        .ok_or_else(|| format!("invalid container pid: {pid_arg}"))?;
+    /// `ip route replace default via <gateway_ip>` inside the (already-
+    /// entered) netns. We let `ip(8)`'s own stderr surface to the user on
+    /// failure rather than re-formatting it.
+    ///
+    /// Before exec we raise `CAP_NET_ADMIN` to the ambient set so the
+    /// `ip(8)` child inherits permitted+effective `CAP_NET_ADMIN` and can
+    /// issue `RTM_NEWROUTE`. The file caps
+    /// `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`
+    /// place `CAP_NET_ADMIN` in the file's permitted+inheritable+effective
+    /// sets, but on exec a process's *thread* inheritable set is taken from
+    /// the parent — which is the unprivileged caller, so inheritable is
+    /// empty after exec. `PR_CAP_AMBIENT_RAISE` requires the cap in both
+    /// permitted AND inheritable, so we first promote permitted →
+    /// inheritable, then inheritable → ambient.
+    fn install_default_route(gateway_ip: Ipv4Addr) -> Result<(), String> {
+        caps::raise(
+            None,
+            caps::CapSet::Inheritable,
+            caps::Capability::CAP_NET_ADMIN,
+        )
+        .map_err(|err| format!("raise CAP_NET_ADMIN to inheritable: {err}"))?;
+        caps::raise(None, caps::CapSet::Ambient, caps::Capability::CAP_NET_ADMIN)
+            .map_err(|err| format!("raise CAP_NET_ADMIN to ambient: {err}"))?;
 
-    let ip_arg = positionals[1].to_string_lossy();
-    let gateway_ip: Ipv4Addr = ip_arg
-        .parse()
-        .map_err(|_| format!("invalid gateway ip: {ip_arg}"))?;
-
-    Ok(ParsedArgs {
-        container_pid: pid,
-        gateway_ip,
-        for_user_arg,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// pidfd_open — direct libc syscall (nix 0.29 does not expose it)
-// ---------------------------------------------------------------------------
-
-/// Open a pidfd referring to `pid`. Returns an `OwnedFd` so the close
-/// is RAII; on error returns the captured `errno` so the caller can
-/// distinguish ESRCH (pid gone) from EINVAL (kernel too old) etc.
-///
-/// `pidfd_open(2)` is Linux 5.3+. If the running kernel is older the
-/// syscall returns -1 with errno=ENOSYS, which surfaces here as the
-/// raw errno. The kernel-floor check is documentation-only (Phase 2D);
-/// at runtime an old kernel just produces a deny.
-fn pidfd_open(pid: i32) -> Result<OwnedFd, i32> {
-    // SAFETY: `libc::syscall` returns -1 on error with errno set; on
-    // success it returns a non-negative file descriptor that we
-    // immediately wrap in `OwnedFd` to take ownership. The flags
-    // argument is 0 — the only currently-defined flag is
-    // `PIDFD_NONBLOCK` (Linux 5.10+) which we don't need here.
-    // nix-rust/nix#2748: pidfd_open wrapper not yet provided; using libc::syscall as a deliberate gap.
-    let raw: libc::c_long =
-        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
-    if raw < 0 {
-        // SAFETY: errno is thread-local and set by the failed syscall
-        // immediately above. No intervening libc call has had a chance
-        // to clobber it.
-        let errno = unsafe { *libc::__errno_location() };
-        return Err(errno);
-    }
-    // SAFETY: `raw` is a non-negative kernel-issued fd we have
-    // exclusive ownership of.
-    let fd = i32::try_from(raw)
-        .expect("pidfd_open returned a non-negative fd; kernel-allocated fd numbers fit in i32");
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// Render a `pidfd_open` errno into the helper's stderr phrasing.
-/// ESRCH gets the dedicated "not found" message that the design calls
-/// out; everything else surfaces the errno verbatim (callers reading
-/// stderr can look the symbol up).
-fn format_pidfd_error(pid: i32, errno: i32) -> String {
-    if errno == libc::ESRCH {
-        format!("container pid {pid} not found")
-    } else {
-        format!("pidfd_open({pid}) failed: errno {errno}")
-    }
-}
-
-/// Explicit drop site so the deny path's intent is grep-able. Function
-/// exists purely for documentation; calling `drop()` directly would
-/// achieve the same close.
-fn drop_pidfd(fd: OwnedFd) {
-    drop(fd);
-}
-
-// ---------------------------------------------------------------------------
-// Step 6 — netns address enforcement
-// ---------------------------------------------------------------------------
-
-/// Verify that every IPv4 address bound to a non-`lo` interface inside
-/// the (already-entered) netns falls inside the caller's subnet.
-///
-/// IPv6 addresses are ignored: the project is IPv4-only today (no IPv6
-/// in the Lima setup), and the design is explicit that IPv6 enforcement
-/// is deferred. Interfaces without an address (e.g. an unconfigured
-/// `eth0` that hasn't yet had an IP assigned) are skipped — they have
-/// no address to validate.
-///
-/// An interface count of zero non-lo entries trivially passes; the
-/// step-7 `ip route replace` would then fail at the kernel level
-/// (nothing to attach the default route to), which is the natural
-/// surface for that misconfiguration. Adding an explicit "must have at
-/// least one non-lo address" check would over-specify what the design
-/// asks of step 6.
-fn enforce_netns_addresses_in_subnet(subnet: &SubnetEntry) -> Result<(), String> {
-    let iter = getifaddrs().map_err(|err| format!("getifaddrs failed: {err}"))?;
-    for ifaddr in iter {
-        if ifaddr.interface_name == "lo" {
-            continue;
-        }
-        let Some(addr) = ifaddr.address else {
-            // Interface present but no address bound — nothing to check.
-            continue;
-        };
-        let Some(sock) = addr.as_sockaddr_in() else {
-            // Not IPv4 (most commonly an IPv6 address or a link-layer
-            // AF_PACKET entry); skip.
-            continue;
-        };
-        // `SockaddrIn::ip()` already returns a `std::net::Ipv4Addr`
-        // in nix 0.29 — no conversion needed.
-        let ip = sock.ip();
-        if !subnet.cidr.contains(ip) {
+        let status = Command::new("ip")
+            .args([
+                "route",
+                "replace",
+                "default",
+                "via",
+                &gateway_ip.to_string(),
+            ])
+            .status()
+            .map_err(|err| format!("failed to spawn ip(8): {err}"))?;
+        if !status.success() {
             return Err(format!(
-                "netns address {} on {} outside caller subnet {}/{}",
-                ip,
-                ifaddr.interface_name,
-                subnet.cidr.base(),
-                subnet.cidr.prefix_len(),
+                "ip route replace failed: exit {}",
+                status.code().unwrap_or(-1)
             ));
         }
+        Ok(())
     }
-    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Step 7 — install default route
-// ---------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
+fn main() -> std::process::ExitCode {
+    imp::run()
+}
 
-/// `ip route replace default via <gateway_ip>` inside the (already-
-/// entered) netns. We let `ip(8)`'s own stderr surface to the user on
-/// failure rather than re-formatting it.
-///
-/// Before exec we raise `CAP_NET_ADMIN` to the ambient set so the
-/// `ip(8)` child inherits permitted+effective `CAP_NET_ADMIN` and can
-/// issue `RTM_NEWROUTE`. The file caps
-/// `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`
-/// place `CAP_NET_ADMIN` in the file's permitted+inheritable+effective
-/// sets, but on exec a process's *thread* inheritable set is taken from
-/// the parent — which is the unprivileged caller, so inheritable is
-/// empty after exec. `PR_CAP_AMBIENT_RAISE` requires the cap in both
-/// permitted AND inheritable, so we first promote permitted →
-/// inheritable, then inheritable → ambient.
-fn install_default_route(gateway_ip: Ipv4Addr) -> Result<(), String> {
-    caps::raise(
-        None,
-        caps::CapSet::Inheritable,
-        caps::Capability::CAP_NET_ADMIN,
-    )
-    .map_err(|err| format!("raise CAP_NET_ADMIN to inheritable: {err}"))?;
-    caps::raise(None, caps::CapSet::Ambient, caps::Capability::CAP_NET_ADMIN)
-        .map_err(|err| format!("raise CAP_NET_ADMIN to ambient: {err}"))?;
-
-    let status = Command::new("ip")
-        .args([
-            "route",
-            "replace",
-            "default",
-            "via",
-            &gateway_ip.to_string(),
-        ])
-        .status()
-        .map_err(|err| format!("failed to spawn ip(8): {err}"))?;
-    if !status.success() {
-        return Err(format!(
-            "ip route replace failed: exit {}",
-            status.code().unwrap_or(-1)
-        ));
-    }
-    Ok(())
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("error: this binary runs on Linux only");
+    std::process::exit(2);
 }
 
 #[cfg(test)]

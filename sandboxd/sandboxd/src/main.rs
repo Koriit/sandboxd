@@ -672,6 +672,10 @@ fn read_cap_xattr(path: &std::path::Path) -> Option<Vec<u8>> {
     // `libc::getxattr` on error returns -1 and we treat that as "no
     // caps" via the `< 0` branch below; on success it returns the
     // number of bytes written, bounded by `buf.len()`.
+    // macOS `getxattr` takes two extra arguments: `position` (byte
+    // offset into the attribute value, 0 = read from start) and
+    // `options` (0 = default, follows symlinks, no compression).
+    #[cfg(target_os = "linux")]
     let n = unsafe {
         libc::getxattr(
             c_path.as_ptr(),
@@ -680,6 +684,19 @@ fn read_cap_xattr(path: &std::path::Path) -> Option<Vec<u8>> {
             buf.len(),
         )
     };
+    #[cfg(target_os = "macos")]
+    let n = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            attr_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            0u32,
+            0i32,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    compile_error!("read_cap_xattr: unsupported platform — getxattr signature varies");
     if n < 0 {
         return None;
     }

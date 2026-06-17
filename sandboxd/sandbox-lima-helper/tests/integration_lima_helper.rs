@@ -1,4 +1,8 @@
 //! Integration tests for `sandbox-lima-helper`.
+// This file contains Linux-only integration tests that require setcap,
+// file capabilities, and Linux-specific libc interfaces. The entire
+// file is excluded from non-Linux compilation.
+#![cfg(target_os = "linux")]
 //!
 //! These tests exercise the setcap-installed binary at the canonical
 //! test install path `/usr/local/libexec/sandboxd-test/sandbox-lima-helper`

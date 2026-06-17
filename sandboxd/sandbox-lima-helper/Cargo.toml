@@ -36,6 +36,10 @@ path = "src/main.rs"
 test-env-override = []
 
 [dependencies]
+# Regex validation for vm names, bridge names, and MAC addresses.
+regex = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 # Feature set:
 #   - "user"  — `User::from_uid` / `User::from_name` for operator-uid
 #               resolution via `getpwuid_r(3)` / `getpwnam_r(3)`.
@@ -47,8 +51,6 @@ libc = "0.2"
 # Manipulate the helper's own capability sets so the exec'd limactl
 # inherits zero capabilities even though the helper carries cap_setuid+ep.
 caps = "0.5"
-# Regex validation for vm names, bridge names, and MAC addresses.
-regex = "1"
 
 [dev-dependencies]
 ring.workspace = true

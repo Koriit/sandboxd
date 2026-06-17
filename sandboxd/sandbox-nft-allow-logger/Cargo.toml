@@ -47,6 +47,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
 # NFCT subscriber for the UDP allow path.
 #
 # The kernel emits one netlink message per new tracked flow on the

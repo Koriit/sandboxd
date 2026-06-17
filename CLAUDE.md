@@ -20,6 +20,8 @@ Sandbox daemon providing isolated Linux environments for coding agents — Lima/
 
 ## Build and test
 
+The Rust workspace builds, lints (`cargo clippy --workspace`), and format-checks (`cargo fmt --all --check`) cleanly on Apple-Silicon macOS. Three crates ship Linux-only binaries (`sandbox-route-helper`, `sandbox-nft-deny-logger`, `sandbox-nft-allow-logger`) and one (`sandbox-lima-helper`) is a Linux-only privileged helper — all four compile on macOS as stub binaries that print `error: this binary runs on Linux only` and exit 2; the Linux implementation is compiled only when `cfg(target_os = "linux")`.
+
 ```bash
 make build                  # cargo build --workspace (preceded by fmt-check)
 make test                   # hermetic unit tests only — fast, no Docker/Lima/nft

@@ -1,4 +1,8 @@
 //! Deny-branch integration tests for `sandbox-route-helper`.
+// This file contains Linux-only integration tests that require Docker,
+// kernel namespaces, and file capabilities — none of which are available
+// on macOS. The entire file is excluded from non-Linux compilation.
+#![cfg(target_os = "linux")]
 //!
 //! All three tests follow the same outer shape:
 //!

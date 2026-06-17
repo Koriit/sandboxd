@@ -324,6 +324,8 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
     }
     // C4 — sync (group lookup); push through `spawn_blocking` so the
     // fan-out is genuinely concurrent rather than parking the runtime.
+    // `getgrouplist(3)` is absent on Apple targets in nix 0.29.
+    #[cfg(target_os = "linux")]
     set.spawn_blocking(check_group_membership);
     // C5 — sync (stat on the unix socket).
     {
@@ -584,6 +586,10 @@ async fn check_version_match(socket_path: &str, socket_reachable: bool) -> Check
 /// `Skip` rather than `Fail` in dev mode. Production: the
 /// operator must be in the group or the unix socket's `0660` mode
 /// will refuse them.
+///
+/// `getgrouplist(3)` is absent on Apple targets in nix 0.29; this
+/// check is Linux-only.
+#[cfg(target_os = "linux")]
 pub(crate) fn check_group_membership() -> CheckRow {
     check_group_membership_with(real_group_resolver)
 }
@@ -592,6 +598,7 @@ pub(crate) fn check_group_membership() -> CheckRow {
 /// "resolve current process's supplementary group names" function so
 /// unit tests can drive the predicate without depending on the
 /// running user's actual group set.
+#[cfg(target_os = "linux")]
 pub(crate) fn check_group_membership_with<R>(resolver: R) -> CheckRow
 where
     R: FnOnce() -> Result<GroupMembership, String>,
@@ -641,6 +648,7 @@ where
 /// - `Member` — sandbox group exists *and* the caller's
 ///   supplementary GIDs include it.
 /// - `NotMember` — sandbox group exists but the caller is not in it.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GroupMembership {
     SandboxGroupAbsent,
@@ -666,6 +674,7 @@ pub(crate) enum GroupMembership {
 /// sandbox`, which promotes `sandbox` to the primary group and silently drops
 /// it from the supplementary list — making a `getgroups`-based check
 /// false-negative even though the user is genuinely a member.
+#[cfg(target_os = "linux")]
 fn real_group_resolver() -> Result<GroupMembership, String> {
     resolve_group_membership_with_source(nix::unistd::getgrouplist)
 }
@@ -678,6 +687,7 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
 /// and primary GID, and must return the full configured GID list as
 /// `getgrouplist(3)` would — that is, the union of the primary GID and every
 /// supplementary GID present in `/etc/group` for that user.
+#[cfg(target_os = "linux")]
 pub(crate) fn resolve_group_membership_with_source<F>(
     groups_source: F,
 ) -> Result<GroupMembership, String>
@@ -2045,6 +2055,7 @@ mod tests {
 
     /// C4 — sandbox group absent → Skip with dev-mode annotation
     /// per.2.
+    #[cfg(target_os = "linux")]
     #[test]
     fn group_check_skips_when_sandbox_group_absent() {
         let row = check_group_membership_with(|| Ok(GroupMembership::SandboxGroupAbsent));
@@ -2060,6 +2071,7 @@ mod tests {
     }
 
     /// C4 — operator is in the group → Pass with `user ∈ groups` form.
+    #[cfg(target_os = "linux")]
     #[test]
     fn group_check_passes_when_member() {
         let row = check_group_membership_with(|| {
@@ -2079,6 +2091,7 @@ mod tests {
 
     /// C4 — sandbox group exists but operator isn't in it → Fail with
     /// the `usermod` hint.
+    #[cfg(target_os = "linux")]
     #[test]
     fn group_check_fails_when_not_member_with_hint() {
         let row = check_group_membership_with(|| {
@@ -2106,6 +2119,7 @@ mod tests {
     /// result to a `Pass` check row containing the username and group names.
     /// This covers the outer predicate logic only; for the `getgrouplist`
     /// injection path see `configured_member_not_in_live_groups_resolves_member`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn group_check_passes_for_configured_member_not_in_live_groups() {
         let row = check_group_membership_with(|| {
@@ -2145,6 +2159,7 @@ mod tests {
     ///
     /// Requires a `sandbox` group on the host; skips with a message if absent
     /// (such as in a minimal CI container where setup-dev-env has not been run).
+    #[cfg(target_os = "linux")]
     #[test]
     fn configured_member_not_in_live_groups_resolves_member() {
         // Resolve the sandbox group's GID using the real system database.

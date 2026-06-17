@@ -34,6 +34,14 @@ chrono.workspace = true
 # the extra feature on this single consumer keeps the workspace default
 # minimal.
 clap = { workspace = true, features = ["env"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["net", "socket", "uio"] }
 # Direct socket2 use lets us set an explicit `listen()` backlog (the
 # tokio TcpListener API uses libc's SOMAXCONN and gives no knob).
@@ -42,12 +50,6 @@ nix = { version = "0.29", features = ["net", "socket", "uio"] }
 # queue is large enough for its burst, eliminating the
 # retry-on-ECONNREFUSED dance an earlier version of the test had to do.
 socket2 = "0.6"
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 # NFLOG receiver for the UDP deny path.
 #

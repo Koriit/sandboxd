@@ -24,6 +24,14 @@ test-env-override = ["sandbox-core/test-env-override"]
 
 [dependencies]
 sandbox-core.workspace = true
+# JSON-Lines serialization for the audit log. Workspace pin; the cap'd
+# binary's TCB grows by serde_json, but the alternative (hand-rolled JSON
+# escaping in privileged code) is strictly worse.
+serde_json.workspace = true
+# RFC 3339 UTC timestamps for the audit log `ts` field. Workspace pin.
+chrono.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 # Feature set:
 #   - "user"  — `User::from_uid` for stderr name lookup; transitively
 #               required by `sandbox-core`'s `SubnetEntry::allows_uid`.
@@ -40,12 +48,6 @@ libc = "0.2"
 # where the container netns is in init userns and there's no userns
 # implicit-cap promotion to cover the post-exec child.
 caps = "0.5"
-# JSON-Lines serialization for the audit log. Workspace pin; the cap'd
-# binary's TCB grows by serde_json, but the alternative (hand-rolled JSON
-# escaping in privileged code) is strictly worse.
-serde_json.workspace = true
-# RFC 3339 UTC timestamps for the audit log `ts` field. Workspace pin.
-chrono.workspace = true
 
 [dev-dependencies]
 # Used by the integration tests to checksum the installed cap'd
@@ -57,3 +59,7 @@ tempfile.workspace = true
 # Used by the integration tests to parse the audit-log JSON-Lines
 # output and assert on field shape.
 serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Used by the integration tests for uid/gid resolution in test helpers.
+nix = { version = "0.29", features = ["user"] }
