@@ -25,6 +25,7 @@ use sandbox_core::bridge_conf;
 use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
+#[cfg(target_os = "linux")]
 use sandbox_core::lima::SetuidHelperExecutor;
 use sandbox_core::users_conf::validate_users_conf_schema_version;
 use sandbox_core::{
@@ -738,6 +739,7 @@ fn xattr_has_cap_sys_admin_effective(buf: &[u8]) -> bool {
 /// Capability bit for `CAP_SETUID` (UAPI `linux/capability.h` —
 /// `#define CAP_SETUID 7`). Required by `sandbox-lima-helper`'s
 /// `setresuid(2)` call (checked by the daemon resolver at startup).
+#[cfg(target_os = "linux")]
 const CAP_SETUID_BIT: u32 = 7;
 
 /// Generalised inner of [`xattr_has_cap_sys_admin_effective`] — decode
@@ -793,6 +795,7 @@ fn xattr_has_cap_effective(buf: &[u8], cap_bit: u32) -> bool {
 /// *and* carry `CAP_SETUID` in the effective-on-exec set. Mirrors
 /// `has_required_caps` for the route helper but inspects
 /// `CAP_SETUID` instead of `CAP_SYS_ADMIN`.
+#[cfg(target_os = "linux")]
 fn has_setuid_cap(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
@@ -830,12 +833,14 @@ fn has_setuid_cap(path: &std::path::Path) -> bool {
 // use `CAP_SETUID_BIT` / [`has_setuid_cap`]).
 
 /// Canonical install path (FHS § 4.7) for `sandbox-lima-helper`.
+#[cfg(target_os = "linux")]
 const LIMA_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-lima-helper";
 
 /// Environment variable for explicit operator override of the lima-helper
 /// path.  When set, the resolver uses this path and only this path
 /// (fail-closed if missing or un-cap'd).  Intended for tests and unusual
 /// deployments; production operators should not set it.
+#[cfg(target_os = "linux")]
 const LIMA_HELPER_PATH_ENV: &str = "SANDBOX_LIMA_HELPER_PATH";
 
 /// Resolve the absolute path to `sandbox-lima-helper`.
@@ -843,6 +848,7 @@ const LIMA_HELPER_PATH_ENV: &str = "SANDBOX_LIMA_HELPER_PATH";
 /// Lookup order: `$SANDBOX_LIMA_HELPER_PATH` (fail-closed override) then
 /// the canonical install path.  Returns `Err` on any failure — there is
 /// no soft fallback.  Daemon startup treats `Err` as fatal.
+#[cfg(target_os = "linux")]
 pub(crate) fn resolve_lima_helper_path() -> Result<PathBuf, SandboxError> {
     let env_override = std::env::var_os(LIMA_HELPER_PATH_ENV).map(PathBuf::from);
     let install_path = PathBuf::from(LIMA_HELPER_INSTALL_PATH);
@@ -864,6 +870,7 @@ pub(crate) fn resolve_lima_helper_path() -> Result<PathBuf, SandboxError> {
 ///
 /// Parameterized over `is_usable` so unit tests can drive the resolver
 /// without `setcap`-ing real binaries.
+#[cfg(target_os = "linux")]
 pub(crate) fn resolve_lima_helper_path_from<F>(
     env_override: Option<&std::path::Path>,
     install_path: &std::path::Path,
@@ -8722,29 +8729,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     info!(base_vm_name = %base_vm_name, "base VM name resolved");
-    // Resolve `sandbox-lima-helper` at startup. The helper is required for
-    // the cross-user Lima model; the resolver returns `Result` — `Err` is
-    // fatal and the daemon refuses to start. There is no soft fallback.
-    let lima_helper_path = match resolve_lima_helper_path() {
-        Ok(path) => {
-            info!(
-                path = %path.display(),
-                "resolved sandbox-lima-helper path"
-            );
-            path
-        }
-        Err(e) => {
-            error!(error = %e, "sandbox-lima-helper not usable; daemon cannot start");
-            eprintln!("sandboxd: {e}");
-            return Err(e.into());
-        }
+    // Construct the operator-execution seam. The platform determines which
+    // implementation is used:
+    //
+    // - Linux: `SetuidHelperExecutor` — resolves `sandbox-lima-helper` (the
+    //   setcap helper that pivots to the operator's uid before exec'ing
+    //   `limactl`). A missing or unprivileged helper is a fatal startup error.
+    //
+    // - macOS: `AgentBrokerExecutor` — binds the agent-broker channel and
+    //   routes each `limactl` op to the operator's checked-in LaunchAgent.
+    //   No helper to resolve; instead the broker socket is bound and a
+    //   listener task is spawned.
+    #[cfg(target_os = "linux")]
+    let lima_executor: Arc<dyn sandbox_core::lima::LimaExecutor> = {
+        let lima_helper_path = match resolve_lima_helper_path() {
+            Ok(path) => {
+                info!(
+                    path = %path.display(),
+                    "resolved sandbox-lima-helper path"
+                );
+                path
+            }
+            Err(e) => {
+                error!(error = %e, "sandbox-lima-helper not usable; daemon cannot start");
+                eprintln!("sandboxd: {e}");
+                return Err(e.into());
+            }
+        };
+        Arc::new(SetuidHelperExecutor::new(lima_helper_path))
     };
 
-    // Construct the operator-execution seam that wraps the helper binary.
-    // This is the single construction site; the Arc is shared across all
-    // per-operator managers via the registry.
-    let lima_executor: Arc<dyn sandbox_core::lima::LimaExecutor> =
-        Arc::new(SetuidHelperExecutor::new(lima_helper_path));
+    #[cfg(target_os = "macos")]
+    let lima_executor: Arc<dyn sandbox_core::lima::LimaExecutor> = {
+        use broker::{
+            AgentBrokerExecutor, AgentRegistry, bind_broker_socket, broker_socket_path,
+            run_broker_listener,
+        };
+
+        let agent_registry = AgentRegistry::new();
+
+        // Bind the broker socket. The path is `/var/run/sandbox/broker.sock`
+        // by default (overridable via `SANDBOX_BROKER_SOCKET` for tests).
+        let broker_path = broker_socket_path();
+        // Ensure the parent directory exists (created by the installer; but
+        // in foreground-dev mode it may not exist).
+        if let Some(parent) = broker_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    let msg = format!(
+                        "failed to create broker socket dir {}: {e}",
+                        parent.display()
+                    );
+                    error!("{msg}");
+                    sandbox_core::error::SandboxError::Internal(msg)
+                })?;
+            }
+        }
+
+        let broker_listener = bind_broker_socket(&broker_path).map_err(|e| {
+            let msg = format!(
+                "failed to bind agent-broker socket at {}: {e}",
+                broker_path.display()
+            );
+            error!("{msg}");
+            sandbox_core::error::SandboxError::Internal(msg)
+        })?;
+        info!(path = %broker_path.display(), "agent-broker socket bound");
+
+        // Spawn the broker listener as a background task for the daemon lifetime.
+        let reg_for_listener = agent_registry.clone();
+        tokio::spawn(run_broker_listener(broker_listener, reg_for_listener));
+
+        Arc::new(AgentBrokerExecutor::new(agent_registry, daemon_uid))
+    };
 
     // Build the per-operator LimaManager registry. One LimaManager per
     // operator uid, created lazily on first session-create. All limactl
@@ -10434,6 +10491,7 @@ mod tests {
     // mirror the spawn-helper outer tests (env-read + env-unset branches).
     // -----------------------------------------------------------------------
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_lima_helper_path_from_uses_env_override_when_set_and_usable() {
         let env_path = std::path::PathBuf::from("/tmp/explicit-lima-helper");
@@ -10446,6 +10504,7 @@ mod tests {
         assert_eq!(resolved, env_path);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_lima_helper_path_from_errors_when_env_override_set_but_unusable() {
         // env-set, env-path NOT usable, canonical IS usable.  The resolver
@@ -10479,6 +10538,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_lima_helper_path_from_uses_canonical_when_env_unset_and_usable() {
         let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-lima-helper");
@@ -10487,6 +10547,7 @@ mod tests {
         assert_eq!(resolved, install_path);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_lima_helper_path_from_errors_when_env_unset_and_canonical_unusable() {
         let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-lima-helper");
@@ -10519,6 +10580,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_lima_helper_path_reads_env_var_when_set() {
         // SAFETY: same rationale as resolve_route_helper_path_reads_env_var_when_set.
@@ -10558,6 +10620,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_lima_helper_path_falls_back_to_canonical_when_env_unset() {
         // SAFETY: same rationale as resolve_route_helper_path_falls_back_to_canonical_when_env_unset.

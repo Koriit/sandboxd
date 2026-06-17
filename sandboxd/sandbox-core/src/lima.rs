@@ -727,24 +727,36 @@ pub enum LimaOp<'a> {
     ReadOwnerMarker { vm: &'a str },
 }
 
-/// Operator-execution seam for all `sandbox-lima-helper` invocations.
+/// Operator-execution seam — the platform-independent interface for running
+/// `limactl` operations as a given operator uid.
+///
+/// The daemon never calls `limactl` directly; every operation goes through
+/// this trait. The platform determines which implementation is used:
+///
+/// - **Linux** ([`SetuidHelperExecutor`]): invokes `sandbox-lima-helper` with
+///   `cap_setuid+ep`. The helper validates the caller, `setresuid`-pivots to
+///   the operator uid, and `exec`s `limactl` with a sanitised env. No
+///   privilege is granted to the daemon itself — the narrow helper is the
+///   only setcap binary in the Lima execution path.
+///
+/// - **macOS** (`AgentBrokerExecutor`, defined in the daemon crate): routes
+///   each operation to the operator's checked-in `sandbox-agent` LaunchAgent
+///   over the broker channel. The agent already runs as the operator, so no
+///   setuid or capability is involved. The daemon's own uid (`_sandbox`, or
+///   the operator in single-uid foreground-dev mode) is special-cased to run
+///   `limactl` directly rather than routing through the broker.
 ///
 /// The trait separates two concerns:
 ///
 /// - One-shot operations ([`Self::run`]): the caller blocks (via
-///   `spawn_blocking`) until the helper exits and returns a fully-buffered
-///   `std::process::Output`.  Timeout and error-label semantics match the
-///   existing [`run_with_timeout`] convention.
+///   `spawn_blocking`) until the operation completes and returns a
+///   fully-buffered `std::process::Output`. Timeout and error-label semantics
+///   match the existing [`run_with_timeout`] convention.
 ///
 /// - The streaming operation ([`Self::guest_socat`]): opens a long-lived
-///   bidirectional byte pump for the duration of an SSH session.  This path
+///   bidirectional byte pump for the duration of an SSH session. This path
 ///   MUST NOT use `spawn_blocking` (see the async-I/O carve-out in
 ///   `CLAUDE.md`); `guest_socat` is therefore `async`.
-///
-/// The Linux implementation is [`SetuidHelperExecutor`], which maps each
-/// [`LimaOp`] variant to the exact argv the helper expects and preserves
-/// byte-identical behavior.  A macOS executor (added in a later session)
-/// will implement the same trait without touching any call site.
 #[async_trait]
 pub trait LimaExecutor: Send + Sync {
     /// Run a one-shot helper operation and return the captured output.

@@ -1890,6 +1890,7 @@ name = "sandboxd"
 version = "0.1.10"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
  "axum-extra",
  "chrono",
@@ -1903,6 +1904,7 @@ dependencies = [
  "refinery",
  "ring",
  "rusqlite",
+ "sandbox-agent",
  "sandbox-core",
  "serde",
  "serde_json",

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 # `axum-extra::extract::Query` supports repeatable query-string
 # parameters (`?layer=a&layer=b` → `Vec<_>`). The axum 0.8 built-in
@@ -63,6 +64,13 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+# The broker wire-protocol types (BrokerRequest / BrokerResponse / BrokerOp)
+# are shared between the daemon and the per-operator agent binary. The agent
+# crate exposes them via its library target (`sandbox_agent_protocol`).
+# Scoped to macOS because the broker channel does not exist on Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+sandbox-agent = { path = "../sandbox-agent" }
 
 [features]
 # `test-env-override` — forwarded to `sandbox-core/test-env-override`.

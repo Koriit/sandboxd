@@ -9,6 +9,14 @@ rust-version.workspace = true
 name = "sandbox-agent"
 path = "src/main.rs"
 
+# Library target: exposes the broker wire-protocol types so the daemon can
+# deserialize/serialize the same `BrokerRequest`/`BrokerResponse` messages
+# without duplicating the definitions. Only the protocol and validation
+# modules are public; the handler (agent-side limactl execution) is not.
+[lib]
+name = "sandbox_agent_protocol"
+path = "src/lib.rs"
+
 [features]
 # `test-env-override` — opts the agent into honouring environment-variable
 # seams used by unit and integration tests:
