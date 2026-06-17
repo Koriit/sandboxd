@@ -23,15 +23,18 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use sandbox_core::backend::{BackendInfo, BackendKind, IsolationLevel, SessionRuntime};
-use sandbox_core::lima::DEFAULT_BASE_VM_NAME;
+use sandbox_core::lima::{DEFAULT_BASE_VM_NAME, LimaExecutor, SetuidHelperExecutor};
 use sandbox_core::{LimaManagerRegistry, LimaRuntime};
 use sandboxd::backends_http::{BackendsApiState, backends_router};
 
 #[tokio::test]
 async fn integration_backends_endpoint_lists_registered_backends_in_stable_order() {
+    let executor: Arc<dyn LimaExecutor> = Arc::new(SetuidHelperExecutor::new(
+        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+    ));
     let registry = Arc::new(LimaManagerRegistry::new(
         DEFAULT_BASE_VM_NAME.to_string(),
-        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        executor,
         "test-pool".to_string(),
     ));
     let lima = LimaRuntime::new(registry);

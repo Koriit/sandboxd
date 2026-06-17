@@ -25,6 +25,7 @@ use sandbox_core::bridge_conf;
 use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
+use sandbox_core::lima::SetuidHelperExecutor;
 use sandbox_core::users_conf::validate_users_conf_schema_version;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, Cidr4, CoreDnsConfig,
@@ -2695,9 +2696,9 @@ async fn create_session(
             // rsync must run as the operator uid to read the
             // operator-owned host workspace source directory.
             let session_name = format!("sandbox-{session_id}");
-            let helper_path = state.lima_runtime.registry().helper_path().to_owned();
+            let executor = Arc::clone(state.lima_runtime.registry().executor());
             match sandbox_core::workspace_rsync::run_initial_push_via_helper(
-                &helper_path,
+                &executor,
                 operator.uid,
                 backend_kind,
                 &session_name,
@@ -3435,9 +3436,9 @@ async fn create_session(
         // source (mode 0700) that the daemon uid (999) cannot enter
         // directly.  Same cross-user rationale as `read-user-key`.
         let session_name = format!("sandbox-{session_id}");
-        let helper_path = state.lima_runtime.registry().helper_path().to_owned();
+        let executor = Arc::clone(state.lima_runtime.registry().executor());
         match sandbox_core::workspace_rsync::run_initial_push_via_helper(
-            &helper_path,
+            &executor,
             operator.uid,
             backend_kind,
             &session_name,
@@ -8734,12 +8735,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Construct the operator-execution seam that wraps the helper binary.
+    // This is the single construction site; the Arc is shared across all
+    // per-operator managers via the registry.
+    let lima_executor: Arc<dyn sandbox_core::lima::LimaExecutor> =
+        Arc::new(SetuidHelperExecutor::new(lima_helper_path));
+
     // Build the per-operator LimaManager registry. One LimaManager per
     // operator uid, created lazily on first session-create. All limactl
     // operations go through sandbox-lima-helper (pivoted to operator uid).
     let lima_registry = Arc::new(LimaManagerRegistry::new(
         base_vm_name,
-        lima_helper_path,
+        lima_executor,
         format!(
             "{}/{}",
             allocation_pool.base(),

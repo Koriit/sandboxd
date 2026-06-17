@@ -34,7 +34,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use sandbox_core::lima::{DEFAULT_BASE_VM_NAME, LimaManager};
+use sandbox_core::lima::{DEFAULT_BASE_VM_NAME, LimaExecutor, LimaManager, SetuidHelperExecutor};
 
 /// Build the wrapper, stage a fake `qemu-system-x86_64` next to it,
 /// exec the wrapper with a benign non-help argument, and return the
@@ -63,9 +63,13 @@ fn capture_wrapper_argv_with_user_netdev(
     // inside the TempDir and cleaned up automatically.
     let lima_home = dir.path().join("lima");
     std::fs::create_dir_all(&lima_home).expect("create lima_home");
+    let executor: std::sync::Arc<dyn LimaExecutor> =
+        std::sync::Arc::new(SetuidHelperExecutor::new(std::path::PathBuf::from(
+            "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+        )));
     let mgr = LimaManager::new(
         lima_home,
-        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        executor,
         nix::unistd::Uid::current().as_raw(),
         DEFAULT_BASE_VM_NAME.to_string(),
         "test-pool".to_string(),
@@ -149,9 +153,13 @@ fn capture_wrapper_argv_with_extra_env(
 
     let lima_home = dir.path().join("lima");
     std::fs::create_dir_all(&lima_home).expect("create lima_home");
+    let executor: std::sync::Arc<dyn LimaExecutor> =
+        std::sync::Arc::new(SetuidHelperExecutor::new(std::path::PathBuf::from(
+            "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+        )));
     let mgr = LimaManager::new(
         lima_home,
-        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        executor,
         nix::unistd::Uid::current().as_raw(),
         DEFAULT_BASE_VM_NAME.to_string(),
         "test-pool".to_string(),

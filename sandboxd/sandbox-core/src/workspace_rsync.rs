@@ -43,8 +43,8 @@
 //! captured stderr is decoded lossy (UTF-8 with U+FFFD replacement chars)
 //! so binary noise never panics the error path.
 
-use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -53,7 +53,7 @@ use tracing::info;
 
 use crate::backend::BackendKind;
 use crate::error::SandboxError;
-use crate::process::run_with_timeout;
+use crate::lima::{LimaExecutor, LimaOp};
 
 /// Caller-side rsync `-e` transport token for Lima sessions.
 /// Passed to rsync as the remote-shell argument; rsync (running as the
@@ -398,7 +398,7 @@ const RSYNC_VIA_HELPER_TIMEOUT: Duration = Duration::from_secs(600);
 /// verbatim (lossy UTF-8) so the operator sees rsync's own diagnostic.
 /// On timeout: returns [`SandboxError::Timeout`].
 pub async fn run_initial_push_via_helper(
-    helper_path: &Path,
+    executor: &Arc<dyn LimaExecutor>,
     op_uid: u32,
     backend: BackendKind,
     session_name: &str,
@@ -415,35 +415,21 @@ pub async fn run_initial_push_via_helper(
         "local-workspace rsync: starting initial push (via helper)"
     );
 
-    let backend_str = match backend {
-        BackendKind::Lima => "lima",
-        BackendKind::Container => "container",
-    };
-
-    let helper_path = helper_path.to_owned();
-    let op_uid_str = op_uid.to_string();
+    let executor = Arc::clone(executor);
     let session_name = session_name.to_owned();
     let host_path = host_path.to_owned();
     let guest_path = guest_path.to_owned();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(&helper_path);
-        cmd.arg("run-rsync")
-            .arg("--op-uid")
-            .arg(&op_uid_str)
-            .arg("--backend")
-            .arg(backend_str)
-            .arg("--session-name")
-            .arg(&session_name)
-            .arg("--host-path")
-            .arg(&host_path)
-            .arg("--guest-path")
-            .arg(&guest_path);
-        if no_gitignore {
-            cmd.arg("--no-gitignore");
-        }
-        run_with_timeout(
-            &mut cmd,
+        executor.run(
+            op_uid,
+            LimaOp::RunRsync {
+                backend,
+                session_name: &session_name,
+                host_path: &host_path,
+                guest_path: &guest_path,
+                no_gitignore,
+            },
             RSYNC_VIA_HELPER_TIMEOUT,
             "sandbox-lima-helper run-rsync",
         )

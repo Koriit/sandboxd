@@ -60,6 +60,7 @@ use sandbox_core::SshKeypair;
 use sandbox_core::backend::{
     BackendKind, LITE_IMAGE_REPOSITORY, ensure_image, stage_ssh_credentials,
 };
+use sandbox_core::lima::{LimaExecutor, SetuidHelperExecutor};
 use sandbox_core::{LimaManagerRegistry, SessionConfig, SessionStore};
 use sandboxd::proxy_http::{ProxyState, handle_proxy};
 use tempfile::TempDir;
@@ -437,11 +438,14 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
     // axum router and serve on a TCP loopback listener.
     let store = Arc::new(store);
     // LimaManagerRegistry is never invoked on the container path;
-    // constructed with a stub helper path so the registry is present but
+    // constructed with a stub executor so the registry is present but
     // never triggers a real helper invocation in this test.
+    let executor: Arc<dyn LimaExecutor> = Arc::new(SetuidHelperExecutor::new(
+        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+    ));
     let lima_registry = Arc::new(LimaManagerRegistry::new(
         "sandbox-base-test".to_string(),
-        std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+        executor,
         "test-pool".to_string(),
     ));
     let proxy_state = Arc::new(ProxyState {

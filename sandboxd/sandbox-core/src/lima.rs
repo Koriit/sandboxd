@@ -4,10 +4,13 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::backend::AsyncReadWrite;
+use crate::backend::BackendKind;
 use crate::error::SandboxError;
 use crate::process::run_with_timeout;
 use crate::session::{SessionConfig, SessionId, WorkspaceMode};
@@ -643,6 +646,412 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
 }
 
 // ---------------------------------------------------------------------------
+// LimaExecutor trait — operator-execution seam
+// ---------------------------------------------------------------------------
+
+/// A one-shot Lima helper operation, represented as a typed value.
+///
+/// Each variant corresponds to one subcommand of `sandbox-lima-helper`.
+/// The closed-enum shape ensures the set of operations is statically
+/// known and no arbitrary argv can be constructed from outside this
+/// module.  The Linux [`SetuidHelperExecutor`] flattens each variant
+/// back to the exact argv the helper expects; a future macOS executor
+/// (added in a later session) will match on these variants to translate
+/// them into broker-protocol messages without touching call sites.
+///
+/// `RunRsync` is included here because it also goes through the helper
+/// binary (the only op that is not Lima-specific: the same helper
+/// subcommand serves both Lima and container initial-push transports,
+/// distinguished by the `backend` field).  `GuestSocat` is intentionally
+/// absent: the streaming socat transport uses
+/// [`LimaExecutor::guest_socat`] rather than `run` because it is
+/// long-lived and must not run inside `spawn_blocking`.
+///
+/// `Stop` carries `force: bool` because the base-image build path may
+/// fall back to `--force` after a graceful stop timeout; this is the
+/// only flag whose presence changes the helper's argv beyond the
+/// subcommand-level dispatch.
+#[derive(Debug)]
+pub enum LimaOp<'a> {
+    /// `sandbox-lima-helper create --vm <vm> --yaml <yaml_path> --owner <owner>`
+    Create {
+        vm: &'a str,
+        yaml_path: &'a std::path::Path,
+        owner: &'a str,
+    },
+    /// `sandbox-lima-helper start --vm <vm> --qemu-wrapper <path>
+    ///   --hardened <0|1> --memory-mb <n> --cpus <n> --start-timeout-s <n>
+    ///   [--bridge-name <b> --vm-mac <m>
+    ///    [--unrestricted-slirp-for-provisioning]]`
+    Start {
+        vm: &'a str,
+        qemu_wrapper: &'a std::path::Path,
+        hardened: bool,
+        memory_mb: u32,
+        cpus: u32,
+        start_timeout_s: u32,
+        /// Bridge name and VM MAC, supplied together or not at all.
+        bridge: Option<(&'a str, &'a str)>,
+        unrestricted_slirp_for_provisioning: bool,
+    },
+    /// `sandbox-lima-helper stop --vm <vm> [--force]`
+    Stop { vm: &'a str, force: bool },
+    /// `sandbox-lima-helper delete --vm <vm>`
+    Delete { vm: &'a str },
+    /// `sandbox-lima-helper clone --base <base> --vm <vm>
+    ///   --cpus <n> --memory <gib> --disk <gb> --owner <owner>`
+    Clone {
+        base: &'a str,
+        vm: &'a str,
+        cpus: u32,
+        memory_gib: u32,
+        disk_gb: u32,
+        owner: &'a str,
+    },
+    /// `sandbox-lima-helper list-json`
+    ListJson,
+    /// `sandbox-lima-helper install-guest-agent --vm <vm>`
+    InstallGuestAgent { vm: &'a str },
+    /// `sandbox-lima-helper read-user-key`
+    ReadUserKey,
+    /// `sandbox-lima-helper run-rsync --op-uid <n> --backend <backend>
+    ///   --session-name <name> --host-path <p> --guest-path <p> [--no-gitignore]`
+    RunRsync {
+        backend: BackendKind,
+        session_name: &'a str,
+        host_path: &'a str,
+        guest_path: &'a str,
+        no_gitignore: bool,
+    },
+    /// `sandbox-lima-helper read-owner-marker --vm <vm>`
+    ReadOwnerMarker { vm: &'a str },
+}
+
+/// Operator-execution seam for all `sandbox-lima-helper` invocations.
+///
+/// The trait separates two concerns:
+///
+/// - One-shot operations ([`Self::run`]): the caller blocks (via
+///   `spawn_blocking`) until the helper exits and returns a fully-buffered
+///   `std::process::Output`.  Timeout and error-label semantics match the
+///   existing [`run_with_timeout`] convention.
+///
+/// - The streaming operation ([`Self::guest_socat`]): opens a long-lived
+///   bidirectional byte pump for the duration of an SSH session.  This path
+///   MUST NOT use `spawn_blocking` (see the async-I/O carve-out in
+///   `CLAUDE.md`); `guest_socat` is therefore `async`.
+///
+/// The Linux implementation is [`SetuidHelperExecutor`], which maps each
+/// [`LimaOp`] variant to the exact argv the helper expects and preserves
+/// byte-identical behavior.  A macOS executor (added in a later session)
+/// will implement the same trait without touching any call site.
+#[async_trait]
+pub trait LimaExecutor: Send + Sync {
+    /// Run a one-shot helper operation and return the captured output.
+    ///
+    /// - `op_uid`: the operator uid passed as `--op-uid <n>`.
+    /// - `op`: the typed operation; [`SetuidHelperExecutor`] flattens this to
+    ///   the exact argv the helper expects.
+    /// - `timeout`: wall-clock budget passed to [`run_with_timeout`].
+    /// - `label`: diagnostic string for error and timeout messages.
+    fn run(
+        &self,
+        op_uid: u32,
+        op: LimaOp<'_>,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<std::process::Output, SandboxError>;
+
+    /// Open a long-lived bidirectional stream to the in-VM guest agent.
+    ///
+    /// Spawns `sandbox-lima-helper guest-socat --op-uid <op_uid> --vm <vm>`
+    /// with async stdio and `kill_on_drop(true)`.  The returned stream owns
+    /// the child handle; dropping it tears down the process.
+    ///
+    /// This is the async-I/O carve-out: it MUST NOT be wrapped in
+    /// `spawn_blocking`.  Holding a blocking-task slot for the full SSH
+    /// session lifetime (potentially hours) deadlocks the executor under load.
+    async fn guest_socat(
+        &self,
+        op_uid: u32,
+        vm: &str,
+    ) -> Result<Box<dyn AsyncReadWrite + Send + Unpin>, SandboxError>;
+}
+
+// ---------------------------------------------------------------------------
+// SetuidHelperExecutor — Linux implementation
+// ---------------------------------------------------------------------------
+
+/// Helper child stdout + stdin owned by the returned stream so
+/// `kill_on_drop(true)` tears the process down when the stream is dropped.
+struct LimaHelperSocatStream {
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    _child: tokio::process::Child,
+}
+
+impl tokio::io::AsyncRead for LimaHelperSocatStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for LimaHelperSocatStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_shutdown(cx)
+    }
+}
+
+/// Linux [`LimaExecutor`] implementation that invokes `sandbox-lima-helper`
+/// directly.
+///
+/// Holds the absolute path to the helper binary, resolved once at daemon
+/// startup by `resolve_lima_helper_path()`.  Each [`LimaOp`] variant is
+/// mapped to the exact argv the helper expects; no subcommand string or
+/// extra-arg array escapes from the executor interface.
+pub struct SetuidHelperExecutor {
+    helper_path: PathBuf,
+}
+
+impl SetuidHelperExecutor {
+    /// Construct an executor for the helper binary at `helper_path`.
+    ///
+    /// `helper_path` must be the absolute path returned by
+    /// `resolve_lima_helper_path()`.  Callers should treat construction
+    /// as fatal on missing (the daemon already enforces this).
+    pub fn new(helper_path: PathBuf) -> Self {
+        Self { helper_path }
+    }
+
+    /// Return the path to the helper binary held by this executor.
+    pub fn helper_path(&self) -> &std::path::Path {
+        &self.helper_path
+    }
+}
+
+#[async_trait]
+impl LimaExecutor for SetuidHelperExecutor {
+    fn run(
+        &self,
+        op_uid: u32,
+        op: LimaOp<'_>,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<std::process::Output, SandboxError> {
+        let mut cmd = Command::new(&self.helper_path);
+        // Every subcommand receives --op-uid as the second argument; the
+        // helper enforces this before dispatching.  RunRsync embeds op_uid
+        // via the same flag — the helper's arg parser unifies them.
+        match op {
+            LimaOp::Create {
+                vm,
+                yaml_path,
+                owner,
+            } => {
+                cmd.arg("create")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--vm")
+                    .arg(vm)
+                    .arg("--yaml")
+                    .arg(yaml_path)
+                    .arg("--owner")
+                    .arg(owner);
+            }
+            LimaOp::Start {
+                vm,
+                qemu_wrapper,
+                hardened,
+                memory_mb,
+                cpus,
+                start_timeout_s,
+                bridge,
+                unrestricted_slirp_for_provisioning,
+            } => {
+                cmd.arg("start")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--vm")
+                    .arg(vm)
+                    .arg("--qemu-wrapper")
+                    .arg(qemu_wrapper)
+                    .arg("--hardened")
+                    .arg(if hardened { "1" } else { "0" })
+                    .arg("--memory-mb")
+                    .arg(memory_mb.to_string())
+                    .arg("--cpus")
+                    .arg(cpus.to_string())
+                    .arg("--start-timeout-s")
+                    .arg(start_timeout_s.to_string());
+                if let Some((bridge_name, mac)) = bridge {
+                    cmd.arg("--bridge-name")
+                        .arg(bridge_name)
+                        .arg("--vm-mac")
+                        .arg(mac);
+                    if unrestricted_slirp_for_provisioning {
+                        cmd.arg("--unrestricted-slirp-for-provisioning");
+                    }
+                }
+            }
+            LimaOp::Stop { vm, force } => {
+                cmd.arg("stop")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--vm")
+                    .arg(vm);
+                if force {
+                    cmd.arg("--force");
+                }
+            }
+            LimaOp::Delete { vm } => {
+                cmd.arg("delete")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--vm")
+                    .arg(vm);
+            }
+            LimaOp::Clone {
+                base,
+                vm,
+                cpus,
+                memory_gib,
+                disk_gb,
+                owner,
+            } => {
+                cmd.arg("clone")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--base")
+                    .arg(base)
+                    .arg("--vm")
+                    .arg(vm)
+                    .arg("--cpus")
+                    .arg(cpus.to_string())
+                    .arg("--memory")
+                    .arg(memory_gib.to_string())
+                    .arg("--disk")
+                    .arg(disk_gb.to_string())
+                    .arg("--owner")
+                    .arg(owner);
+            }
+            LimaOp::ListJson => {
+                cmd.arg("list-json").arg("--op-uid").arg(op_uid.to_string());
+            }
+            LimaOp::InstallGuestAgent { vm } => {
+                cmd.arg("install-guest-agent")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--vm")
+                    .arg(vm);
+            }
+            LimaOp::ReadUserKey => {
+                cmd.arg("read-user-key")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string());
+            }
+            LimaOp::RunRsync {
+                backend,
+                session_name,
+                host_path,
+                guest_path,
+                no_gitignore,
+            } => {
+                let backend_str = match backend {
+                    BackendKind::Lima => "lima",
+                    BackendKind::Container => "container",
+                };
+                cmd.arg("run-rsync")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--backend")
+                    .arg(backend_str)
+                    .arg("--session-name")
+                    .arg(session_name)
+                    .arg("--host-path")
+                    .arg(host_path)
+                    .arg("--guest-path")
+                    .arg(guest_path);
+                if no_gitignore {
+                    cmd.arg("--no-gitignore");
+                }
+            }
+            LimaOp::ReadOwnerMarker { vm } => {
+                cmd.arg("read-owner-marker")
+                    .arg("--op-uid")
+                    .arg(op_uid.to_string())
+                    .arg("--vm")
+                    .arg(vm);
+            }
+        }
+        run_with_timeout(&mut cmd, timeout, label).map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => SandboxError::Lima(
+                format!("{label}: sandbox-lima-helper not found or not executable: {msg}"),
+            ),
+            other => other,
+        })
+    }
+
+    async fn guest_socat(
+        &self,
+        op_uid: u32,
+        vm: &str,
+    ) -> Result<Box<dyn AsyncReadWrite + Send + Unpin>, SandboxError> {
+        // Async-I/O carve-out: spawn via tokio::process::Command (NOT
+        // spawn_blocking). See CLAUDE.md "Async-I/O carve-out for long-lived
+        // child processes."
+        use std::process::Stdio;
+        let mut command = tokio::process::Command::new(&self.helper_path);
+        command
+            .args(["guest-socat", "--op-uid", &op_uid.to_string(), "--vm", vm])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|e| {
+            SandboxError::Lima(format!(
+                "failed to spawn sandbox-lima-helper guest-socat for {vm}: {e}"
+            ))
+        })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            SandboxError::Internal("failed to capture stdin of limactl shell socat".into())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            SandboxError::Internal("failed to capture stdout of limactl shell socat".into())
+        })?;
+
+        Ok(Box::new(LimaHelperSocatStream {
+            stdin,
+            stdout,
+            _child: child,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-operator LimaManager registry
 // ---------------------------------------------------------------------------
 
@@ -677,11 +1086,11 @@ pub struct LimaManagerRegistry {
     /// use.  Entries are never removed; the registry grows monotonically
     /// as new operators create sessions.
     managers: Mutex<HashMap<u32, Arc<LimaManager>>>,
-    /// Path to `sandbox-lima-helper`, shared across all managers.
-    /// Resolved once at registry construction from `resolve_lima_helper_path()`.
-    /// The daemon never invokes `limactl` directly — all limactl operations
-    /// go through the helper, which resolves limactl post-setresuid.
-    helper_path: PathBuf,
+    /// Operator-execution seam for all `sandbox-lima-helper` invocations.
+    /// Shared across all per-operator managers; each manager holds a clone
+    /// of this `Arc`.  The Linux implementation is [`SetuidHelperExecutor`];
+    /// a macOS implementation (added in a later session) slots in here.
+    executor: Arc<dyn LimaExecutor>,
     /// Golden-image base VM name shared across all per-operator managers.
     base_vm_name: String,
     /// Canonical pool CIDR string (`<base>/<prefix>`) stamped as
@@ -705,17 +1114,19 @@ impl LimaManagerRegistry {
     /// Construct a registry backed by the production
     /// `ensure_operator_lima_home` provisioning function.
     ///
-    /// `helper_path` is the absolute path to `sandbox-lima-helper`, resolved
-    /// at daemon startup by `resolve_lima_helper_path()`.
+    /// `executor` is the operator-execution seam for all helper invocations,
+    /// constructed once at daemon startup.  The Linux implementation is
+    /// [`SetuidHelperExecutor`], built from the path returned by
+    /// `resolve_lima_helper_path()`.
     ///
     /// `base_vm_name` is the Lima instance name for the golden base image.
     ///
     /// `owner_pool` is the canonical pool CIDR string stamped via `--owner`
     /// on every `create`/`clone` helper call.
-    pub fn new(base_vm_name: String, helper_path: PathBuf, owner_pool: String) -> Self {
+    pub fn new(base_vm_name: String, executor: Arc<dyn LimaExecutor>, owner_pool: String) -> Self {
         Self {
             managers: Mutex::new(HashMap::new()),
-            helper_path,
+            executor,
             base_vm_name,
             owner_pool,
             provision_lima_home: Box::new(ensure_operator_lima_home),
@@ -733,7 +1144,7 @@ impl LimaManagerRegistry {
     /// hermetic and do not touch `/var/lib/sandboxd/`.
     pub fn new_with_provisioner<F>(
         base_vm_name: String,
-        helper_path: PathBuf,
+        executor: Arc<dyn LimaExecutor>,
         owner_pool: String,
         provision: F,
     ) -> Self
@@ -742,7 +1153,7 @@ impl LimaManagerRegistry {
     {
         Self {
             managers: Mutex::new(HashMap::new()),
-            helper_path,
+            executor,
             base_vm_name,
             owner_pool,
             provision_lima_home: Box::new(provision),
@@ -792,7 +1203,7 @@ impl LimaManagerRegistry {
 
         let mgr = Arc::new(LimaManager::new(
             lima_home,
-            self.helper_path.clone(),
+            Arc::clone(&self.executor),
             op_uid,
             self.base_vm_name.clone(),
             self.owner_pool.clone(),
@@ -807,12 +1218,13 @@ impl LimaManagerRegistry {
         Ok(Arc::clone(inserted))
     }
 
-    /// Return the absolute path to `sandbox-lima-helper` held by this
-    /// registry.  Used by call sites that need to invoke the helper
-    /// directly (e.g. the workspace rsync pivot) without going through
-    /// a per-operator [`LimaManager`].
-    pub fn helper_path(&self) -> &std::path::Path {
-        &self.helper_path
+    /// Return the executor held by this registry.
+    ///
+    /// Used by call sites that need to invoke the helper outside the
+    /// per-operator [`LimaManager`] world — currently the workspace rsync
+    /// pivot ([`crate::workspace_rsync::run_initial_push_via_helper`]).
+    pub fn executor(&self) -> &Arc<dyn LimaExecutor> {
+        &self.executor
     }
 
     /// Return the number of operator entries currently in the registry.
@@ -1033,10 +1445,10 @@ fi
 /// exec'ing `limactl`. The daemon never invokes `limactl` directly.
 pub struct LimaManager {
     base_dir: PathBuf,
-    /// Absolute path to the `sandbox-lima-helper` binary, resolved at daemon
-    /// startup by `resolve_lima_helper_path()`. Every limactl invocation goes
-    /// through the helper — `limactl` is never exec'd directly by the daemon.
-    helper_path: PathBuf,
+    /// Operator-execution seam for all helper invocations bound to this
+    /// operator.  Every limactl call goes through the executor — limactl is
+    /// never exec'd directly by the daemon.
+    executor: Arc<dyn LimaExecutor>,
     /// Operator uid this manager is bound to. Passed as `--op-uid <N>` on
     /// every helper invocation. The helper rejects `--op-uid 0`.
     op_uid: u32,
@@ -1067,8 +1479,8 @@ impl LimaManager {
     /// Create a new manager for the given operator, rooted at the per-operator
     /// LIMA_HOME directory.
     ///
-    /// `helper_path` is the absolute path to the `sandbox-lima-helper` binary,
-    /// resolved once at daemon startup by `resolve_lima_helper_path()`.
+    /// `executor` is the operator-execution seam for all helper invocations,
+    /// shared with all other managers in the same registry.
     ///
     /// `op_uid` is the numeric uid of the operator that owns this manager.
     /// The helper rejects `--op-uid 0`; callers must never pass 0.
@@ -1078,14 +1490,14 @@ impl LimaManager {
     /// `SANDBOX_BASE_VM_NAME`; tests typically pass [`DEFAULT_BASE_VM_NAME`].
     pub fn new(
         base_dir: PathBuf,
-        helper_path: PathBuf,
+        executor: Arc<dyn LimaExecutor>,
         op_uid: u32,
         base_vm_name: String,
         owner_pool: String,
     ) -> Self {
         Self {
             base_dir,
-            helper_path,
+            executor,
             op_uid,
             base_vm_name,
             owner_pool,
@@ -1094,7 +1506,7 @@ impl LimaManager {
     }
 
     /// Create a manager with a caller-supplied helper path and operator uid,
-    /// skipping any path resolution. Useful for tests.
+    /// wrapping the path in a [`SetuidHelperExecutor`]. Useful for tests.
     #[cfg(test)]
     pub fn with_helper_path(
         base_dir: PathBuf,
@@ -1104,7 +1516,7 @@ impl LimaManager {
     ) -> Self {
         Self {
             base_dir,
-            helper_path,
+            executor: Arc::new(SetuidHelperExecutor::new(helper_path)),
             op_uid,
             base_vm_name,
             owner_pool: "test-pool".to_string(),
@@ -1122,9 +1534,9 @@ impl LimaManager {
         self.op_uid
     }
 
-    /// Return the path to the `sandbox-lima-helper` binary.
-    pub fn helper_path(&self) -> &std::path::Path {
-        &self.helper_path
+    /// Return the executor held by this manager.
+    pub fn executor(&self) -> &Arc<dyn LimaExecutor> {
+        &self.executor
     }
 
     /// Return the VM name this manager uses for the golden base image.
@@ -1132,28 +1544,19 @@ impl LimaManager {
         &self.base_vm_name
     }
 
-    /// Helper: build and run the helper with the given subcommand and args.
-    /// Wraps `run_with_timeout` and maps spawn errors.
+    /// Run a typed [`LimaOp`] through the executor, binding `self.op_uid`.
+    ///
+    /// All one-shot helper calls in this manager go through this method so
+    /// the executor seam is the single point through which operations are
+    /// dispatched.  The `timeout` and `label` parameters are forwarded
+    /// verbatim to [`LimaExecutor::run`].
     pub(crate) fn run_helper(
         &self,
-        subcommand: &str,
-        extra_args: &[&str],
-        timeout: std::time::Duration,
+        op: LimaOp<'_>,
+        timeout: Duration,
         label: &str,
     ) -> Result<std::process::Output, SandboxError> {
-        let mut cmd = Command::new(&self.helper_path);
-        cmd.arg(subcommand)
-            .arg("--op-uid")
-            .arg(self.op_uid.to_string());
-        for arg in extra_args {
-            cmd.arg(arg);
-        }
-        run_with_timeout(&mut cmd, timeout, label).map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => SandboxError::Lima(
-                format!("{label}: sandbox-lima-helper not found or not executable: {msg}"),
-            ),
-            other => other,
-        })
+        self.executor.run(self.op_uid, op, timeout, label)
     }
 
     // -- public API ---------------------------------------------------------
@@ -1250,7 +1653,6 @@ impl LimaManager {
             self.write_operator_readable_template(session_id, template.as_bytes())?;
 
         let vm_name = vm_name(session_id);
-        let template_str = template_path.to_string_lossy().to_string();
 
         info!(
             session_id = %session_id,
@@ -1263,15 +1665,11 @@ impl LimaManager {
         );
 
         let result = self.run_helper(
-            "create",
-            &[
-                "--vm",
-                &vm_name,
-                "--yaml",
-                &template_str,
-                "--owner",
-                &self.owner_pool,
-            ],
+            LimaOp::Create {
+                vm: &vm_name,
+                yaml_path: &template_path,
+                owner: &self.owner_pool,
+            },
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create",
         );
@@ -1311,7 +1709,6 @@ impl LimaManager {
         let staged = self.write_operator_readable_template(session_id, &content)?;
 
         let vm_name = vm_name(session_id);
-        let staged_str = staged.to_string_lossy().to_string();
 
         info!(
             session_id = %session_id,
@@ -1321,15 +1718,11 @@ impl LimaManager {
         );
 
         let result = self.run_helper(
-            "create",
-            &[
-                "--vm",
-                &vm_name,
-                "--yaml",
-                &staged_str,
-                "--owner",
-                &self.owner_pool,
-            ],
+            LimaOp::Create {
+                vm: &vm_name,
+                yaml_path: &staged,
+                owner: &self.owner_pool,
+            },
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create (custom template)",
         );
@@ -1366,11 +1759,6 @@ impl LimaManager {
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
-        let qemu_wrapper_str = qemu_wrapper.to_string_lossy().to_string();
-        let hardened_flag = if config.hardened { "1" } else { "0" };
-        let timeout_s = START_VM_TIMEOUT.as_secs().to_string();
-        let memory_mb_s = config.memory_mb.to_string();
-        let cpus_s = config.cpus.to_string();
 
         info!(
             session_id = %session_id,
@@ -1381,42 +1769,27 @@ impl LimaManager {
             "starting VM"
         );
 
-        let mut extra: Vec<&str> = vec![
-            "--vm",
-            &vm_name,
-            "--qemu-wrapper",
-            &qemu_wrapper_str,
-            "--hardened",
-            hardened_flag,
-            "--memory-mb",
-            &memory_mb_s,
-            "--cpus",
-            &cpus_s,
-            "--start-timeout-s",
-            &timeout_s,
-        ];
-
-        // Bridge/MAC must be supplied together.
-        let bridge_owned;
-        let mac_owned;
-        if let (Some(bridge), Some(mac)) = (bridge_name, vm_mac) {
-            bridge_owned = bridge.to_string();
-            mac_owned = mac.to_string();
-            extra.push("--bridge-name");
-            extra.push(&bridge_owned);
-            extra.push("--vm-mac");
-            extra.push(&mac_owned);
-            if unrestricted_slirp_for_provisioning {
-                extra.push("--unrestricted-slirp-for-provisioning");
-            }
-        }
+        // Bridge/MAC must be supplied together (enforced by the caller).
+        let bridge = match (bridge_name, vm_mac) {
+            (Some(b), Some(m)) => Some((b, m)),
+            _ => None,
+        };
 
         let output = self.run_helper(
-            "start",
-            &extra,
+            LimaOp::Start {
+                vm: &vm_name,
+                qemu_wrapper: &qemu_wrapper,
+                hardened: config.hardened,
+                memory_mb: config.memory_mb,
+                cpus: config.cpus,
+                // Cast is safe: START_VM_TIMEOUT is 300 s, well within u32.
+                start_timeout_s: START_VM_TIMEOUT.as_secs() as u32,
+                bridge,
+                unrestricted_slirp_for_provisioning,
+            },
             // Host-side wall-clock kill: slightly longer than Lima's own
             // --timeout so Lima can report its own error instead of being
-            // killed. This is distinct from `--start-timeout-s` (above)
+            // killed. This is distinct from `start_timeout_s` (above)
             // which is Lima's internal SSH-reachability wait.
             START_VM_TIMEOUT + Duration::from_secs(30),
             "sandbox-lima-helper start",
@@ -1438,8 +1811,10 @@ impl LimaManager {
         info!(session_id = %session_id, vm = %vm_name, "stopping VM");
 
         let output = self.run_helper(
-            "stop",
-            &["--vm", &vm_name],
+            LimaOp::Stop {
+                vm: &vm_name,
+                force: false,
+            },
             STOP_VM_TIMEOUT,
             "sandbox-lima-helper stop",
         )?;
@@ -1460,8 +1835,7 @@ impl LimaManager {
         info!(session_id = %session_id, vm = %vm_name, "deleting VM");
 
         let output = self.run_helper(
-            "delete",
-            &["--vm", &vm_name],
+            LimaOp::Delete { vm: &vm_name },
             DELETE_VM_TIMEOUT,
             "sandbox-lima-helper delete",
         )?;
@@ -1489,8 +1863,7 @@ impl LimaManager {
     pub fn read_owner_marker(&self, session_id: &SessionId) -> Option<String> {
         let vm_name = vm_name(session_id);
         let output = match self.run_helper(
-            "read-owner-marker",
-            &["--vm", &vm_name],
+            LimaOp::ReadOwnerMarker { vm: &vm_name },
             READ_OWNER_MARKER_TIMEOUT,
             "sandbox-lima-helper read-owner-marker",
         ) {
@@ -1529,8 +1902,7 @@ impl LimaManager {
     /// already has a primary failure to report.
     fn cleanup_partial_lima_instance(&self, vm: &str) {
         let delete_attempt = self.run_helper(
-            "delete",
-            &["--vm", vm],
+            LimaOp::Delete { vm },
             DELETE_VM_TIMEOUT,
             "sandbox-lima-helper delete (partial-clone cleanup)",
         );
@@ -1590,8 +1962,7 @@ impl LimaManager {
         info!(vm = %vm_name, op_uid = self.op_uid, "installing guest agent via helper");
 
         let output = self.run_helper(
-            "install-guest-agent",
-            &["--vm", vm_name],
+            LimaOp::InstallGuestAgent { vm: vm_name },
             INSTALL_TOTAL_TIMEOUT,
             "sandbox-lima-helper install-guest-agent",
         )?;
@@ -1809,20 +2180,15 @@ impl LimaManager {
             std::fs::set_permissions(&template_path, std::fs::Permissions::from_mode(0o644))?;
         }
         info!(path = %template_path.display(), "wrote base template");
-        let template_str = template_path.to_string_lossy().to_string();
 
         // 2. Create the VM via helper.
         info!("creating base VM");
         let output = self.run_helper(
-            "create",
-            &[
-                "--vm",
-                &self.base_vm_name,
-                "--yaml",
-                &template_str,
-                "--owner",
-                &self.owner_pool,
-            ],
+            LimaOp::Create {
+                vm: &self.base_vm_name,
+                yaml_path: &template_path,
+                owner: &self.owner_pool,
+            },
             BASE_CREATE_TIMEOUT,
             "sandbox-lima-helper create (base image)",
         )?;
@@ -1846,8 +2212,9 @@ impl LimaManager {
                 warn!(error = %e, "base image build failed, cleaning up partial VM");
                 // Best-effort cleanup — errors here are swallowed.
                 let _ = self.run_helper(
-                    "delete",
-                    &["--vm", &self.base_vm_name],
+                    LimaOp::Delete {
+                        vm: &self.base_vm_name,
+                    },
                     Duration::from_secs(60),
                     "sandbox-lima-helper delete (base image cleanup)",
                 );
@@ -1871,25 +2238,19 @@ impl LimaManager {
         // 3. Start the VM with QEMU wrapper for hardening.
         info!("starting base VM (this may take several minutes for cloud-init)");
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
-        let qemu_wrapper_str = qemu_wrapper.to_string_lossy().to_string();
-        let timeout_s = BASE_START_TIMEOUT.as_secs().to_string();
 
         let output = self.run_helper(
-            "start",
-            &[
-                "--vm",
-                &self.base_vm_name,
-                "--qemu-wrapper",
-                &qemu_wrapper_str,
-                "--hardened",
-                "1",
-                "--memory-mb",
-                "4096",
-                "--cpus",
-                "4",
-                "--start-timeout-s",
-                &timeout_s,
-            ],
+            LimaOp::Start {
+                vm: &self.base_vm_name,
+                qemu_wrapper: &qemu_wrapper,
+                hardened: true,
+                memory_mb: 4096,
+                cpus: 4,
+                // Cast is safe: BASE_START_TIMEOUT is 600 s, well within u32.
+                start_timeout_s: BASE_START_TIMEOUT.as_secs() as u32,
+                bridge: None,
+                unrestricted_slirp_for_provisioning: false,
+            },
             // Host-side wall-clock kill: slightly longer than Lima's own
             // --timeout so Lima can report its own error message.
             BASE_START_TIMEOUT + Duration::from_secs(30),
@@ -1913,8 +2274,10 @@ impl LimaManager {
         // The warn! on fallback is the diagnostic signal.
         info!("stopping base VM");
         let graceful = self.run_helper(
-            "stop",
-            &["--vm", &self.base_vm_name],
+            LimaOp::Stop {
+                vm: &self.base_vm_name,
+                force: false,
+            },
             BASE_STOP_GRACEFUL_BUDGET,
             "sandbox-lima-helper stop (base image)",
         );
@@ -1932,8 +2295,10 @@ impl LimaManager {
                     BASE_STOP_GRACEFUL_BUDGET.as_secs(),
                 );
                 let force = self.run_helper(
-                    "stop",
-                    &["--vm", &self.base_vm_name, "--force"],
+                    LimaOp::Stop {
+                        vm: &self.base_vm_name,
+                        force: true,
+                    },
                     BASE_STOP_FORCE_BUDGET,
                     "sandbox-lima-helper stop --force (base image fallback)",
                 )?;
@@ -1974,8 +2339,9 @@ impl LimaManager {
 
         // Delete the existing VM (ignore errors if it doesn't exist).
         let output = self.run_helper(
-            "delete",
-            &["--vm", &self.base_vm_name],
+            LimaOp::Delete {
+                vm: &self.base_vm_name,
+            },
             DELETE_VM_TIMEOUT,
             "sandbox-lima-helper delete (base image)",
         );
@@ -2017,9 +2383,7 @@ impl LimaManager {
         disk_gb: u32,
     ) -> Result<(), SandboxError> {
         let target = vm_name(&session_id);
-        let cpus_s = cpus.to_string();
-        let memory_gib_s = mib_to_ceil_gib(memory_mb).to_string();
-        let disk_s = disk_gb.to_string();
+        let memory_gib = mib_to_ceil_gib(memory_mb);
 
         info!(
             session_id = %session_id,
@@ -2033,21 +2397,14 @@ impl LimaManager {
 
         let output = self
             .run_helper(
-                "clone",
-                &[
-                    "--base",
-                    &self.base_vm_name,
-                    "--vm",
-                    &target,
-                    "--cpus",
-                    &cpus_s,
-                    "--memory",
-                    &memory_gib_s,
-                    "--disk",
-                    &disk_s,
-                    "--owner",
-                    &self.owner_pool,
-                ],
+                LimaOp::Clone {
+                    base: &self.base_vm_name,
+                    vm: &target,
+                    cpus,
+                    memory_gib,
+                    disk_gb,
+                    owner: &self.owner_pool,
+                },
                 CLONE_VM_TIMEOUT,
                 "sandbox-lima-helper clone",
             )
@@ -2647,8 +3004,7 @@ provision:
     /// key file directly.
     pub fn read_user_key(&self) -> Result<String, SandboxError> {
         let output = self.run_helper(
-            "read-user-key",
-            &[],
+            LimaOp::ReadUserKey,
             Duration::from_secs(10),
             "sandbox-lima-helper read-user-key",
         )?;
@@ -2680,8 +3036,7 @@ provision:
     /// with `LIMA_HOME` set to the per-operator path.
     fn list_vms_raw(&self) -> Result<Vec<LimactlListEntry>, SandboxError> {
         let output = self.run_helper(
-            "list-json",
-            &[],
+            LimaOp::ListJson,
             LIST_VMS_TIMEOUT,
             "sandbox-lima-helper list-json",
         )?;
@@ -4857,7 +5212,9 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
-            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            Arc::new(SetuidHelperExecutor::new(PathBuf::from(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+            ))),
             "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
@@ -4878,7 +5235,9 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
-            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            Arc::new(SetuidHelperExecutor::new(PathBuf::from(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+            ))),
             "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
@@ -4901,7 +5260,9 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let registry = LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
-            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            Arc::new(SetuidHelperExecutor::new(PathBuf::from(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+            ))),
             "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
@@ -4947,7 +5308,9 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
-            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            Arc::new(SetuidHelperExecutor::new(PathBuf::from(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+            ))),
             "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
@@ -5000,7 +5363,9 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
             "sandbox-base".to_string(),
-            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            Arc::new(SetuidHelperExecutor::new(PathBuf::from(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+            ))),
             "test-pool".to_string(),
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)

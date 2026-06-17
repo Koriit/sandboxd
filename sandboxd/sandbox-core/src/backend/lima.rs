@@ -15,12 +15,9 @@
 //! - [`LimaRuntime::stop`] / `delete` / `status` carry `operator_uid`
 //!   so the right per-operator manager is selected from the registry.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::process::Command;
 use tracing::debug;
 
 use crate::backend::capabilities::{BackendKind, Capabilities};
@@ -29,7 +26,7 @@ use crate::backend::{
     AsyncReadWrite, GuestTransport, RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime,
 };
 use crate::error::SandboxError;
-use crate::lima::{self, LimaManager, LimaManagerRegistry, VmStatus};
+use crate::lima::{self, LimaManager, LimaManagerRegistry, LimaOp, VmStatus};
 use crate::session::{SessionConfig, SessionId};
 
 // ---------------------------------------------------------------------------
@@ -389,25 +386,19 @@ fn refresh_lima_guest_binary_via_helper(
     // real per-session config is applied on the subsequent `runtime.start`
     // by the orchestrator; the refresh boot is just to reach Running.
     let qemu_wrapper = manager.ensure_qemu_wrapper_for_test()?;
-    let qemu_wrapper_str = qemu_wrapper.to_string_lossy().to_string();
 
     tracing::debug!(vm = %vm_name, "refresh_guest_binary: ensuring VM running via helper");
     let output = manager.run_helper(
-        "start",
-        &[
-            "--vm",
-            vm_name,
-            "--qemu-wrapper",
-            &qemu_wrapper_str,
-            "--hardened",
-            "1",
-            "--memory-mb",
-            "4096",
-            "--cpus",
-            "4",
-            "--start-timeout-s",
-            "300",
-        ],
+        LimaOp::Start {
+            vm: vm_name,
+            qemu_wrapper: &qemu_wrapper,
+            hardened: true,
+            memory_mb: 4096,
+            cpus: 4,
+            start_timeout_s: 300,
+            bridge: None,
+            unrestricted_slirp_for_provisioning: false,
+        },
         REFRESH_START_TIMEOUT,
         "sandbox-lima-helper start (guest refresh)",
     )?;
@@ -420,8 +411,7 @@ fn refresh_lima_guest_binary_via_helper(
 
     tracing::debug!(vm = %vm_name, "refresh_guest_binary: running install-guest-agent via helper");
     let output = manager.run_helper(
-        "install-guest-agent",
-        &["--vm", vm_name],
+        LimaOp::InstallGuestAgent { vm: vm_name },
         REFRESH_INSTALL_TIMEOUT,
         "sandbox-lima-helper install-guest-agent (guest refresh)",
     )?;
@@ -434,8 +424,10 @@ fn refresh_lima_guest_binary_via_helper(
 
     tracing::debug!(vm = %vm_name, "refresh_guest_binary: stopping VM via helper");
     let output = manager.run_helper(
-        "stop",
-        &["--vm", vm_name],
+        LimaOp::Stop {
+            vm: vm_name,
+            force: false,
+        },
         REFRESH_STOP_TIMEOUT,
         "sandbox-lima-helper stop (guest refresh)",
     )?;
@@ -492,9 +484,10 @@ pub struct LimaTransport {
 #[async_trait]
 impl GuestTransport for LimaTransport {
     async fn connect(&self) -> Result<Box<dyn AsyncReadWrite + Send + Unpin>, SandboxError> {
-        // Async-I/O carve-out: spawn via tokio::process::Command (NOT
-        // spawn_blocking). See LimaTransport doc-comment and CLAUDE.md
-        // "Async-I/O carve-out for long-lived child processes."
+        // Async-I/O carve-out: the executor's guest_socat spawns via
+        // tokio::process::Command (NOT spawn_blocking). See LimaTransport
+        // doc-comment and CLAUDE.md "Async-I/O carve-out for long-lived
+        // child processes."
         let manager = match &self.manager {
             Ok(m) => m,
             Err(e) => {
@@ -510,83 +503,10 @@ impl GuestTransport for LimaTransport {
             "opening sandbox-lima-helper guest-socat transport"
         );
 
-        let mut command = Command::new(manager.helper_path());
-        command
-            .args([
-                "guest-socat",
-                "--op-uid",
-                &self.operator_uid.to_string(),
-                "--vm",
-                &self.vm_name,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = command.spawn().map_err(|e| {
-            SandboxError::Lima(format!(
-                "failed to spawn sandbox-lima-helper guest-socat for {}: {e}",
-                self.vm_name
-            ))
-        })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdin of limactl shell socat".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdout of limactl shell socat".into())
-        })?;
-
-        Ok(Box::new(LimaTransportStream {
-            stdin,
-            stdout,
-            _child: child,
-        }))
-    }
-}
-
-/// Bidirectional duplex stream backed by a `limactl shell ... socat`
-/// child. Owns the child handle so dropping the stream
-/// (`kill_on_drop(true)`) tears the process down — no zombie left
-/// behind even on caller-side panic.
-struct LimaTransportStream {
-    stdin: tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
-    _child: tokio::process::Child,
-}
-
-impl AsyncRead for LimaTransportStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdout).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for LimaTransportStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.stdin).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdin).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdin).poll_shutdown(cx)
+        manager
+            .executor()
+            .guest_socat(self.operator_uid, &self.vm_name)
+            .await
     }
 }
 
@@ -607,9 +527,13 @@ mod tests {
     /// `LimaManager::with_helper_path` (gated `#[cfg(test)]` in
     /// `lima.rs`) so no helper binary must be present on the host.
     fn test_runtime() -> Arc<LimaRuntime> {
+        let executor: Arc<dyn crate::lima::LimaExecutor> =
+            Arc::new(crate::lima::SetuidHelperExecutor::new(PathBuf::from(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+            )));
         let registry = Arc::new(crate::lima::LimaManagerRegistry::new(
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
-            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            executor,
             "test-pool".to_string(),
         ));
         LimaRuntime::new(registry)
@@ -757,10 +681,13 @@ mod tests {
     /// `LimaManager` instances; this pins the constructor wiring.
     #[test]
     fn registry_round_trips_through_constructor() {
-        let helper = PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper");
+        let executor: Arc<dyn crate::lima::LimaExecutor> =
+            Arc::new(crate::lima::SetuidHelperExecutor::new(PathBuf::from(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper",
+            )));
         let registry = Arc::new(crate::lima::LimaManagerRegistry::new(
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
-            helper.clone(),
+            executor,
             "test-pool".to_string(),
         ));
         let rt = LimaRuntime::new(Arc::clone(&registry));
