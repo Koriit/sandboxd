@@ -1,0 +1,42 @@
+[package]
+name = "sandbox-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandbox-agent"
+path = "src/main.rs"
+
+[features]
+# `test-env-override` — opts the agent into honouring environment-variable
+# seams used by unit and integration tests:
+#
+#   SANDBOX_AGENT_TEST_SANDBOX_GROUP — override the `_sandbox` group name
+#     so tests can drive the self-gate membership check against a synthetic
+#     group without requiring the real `_sandbox` group to exist.
+#
+#   SANDBOX_AGENT_TEST_BROKER_SOCKET — override the broker socket path so
+#     tests can point the agent at a temp-dir socket without needing
+#     /var/run or root privileges.
+#
+# Default (production) builds ignore all env vars. A non-privileged binary
+# must not be redirectable via process environment variables.
+test-env-override = []
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+
+# libc is used only in the macOS implementation; the Linux stub main
+# has no libc calls. Gated here so the macOS-only dep doesn't widen
+# the Linux TCB unnecessarily (mirrors the route-helper / nft-logger
+# gating pattern).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }

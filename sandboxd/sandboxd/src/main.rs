@@ -49,6 +49,11 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+// The agent broker channel is macOS-only. On Linux the daemon reaches
+// operators via the `sandbox-lima-helper` setcap binary instead.
+#[cfg(target_os = "macos")]
+mod broker;
+
 // ---------------------------------------------------------------------------
 // CLI args
 // ---------------------------------------------------------------------------

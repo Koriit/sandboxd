@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "sandboxd",
+    "sandbox-agent",
     "sandbox-cli",
     "sandbox-core",
     "sandbox-event-emitter",

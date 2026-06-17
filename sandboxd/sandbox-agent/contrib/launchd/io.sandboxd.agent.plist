@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    io.sandboxd.agent — per-operator LaunchAgent for sandboxd.
+
+    launchd starts one instance of this agent per enrolled operator, in that
+    operator's GUI login session, as the operator's own uid.
+
+    LimitLoadToSessionType: Aqua is mandatory.  A LaunchAgent in
+    /Library/LaunchAgents without this key is loaded into every session type,
+    including LoginWindow (which runs as root before any user has logged in)
+    and Background/Standard.  That would start the agent as root with no Aqua
+    session, which (a) is rejected by the daemon's uid-0 gate on the broker
+    socket, and (b) prevents TCC consent prompts from appearing.  Setting Aqua
+    ensures the agent only loads in a real user GUI session.
+
+    KeepAlive is intentionally absent (equivalent to KeepAlive = false).  The
+    agent self-gates on _sandbox group membership at startup and exits with
+    code 0 for non-enrolled users.  Without KeepAlive, launchd does not
+    respawn on a successful exit, so unenrolled users do not see a throttled
+    respawn loop in Console.app.  If the agent crashes (non-zero exit) launchd
+    will restart it, which is the correct behaviour for enrolled operators
+    whose agent exited unexpectedly.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.sandboxd.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/sandboxd/sandbox-agent</string>
+    </array>
+
+    <!--
+        Aqua scoping: load only in a real GUI login session.
+        This is the primary defence against a LoginWindow (root) load.
+        The agent's own _sandbox membership self-gate is defence-in-depth.
+    -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <!--
+        Restart on crash (non-zero exit), but not on clean exit (code 0).
+        This matches the self-gate contract: a non-enrolled user exits 0 and
+        is never respawned; an enrolled user's agent that crashes is restarted.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!--
+        5-second minimum between restarts, matching the daemon's
+        ThrottleInterval convention.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!--
+        Run at login so the agent checks in with the daemon as soon as
+        the operator's session starts.
+    -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+        Standard output and error go to the system log.  The agent uses
+        structured tracing (RUST_LOG) for its own log lines; these paths
+        capture pre-tracing-init output and unexpected panics only.
+    -->
+    <key>StandardOutPath</key>
+    <string>/var/log/sandbox/agent.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/sandbox/agent.stderr.log</string>
+</dict>
+</plist>

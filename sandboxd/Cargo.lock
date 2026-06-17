@@ -1730,6 +1730,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-agent"
+version = "0.1.10"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sandbox-cli"
 version = "0.1.10"
 dependencies = [
