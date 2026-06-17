@@ -285,60 +285,6 @@ pub fn validate_session_name(name: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Copy path pair
-// ---------------------------------------------------------------------------
-
-/// Extract the VM prefix from a `<vm>:<path>` string.
-/// Returns `None` if no `:` is present (host-side path),
-/// `Some(Ok(vm_name))` if exactly one `:` with a non-empty vm prefix,
-/// `Some(Err(reason))` on malformed syntax.
-fn extract_vm_prefix(s: &str) -> Option<Result<&str, String>> {
-    let colon_pos = s.find(':')?;
-    if s[colon_pos + 1..].contains(':') {
-        return Some(Err(format!("more than one ':' in {s:?}")));
-    }
-    let vm_part = &s[..colon_pos];
-    if vm_part.is_empty() {
-        return Some(Err(format!("empty vm name in {s:?}")));
-    }
-    Some(Ok(vm_part))
-}
-
-/// Validate a `copy` src/dst pair.
-///
-/// Rules mirror `sandbox-lima-helper::imp::validate_copy_paths`.
-pub fn validate_copy_paths(src: &str, dst: &str) -> Result<(), String> {
-    let src_vm = extract_vm_prefix(src);
-    let dst_vm = extract_vm_prefix(dst);
-
-    if src_vm.is_none() && dst_vm.is_none() {
-        return Err("copy requires a <vm>: prefix on at least one side".to_string());
-    }
-    // Validate the vm portions.
-    if let Some(Ok(vm)) = src_vm.as_ref() {
-        validate_vm_name(vm)?;
-    }
-    if let Some(Ok(vm)) = dst_vm.as_ref() {
-        validate_vm_name(vm)?;
-    }
-    // Propagate malformed-prefix errors.
-    if let Some(Err(e)) = src_vm {
-        return Err(format!("malformed <vm>: prefix in src: {e}"));
-    }
-    if let Some(Err(e)) = dst_vm {
-        return Err(format!("malformed <vm>: prefix in dst: {e}"));
-    }
-    // Validate host-side portions.
-    if extract_vm_prefix(src).is_none() {
-        validate_path_arg("src (host side)", src)?;
-    }
-    if extract_vm_prefix(dst).is_none() {
-        validate_path_arg("dst (host side)", dst)?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Hardened flag
 // ---------------------------------------------------------------------------
 
@@ -520,6 +466,18 @@ pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<()
         ));
     }
 
+    // Validate the socket path value itself. A buggy daemon could render an
+    // arbitrary socket path, connecting the VM to a non-sandboxd socket and
+    // bypassing egress enforcement. Requirements:
+    //   - absolute (no relative paths)
+    //   - no `..` traversal components
+    //   - confined to the `/var/run/sandbox/vmnet/` namespace
+    let socket_val = nic
+        .get("socket")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "lima.yaml 'networks[0].socket' must be a string value".to_string())?;
+    validate_socket_path(socket_val)?;
+
     // Belt-and-suspenders: the expected VM name should appear somewhere in the
     // raw YAML text. This is a coarse sanity check — the `vm` field in the
     // BrokerOp is the authoritative name used for limactl's `--name` flag, but
@@ -527,6 +485,60 @@ pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<()
     if !expected_vm.is_empty() && !lima_yaml.contains(expected_vm) {
         return Err(format!(
             "lima.yaml does not appear to reference the expected VM name {expected_vm:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Socket-path validation (used inside validate_lima_yaml_shape)
+// ---------------------------------------------------------------------------
+
+/// Validate a `socket:` path extracted from a rendered `lima.yaml`.
+///
+/// Enforces three properties that together prevent a buggy daemon from routing
+/// a VM to an arbitrary (non-sandboxd) socket_vmnet instance and bypassing
+/// egress enforcement:
+///
+/// 1. Absolute path — no relative segments.
+/// 2. No `..` traversal — `path::Path::components` must be free of
+///    `Component::ParentDir`.
+/// 3. Confined to `/var/run/sandbox/vmnet/` — the slot socket namespace. Only
+///    sockets within this prefix are daemon-managed slot sockets; anything
+///    outside it is unrecognized or attacker-controlled.
+///
+/// Rejection on any violation: the agent never clamps or rewrites the value,
+/// it rejects outright.
+pub fn validate_socket_path(path: &str) -> Result<(), String> {
+    use std::path::{Component, Path};
+
+    if path.is_empty() {
+        return Err("socket path is empty".to_string());
+    }
+
+    let p = Path::new(path);
+
+    if !p.is_absolute() {
+        return Err(format!(
+            "socket path {path:?} is not absolute; only absolute paths are permitted"
+        ));
+    }
+
+    for component in p.components() {
+        if component == Component::ParentDir {
+            return Err(format!(
+                "socket path {path:?} contains '..' traversal; traversal is not permitted"
+            ));
+        }
+    }
+
+    // Require the path to be inside the vmnet slot socket namespace.
+    const VMNET_PREFIX: &str = "/var/run/sandbox/vmnet/";
+    if !path.starts_with(VMNET_PREFIX) {
+        return Err(format!(
+            "socket path {path:?} is not within the expected prefix {VMNET_PREFIX:?}; \
+             only sandboxd-managed slot sockets are permitted"
         ));
     }
 
@@ -888,60 +900,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Copy path pairs — reject foreign paths and traversal
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn copy_paths_valid_vm_to_host() {
-        assert!(validate_copy_paths("sandbox-abc:/tmp/file", "/host/path").is_ok());
-    }
-
-    #[test]
-    fn copy_paths_valid_host_to_vm() {
-        assert!(validate_copy_paths("/host/src", "sandbox-abc:/tmp/dst").is_ok());
-    }
-
-    #[test]
-    fn copy_paths_valid_vm_to_vm() {
-        assert!(validate_copy_paths("sandbox-abc:/tmp/a", "sandbox-xyz:/tmp/b").is_ok());
-    }
-
-    #[test]
-    fn copy_paths_rejects_both_host_side() {
-        // Both sides host-only: no vm prefix on either — must be rejected.
-        let result = validate_copy_paths("/host/src", "/host/dst");
-        assert!(
-            result.is_err(),
-            "copy with no VM prefix on either side must be rejected"
-        );
-    }
-
-    #[test]
-    fn copy_paths_rejects_traversal_in_host_side() {
-        // Host-side path with `..` must be rejected.
-        let result = validate_copy_paths("sandbox-abc:/tmp/file", "/host/../etc/passwd");
-        assert!(
-            result.is_err(),
-            "dotdot traversal in host-side copy path must be rejected"
-        );
-    }
-
-    #[test]
-    fn copy_paths_rejects_bad_vm_name() {
-        // VM name with a leading dash would be parsed as a flag.
-        let result = validate_copy_paths("-bad:path", "/host/path");
-        assert!(
-            result.is_err(),
-            "leading-dash VM name in copy must be rejected"
-        );
-    }
-
-    #[test]
-    fn copy_paths_rejects_relative_host_path() {
-        assert!(validate_copy_paths("sandbox-abc:/tmp/file", "relative/path").is_err());
-    }
-
-    // -----------------------------------------------------------------------
     // Lima YAML shape validation
     // -----------------------------------------------------------------------
 
@@ -1209,6 +1167,97 @@ networks:
         assert!(
             result.is_err(),
             "foreign uid must be rejected; agent must only act for its own uid"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_socket_path — socket path confinement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn socket_path_valid_slot() {
+        assert!(
+            validate_socket_path("/var/run/sandbox/vmnet/slot-0.sock").is_ok(),
+            "a valid slot socket path must be accepted"
+        );
+    }
+
+    #[test]
+    fn socket_path_valid_slot_numbered() {
+        assert!(
+            validate_socket_path("/var/run/sandbox/vmnet/slot-7.sock").is_ok(),
+            "slot-7 socket path must be accepted"
+        );
+    }
+
+    #[test]
+    fn socket_path_rejects_relative() {
+        let result = validate_socket_path("var/run/sandbox/vmnet/slot-0.sock");
+        assert!(
+            result.is_err(),
+            "relative socket path must be rejected; only absolute paths are permitted"
+        );
+    }
+
+    #[test]
+    fn socket_path_rejects_traversal() {
+        let result = validate_socket_path("/var/run/sandbox/vmnet/../../../tmp/evil.sock");
+        assert!(
+            result.is_err(),
+            "socket path with '..' traversal must be rejected"
+        );
+    }
+
+    #[test]
+    fn socket_path_rejects_out_of_prefix() {
+        let result = validate_socket_path("/var/run/arbitrary/slot-0.sock");
+        assert!(
+            result.is_err(),
+            "socket path outside /var/run/sandbox/vmnet/ must be rejected"
+        );
+    }
+
+    #[test]
+    fn socket_path_rejects_empty() {
+        let result = validate_socket_path("");
+        assert!(result.is_err(), "empty socket path must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // B1: validate_lima_yaml_shape rejects non-vmnet socket paths
+    // -----------------------------------------------------------------------
+
+    /// A YAML with a socket path outside the vmnet prefix must be rejected.
+    /// This guards against a buggy daemon routing a VM to an arbitrary socket,
+    /// which would bypass egress enforcement.
+    #[test]
+    fn lima_yaml_rejects_out_of_prefix_socket_path() {
+        let yaml = "cpus: 2\nnetworks:\n  - socket: /arbitrary/socket.sock\n";
+        let result = validate_lima_yaml_shape(yaml, "");
+        assert!(
+            result.is_err(),
+            "socket path outside /var/run/sandbox/vmnet/ must be rejected by shape validation"
+        );
+    }
+
+    #[test]
+    fn lima_yaml_rejects_traversal_socket_path() {
+        let yaml =
+            "cpus: 2\nnetworks:\n  - socket: /var/run/sandbox/vmnet/../../../tmp/evil.sock\n";
+        let result = validate_lima_yaml_shape(yaml, "");
+        assert!(
+            result.is_err(),
+            "socket path with '..' traversal must be rejected"
+        );
+    }
+
+    #[test]
+    fn lima_yaml_rejects_relative_socket_path() {
+        let yaml = "cpus: 2\nnetworks:\n  - socket: relative/vmnet/slot-0.sock\n";
+        let result = validate_lima_yaml_shape(yaml, "");
+        assert!(
+            result.is_err(),
+            "relative socket path must be rejected by shape validation"
         );
     }
 }

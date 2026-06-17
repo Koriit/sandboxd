@@ -1299,6 +1299,8 @@ fn run_limactl_direct(
     timeout: std::time::Duration,
     label: &str,
 ) -> Result<std::process::Output, sandbox_core::error::SandboxError> {
+    use std::os::unix::process::CommandExt;
+
     use sandbox_core::error::SandboxError;
     use sandbox_core::lima::LimaOp;
     use sandbox_core::process::run_with_timeout;
@@ -1306,14 +1308,64 @@ fn run_limactl_direct(
     let lima_home = sandbox_core::lima::operator_lima_home(op_uid);
     let lima_home_str = lima_home.to_string_lossy().into_owned();
 
-    let mut cmd = std::process::Command::new("limactl");
-    // Set LIMA_HOME so limactl uses the operator's isolated tree.
-    cmd.env("LIMA_HOME", &lima_home_str);
+    // Resolve HOME for the daemon uid — limactl reads it for SSH key locations.
+    // Falls back to an empty string if resolution fails (limactl will use its
+    // own fallbacks).
+    let home_str = uid_to_username(op_uid)
+        .and_then(|username| {
+            // Resolve pw_dir via getpwnam_r (same uid, re-lookup for pw_dir).
+            let name_c = std::ffi::CString::new(username).ok()?;
+            let bufsize = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+            let bufsize = if bufsize <= 0 { 1024 } else { bufsize as usize };
+            let mut buf = vec![0i8; bufsize];
+            let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getpwnam_r(
+                    name_c.as_ptr(),
+                    &mut pwd,
+                    buf.as_mut_ptr(),
+                    bufsize,
+                    &mut result,
+                )
+            };
+            if rc != 0 || result.is_null() {
+                return None;
+            }
+            let dir_ptr = unsafe { (*result).pw_dir };
+            if dir_ptr.is_null() {
+                return None;
+            }
+            unsafe { std::ffi::CStr::from_ptr(dir_ptr) }
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
 
-    // Set PATH with Homebrew prefixes (same as the agent).
+    let mut cmd = std::process::Command::new("limactl");
+
+    // Clear the environment and set only the minimal required vars, mirroring
+    // the agent's `run_limactl` pattern. This prevents leaked env vars from
+    // the daemon's process environment from influencing limactl's behaviour.
     let current_path = std::env::var("PATH").unwrap_or_default();
     let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
-    cmd.env("PATH", &path_value);
+    cmd.env_clear()
+        .env("LIMA_HOME", &lima_home_str)
+        .env("PATH", &path_value)
+        .env("HOME", &home_str)
+        .env("TERM", "dumb");
+
+    // SAFETY: libc::umask is async-signal-safe on macOS and safe to call in a
+    // pre_exec hook. We mirror the agent's behaviour so SSH key files created
+    // by limactl land at 0600, not a more permissive mode derived from the
+    // daemon's current umask.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
 
     match op {
         LimaOp::Create { vm, yaml_path, .. } => {

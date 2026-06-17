@@ -242,12 +242,6 @@ pub enum BrokerOp {
     },
     /// Read `{lima_home}/{vm}/sandboxd-owner` and return its contents.
     ReadOwnerMarker { op_uid: u32, vm: String },
-    /// Copy a file between host and VM using `limactl copy`.
-    Copy {
-        op_uid: u32,
-        src: String,
-        dst: String,
-    },
     /// Open a long-lived bidirectional stream to the in-VM guest agent.
     ///
     /// After the agent sends `BrokerResult::StreamOpen`, the stream transitions
@@ -297,7 +291,6 @@ impl BrokerOp {
             | BrokerOp::ReadUserKey { op_uid }
             | BrokerOp::RunRsync { op_uid, .. }
             | BrokerOp::ReadOwnerMarker { op_uid, .. }
-            | BrokerOp::Copy { op_uid, .. }
             | BrokerOp::GuestSocat { op_uid, .. }
             | BrokerOp::RestrictOnVerify { op_uid, .. } => *op_uid,
         }

@@ -252,11 +252,6 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
             .await
         }
         BrokerOp::ReadOwnerMarker { op_uid: _, vm } => handle_read_owner_marker(ctx, vm).await,
-        BrokerOp::Copy {
-            op_uid: _,
-            src,
-            dst,
-        } => handle_copy(ctx, src, dst).await,
         BrokerOp::GuestSocat { .. } => {
             // GuestSocat must be dispatched via `handle_guest_socat`, not here.
             BrokerResult::Rejected {
@@ -416,8 +411,16 @@ async fn handle_create(
     if let Err(reason) = validation::validate_cidr_owner("owner", &owner) {
         return BrokerResult::Rejected { reason };
     }
-    if let Err(reason) = validation::validate_qemu_wrapper(&qemu_wrapper) {
-        return BrokerResult::Rejected { reason };
+    // The qemu_wrapper field is empty for Create: the daemon embeds the wrapper
+    // reference inside the rendered lima.yaml, which is shape-validated below.
+    // The wrapper is a Start-time concern (QEMU_SYSTEM_AARCH64 env var); for
+    // Create, limactl only provisions the instance directory — it does not boot
+    // a QEMU process. Skipping validation when empty avoids rejecting every
+    // operator session-create where no wrapper path is separately supplied.
+    if !qemu_wrapper.is_empty() {
+        if let Err(reason) = validation::validate_qemu_wrapper(&qemu_wrapper) {
+            return BrokerResult::Rejected { reason };
+        }
     }
     if let Err(reason) = validation::validate_lima_yaml_shape(&lima_yaml, &vm) {
         return BrokerResult::Rejected { reason };
@@ -933,14 +936,6 @@ async fn handle_read_owner_marker(ctx: &RunContext, vm: String) -> BrokerResult 
     }
 }
 
-async fn handle_copy(ctx: &RunContext, src: String, dst: String) -> BrokerResult {
-    if let Err(reason) = validation::validate_copy_paths(&src, &dst) {
-        return BrokerResult::Rejected { reason };
-    }
-    // Hardcoded argv: `limactl copy <src> <dst>`.
-    run_limactl(ctx, &["copy", &src, &dst], &[]).await
-}
-
 // ---------------------------------------------------------------------------
 // RestrictOnVerify handler
 // ---------------------------------------------------------------------------
@@ -1020,6 +1015,7 @@ pub async fn handle_guest_socat<S>(
     ctx: &RunContext,
     vm: String,
     op_uid: u32,
+    request_id: u64,
     mut stream: S,
 ) -> std::io::Result<()>
 where
@@ -1030,7 +1026,7 @@ where
     // Own-uid gate (belt-and-suspenders).
     if op_uid != ctx.own_uid {
         let response = BrokerResponse {
-            request_id: 0,
+            request_id,
             result: BrokerResult::Rejected {
                 reason: format!("GuestSocat: op_uid {op_uid} != agent uid {}", ctx.own_uid),
             },
@@ -1044,7 +1040,7 @@ where
     // VM name validation.
     if let Err(reason) = validation::validate_vm_name(&vm) {
         let response = BrokerResponse {
-            request_id: 0,
+            request_id,
             result: BrokerResult::Rejected { reason },
         };
         let msg = serde_json::to_string(&response).unwrap_or_default();
@@ -1058,7 +1054,7 @@ where
         Some(p) => p,
         None => {
             let response = BrokerResponse {
-                request_id: 0,
+                request_id,
                 result: BrokerResult::Rejected {
                     reason: "limactl not found in PATH".to_string(),
                 },
@@ -1090,11 +1086,10 @@ where
     let child_stdout = child.stdout.take().unwrap();
 
     // Send StreamOpen to the daemon before beginning raw byte-pump.
-    // The request_id is unknown here (the caller holds it); we use 0 as a
-    // sentinel. The daemon correlates by framing order, not by id, for the
-    // streaming op.
+    // Echo the caller's request_id so the daemon's request_id validation
+    // can verify the response matches the outstanding request.
     let response = BrokerResponse {
-        request_id: 0,
+        request_id,
         result: BrokerResult::StreamOpen,
     };
     let open_msg = serde_json::to_string(&response).unwrap_or_default();
@@ -1354,6 +1349,56 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // B1 fix: Create accepts an empty qemu_wrapper (it is a Start concern)
+    // -----------------------------------------------------------------------
+
+    /// Verify that a Create op with an empty qemu_wrapper is accepted.
+    ///
+    /// This was the B1 blocker: `handle_create` previously called
+    /// `validate_qemu_wrapper("")` unconditionally, which rejected every
+    /// brokered Create because `lima_op_to_broker_op` sends an empty wrapper
+    /// string. The wrapper is a Start-time concern; for Create, limactl only
+    /// provisions the instance directory — it does not boot a QEMU process.
+    ///
+    /// The test exercises Create dispatch up to the point where `limactl create`
+    /// would be invoked; it cannot actually run limactl, so it expects either
+    /// Ok (limactl succeeded) or Failed (limactl not found / not runnable) —
+    /// NOT Rejected (a validation error). A Rejected result means the validation
+    /// pipeline erroneously rejected the request before limactl was invoked.
+    #[tokio::test]
+    async fn dispatch_create_accepts_empty_qemu_wrapper() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        // Minimal YAML that passes validate_lima_yaml_shape. The VM name must
+        // appear somewhere in the YAML text for the belt-and-suspenders check.
+        let vm_name = "test-empty-wrapper";
+        let lima_yaml = format!(
+            "# vm: {vm_name}\ncpus: 2\nmemory: \"4GiB\"\ndisk: \"20GiB\"\n\
+             networks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n"
+        );
+        let op = BrokerOp::Create {
+            op_uid: own_uid,
+            vm: vm_name.to_string(),
+            lima_yaml,
+            owner: "10.1.0.0/29".to_string(),
+            qemu_wrapper: String::new(), // empty — as sent by lima_op_to_broker_op
+        };
+        let result = dispatch_op(&ctx, op).await;
+        // The request must NOT be Rejected due to qemu_wrapper validation. Any
+        // Rejected result containing "qemu_wrapper" means the empty-wrapper fix
+        // did not take effect. Other Rejected reasons (e.g. file write failure in
+        // the test environment where /var/lib/sandboxd does not exist) are NOT a
+        // validation rejection — they are expected I/O failures and are permitted.
+        if let BrokerResult::Rejected { ref reason } = result {
+            assert!(
+                !reason.contains("qemu_wrapper"),
+                "Create with empty qemu_wrapper must not be rejected by qemu_wrapper validation; \
+                 got Rejected {{ reason: {reason:?} }}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // dispatch_op — qemu-wrapper missing/mismatched
     // -----------------------------------------------------------------------
 
@@ -1546,7 +1591,7 @@ mod tests {
             lima_home: ctx.lima_home.clone(),
         };
         let handle = tokio::spawn(async move {
-            let _ = handle_guest_socat(&ctx_clone, vm, op_uid, server).await;
+            let _ = handle_guest_socat(&ctx_clone, vm, op_uid, 1, server).await;
         });
 
         // Read the first line from the client end — must be a valid JSON
@@ -1581,41 +1626,5 @@ mod tests {
         );
 
         handle.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // Copy path validation at dispatch
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn dispatch_rejects_copy_with_no_vm_prefix() {
-        let own_uid = unsafe { libc::getuid() };
-        let ctx = ctx(own_uid);
-        let op = BrokerOp::Copy {
-            op_uid: own_uid,
-            src: "/host/src".to_string(),
-            dst: "/host/dst".to_string(),
-        };
-        let result = dispatch_op(&ctx, op).await;
-        assert!(
-            matches!(result, BrokerResult::Rejected { .. }),
-            "copy with no VM prefix on either side must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_rejects_copy_with_traversal_in_host_path() {
-        let own_uid = unsafe { libc::getuid() };
-        let ctx = ctx(own_uid);
-        let op = BrokerOp::Copy {
-            op_uid: own_uid,
-            src: "sandbox-abc:/tmp/file".to_string(),
-            dst: "/host/../etc/passwd".to_string(),
-        };
-        let result = dispatch_op(&ctx, op).await;
-        assert!(
-            matches!(result, BrokerResult::Rejected { .. }),
-            "copy with traversal in host path must be rejected"
-        );
     }
 }

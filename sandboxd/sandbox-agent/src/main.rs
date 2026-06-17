@@ -536,7 +536,7 @@ mod imp {
 
                         // handle_guest_socat writes StreamOpen (or Rejected) and
                         // then pumps raw bytes. The connection is consumed.
-                        let _ = handler::handle_guest_socat(run_ctx, vm, op_uid, stream).await;
+                        let _ = handler::handle_guest_socat(run_ctx, vm, op_uid, request_id, stream).await;
                         // After GuestSocat ends, the connection is done.
                         return;
                     }
