@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -310,12 +310,67 @@ pub const NFT_POLICY_ALLOW_UDP_SET: &str = "policy_allow_udp";
 /// nftables rules are injected into the container via `docker exec`. The
 /// container is granted `CAP_NET_ADMIN` and includes the `nft` binary so it
 /// can manage its own nftables rules without requiring host-level privileges.
-pub struct GatewayManager;
+///
+/// ## Docker socket parameterization
+///
+/// On Linux, all `docker` invocations target the host Docker daemon (default
+/// socket, `docker_socket: None`). On macOS, the gateway containers run inside
+/// the `sandboxd-gateway` Lima VM; all `docker` commands — including
+/// `docker exec` for nft injection — must be directed to the forwarded socket
+/// via `-H unix://<path>`. Set `docker_socket: Some(path)` via
+/// [`Self::with_gateway_socket`] for macOS session managers.
+pub struct GatewayManager {
+    /// On Linux: `None` (use host Docker socket, no `-H` flag).
+    /// On macOS: `Some(path)` to the gateway Lima instance's forwarded
+    /// Docker socket. Injected as `-H unix://<path>` on every docker command.
+    ///
+    /// Linux behavior is byte-for-byte identical when this is `None` —
+    /// no `-H` flag is ever prepended.
+    docker_socket: Option<PathBuf>,
+}
 
 impl GatewayManager {
-    /// Create a new `GatewayManager`.
+    /// Create a new `GatewayManager` targeting the host Docker socket.
+    ///
+    /// This is the production constructor on Linux (and macOS host Docker,
+    /// if applicable). All docker commands go to the default Docker socket —
+    /// no `-H` flag is injected.
     pub fn new() -> Self {
-        Self
+        Self {
+            docker_socket: None,
+        }
+    }
+
+    /// Create a `GatewayManager` that routes all docker commands through the
+    /// specified forwarded socket path.
+    ///
+    /// On macOS, gateway containers run inside the `sandboxd-gateway` Lima VM.
+    /// Every docker command (including `docker exec` for nft injection) must be
+    /// directed to the forwarded socket via `-H unix://<path>`. This constructor
+    /// wires that socket into every docker call the manager makes.
+    ///
+    /// Linux builds can call this (the field is non-cfg), but production Linux
+    /// code always uses [`Self::new`] (no forwarding needed).
+    pub fn with_gateway_socket(socket: PathBuf) -> Self {
+        Self {
+            docker_socket: Some(socket),
+        }
+    }
+
+    /// Build a `docker` [`Command`] with the optional `-H unix://<socket>`
+    /// prefix pre-applied.
+    ///
+    /// All `docker` invocations in this impl go through this helper so
+    /// that macOS (forwarded socket) and Linux (host socket) behave
+    /// identically — the only difference is the presence or absence of
+    /// the `-H` flag. Linux callers see zero overhead: `None` means no
+    /// argument is prepended.
+    fn docker_cmd(&self) -> Command {
+        let mut cmd = Command::new("docker");
+        if let Some(sock) = &self.docker_socket {
+            cmd.args(["-H", &format!("unix://{}", sock.display())]);
+        }
+        cmd
     }
 
     // -- Container lifecycle ---------------------------------------------------
@@ -369,7 +424,7 @@ impl GatewayManager {
         // exits with an error only when the container does not exist, which
         // we intentionally ignore.
         let rm_output = run_with_timeout(
-            Command::new("docker").args(["rm", "--force", &container_name]),
+            self.docker_cmd().args(["rm", "--force", &container_name]),
             DOCKER_RM_TIMEOUT,
             "docker rm (pre-cleanup)",
         );
@@ -588,7 +643,7 @@ impl GatewayManager {
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = run_with_timeout(
-            Command::new("docker").args(&args_refs),
+            self.docker_cmd().args(&args_refs),
             DOCKER_RUN_TIMEOUT,
             "docker run (gateway)",
         )
@@ -724,7 +779,8 @@ impl GatewayManager {
 
         // Step 2: Stop the container.
         let output = run_with_timeout(
-            Command::new("docker").args(["stop", "--time", "10", &container_name]),
+            self.docker_cmd()
+                .args(["stop", "--time", "10", &container_name]),
             DOCKER_STOP_TIMEOUT,
             "docker stop (gateway)",
         )
@@ -747,7 +803,7 @@ impl GatewayManager {
 
         // Step 3: Remove the container.
         let output = run_with_timeout(
-            Command::new("docker").args(["rm", "--force", &container_name]),
+            self.docker_cmd().args(["rm", "--force", &container_name]),
             DOCKER_RM_TIMEOUT,
             "docker rm (gateway)",
         )
@@ -883,12 +939,8 @@ impl GatewayManager {
 
         // First check if the container is running.
         let output = run_with_timeout(
-            Command::new("docker").args([
-                "inspect",
-                "--format",
-                "{{.State.Running}}",
-                &container_name,
-            ]),
+            self.docker_cmd()
+                .args(["inspect", "--format", "{{.State.Running}}", &container_name]),
             DOCKER_INSPECT_TIMEOUT,
             "docker inspect (gateway status)",
         )
@@ -910,7 +962,8 @@ impl GatewayManager {
 
         // Run the healthcheck script.
         let output = run_with_timeout(
-            Command::new("docker").args(["exec", &container_name, "/healthcheck.sh"]),
+            self.docker_cmd()
+                .args(["exec", &container_name, "/healthcheck.sh"]),
             DOCKER_INSPECT_TIMEOUT,
             "docker exec (healthcheck)",
         )
@@ -968,7 +1021,8 @@ impl GatewayManager {
                    filter=^listener_manager\\.total_listeners_active$&\
                    format=text";
         let output = run_with_timeout(
-            Command::new("docker").args(["exec", &container_name, "curl", "-sf", url]),
+            self.docker_cmd()
+                .args(["exec", &container_name, "curl", "-sf", url]),
             DOCKER_INSPECT_TIMEOUT,
             "docker exec (envoy listener_active probe)",
         )
@@ -998,12 +1052,8 @@ impl GatewayManager {
         let container_name = container_name(session_id);
 
         let output = run_with_timeout(
-            Command::new("docker").args([
-                "inspect",
-                "--format",
-                "{{.State.Status}}",
-                &container_name,
-            ]),
+            self.docker_cmd()
+                .args(["inspect", "--format", "{{.State.Status}}", &container_name]),
             DOCKER_INSPECT_TIMEOUT,
             "docker inspect (container status)",
         );
@@ -1038,7 +1088,7 @@ impl GatewayManager {
         let container_name = container_name(session_id);
 
         let output = run_with_timeout(
-            Command::new("docker").args([
+            self.docker_cmd().args([
                 "inspect",
                 "--format",
                 "{{.State.Health.Status}}",
@@ -1077,7 +1127,7 @@ impl GatewayManager {
         args.extend(check_cmd);
 
         match run_with_timeout(
-            Command::new("docker").args(&args),
+            self.docker_cmd().args(&args),
             DOCKER_INSPECT_TIMEOUT,
             &format!("docker exec ({component} health)"),
         ) {
@@ -1189,7 +1239,7 @@ impl GatewayManager {
         let container_name = container_name(session_id);
 
         let output = run_with_timeout(
-            Command::new("docker").args([
+            self.docker_cmd().args([
                 "inspect",
                 "--format",
                 "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
@@ -1240,7 +1290,8 @@ impl GatewayManager {
             "injecting nftables ruleset via docker exec"
         );
 
-        let mut child = Command::new("docker")
+        let mut child = self
+            .docker_cmd()
             .args(["exec", "-i", &container, "nft", "-f", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1316,7 +1367,7 @@ impl GatewayManager {
     /// bridge IP rather than 127.0.0.1 (PREROUTING DNAT to loopback is
     /// dropped by the kernel as a martian), so its probe goes through
     /// `$(hostname -i)`.
-    fn wait_for_components(&self, session_id: &SessionId) -> Result<(), SandboxError> {
+    pub fn wait_for_components(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
         let deadline = Instant::now() + COMPONENT_READY_TIMEOUT;
 
@@ -1369,7 +1420,7 @@ impl GatewayManager {
             let mut args = vec!["exec", container_name];
             args.extend(check_cmd);
 
-            let output = Command::new("docker").args(&args).output().map_err(|e| {
+            let output = self.docker_cmd().args(&args).output().map_err(|e| {
                 SandboxError::Gateway(format!("failed to check {component_name} readiness: {e}"))
             })?;
 

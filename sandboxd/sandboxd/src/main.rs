@@ -1060,6 +1060,31 @@ struct AppState {
     /// shows the actually-resolved pool rather than expecting the
     /// operator to grep journald.
     users_conf_pool: sandbox_core::users_conf::SubnetEntry,
+    /// macOS only: socket_vmnet NIC slot pool. Tracks which pool slots
+    /// are in use by running Lima sessions and enforces the concurrent-
+    /// session cap. Constructed at startup from the `max_macos_sessions`
+    /// config value; restored from persisted `NetworkInfo` on daemon restart.
+    ///
+    /// Never accessed on Linux (the field is cfg-gated). The Lima create
+    /// handler calls `claim_lima_slot` before `limactl create` and
+    /// `release_lima_slot` on any failure path.
+    // Fields are constructed at startup but not yet consumed by request handlers
+    // (the macOS create/start/stop handlers are wired in the next session).
+    // `dead_code` is suppressed until that wiring is in place.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    vmnet_pool: Arc<sandbox_core::network::VmnetPool>,
+    /// macOS only: gateway Lima instance manager. Manages the
+    /// `sandboxd-gateway` Lima VM that hosts all per-session gateway
+    /// containers. After `ensure_ready` succeeds at startup, exposes
+    /// the NIC map and the forwarded Docker socket path.
+    ///
+    /// The manager is constructed once at startup (in `main()`) and
+    /// the same `Arc` is shared into every session create handler that
+    /// needs the forwarded socket path or the NIC map.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager>,
 }
 
 /// Look up the runtime for a given backend kind from the dispatch
@@ -3925,6 +3950,11 @@ fn session_network_info_for(
             gateway_ip: ni.gateway_ip,
             session_ip: ni.vm_ip,
             session_subnet_cidr: ni.subnet,
+            vmnet_slot: ni.vmnet_slot.map(|vs| sandbox_core::VmnetSlotDto {
+                index: vs.index,
+                daemon_label: vs.daemon_label,
+                socket_path: vs.socket_path,
+            }),
         }),
         Ok(None) => None,
         Err(e) => {
@@ -8817,36 +8847,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg!(target_os = "macos"),
     ));
 
-    // On macOS: construct the GatewayLimaManager. The gateway instance is
-    // daemon-owned infrastructure (not per-operator). Construction is cheap;
-    // ensure_ready (the full bring-up sequence) is called from the live startup
-    // sequence once prerequisites and the vmnet pool are verified.
+    // On macOS: construct the VmnetPool and GatewayLimaManager.
     //
-    // The VmnetPool is not yet wired into the startup path. We construct the
-    // manager with a temporary pool so it is ready to call ensure_ready when
-    // the startup sequence is assembled. The live startup path will thread the
-    // config-derived pool through and call ensure_ready in the correct order
-    // (after prerequisite checks — IP-forwarding assertion, socket_vmnet daemon
-    // verification — and pool init).
+    // The GatewayLimaManager manages the `sandboxd-gateway` Lima instance —
+    // daemon-owned infrastructure. The VmnetPool tracks NIC slot assignments
+    // for per-session Lima VMs. Both are wired into AppState.
     //
-    // This block constructs only; it does NOT call ensure_ready. Calling it
-    // here prematurely would skip the prerequisite checks that must precede it.
+    // This block constructs both; it does NOT call ensure_ready. The live
+    // startup sequence assembles the full prerequisite chain (IP-forwarding
+    // assertion, socket_vmnet daemon check) before ensure_ready is called.
+    // That full sequence is M20-S5/S6; for now the manager is constructed
+    // and stored so session handlers can reach it.
     #[cfg(target_os = "macos")]
-    let _gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager> = {
+    let (vmnet_pool, gateway_lima_manager): (
+        Arc<sandbox_core::network::VmnetPool>,
+        Arc<sandbox_core::GatewayLimaManager>,
+    ) = {
         use sandbox_core::network::VmnetPool;
 
         // Default max_slots = 8 (matches the default for max_macos_sessions).
         // The live startup path will replace this with the config-derived value.
         const DEFAULT_MAX_MACOS_SESSIONS: u16 = 8;
-        let pool = VmnetPool::new(DEFAULT_MAX_MACOS_SESSIONS);
+        let pool = Arc::new(VmnetPool::new(DEFAULT_MAX_MACOS_SESSIONS));
 
         let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
-        Arc::new(sandbox_core::GatewayLimaManager::new(
+        let manager = Arc::new(sandbox_core::GatewayLimaManager::new(
             daemon_lima_home,
             lima_registry.executor().clone(),
             daemon_uid,
             &pool,
-        ))
+        ));
+        (pool, manager)
     };
 
     // Build the Lima runtime backed by the registry and register it in
@@ -9134,6 +9165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon_uid,
         daemon_user: daemon_user_resolved,
         users_conf_pool: users_conf_pool_entry,
+        #[cfg(target_os = "macos")]
+        vmnet_pool,
+        #[cfg(target_os = "macos")]
+        gateway_lima_manager,
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per

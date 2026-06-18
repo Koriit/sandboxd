@@ -14,6 +14,11 @@ pub mod gateway_lima;
 pub mod guest;
 pub mod lds_ack;
 pub mod lima;
+/// macOS session lifecycle helpers: macvlan network + gateway container
+/// setup/teardown, restrict=on verification stub, host IP-forwarding check.
+/// macOS only — not compiled on Linux.
+#[cfg(target_os = "macos")]
+pub mod macos_session;
 pub mod network;
 pub mod policy;
 pub mod policy_distributor;
@@ -42,9 +47,9 @@ pub use api::{
     LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
     PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, PropagationStatusResponse,
     SessionConfigDto, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
-    SessionRootlessDockerDto, SshConfigDto, UpdatePolicyRequest, WorkspaceLockAcquireRequest,
-    WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest, WorkspaceModeDetailDto,
-    WorkspaceOpDto, WorkspaceSecurityModelDto, event_to_jsonl_line,
+    SessionRootlessDockerDto, SshConfigDto, UpdatePolicyRequest, VmnetSlotDto,
+    WorkspaceLockAcquireRequest, WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest,
+    WorkspaceModeDetailDto, WorkspaceOpDto, WorkspaceSecurityModelDto, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
     AtomicListenerWriter, ListenerWriteError, listener_host_root, session_listener_host_dir,
@@ -105,6 +110,11 @@ pub use lima::{
     PRODUCTION_GUEST_BINARY_PATH, SANDBOXD_STATE_ROOT, SetuidHelperExecutor, VmInfo, VmStatus,
     decide_lima_vm, ensure_operator_lima_home, enumerate_operator_uids_from_fs, guest_agent_path,
     operator_lima_home, reap_lima_orphans, vm_name,
+};
+#[cfg(target_os = "macos")]
+pub use macos_session::{
+    check_host_ip_forwarding_disabled, macos_docker_network_name, macos_gateway_container_name,
+    setup_macos_gateway, teardown_macos_gateway, verify_restrict_on,
 };
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{

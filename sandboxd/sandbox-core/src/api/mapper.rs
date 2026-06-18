@@ -736,6 +736,8 @@ mod tests {
             gateway_ip: "10.209.0.2".into(),
             session_ip: "10.209.0.3".into(),
             session_subnet_cidr: "10.209.0.0/28".into(),
+            // Linux session — no macOS vmnet slot.
+            vmnet_slot: None,
         };
         let dto = SessionDto::from(&session).with_network(Some(net.clone()));
 

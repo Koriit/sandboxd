@@ -12,8 +12,8 @@ pub mod mapper;
 pub use dto::{
     PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
     SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto, SshConfigDto,
-    WorkspaceLockAcquireRequest, WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest,
-    WorkspaceModeDetailDto, WorkspaceOpDto, WorkspaceSecurityModelDto,
+    VmnetSlotDto, WorkspaceLockAcquireRequest, WorkspaceLockAcquireResponse,
+    WorkspaceLockReleaseRequest, WorkspaceModeDetailDto, WorkspaceOpDto, WorkspaceSecurityModelDto,
 };
 pub use event_dto::{
     DenyLoggerEventBodyDto, DenyLoggerEventDto, DenyProtocolDto, DnsEventBodyDto, DnsEventDto,

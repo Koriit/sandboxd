@@ -2592,6 +2592,9 @@ fn render_network_block(network: Option<&SessionNetworkInfo>, out: &mut String) 
             let _ = writeln!(out, "  Gateway IP:  {}", n.gateway_ip);
             let _ = writeln!(out, "  Session IP:  {}", n.session_ip);
             let _ = writeln!(out, "  Subnet:      {}", n.session_subnet_cidr);
+            if let Some(vs) = &n.vmnet_slot {
+                let _ = writeln!(out, "  vmnet_slot   {} ({})", vs.index, vs.daemon_label);
+            }
         }
     }
     out.push('\n');

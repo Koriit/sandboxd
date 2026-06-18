@@ -213,6 +213,36 @@ pub struct SessionNetworkInfo {
     /// CIDR of the per-session /28 block, e.g. `"10.209.0.0/28"`.
     /// Backend-agnostic; tests use this in lieu of an IP-shape regex.
     pub session_subnet_cidr: String,
+    /// macOS only: socket_vmnet slot info for this session.
+    ///
+    /// `None` on Linux sessions, on stopped macOS sessions (slots are
+    /// released on stop), and on records written before this field was
+    /// introduced. Omitted from the wire entirely when absent so the
+    /// Linux wire format is unchanged (`skip_serializing_if`).
+    /// Old records deserialize cleanly via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmnet_slot: Option<VmnetSlotDto>,
+}
+
+/// Wire representation of a socket_vmnet slot claimed by a running macOS
+/// Lima session.
+///
+/// Mirrors [`crate::network::VmnetSlot`] field-for-field. Kept as a
+/// separate DTO type so a future shape change in the persisted domain
+/// struct cannot silently leak onto the wire — the mapper in
+/// [`super::mapper`] is the single edge between domain and wire.
+///
+/// This DTO is additive: older clients that do not know about macOS
+/// will simply ignore the field when it appears on `SessionNetworkInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmnetSlotDto {
+    /// Slot index `0..max_slots-1`.
+    pub index: u16,
+    /// launchd job label, e.g. `"io.sandboxd.vmnet.2"`.
+    pub daemon_label: String,
+    /// Path to the socket_vmnet Unix socket for this slot,
+    /// e.g. `"/var/run/sandbox/vmnet/slot-2.sock"`.
+    pub socket_path: String,
 }
 
 /// Backend-neutral per-session mount-surface summary surfaced on the
