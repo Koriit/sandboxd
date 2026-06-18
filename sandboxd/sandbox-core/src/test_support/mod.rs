@@ -25,6 +25,20 @@
 
 pub mod docker_path_stub;
 
+/// macOS-only: a `LimaExecutor` implementation that calls `limactl` directly
+/// in the current process context — the degenerate single-uid dev path.
+///
+/// This is the sanctioned integration-test executor on macOS. It mirrors
+/// `broker::run_limactl_direct` exactly (env-clear, LIMA_HOME, PATH prepend).
+/// When `op_uid == current uid` (which it always is in a dev-host test),
+/// this produces the same result as the full broker path without requiring
+/// a running `sandbox-agent`.
+///
+/// Production code must never use this type. It exists only for integration
+/// tests in `sandbox-core/tests/` that need to drive real `limactl` calls.
+#[cfg(target_os = "macos")]
+pub mod direct_executor;
+
 /// Returns a reference to the process-wide mutex that serializes all
 /// tests which mutate `HOME`, `XDG_RUNTIME_DIR`, `SANDBOX_LISTENER_DIR`,
 /// `SANDBOX_EVENTS_DIR`, or any other XDG / home-directory env var.

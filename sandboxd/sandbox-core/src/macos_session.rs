@@ -537,7 +537,9 @@ pub fn teardown_macos_gateway(
 /// in this stub phase), `Err` when the marker exists but does NOT confirm
 /// `restrict=on`.
 ///
-/// The marker file location: `<lima_home>/sandbox-<id>/qemu-restrict.marker`
+/// The marker file location: `<lima_home>/sandbox-<id>/sandboxd-restrict-marker`
+/// (the filename matches the protocol constant `RESTRICT_MARKER_FILENAME` in
+/// `sandbox-agent-protocol`).
 #[cfg(target_os = "macos")]
 pub fn verify_restrict_on(
     session_id: &SessionId,
@@ -545,9 +547,15 @@ pub fn verify_restrict_on(
 ) -> Result<(), SandboxError> {
     // STUB: M20-S6 implements live QMP query-netdev. Here we check for the
     // wrapper marker file written by the qemu-wrapper on success.
+    //
+    // The marker filename is `sandboxd-restrict-marker`, matching the
+    // protocol constant `RESTRICT_MARKER_FILENAME` used by the agent's
+    // `RestrictOnVerify` handler. The wrapper writes the final rewritten
+    // `-netdev user,...` token (which must contain `restrict=on`) to this
+    // path when `SANDBOX_RESTRICT_MARKER` env var is set before `limactl start`.
     let marker_path = operator_lima_home
         .join(format!("sandbox-{session_id}"))
-        .join("qemu-restrict.marker");
+        .join("sandboxd-restrict-marker");
 
     if marker_path.exists() {
         let content = std::fs::read_to_string(&marker_path).unwrap_or_default();
@@ -988,7 +996,7 @@ mod tests {
         let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_ok");
         let vm_dir = tmpdir.join(format!("sandbox-{id}"));
         std::fs::create_dir_all(&vm_dir).unwrap();
-        let marker_path = vm_dir.join("qemu-restrict.marker");
+        let marker_path = vm_dir.join("sandboxd-restrict-marker");
         let mut f = std::fs::File::create(&marker_path).unwrap();
         writeln!(f, "restrict=on applied successfully").unwrap();
         drop(f);
@@ -1011,7 +1019,7 @@ mod tests {
         let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_bad");
         let vm_dir = tmpdir.join(format!("sandbox-{id}"));
         std::fs::create_dir_all(&vm_dir).unwrap();
-        let marker_path = vm_dir.join("qemu-restrict.marker");
+        let marker_path = vm_dir.join("sandboxd-restrict-marker");
         let mut f = std::fs::File::create(&marker_path).unwrap();
         writeln!(f, "wrapper failed to inject restrict").unwrap();
         drop(f);

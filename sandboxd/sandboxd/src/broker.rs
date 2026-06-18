@@ -1407,6 +1407,17 @@ fn run_limactl_direct(
             let qemu_wrapper_str = qemu_wrapper.to_string_lossy().into_owned();
             if !qemu_wrapper_str.is_empty() {
                 cmd.env("QEMU_SYSTEM_AARCH64", &qemu_wrapper_str);
+
+                // Set SANDBOX_RESTRICT_MARKER so the qemu-wrapper knows where
+                // to write the rewritten `-netdev user,...` token after it
+                // injects restrict=on. The broker-mediated RestrictOnVerify
+                // check (and the daemon's verify_restrict_on stub) read this
+                // file to confirm the management NIC was locked. Path:
+                // `{lima_home}/{vm}/sandboxd-restrict-marker`.
+                // Only set when a wrapper is present (gateway instance skips
+                // the wrapper and must NOT have its management NIC restricted).
+                let marker_path = format!("{lima_home_str}/{vm}/sandboxd-restrict-marker");
+                cmd.env("SANDBOX_RESTRICT_MARKER", &marker_path);
             }
             let hardened_str = if hardened { "1" } else { "0" };
             let memory_mb_str = memory_mb.to_string();

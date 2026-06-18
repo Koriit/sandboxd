@@ -2046,6 +2046,97 @@ impl LimaManager {
         Ok(())
     }
 
+    /// Rewrite the sandbox VM's Lima YAML to use a new socket_vmnet slot.
+    ///
+    /// Called during `start` (resume) on macOS, where slots are non-sticky:
+    /// the session was stopped on slot N and is being resumed on slot M.
+    /// Lima's `networks: [{socket: ...}]` entry in `lima.yaml` must be
+    /// updated to the new slot's socket path before `limactl start`.
+    ///
+    /// The YAML rewrite is a targeted string replacement: the old
+    /// `socket: /var/run/sandbox/vmnet/slot-<N>.sock` line is replaced with
+    /// the new slot's path. This is intentionally narrow (not a full YAML
+    /// parse/rewrite) to avoid disturbing other fields Lima may have written
+    /// into the file (e.g. `status`, `sshLocalPort`).
+    ///
+    /// The file lives at `{base_dir}/{vm}/lima.yaml`, owned by the operator.
+    /// This method runs as the operator uid (via the helper seam) — but since
+    /// `run_limactl_direct` / the agent both use the operator's LIMA_HOME, the
+    /// file is directly readable/writable here. In single-uid (dev) mode and
+    /// in the full agent path, the agent owns the file and writes it.
+    ///
+    /// On the degenerate-executor (dev) path, the daemon runs as the operator
+    /// so it can write the file directly. In the full agent path, this write
+    /// happens daemon-side before the brokered `Start` op is sent (the daemon
+    /// authors the YAML; the agent validates and re-uses it verbatim).
+    #[cfg(target_os = "macos")]
+    pub fn rewrite_vm_network_slot(
+        &self,
+        session_id: &SessionId,
+        new_slot: u16,
+    ) -> Result<(), SandboxError> {
+        use crate::network::{VMNET_SOCKET_DIR, vmnet_slot_socket_path};
+
+        let vm = vm_name(session_id);
+        let yaml_path = self.base_dir.join(&vm).join("lima.yaml");
+
+        let contents = std::fs::read_to_string(&yaml_path).map_err(|e| {
+            SandboxError::Internal(format!(
+                "rewrite_vm_network_slot: failed to read {}: {e}",
+                yaml_path.display()
+            ))
+        })?;
+
+        // Replace any existing slot-N.sock line with the new slot path.
+        // Pattern: `  socket: /var/run/sandbox/vmnet/slot-<N>.sock`
+        let new_socket = vmnet_slot_socket_path(new_slot);
+        let socket_dir = VMNET_SOCKET_DIR;
+        let new_contents = {
+            let mut out = String::with_capacity(contents.len());
+            for line in contents.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("socket:") && trimmed.contains(socket_dir) {
+                    // Replace the socket path on this line.
+                    let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                    out.push_str(&format!("{indent}socket: {new_socket}\n"));
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            out
+        };
+
+        if new_contents == contents {
+            // No socket line found — the YAML may be from before slot support
+            // or may have a different format. Log a warning but do not fail:
+            // limactl start will use whatever socket is in the file.
+            tracing::warn!(
+                session_id = %session_id,
+                vm = %vm,
+                new_slot,
+                "rewrite_vm_network_slot: no slot socket line found in lima.yaml; \
+                 starting with existing YAML"
+            );
+        }
+
+        std::fs::write(&yaml_path, new_contents.as_bytes()).map_err(|e| {
+            SandboxError::Internal(format!(
+                "rewrite_vm_network_slot: failed to write {}: {e}",
+                yaml_path.display()
+            ))
+        })?;
+
+        info!(
+            session_id = %session_id,
+            vm = %vm,
+            new_slot,
+            socket = %new_socket,
+            "VM Lima YAML rewritten with new slot socket path"
+        );
+        Ok(())
+    }
+
     /// Force-delete a VM and its Lima data.
     pub fn delete_vm(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);

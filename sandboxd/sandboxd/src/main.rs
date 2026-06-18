@@ -1065,14 +1065,10 @@ struct AppState {
     /// session cap. Constructed at startup from the `max_macos_sessions`
     /// config value; restored from persisted `NetworkInfo` on daemon restart.
     ///
-    /// Never accessed on Linux (the field is cfg-gated). The Lima create
-    /// handler calls `claim_lima_slot` before `limactl create` and
-    /// `release_lima_slot` on any failure path.
-    // Fields are constructed at startup but not yet consumed by request handlers
-    // (the macOS create/start/stop handlers are wired in the next session).
-    // `dead_code` is suppressed until that wiring is in place.
+    /// Never accessed on Linux (the field is cfg-gated). The Lima create/start
+    /// handlers call `claim_lima_slot` and `release_lima_slot`; stop/rm call
+    /// `release_lima_slot` after `teardown_macos_gateway`.
     #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
     vmnet_pool: Arc<sandbox_core::network::VmnetPool>,
     /// macOS only: gateway Lima instance manager. Manages the
     /// `sandboxd-gateway` Lima VM that hosts all per-session gateway
@@ -1080,10 +1076,9 @@ struct AppState {
     /// the NIC map and the forwarded Docker socket path.
     ///
     /// The manager is constructed once at startup (in `main()`) and
-    /// the same `Arc` is shared into every session create handler that
-    /// needs the forwarded socket path or the NIC map.
+    /// the same `Arc` is shared into every session create/start/stop/rm
+    /// handler that needs the forwarded socket path or the NIC map.
     #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
     gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager>,
 }
 
@@ -1968,6 +1963,28 @@ async fn create_session(
     };
 
     let session_id = session.id;
+
+    // macOS full-backend Lima path: slot claim → gateway-before-VM ordering.
+    // The Linux Lima path (Docker bridge network → VM → gateway) is completely
+    // different in ordering, so the macOS path is a separate early-return block
+    // rather than a shared-but-branched path. Linux behavior is unchanged.
+    #[cfg(target_os = "macos")]
+    if backend_kind == BackendKind::Lima {
+        // Clone config and operator so the Container path (below) can still
+        // use the originals. On the Lima path we return immediately after this
+        // call, so the originals become dead code — the clone is a cheap price
+        // for keeping the borrow checker happy without restructuring the
+        // Container path.
+        return create_session_macos_lima(
+            session_id,
+            config.clone(),
+            operator.clone(),
+            req.clone(),
+            warnings.clone(),
+            state,
+        )
+        .await;
+    }
 
     // 1. Create Docker network BEFORE the VM so the bridge exists at QEMU boot.
     //    Also generate the per-session CA certificate (needed by the gateway).
@@ -3780,6 +3797,722 @@ async fn probe_gateway_status(state: &AppState, session: &Session) -> Option<Str
     )
 }
 
+// ---------------------------------------------------------------------------
+// macOS Lima session lifecycle helpers
+// ---------------------------------------------------------------------------
+//
+// These three functions drive the macOS full-backend create/start/stop flows.
+// They are cfg-gated to macOS only; the Linux paths in the public handlers
+// (create_session / start_session / stop_session) are byte-for-behavior
+// unchanged. Each function is called from the handler's early-return
+// `#[cfg(target_os = "macos")]` block, consumes the full AppState via
+// `Arc`, and is async (all limactl/docker calls go through spawn_blocking).
+
+/// macOS Lima create: slot claim → gateway-before-VM ordering.
+///
+/// Egress happens-before invariant: the sandbox VM's NIC never carries
+/// traffic until deny-all AND DNAT are both in place. The ordering below
+/// guarantees this: `setup_macos_gateway` installs deny-all + health +
+/// DNAT before `limactl start` (which is the first moment the VM can emit
+/// a packet). Rollback on any failure between slot-claim and Running:
+/// `teardown_macos_gateway` + `vmnet_pool.release_lima_slot`.
+#[cfg(target_os = "macos")]
+async fn create_session_macos_lima(
+    session_id: SessionId,
+    config: SessionConfig,
+    operator: OperatorIdentity,
+    req: CreateSessionRequest,
+    warnings: Vec<String>,
+    state: Arc<AppState>,
+) -> axum::response::Response {
+    use sandbox_core::gateway::gateway_image_tag_for_daemon;
+    use sandbox_core::lima::operator_lima_home;
+    use sandbox_core::macos_session::{
+        setup_macos_gateway, teardown_macos_gateway, verify_restrict_on,
+    };
+
+    // Step 1: generate the per-session CA certificate.
+    let ca_dir = {
+        let base_dir = state.base_dir.clone();
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || CaManager::generate_session_ca(&base_dir, &sid))
+            .await
+        {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(e)) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    };
+
+    // Step 2: claim a vmnet slot from the pool.
+    let vmnet_pool = state.vmnet_pool.clone();
+    let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = {
+        let pool = vmnet_pool.clone();
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || pool.claim_lima_slot(&sid)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                })
+                .await;
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    };
+
+    // Build NetworkInfo with the slot addresses.
+    let nic_name = {
+        let nic_map = state.gateway_lima_manager.nic_map();
+        nic_map
+            .and_then(|m| {
+                m.interface_for_slot(vmnet_slot.index)
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| format!("lima{}", vmnet_slot.index))
+    };
+    let docker_network_name = format!("sandbox-net-{session_id}");
+    let network_info = NetworkInfo {
+        bridge_name: nic_name.clone(),
+        subnet: subnet_cidr,
+        gateway_ip: gateway_ip.to_string(),
+        vm_ip: vm_ip.to_string(),
+        docker_network_name,
+        vmnet_slot: Some(vmnet_slot.clone()),
+    };
+
+    // Macro: full rollback (teardown gateway + release slot + remove CA + set Error).
+    // Defined as an async closure captured by the rollback calls below.
+    // We use a helper async fn instead of a macro because we need .await.
+    let rollback = {
+        let state2 = state.clone();
+        let pool2 = vmnet_pool.clone();
+        let sock = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        let sid = session_id;
+        let op_name = operator.name.clone();
+        let base_dir = state.base_dir.clone();
+        move || {
+            let state2 = state2.clone();
+            let pool2 = pool2.clone();
+            let sock2 = sock.clone();
+            let op_name2 = op_name.clone();
+            let base_dir2 = base_dir.clone();
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = teardown_macos_gateway(&sid, &sock2);
+                    let _ = pool2.release_lima_slot(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir2, &sid);
+                })
+                .await;
+                let _ = state2
+                    .store
+                    .update_state(&sid, &op_name2, SessionState::Error);
+            }
+        }
+    };
+
+    // Step 3: persist slot info into sessions.db.
+    if let Err(e) = state
+        .store
+        .set_network_info(&session_id, &operator.name, &network_info)
+    {
+        rollback().await;
+        return error_response(e).into_response();
+    }
+
+    // Step 4: limactl create (via operator-execution seam).
+    {
+        let manager = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(m) => m,
+            Err(e) => {
+                rollback().await;
+                return error_response(e).into_response();
+            }
+        };
+        let sid = session_id;
+        let cfg = config.clone();
+        let op_id = Some((operator.uid, operator.gid));
+        let slot_idx = vmnet_slot.index;
+        match tokio::task::spawn_blocking(move || {
+            manager.create_vm(&sid, &cfg, op_id, Some(slot_idx))
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                rollback().await;
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Steps 5-9: setup gateway (macvlan + container + deny-all + health + DNAT).
+    // Must complete before limactl start (egress happens-before invariant).
+    {
+        let gateway_sock = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        let ni = network_info.clone();
+        let nic = nic_name.clone();
+        let dns = compute_initial_dns_policy(&req);
+        let owner_pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
+        let ca = ca_dir.clone();
+        let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || {
+            setup_macos_gateway(
+                &sid,
+                &ni,
+                &nic,
+                &gateway_sock,
+                &gateway_tag,
+                Some(&ca),
+                Some(&dns),
+                Some(&owner_pool),
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                rollback().await;
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Register VM IP for event attribution before the VM boots.
+    state.event_bus.register_session(session_id);
+    if let Ok(ip) = network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
+        state.vm_ip_map.bind(ip, session_id);
+    }
+
+    // Step 10: limactl start (wrapped: injects restrict=on via QEMU_SYSTEM_AARCH64 +
+    // SANDBOX_RESTRICT_MARKER). The `run_limactl_direct` path sets SANDBOX_RESTRICT_MARKER
+    // to `{lima_home}/{vm}/sandboxd-restrict-marker` when a non-empty qemu_wrapper is given.
+    {
+        let manager = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(m) => m,
+            Err(e) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(e).into_response();
+            }
+        };
+        let sid = session_id;
+        let cfg = config.clone();
+        match tokio::task::spawn_blocking(move || manager.start_vm(&sid, &cfg, None, None, false))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Step 11: verify restrict=on (fails closed; caller tears down on Err).
+    {
+        let op_lima_home = operator_lima_home(operator.uid);
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || verify_restrict_on(&sid, &op_lima_home)).await {
+            Ok(Ok(())) => {
+                info!(%session_id, "restrict=on confirmed");
+            }
+            Ok(Err(e)) => {
+                error!(%session_id, error = %e, "restrict-verify failed; tearing down session");
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(SandboxError::Internal(format!(
+                    "session rejected: restrict-verify failed ({e}). \
+                     The sandbox VM was torn down. Check that the qemu-wrapper is installed \
+                     and the wrapper marker path is correct."
+                )))
+                .into_response();
+            }
+            Err(e) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Step 12: guest agent ping — wait for the agent to become responsive.
+    {
+        const MAX_PING: u32 = 15;
+        let mut succeeded = false;
+        let mut last_err: Option<SandboxError> = None;
+        for attempt in 1..=MAX_PING {
+            match state.guest.ping(&session_id).await {
+                Ok(true) => {
+                    info!(%session_id, attempt, "guest agent responsive (macOS Lima)");
+                    succeeded = true;
+                    break;
+                }
+                Ok(false) => {
+                    let e = SandboxError::Internal("guest agent ping: unexpected response".into());
+                    state.vm_ip_map.unbind(
+                        network_info
+                            .vm_ip
+                            .parse::<std::net::Ipv4Addr>()
+                            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                    );
+                    state.event_bus.unregister_session(&session_id);
+                    rollback().await;
+                    return error_response(e).into_response();
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < MAX_PING {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+        if !succeeded {
+            let e = last_err
+                .unwrap_or_else(|| SandboxError::Internal("guest agent ping timed out".into()));
+            state.vm_ip_map.unbind(
+                network_info
+                    .vm_ip
+                    .parse::<std::net::Ipv4Addr>()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            );
+            state.event_bus.unregister_session(&session_id);
+            rollback().await;
+            return error_response(e).into_response();
+        }
+    }
+
+    // Step 13: mark Running.
+    if let Err(e) = state
+        .store
+        .update_state(&session_id, &operator.name, SessionState::Running)
+    {
+        return error_response(e).into_response();
+    }
+
+    // Spawn DNS propagation and gate listener.
+    start_dns_propagation_loop(&session_id, &state).await;
+    start_dns_gate_listener(&session_id, &state).await;
+    spawn_session_ingestor(&session_id, &state).await;
+
+    // Build the response DTO.
+    let created = match state.store.get_session(&session_id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(session_id.to_string()))
+                .into_response();
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+    let agent_status = probe_agent_status(&state, &created).await;
+    let gateway_status = probe_gateway_status(&state, &created).await;
+    let policy_opt = {
+        state
+            .session_policies
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+    };
+    let dto = SessionDto::from(&created)
+        .with_status(agent_status, gateway_status)
+        .with_policy(policy_opt.as_ref())
+        .with_warnings(warnings);
+    (StatusCode::CREATED, Json(dto)).into_response()
+}
+
+/// macOS Lima start (resume): fresh slot claim + YAML rewrite + gateway-before-VM.
+///
+/// Slots are not sticky across stop/start. A fresh slot is claimed, the sandbox
+/// VM's Lima YAML is rewritten with the new slot's socket path, then the same
+/// gateway-before-VM sequence as create runs (setup → wrapped start → verify →
+/// Running). On any failure: `teardown_macos_gateway` + `release_lima_slot`.
+#[cfg(target_os = "macos")]
+async fn start_session_macos_lima(
+    session: Session,
+    needs_refresh: bool,
+    operator: OperatorIdentity,
+    state: Arc<AppState>,
+) -> axum::response::Response {
+    use sandbox_core::gateway::gateway_image_tag_for_daemon;
+    use sandbox_core::lima::operator_lima_home;
+    use sandbox_core::macos_session::{
+        setup_macos_gateway, teardown_macos_gateway, verify_restrict_on,
+    };
+
+    let session_id = session.id;
+    let vmnet_pool = state.vmnet_pool.clone();
+
+    // Step 1: claim a fresh slot (slots are non-sticky across stop/start).
+    let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = {
+        let pool = vmnet_pool.clone();
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || pool.claim_lima_slot(&sid)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return error_response(e).into_response(),
+            Err(e) => {
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    };
+
+    let nic_name = {
+        let nic_map = state.gateway_lima_manager.nic_map();
+        nic_map
+            .and_then(|m| {
+                m.interface_for_slot(vmnet_slot.index)
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| format!("lima{}", vmnet_slot.index))
+    };
+    let docker_network_name = format!("sandbox-net-{session_id}");
+    let network_info = NetworkInfo {
+        bridge_name: nic_name.clone(),
+        subnet: subnet_cidr,
+        gateway_ip: gateway_ip.to_string(),
+        vm_ip: vm_ip.to_string(),
+        docker_network_name,
+        vmnet_slot: Some(vmnet_slot.clone()),
+    };
+
+    let rollback = {
+        let pool2 = vmnet_pool.clone();
+        let sock = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        let sid = session_id;
+        move || {
+            let pool2 = pool2.clone();
+            let sock2 = sock.clone();
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = teardown_macos_gateway(&sid, &sock2);
+                    let _ = pool2.release_lima_slot(&sid);
+                })
+                .await;
+            }
+        }
+    };
+
+    // Step 2: persist updated slot info.
+    if let Err(e) = state
+        .store
+        .set_network_info(&session_id, &operator.name, &network_info)
+    {
+        rollback().await;
+        return error_response(e).into_response();
+    }
+
+    // Step 3: rewrite the sandbox VM's Lima YAML with the new slot socket path.
+    // The manager's `rewrite_vm_network_slot` updates the socket: entry.
+    {
+        let manager = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(m) => m,
+            Err(e) => {
+                rollback().await;
+                return error_response(e).into_response();
+            }
+        };
+        let sid = session_id;
+        let slot_idx = vmnet_slot.index;
+        match tokio::task::spawn_blocking(move || manager.rewrite_vm_network_slot(&sid, slot_idx))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                rollback().await;
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Steps 4-8: setup gateway (gateway-before-VM invariant).
+    {
+        let gateway_sock = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        let ni = network_info.clone();
+        let nic = nic_name.clone();
+        let owner_pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
+        let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || {
+            setup_macos_gateway(
+                &sid,
+                &ni,
+                &nic,
+                &gateway_sock,
+                &gateway_tag,
+                None,
+                None,
+                Some(&owner_pool),
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                rollback().await;
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Register VM IP for event attribution.
+    state.event_bus.register_session(session_id);
+    if let Ok(ip) = network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
+        state.vm_ip_map.bind(ip, session_id);
+    }
+
+    // Step 9: limactl start (wrapped; restrict marker injected).
+    {
+        let manager = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(m) => m,
+            Err(e) => {
+                rollback().await;
+                return error_response(e).into_response();
+            }
+        };
+        let sid = session_id;
+        let config = session.config.clone();
+        match tokio::task::spawn_blocking(move || {
+            manager.start_vm(&sid, &config, None, None, false)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Step 10: verify restrict=on.
+    {
+        let op_lima_home = operator_lima_home(operator.uid);
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || verify_restrict_on(&sid, &op_lima_home)).await {
+            Ok(Ok(())) => {
+                info!(%session_id, "restrict=on confirmed (resume)");
+            }
+            Ok(Err(e)) => {
+                error!(%session_id, error = %e, "restrict-verify failed on resume; tearing down");
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(SandboxError::Internal(format!(
+                    "restrict-verify failed on resume: {e}"
+                )))
+                .into_response();
+            }
+            Err(e) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Guest agent ping.
+    match state.guest.ping(&session_id).await {
+        Ok(true) => {
+            info!(%session_id, "guest agent responsive after resume");
+        }
+        Ok(false) => {
+            let e =
+                SandboxError::Internal("guest agent ping: unexpected response after resume".into());
+            state.vm_ip_map.unbind(
+                network_info
+                    .vm_ip
+                    .parse::<std::net::Ipv4Addr>()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            );
+            state.event_bus.unregister_session(&session_id);
+            rollback().await;
+            return error_response(e).into_response();
+        }
+        Err(e) => {
+            error!(%session_id, error = %e, "guest agent ping failed after resume");
+            state.vm_ip_map.unbind(
+                network_info
+                    .vm_ip
+                    .parse::<std::net::Ipv4Addr>()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            );
+            state.event_bus.unregister_session(&session_id);
+            rollback().await;
+            return error_response(e).into_response();
+        }
+    }
+
+    // Mark Running.
+    if let Err(e) = state
+        .store
+        .update_state(&session_id, &operator.name, SessionState::Running)
+    {
+        return error_response(e).into_response();
+    }
+
+    // Update guest version stamp if a refresh ran.
+    if needs_refresh {
+        if let Err(e) = state.store.update_guest_versions(
+            &operator.name,
+            &session_id,
+            sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+            sandbox_core::guest::SANDBOX_GUEST_VERSION,
+        ) {
+            warn!(%session_id, error = %e, "update_guest_versions failed after resume");
+        }
+    }
+
+    start_dns_propagation_loop(&session_id, &state).await;
+    start_dns_gate_listener(&session_id, &state).await;
+    spawn_session_ingestor(&session_id, &state).await;
+
+    let refreshed = match state.store.get_session(&session_id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(session_id.to_string()))
+                .into_response();
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+    let dto = SessionDto::from(&refreshed).with_status(None, None);
+    (StatusCode::OK, Json(dto)).into_response()
+}
+
 async fn list_sessions(
     State(state): State<Arc<AppState>>,
     Extension(operator): Extension<OperatorIdentity>,
@@ -4113,6 +4846,16 @@ async fn start_session(
 
     info!(session_id = %session.id, "starting session");
 
+    // macOS full-backend Lima: fresh slot claim + gateway-before-VM.
+    // Linux Lima and Container backends use the existing bridge-ensure path below.
+    #[cfg(target_os = "macos")]
+    if session.backend == BackendKind::Lima {
+        // Clone session/operator so the Container path (below) remains
+        // borrow-checker-valid on macOS. The Lima path returns immediately.
+        return start_session_macos_lima(session.clone(), needs_refresh, operator.clone(), state)
+            .await;
+    }
+
     // Ensure the Docker bridge network exists BEFORE starting the VM so the
     // QEMU wrapper can attach the bridge NIC via qemu-bridge-helper at boot.
     let (bridge_name, vm_mac) = {
@@ -4393,6 +5136,49 @@ async fn stop_session(
     // stopping the VM. The network_info is kept in the DB so `start` can
     // recreate everything. The subnet remains allocated in the
     // NetworkManager so it is not reused by another session.
+    // Platform-specific networking teardown.
+    // macOS Lima: teardown via forwarded gateway socket + release vmnet slot.
+    // Everything else (Linux Lima + Container on all platforms): host Docker.
+    #[cfg(target_os = "macos")]
+    {
+        if session.backend == BackendKind::Lima {
+            let gateway_docker_socket = state
+                .gateway_lima_manager
+                .gateway_docker_socket()
+                .to_path_buf();
+            let sid = session.id;
+            let vmnet_pool = state.vmnet_pool.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                debug!(session_id = %sid, "tearing down macOS session networking");
+                if let Err(e) = sandbox_core::macos_session::teardown_macos_gateway(
+                    &sid,
+                    &gateway_docker_socket,
+                ) {
+                    warn!(%sid, error = %e, "macOS gateway teardown failed (best-effort)");
+                }
+                if let Err(e) = vmnet_pool.release_lima_slot(&sid) {
+                    warn!(%sid, error = %e, "vmnet slot release failed (best-effort)");
+                }
+            })
+            .await;
+        } else {
+            // Container backend on macOS: use host Docker (same as Linux).
+            let gateway = state.gateway.clone();
+            let network = state.network.clone();
+            let sid = session.id;
+            let _ = tokio::task::spawn_blocking(move || {
+                debug!(session_id = %sid, "tearing down container session networking (macOS)");
+                if let Err(e) = gateway.stop_gateway(&sid) {
+                    warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+                }
+                if let Err(e) = network.remove_docker_network(&sid) {
+                    warn!(%sid, error = %e, "failed to remove Docker network (best-effort)");
+                }
+            })
+            .await;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     {
         let gateway = state.gateway.clone();
         let network = state.network.clone();
@@ -4548,27 +5334,78 @@ async fn remove_session(
         let op_uid_for_delete = session.operator_uid.unwrap_or(operator.uid);
         let _ = runtime.delete(&handle, op_uid_for_delete).await;
 
-        let gateway = state.gateway.clone();
-        let network = state.network.clone();
-        let base_dir = state.base_dir.clone();
-        let sid = session.id;
-        let _ = tokio::task::spawn_blocking(move || {
-            // Full teardown: networking + CA + release subnet allocation.
-            debug!(session_id = %sid, "tearing down session networking (full cleanup)");
-            if let Err(e) = detach_vm_from_bridge(&sid) {
-                warn!(%sid, error = %e, "failed to detach VM from bridge (best-effort)");
+        #[cfg(target_os = "macos")]
+        {
+            if session.backend == BackendKind::Lima {
+                // macOS Lima: tear down via the forwarded gateway socket + release the vmnet slot.
+                let gateway_docker_socket = state
+                    .gateway_lima_manager
+                    .gateway_docker_socket()
+                    .to_path_buf();
+                let sid = session.id;
+                let vmnet_pool = state.vmnet_pool.clone();
+                let base_dir = state.base_dir.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    debug!(session_id = %sid, "tearing down macOS session networking (full cleanup)");
+                    if let Err(e) = sandbox_core::macos_session::teardown_macos_gateway(
+                        &sid,
+                        &gateway_docker_socket,
+                    ) {
+                        warn!(%sid, error = %e, "macOS gateway teardown failed (best-effort)");
+                    }
+                    if let Err(e) = vmnet_pool.release_lima_slot(&sid) {
+                        warn!(%sid, error = %e, "vmnet slot release failed (best-effort)");
+                    }
+                    if let Err(e) = CaManager::remove_session_ca(&base_dir, &sid) {
+                        warn!(%sid, error = %e, "failed to remove session CA (best-effort)");
+                    }
+                })
+                .await;
+            } else {
+                // Container backend on macOS: use host Docker.
+                let gateway = state.gateway.clone();
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session.id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    debug!(session_id = %sid, "tearing down container session networking (macOS, full cleanup)");
+                    if let Err(e) = gateway.stop_gateway(&sid) {
+                        warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+                    }
+                    if let Err(e) = network.delete_network(&sid) {
+                        warn!(%sid, error = %e, "failed to delete network (best-effort)");
+                    }
+                    if let Err(e) = CaManager::remove_session_ca(&base_dir, &sid) {
+                        warn!(%sid, error = %e, "failed to remove session CA (best-effort)");
+                    }
+                })
+                .await;
             }
-            if let Err(e) = gateway.stop_gateway(&sid) {
-                warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
-            }
-            if let Err(e) = network.delete_network(&sid) {
-                warn!(%sid, error = %e, "failed to delete network (best-effort)");
-            }
-            if let Err(e) = CaManager::remove_session_ca(&base_dir, &sid) {
-                warn!(%sid, error = %e, "failed to remove session CA (best-effort)");
-            }
-        })
-        .await;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let gateway = state.gateway.clone();
+            let network = state.network.clone();
+            let base_dir = state.base_dir.clone();
+            let sid = session.id;
+            let _ = tokio::task::spawn_blocking(move || {
+                // Full teardown: networking + CA + release subnet allocation.
+                debug!(session_id = %sid, "tearing down session networking (full cleanup)");
+                if let Err(e) = detach_vm_from_bridge(&sid) {
+                    warn!(%sid, error = %e, "failed to detach VM from bridge (best-effort)");
+                }
+                if let Err(e) = gateway.stop_gateway(&sid) {
+                    warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+                }
+                if let Err(e) = network.delete_network(&sid) {
+                    warn!(%sid, error = %e, "failed to delete network (best-effort)");
+                }
+                if let Err(e) = CaManager::remove_session_ca(&base_dir, &sid) {
+                    warn!(%sid, error = %e, "failed to remove session CA (best-effort)");
+                }
+            })
+            .await;
+        }
     }
 
     // Remove from the stopping set now that teardown is complete.
