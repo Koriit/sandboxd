@@ -145,5 +145,13 @@ filter = '''
 '''
 test-group = 'docker-sandbox-namespace'
 
+# gateway-lima tests share a single `sandboxd-gateway` Lima instance and
+# must not run concurrently — parallel `limactl start` calls against the
+# same instance cause "another hostagent may already be running" failures.
+[[profile.integration.overrides]]
+filter = 'test(/^integration_gateway_lima/)'
+test-group = 'gateway-lima-instance'
+
 [test-groups]
 docker-sandbox-namespace = { max-threads = 1 }
+gateway-lima-instance = { max-threads = 1 }

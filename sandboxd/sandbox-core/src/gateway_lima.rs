@@ -99,8 +99,13 @@ pub const MIN_LIMA_VERSION: &str = "1.2.0";
 const DOCKER_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Total timeout waiting for the gateway Docker socket to become ready.
+///
+/// On first boot this covers cloud-init + Docker install (apt install docker.io
+/// on Ubuntu 24.04 takes 2-3 minutes on this host). On subsequent daemon
+/// restarts the VM is already provisioned so the socket becomes ready in a few
+/// seconds. 300 seconds is generous headroom for the worst-case first-boot path.
 #[cfg(target_os = "macos")]
-const DOCKER_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const DOCKER_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Timeout for `limactl create sandboxd-gateway`. The Ubuntu cloud image
 /// download (~600 MiB) dominates on first run; subsequent creates skip the
@@ -254,15 +259,22 @@ pub fn generate_gateway_template(max_slots: u16) -> String {
         })
         .collect::<String>();
 
-    // Build the no-DHCP netplan stanzas for each limaN NIC.
+    // Build the no-DHCP netplan printf lines for each limaN NIC.
     // Without this, systemd-networkd tries DHCP on every limaN NIC and
     // blocks boot on `network-online.target` waiting for leases that never arrive.
+    //
+    // We use `printf` rather than a heredoc because the Lima template is a YAML
+    // block scalar (`script: |`) — heredoc terminators must appear at column 0 in
+    // the shell script, but column-0 content in a YAML block scalar terminates the
+    // scalar and is parsed as YAML, causing a parse error. `printf` appended line
+    // by line avoids the column-0 heredoc marker entirely.
     let netplan_lima_entries = (0..max_slots)
         .map(|slot| {
+            // Each NIC block: "    lima{n}:" (4-space indent under `ethernets:`)
+            // followed by dhcp4/optional at 6-space indent. The \\n sequences
+            // are the printf escape sequences for newlines inside the shell string.
             format!(
-                "          lima{slot}:\n\
-                             dhcp4: no\n\
-                             optional: true\n"
+                "      printf '    lima{slot}:\\n      dhcp4: no\\n      optional: true\\n' >> /etc/netplan/99-sandbox-vmnet.yaml\n"
             )
         })
         .collect::<String>();
@@ -318,6 +330,15 @@ provision:
       groupadd -f docker
       chgrp docker /var/run/docker.sock
       chmod 660 /var/run/docker.sock
+      # Add the Lima SSH user to the docker group so Lima's socket-forward
+      # (which connects as the login user via SSH) can read /var/run/docker.sock.
+      # Lima creates an operator user with the same UID as the macOS host user.
+      # macOS UIDs typically start at 500 (unlike Linux where they start at 1000),
+      # so we add all non-system users (UID 500–65533) to the docker group. This
+      # is portable across macOS hosts without baking in a specific username.
+      for u in $(awk -F: '$3 >= 500 && $3 < 65534 {{print $1}}' /etc/passwd); do
+        usermod -aG docker "$u"
+      done
   - mode: system
     script: |
       #!/bin/bash
@@ -327,12 +348,13 @@ provision:
       # 1280 is the IPv6 minimum — safe on all paths. The socket_vmnet NICs
       # (lima0…) use native L2 MTU and are unaffected.
       # Clamp by NIC name (eth0 = slirp/management), never by index.
-      install -m 0644 /dev/stdin /etc/netplan/99-sandbox-mtu.yaml <<'EOF'
-      network:
-        ethernets:
-          eth0:
-            mtu: 1280
-      EOF
+      #
+      # printf is used instead of a heredoc because the Lima template is a
+      # YAML block scalar — heredoc terminators at column 0 would be
+      # misinterpreted by the YAML parser as end-of-scalar.
+      printf 'network:\n  ethernets:\n    eth0:\n      mtu: 1280\n' \
+        > /etc/netplan/99-sandbox-mtu.yaml
+      chmod 0644 /etc/netplan/99-sandbox-mtu.yaml
       netplan apply
   - mode: system
     script: |
@@ -348,11 +370,11 @@ provision:
       # - Without `dhcp4: no` + `optional: true`, Ubuntu systemd-networkd
       #   attempts DHCP on every unconfigured NIC and BLOCKS boot waiting for
       #   leases that never arrive on network-identifier segments (no DHCP).
-{ipv6_disable_lines}      # Write the netplan config for all limaN NICs.
-      install -m 0644 /dev/stdin /etc/netplan/99-sandbox-vmnet.yaml <<'EOF'
-      network:
-        ethernets:
-{netplan_lima_entries}      EOF
+      #
+      # printf is used to write the netplan YAML to avoid column-0 heredoc
+      # markers that would break YAML parsing of the Lima template.
+{ipv6_disable_lines}      printf 'network:\n  ethernets:\n' > /etc/netplan/99-sandbox-vmnet.yaml
+{netplan_lima_entries}      chmod 0644 /etc/netplan/99-sandbox-vmnet.yaml
       netplan apply
 "#,
     )
@@ -362,36 +384,61 @@ provision:
 // Baseline eth0 nft ruleset
 // ---------------------------------------------------------------------------
 
-/// Generate the baseline default-drop egress nft policy for the gateway VM's
-/// `eth0` NIC (the Lima/QEMU user-mode SLIRP management uplink).
+/// Generate the baseline egress nft policy for the gateway VM's `eth0` NIC
+/// (the Lima/QEMU user-mode SLIRP management uplink).
 ///
-/// ## Intent (defense-in-depth on the shared uplink)
+/// ## Traffic paths on the gateway VM
 ///
-/// `eth0` is the gateway VM's only path to the internet. Per-session enforcement
-/// lives on the VM-facing side (the isolated socket_vmnet macvlan segments +
-/// gateway container nftables), so a compromised gateway component would
-/// otherwise have an unfiltered path out `eth0`. This policy bounds that
-/// blast radius.
+/// The gateway VM has two distinct forwarding paths on `eth0`:
 ///
-/// ## Policy rules
+/// 1. **FORWARD chain**: Gateway container traffic — Docker NAT/MASQUERADE takes
+///    packets from the `sandboxd-egress` bridge, masquerades them as the gateway
+///    VM's IP, and forwards them out `eth0`. This path is managed entirely by
+///    Docker's own iptables/nft rules in the `ip filter`/`ip nat` tables. Our
+///    policy must NOT interfere with it, and deliberately does not — this table
+///    declares no FORWARD chain, so Docker NAT is completely unaffected.
 ///
-/// - **Output chain (eth0 egress):** default drop.
-///   - Allow conntrack established/related: these are responses to connections
-///     the gateway containers already opened and intercepted (i.e., Envoy /
-///     mitmproxy re-originating upstream traffic). Without this, TCP replies to
-///     re-originated connections are dropped and all upstream traffic fails.
-///   - Allow DNS (UDP/TCP port 53): outbound resolver queries from the gateway
-///     VM's systemd-resolved / Docker embedded resolver, needed for the
-///     CoreDNS → `127.0.0.11` → Docker embedded resolver → host chain.
-/// - **Input chain (eth0 ingress):** accept established/related (return traffic
-///   for the DNS + upstream connections allowed in output).
+/// 2. **OUTPUT chain**: Traffic originating from the gateway VM's own host-namespace
+///    processes — Lima agents, Docker daemon (image pulls, registry access),
+///    systemd-resolved (DNS forwarding), etc. This is what our
+///    `sandboxd-gateway-eth0` table governs, and this is the surface that must be
+///    bounded to limit blast radius if a gateway component escapes its container
+///    namespace into the VM's host namespace.
 ///
-/// The gateway VM's `eth0` is NEVER `restrict=on` (that would drop all upstream
-/// traffic). This policy is a separate, complementary mechanism.
+/// ## Policy design
+///
+/// **OUTPUT (gateway VM's own processes on `eth0`):**
+/// - Non-eth0 interfaces (loopback, limaN Docker bridges): pass through — these
+///   are handled by per-session container nftables and Docker's own rules.
+/// - `ct state established,related`: allow return traffic for connections already
+///   open — this rule is load-bearing for all allowed outbound flows.
+/// - Explicit port allow-list for what VM-host-namespace processes genuinely need:
+///   DNS (port 53 TCP+UDP), HTTPS (port 443), HTTP (port 80). This covers Docker
+///   daemon image pulls, Lima agents (HTTPS), and systemd-resolved DNS forwarding.
+/// - Default drop: all other VM-originated new outbound on eth0 is blocked, so a
+///   compromised component that escapes into the gateway VM's host namespace cannot
+///   freely egress to arbitrary destinations.
+///
+/// **INPUT (incoming on `eth0`):**
+/// - `ct state established,related`: accept return traffic for connections the VM
+///   opened.
+/// - Drop new/invalid: external parties cannot initiate connections into the
+///   gateway VM.
+///
+/// ## Why container egress is unaffected
+///
+/// Gateway container re-originated traffic traverses the FORWARD chain (Docker
+/// NAT/MASQUERADE), not the OUTPUT chain. Because this table declares no FORWARD
+/// chain, Docker's iptables FORWARD rules operate without any interference. The
+/// OUTPUT restrictions bind only VM-host-namespace processes — which is exactly
+/// the blast-radius bound required: a compromised component that escapes its
+/// container netns into the gateway VM's host network namespace is constrained to
+/// DNS + HTTPS + HTTP, not arbitrary outbound.
 #[cfg(target_os = "macos")]
 pub fn generate_gateway_eth0_nft_policy() -> String {
     // The ruleset is applied inside the gateway Lima VM via `nft -f` on a tempfile.
-    // It uses a sandboxd-specific table rather than modifying the filter table.
+    // It uses a sandboxd-specific table rather than modifying the filter table so
+    // it does not conflict with Docker's iptables/nft rules.
     //
     // Idempotency across daemon restarts (daemon restart against a still-running
     // gateway VM must not fail):
@@ -400,20 +447,24 @@ pub fn generate_gateway_eth0_nft_policy() -> String {
     //   flush table inet sandboxd-gateway-eth0   <- atomically clear all rules
     //   table inet sandboxd-gateway-eth0 { ... } <- re-add the full ruleset
     //
-    // This mirrors the `sandbox_dnat`/`sandbox_policy` pattern in `policy.rs`: a
-    // bare `table inet X {}` is an implicit `add table` — a no-op when the table
-    // already exists — and the subsequent `flush table` clears its contents so the
-    // re-created chains never collide with stale rules from a prior application.
+    // This mirrors the `sandbox_dnat`/`sandbox_policy` pattern in `policy.rs`.
     r#"# sandboxd baseline egress policy for gateway VM eth0.
 #
 # eth0 is the Lima/QEMU user-mode SLIRP management NIC — the gateway VM's
-# only sanctioned path to the internet. This policy (default-drop + allow
-# established/related + allow DNS) is the defense-in-depth control that
-# bounds a compromised gateway component's blast radius.
+# only sanctioned path to the internet. This table bounds the blast radius
+# of a compromised gateway component by restricting the gateway VM's own
+# host-namespace processes to the specific ports they genuinely need.
 #
-# The gateway VM is NEVER restrict=on on eth0 (that would drop ALL upstream
-# traffic and sever egress for every session). This table is the alternative:
-# unrestricted-but-policed egress, not a block.
+# Traffic path clarification:
+# - Gateway CONTAINER egress goes through the FORWARD chain (Docker NAT), not
+#   this OUTPUT chain. This table has no FORWARD chain, so Docker NAT is
+#   completely unaffected — container egress policy is enforced separately by
+#   the per-session Envoy/nft pipeline.
+# - OUTPUT governs only the gateway VM's host-namespace processes (Lima agents,
+#   Docker daemon, systemd-resolved, etc.). These are restricted to an explicit
+#   port allow-list so a component that escapes its container namespace into the
+#   VM host namespace cannot freely egress to arbitrary destinations.
+# - The INPUT chain drops unsolicited inbound on eth0.
 
 # Create-if-absent then flush: idempotent across daemon restarts.
 table inet sandboxd-gateway-eth0 {}
@@ -426,27 +477,39 @@ table inet sandboxd-gateway-eth0 {
     # Allow loopback traffic (Docker bridge + in-VM processes).
     oifname "lo" accept
 
-    # Do NOT restrict traffic on socket_vmnet NICs (lima0…) — those are
-    # the VM-facing side managed by per-session gateway container nftables.
-    # This policy controls only eth0 (the management/uplink NIC).
+    # Do NOT restrict traffic on socket_vmnet NICs (lima0…) or Docker bridges —
+    # those are managed by per-session gateway container nftables and Docker's
+    # own FORWARD chain rules. This policy controls only eth0.
     oifname != "eth0" accept
 
-    # Allow established/related: responses to connections the gateway
-    # containers re-originated upstream after intercepting session traffic.
+    # Allow return traffic for connections already opened.
+    # This rule is load-bearing: all port-specific accepts below depend on it
+    # for the return path (established/related flows).
     ct state established,related accept
 
-    # Allow outbound DNS so Lima's resolver, systemd-resolved, and the
-    # Docker embedded resolver (127.0.0.11) can forward queries upstream.
+    # DNS: systemd-resolved forwards queries to upstream resolvers.
     ip protocol udp udp dport 53 accept
     ip protocol tcp tcp dport 53 accept
 
-    # Everything else on eth0 is dropped (default policy above).
+    # HTTPS: Docker daemon pulls gateway images from registries; Lima agents
+    # communicate over HTTPS.
+    ip protocol tcp tcp dport 443 accept
+
+    # HTTP: apt-get package updates; some Docker registries use plain HTTP.
+    ip protocol tcp tcp dport 80 accept
+
+    # Drop invalid/untracked packets.
+    ct state invalid drop
+
+    # Default drop: all other VM-host-namespace new outbound on eth0 is
+    # blocked. A component that escapes its container namespace cannot freely
+    # egress — only DNS, HTTPS, and HTTP are permitted.
   }
 
   chain input-eth0 {
     type filter hook input priority 0; policy accept;
 
-    # Accept established/related on eth0 (return traffic for DNS + upstream).
+    # Accept established/related on eth0 (return traffic for VM-opened connections).
     iifname "eth0" ct state established,related accept
 
     # Drop new/invalid inbound connections on eth0 — no external host
@@ -480,6 +543,11 @@ fn apply_limactl_env(cmd: &mut Command, daemon_uid: u32) {
     let current_path = std::env::var("PATH").unwrap_or_default();
     let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
     let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        tracing::warn!(
+            "apply_limactl_env: HOME is unset; limactl may fail to locate its config directory"
+        );
+    }
 
     cmd.env_clear()
         .env("LIMA_HOME", &lima_home_str)
@@ -499,13 +567,17 @@ fn apply_limactl_env(cmd: &mut Command, daemon_uid: u32) {
 fn apply_docker_env(cmd: &mut Command) {
     let current_path = std::env::var("PATH").unwrap_or_default();
     let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        tracing::warn!(
+            "apply_docker_env: HOME is unset; docker CLI may fail to locate its config directory"
+        );
+    }
 
     // env_clear removes DOCKER_HOST and all other ambient overrides; then we
     // reconstruct only the vars the docker CLI needs to locate its binary
     // dependencies.
-    cmd.env_clear()
-        .env("PATH", &path_value)
-        .env("HOME", std::env::var("HOME").unwrap_or_default());
+    cmd.env_clear().env("PATH", &path_value).env("HOME", home);
 }
 
 // ---------------------------------------------------------------------------
@@ -728,17 +800,33 @@ impl GatewayLimaManager {
     /// Write the gateway template YAML to a file and run `limactl create`.
     fn create_instance(&self) -> Result<(), SandboxError> {
         let template_content = generate_gateway_template(self.max_slots);
-        let instance_dir = self.daemon_lima_home.join(GATEWAY_INSTANCE_NAME);
 
-        // Create the instance directory so we can write the template.
-        std::fs::create_dir_all(&instance_dir).map_err(|e| {
+        // Write the template to a sibling directory of LIMA_HOME — NOT inside
+        // LIMA_HOME itself. If the template is written inside LIMA_HOME (e.g.
+        // at LIMA_HOME/sandboxd-gateway/lima.yaml), limactl will see the
+        // directory during instance enumeration before `limactl create` runs
+        // and will report "instance already exists". Writing outside LIMA_HOME
+        // sidesteps this, mirroring the `write_operator_readable_template`
+        // pattern in `lima.rs`.
+        let template_dir = self
+            .daemon_lima_home
+            .parent()
+            .ok_or_else(|| {
+                SandboxError::Internal(format!(
+                    "gateway: daemon_lima_home {} has no parent",
+                    self.daemon_lima_home.display()
+                ))
+            })?
+            .to_path_buf();
+
+        std::fs::create_dir_all(&template_dir).map_err(|e| {
             SandboxError::Internal(format!(
-                "gateway: failed to create instance directory {}: {e}",
-                instance_dir.display()
+                "gateway: failed to create template dir {}: {e}",
+                template_dir.display()
             ))
         })?;
 
-        let template_path = instance_dir.join("lima.yaml");
+        let template_path = template_dir.join("sandboxd-gateway-tmpl.yaml");
         std::fs::write(&template_path, &template_content).map_err(|e| {
             SandboxError::Internal(format!(
                 "gateway: failed to write template to {}: {e}",
@@ -747,7 +835,7 @@ impl GatewayLimaManager {
         })?;
         info!(path = %template_path.display(), "gateway Lima template written");
 
-        let output = self.executor.run(
+        let result = self.executor.run(
             self.daemon_uid,
             LimaOp::Create {
                 vm: GATEWAY_INSTANCE_NAME,
@@ -759,8 +847,12 @@ impl GatewayLimaManager {
             },
             GATEWAY_CREATE_TIMEOUT,
             "gateway: limactl create",
-        )?;
+        );
 
+        // Clean up the temp template file regardless of success/failure.
+        let _ = std::fs::remove_file(&template_path);
+
+        let output = result?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SandboxError::Lima(format!(
@@ -810,17 +902,61 @@ impl GatewayLimaManager {
         Ok(())
     }
 
-    /// Poll `docker -H unix://<socket> info` until success or timeout.
+    /// Poll until the gateway Docker daemon is reachable via the forwarded socket.
+    ///
+    /// Two-phase readiness:
+    ///
+    /// 1. **Inside-VM check (via `limactl shell`)**: wait until `docker info`
+    ///    succeeds inside the VM. This is the authoritative signal that the Docker
+    ///    daemon is running and its socket is available in the VM, regardless of
+    ///    whether the Lima host-side socket forward is set up yet.
+    ///
+    /// 2. **Host-side socket forward check**: once Docker is confirmed running
+    ///    inside the VM, poll the forwarded socket path with `docker -H` until
+    ///    it is accessible from the macOS host. Lima establishes the socket
+    ///    forward via SSH at VM-start time; if the forward was set up before
+    ///    Docker started (during cloud-init), Lima may need a moment to re-detect
+    ///    the socket.
     fn wait_docker_ready(&self) -> Result<(), SandboxError> {
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
         let deadline = Instant::now() + DOCKER_READY_TIMEOUT;
 
         info!(
             socket = %self.gateway_docker_socket.display(),
             timeout_s = DOCKER_READY_TIMEOUT.as_secs(),
-            "waiting for gateway Docker socket to become ready"
+            "waiting for gateway Docker daemon to be ready"
         );
 
+        // Phase 1: wait for Docker inside the VM to be running.
+        loop {
+            let docker_check = self.run_gateway_shell(
+                "docker info >/dev/null 2>&1 && echo READY",
+                Duration::from_secs(15),
+            );
+
+            match docker_check {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if stdout.contains("READY") {
+                        info!("gateway Docker daemon running inside VM");
+                        break;
+                    }
+                }
+                _ => {}
+            }
+
+            if Instant::now() >= deadline {
+                return Err(SandboxError::Gateway(format!(
+                    "Docker daemon did not start inside gateway VM within {}s",
+                    DOCKER_READY_TIMEOUT.as_secs()
+                )));
+            }
+            thread::sleep(DOCKER_READY_POLL_INTERVAL);
+        }
+
+        // Phase 2: wait for the host-side forwarded socket to be accessible.
+        // Lima's host agent establishes the SSH socket forward; it may retry a
+        // few times after the in-VM Docker socket appears.
+        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
         loop {
             let mut cmd = Command::new("docker");
             apply_docker_env(&mut cmd);
@@ -829,12 +965,12 @@ impl GatewayLimaManager {
             let result = run_with_timeout(
                 &mut cmd,
                 Duration::from_secs(5),
-                "gateway: docker info probe",
+                "gateway: docker info probe via forwarded socket",
             );
 
             match result {
                 Ok(output) if output.status.success() => {
-                    info!("gateway Docker socket ready");
+                    info!("gateway Docker socket accessible from host");
                     return Ok(());
                 }
                 _ => {}
@@ -949,9 +1085,12 @@ impl GatewayLimaManager {
             )));
         }
 
-        // Step 2: apply the ruleset.
+        // Step 2: apply the ruleset. `nft` requires CAP_NET_ADMIN (root inside
+        // the VM); the Lima SSH user connects as the operator (non-root), so we
+        // use `sudo nft`. Lima provisions the Ubuntu VM with passwordless sudo
+        // for all users, so this is safe in the gateway VM context.
         let apply_output = self.run_gateway_shell(
-            "nft -f /tmp/sandboxd-gateway-eth0-nft.conf",
+            "sudo nft -f /tmp/sandboxd-gateway-eth0-nft.conf",
             NFT_INJECT_TIMEOUT,
         )?;
 
@@ -1232,15 +1371,45 @@ mod tests {
     }
 
     #[test]
-    fn nft_policy_allows_dns() {
+    fn nft_policy_allows_dns_port_53() {
         let ruleset = generate_gateway_eth0_nft_policy();
         assert!(
             ruleset.contains("udp dport 53 accept"),
-            "baseline nft must allow UDP DNS egress"
+            "baseline nft must allow DNS (UDP port 53) for systemd-resolved"
         );
         assert!(
             ruleset.contains("tcp dport 53 accept"),
-            "baseline nft must allow TCP DNS egress"
+            "baseline nft must allow DNS (TCP port 53) for systemd-resolved"
+        );
+    }
+
+    #[test]
+    fn nft_policy_allows_https_port_443() {
+        let ruleset = generate_gateway_eth0_nft_policy();
+        assert!(
+            ruleset.contains("tcp dport 443 accept"),
+            "baseline nft must allow HTTPS (TCP port 443) for Docker daemon image pulls and Lima agents"
+        );
+    }
+
+    #[test]
+    fn nft_policy_allows_http_port_80() {
+        let ruleset = generate_gateway_eth0_nft_policy();
+        assert!(
+            ruleset.contains("tcp dport 80 accept"),
+            "baseline nft must allow HTTP (TCP port 80) for apt-get and HTTP registries"
+        );
+    }
+
+    #[test]
+    fn nft_policy_does_not_have_blanket_new_accept() {
+        // The policy must NOT have a blanket `ct state new accept` on the OUTPUT
+        // chain — that would allow any VM-host-namespace process to egress
+        // anywhere, defeating the blast-radius bound.
+        let ruleset = generate_gateway_eth0_nft_policy();
+        assert!(
+            !ruleset.contains("ct state new accept"),
+            "baseline nft must NOT have a blanket ct state new accept; use explicit port allow-list"
         );
     }
 

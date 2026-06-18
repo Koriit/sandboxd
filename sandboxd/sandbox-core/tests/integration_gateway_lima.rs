@@ -185,10 +185,14 @@ mod tests {
         );
 
         // Verify baseline nft policy is loaded inside the VM.
+        // Use `sudo nft` because nft requires CAP_NET_ADMIN (root). Lima
+        // provisions Ubuntu VMs with passwordless sudo, so this is safe.
+        // HOME must be set — Lima panics without it.
         let daemon_uid = Uid::current().as_raw();
         let lima_home = operator_lima_home(daemon_uid);
         let lima_home_str = lima_home.to_string_lossy().into_owned();
         let current_path = std::env::var("PATH").unwrap_or_default();
+        let home_str = std::env::var("HOME").unwrap_or_default();
         let nft_output = std::process::Command::new("limactl")
             .args([
                 "shell",
@@ -196,7 +200,7 @@ mod tests {
                 "--",
                 "bash",
                 "-c",
-                "nft list table inet sandboxd-gateway-eth0",
+                "sudo nft list table inet sandboxd-gateway-eth0",
             ])
             .env_clear()
             .env("LIMA_HOME", &lima_home_str)
@@ -204,6 +208,7 @@ mod tests {
                 "PATH",
                 format!("/opt/homebrew/bin:/usr/local/bin:{current_path}"),
             )
+            .env("HOME", &home_str)
             .env("TERM", "dumb")
             .output()
             .expect("limactl shell nft list should run");
@@ -219,15 +224,19 @@ mod tests {
             .ensure_ready()
             .expect("second ensure_ready (daemon restart simulation) failed");
 
-        // Teardown: stop the gateway instance so subsequent runs start fresh.
-        manager.stop_instance().ok();
+        // No teardown: leave the gateway VM running so subsequent integration
+        // tests in this serial group can reuse the already-provisioned instance
+        // without the cost of a full re-create + cloud-init.
     }
 
     /// Test NIC discovery against a real gateway VM. The test verifies that
     /// `ip -json link show` returns the expected `limaN` interface names.
     #[test]
     fn integration_gateway_lima_nic_discovery_live() {
-        const MAX_SLOTS: u16 = 4;
+        // Use max_slots=2 to match the gateway created by the lifecycle test
+        // (which uses 2 slots for fast provisioning). NIC discovery asserts the
+        // discovered count equals max_slots when the gateway has the right NICs.
+        const MAX_SLOTS: u16 = 2;
         let pool = VmnetPool::new(MAX_SLOTS);
         let manager = build_test_manager(&pool);
         manager.ensure_ready().expect("ensure_ready failed");
@@ -280,6 +289,7 @@ mod tests {
         let lima_home_str = lima_home.to_string_lossy().into_owned();
         let current_path = std::env::var("PATH").unwrap_or_default();
 
+        let home_str = std::env::var("HOME").unwrap_or_default();
         let table_output = std::process::Command::new("limactl")
             .args([
                 "shell",
@@ -287,7 +297,7 @@ mod tests {
                 "--",
                 "bash",
                 "-c",
-                "nft list table inet sandboxd-gateway-eth0 2>&1",
+                "sudo nft list table inet sandboxd-gateway-eth0 2>&1",
             ])
             .env_clear()
             .env("LIMA_HOME", &lima_home_str)
@@ -295,6 +305,7 @@ mod tests {
                 "PATH",
                 format!("/opt/homebrew/bin:/usr/local/bin:{current_path}"),
             )
+            .env("HOME", &home_str)
             .env("TERM", "dumb")
             .output()
             .expect("limactl shell should run");
@@ -313,9 +324,28 @@ mod tests {
             table_content.contains("established") && table_content.contains("related"),
             "output chain should allow established/related"
         );
+        // The policy uses an explicit port allow-list (DNS, HTTPS, HTTP) rather than
+        // a blanket `ct state new accept`, bounding blast radius per the spec MUST.
         assert!(
             table_content.contains("dport 53"),
-            "output chain should allow port 53 (DNS)"
+            "output chain should allow DNS (port 53)"
+        );
+        assert!(
+            table_content.contains("dport 443"),
+            "output chain should allow HTTPS (port 443)"
+        );
+        assert!(
+            table_content.contains("dport 80"),
+            "output chain should allow HTTP (port 80)"
+        );
+        assert!(
+            !table_content.contains("ct state new accept"),
+            "output chain must NOT have a blanket ct state new accept"
+        );
+        // Inbound defense: drop new/invalid connections from external parties.
+        assert!(
+            table_content.contains("invalid") && table_content.contains("new drop"),
+            "input chain should drop new/invalid inbound connections on eth0"
         );
     }
 
