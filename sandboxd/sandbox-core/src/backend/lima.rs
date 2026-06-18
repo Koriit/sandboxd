@@ -217,7 +217,7 @@ impl SessionRuntime for LimaRuntime {
                     std::path::Path::new(template_path),
                 )
             } else {
-                manager.create_vm(&session_id_owned, &config, operator_identity)
+                manager.create_vm(&session_id_owned, &config, operator_identity, None)
             }
         })
         .await
@@ -535,6 +535,7 @@ mod tests {
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
             executor,
             "test-pool".to_string(),
+            false, // is_macos: Linux test environment
         ));
         LimaRuntime::new(registry)
     }
@@ -689,6 +690,7 @@ mod tests {
             crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
             executor,
             "test-pool".to_string(),
+            false, // is_macos: Linux test environment
         ));
         let rt = LimaRuntime::new(Arc::clone(&registry));
         assert!(

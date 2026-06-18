@@ -324,9 +324,12 @@ pub fn validate_backend(backend: &str) -> Result<(), String> {
 /// The agent writes the YAML verbatim after this check; it does not parse or
 /// reassemble the YAML. Shape validation asserts the YAML is safe to write:
 ///
-/// - No `vmType` key at the top level. Lima defaults to `vmType: "qemu"` when
-///   unset; any explicit override must be rejected to prevent a future daemon
-///   bug from shipping a `vz` or other YAML that bypasses the gateway.
+/// - The `vmType` key must be present at the top level and equal to `"qemu"`.
+///   Lima on macOS **defaults to VZ (Virtualization.framework)** when `vmType`
+///   is unset. VZ cannot attach socket_vmnet NICs, so a VM booting under VZ
+///   would use vzNAT and bypass the gateway entirely — voiding egress control.
+///   An absent `vmType` is therefore rejected, as is any value other than
+///   `"qemu"`. The daemon template must always emit `vmType: "qemu"` explicitly.
 /// - The `networks` sequence (if present) contains exactly one entry, that
 ///   entry is a mapping with a `socket` key and no `mode` key. Lima 2.x uses
 ///   `networks: [{socket: <path>}]` for unmanaged socket_vmnet attachments;
@@ -335,7 +338,7 @@ pub fn validate_backend(backend: &str) -> Result<(), String> {
 ///   accept in some versions).
 ///
 /// This function validates SHAPE only — structural properties of the YAML
-/// (vmType absence, socket NIC count, mode absence). The rendered field
+/// (vmType value, socket NIC count, mode absence). The rendered field
 /// values (socket paths, CIDR, wrapper path) are validated separately by
 /// the per-field validators called before this function.
 ///
@@ -371,18 +374,36 @@ pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<()
         _ => return Err("lima.yaml top-level must be a YAML mapping".to_string()),
     };
 
-    // Check: no `vmType` key at the top level.
+    // Check: `vmType` must be present and equal to `"qemu"`.
     //
-    // Parsing normalises all syntactic forms — `vmType: vz`, `{vmType: vz}`,
-    // `'vmType': vz`, `"vmType": vz` — into the same key in the mapping.
-    // Rejection is based on the key being present at all, so a future daemon
-    // that emits `vmType: qemu` would also be rejected here. If a Lima version
-    // ever requires an explicit `vmType: qemu`, this check and the daemon
-    // template must be updated together.
-    if top.contains_key("vmType") {
-        return Err("lima.yaml must not contain a top-level vmType key; \
-             only the Lima default (QEMU) is permitted"
-            .to_string());
+    // Lima on macOS defaults to VZ (Virtualization.framework) when `vmType` is
+    // unset. VZ cannot attach socket_vmnet NICs — it would boot the VM under
+    // vzNAT, bypassing the gateway and voiding egress control entirely. An
+    // absent `vmType` is therefore as dangerous as `vmType: vz` on macOS.
+    //
+    // The daemon template must always emit `vmType: "qemu"` explicitly so this
+    // check can verify the correct backend is selected. Any other value
+    // (`vz`, `libkrun`, etc.) or an absent key is rejected.
+    //
+    // Parsing normalises all syntactic forms — `vmType: qemu`, `{vmType: qemu}`,
+    // `'vmType': qemu`, `"vmType": qemu` — into the same key/value in the mapping,
+    // so this check is robust to YAML serialisation style.
+    let vmtype_val = top
+        .get("vmType")
+        .ok_or_else(|| {
+            "lima.yaml must contain vmType: \"qemu\"; absent vmType is rejected because \
+             Lima defaults to VZ on macOS, which cannot attach socket_vmnet and \
+             would void egress control"
+                .to_string()
+        })?
+        .as_str()
+        .ok_or_else(|| "lima.yaml vmType value must be a string".to_string())?;
+    if vmtype_val != "qemu" {
+        return Err(format!(
+            "lima.yaml vmType must be \"qemu\", got {vmtype_val:?}; \
+             vz (and any other non-qemu backend) cannot attach socket_vmnet \
+             and would void egress control"
+        ));
     }
 
     // Check: no `network` key (singular) at the top level. Some Lima versions
@@ -903,11 +924,12 @@ mod tests {
     // Lima YAML shape validation
     // -----------------------------------------------------------------------
 
-    /// Canonical block-style YAML with a single socket NIC and no vmType.
-    /// This is the form the daemon template produces and must be accepted.
+    /// Canonical block-style YAML with vmType: qemu and a single socket NIC.
+    /// This is the form the daemon's macOS template produces and must be accepted.
     #[test]
     fn lima_yaml_valid_shape_block_style() {
         let yaml = r#"
+vmType: "qemu"
 images:
   - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
     arch: aarch64
@@ -919,27 +941,41 @@ networks:
 "#;
         assert!(
             validate_lima_yaml_shape(yaml, "").is_ok(),
-            "canonical block-style YAML must be accepted"
+            "canonical block-style YAML with vmType: qemu must be accepted"
         );
     }
 
-    /// Flow-style `networks` sequence — `[{socket: /path}]` on one line.
+    /// Flow-style `networks` sequence with vmType: qemu.
     /// A buggy daemon using a YAML serializer could produce this form. The
     /// structural parser normalises it to the same Value as the block form,
-    /// so it must also be accepted (one socket NIC, no mode, no vmType).
+    /// so it must also be accepted (vmType: qemu, one socket NIC, no mode).
     #[test]
     fn lima_yaml_valid_shape_flow_style_networks() {
-        let yaml = "cpus: 2\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}]\n";
+        let yaml =
+            "vmType: qemu\ncpus: 2\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}]\n";
         assert!(
             validate_lima_yaml_shape(yaml, "").is_ok(),
-            "flow-style single socket NIC must be accepted — parser normalises to same Value"
+            "flow-style single socket NIC with vmType: qemu must be accepted"
+        );
+    }
+
+    /// vmType absent — must be rejected. Lima on macOS defaults to VZ when
+    /// vmType is unset, which cannot attach socket_vmnet and voids egress control.
+    #[test]
+    fn lima_yaml_rejects_missing_vmtype() {
+        let yaml = "networks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
+        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        assert!(
+            result.is_err(),
+            "absent vmType must be rejected — Lima defaults to VZ on macOS, \
+             which cannot attach socket_vmnet and would void egress control"
         );
     }
 
     /// vmType: vz — must be rejected regardless of serialisation style.
     #[test]
     fn lima_yaml_rejects_vmtype_vz() {
-        let yaml = "vmType: vz\nnetworks:\n  - socket: /foo.sock\n";
+        let yaml = "vmType: vz\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
         let result = validate_lima_yaml_shape(yaml, "test-vm");
         assert!(
             result.is_err(),
@@ -947,27 +983,34 @@ networks:
         );
     }
 
-    /// vmType: qemu — also rejected (the key must be absent entirely).
+    /// vmType: qemu — must now be accepted (required for macOS QEMU guarantee).
     #[test]
-    fn lima_yaml_rejects_vmtype_qemu_explicit() {
-        // Even the "correct" vmType value is rejected: the key must be absent.
-        // The daemon template omits it; any explicit value indicates unexpected
-        // daemon behaviour and is rejected conservatively.
-        let yaml = "vmType: qemu\nnetworks:\n  - socket: /foo.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+    fn lima_yaml_accepts_vmtype_qemu_explicit() {
+        let yaml = "vmType: qemu\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
+        let result = validate_lima_yaml_shape(yaml, "");
         assert!(
-            result.is_err(),
-            "explicit vmType: qemu must be rejected — key must be absent"
+            result.is_ok(),
+            "explicit vmType: qemu must be accepted; error: {:?}",
+            result.err()
         );
     }
 
-    /// Flow-style vmType: `{vmType: vz, networks: [...]}` on one line.
-    /// Previously evadable with line-by-line checking if vmType appeared
-    /// inside braces on a line that didn't start with `vmType:`. The
-    /// structural parser catches this regardless of serialisation style.
+    /// vmType: libkrun — a non-qemu, non-vz backend — must be rejected.
+    #[test]
+    fn lima_yaml_rejects_vmtype_non_qemu() {
+        let yaml = "vmType: libkrun\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
+        let result = validate_lima_yaml_shape(yaml, "");
+        assert!(
+            result.is_err(),
+            "vmType: libkrun must be rejected — only qemu is permitted"
+        );
+    }
+
+    /// Flow-style vmType: vz — rejected regardless of serialisation style.
+    /// The structural parser catches this regardless of serialisation style.
     #[test]
     fn lima_yaml_rejects_vmtype_flow_style() {
-        // Inline flow-mapping for the whole document — vmType in braces.
+        // Inline flow-mapping for the whole document — vmType: vz in braces.
         // The YAML parser normalises this to the same top-level mapping.
         let yaml = "{vmType: vz, networks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}]}\n";
         let result = validate_lima_yaml_shape(yaml, "");
@@ -980,7 +1023,7 @@ networks:
     /// No `networks` key at all — must be rejected.
     #[test]
     fn lima_yaml_rejects_missing_networks() {
-        let yaml = "cpus: 2\nmemory: \"4GiB\"\ndisk: \"20GiB\"\n";
+        let yaml = "vmType: qemu\ncpus: 2\nmemory: \"4GiB\"\ndisk: \"20GiB\"\n";
         let result = validate_lima_yaml_shape(yaml, "test-vm");
         assert!(
             result.is_err(),
@@ -991,7 +1034,7 @@ networks:
     /// Two socket NIC entries — only one is permitted.
     #[test]
     fn lima_yaml_rejects_multiple_socket_nics() {
-        let yaml = "networks:\n  - socket: /slot-0.sock\n  - socket: /slot-1.sock\n";
+        let yaml = "vmType: qemu\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n  - socket: /var/run/sandbox/vmnet/slot-1.sock\n";
         let result = validate_lima_yaml_shape(yaml, "test-vm");
         assert!(
             result.is_err(),
@@ -1006,7 +1049,7 @@ networks:
     /// the sequence directly.
     #[test]
     fn lima_yaml_rejects_multiple_socket_nics_flow_style() {
-        let yaml = "networks: [{socket: /slot-0.sock}, {socket: /slot-1.sock}]\n";
+        let yaml = "vmType: qemu\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}, {socket: /var/run/sandbox/vmnet/slot-1.sock}]\n";
         let result = validate_lima_yaml_shape(yaml, "test-vm");
         assert!(
             result.is_err(),
@@ -1019,7 +1062,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_nic_with_mode_key() {
         // Single NIC entry containing both socket and mode — extra key, rejected.
-        let yaml = "networks:\n  - socket: /slot-0.sock\n    mode: shared\n";
+        let yaml = "vmType: qemu\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n    mode: shared\n";
         let result = validate_lima_yaml_shape(yaml, "test-vm");
         assert!(
             result.is_err(),
@@ -1034,7 +1077,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_nic_mode_in_flow_style() {
         // Flow-style NIC mapping with both socket and mode.
-        let yaml = "networks: [{socket: /slot-0.sock, mode: shared}]\n";
+        let yaml = "vmType: qemu\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock, mode: shared}]\n";
         let result = validate_lima_yaml_shape(yaml, "test-vm");
         assert!(
             result.is_err(),
@@ -1051,7 +1094,7 @@ networks:
     /// and the sequence-length check catches the extra NIC.
     #[test]
     fn lima_yaml_rejects_anchor_alias_extra_nic() {
-        let yaml = "networks:\n  - &nic\n    socket: /slot-0.sock\n  - *nic\n";
+        let yaml = "vmType: qemu\nnetworks:\n  - &nic\n    socket: /var/run/sandbox/vmnet/slot-0.sock\n  - *nic\n";
         let result = validate_lima_yaml_shape(yaml, "test-vm");
         assert!(
             result.is_err(),
@@ -1069,7 +1112,7 @@ networks:
         // serde_yaml parses 'socket' and socket as the same string key.
         // A single-NIC YAML with a quoted key must be accepted — the check is
         // on the parsed structure, not the raw text.
-        let yaml = "networks:\n  - 'socket': /var/run/sandbox/vmnet/slot-0.sock\n";
+        let yaml = "vmType: qemu\nnetworks:\n  - 'socket': /var/run/sandbox/vmnet/slot-0.sock\n";
         assert!(
             validate_lima_yaml_shape(yaml, "").is_ok(),
             "quoted 'socket' key must be accepted — parser normalises to same key"
@@ -1258,6 +1301,137 @@ networks:
         assert!(
             result.is_err(),
             "relative socket path must be rejected by shape validation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Validator round-trip: real daemon-rendered macOS template output
+    //
+    // These fixtures are derived from the actual output of
+    // `LimaManager::generate_template` with `is_macos=true`. They serve as
+    // ground truth: any change to the macOS template generation that breaks
+    // these tests indicates a shape violation the agent would reject.
+    // -----------------------------------------------------------------------
+
+    /// Round-trip: the daemon's macOS sandbox VM template (slot 0, no workspace,
+    /// operator uid == 1000) must pass `validate_lima_yaml_shape`.
+    ///
+    /// This is the canonical minimal rendered template. All other macOS template
+    /// variants (different slots, operator-uid cloud-init, shared workspace) share
+    /// the same shape-critical fields — only their provision scripts differ.
+    #[test]
+    fn validator_roundtrip_macos_template_slot0_no_workspace() {
+        // This YAML mirrors the actual output of generate_template_macos for:
+        //   session_id = "550e8400e29b", vmnet_slot = 0, operator_identity = None
+        // Key shape invariants: vmType: "qemu" present, networks with one socket
+        // entry in /var/run/sandbox/vmnet/, no mode key, no network (singular) key.
+        let yaml = r#"# Auto-generated Lima template for macOS sandbox session 550e8400e29b
+minimumLimaVersion: "2.0.0"
+
+vmType: "qemu"
+
+images:
+- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+cpus: 2
+memory: "4GiB"
+disk: "20GiB"
+
+networks:
+- socket: /var/run/sandbox/vmnet/slot-0.sock
+
+mounts: []
+portForwards: []
+
+containerd:
+  system: false
+  user: false
+
+user:
+  name: "sandbox"
+  home: "/home/sandbox"
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    hostnamectl set-hostname sandbox-550e8400e29b
+"#;
+        let result = validate_lima_yaml_shape(yaml, "sandbox-550e8400e29b");
+        assert!(
+            result.is_ok(),
+            "canonical macOS template (slot 0) must pass shape validation; error: {:?}",
+            result.err()
+        );
+    }
+
+    /// Round-trip: macOS template with a non-zero slot index.
+    #[test]
+    fn validator_roundtrip_macos_template_slot3() {
+        let yaml = r#"minimumLimaVersion: "2.0.0"
+vmType: "qemu"
+images:
+- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+cpus: 2
+memory: "4GiB"
+disk: "20GiB"
+networks:
+- socket: /var/run/sandbox/vmnet/slot-3.sock
+mounts: []
+portForwards: []
+containerd:
+  system: false
+  user: false
+user:
+  name: "sandbox"
+  home: "/home/sandbox"
+"#;
+        let result = validate_lima_yaml_shape(yaml, "");
+        assert!(
+            result.is_ok(),
+            "macOS template with slot 3 must pass shape validation; error: {:?}",
+            result.err()
+        );
+    }
+
+    /// Round-trip: macOS template with a 9p shared workspace mount.
+    /// The shape validator inspects vmType (must be qemu), networks, and socket
+    /// paths — not the mounts section content.
+    #[test]
+    fn validator_roundtrip_macos_template_with_shared_workspace() {
+        let yaml = r#"minimumLimaVersion: "2.0.0"
+vmType: "qemu"
+images:
+- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+cpus: 2
+memory: "4GiB"
+disk: "20GiB"
+networks:
+- socket: /var/run/sandbox/vmnet/slot-1.sock
+mountType: "9p"
+mounts:
+- location: "/home/operator/project"
+  mountPoint: "/workspace"
+  writable: true
+  9p:
+    securityModel: mapped-xattr
+    cache: mmap
+portForwards: []
+containerd:
+  system: false
+  user: false
+user:
+  name: "sandbox"
+  home: "/home/sandbox"
+"#;
+        let result = validate_lima_yaml_shape(yaml, "");
+        assert!(
+            result.is_ok(),
+            "macOS template with 9p shared workspace must pass shape validation; error: {:?}",
+            result.err()
         );
     }
 }

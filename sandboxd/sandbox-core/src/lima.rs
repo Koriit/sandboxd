@@ -1111,6 +1111,10 @@ pub struct LimaManagerRegistry {
     /// the Lima orphan reaper can attribute VMs to this daemon. Shared
     /// across all per-operator managers (same daemon = same pool).
     owner_pool: String,
+    /// Whether this registry is running on macOS.  Propagated to every
+    /// [`LimaManager`] created by [`get_or_create`] so template generation
+    /// and wrapper selection use the correct platform paths.
+    is_macos: bool,
     /// Provisioning function: creates the per-operator LIMA_HOME directory
     /// and applies the POSIX ACL.  Production wiring uses
     /// `ensure_operator_lima_home`; tests inject a closure that provisions
@@ -1135,12 +1139,18 @@ impl LimaManagerRegistry {
     ///
     /// `owner_pool` is the canonical pool CIDR string stamped via `--owner`
     /// on every `create`/`clone` helper call.
-    pub fn new(base_vm_name: String, executor: Arc<dyn LimaExecutor>, owner_pool: String) -> Self {
+    pub fn new(
+        base_vm_name: String,
+        executor: Arc<dyn LimaExecutor>,
+        owner_pool: String,
+        is_macos: bool,
+    ) -> Self {
         Self {
             managers: Mutex::new(HashMap::new()),
             executor,
             base_vm_name,
             owner_pool,
+            is_macos,
             provision_lima_home: Box::new(ensure_operator_lima_home),
         }
     }
@@ -1158,6 +1168,7 @@ impl LimaManagerRegistry {
         base_vm_name: String,
         executor: Arc<dyn LimaExecutor>,
         owner_pool: String,
+        is_macos: bool,
         provision: F,
     ) -> Self
     where
@@ -1168,6 +1179,7 @@ impl LimaManagerRegistry {
             executor,
             base_vm_name,
             owner_pool,
+            is_macos,
             provision_lima_home: Box::new(provision),
         }
     }
@@ -1219,6 +1231,7 @@ impl LimaManagerRegistry {
             op_uid,
             self.base_vm_name.clone(),
             self.owner_pool.clone(),
+            self.is_macos,
         ));
 
         // Re-lock and insert, using entry().or_insert_with so that a
@@ -1284,6 +1297,26 @@ Environment=RUST_LOG=info
 
 [Install]
 WantedBy=multi-user.target";
+
+// ---------------------------------------------------------------------------
+// Shared Ubuntu cloud-image URL constants
+// ---------------------------------------------------------------------------
+
+/// Canonical Ubuntu 24.04 (Noble) cloud-image for x86_64.
+///
+/// Used by the Linux base template and the Linux session template. Centralised
+/// here so a URL change (new release, mirror move) is a single-location edit
+/// rather than a silently-diverging copy across multiple format strings.
+const UBUNTU_IMAGE_AMD64: &str =
+    "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img";
+
+/// Canonical Ubuntu 24.04 (Noble) cloud-image for arm64 (Apple Silicon + Linux arm64).
+///
+/// Used by the Linux base template, the Linux session template, and the macOS
+/// session template. Centralised alongside [`UBUNTU_IMAGE_AMD64`] — the two
+/// constants form the complete cross-arch image set for all templates.
+const UBUNTU_IMAGE_ARM64: &str =
+    "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img";
 
 /// QEMU wrapper script that injects PCIe root-port, bridge networking,
 /// device lockdown, and optional cgroup resource limits via `systemd-run`.
@@ -1442,6 +1475,150 @@ else
 fi
 "#;
 
+/// macOS QEMU wrapper script that injects `restrict=on` into Lima's mandatory
+/// slirp management NIC (`eth0`) for each sandbox VM.
+///
+/// This wrapper is the egress-enforcement surface for macOS sandbox VMs.
+/// It must be fail-closed: if it cannot find exactly one `-netdev user,...`
+/// token, it aborts the launch rather than starting a VM with an unrestricted
+/// management NIC.
+///
+/// Genuine macOS deltas from the Linux wrapper:
+///
+/// 1. **Binary name** — `qemu-system-aarch64` (Apple Silicon only).
+/// 2. **Firmware path** — Lima derives the edk2 firmware search path from the
+///    qemu binary's directory (`../share/qemu/edk2-aarch64-code.fd`).  The
+///    wrapper's directory must contain a `share/qemu` symlink pointing to the
+///    Homebrew firmware directory so Lima can resolve the firmware.  The symlink
+///    is created by `ensure_qemu_wrapper_macos()` alongside the script.
+/// 3. **HVF via exec** — the wrapper `exec`s the real Homebrew-signed QEMU
+///    (`com.apple.security.hypervisor` entitlement is re-acquired on `exec`).
+/// 4. **No bridge NIC** — socket_vmnet is the gateway-facing NIC; the wrapper
+///    never appends a second NIC.  The bridge-networking block is absent.
+/// 5. **No systemd-run / cgroup limits** — cgroups don't exist on macOS.
+/// 6. **Marker file** — the wrapper records the final rewritten `-netdev`
+///    token to `$SANDBOX_RESTRICT_MARKER` (an absolute path in the instance
+///    dir, set by the daemon before the limactl start invocation). The
+///    broker-mediated post-boot verification reads this as fallback evidence
+///    (M20-S6 prefers a live QMP query).
+///
+/// The rewrite algorithm (identical to the Linux wrapper):
+/// Scan argv for every `-netdev user,...` token (both split and single-arg
+/// forms), strip any existing `restrict=` field, splice `,restrict=on`, and
+/// confirm exactly one such token was found. Zero or more than one → abort.
+///
+/// `SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING=1` skips the rewrite (base
+/// image builds need unrestricted slirp for apt package installation).
+#[cfg(target_os = "macos")]
+const QEMU_WRAPPER_MACOS_SCRIPT: &str = r#"#!/bin/sh
+# macOS QEMU wrapper injected by sandboxd (sandbox VMs only).
+#
+# Injects restrict=on into Lima's mandatory slirp management NIC (eth0) so
+# the guest cannot egress except through the gateway.  Fail-closed: aborts
+# if it cannot find exactly one -netdev user,... token.
+#
+# Does NOT apply cgroup limits (Linux-only feature) or bridge networking.
+# Socket_vmnet is the gateway-facing NIC — this wrapper never touches it.
+
+# Find the real qemu-system-aarch64, excluding this wrapper's directory
+# (which Lima prepends to PATH) to prevent infinite recursion.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REAL_QEMU=""
+IFS=:
+for dir in $PATH; do
+    [ "$dir" = "$SCRIPT_DIR" ] && continue
+    if [ -x "$dir/qemu-system-aarch64" ]; then
+        REAL_QEMU="$dir/qemu-system-aarch64"
+        break
+    fi
+done
+unset IFS
+[ -z "$REAL_QEMU" ] && { echo "sandboxd qemu-wrapper: qemu-system-aarch64 not found on PATH (excluding wrapper dir $SCRIPT_DIR)" >&2; exit 1; }
+
+# Lima runs probe commands (-machine help, -cpu help, -accel help, --version,
+# etc.) through the wrapper.  Pass these straight to QEMU without extra flags.
+for arg in "$@"; do
+    case "$arg" in
+        help|--version|--help|-help)
+            exec "$REAL_QEMU" "$@" ;;
+    esac
+done
+
+# Restrict=on rewrite: splice restrict=on into Lima's management slirp netdev.
+# Skipped for base-image provisioning builds (unrestricted slirp needed for apt).
+if [ "$SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING" != "1" ]; then
+    user_netdev_count=0
+    rewritten_netdev=""
+
+    remaining=$#
+    while [ "$remaining" -gt 0 ]; do
+        arg="$1"
+        shift
+        remaining=$((remaining - 1))
+
+        if [ "$arg" = "-netdev" ] && [ "$remaining" -gt 0 ]; then
+            netdev="$1"
+            shift
+            remaining=$((remaining - 1))
+
+            case "$netdev" in
+                user|user,*)
+                    user_netdev_count=$((user_netdev_count + 1))
+                    # Strip any existing restrict= field, then splice restrict=on.
+                    IFS=,
+                    restricted_netdev=""
+                    for field in $netdev; do
+                        case "$field" in
+                            restrict=*) continue ;;
+                        esac
+                        if [ -z "$restricted_netdev" ]; then
+                            restricted_netdev="$field"
+                        else
+                            restricted_netdev="$restricted_netdev,$field"
+                        fi
+                    done
+                    unset IFS
+                    netdev="$restricted_netdev,restrict=on"
+                    rewritten_netdev="$netdev"
+                    ;;
+            esac
+
+            set -- "$@" "$arg" "$netdev"
+        else
+            set -- "$@" "$arg"
+        fi
+    done
+
+    # Fail closed: exactly one user netdev required.
+    if [ "$user_netdev_count" -eq 0 ]; then
+        echo "sandboxd qemu-wrapper: no -netdev user,... token found in QEMU argv — Lima version incompatibility? Aborting to prevent unrestricted slirp egress." >&2
+        exit 1
+    fi
+    if [ "$user_netdev_count" -gt 1 ]; then
+        echo "sandboxd qemu-wrapper: found $user_netdev_count -netdev user,... tokens (expected exactly 1) — Aborting." >&2
+        exit 1
+    fi
+
+    # Belt-and-suspenders: confirm restrict=on is present in the rewritten token.
+    case "$rewritten_netdev" in
+        *restrict=on*)
+            ;;
+        *)
+            echo "sandboxd qemu-wrapper: restrict=on not present in rewritten netdev '$rewritten_netdev' — Aborting." >&2
+            exit 1
+            ;;
+    esac
+
+    # Record the rewritten netdev token to the marker file (if requested).
+    # The broker-mediated post-boot verification reads this as fallback evidence.
+    if [ -n "$SANDBOX_RESTRICT_MARKER" ]; then
+        printf '%s\n' "$rewritten_netdev" > "$SANDBOX_RESTRICT_MARKER" 2>/dev/null || true
+    fi
+fi
+
+exec "$REAL_QEMU" "$@"
+"#;
+
 /// Manages Lima virtual machines that back sandbox sessions.
 ///
 /// All VMs are named `sandbox-{session_id}` so they can be distinguished from
@@ -1476,6 +1653,11 @@ pub struct LimaManager {
     /// The Lima orphan reaper reads this marker to attribute VMs to this
     /// daemon without relying on LIMA_HOME isolation alone.
     owner_pool: String,
+    /// Whether this manager is running on macOS. Controls template generation
+    /// (socket_vmnet NIC instead of bridge, no Linux seccomp/cgroup wrapper,
+    /// aarch64-only image) and wrapper selection
+    /// (`ensure_qemu_wrapper_macos` vs `ensure_qemu_wrapper`).
+    is_macos: bool,
     /// Serialises concurrent `build_base_image` calls for this operator.
     /// A single `Arc<LimaManager>` is shared across all callers for the
     /// same operator (vended by `LimaManagerRegistry`), so two concurrent
@@ -1506,6 +1688,7 @@ impl LimaManager {
         op_uid: u32,
         base_vm_name: String,
         owner_pool: String,
+        is_macos: bool,
     ) -> Self {
         Self {
             base_dir,
@@ -1513,6 +1696,7 @@ impl LimaManager {
             op_uid,
             base_vm_name,
             owner_pool,
+            is_macos,
             build_lock: std::sync::Mutex::new(()),
         }
     }
@@ -1532,6 +1716,27 @@ impl LimaManager {
             op_uid,
             base_vm_name,
             owner_pool: "test-pool".to_string(),
+            is_macos: false,
+            build_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Test constructor with explicit `is_macos` flag, for macOS template tests.
+    #[cfg(test)]
+    pub fn with_helper_path_and_platform(
+        base_dir: PathBuf,
+        helper_path: PathBuf,
+        op_uid: u32,
+        base_vm_name: String,
+        is_macos: bool,
+    ) -> Self {
+        Self {
+            base_dir,
+            executor: Arc::new(SetuidHelperExecutor::new(helper_path)),
+            op_uid,
+            base_vm_name,
+            owner_pool: "test-pool".to_string(),
+            is_macos,
             build_lock: std::sync::Mutex::new(()),
         }
     }
@@ -1656,8 +1861,9 @@ impl LimaManager {
         session_id: &SessionId,
         config: &SessionConfig,
         operator_identity: Option<(u32, u32)>,
+        vmnet_slot: Option<u16>,
     ) -> Result<(), SandboxError> {
-        let template = self.generate_template(session_id, config, operator_identity);
+        let template = self.generate_template(session_id, config, operator_identity, vmnet_slot);
         // Write the template to a world-readable tempfile outside LIMA_HOME
         // so the operator-uid `limactl create` can open it without touching
         // the LIMA_HOME subdirectory tree (which Lima enumerates for instances).
@@ -1770,7 +1976,7 @@ impl LimaManager {
         unrestricted_slirp_for_provisioning: bool,
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
-        let qemu_wrapper = self.ensure_qemu_wrapper()?;
+        let qemu_wrapper = self.resolve_qemu_wrapper()?;
 
         info!(
             session_id = %session_id,
@@ -2249,7 +2455,7 @@ impl LimaManager {
             .map_err(|e| SandboxError::Internal(format!("LimaManager build_lock poisoned: {e}")))?;
         // 3. Start the VM with QEMU wrapper for hardening.
         info!("starting base VM (this may take several minutes for cloud-init)");
-        let qemu_wrapper = self.ensure_qemu_wrapper()?;
+        let qemu_wrapper = self.resolve_qemu_wrapper()?;
 
         let output = self.run_helper(
             LimaOp::Start {
@@ -2446,6 +2652,8 @@ impl LimaManager {
     /// provisioning scripts (user creation, socat/git, Docker install).
     pub fn generate_base_template(&self) -> String {
         let base_vm_name = &self.base_vm_name;
+        let ubuntu_amd64 = UBUNTU_IMAGE_AMD64;
+        let ubuntu_arm64 = UBUNTU_IMAGE_ARM64;
         format!(
             r#"# Auto-generated Lima template for golden base image
 minimumLimaVersion: "2.0.0"
@@ -2453,9 +2661,9 @@ minimumLimaVersion: "2.0.0"
 vmType: "qemu"
 
 images:
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+- location: "{ubuntu_amd64}"
   arch: "x86_64"
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+- location: "{ubuntu_arm64}"
   arch: "aarch64"
 
 cpus: 4
@@ -2612,6 +2820,19 @@ provision:
 
     /// Generate the Lima YAML template for a session.
     ///
+    /// On macOS (`self.is_macos == true`) the template uses:
+    /// - A single `aarch64` image (Apple Silicon only).
+    /// - A `networks: [{socket: /var/run/sandbox/vmnet/slot-<n>.sock}]` entry
+    ///   for the socket_vmnet slot allocated to this session
+    ///   (`vmnet_slot` must be `Some` on macOS).
+    /// - No Linux seccomp/cgroup wrapper (`SANDBOX_DOCKER_BRIDGE`, etc.).
+    /// - Same cloud-init provisioning, `mountType: 9p`, and operator-uid
+    ///   alignment as Linux.
+    ///
+    /// On Linux (`self.is_macos == false`) the template is the same as before:
+    /// both `amd64` and `aarch64` images, no `networks:` section (the bridge
+    /// NIC is added by the QEMU wrapper at runtime via `SANDBOX_DOCKER_BRIDGE`).
+    ///
     /// # Panics
     ///
     /// Panics (via `sanitize_yaml_path`) if a shared-workspace `host_path`
@@ -2619,12 +2840,24 @@ provision:
     /// practice this cannot happen because `WorkspaceMode::parse_flag`
     /// validates the path before it reaches this point, but the check here
     /// acts as defense-in-depth.
+    ///
+    /// Also panics if `self.is_macos && vmnet_slot.is_none()` (a macOS
+    /// template requires a slot index).
     pub fn generate_template(
         &self,
         session_id: &SessionId,
         config: &SessionConfig,
         operator_identity: Option<(u32, u32)>,
+        vmnet_slot: Option<u16>,
     ) -> String {
+        if self.is_macos {
+            return self.generate_template_macos(
+                session_id,
+                config,
+                operator_identity,
+                vmnet_slot.expect("generate_template on macOS requires a vmnet_slot"),
+            );
+        }
         // Hostname includes the full 12-hex session id. At 20 chars it is
         // well under the POSIX HOST_NAME_MAX of 64.
         let hostname = format!("sandbox-{session_id}");
@@ -2751,9 +2984,9 @@ minimumLimaVersion: "2.0.0"
 vmType: "qemu"
 
 images:
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+- location: "{ubuntu_amd64}"
   arch: "x86_64"
-- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+- location: "{ubuntu_arm64}"
   arch: "aarch64"
 
 cpus: {cpus}
@@ -2898,10 +3131,311 @@ provision:
             hardened_section = hardened_section,
             usermod_section = usermod_section,
             hostname = hostname,
+            ubuntu_amd64 = UBUNTU_IMAGE_AMD64,
+            ubuntu_arm64 = UBUNTU_IMAGE_ARM64,
+        )
+    }
+
+    /// Generate the macOS-specific Lima YAML template for a sandbox session VM.
+    ///
+    /// Key differences from the Linux template:
+    /// - **Single `aarch64` image** (Apple Silicon only; no `amd64` entry).
+    /// - **`networks: [{socket: ...}]`** socket_vmnet NIC for the allocated
+    ///   vmnet slot.  Lima adds its mandatory slirp management NIC automatically.
+    /// - **Explicit `vmType: "qemu"`** — Lima on macOS defaults to VZ
+    ///   (Virtualization.framework) when `vmType` is unset, and VZ cannot attach
+    ///   socket_vmnet NICs.  A VM booting under VZ would use vzNAT and bypass
+    ///   the gateway entirely, voiding egress control.  The template always
+    ///   emits `vmType: "qemu"` explicitly; the agent's
+    ///   `validate_lima_yaml_shape` now requires it.
+    /// - **No Linux process-isolation wrapper** — `systemd-run`, cgroups,
+    ///   namespace flags, and QEMU `-sandbox` seccomp are Linux-only features.
+    /// - **Static IP cloud-init** — the socket_vmnet segment has no DHCP.
+    ///   The sandbox VM's gateway NIC (`lima0`) is configured with a static
+    ///   `B+4` address and default route pointing to the gateway container
+    ///   (`B+3`), where `B` is the /29 base for slot `n`.
+    ///   (`10.209.128.0 + 8*n` per the subnet allocation table.)
+    /// - Everything else (cloud-init provisioning, operator-uid alignment,
+    ///   9p mounts, hardened video/audio) is identical to Linux.
+    ///
+    /// Called by [`generate_template`] when `self.is_macos == true`.
+    fn generate_template_macos(
+        &self,
+        session_id: &SessionId,
+        config: &SessionConfig,
+        operator_identity: Option<(u32, u32)>,
+        vmnet_slot: u16,
+    ) -> String {
+        let hostname = format!("sandbox-{session_id}");
+        let memory_gib = format!("{}GiB", mib_to_gib_string(config.memory_mb));
+        let disk_gib = format!("{}GiB", config.disk_gb);
+
+        // Compute the /29 base for this slot: 10.209.128.0 + 8*n
+        // Address roles per § Subnet allocation:
+        //   B+3 = gateway container IP (the VM's default route)
+        //   B+4 = sandbox VM IP (assigned statically via cloud-init)
+        let slot = vmnet_slot as u32;
+        let base_u32: u32 = (10 << 24) | (209 << 16) | (128 << 8) | (slot * 8);
+        let gateway_ip = format!(
+            "{}.{}.{}.{}",
+            (base_u32 >> 24) & 0xff,
+            (base_u32 >> 16) & 0xff,
+            (base_u32 >> 8) & 0xff,
+            (base_u32 & 0xff) + 3,
+        );
+        let vm_ip = format!(
+            "{}.{}.{}.{}",
+            (base_u32 >> 24) & 0xff,
+            (base_u32 >> 16) & 0xff,
+            (base_u32 >> 8) & 0xff,
+            (base_u32 & 0xff) + 4,
+        );
+        let socket_path = format!("/var/run/sandbox/vmnet/slot-{vmnet_slot}.sock");
+
+        // Mounts section — identical logic to the Linux path.
+        let mounts_section = match &config.workspace_mode {
+            Some(WorkspaceMode::Shared {
+                host_path,
+                guest_path,
+                security_model,
+            }) => {
+                let safe_host = sanitize_yaml_path(host_path);
+                let safe_guest = sanitize_yaml_path(guest_path);
+                let model = security_model.unwrap_or_default().as_yaml();
+                format!(
+                    "\
+mountType: \"9p\"
+mounts:
+- location: \"{safe_host}\"
+  mountPoint: \"{safe_guest}\"
+  writable: true
+  9p:
+    securityModel: {model}
+    cache: mmap"
+                )
+            }
+            _ => "mounts: []".to_string(),
+        };
+
+        let hardened_section = if config.hardened {
+            "\nvideo:\n  display: \"none\"\naudio:\n  device: \"none\""
+        } else {
+            ""
+        };
+
+        // Operator-uid alignment cloud-init — identical to Linux.
+        let usermod_section = match operator_identity {
+            Some((uid, gid)) if uid != 1000 || gid != 1000 => format!(
+                "- mode: system\n  \
+                 script: |\n    \
+                 #!/bin/bash\n    \
+                 set -eux -o pipefail\n    \
+                 echo \"[sandbox-provision] step=operator-uid start=$(date -u +%Y-%m-%dT%H:%M:%S)\"\n    \
+                 # Re-align the in-VM `sandbox` account's uid/gid with the\n    \
+                 # operator's host-side identity ({uid}:{gid}). The base\n    \
+                 # image bakes uid/gid 1000; this step bumps them to the\n    \
+                 # operator's values so 9p mapped-xattr shared workspaces\n    \
+                 # and synthetic /etc/passwd consistency hold.\n    \
+                 if id sandbox &>/dev/null; then\n    \
+                   current_uid=$(id -u sandbox)\n    \
+                   current_gid=$(id -g sandbox)\n    \
+                   if [ \"$current_uid\" != \"{uid}\" ] || [ \"$current_gid\" != \"{gid}\" ]; then\n    \
+                     # `groupmod` first because `usermod -u` validates\n    \
+                     # the primary group still exists at the new gid.\n    \
+                     groupmod -g {gid} sandbox\n    \
+                     usermod -u {uid} -g {gid} sandbox\n    \
+                     chown -R {uid}:{gid} /home/sandbox\n    \
+                   fi\n    \
+                 fi\n    \
+                 echo \"[sandbox-provision] step=operator-uid done=$(date -u +%Y-%m-%dT%H:%M:%S)\"\n"
+            ),
+            _ => String::new(),
+        };
+
+        format!(
+            r#"# Auto-generated Lima template for macOS sandbox session {session_id}
+minimumLimaVersion: "2.0.0"
+
+vmType: "qemu"
+
+images:
+- location: "{ubuntu_arm64}"
+  arch: "aarch64"
+
+cpus: {cpus}
+memory: "{memory_gib}"
+disk: "{disk_gib}"
+
+networks:
+- socket: {socket_path}
+
+{mounts_section}
+portForwards: []
+{hardened_section}
+containerd:
+  system: false
+  user: false
+
+user:
+  name: "sandbox"
+  home: "/home/sandbox"
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=hostname start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    hostnamectl set-hostname {hostname}
+    if ! grep -q '{hostname}' /etc/hosts; then
+      echo "127.0.1.1 {hostname}" >> /etc/hosts
+    fi
+    echo "[sandbox-provision] step=hostname done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=user start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    if ! id sandbox &>/dev/null; then
+      useradd -m -d /home/sandbox -s /bin/bash sandbox
+    fi
+    echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
+    chmod 0440 /etc/sudoers.d/sandbox
+    echo "[sandbox-provision] step=user done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+{usermod_section}- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=net-tune start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Clamp eth0 (the slirp/Lima management NIC) MTU to 1280.
+    # libslirp doesn't relay host PMTU into the guest; 1280 is the
+    # IPv6 minimum — safe on all paths.
+    install -m 0600 /dev/stdin /etc/netplan/99-sandbox-mtu.yaml <<'NETPLAN_EOF'
+    network:
+      version: 2
+      ethernets:
+        eth0:
+          mtu: 1280
+    NETPLAN_EOF
+    netplan apply
+    echo "[sandbox-provision] step=net-tune done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=net-vmnet start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Configure lima0 (socket_vmnet NIC) with a static IP.
+    # The socket_vmnet segment has no DHCP; addresses are assigned statically.
+    # B+4 = sandbox VM IP; B+3 = gateway container (default route).
+    # Without this, systemd-networkd stalls at boot waiting for DHCP
+    # that never arrives on the network-identifier segment.
+    install -m 0600 /dev/stdin /etc/netplan/99-sandbox-vmnet.yaml <<'NETPLAN_EOF'
+    network:
+      version: 2
+      ethernets:
+        lima0:
+          dhcp4: no
+          addresses:
+            - {vm_ip}/29
+          routes:
+            - to: default
+              via: {gateway_ip}
+          nameservers:
+            addresses:
+              - {gateway_ip}
+    NETPLAN_EOF
+    netplan apply
+    echo "[sandbox-provision] step=net-vmnet done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=apt-config start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
+    cat > /etc/apt/apt.conf.d/99sandbox <<'APTEOF'
+    Acquire::http::Timeout "5";
+    Acquire::https::Timeout "5";
+    Acquire::Retries "5";
+    Acquire::ForceIPv4 "true";
+    Acquire::Queue-Mode "access";
+    Acquire::http::Pipeline-Depth "0";
+    Acquire::https::Pipeline-Depth "0";
+    APTEOF
+    echo "[sandbox-provision] step=apt-config done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    echo "[sandbox-provision] step=apt-baseline start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    if ! command -v socat &>/dev/null \
+        || ! command -v git &>/dev/null \
+        || ! command -v rsync &>/dev/null \
+        || ! command -v docker &>/dev/null; then
+      attempt=1
+      max_attempts=3
+      until apt-get update -qq && apt-get install -y socat git rsync docker.io; do
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "[sandbox-provision] apt-baseline failed after $max_attempts attempts" >&2
+          exit 1
+        fi
+        echo "[sandbox-provision] apt-baseline attempt=$attempt failed, retrying" >&2
+        attempt=$((attempt + 1))
+        sleep 10
+      done
+      echo "[sandbox-provision] apt-baseline succeeded after $attempt attempt(s)"
+    fi
+    mkdir -p /home/sandbox/workspace
+    chown sandbox:sandbox /home/sandbox/workspace
+    echo "[sandbox-provision] step=apt-baseline done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=docker start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    if command -v docker &>/dev/null; then
+      usermod -aG docker sandbox
+    fi
+    echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+"#,
+            session_id = session_id,
+            cpus = config.cpus,
+            memory_gib = memory_gib,
+            disk_gib = disk_gib,
+            socket_path = socket_path,
+            mounts_section = mounts_section,
+            hardened_section = hardened_section,
+            usermod_section = usermod_section,
+            hostname = hostname,
+            vm_ip = vm_ip,
+            gateway_ip = gateway_ip,
+            ubuntu_arm64 = UBUNTU_IMAGE_ARM64,
         )
     }
 
     // -- helpers ------------------------------------------------------------
+
+    /// Return the appropriate QEMU wrapper path for this platform.
+    ///
+    /// On macOS (`self.is_macos`) delegates to `ensure_qemu_wrapper_macos`;
+    /// on Linux delegates to `ensure_qemu_wrapper`.
+    fn resolve_qemu_wrapper(&self) -> Result<PathBuf, SandboxError> {
+        if self.is_macos {
+            #[cfg(target_os = "macos")]
+            {
+                self.ensure_qemu_wrapper_macos()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(SandboxError::Internal(
+                    "resolve_qemu_wrapper: is_macos=true but cfg(target_os) is not macos"
+                        .to_string(),
+                ))
+            }
+        } else {
+            self.ensure_qemu_wrapper()
+        }
+    }
 
     /// Create a QEMU wrapper script that injects process hardening.
     ///
@@ -2999,6 +3533,99 @@ provision:
     #[doc(hidden)]
     pub fn ensure_qemu_wrapper_for_test(&self) -> Result<PathBuf, SandboxError> {
         self.ensure_qemu_wrapper()
+    }
+
+    /// Create the macOS `restrict=on` qemu-wrapper and its firmware symlink.
+    ///
+    /// # Wrapper binary
+    ///
+    /// The wrapper script is written to `{operator_state_root}/libexec/` as
+    /// `qemu-system-aarch64` (mode 0755, world-executable).  Lima passes the
+    /// wrapper dir via `--qemu-binary-path` (which it derives from
+    /// `--qemu-wrapper`) to resolve firmware paths, so the binary name must
+    /// match Lima's probing logic (`qemu-system-aarch64`).
+    ///
+    /// # Firmware symlink
+    ///
+    /// Lima derives the edk2 firmware search path from the qemu binary's
+    /// directory: `<wrapper_dir>/../share/qemu/edk2-aarch64-code.fd`.  The
+    /// wrapper's parent directory must therefore expose `share/qemu/` pointing
+    /// at the Homebrew firmware dir so Lima can resolve the firmware.  This
+    /// function creates:
+    ///
+    /// ```text
+    /// {operator_state_root}/
+    ///   libexec/
+    ///     qemu-system-aarch64   ← wrapper script (mode 0755)
+    ///   share -> /opt/homebrew/share  ← symlink for firmware resolution
+    /// ```
+    ///
+    /// If the Homebrew share dir (`/opt/homebrew/share`) does not exist
+    /// (non-macOS build, or Homebrew not installed), the symlink creation is
+    /// silently skipped — Lima will emit a firmware warning on first use, but
+    /// the wrapper itself is still functional.
+    ///
+    /// # Returns
+    ///
+    /// The absolute path to the wrapper script.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ensure_qemu_wrapper_macos(&self) -> Result<PathBuf, SandboxError> {
+        let state_root = self.base_dir.parent().ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "base_dir {} has no parent — cannot derive operator state root for macOS QEMU wrapper",
+                self.base_dir.display()
+            ))
+        })?;
+        let wrapper_dir = state_root.join("libexec");
+        std::fs::create_dir_all(&wrapper_dir)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper_dir, std::fs::Permissions::from_mode(0o755))?;
+        }
+
+        // Write the wrapper script as `qemu-system-aarch64` (aarch64 only on macOS).
+        let wrapper_path = wrapper_dir.join("qemu-system-aarch64");
+        let script = QEMU_WRAPPER_MACOS_SCRIPT;
+        std::fs::write(&wrapper_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+
+        // Create a `share` symlink in the state root pointing at the Homebrew
+        // share directory so Lima can find the edk2 firmware.  Lima resolves:
+        //   <wrapper_dir>/../share/qemu/edk2-aarch64-code.fd
+        // which expands to:
+        //   {state_root}/share/qemu/edk2-aarch64-code.fd → Homebrew firmware.
+        let share_link = state_root.join("share");
+        let homebrew_share = std::path::Path::new("/opt/homebrew/share");
+        if homebrew_share.exists() && !share_link.exists() {
+            #[cfg(unix)]
+            {
+                if let Err(e) = std::os::unix::fs::symlink(homebrew_share, &share_link) {
+                    // Non-fatal: Lima will warn about missing firmware but the wrapper works.
+                    debug!(
+                        link = %share_link.display(),
+                        target = %homebrew_share.display(),
+                        error = %e,
+                        "macOS QEMU wrapper: could not create firmware symlink (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        debug!(path = %wrapper_path.display(), "macOS QEMU wrapper script ready");
+        Ok(wrapper_path)
+    }
+
+    /// Test-only escape hatch for the macOS wrapper.
+    #[cfg(all(test, target_os = "macos"))]
+    pub fn ensure_qemu_wrapper_macos_for_test(&self) -> Result<PathBuf, SandboxError> {
+        self.ensure_qemu_wrapper_macos()
     }
 
     /// Read the operator's Lima SSH private key by invoking
@@ -3374,7 +4001,7 @@ mod tests {
         let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default(); // 2 CPU, 4096 MB, 20 GB
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         // Parse as YAML via serde_json (Lima YAML is a superset; we
         // just verify key fields are present via string inspection and
@@ -3478,7 +4105,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         assert!(
             template.contains("cpus: 8"),
@@ -3528,7 +4155,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
         assert!(
             template.contains("memory: \"1.5GiB\""),
             "template should handle fractional GiB"
@@ -3571,7 +4198,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         // Should NOT contain the empty mounts placeholder.
         assert!(
@@ -3647,7 +4274,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         // SF-17 round-trip: an explicit `Some(MappedXattr)` should
         // serialize to the same `securityModel: mapped-xattr` line as
@@ -3686,7 +4313,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         // SF-17 round-trip: an explicit `Some(NoneMapping)` should
         // serialize to `securityModel: none` (the YAML wire form).
@@ -3720,7 +4347,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         // Clone mode should NOT add mounts — cloning is handled post-boot.
         assert!(
@@ -3770,7 +4397,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         assert!(
             template.contains("mounts: []"),
@@ -3926,7 +4553,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         assert!(
             template.contains("display: \"none\""),
@@ -3968,7 +4595,7 @@ mod tests {
             rootless_docker: None,
         };
 
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
 
         assert!(
             !template.contains("display: \"none\""),
@@ -4004,7 +4631,7 @@ mod tests {
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default();
-        let template = mgr.generate_template(&id, &config, None);
+        let template = mgr.generate_template(&id, &config, None, None);
         assert!(
             !template.contains("step=operator-uid"),
             "operator_identity=None must NOT emit the operator-uid \
@@ -4027,7 +4654,7 @@ mod tests {
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default();
-        let template = mgr.generate_template(&id, &config, Some((1000, 1000)));
+        let template = mgr.generate_template(&id, &config, Some((1000, 1000)), None);
         assert!(
             !template.contains("step=operator-uid"),
             "operator_identity=Some((1000, 1000)) coincides with the \
@@ -4057,7 +4684,7 @@ mod tests {
         );
         let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default();
-        let template = mgr.generate_template(&id, &config, Some((5001, 5001)));
+        let template = mgr.generate_template(&id, &config, Some((5001, 5001)), None);
         // Step header.
         assert!(
             template.contains("step=operator-uid start="),
@@ -5228,6 +5855,7 @@ mod tests {
                 "/usr/local/libexec/sandboxd/sandbox-lima-helper",
             ))),
             "test-pool".to_string(),
+            false, // is_macos: Linux test environment
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -5251,6 +5879,7 @@ mod tests {
                 "/usr/local/libexec/sandboxd/sandbox-lima-helper",
             ))),
             "test-pool".to_string(),
+            false, // is_macos: Linux test environment
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -5276,6 +5905,7 @@ mod tests {
                 "/usr/local/libexec/sandboxd/sandbox-lima-helper",
             ))),
             "test-pool".to_string(),
+            false, // is_macos: Linux test environment
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -5324,6 +5954,7 @@ mod tests {
                 "/usr/local/libexec/sandboxd/sandbox-lima-helper",
             ))),
             "test-pool".to_string(),
+            false, // is_macos: Linux test environment
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -5379,6 +6010,7 @@ mod tests {
                 "/usr/local/libexec/sandboxd/sandbox-lima-helper",
             ))),
             "test-pool".to_string(),
+            false, // is_macos: Linux test environment
             move |uid| {
                 ensure_operator_lima_home_at(&root, nix::unistd::Uid::current().as_raw(), uid)
             },
@@ -5829,5 +6461,386 @@ mod tests {
             deleted.iter().any(|(_, s)| s == SID_B),
             "SID_B must be deleted; deleted={deleted:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS qemu-wrapper script content tests
+    // -----------------------------------------------------------------------
+
+    /// The macOS wrapper must detect the real qemu-system-aarch64 binary,
+    /// pass probe commands straight through, and rewrite the user netdev.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_script_probe_passthrough() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("help|--version|--help|-help"),
+            "macOS wrapper must pass Lima probe commands straight through"
+        );
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("exec \"$REAL_QEMU\" \"$@\""),
+            "macOS wrapper must exec probe commands without modification"
+        );
+    }
+
+    /// The macOS wrapper must contain the in-place restrict=on rewrite.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_rewrites_user_netdev() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("user|user,*)"),
+            "macOS wrapper must scan for -netdev user,... backends"
+        );
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("netdev=\"$restricted_netdev,restrict=on\""),
+            "macOS wrapper must splice restrict=on into the user netdev"
+        );
+    }
+
+    /// Fail-closed: zero user netdev tokens → abort.
+    ///
+    /// The shell variable is referenced as `"$user_netdev_count"` (quoted expansion)
+    /// in the actual script; the test must match the exact form used.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_fails_closed_on_zero_user_netdev() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("\"$user_netdev_count\" -eq 0"),
+            "macOS wrapper must abort when no -netdev user,... token is found; \
+             check that the zero-count guard uses \"$user_netdev_count\" -eq 0"
+        );
+    }
+
+    /// Fail-closed: >1 user netdev tokens → abort.
+    ///
+    /// The shell variable is referenced as `"$user_netdev_count"` (quoted expansion)
+    /// in the actual script; the test must match the exact form used.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_fails_closed_on_multiple_user_netdevs() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("\"$user_netdev_count\" -gt 1"),
+            "macOS wrapper must abort when more than one -netdev user,... token is found; \
+             check that the multiple-count guard uses \"$user_netdev_count\" -gt 1"
+        );
+    }
+
+    /// The wrapper must verify restrict=on is present after the rewrite.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_confirms_restrict_on_present() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("*restrict=on*)"),
+            "macOS wrapper must confirm restrict=on is present in the rewritten token"
+        );
+    }
+
+    /// The wrapper must record the rewritten netdev to the marker file.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_writes_marker_file() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("SANDBOX_RESTRICT_MARKER"),
+            "macOS wrapper must write the rewritten netdev token to SANDBOX_RESTRICT_MARKER"
+        );
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("> \"$SANDBOX_RESTRICT_MARKER\""),
+            "macOS wrapper must write marker file content"
+        );
+    }
+
+    /// The wrapper must respect SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_respects_unrestricted_slirp_flag() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING"),
+            "macOS wrapper must skip rewrite when SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING=1"
+        );
+    }
+
+    /// The macOS wrapper must NOT contain bridge networking (socket_vmnet is
+    /// the gateway-facing NIC; the wrapper never adds a second NIC).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_has_no_bridge_networking() {
+        assert!(
+            !QEMU_WRAPPER_MACOS_SCRIPT.contains("SANDBOX_DOCKER_BRIDGE"),
+            "macOS wrapper must not reference SANDBOX_DOCKER_BRIDGE; bridge networking is Linux-only"
+        );
+        assert!(
+            !QEMU_WRAPPER_MACOS_SCRIPT.contains("qemu-bridge-helper"),
+            "macOS wrapper must not reference qemu-bridge-helper"
+        );
+    }
+
+    /// The macOS wrapper must NOT contain systemd-run (cgroups are Linux-only).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_has_no_systemd_run() {
+        assert!(
+            !QEMU_WRAPPER_MACOS_SCRIPT.contains("systemd-run"),
+            "macOS wrapper must not use systemd-run; cgroup limits are Linux-only"
+        );
+    }
+
+    /// The macOS wrapper targets qemu-system-aarch64 (Apple Silicon only).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_qemu_wrapper_targets_aarch64() {
+        assert!(
+            QEMU_WRAPPER_MACOS_SCRIPT.contains("qemu-system-aarch64"),
+            "macOS wrapper must target qemu-system-aarch64 (Apple Silicon)"
+        );
+        assert!(
+            !QEMU_WRAPPER_MACOS_SCRIPT.contains("qemu-system-x86_64"),
+            "macOS wrapper must not reference x86_64 QEMU binary"
+        );
+    }
+
+    /// Idempotent: re-running ensure_qemu_wrapper_macos with an existing
+    /// wrapper file overwrites it cleanly.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_ensure_qemu_wrapper_is_idempotent() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let lima_home = dir.path().join("lima");
+        std::fs::create_dir_all(&lima_home).expect("create lima_home");
+        let mgr = LimaManager::with_helper_path_and_platform(
+            lima_home,
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
+            DEFAULT_BASE_VM_NAME.to_string(),
+            true,
+        );
+
+        let wrapper1 = mgr.ensure_qemu_wrapper_macos_for_test().unwrap();
+        let wrapper2 = mgr.ensure_qemu_wrapper_macos_for_test().unwrap();
+        assert_eq!(
+            wrapper1, wrapper2,
+            "idempotent calls must return the same path"
+        );
+        assert!(
+            wrapper1.exists(),
+            "wrapper script must exist after second call"
+        );
+        let content = std::fs::read_to_string(&wrapper1).unwrap();
+        assert!(
+            content.contains("restrict=on"),
+            "wrapper must contain restrict=on rewrite logic"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS generate_template tests
+    // -----------------------------------------------------------------------
+
+    fn macos_mgr() -> LimaManager {
+        LimaManager::with_helper_path_and_platform(
+            PathBuf::from("/tmp/test/lima"),
+            PathBuf::from("/usr/local/libexec/sandboxd/sandbox-lima-helper"),
+            nix::unistd::Uid::current().as_raw(),
+            DEFAULT_BASE_VM_NAME.to_string(),
+            true,
+        )
+    }
+
+    /// macOS template must use aarch64 image only (no amd64 entry).
+    #[test]
+    fn macos_template_uses_aarch64_image_only() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, None, Some(0));
+        assert!(
+            template.contains("aarch64"),
+            "macOS template must contain aarch64 image"
+        );
+        assert!(
+            !template.contains("amd64") && !template.contains("x86_64"),
+            "macOS template must not contain x86_64/amd64 image entry"
+        );
+    }
+
+    /// macOS template must have a networks: [{socket: ...}] entry for the
+    /// allocated vmnet slot.
+    #[test]
+    fn macos_template_has_socket_vmnet_nic() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, None, Some(3));
+        assert!(
+            template.contains("networks:"),
+            "macOS template must contain networks section"
+        );
+        assert!(
+            template.contains("- socket: /var/run/sandbox/vmnet/slot-3.sock"),
+            "macOS template must reference the correct vmnet slot socket path"
+        );
+    }
+
+    /// macOS template must explicitly emit `vmType: "qemu"`.
+    /// Lima on macOS defaults to VZ when vmType is unset; VZ cannot attach
+    /// socket_vmnet and would void egress control. The template must always
+    /// emit vmType: "qemu" explicitly so the agent validator can enforce it.
+    #[test]
+    fn macos_template_has_vmtype_qemu() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, None, Some(0));
+        assert!(
+            template.contains("vmType: \"qemu\""),
+            "macOS template must emit vmType: \"qemu\"; Lima defaults to VZ on macOS \
+             when vmType is unset, which cannot attach socket_vmnet and voids egress control"
+        );
+    }
+
+    /// macOS template must NOT contain Linux seccomp/cgroup wrapper references.
+    #[test]
+    fn macos_template_has_no_linux_wrapper() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, None, Some(0));
+        assert!(
+            !template.contains("SANDBOX_DOCKER_BRIDGE"),
+            "macOS template must not reference SANDBOX_DOCKER_BRIDGE"
+        );
+        assert!(
+            !template.contains("systemd-run"),
+            "macOS template must not reference systemd-run"
+        );
+    }
+
+    /// macOS template must contain static IP cloud-init for the socket_vmnet NIC.
+    #[test]
+    fn macos_template_has_static_ip_cloud_init() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        // Slot 0: B=10.209.128.0, B+3=.3 (gateway), B+4=.4 (VM)
+        let template = mgr.generate_template(&id, &config, None, Some(0));
+        assert!(
+            template.contains("10.209.128.4/29"),
+            "macOS template slot 0 must configure VM IP 10.209.128.4/29; got: {}",
+            &template[..template.len().min(3000)]
+        );
+        assert!(
+            template.contains("via: 10.209.128.3"),
+            "macOS template slot 0 must set default route via gateway 10.209.128.3"
+        );
+    }
+
+    /// Verify static IP arithmetic for a non-zero slot.
+    #[test]
+    fn macos_template_static_ip_slot_2() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        // Slot 2: B=10.209.128.16, B+3=.19 (gateway), B+4=.20 (VM)
+        let template = mgr.generate_template(&id, &config, None, Some(2));
+        assert!(
+            template.contains("10.209.128.20/29"),
+            "macOS template slot 2 must configure VM IP 10.209.128.20/29"
+        );
+        assert!(
+            template.contains("via: 10.209.128.19"),
+            "macOS template slot 2 must set default route via gateway 10.209.128.19"
+        );
+    }
+
+    /// macOS template must emit operator-uid cloud-init when uid != 1000.
+    #[test]
+    fn macos_template_emits_operator_uid_step_for_non_default_uid() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, Some((5001, 5001)), Some(0));
+        assert!(
+            template.contains("step=operator-uid"),
+            "macOS template must emit operator-uid cloud-init step for uid != 1000"
+        );
+        assert!(
+            template.contains("groupmod -g 5001 sandbox"),
+            "macOS template must call groupmod with operator gid"
+        );
+        assert!(
+            template.contains("usermod -u 5001 -g 5001 sandbox"),
+            "macOS template must call usermod with operator uid:gid"
+        );
+    }
+
+    /// macOS template must elide operator-uid cloud-init at uid 1000.
+    #[test]
+    fn macos_template_elides_operator_uid_step_at_1000() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, Some((1000, 1000)), Some(0));
+        assert!(
+            !template.contains("step=operator-uid"),
+            "macOS template must elide operator-uid step at uid 1000 (no-op)"
+        );
+    }
+
+    /// macOS template must pass structural shape validation.
+    ///
+    /// This test checks the key invariants the agent's `validate_lima_yaml_shape`
+    /// enforces: vmType must be "qemu", networks with exactly one socket entry, and
+    /// the socket path confined to `/var/run/sandbox/vmnet/`. It does so via text
+    /// inspection (sandbox-core has no serde_yaml dep; the full structural parse
+    /// lives in sandbox-agent's `validate_lima_yaml_shape` which is tested
+    /// separately by the validator round-trip test in sandbox-agent/src/validation.rs).
+    #[test]
+    fn macos_template_shape_is_valid_for_agent_validator() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, None, Some(0));
+
+        // 1. vmType: "qemu" must be present. Lima defaults to VZ on macOS when
+        //    vmType is absent; VZ cannot attach socket_vmnet and voids egress.
+        assert!(
+            template.contains("vmType: \"qemu\""),
+            "macOS template must emit vmType: \"qemu\" (agent validator requires it)"
+        );
+        // 2. networks section present.
+        assert!(
+            template.contains("\nnetworks:"),
+            "macOS template must have a networks: section"
+        );
+        // 3. Exactly one socket entry within /var/run/sandbox/vmnet/.
+        let socket_count = template
+            .matches("- socket: /var/run/sandbox/vmnet/")
+            .count();
+        assert_eq!(
+            socket_count, 1,
+            "macOS template must have exactly one socket vmnet entry; found {socket_count}"
+        );
+        // 4. No mode: key inside the networks section.
+        assert!(
+            !template.contains("  mode:"),
+            "macOS template must not have a mode: key in the networks section"
+        );
+        // 5. No top-level network: (singular) key.
+        //
+        // The naive check (iterate lines and strip_start) false-positives on the
+        // netplan `network:` root key embedded inside the cloud-init `script:` block
+        // (which is a multi-line string value, not a top-level YAML key). The real
+        // agent validator (`validate_lima_yaml_shape`) parses structurally and only
+        // checks top-level keys — it never trips on `network:` inside a string value.
+        //
+        // Reliable proxy for top-level YAML keys: lines that start at column 0 (no
+        // leading whitespace). The netplan `network:` key is always indented inside
+        // the provision script block; a true top-level `network:` would start at col 0.
+        for line in template.lines() {
+            if line.starts_with("network:") {
+                panic!(
+                    "macOS template must not have a top-level 'network:' key (column 0); \
+                     found: {line:?}"
+                );
+            }
+        }
     }
 }

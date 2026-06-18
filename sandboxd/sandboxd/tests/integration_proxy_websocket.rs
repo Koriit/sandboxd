@@ -447,6 +447,7 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
         "sandbox-base-test".to_string(),
         executor,
         "test-pool".to_string(),
+        false, // is_macos: Linux test environment
     ));
     let proxy_state = Arc::new(ProxyState {
         store,

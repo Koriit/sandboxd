@@ -8814,6 +8814,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allocation_pool.base(),
             allocation_pool.prefix_len()
         ),
+        cfg!(target_os = "macos"),
     ));
 
     // On macOS: construct the GatewayLimaManager. The gateway instance is

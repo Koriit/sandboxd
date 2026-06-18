@@ -36,6 +36,7 @@ async fn integration_backends_endpoint_lists_registered_backends_in_stable_order
         DEFAULT_BASE_VM_NAME.to_string(),
         executor,
         "test-pool".to_string(),
+        false, // is_macos: Linux test environment
     ));
     let lima = LimaRuntime::new(registry);
 

@@ -73,6 +73,7 @@ fn capture_wrapper_argv_with_user_netdev(
         nix::unistd::Uid::current().as_raw(),
         DEFAULT_BASE_VM_NAME.to_string(),
         "test-pool".to_string(),
+        false, // is_macos: Linux test environment
     );
     let wrapper_path: PathBuf = mgr
         .ensure_qemu_wrapper_for_test()
@@ -163,6 +164,7 @@ fn capture_wrapper_argv_with_extra_env(
         nix::unistd::Uid::current().as_raw(),
         DEFAULT_BASE_VM_NAME.to_string(),
         "test-pool".to_string(),
+        false, // is_macos: Linux test environment
     );
     let wrapper_path: PathBuf = mgr
         .ensure_qemu_wrapper_for_test()
