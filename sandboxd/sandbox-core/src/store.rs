@@ -2647,6 +2647,7 @@ mod tests {
             gateway_ip: "10.209.0.2".to_string(),
             vm_ip: "10.209.0.3".to_string(),
             docker_network_name: format!("sandbox-net-{}", session.id),
+            vmnet_slot: None,
         };
 
         store
@@ -2676,6 +2677,7 @@ mod tests {
             gateway_ip: "10.209.0.2".to_string(),
             vm_ip: "10.209.0.3".to_string(),
             docker_network_name: "sandbox-net-xxx".to_string(),
+            vmnet_slot: None,
         };
 
         let result = store.set_network_info(&missing_id(), TEST_CALLER, &net_info);
@@ -2729,6 +2731,7 @@ mod tests {
             gateway_ip: "10.209.0.2".to_string(),
             vm_ip: "10.209.0.3".to_string(),
             docker_network_name: format!("sandbox-net-{}", s1.id),
+            vmnet_slot: None,
         };
         let info2 = crate::network::NetworkInfo {
             bridge_name: "sb-bbb".to_string(),
@@ -2736,6 +2739,7 @@ mod tests {
             gateway_ip: "10.209.0.18".to_string(),
             vm_ip: "10.209.0.19".to_string(),
             docker_network_name: format!("sandbox-net-{}", s2.id),
+            vmnet_slot: None,
         };
 
         store

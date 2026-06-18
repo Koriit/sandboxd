@@ -133,6 +133,7 @@ fn test_network_info() -> NetworkInfo {
         gateway_ip: "10.209.15.2".to_string(),
         vm_ip: "10.209.15.3".to_string(),
         docker_network_name: "sandbox-net-validator".to_string(),
+        vmnet_slot: None,
     }
 }
 

@@ -137,6 +137,7 @@ mod tests {
             gateway_ip: "10.209.0.2".to_string(),
             vm_ip: "10.209.0.3".to_string(),
             docker_network_name: "sandbox-net-test".to_string(),
+            vmnet_slot: None,
         };
 
         let mac = "52:54:00:55:0e:84";
