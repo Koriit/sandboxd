@@ -1168,22 +1168,26 @@ setup-darwin-vmnet-daemons: setup-darwin-vmnet-plists
 	  plist_path="$(DARWIN_LAUNCH_DAEMONS_DIR)/$$label.plist"; \
 	  socket_path="/var/run/sandbox/vmnet/slot-$$slot.sock"; \
 	  \
-	  if launchctl print "system/$$label" >/dev/null 2>&1 && [ -S "$$socket_path" ]; then \
+	  if [ -f "$$plist_path" ] && launchctl print "system/$$label" >/dev/null 2>&1; then \
 	    echo "$(GREEN)✓ already configured: $$label running, socket $$socket_path present$(RESET)"; \
 	  else \
-	    echo "[sudo] launchctl bootstrap system $$plist_path"; \
-	    sudo -k launchctl bootstrap system "$$plist_path" 2>/dev/null || true; \
-	    echo "[sudo] launchctl enable system/$$label"; \
-	    sudo -k launchctl enable "system/$$label" 2>/dev/null || true; \
-	    echo "  waiting for socket $$socket_path (up to 10 s)..."; \
-	    for i in 1 2 3 4 5 6 7 8 9 10; do \
-	      [ -S "$$socket_path" ] && break; \
-	      sleep 1; \
+	    if ! launchctl print "system/$$label" >/dev/null 2>&1; then \
+	      echo "[sudo] launchctl bootstrap system $$plist_path"; \
+	      sudo -k launchctl bootstrap system "$$plist_path" 2>/dev/null || true; \
+	      echo "[sudo] launchctl enable system/$$label"; \
+	      sudo launchctl enable "system/$$label" 2>/dev/null || true; \
+	    fi; \
+	    echo "  waiting for socket $$socket_path (up to 60 s)..."; \
+	    i=0; \
+	    while [ $$i -lt 60 ]; do \
+	      sudo test -S "$$socket_path" 2>/dev/null && break; \
+	      sleep 2; \
+	      i=$$((i + 2)); \
 	    done; \
-	    if [ -S "$$socket_path" ]; then \
+	    if sudo test -S "$$socket_path" 2>/dev/null; then \
 	      echo "$(GREEN)✓ $$label started, socket $$socket_path present$(RESET)"; \
 	    else \
-	      echo "ERROR: socket $$socket_path did not appear after 10 s."; \
+	      echo "ERROR: socket $$socket_path did not appear after 60 s."; \
 	      echo "  Check: sudo launchctl print system/$$label"; \
 	      echo "  Check: sudo launchctl list | grep vmnet"; \
 	      exit 1; \

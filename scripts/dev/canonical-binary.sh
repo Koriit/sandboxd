@@ -82,8 +82,17 @@ install)
         fi
     fi
     if [ "$need_install" = 1 ]; then
-        echo "[sudo] install -D -m $mode $built $canonical"
-        sudo -k install -D -m "$mode" "$built" "$canonical"
+        # Create the parent directory if it does not exist. GNU `install -D`
+        # does this automatically, but BSD `install` (macOS) treats `-D` as a
+        # destdir prefix flag (different meaning) and does NOT create parent
+        # dirs. Explicit `mkdir -p` is portable to both. Guard with a no-op
+        # test so a warm re-run never invokes sudo for this step.
+        if [ ! -d "$(dirname "$canonical")" ]; then
+            echo "[sudo] mkdir -p $(dirname "$canonical")"
+            sudo mkdir -p "$(dirname "$canonical")"
+        fi
+        echo "[sudo] install -m $mode $built $canonical"
+        sudo -k install -m "$mode" "$built" "$canonical"
         if [ -n "$setcap_args" ]; then
             echo "[sudo] setcap $setcap_args $canonical"
             sudo -k setcap "$setcap_args" "$canonical"
