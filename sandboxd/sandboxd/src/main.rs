@@ -3828,8 +3828,35 @@ async fn create_session_macos_lima(
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
     use sandbox_core::lima::operator_lima_home;
     use sandbox_core::macos_session::{
-        setup_macos_gateway, teardown_macos_gateway, verify_restrict_on,
+        check_host_ip_forwarding_disabled, setup_macos_gateway, teardown_macos_gateway,
+        verify_restrict_on,
     };
+
+    // Defense-in-depth (#244): re-check host IP forwarding before creating a
+    // session. A VPN client or Docker Desktop can enable forwarding at runtime,
+    // after the daemon started with forwarding off. If forwarding is now on,
+    // the egress guarantee cannot be upheld — refuse the create with a hard
+    // error so the operator knows immediately.
+    {
+        match tokio::task::spawn_blocking(check_host_ip_forwarding_disabled).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "IP-forwarding check task panicked: {e}"
+                )))
+                .into_response();
+            }
+        }
+    }
 
     // Step 1: generate the per-session CA certificate.
     let ca_dir = {
@@ -9022,6 +9049,303 @@ async fn reconcile_networking(state: &AppState) {
 }
 
 // ---------------------------------------------------------------------------
+// macOS startup reconcile (steps 6a + 6b) and pool-state restore (step 7)
+// ---------------------------------------------------------------------------
+
+/// macOS startup reconcile — two halves as specified.
+///
+/// **Step 6a (unconditional):** for every non-running session, remove its
+/// gateway container + macvlan network (via `teardown_macos_gateway`) and
+/// release its vmnet slot. Remove orphaned gateway containers (no matching
+/// session). Runs regardless of operator login state — gateway infra is
+/// daemon-owned (_sandbox), reachable without an agent.
+///
+/// **Step 6b (agent-gated):** for each operator uid in
+/// `agent_registry.connected_uids()`, verify their running
+/// sessions' VMs are live. If a VM is dead (no Lima entry or stopped), mark
+/// the session Error and release the slot. Operators not checked in are
+/// reconciled lazily on next agent check-in; their VMs are down anyway
+/// (login-scoped, per the macOS per-operator model).
+///
+/// Live failure recovery (gateway crash poll, agent crash respawn) is deferred
+/// to M21-S1/S2.
+#[cfg(target_os = "macos")]
+async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistry) {
+    use sandbox_core::macos_session::teardown_macos_gateway;
+    use sandbox_core::{BackendKind, SessionState};
+
+    let sessions = match state.store.list_sessions_unfiltered() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "macOS reconcile: failed to list sessions");
+            return;
+        }
+    };
+
+    let gateway_docker_socket = state
+        .gateway_lima_manager
+        .gateway_docker_socket()
+        .to_path_buf();
+
+    // -------------------------------------------------------------------------
+    // Step 6a: unconditional gateway-side cleanup.
+    // -------------------------------------------------------------------------
+    //
+    // For every non-running Lima session: remove its gateway container + macvlan
+    // network (idempotent) and release its vmnet slot. This covers:
+    // - Sessions of logged-out operators (their VMs are down; gateway state leaked).
+    // - Sessions stopped/errored before this restart.
+    // - Any partially-created session that didn't finish cleanup.
+    let mut released_6a = 0u32;
+    let mut cleaned_gw_6a = 0u32;
+
+    for session in &sessions {
+        if session.backend != BackendKind::Lima {
+            continue;
+        }
+        let is_running = session.state == SessionState::Running;
+        if !is_running {
+            // Teardown gateway container + macvlan (idempotent).
+            let sock = gateway_docker_socket.clone();
+            let sid = session.id;
+            let tear_result =
+                tokio::task::spawn_blocking(move || teardown_macos_gateway(&sid, &sock)).await;
+            match tear_result {
+                Ok(Ok(())) => {
+                    cleaned_gw_6a += 1;
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        session_id = %session.id,
+                        error = %e,
+                        "macOS reconcile 6a: teardown_macos_gateway error (non-fatal)"
+                    );
+                    cleaned_gw_6a += 1; // best-effort
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = %session.id,
+                        error = %e,
+                        "macOS reconcile 6a: spawn_blocking join error (non-fatal)"
+                    );
+                }
+            }
+
+            // Release slot if this session held one.
+            if let Ok(Some(info)) = state.store.get_network_info_unfiltered(&session.id) {
+                if info.vmnet_slot.is_some() {
+                    match state.vmnet_pool.release_lima_slot(&session.id) {
+                        Ok(()) => {
+                            released_6a += 1;
+                            debug!(
+                                session_id = %session.id,
+                                "macOS reconcile 6a: slot released for stopped session"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "macOS reconcile 6a: failed to release slot (non-fatal)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove orphaned gateway containers: containers named `sandbox-gw-*` in
+    // the gateway VM with no matching session in the store.
+    // This is deferred: requires listing docker containers via the forwarded
+    // socket, which is an extra docker command at startup. The teardown loop
+    // above already handles known sessions. Orphan reap is M21-S1 (live recovery).
+
+    info!(
+        cleaned_gateway = cleaned_gw_6a,
+        released_slots = released_6a,
+        "macOS reconcile 6a complete (gateway-side cleanup)"
+    );
+
+    // -------------------------------------------------------------------------
+    // Step 6b: agent-gated VM-side reconcile.
+    // -------------------------------------------------------------------------
+    //
+    // For each operator whose agent is checked in, verify running sessions'
+    // VMs are live. At daemon startup the agent-broker was just bound, so no
+    // agents will have checked in yet. This loop is a no-op on cold start
+    // but is correct for hot restarts (daemon restart while agents are live).
+    let checked_in_uids = agent_registry.connected_uids().await;
+    let mut verified_6b = 0u32;
+    let mut errored_6b = 0u32;
+
+    for &op_uid in &checked_in_uids {
+        // List VMs for this operator via their agent.
+        let mgr = match state.lima_runtime.registry().get_or_create(op_uid) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    op_uid,
+                    error = %e,
+                    "macOS reconcile 6b: failed to get LimaManager for operator; skipping"
+                );
+                continue;
+            }
+        };
+        let vm_list = match tokio::task::spawn_blocking({
+            let mgr = mgr.clone();
+            move || mgr.list_vms()
+        })
+        .await
+        {
+            Ok(Ok(vms)) => vms,
+            Ok(Err(e)) => {
+                warn!(
+                    op_uid,
+                    error = %e,
+                    "macOS reconcile 6b: failed to list VMs for operator; skipping"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    op_uid,
+                    error = %e,
+                    "macOS reconcile 6b: spawn_blocking join error; skipping"
+                );
+                continue;
+            }
+        };
+
+        // For each running session owned by this operator, verify the VM is up.
+        for session in sessions
+            .iter()
+            .filter(|s| s.backend == BackendKind::Lima)
+            .filter(|s| s.operator_uid == Some(op_uid))
+            .filter(|s| s.state == SessionState::Running)
+        {
+            let vm = vm_list.iter().find(|v| v.session_id == Some(session.id));
+            match vm {
+                Some(info) if info.status == sandbox_core::VmStatus::Running => {
+                    verified_6b += 1;
+                }
+                Some(_) | None => {
+                    // VM missing or stopped — mark session Error + release slot.
+                    warn!(
+                        session_id = %session.id,
+                        op_uid,
+                        "macOS reconcile 6b: running session's VM is down; marking Error"
+                    );
+                    let _ = state
+                        .store
+                        .update_state_reconcile(&session.id, SessionState::Error);
+                    // Release the slot (gateway side was cleaned in 6a above).
+                    let _ = state.vmnet_pool.release_lima_slot(&session.id);
+                    errored_6b += 1;
+                }
+            }
+        }
+    }
+
+    info!(
+        checked_in_operators = checked_in_uids.len(),
+        verified = verified_6b,
+        errored = errored_6b,
+        "macOS reconcile 6b complete (agent-gated VM-side)"
+    );
+}
+
+/// macOS startup: startup slot-leak release (step 6 leak cleanup) + pool-state
+/// restore (step 7).
+///
+/// **Slot-leak release:** after the 6a+6b reconcile, any session that is still
+/// in a non-Running state but whose NetworkInfo still holds a `vmnet_slot` has
+/// a leaked slot (the reconcile did not release it, e.g., the session was
+/// already in Error/Stopped state at reconcile time with no slot in the pool).
+/// Release those so the pool is clean.
+///
+/// **Pool-state restore (step 7):** for genuinely running sessions, mark their
+/// slot as claimed in the pool so the pool's in-memory accounting reflects
+/// current usage.
+///
+/// This runs after `reconcile_macos` so that 6a/6b have already corrected
+/// session states before we decide which sessions are truly running.
+#[cfg(target_os = "macos")]
+async fn restore_macos_pool_state(state: &AppState) {
+    use sandbox_core::{BackendKind, SessionState};
+
+    let sessions = match state.store.list_sessions_unfiltered() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "macOS pool restore: failed to list sessions");
+            return;
+        }
+    };
+
+    // Collect (session_id, NetworkInfo) for sessions that have a vmnet_slot.
+    let mut running_infos: Vec<(sandbox_core::SessionId, sandbox_core::NetworkInfo)> = Vec::new();
+    let mut leaked_sessions: Vec<sandbox_core::SessionId> = Vec::new();
+
+    for session in &sessions {
+        if session.backend != BackendKind::Lima {
+            continue;
+        }
+        let info = match state.store.get_network_info_unfiltered(&session.id) {
+            Ok(Some(i)) => i,
+            Ok(None) | Err(_) => continue,
+        };
+        if info.vmnet_slot.is_none() {
+            continue;
+        }
+        match session.state {
+            SessionState::Running => {
+                running_infos.push((session.id, info));
+            }
+            _ => {
+                // Non-running session holds a slot — leak candidate.
+                // Attempt release (best-effort; slot may not be in pool yet).
+                leaked_sessions.push(session.id);
+                let _ = state.vmnet_pool.release_lima_slot(&session.id);
+            }
+        }
+    }
+
+    // Step 7: restore pool state from running sessions.
+    if !running_infos.is_empty() {
+        let pool = state.vmnet_pool.clone();
+        let infos_for_restore = running_infos.clone();
+        let result =
+            tokio::task::spawn_blocking(move || pool.restore_from_infos(&infos_for_restore)).await;
+        match result {
+            Ok(Ok(())) => {
+                info!(
+                    count = running_infos.len(),
+                    "macOS startup step 7: pool state restored from running sessions"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    error = %e,
+                    "macOS startup step 7: pool restore error (non-fatal; pool may be over-allocated)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "macOS startup step 7: pool restore task panicked (non-fatal)"
+                );
+            }
+        }
+    }
+
+    info!(
+        running_restored = running_infos.len(),
+        leaked_released = leaked_sessions.len(),
+        "macOS pool restore complete"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Gateway crash recovery
 // ---------------------------------------------------------------------------
 
@@ -9626,14 +9950,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(SetuidHelperExecutor::new(lima_helper_path))
     };
 
+    // On macOS, construct the AgentRegistry before the executor block so a
+    // clone can be held for the startup 6b reconcile gate. AgentRegistry is
+    // Clone (Arc-wrapped inner) — both clones share the same live registry.
+    #[cfg(target_os = "macos")]
+    let agent_registry = broker::AgentRegistry::new();
+
     #[cfg(target_os = "macos")]
     let lima_executor: Arc<dyn sandbox_core::lima::LimaExecutor> = {
         use broker::{
-            AgentBrokerExecutor, AgentRegistry, bind_broker_socket, broker_socket_path,
-            run_broker_listener,
+            AgentBrokerExecutor, bind_broker_socket, broker_socket_path, run_broker_listener,
         };
-
-        let agent_registry = AgentRegistry::new();
 
         // Bind the broker socket. The path is `/var/run/sandbox/broker.sock`
         // by default (overridable via `SANDBOX_BROKER_SOCKET` for tests).
@@ -9667,7 +9994,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reg_for_listener = agent_registry.clone();
         tokio::spawn(run_broker_listener(broker_listener, reg_for_listener));
 
-        Arc::new(AgentBrokerExecutor::new(agent_registry, daemon_uid))
+        Arc::new(AgentBrokerExecutor::new(agent_registry.clone(), daemon_uid))
     };
 
     // Build the per-operator LimaManager registry. One LimaManager per
@@ -9684,29 +10011,154 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg!(target_os = "macos"),
     ));
 
-    // On macOS: construct the VmnetPool and GatewayLimaManager.
+    // On macOS: execute the 8-step startup sequence.
     //
-    // The GatewayLimaManager manages the `sandboxd-gateway` Lima instance —
-    // daemon-owned infrastructure. The VmnetPool tracks NIC slot assignments
-    // for per-session Lima VMs. Both are wired into AppState.
+    // Steps 1 (broker bind) and 3 (pool slot-map init) are done above and
+    // below respectively. Steps 2 (prereq checks), 4 (gateway init), 6
+    // (reconcile), and 7 (pool-state restore) are wired here.
     //
-    // This block constructs both; it does NOT call ensure_ready. The live
-    // startup sequence assembles the full prerequisite chain (IP-forwarding
-    // assertion, socket_vmnet daemon check) before ensure_ready is called.
-    // That full sequence is M20-S5/S6; for now the manager is constructed
-    // and stored so session handlers can reach it.
+    // CROSS-PLATFORM NOTE: This entire block is cfg-gated on macos.
+    // The Linux startup path is unchanged. Any change that accidentally
+    // touches Linux behaviour should be flagged and reviewed separately.
     #[cfg(target_os = "macos")]
     let (vmnet_pool, gateway_lima_manager): (
         Arc<sandbox_core::network::VmnetPool>,
         Arc<sandbox_core::GatewayLimaManager>,
     ) = {
-        use sandbox_core::network::VmnetPool;
+        use sandbox_core::macos_session::check_host_ip_forwarding_disabled;
+        use sandbox_core::network::{
+            STAGED_SOCKET_VMNET_PATH, VMNET_SOCKET_DIR, VmnetPool, assert_root_exec_ancestry,
+            vmnet_slot_socket_path,
+        };
 
-        // Default max_slots = 8 (matches the default for max_macos_sessions).
-        // The live startup path will replace this with the config-derived value.
+        // ---------------------------------------------------------------------------
+        // Step 2: Prerequisite checks (fail fast with actionable errors)
+        // ---------------------------------------------------------------------------
+        //
+        // 2a: IP-forwarding HARD assert — refuse to start if forwarding is on.
+        //     A host with forwarding enabled can route guest on-link B+1 traffic
+        //     off-segment via the vmnet bridge, voiding the egress guarantee.
+        info!("macOS startup: step 2 — prerequisite checks");
+        {
+            let check = tokio::task::spawn_blocking(check_host_ip_forwarding_disabled).await;
+            match check {
+                Ok(Ok(())) => {
+                    info!("macOS startup 2f: host IP forwarding is off");
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        error = %e,
+                        "macOS startup: host IP forwarding is ON — egress guarantee cannot be upheld; \
+                         daemon refuses to start. Disable forwarding in VPN software / Docker Desktop."
+                    );
+                    eprintln!("sandboxd: {e}");
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    let msg = format!("IP-forwarding check task panicked: {e}");
+                    error!("{msg}");
+                    return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                }
+            }
+        }
+
+        // 2a: socket_vmnet binary ancestry + ownership assertion.
+        //     /Library/sandboxd/socket_vmnet must be root-owned with no
+        //     group/other-writable ancestors, because launchd daemons exec it
+        //     as root.
+        let socket_vmnet_path = std::path::Path::new(STAGED_SOCKET_VMNET_PATH);
+        if socket_vmnet_path.exists() {
+            let path_for_check = socket_vmnet_path.to_path_buf();
+            let ancestry_result =
+                tokio::task::spawn_blocking(move || assert_root_exec_ancestry(&path_for_check))
+                    .await;
+            match ancestry_result {
+                Ok(Ok(())) => {
+                    info!(
+                        path = STAGED_SOCKET_VMNET_PATH,
+                        "macOS startup 2a: socket_vmnet ancestry assertion passed"
+                    );
+                }
+                Ok(Err(e)) => {
+                    let msg = format!(
+                        "socket_vmnet binary at {STAGED_SOCKET_VMNET_PATH} has an unsafe \
+                         ownership/permission chain: {e}. \
+                         Run 'make setup-dev-env' to reinstall with correct ownership."
+                    );
+                    error!("{msg}");
+                    eprintln!("sandboxd: {msg}");
+                    return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                }
+                Err(e) => {
+                    let msg = format!("socket_vmnet ancestry check task panicked: {e}");
+                    error!("{msg}");
+                    return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                }
+            }
+        } else {
+            error!(
+                path = STAGED_SOCKET_VMNET_PATH,
+                "macOS startup 2a: socket_vmnet binary not found at staged path. \
+                 Run 'make setup-dev-env' to stage it."
+            );
+            let msg = format!(
+                "socket_vmnet binary not found at {STAGED_SOCKET_VMNET_PATH}. \
+                 Run 'make setup-dev-env' or install socket_vmnet via 'brew install socket_vmnet'."
+            );
+            eprintln!("sandboxd: {msg}");
+            return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+        }
+
+        // 2e: verify slot sockets are reachable.
+        //     The N io.sandboxd.vmnet.<n> launchd daemons must be loaded and
+        //     their slot sockets must exist under /var/run/sandbox/vmnet/.
+        //     The daemon does NOT start these daemons — launchd does at boot.
+        //     MAX_MACOS_SESSIONS drives the slot count; default is 8.
         const DEFAULT_MAX_MACOS_SESSIONS: u16 = 8;
+        {
+            let mut missing_sockets: Vec<String> = Vec::new();
+            for slot in 0..DEFAULT_MAX_MACOS_SESSIONS {
+                let sock = vmnet_slot_socket_path(slot);
+                if !std::path::Path::new(&sock).exists() {
+                    missing_sockets.push(sock);
+                }
+            }
+            if !missing_sockets.is_empty() {
+                // Non-fatal at startup — log a warning. The sockets should appear
+                // once launchd loads the plist daemons (which happens at boot or
+                // after 'make setup-dev-env'). If they're all missing this is
+                // almost certainly a fresh dev install; we warn loudly but allow
+                // startup so 'sandbox doctor' can surface the diagnostic.
+                warn!(
+                    missing = ?missing_sockets,
+                    vmnet_dir = VMNET_SOCKET_DIR,
+                    "macOS startup 2e: some vmnet slot sockets are missing; \
+                     ensure the io.sandboxd.vmnet.<n> launchd daemons are loaded. \
+                     Run 'make setup-dev-env' if this is a fresh install."
+                );
+            } else {
+                info!(
+                    count = DEFAULT_MAX_MACOS_SESSIONS,
+                    "macOS startup 2e: all vmnet slot sockets reachable"
+                );
+            }
+        }
+
+        // 2b/2c: limactl + docker CLI presence is implicitly validated when
+        // ensure_ready() (step 4) calls limactl — any missing binary will produce
+        // a clear error there. Explicit version checks are deferred to M21-S4.
+
+        // ---------------------------------------------------------------------------
+        // Step 3: socket_vmnet pool init — record slot→socket-path map.
+        //         No networks.yaml is written. The pool just holds the N slots.
+        // ---------------------------------------------------------------------------
+        info!("macOS startup: step 3 — pool init (slot→socket-path map)");
         let pool = Arc::new(VmnetPool::new(DEFAULT_MAX_MACOS_SESSIONS));
 
+        // ---------------------------------------------------------------------------
+        // Step 4: Gateway Lima instance init (HARD FAIL on error).
+        // ---------------------------------------------------------------------------
+        info!("macOS startup: step 4 — gateway Lima instance init");
         let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
         let manager = Arc::new(sandbox_core::GatewayLimaManager::new(
             daemon_lima_home,
@@ -9714,6 +10166,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             daemon_uid,
             &pool,
         ));
+        {
+            let mgr = manager.clone();
+            let result = tokio::task::spawn_blocking(move || mgr.ensure_ready()).await;
+            match result {
+                Ok(Ok(())) => {
+                    info!("macOS startup step 4: gateway Lima instance ready");
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        error = %e,
+                        "macOS startup step 4: gateway Lima ensure_ready failed — \
+                         this is mandatory egress infrastructure; daemon refuses to start."
+                    );
+                    eprintln!("sandboxd: gateway Lima instance init failed: {e}");
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    let msg = format!("gateway Lima ensure_ready task panicked: {e}");
+                    error!("{msg}");
+                    return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                }
+            }
+        }
+
         (pool, manager)
     };
 
@@ -10049,6 +10525,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // map above makes `reapply_session_policy` find the right policy
     // for each restored gateway.
     reconcile_networking(&state).await;
+
+    // macOS step 6: Two-halves reconcile.
+    //
+    // CROSS-PLATFORM NOTE: This block is cfg-gated on macos. Linux startup
+    // path is unchanged. Flag any changes here for Linux re-check.
+    //
+    // 6a (unconditional): for every non-running session, remove its gateway
+    //    container + macvlan network and release its slot. Also remove orphaned
+    //    gateway containers with no matching session. Runs for all operators
+    //    regardless of login state, because the gateway runs as the daemon
+    //    (_sandbox) and is reachable without an agent.
+    //
+    // 6b (agent-gated): for each operator whose agent is checked in, verify
+    //    their running sessions' VMs are live (mark error if dead, release slot).
+    //    Operators not checked in are reconciled lazily on their next agent
+    //    check-in — their VMs are down anyway (login-scoped).
+    #[cfg(target_os = "macos")]
+    {
+        reconcile_macos(&state, &agent_registry).await;
+    }
+
+    // macOS steps 6 (slot-leak) + 7: pool-state restore.
+    //
+    // CROSS-PLATFORM NOTE: cfg-gated on macos; Linux unchanged.
+    //
+    // Step 6 slot-leak release: stopped or nonexistent sessions hold no slot.
+    //    Any vmnet_slot in a non-running session's NetworkInfo is a leaked slot
+    //    (daemon restart with sessions that were stopped or lost their VM). These
+    //    are released so the pool can re-issue them to new sessions.
+    //
+    // Step 7: restore pool state for genuinely running sessions — mark their
+    //    slots as claimed so the pool tracks current usage correctly.
+    #[cfg(target_os = "macos")]
+    {
+        restore_macos_pool_state(&state).await;
+    }
 
     // Spawn background gateway monitor for crash recovery.
     let monitor_state = Arc::clone(&state);

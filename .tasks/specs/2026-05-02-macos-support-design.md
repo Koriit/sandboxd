@@ -466,7 +466,7 @@ The socket_vmnet slot segment is intentionally **isolated** (`--vmnet-mode=host`
 
 > **Threat-model note — on-link neighbors vs. the gateway.** "Default route = gateway" constrains *routed* (off-segment) traffic, but every host on the /29 is also an **on-link** neighbor the guest can address directly without traversing `B+3`. The spike confirmed the segment **does** carry a host-side vmnet gateway (`B+1`, on a per-identifier `bridgeN`), and the guest *can* reach it on-link — this is **not** filtered by the gateway container's nftables (on-link traffic never enters the gateway netns). Two facts make it a non-bypass: (1) **host mode provides no internet transit** — `B+1` is a dead-end vmnet bridge, not a route to the outside, **provided the macOS host is not IP-forwarding**; and (2) the guest's *other* NIC, the slirp `eth0`, is **`restrict=on`** (§ vzNAT and SLIRP), so it cannot egress either. So a guest reaching `B+1` is a host-local attack-surface consideration (the macOS host's own vmnet bridge), not an egress bypass of the core promise.
 >
-> **Enforced invariant — host IP-forwarding must be off.** Fact (1) is *conditional*: if `net.inet.ip.forwarding=1` on the host (which third-party software — Docker Desktop, some VPN clients, Internet Sharing — can enable), the host could route a guest's on-link `B+1` traffic off-segment, and that path is invisible to the gateway nft (it never enters the gateway netns). The spike confirmed `B+1` exists but did **not** test it as a dead-end under forwarding=1, so the daemon must **not** assume it. **The daemon asserts `sysctl net.inet.ip.forwarding == 0` at startup** (and `sandbox doctor` checks it), refusing to start / surfacing a hard error if forwarding is enabled; enabling host IP-forwarding **voids the egress guarantee** and is documented as unsupported. (Disabling `restrict=on`'s sibling, `net.inet.ip6.forwarding`, is implied by the single-stack-IPv4 posture; assert both.) **Inter-segment isolation** (a guest on slot-N reaching slot-M) is **spike-confirmed absent**: distinct per-identifier bridges, and a same-subnet ARP across identifiers fails.
+> **Enforced invariant — host IP-forwarding must be off.** Fact (1) is *conditional*: if `net.inet.ip.forwarding=1` on the host (which third-party software — Docker Desktop, some VPN clients, Internet Sharing — can enable), the host could route a guest's on-link `B+1` traffic off-segment, and that path is invisible to the gateway nft (it never enters the gateway netns). The spike confirmed `B+1` exists but did **not** test it as a dead-end under forwarding=1, so the daemon must **not** assume it. **The daemon asserts `sysctl net.inet.ip.forwarding == 0` at startup** (and `sandbox doctor` checks it), refusing to start / surfacing a hard error if forwarding is enabled; enabling host IP-forwarding **voids the egress guarantee** and is documented as unsupported. (Disabling `restrict=on`'s sibling, `net.inet6.ip6.forwarding`, is implied by the single-stack-IPv4 posture; assert both. Note: the correct macOS IPv6 forwarding key is `net.inet6.ip6.forwarding` — `net.inet.ip6.forwarding` is an "unknown oid" on macOS and returns empty stdout, treated defensively as off.) **Inter-segment isolation** (a guest on slot-N reaching slot-M) is **spike-confirmed absent**: distinct per-identifier bridges, and a same-subnet ARP across identifiers fails.
 
 The gateway container therefore has **two NICs**:
 
@@ -743,10 +743,12 @@ Disk state (Lima VM image) is preserved. The session can be resumed with `start`
       log in); there is no host lima-helper on macOS
    e. the N io.sandboxd.vmnet.<n> launchd daemons are loaded and their slot sockets under
       /var/run/sandbox/vmnet/ are reachable (sandboxd does not start them — launchd does, at boot)
-   f. host IP-forwarding is OFF: `sysctl net.inet.ip.forwarding` and `net.inet.ip6.forwarding`
+   f. host IP-forwarding is OFF: `sysctl net.inet.ip.forwarding` and `net.inet6.ip6.forwarding`
       both == 0. If either is 1, refuse to start with a hard error — host forwarding would let a
       guest route off-segment via the on-link host vmnet gateway (B+1), voiding the egress
       guarantee (§ Gateway → internet egress, threat-model note). Re-checked by `sandbox doctor`.
+      (Note: `net.inet6.ip6.forwarding` uses `inet6`, not `inet.ip6` — the latter is an unknown
+      oid on macOS. An absent/unknown sysctl is treated defensively as off.)
 
 3. socket_vmnet pool init:
    - NO networks.yaml is written (daemon or per-operator). The unmanaged socket attachment is a

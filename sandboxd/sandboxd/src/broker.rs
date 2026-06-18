@@ -508,23 +508,26 @@ impl AgentRegistry {
         }
     }
 
-    /// Check whether an agent is currently registered for `uid`.
-    ///
-    /// Used in tests and future reconcile logic; not yet on the hot path.
-    #[allow(dead_code)]
-    pub async fn is_registered(&self, uid: u32) -> bool {
-        let inner = self.inner.lock().await;
-        inner.agents.contains_key(&uid)
-    }
-
     /// Return the set of currently connected uids.
     ///
-    /// Reserved for the startup reconcile loop (M20); not yet called in
-    /// production code.
-    #[allow(dead_code)]
+    /// Used by the startup reconcile loop (step 6b) to enumerate checked-in
+    /// operators. Only operators in this set have their VMs reconciled at
+    /// startup; operators not in this set are reconciled lazily on next
+    /// agent check-in.
     pub async fn connected_uids(&self) -> Vec<u32> {
         let inner = self.inner.lock().await;
         inner.agents.keys().copied().collect()
+    }
+
+    /// Check whether an agent is currently registered for `uid`.
+    ///
+    /// Used in tests to verify registry state after register/remove operations.
+    /// Production code gates on [`connected_uids`] (the enumeration form) rather
+    /// than per-uid point queries.
+    #[cfg(test)]
+    pub async fn is_registered(&self, uid: u32) -> bool {
+        let inner = self.inner.lock().await;
+        inner.agents.contains_key(&uid)
     }
 
     /// Send a one-shot op to the agent registered for `uid` and await its
@@ -2388,6 +2391,111 @@ mod tests {
             std::env::remove_var(TEST_SANDBOX_GROUP_ENV);
             std::env::remove_var(TEST_BROKER_SOCKET_ENV);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile 6b gate tests — verify connected_uids, the actual production gate
+    // -----------------------------------------------------------------------
+
+    /// Verify that `connected_uids` is empty when no agent is registered.
+    /// This is the "no operators logged in" case at cold daemon start.
+    /// The 6b reconcile loop iterates `connected_uids()` — an empty set means
+    /// 6b is a no-op, which is correct (no VMs to verify for logged-out ops).
+    #[tokio::test]
+    async fn reconcile_6b_gate_not_checked_in() {
+        let registry = AgentRegistry::new();
+        // No agents registered — connected_uids must be empty.
+        assert!(
+            registry.connected_uids().await.is_empty(),
+            "connected_uids must be empty when no agent is registered"
+        );
+        // is_registered (test-only helper) also returns false.
+        assert!(
+            !registry.is_registered(1000).await,
+            "is_registered must return false when registry is empty"
+        );
+    }
+
+    /// Verify that `connected_uids` reflects agent check-in and removal.
+    /// This exercises the 6b reconcile gate across the full check-in / remove
+    /// lifecycle: before check-in → empty; after check-in → uid present; after
+    /// disconnect → empty again.
+    #[tokio::test]
+    async fn reconcile_6b_gate_checked_in_then_removed() {
+        let registry = AgentRegistry::new();
+
+        // Not yet checked in.
+        assert!(registry.connected_uids().await.is_empty());
+
+        // Agent checks in.
+        let (slot_gen, _evict_rx, _req_rx) = registry.register(1500).await;
+        assert!(
+            registry.connected_uids().await.contains(&1500),
+            "uid 1500 must appear in connected_uids after register()"
+        );
+        assert!(
+            registry.is_registered(1500).await,
+            "is_registered must return true after register()"
+        );
+
+        // Agent disconnects (remove with matching generation).
+        registry.remove(1500, slot_gen).await;
+        assert!(
+            !registry.connected_uids().await.contains(&1500),
+            "uid 1500 must NOT appear in connected_uids after remove()"
+        );
+    }
+
+    /// Verify that `connected_uids` returns the exact set of currently
+    /// checked-in operator uids — the iterator the 6b reconcile loop uses.
+    #[tokio::test]
+    async fn reconcile_6b_connected_uids_reflects_live_agents() {
+        let registry = AgentRegistry::new();
+
+        // Register two operators.
+        let (gen_a, _rx_a, _rq_a) = registry.register(501).await;
+        let (_gen_b, _rx_b, _rq_b) = registry.register(502).await;
+
+        let mut uids = registry.connected_uids().await;
+        uids.sort();
+        assert_eq!(
+            uids,
+            vec![501, 502],
+            "both registered uids must appear in connected_uids"
+        );
+
+        // Remove operator A.
+        registry.remove(501, gen_a).await;
+        let mut uids = registry.connected_uids().await;
+        uids.sort();
+        assert_eq!(
+            uids,
+            vec![502],
+            "after operator A disconnects, only operator B must appear"
+        );
+    }
+
+    /// Verify the 6b gate property: an operator not in `connected_uids` is not
+    /// reconciled; an operator in `connected_uids` is. Uses `connected_uids`
+    /// directly — the method production code iterates to drive 6b.
+    #[tokio::test]
+    async fn reconcile_6b_gate_only_for_checked_in_operator() {
+        let registry = AgentRegistry::new();
+        let uid_logged_in: u32 = 600;
+        let uid_logged_out: u32 = 601;
+
+        // Only uid_logged_in checks in.
+        let (_slot_gen, _rx, _rq) = registry.register(uid_logged_in).await;
+
+        let uids = registry.connected_uids().await;
+        assert!(
+            uids.contains(&uid_logged_in),
+            "logged-in operator must appear in connected_uids (6b will reconcile them)"
+        );
+        assert!(
+            !uids.contains(&uid_logged_out),
+            "logged-out operator must NOT appear in connected_uids (6b skips them)"
+        );
     }
 
     /// Resolve a gid to a group name via `getgrgid_r`. Used in integration

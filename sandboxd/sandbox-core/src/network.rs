@@ -2236,6 +2236,139 @@ mod tests {
             assert!(pool.allocated_slot_indices().is_empty());
         }
 
+        // -- startup slot-leak release tests ----------------------------------
+        //
+        // These tests model the startup slot-leak release behaviour from step 6
+        // of the macOS daemon startup sequence:
+        //
+        // A session that is not Running but whose NetworkInfo holds a vmnet_slot
+        // is a "leaked" slot. The startup reconcile (6a) releases those slots
+        // by calling pool.release_lima_slot() — after which the pool no longer
+        // reports that slot as allocated. This frees the slot for new sessions.
+
+        #[test]
+        fn test_startup_slot_leak_release_stopped_session() {
+            // Simulate: a stopped session held slot 1 across a daemon restart.
+            // The session is not Running, so its slot is leaked and should be
+            // released. After release, the pool has zero allocated slots.
+            let pool = VmnetPool::new(4);
+            let id = SessionId::generate();
+
+            // claim_lima_slot simulates what create did at runtime.
+            let (slot, subnet, gw, vm) = pool.claim_lima_slot(&id).unwrap();
+            let info = NetworkInfo {
+                bridge_name: format!("lima{}", slot.index),
+                subnet,
+                gateway_ip: gw.to_string(),
+                vm_ip: vm.to_string(),
+                docker_network_name: format!("sandbox-net-{id}"),
+                vmnet_slot: Some(VmnetSlot {
+                    index: slot.index,
+                    daemon_label: slot.daemon_label.clone(),
+                    socket_path: slot.socket_path.clone(),
+                }),
+            };
+            pool.set_lima_network_info(&id, slot.index, info).unwrap();
+
+            // Session is now "stopped" (daemon crashed while it was claimed).
+            // 6a should release the slot.
+            assert!(pool.allocated_slot_indices().contains(&slot.index));
+            pool.release_lima_slot(&id).unwrap();
+
+            // After release: slot must be free.
+            assert!(
+                !pool.allocated_slot_indices().contains(&slot.index),
+                "slot must be released after startup leak cleanup"
+            );
+            assert_eq!(pool.running_session_count(), 0);
+        }
+
+        #[test]
+        fn test_startup_slot_leak_release_multiple_sessions() {
+            // Two stopped sessions each held a slot. Both should be released.
+            let pool = VmnetPool::new(4);
+            let id0 = SessionId::generate();
+            let id1 = SessionId::generate();
+
+            let (slot0, _, _, _) = pool.claim_lima_slot(&id0).unwrap();
+            let (slot1, _, _, _) = pool.claim_lima_slot(&id1).unwrap();
+
+            assert_eq!(pool.running_session_count(), 2);
+
+            pool.release_lima_slot(&id0).unwrap();
+            pool.release_lima_slot(&id1).unwrap();
+
+            assert_eq!(pool.running_session_count(), 0);
+            assert!(
+                !pool.allocated_slot_indices().contains(&slot0.index),
+                "slot0 must be released"
+            );
+            assert!(
+                !pool.allocated_slot_indices().contains(&slot1.index),
+                "slot1 must be released"
+            );
+        }
+
+        #[test]
+        fn test_startup_slot_restore_only_running_sessions() {
+            // Step 7 restore_from_infos: only sessions that are still Running
+            // after the reconcile (6a) contribute to pool state.
+            // This mirrors the daemon's logic: running_infos goes to restore_from_infos,
+            // non-running sessions get slot released first.
+            let pool = VmnetPool::new(4);
+
+            let id_running = SessionId::generate();
+            let id_stopped = SessionId::generate();
+
+            // Construct two NetworkInfo entries (as if loaded from DB).
+            let info_running = NetworkInfo {
+                bridge_name: "lima0".to_string(),
+                subnet: "10.209.128.0/29".to_string(),
+                gateway_ip: "10.209.128.3".to_string(),
+                vm_ip: "10.209.128.4".to_string(),
+                docker_network_name: format!("sandbox-net-{id_running}"),
+                vmnet_slot: Some(VmnetSlot {
+                    index: 0,
+                    daemon_label: "io.sandboxd.vmnet.0".to_string(),
+                    socket_path: "/var/run/sandbox/vmnet/slot-0.sock".to_string(),
+                }),
+            };
+            // The stopped session's NetworkInfo is defined here to document what
+            // the daemon would load from the DB, but is intentionally NOT passed to
+            // restore_from_infos (the daemon releases the slot for stopped sessions
+            // first and only restores running-session infos).
+            let _info_stopped = NetworkInfo {
+                bridge_name: "lima1".to_string(),
+                subnet: "10.209.128.8/29".to_string(),
+                gateway_ip: "10.209.128.11".to_string(),
+                vm_ip: "10.209.128.12".to_string(),
+                docker_network_name: format!("sandbox-net-{id_stopped}"),
+                vmnet_slot: Some(VmnetSlot {
+                    index: 1,
+                    daemon_label: "io.sandboxd.vmnet.1".to_string(),
+                    socket_path: "/var/run/sandbox/vmnet/slot-1.sock".to_string(),
+                }),
+            };
+
+            // Only pass the running session to restore_from_infos.
+            pool.restore_from_infos(&[(id_running, info_running)])
+                .unwrap();
+
+            assert_eq!(
+                pool.running_session_count(),
+                1,
+                "only the running session should contribute to pool count"
+            );
+            assert!(
+                pool.allocated_slot_indices().contains(&0),
+                "running session's slot must be marked allocated"
+            );
+            assert!(
+                !pool.allocated_slot_indices().contains(&1),
+                "stopped session's slot must NOT be in pool (it was released, not restored)"
+            );
+        }
+
         // -- no networks.yaml written test -----------------------------------
 
         #[test]
