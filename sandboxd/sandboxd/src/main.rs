@@ -8816,6 +8816,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ));
 
+    // On macOS: construct the GatewayLimaManager. The gateway instance is
+    // daemon-owned infrastructure (not per-operator). Construction is cheap;
+    // ensure_ready (the full bring-up sequence) is called from the live startup
+    // sequence once prerequisites and the vmnet pool are verified.
+    //
+    // The VmnetPool is not yet wired into the startup path. We construct the
+    // manager with a temporary pool so it is ready to call ensure_ready when
+    // the startup sequence is assembled. The live startup path will thread the
+    // config-derived pool through and call ensure_ready in the correct order
+    // (after prerequisite checks — IP-forwarding assertion, socket_vmnet daemon
+    // verification — and pool init).
+    //
+    // This block constructs only; it does NOT call ensure_ready. Calling it
+    // here prematurely would skip the prerequisite checks that must precede it.
+    #[cfg(target_os = "macos")]
+    let _gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager> = {
+        use sandbox_core::network::VmnetPool;
+
+        // Default max_slots = 8 (matches the default for max_macos_sessions).
+        // The live startup path will replace this with the config-derived value.
+        const DEFAULT_MAX_MACOS_SESSIONS: u16 = 8;
+        let pool = VmnetPool::new(DEFAULT_MAX_MACOS_SESSIONS);
+
+        let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
+        Arc::new(sandbox_core::GatewayLimaManager::new(
+            daemon_lima_home,
+            lima_registry.executor().clone(),
+            daemon_uid,
+            &pool,
+        ))
+    };
+
     // Build the Lima runtime backed by the registry and register it in
     // the backend dispatch table. The same Arc<LimaRuntime> is held both
     // as a typed handle (for Lima-only orchestration via

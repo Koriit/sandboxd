@@ -9,6 +9,8 @@ pub mod dns_propagation;
 pub mod error;
 pub mod events;
 pub mod gateway;
+#[cfg(target_os = "macos")]
+pub mod gateway_lima;
 pub mod guest;
 pub mod lds_ack;
 pub mod lima;
@@ -82,6 +84,12 @@ pub use gateway::{
     DockerHealth, GATEWAY_DENY_LOGGER_HEALTH_PORT, GATEWAY_DENY_LOGGER_TCP_PORT, GATEWAY_DNS_PORT,
     GATEWAY_ENVOY_PORT, GatewayManager, GatewayStatus, NFT_NFLOG_DENY_GROUP,
     NFT_POLICY_ALLOW_TCP_SET, NFT_POLICY_ALLOW_UDP_SET,
+};
+#[cfg(target_os = "macos")]
+pub use gateway_lima::{
+    EGRESS_BRIDGE_NAME, GATEWAY_INSTANCE_NAME, GatewayLimaManager, IpLinkEntry, NicMap,
+    UBUNTU_NOBLE_ARM64_URL, discover_nics_from_ip_json, generate_gateway_eth0_nft_policy,
+    generate_gateway_template,
 };
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,
