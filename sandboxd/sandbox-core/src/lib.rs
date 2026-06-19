@@ -93,8 +93,10 @@ pub use gateway::{
 #[cfg(target_os = "macos")]
 pub use gateway_lima::{
     EGRESS_BRIDGE_NAME, GATEWAY_INSTANCE_NAME, GatewayLimaManager, IpLinkEntry, NicMap,
-    UBUNTU_NOBLE_ARM64_URL, discover_nics_from_ip_json, generate_gateway_eth0_nft_policy,
-    generate_gateway_template,
+    PoolResizeDecision, UBUNTU_NOBLE_ARM64_URL, VMNET_LAUNCH_DAEMONS_DIR,
+    count_reachable_slot_sockets, count_vmnet_plists, decide_pool_resize,
+    discover_nics_from_ip_json, generate_gateway_eth0_nft_policy, generate_gateway_template,
+    observe_vmnet_daemon_set,
 };
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,

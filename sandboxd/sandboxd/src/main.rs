@@ -10745,6 +10745,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             STAGED_SOCKET_VMNET_PATH, VMNET_SOCKET_DIR, VmnetPool, assert_root_exec_ancestry,
             vmnet_slot_socket_path,
         };
+        use sandbox_core::{
+            PoolResizeDecision, VMNET_LAUNCH_DAEMONS_DIR, decide_pool_resize,
+            observe_vmnet_daemon_set,
+        };
 
         // ---------------------------------------------------------------------------
         // Step 2: Prerequisite checks (fail fast with actionable errors)
@@ -10824,15 +10828,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(sandbox_core::error::SandboxError::Internal(msg).into());
         }
 
-        // 2e: verify slot sockets are reachable.
+        // ---------------------------------------------------------------------------
+        // Resolve the configured pool size from the environment.
+        //     SANDBOX_MAX_MACOS_SESSIONS overrides the default of 8.
+        //     Valid range: 1..=32 (a /24 holds 32 /29 subnets).
+        // ---------------------------------------------------------------------------
+        const DEFAULT_MAX_MACOS_SESSIONS: u16 = 8;
+        const MAX_MACOS_SESSIONS_ENV: &str = "SANDBOX_MAX_MACOS_SESSIONS";
+        let config_n: u16 = match std::env::var(MAX_MACOS_SESSIONS_ENV) {
+            Ok(val) => match val.parse::<u16>() {
+                Ok(n) if (1..=32).contains(&n) => {
+                    info!(
+                        env = MAX_MACOS_SESSIONS_ENV,
+                        value = n,
+                        "macOS startup: using configured max_macos_sessions from env"
+                    );
+                    n
+                }
+                Ok(n) => {
+                    let msg = format!(
+                        "{MAX_MACOS_SESSIONS_ENV}={n} is out of range; \
+                         valid values are 1..=32 (a /24 holds 32 /29 subnets)"
+                    );
+                    error!("{msg}");
+                    eprintln!("sandboxd: {msg}");
+                    return Err(sandbox_core::error::SandboxError::InvalidArgument(msg).into());
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "{MAX_MACOS_SESSIONS_ENV}={val:?} is not a valid integer; \
+                         expected a number in 1..=32"
+                    );
+                    error!("{msg}");
+                    eprintln!("sandboxd: {msg}");
+                    return Err(sandbox_core::error::SandboxError::InvalidArgument(msg).into());
+                }
+            },
+            Err(_) => {
+                info!(
+                    default = DEFAULT_MAX_MACOS_SESSIONS,
+                    "macOS startup: SANDBOX_MAX_MACOS_SESSIONS not set; using default"
+                );
+                DEFAULT_MAX_MACOS_SESSIONS
+            }
+        };
+
+        // 2e: observe the vmnet daemon set and log socket reachability.
         //     The N io.sandboxd.vmnet.<n> launchd daemons must be loaded and
         //     their slot sockets must exist under /var/run/sandbox/vmnet/.
         //     The daemon does NOT start these daemons — launchd does at boot.
-        //     MAX_MACOS_SESSIONS drives the slot count; default is 8.
-        const DEFAULT_MAX_MACOS_SESSIONS: u16 = 8;
+        //     This observation is also used by the pool-resize decision below.
+        let plist_dir = std::path::Path::new(VMNET_LAUNCH_DAEMONS_DIR);
+        let socket_dir = std::path::Path::new(VMNET_SOCKET_DIR);
+        let daemon_set_n = observe_vmnet_daemon_set(plist_dir, socket_dir, config_n);
         {
             let mut missing_sockets: Vec<String> = Vec::new();
-            for slot in 0..DEFAULT_MAX_MACOS_SESSIONS {
+            for slot in 0..config_n {
                 let sock = vmnet_slot_socket_path(slot);
                 if !std::path::Path::new(&sock).exists() {
                     missing_sockets.push(sock);
@@ -10853,7 +10904,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 info!(
-                    count = DEFAULT_MAX_MACOS_SESSIONS,
+                    count = config_n,
                     "macOS startup 2e: all vmnet slot sockets reachable"
                 );
             }
@@ -10864,25 +10915,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // a clear error there. Explicit version checks are deferred to M21-S4.
 
         // ---------------------------------------------------------------------------
-        // Step 3: socket_vmnet pool init — record slot→socket-path map.
-        //         No networks.yaml is written. The pool just holds the N slots.
+        // Count running Lima sessions before pool construction so the resize
+        // decision can run first. This avoids sizing the pool with config_n when
+        // only discovered_n NICs exist.
         // ---------------------------------------------------------------------------
-        info!("macOS startup: step 3 — pool init (slot→socket-path map)");
-        let pool = Arc::new(VmnetPool::new(DEFAULT_MAX_MACOS_SESSIONS));
+        let running_lima_sessions: u32 = {
+            let sessions = store.list_sessions_unfiltered().unwrap_or_default();
+            sessions
+                .iter()
+                .filter(|s| {
+                    s.backend == sandbox_core::backend::BackendKind::Lima
+                        && s.state == sandbox_core::SessionState::Running
+                })
+                .count() as u32
+        };
+        info!(
+            running_lima_sessions,
+            "macOS startup: running Lima session count before pool init"
+        );
 
         // ---------------------------------------------------------------------------
-        // Step 4: Gateway Lima instance init (HARD FAIL on error).
+        // Step 4 (early): bring the gateway Lima instance up so we can discover
+        // its NIC count. We use a temporary manager sized at config_n; the
+        // pool-resize decision may rebuild the gateway to a different NIC count,
+        // after which we re-discover and build the final pool at effective_n.
         // ---------------------------------------------------------------------------
         info!("macOS startup: step 4 — gateway Lima instance init");
         let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
-        let manager = Arc::new(sandbox_core::GatewayLimaManager::new(
+
+        // Temporary pool at config_n for the initial GatewayLimaManager constructor.
+        // This is replaced below with the effective-n pool after the resize decision.
+        let temp_pool = Arc::new(VmnetPool::new(config_n));
+        let manager_arc = Arc::new(sandbox_core::GatewayLimaManager::new(
             daemon_lima_home,
             lima_registry.executor().clone(),
             daemon_uid,
-            &pool,
+            &temp_pool,
         ));
+        drop(temp_pool); // temp_pool not used further; manager holds max_slots=config_n
+
         {
-            let mgr = manager.clone();
+            let mgr = manager_arc.clone();
             let result = tokio::task::spawn_blocking(move || mgr.ensure_ready()).await;
             match result {
                 Ok(Ok(())) => {
@@ -10905,7 +10978,183 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        (pool, manager)
+        // Retrieve the discovered NIC count from the cached NIC map.
+        let discovered_nic_count = manager_arc
+            .nic_map()
+            .map(|m| m.discovered_count)
+            .unwrap_or(0);
+
+        // ---------------------------------------------------------------------------
+        // Pool-resize decision: single authority for what to do when discovered NIC
+        // count differs from config_n. Routes through decide_pool_resize and acts on
+        // the result. All non-rebuild arms are always-start (daemon continues). The
+        // rebuild arm is attempted only when safe (running==0 AND daemon_set==config_n).
+        // ---------------------------------------------------------------------------
+        let decision = decide_pool_resize(
+            config_n,
+            discovered_nic_count,
+            daemon_set_n,
+            running_lima_sessions,
+        );
+        info!(
+            config_n,
+            discovered_nic_count,
+            daemon_set_n,
+            running_lima_sessions,
+            decision = ?decision,
+            "macOS startup: pool-resize decision"
+        );
+
+        // Effective pool size after acting on the decision.
+        let effective_n: u16 = match &decision {
+            PoolResizeDecision::NoChange { effective_n } => {
+                info!(
+                    n = effective_n,
+                    "macOS startup: NIC count matches config; no resize needed"
+                );
+                *effective_n
+            }
+            PoolResizeDecision::WarnRunningSessions {
+                effective_n,
+                config_n: new_n,
+                running,
+            } => {
+                warn!(
+                    discovered = effective_n,
+                    config_n = new_n,
+                    running_sessions = running,
+                    "macOS startup: max_macos_sessions changed from {effective_n} to {new_n} \
+                     but {running} session(s) are running. Pool resize requires all sessions \
+                     to be stopped. Continuing with the current pool of {effective_n} NIC(s); \
+                     pool resize to {new_n} deferred while sessions are running: stop all \
+                     sessions and restart sandboxd to apply; if the socket_vmnet daemon set \
+                     is not yet sized to {new_n}, also re-run the privileged setup: \
+                     make setup-dev-env DARWIN_VMNET_SLOTS={new_n}"
+                );
+                *effective_n
+            }
+            PoolResizeDecision::RefuseNeedsPrivilegedRegen {
+                effective_n,
+                config_n: new_n,
+                daemon_set_n: set_n,
+            } => {
+                warn!(
+                    discovered = effective_n,
+                    config_n = new_n,
+                    daemon_set_n = set_n,
+                    "macOS startup: max_macos_sessions is {new_n} but the gateway has \
+                     {effective_n} NIC(s) and the socket_vmnet daemon set has {set_n} slot(s). \
+                     The vmnet launchd daemon set must be regenerated first (a privileged step): \
+                     re-run the privileged socket_vmnet pool setup to provision {new_n} slots: \
+                     make setup-dev-env DARWIN_VMNET_SLOTS={new_n} \
+                     Continuing with the current pool of {effective_n} NIC(s)."
+                );
+                *effective_n
+            }
+            PoolResizeDecision::Rebuild { target_n } => {
+                let target = *target_n;
+                info!(
+                    from = discovered_nic_count,
+                    to = target,
+                    "macOS startup: rebuilding gateway to match config_n \
+                     (no sessions running, vmnet daemon set already matches)"
+                );
+                // Rebuild sequence: force-stop → delete → recreate(target_n) →
+                // start → re-discover. On failure, fall back to whatever gateway
+                // is still reachable (re-run ensure_ready) and use the discovered
+                // count — a failed resize is non-fatal (the existing hard-fail
+                // semantics cover only "no gateway at all").
+                let mgr = manager_arc.clone();
+                let rebuild_result = tokio::task::spawn_blocking(move || {
+                    mgr.force_stop_instance()?;
+                    mgr.delete_instance()?;
+                    mgr.ensure_ready() // creates+starts at manager's max_slots=config_n, re-discovers
+                })
+                .await;
+
+                match rebuild_result {
+                    Ok(Ok(())) => {
+                        // Re-read discovered count after rebuild.
+                        let rebuilt_count = manager_arc
+                            .nic_map()
+                            .map(|m| m.discovered_count as u16)
+                            .unwrap_or(target);
+                        info!(
+                            rebuilt_nic_count = rebuilt_count,
+                            "macOS startup: gateway rebuild successful"
+                        );
+                        rebuilt_count
+                    }
+                    Ok(Err(e)) => {
+                        // Rebuild failed. Attempt to ensure the old gateway (or
+                        // whatever state it's in) is up, then continue with whatever
+                        // NIC count is currently discovered. A failed resize is
+                        // non-fatal; only a total gateway failure stays hard-fail.
+                        warn!(
+                            error = %e,
+                            "macOS startup: gateway rebuild failed; \
+                             attempting to recover the existing gateway"
+                        );
+                        let mgr2 = manager_arc.clone();
+                        let recovery =
+                            tokio::task::spawn_blocking(move || mgr2.ensure_ready()).await;
+                        match recovery {
+                            Ok(Ok(())) => {
+                                let fallback_count = manager_arc
+                                    .nic_map()
+                                    .map(|m| m.discovered_count as u16)
+                                    .unwrap_or(discovered_nic_count as u16);
+                                warn!(
+                                    fallback_nic_count = fallback_count,
+                                    "macOS startup: gateway rebuild failed; continuing with \
+                                     recovered gateway ({fallback_count} NIC(s))"
+                                );
+                                fallback_count
+                            }
+                            Ok(Err(recovery_err)) => {
+                                // Gateway is completely down after a failed rebuild —
+                                // this is the existing hard-fail case.
+                                error!(
+                                    rebuild_error = %e,
+                                    recovery_error = %recovery_err,
+                                    "macOS startup: gateway rebuild failed and recovery also \
+                                     failed — mandatory egress infrastructure unavailable; \
+                                     daemon refuses to start."
+                                );
+                                eprintln!(
+                                    "sandboxd: gateway rebuild and recovery both failed: {recovery_err}"
+                                );
+                                return Err(recovery_err.into());
+                            }
+                            Err(panic_err) => {
+                                let msg = format!(
+                                    "gateway recovery task panicked after rebuild failure: {panic_err}"
+                                );
+                                error!("{msg}");
+                                return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                            }
+                        }
+                    }
+                    Err(panic_err) => {
+                        let msg = format!("gateway rebuild task panicked: {panic_err}");
+                        error!("{msg}");
+                        return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                    }
+                }
+            }
+        };
+
+        // ---------------------------------------------------------------------------
+        // Step 3: socket_vmnet pool init — sized from effective_n so the pool
+        // never hands out slot indices beyond the NICs that actually exist.
+        // ---------------------------------------------------------------------------
+        info!(
+            effective_n,
+            "macOS startup: step 3 — pool init (slot→socket-path map)"
+        );
+        let pool = Arc::new(VmnetPool::new(effective_n));
+
+        (pool, manager_arc)
     };
 
     // Build the Lima runtime backed by the registry and register it in

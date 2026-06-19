@@ -29,9 +29,9 @@
 /// `ip -json link show` inside the VM, selects `limaN` interfaces, orders them
 /// by numeric suffix, and builds the `slot_index → interface_name` map.
 ///
-/// If discovered NIC count ≠ `max_slots`, this is NON-FATAL: a warning is logged
-/// and the daemon continues with the actually-discovered count. Pool resize is
-/// handled by the pool-resize handler when all sessions are stopped.
+/// If discovered NIC count ≠ `max_slots`, the mismatch is deferred to the
+/// `decide_pool_resize` handler in the bin-crate startup sequence. `ensure_ready`
+/// itself does not decide — it discovers and caches; the caller acts on the result.
 ///
 /// ## Baseline `eth0` nft policy
 ///
@@ -694,8 +694,10 @@ impl GatewayLimaManager {
     /// 2. If absent: write template → `limactl create` → `limactl start`.
     /// 3. If stopped: `limactl start`.
     /// 4. If running: proceed.
-    /// 5. Poll `docker -H <sock> info` until ready (60 s / 2 s).
-    /// 6. Discover slot→NIC map; cache it; warn on count mismatch.
+    /// 5. Poll `docker -H <sock> info` until ready (300 s / 2 s on first boot).
+    /// 6. Discover slot→NIC map; cache it. Any mismatch with the configured pool
+    ///    size is handled by `decide_pool_resize` in the caller — this method
+    ///    does not decide; it only observes and caches.
     /// 7. Ensure `sandboxd-egress` NAT bridge (idempotent).
     /// 8. Apply baseline `eth0` nft policy.
     pub fn ensure_ready(&self) -> Result<(), SandboxError> {
@@ -741,26 +743,19 @@ impl GatewayLimaManager {
         // let the session-create check catch the missing image later.
         self.load_gateway_image_if_needed();
 
-        // Step 4e: discover slot→NIC map.
+        // Step 4e: discover slot→NIC map and cache it.
+        //
+        // Discovery is purely mechanical — it reports what the VM has. Any
+        // mismatch between the discovered count and the configured pool size
+        // is handled by the pool-resize decision in the bin-crate startup
+        // sequence, which calls `decide_pool_resize` after `ensure_ready`
+        // returns. This method does not decide; it only observes and caches.
         let nic_map = self.discover_nics()?;
         let discovered = nic_map.discovered_count;
-        if discovered != self.max_slots as usize {
-            warn!(
-                discovered,
-                expected = self.max_slots,
-                "gateway Lima NIC count mismatch: discovered {} NICs but max_slots={}. \
-                 Pool resize requires all sessions to be stopped and the gateway instance \
-                 to be recreated. Continuing this run with the {} actually-discovered NICs.",
-                discovered,
-                self.max_slots,
-                discovered
-            );
-        } else {
-            info!(
-                nic_count = discovered,
-                "gateway Lima NIC discovery complete"
-            );
-        }
+        info!(
+            nic_count = discovered,
+            "gateway Lima NIC discovery complete"
+        );
         {
             let mut guard = self.nic_map.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(nic_map);
@@ -1369,6 +1364,46 @@ impl GatewayLimaManager {
         )))
     }
 
+    /// Delete the gateway Lima instance (`limactl delete sandboxd-gateway`).
+    ///
+    /// Idempotent: "not found" and "no instance" errors are treated as success.
+    /// Called by the pool-resize rebuild arm after `force_stop_instance` to
+    /// remove the instance directory before `create_instance` rebuilds it with
+    /// a new NIC count. (`create_instance` fails with "already exists" if the
+    /// directory is still present.)
+    pub fn delete_instance(&self) -> Result<(), SandboxError> {
+        let output = self.executor.run(
+            self.daemon_uid,
+            LimaOp::Delete {
+                vm: GATEWAY_INSTANCE_NAME,
+            },
+            GATEWAY_STOP_TIMEOUT,
+            "gateway: limactl delete",
+        )?;
+
+        if output.status.success() {
+            info!("gateway Lima instance deleted");
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Tolerate "not found" / "no instance" — idempotent.
+        if stderr.contains("not found")
+            || stderr.contains("no instance")
+            || stderr.contains("instance not found")
+        {
+            info!(
+                stderr = %stderr.trim(),
+                "gateway Lima delete: instance absent (treating as success)"
+            );
+            return Ok(());
+        }
+
+        Err(SandboxError::Lima(format!(
+            "gateway: limactl delete failed: {stderr}"
+        )))
+    }
+
     /// Restart the gateway Lima instance for crash recovery.
     ///
     /// Performs a forced stop followed by a start, then waits up to
@@ -1446,6 +1481,199 @@ impl GatewayLimaManager {
         info!("gateway Lima recovery: instance ready");
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pool resize decision (pure, hermetic)
+// ---------------------------------------------------------------------------
+
+/// Outcome of the pool-resize decision at daemon startup.
+///
+/// The daemon computes this once — after NIC discovery but before constructing
+/// the `VmnetPool` — and acts on it. Every arm carries `effective_n`, the NIC
+/// count that *actually exists* on the gateway instance after the arm runs;
+/// callers must size the `VmnetPool` from `effective_n`, never blindly from
+/// `config_n`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolResizeDecision {
+    /// NIC count already matches config. Proceed with the existing gateway.
+    NoChange {
+        /// Pool size: equals `config_n` (which equals `discovered_nic_count`).
+        effective_n: u16,
+    },
+    /// Config changed but sessions are running — cannot disrupt them. Proceed
+    /// with the discovered NIC count; resize takes effect on next full restart
+    /// with no sessions.
+    WarnRunningSessions {
+        /// Pool size capped at the currently-discovered NIC count.
+        effective_n: u16,
+        /// The requested new pool size (for the warning message).
+        config_n: u16,
+        /// Number of running sessions that prevented the resize.
+        running: u32,
+    },
+    /// Config changed, no sessions running, but the socket_vmnet launchd daemon
+    /// set has not been updated to match `config_n` — that is a privileged step
+    /// the daemon cannot perform itself. Proceed with discovered count.
+    RefuseNeedsPrivilegedRegen {
+        /// Pool size capped at the currently-discovered NIC count.
+        effective_n: u16,
+        /// The requested new pool size (for the warning message).
+        config_n: u16,
+        /// Observed daemon-set size (for the warning message).
+        daemon_set_n: u16,
+    },
+    /// Safe to rebuild: no sessions running and the socket_vmnet daemon set
+    /// already matches `config_n`. Caller must stop → delete → recreate(target_n)
+    /// → start the gateway instance, then re-discover NICs.
+    Rebuild {
+        /// The target NIC count for the rebuilt gateway instance.
+        target_n: u16,
+    },
+}
+
+/// Decide what to do when the gateway's discovered NIC count differs from the
+/// configured pool size.
+///
+/// This is the single authority for the resize decision. It is a pure function
+/// of the four startup-time observations; all I/O and orchestration live in the
+/// caller.
+///
+/// # Arguments
+///
+/// * `config_n` — desired pool size from `SANDBOX_MAX_MACOS_SESSIONS` (default 8).
+/// * `discovered_nic_count` — `NicMap::discovered_count` after `ensure_ready`.
+/// * `daemon_set_n` — number of socket_vmnet launchd slots observed on disk
+///   (plist count AND socket liveness; see `observe_vmnet_daemon_set`).
+/// * `running` — number of Lima sessions currently in the `Running` state
+///   (from the session store; read before constructing the pool).
+///
+/// # Decision tree
+///
+/// ```text
+/// discovered == config_n  →  NoChange
+/// discovered != config_n AND running > 0  →  WarnRunningSessions (effective = discovered)
+/// discovered != config_n AND running == 0 AND daemon_set_n != config_n  →  RefuseNeedsPrivilegedRegen
+/// discovered != config_n AND running == 0 AND daemon_set_n == config_n  →  Rebuild
+/// ```
+#[cfg(target_os = "macos")]
+pub fn decide_pool_resize(
+    config_n: u16,
+    discovered_nic_count: usize,
+    daemon_set_n: u16,
+    running: u32,
+) -> PoolResizeDecision {
+    let discovered_n = discovered_nic_count as u16;
+    if discovered_n == config_n {
+        return PoolResizeDecision::NoChange {
+            effective_n: config_n,
+        };
+    }
+    // Mismatch: config_n != discovered.
+    if running > 0 {
+        return PoolResizeDecision::WarnRunningSessions {
+            effective_n: discovered_n,
+            config_n,
+            running,
+        };
+    }
+    if daemon_set_n != config_n {
+        return PoolResizeDecision::RefuseNeedsPrivilegedRegen {
+            effective_n: discovered_n,
+            config_n,
+            daemon_set_n,
+        };
+    }
+    // running == 0 AND daemon_set_n == config_n — safe to rebuild.
+    PoolResizeDecision::Rebuild { target_n: config_n }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-set observation (no privilege; reads world-readable artifacts)
+// ---------------------------------------------------------------------------
+
+/// Default path to the system LaunchDaemons directory.
+#[cfg(target_os = "macos")]
+pub const VMNET_LAUNCH_DAEMONS_DIR: &str = "/Library/LaunchDaemons";
+
+/// Count the number of `io.sandboxd.vmnet.<n>.plist` files in `plist_dir`.
+///
+/// Counts entries whose filename matches `^io\.sandboxd\.vmnet\.\d+\.plist$`.
+/// The directory is root-owned but world-readable (`0644` plists); no privilege
+/// is needed.
+///
+/// Returns 0 if the directory does not exist or cannot be read.
+#[cfg(target_os = "macos")]
+pub fn count_vmnet_plists(plist_dir: &std::path::Path) -> u16 {
+    let entries = match std::fs::read_dir(plist_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut count: u16 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_vmnet_plist_name(&name_str) {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Return true if `name` matches `io.sandboxd.vmnet.<n>.plist`.
+#[cfg(target_os = "macos")]
+fn is_vmnet_plist_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("io.sandboxd.vmnet.") else {
+        return false;
+    };
+    let Some(index_str) = rest.strip_suffix(".plist") else {
+        return false;
+    };
+    index_str.parse::<u16>().is_ok()
+}
+
+/// Count how many of the `0..n` slot sockets at `socket_dir/slot-<i>.sock`
+/// exist on disk.
+///
+/// Uses `Path::exists()` — no socket connection attempted. Returns the count of
+/// present socket files.
+#[cfg(target_os = "macos")]
+pub fn count_reachable_slot_sockets(socket_dir: &std::path::Path, n: u16) -> u16 {
+    (0..n)
+        .filter(|&slot| socket_dir.join(format!("slot-{slot}.sock")).exists())
+        .count() as u16
+}
+
+/// Observe the socket_vmnet launchd daemon set size without privilege.
+///
+/// Returns `min(plist_count, socket_count)` as a conservative proxy for the
+/// number of fully-provisioned slots. This assumes plists and sockets are
+/// generated with matching, contiguous indices — as `make setup-dev-env`
+/// guarantees — so the minimum of the two independent totals equals the number
+/// of slots where both the plist and socket are present.
+///
+/// In practice this is called with `config_n` as `expected_n`; the returned
+/// count equals `config_n` only when the privileged regen has already produced
+/// all `config_n` slots and the daemons are running.
+///
+/// For the resize-decision predicate, callers compare the returned value against
+/// `config_n`: equality means the daemon set is ready for a gateway rebuild;
+/// inequality means the privileged regen has not yet run.
+///
+/// Uses the production paths by default; pass explicit paths in tests.
+#[cfg(target_os = "macos")]
+pub fn observe_vmnet_daemon_set(
+    plist_dir: &std::path::Path,
+    socket_dir: &std::path::Path,
+    expected_n: u16,
+) -> u16 {
+    let plist_count = count_vmnet_plists(plist_dir);
+    let socket_count = count_reachable_slot_sockets(socket_dir, expected_n.max(plist_count));
+
+    // Both plist and socket must be present for a slot to count.
+    // The minimum of the two is the number of fully-provisioned slots.
+    plist_count.min(socket_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,5 +2007,251 @@ mod tests {
         assert_eq!(map.interface_for_slot(1), Some("lima1"));
         assert_eq!(map.interface_for_slot(2), Some("lima2"));
         assert_eq!(map.interface_for_slot(3), None); // out of range
+    }
+
+    // -- Pool resize decision (pure, hermetic) ---------------------------------
+
+    /// C0: NIC count already matches config — no action needed.
+    #[test]
+    fn decide_pool_resize_no_change_when_counts_match() {
+        let d = decide_pool_resize(8, 8, 8, 0);
+        assert_eq!(d, PoolResizeDecision::NoChange { effective_n: 8 });
+    }
+
+    /// C0: single-slot pool also matches.
+    #[test]
+    fn decide_pool_resize_no_change_single_slot() {
+        let d = decide_pool_resize(1, 1, 1, 0);
+        assert_eq!(d, PoolResizeDecision::NoChange { effective_n: 1 });
+    }
+
+    /// C1: config changed upward but sessions are running — warn, keep discovered.
+    #[test]
+    fn decide_pool_resize_warns_and_keeps_discovered_when_sessions_running_grow() {
+        // Pool wants to grow 8 → 12 but 3 sessions are live.
+        let d = decide_pool_resize(12, 8, 8, 3);
+        assert_eq!(
+            d,
+            PoolResizeDecision::WarnRunningSessions {
+                effective_n: 8,
+                config_n: 12,
+                running: 3,
+            }
+        );
+    }
+
+    /// C1: config changed downward but sessions are running — warn, keep discovered.
+    #[test]
+    fn decide_pool_resize_warns_and_keeps_discovered_when_sessions_running_shrink() {
+        // Pool wants to shrink 12 → 8 but 1 session is live.
+        let d = decide_pool_resize(8, 12, 8, 1);
+        assert_eq!(
+            d,
+            PoolResizeDecision::WarnRunningSessions {
+                effective_n: 12,
+                config_n: 8,
+                running: 1,
+            }
+        );
+    }
+
+    /// C1: effective_n is always discovered, not config_n.
+    #[test]
+    fn decide_pool_resize_effective_n_is_discovered_when_sessions_running() {
+        let d = decide_pool_resize(4, 8, 4, 5);
+        match d {
+            PoolResizeDecision::WarnRunningSessions { effective_n, .. } => {
+                assert_eq!(effective_n, 8, "effective_n must be discovered count");
+            }
+            other => panic!("expected WarnRunningSessions, got {other:?}"),
+        }
+    }
+
+    /// C2: no sessions running, but the vmnet daemon set hasn't been updated — refuse.
+    #[test]
+    fn decide_pool_resize_refuses_rebuild_when_daemon_set_mismatch_grow() {
+        // Config N=12 but daemon set still at 8; no sessions.
+        let d = decide_pool_resize(12, 8, 8, 0);
+        assert_eq!(
+            d,
+            PoolResizeDecision::RefuseNeedsPrivilegedRegen {
+                effective_n: 8,
+                config_n: 12,
+                daemon_set_n: 8,
+            }
+        );
+    }
+
+    /// C2: shrink path — daemon set doesn't match new smaller config_n.
+    #[test]
+    fn decide_pool_resize_refuses_rebuild_when_daemon_set_mismatch_shrink() {
+        // Config N=4 but daemon set still at 8; no sessions.
+        let d = decide_pool_resize(4, 8, 8, 0);
+        assert_eq!(
+            d,
+            PoolResizeDecision::RefuseNeedsPrivilegedRegen {
+                effective_n: 8,
+                config_n: 4,
+                daemon_set_n: 8,
+            }
+        );
+    }
+
+    /// C2: effective_n is always discovered in the refuse arm.
+    #[test]
+    fn decide_pool_resize_effective_n_is_discovered_when_refused() {
+        let d = decide_pool_resize(12, 8, 8, 0);
+        match d {
+            PoolResizeDecision::RefuseNeedsPrivilegedRegen { effective_n, .. } => {
+                assert_eq!(effective_n, 8, "effective_n must be discovered count");
+            }
+            other => panic!("expected RefuseNeedsPrivilegedRegen, got {other:?}"),
+        }
+    }
+
+    /// C3: safe to rebuild — no sessions, daemon set matches config_n, NIC count differs.
+    #[test]
+    fn decide_pool_resize_rebuilds_when_safe_grow() {
+        // Config N=12, daemon set is 12, but gateway still has 8 NICs; no sessions.
+        let d = decide_pool_resize(12, 8, 12, 0);
+        assert_eq!(d, PoolResizeDecision::Rebuild { target_n: 12 });
+    }
+
+    /// C3: shrink path — daemon set matches smaller config_n.
+    #[test]
+    fn decide_pool_resize_rebuilds_when_safe_shrink() {
+        // Config N=4, daemon set is 4, gateway still has 8 NICs; no sessions.
+        let d = decide_pool_resize(4, 8, 4, 0);
+        assert_eq!(d, PoolResizeDecision::Rebuild { target_n: 4 });
+    }
+
+    /// Running > 0 takes priority over daemon_set mismatch — always WarnRunningSessions.
+    #[test]
+    fn decide_pool_resize_running_sessions_takes_priority() {
+        // Even if the daemon set matches config_n, running sessions block rebuild.
+        let d = decide_pool_resize(12, 8, 12, 2);
+        assert!(
+            matches!(d, PoolResizeDecision::WarnRunningSessions { .. }),
+            "running sessions must always produce WarnRunningSessions, not Rebuild"
+        );
+    }
+
+    // -- Daemon-set observation helpers (tempdir-based, hermetic) ---------------
+
+    #[test]
+    fn count_vmnet_plists_counts_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        // Create 3 matching plists + 1 non-matching file.
+        std::fs::write(path.join("io.sandboxd.vmnet.0.plist"), b"").unwrap();
+        std::fs::write(path.join("io.sandboxd.vmnet.1.plist"), b"").unwrap();
+        std::fs::write(path.join("io.sandboxd.vmnet.2.plist"), b"").unwrap();
+        std::fs::write(path.join("com.example.other.plist"), b"").unwrap();
+        assert_eq!(count_vmnet_plists(path), 3);
+    }
+
+    #[test]
+    fn count_vmnet_plists_returns_zero_for_missing_dir() {
+        let dir = std::path::Path::new("/nonexistent/path/that/does/not/exist");
+        assert_eq!(count_vmnet_plists(dir), 0);
+    }
+
+    #[test]
+    fn count_vmnet_plists_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(count_vmnet_plists(dir.path()), 0);
+    }
+
+    #[test]
+    fn count_reachable_slot_sockets_counts_present_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        // Create slot-0 and slot-2 sockets; slot-1 is absent.
+        std::fs::write(path.join("slot-0.sock"), b"").unwrap();
+        std::fs::write(path.join("slot-2.sock"), b"").unwrap();
+        // Checking 3 slots (0..3): only 0 and 2 exist → count = 2.
+        assert_eq!(count_reachable_slot_sockets(path, 3), 2);
+    }
+
+    #[test]
+    fn count_reachable_slot_sockets_all_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for slot in 0..4u16 {
+            std::fs::write(path.join(format!("slot-{slot}.sock")), b"").unwrap();
+        }
+        assert_eq!(count_reachable_slot_sockets(path, 4), 4);
+    }
+
+    #[test]
+    fn count_reachable_slot_sockets_missing_socket_breaks_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        // Only slot-0 socket, but we check for 4 slots.
+        std::fs::write(path.join("slot-0.sock"), b"").unwrap();
+        assert_eq!(count_reachable_slot_sockets(path, 4), 1);
+    }
+
+    #[test]
+    fn observe_vmnet_daemon_set_matches_when_all_present() {
+        let plist_dir = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        for slot in 0..4u16 {
+            std::fs::write(
+                plist_dir
+                    .path()
+                    .join(format!("io.sandboxd.vmnet.{slot}.plist")),
+                b"",
+            )
+            .unwrap();
+            std::fs::write(socket_dir.path().join(format!("slot-{slot}.sock")), b"").unwrap();
+        }
+        // Both plist count and socket count are 4 → observed = 4.
+        assert_eq!(
+            observe_vmnet_daemon_set(plist_dir.path(), socket_dir.path(), 4),
+            4
+        );
+    }
+
+    #[test]
+    fn observe_vmnet_daemon_set_mismatches_when_socket_missing() {
+        let plist_dir = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        // 4 plists, but only 3 sockets (slot-2 missing).
+        for slot in 0..4u16 {
+            std::fs::write(
+                plist_dir
+                    .path()
+                    .join(format!("io.sandboxd.vmnet.{slot}.plist")),
+                b"",
+            )
+            .unwrap();
+        }
+        for slot in [0u16, 1, 3] {
+            std::fs::write(socket_dir.path().join(format!("slot-{slot}.sock")), b"").unwrap();
+        }
+        // min(4, 3) = 3, not 4 → mismatch against expected_n=4.
+        assert!(observe_vmnet_daemon_set(plist_dir.path(), socket_dir.path(), 4) < 4);
+    }
+
+    #[test]
+    fn observe_vmnet_daemon_set_mismatches_when_plist_missing() {
+        let plist_dir = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        // 3 plists, 4 sockets.
+        for slot in 0..3u16 {
+            std::fs::write(
+                plist_dir
+                    .path()
+                    .join(format!("io.sandboxd.vmnet.{slot}.plist")),
+                b"",
+            )
+            .unwrap();
+        }
+        for slot in 0..4u16 {
+            std::fs::write(socket_dir.path().join(format!("slot-{slot}.sock")), b"").unwrap();
+        }
+        // min(3, 4) = 3, not 4.
+        assert!(observe_vmnet_daemon_set(plist_dir.path(), socket_dir.path(), 4) < 4);
     }
 }
