@@ -384,4 +384,227 @@ mod tests {
             .ensure_ready()
             .expect("second ensure_ready failed (idempotent)");
     }
+
+    // ------------------------------------------------------------------
+    // Recovery primitive tests (Pass 2b)
+    //
+    // These tests exercise `probe_docker_health`, `force_stop_instance`,
+    // and `restart_instance_for_recovery` against a live gateway VM.
+    // They require the same infrastructure as the lifecycle test:
+    // - macOS host with Lima ≥ 1.2.0 and QEMU on PATH
+    // - `sandboxd-gateway` Lima instance running (or ensured ready below)
+    // - socket_vmnet pool daemons present
+    //
+    // Each test calls `ensure_ready()` as a guard/setup step rather than
+    // relying on a shared pre-started instance, so they can be run
+    // individually without the lifecycle test running first.
+    // ------------------------------------------------------------------
+
+    /// `probe_docker_health` returns `Ok(true)` when the gateway is running
+    /// and `Ok(false)` after `force_stop_instance`.
+    ///
+    /// Verifies the two observable states the recovery orchestrator relies
+    /// on: a healthy probe and a "connection refused / timed out" probe
+    /// that signals the instance is down.
+    ///
+    /// After the test, the gateway instance is left stopped. Callers that
+    /// need it running should call `ensure_ready()` afterwards; the
+    /// subsequent `integration_gateway_lima_force_stop_is_idempotent` and
+    /// `integration_gateway_lima_restart_for_recovery_*` tests call
+    /// `ensure_ready()` themselves as a guard.
+    #[test]
+    fn integration_gateway_lima_probe_docker_health_reflects_state() {
+        const MAX_SLOTS: u16 = 2;
+        let pool = VmnetPool::new(MAX_SLOTS);
+        let manager = build_test_manager(&pool);
+
+        // Ensure the gateway is up before probing.
+        manager
+            .ensure_ready()
+            .expect("ensure_ready failed before probe test");
+
+        // Healthy instance → probe must return Ok(true).
+        let healthy = manager
+            .probe_docker_health()
+            .expect("probe_docker_health returned Err on a running instance");
+        assert!(
+            healthy,
+            "probe_docker_health must return true when the gateway is running"
+        );
+
+        // Force-stop the instance to simulate a crash.
+        manager
+            .force_stop_instance()
+            .expect("force_stop_instance failed");
+
+        // Stopped instance → probe must return Ok(false), not Err.
+        // The Docker socket is no longer reachable so the probe will get
+        // a connection-refused / timeout, which maps to Ok(false).
+        let down = manager
+            .probe_docker_health()
+            .expect("probe_docker_health must return Ok(false) on a stopped instance, not Err");
+        assert!(
+            !down,
+            "probe_docker_health must return false when the gateway is stopped"
+        );
+
+        eprintln!(
+            "[integration_gateway_lima_probe_docker_health_reflects_state] PASS: \
+             healthy=true then stopped=false"
+        );
+        // Gateway left stopped; next test calls ensure_ready().
+    }
+
+    /// `force_stop_instance` is idempotent: calling it on an already-stopped
+    /// instance must succeed (not return an error).
+    ///
+    /// The recovery orchestrator calls `force_stop_instance` before `start_instance`
+    /// without checking the current state; this test verifies that double-stop is safe.
+    #[test]
+    fn integration_gateway_lima_force_stop_is_idempotent() {
+        let pool = VmnetPool::new(2);
+        let manager = build_test_manager(&pool);
+
+        // Ensure the gateway is running first so the first stop is meaningful.
+        manager
+            .ensure_ready()
+            .expect("ensure_ready failed in idempotent stop test");
+
+        // First stop.
+        manager
+            .force_stop_instance()
+            .expect("first force_stop_instance failed");
+
+        // Second stop on an already-stopped instance must succeed (idempotent).
+        manager
+            .force_stop_instance()
+            .expect("second force_stop_instance on already-stopped instance must not fail");
+
+        eprintln!(
+            "[integration_gateway_lima_force_stop_is_idempotent] PASS: \
+             double force-stop succeeded"
+        );
+        // Gateway left stopped.
+    }
+
+    /// `restart_instance_for_recovery` restores the instance to Running, makes
+    /// Docker reachable, and re-establishes the egress bridge and eth0 nft policy.
+    ///
+    /// Exercises the full recovery sequence from the stopped state:
+    /// 1. `force_stop_instance` (already performed by previous test, but we
+    ///    call `ensure_ready` then `force_stop_instance` to guarantee a clean
+    ///    starting state).
+    /// 2. `restart_instance_for_recovery` — the method under test.
+    /// 3. `instance_state()` must return `"Running"`.
+    /// 4. `probe_docker_health()` must return `Ok(true)`.
+    /// 5. The egress bridge must still exist (same assertion as the lifecycle test).
+    /// 6. The baseline nft policy must still be in place on eth0.
+    #[test]
+    fn integration_gateway_lima_restart_for_recovery_restores_readiness_and_fabric() {
+        const MAX_SLOTS: u16 = 2;
+        let pool = VmnetPool::new(MAX_SLOTS);
+        let manager = build_test_manager(&pool);
+
+        // Bring the gateway up so we start from a known state.
+        manager
+            .ensure_ready()
+            .expect("ensure_ready failed before recovery restart test");
+
+        // Simulate a crash by force-stopping the instance.
+        manager
+            .force_stop_instance()
+            .expect("force_stop_instance failed before recovery restart");
+
+        // Confirm it is stopped before recovery.
+        let state_before = manager
+            .instance_state()
+            .expect("instance_state() failed after force-stop");
+        assert_ne!(
+            state_before, "Running",
+            "instance must not be Running after force-stop; got: {state_before}"
+        );
+
+        // Run the recovery method under test.
+        manager
+            .restart_instance_for_recovery()
+            .expect("restart_instance_for_recovery failed");
+
+        // 3. instance_state() must now be "Running".
+        let state_after = manager
+            .instance_state()
+            .expect("instance_state() failed after recovery restart");
+        assert_eq!(
+            state_after, "Running",
+            "instance must be Running after restart_instance_for_recovery; got: {state_after}"
+        );
+
+        // 4. probe_docker_health() must return Ok(true).
+        let healthy = manager
+            .probe_docker_health()
+            .expect("probe_docker_health returned Err after recovery restart");
+        assert!(
+            healthy,
+            "probe_docker_health must return true after restart_instance_for_recovery"
+        );
+
+        // 5. The sandboxd-egress bridge must exist inside the VM.
+        let socket_path = manager.gateway_docker_socket();
+        let socket_str = format!("unix://{}", socket_path.display());
+        let bridge_out = std::process::Command::new("docker")
+            .args(["-H", &socket_str, "network", "inspect", EGRESS_BRIDGE_NAME])
+            .output()
+            .expect("docker network inspect should run");
+        assert!(
+            bridge_out.status.success(),
+            "sandboxd-egress bridge must exist after restart_instance_for_recovery: {}",
+            String::from_utf8_lossy(&bridge_out.stderr)
+        );
+
+        // 6. The baseline eth0 nft policy must be in place.
+        let daemon_uid = Uid::current().as_raw();
+        let lima_home = operator_lima_home(daemon_uid);
+        let lima_home_str = lima_home.to_string_lossy().into_owned();
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let home_str = std::env::var("HOME").unwrap_or_default();
+        let nft_out = std::process::Command::new("limactl")
+            .args([
+                "shell",
+                GATEWAY_INSTANCE_NAME,
+                "--",
+                "bash",
+                "-c",
+                "sudo nft list table inet sandboxd-gateway-eth0 2>&1",
+            ])
+            .env_clear()
+            .env("LIMA_HOME", &lima_home_str)
+            .env(
+                "PATH",
+                format!("/opt/homebrew/bin:/usr/local/bin:{current_path}"),
+            )
+            .env("HOME", &home_str)
+            .env("TERM", "dumb")
+            .output()
+            .expect("limactl shell nft list should run");
+        assert!(
+            nft_out.status.success(),
+            "sandboxd-gateway-eth0 nft table must exist after recovery restart; stderr: {}",
+            String::from_utf8_lossy(&nft_out.stderr)
+        );
+
+        let nft_content = String::from_utf8_lossy(&nft_out.stdout);
+        assert!(
+            nft_content.contains("policy drop"),
+            "output chain must have default-drop policy after recovery restart"
+        );
+        assert!(
+            nft_content.contains("dport 53"),
+            "output chain must allow DNS after recovery restart"
+        );
+
+        eprintln!(
+            "[integration_gateway_lima_restart_for_recovery_restores_readiness_and_fabric] \
+             PASS: Running, docker healthy, egress bridge present, eth0 nft policy in place"
+        );
+        // Gateway left running — no teardown, reusable by subsequent tests.
+    }
 }

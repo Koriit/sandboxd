@@ -865,4 +865,198 @@ mod integration_macos_session_lifecycle {
 
         eprintln!("[integration_create_rollback_removes_vm_and_session_record] PASS");
     }
+
+    // ---------------------------------------------------------------------------
+    // Test: slot reclaimed when a confirmed-dead session is released (#247 / §4)
+    // ---------------------------------------------------------------------------
+
+    /// A vmnet slot held by a confirmed-dead (non-Running) session is released
+    /// by the reconcile path and the pool count reflects the reclaim.
+    ///
+    /// This models the step-6b reconcile logic: a persisted session that was
+    /// Running at daemon shutdown but whose Lima VM is no longer Running at
+    /// startup is marked Error and its slot is released via `release_lima_slot`.
+    /// The pool must then make the slot available for a new session.
+    ///
+    /// This test is hermetic: it exercises only `VmnetPool` (claim → restore
+    /// as "Running" → release via the reconcile path → re-claim). No gateway
+    /// VM, no limactl, no Docker required.
+    ///
+    /// The "confirmed-dead" determination (querying limactl) is done by the
+    /// daemon's `reconcile_macos` step 6b; this test verifies the pool
+    /// mechanics that step 6b relies on, not the daemon's orchestration itself
+    /// (which lives in main.rs and is only reachable via e2e).
+    #[test]
+    fn integration_macos_slot_reclaimed_on_confirmed_dead_session() {
+        let pool = Arc::new(VmnetPool::new(2));
+
+        // --- Step 1: claim a slot for a session (simulates session create) ---
+        let sid_dead = SessionId::generate();
+        let (slot, subnet, gw, vm) = pool.claim_lima_slot(&sid_dead).expect("claim failed");
+        let slot_idx = slot.index;
+
+        // Record the full NetworkInfo so the pool tracks the mapping.
+        let info = NetworkInfo {
+            bridge_name: format!("lima{slot_idx}"),
+            subnet: subnet.clone(),
+            gateway_ip: gw.to_string(),
+            vm_ip: vm.to_string(),
+            docker_network_name: macos_docker_network_name(&sid_dead),
+            vmnet_slot: Some(slot.clone()),
+        };
+        pool.set_lima_network_info(&sid_dead, slot_idx, info.clone())
+            .expect("set_lima_network_info failed");
+
+        assert_eq!(pool.running_session_count(), 1, "one slot must be claimed");
+        assert!(
+            pool.allocated_slot_indices().contains(&slot_idx),
+            "slot must appear in allocated set after claim"
+        );
+
+        // --- Step 2: claim a second slot to prove the pool is at capacity ---
+        let sid_live = SessionId::generate();
+        let (_slot_live, _, _, _) = pool
+            .claim_lima_slot(&sid_live)
+            .expect("second claim failed");
+        assert_eq!(
+            pool.running_session_count(),
+            2,
+            "both slots must be claimed"
+        );
+
+        // Pool exhausted (max=2); a third claim must fail.
+        let sid_extra = SessionId::generate();
+        assert!(
+            pool.claim_lima_slot(&sid_extra).is_err(),
+            "pool must be exhausted at max_slots=2"
+        );
+
+        // --- Step 3: reconcile path — simulate step 6b releasing the dead slot ---
+        //
+        // In the daemon's reconcile_macos, step 6b detects that the VM for
+        // sid_dead is no longer Running (e.g. it died while the daemon was
+        // stopped) and calls pool.release_lima_slot(&sid_dead). This test
+        // exercises the same pool operation.
+        pool.release_lima_slot(&sid_dead)
+            .expect("release_lima_slot on confirmed-dead session must succeed");
+
+        assert_eq!(
+            pool.running_session_count(),
+            1,
+            "pool count must drop to 1 after dead session slot release"
+        );
+        assert!(
+            !pool.allocated_slot_indices().contains(&slot_idx),
+            "released slot must no longer appear in allocated set"
+        );
+
+        // --- Step 4: the freed slot must be reusable for a new session ---
+        let sid_new = SessionId::generate();
+        let (slot_new, _, _, _) = pool
+            .claim_lima_slot(&sid_new)
+            .expect("new claim after reconcile reclaim must succeed");
+        assert_eq!(
+            slot_new.index, slot_idx,
+            "reclaimed slot must be reused for the new session"
+        );
+        assert_eq!(pool.running_session_count(), 2, "both slots claimed again");
+
+        // --- Cleanup ---
+        pool.release_lima_slot(&sid_live)
+            .expect("release live slot");
+        pool.release_lima_slot(&sid_new).expect("release new slot");
+        assert_eq!(pool.running_session_count(), 0, "all slots released");
+
+        eprintln!("[integration_macos_slot_reclaimed_on_confirmed_dead_session] PASS");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test: restore_from_infos does not double-count an already-released slot
+    // ---------------------------------------------------------------------------
+
+    /// After the reconcile path releases a dead session's slot, passing that
+    /// session's NetworkInfo to `restore_from_infos` must NOT re-claim the slot
+    /// (restore only acts on Running sessions in the daemon; non-Running sessions'
+    /// infos are filtered out before calling restore).
+    ///
+    /// This is a companion to `integration_restore_skips_macos_vmnet_slot_rows`:
+    /// it verifies the two-step reconcile sequence (6a release → step-7 restore)
+    /// leaves the pool consistent when a session is dead.
+    ///
+    /// Hermetic — no live infrastructure required.
+    #[test]
+    fn integration_macos_reconcile_release_then_restore_does_not_double_count() {
+        let pool = Arc::new(VmnetPool::new(4));
+
+        // Simulate a persisted Running session (claim its slot).
+        let sid_running = SessionId::generate();
+        let (slot_r, subnet_r, gw_r, vm_r) = pool
+            .claim_lima_slot(&sid_running)
+            .expect("claim running failed");
+
+        // Simulate a persisted dead session (claim a different slot).
+        let sid_dead = SessionId::generate();
+        let (slot_d, subnet_d, gw_d, vm_d) =
+            pool.claim_lima_slot(&sid_dead).expect("claim dead failed");
+
+        // Both claimed up front.
+        assert_eq!(pool.running_session_count(), 2);
+
+        // 6a reconcile: release both (as-if daemon startup sees both as non-Running
+        // initially). In the real daemon, step 6b then re-evaluates and marks truly
+        // Running sessions back; here we model: dead session stays released, running
+        // session is restored via restore_from_infos.
+        pool.release_lima_slot(&sid_dead)
+            .expect("release dead failed");
+        pool.release_lima_slot(&sid_running)
+            .expect("release running for restore test");
+
+        assert_eq!(pool.running_session_count(), 0, "both released");
+
+        // Step 7: restore_from_infos is called only for confirmed-Running sessions.
+        // The dead session's info is excluded — only the running session is restored.
+        let info_running = NetworkInfo {
+            bridge_name: format!("lima{}", slot_r.index),
+            subnet: subnet_r,
+            gateway_ip: gw_r.to_string(),
+            vm_ip: vm_r.to_string(),
+            docker_network_name: macos_docker_network_name(&sid_running),
+            vmnet_slot: Some(slot_r.clone()),
+        };
+        pool.restore_from_infos(&[(sid_running, info_running)])
+            .expect("restore_from_infos must succeed");
+
+        // Only the running session's slot must be allocated.
+        assert_eq!(
+            pool.running_session_count(),
+            1,
+            "only the running session's slot must be restored"
+        );
+        assert!(
+            pool.allocated_slot_indices().contains(&slot_r.index),
+            "running session slot must be in allocated set"
+        );
+        assert!(
+            !pool.allocated_slot_indices().contains(&slot_d.index),
+            "dead session slot must NOT be re-allocated by restore"
+        );
+
+        // The dead session's slot is free — a new session can claim it.
+        let sid_new = SessionId::generate();
+        let (slot_new, _, _, _) = pool
+            .claim_lima_slot(&sid_new)
+            .expect("new claim on freed dead slot must succeed");
+        assert_eq!(
+            slot_new.index, slot_d.index,
+            "the freed dead-session slot must be reusable"
+        );
+
+        // Cleanup — drop captured but unused bindings, then release slots.
+        drop((subnet_d, gw_d, vm_d, slot_d));
+        pool.release_lima_slot(&sid_running).unwrap();
+        pool.release_lima_slot(&sid_new).unwrap();
+        assert_eq!(pool.running_session_count(), 0);
+
+        eprintln!("[integration_macos_reconcile_release_then_restore_does_not_double_count] PASS");
+    }
 }
