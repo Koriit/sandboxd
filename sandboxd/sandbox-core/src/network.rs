@@ -1200,6 +1200,35 @@ impl VmnetPool {
         Ok(())
     }
 
+    /// Restore `n` lite session-count tokens at daemon startup.
+    ///
+    /// Called after loading sessions from the store. Lite sessions have no
+    /// `vmnet_slot` so [`Self::restore_from_infos`] does not count them —
+    /// they are tracked only via `session_count`. This method bumps the
+    /// count by `n` to reflect running lite (container-backend) sessions
+    /// that survived a daemon restart.
+    ///
+    /// The caller is responsible for determining `n` by counting the running
+    /// `BackendKind::Container` sessions from the store (after the 6a/6b
+    /// reconcile, so only genuinely-running sessions are counted). This keeps
+    /// the session-count cap honest across daemon restarts: without this call,
+    /// the cap would under-count until lite sessions are explicitly stopped
+    /// and released.
+    ///
+    /// Fails with `Err` only when the lock is poisoned — a programming error,
+    /// not a runtime condition.
+    pub fn restore_lite_tokens(&self, n: u32) -> Result<(), crate::error::SandboxError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let mut count = self
+            .session_count
+            .lock()
+            .map_err(|e| crate::error::SandboxError::Internal(format!("lock poisoned: {e}")))?;
+        *count += n;
+        Ok(())
+    }
+
     /// Return the current number of running sessions.
     pub fn running_session_count(&self) -> u32 {
         *self.session_count.lock().unwrap_or_else(|e| e.into_inner())
@@ -2234,6 +2263,131 @@ mod tests {
             pool.restore_from_infos(&[(id, info)]).unwrap();
             assert_eq!(pool.running_session_count(), 0);
             assert!(pool.allocated_slot_indices().is_empty());
+        }
+
+        // -- restore_lite_tokens -----------------------------------------------
+
+        /// Restoring n lite tokens bumps session_count by n and does not
+        /// allocate any NIC slots — lite sessions have no vmnet_slot.
+        #[test]
+        fn restore_lite_tokens_bumps_session_count_without_slot() {
+            let pool = VmnetPool::new(8);
+            pool.restore_lite_tokens(3).unwrap();
+            assert_eq!(pool.running_session_count(), 3);
+            assert!(
+                pool.allocated_slot_indices().is_empty(),
+                "lite tokens must not allocate any NIC slots"
+            );
+        }
+
+        /// restore_lite_tokens(0) is a no-op.
+        #[test]
+        fn restore_lite_tokens_zero_is_noop() {
+            let pool = VmnetPool::new(8);
+            pool.restore_lite_tokens(0).unwrap();
+            assert_eq!(pool.running_session_count(), 0);
+        }
+
+        /// Mixed restore: slot sessions via restore_from_infos + lite sessions
+        /// via restore_lite_tokens produce the correct combined count and the
+        /// right set of allocated NIC slots.
+        ///
+        /// Scenario: 2 Lima sessions (slots 0 and 2) + 3 lite sessions.
+        /// Expected: running_session_count() == 5, allocated_slot_indices() == {0, 2}.
+        #[test]
+        fn restore_mixed_lima_and_lite_sessions() {
+            let pool = VmnetPool::new(8);
+            let id0 = SessionId::generate();
+            let id1 = SessionId::generate();
+
+            let info0 = NetworkInfo {
+                bridge_name: "lima0".to_string(),
+                subnet: "10.209.128.0/29".to_string(),
+                gateway_ip: "10.209.128.3".to_string(),
+                vm_ip: "10.209.128.4".to_string(),
+                docker_network_name: format!("sandbox-net-{id0}"),
+                vmnet_slot: Some(VmnetSlot {
+                    index: 0,
+                    daemon_label: "io.sandboxd.vmnet.0".to_string(),
+                    socket_path: "/var/run/sandbox/vmnet/slot-0.sock".to_string(),
+                }),
+            };
+            let info1 = NetworkInfo {
+                bridge_name: "lima2".to_string(),
+                subnet: "10.209.128.16/29".to_string(),
+                gateway_ip: "10.209.128.19".to_string(),
+                vm_ip: "10.209.128.20".to_string(),
+                docker_network_name: format!("sandbox-net-{id1}"),
+                vmnet_slot: Some(VmnetSlot {
+                    index: 2,
+                    daemon_label: "io.sandboxd.vmnet.2".to_string(),
+                    socket_path: "/var/run/sandbox/vmnet/slot-2.sock".to_string(),
+                }),
+            };
+
+            // Restore 2 Lima slots.
+            pool.restore_from_infos(&[(id0, info0), (id1, info1)])
+                .unwrap();
+            // Then restore 3 lite tokens.
+            pool.restore_lite_tokens(3).unwrap();
+
+            assert_eq!(
+                pool.running_session_count(),
+                5,
+                "2 Lima + 3 lite = 5 total sessions"
+            );
+            let slots = pool.allocated_slot_indices();
+            assert_eq!(slots.len(), 2, "only Lima sessions hold NIC slots");
+            assert!(slots.contains(&0));
+            assert!(slots.contains(&2));
+            assert!(!slots.contains(&1));
+        }
+
+        /// A lite session restored via restore_lite_tokens consumes a token —
+        /// subsequent claim attempts must respect the cap.
+        #[test]
+        fn restore_lite_tokens_count_enforced_against_cap() {
+            let pool = VmnetPool::new(4);
+            // Pre-fill with 3 lite tokens (as if 3 lite sessions were running).
+            pool.restore_lite_tokens(3).unwrap();
+            assert_eq!(pool.running_session_count(), 3);
+
+            // One more lite token must succeed (total = 4, cap = 4).
+            pool.claim_lite_token().unwrap();
+            assert_eq!(pool.running_session_count(), 4);
+
+            // Another lite token must fail (cap exhausted).
+            let result = pool.claim_lite_token();
+            assert!(result.is_err(), "must fail when cap is reached");
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("max concurrent sessions reached"),
+                "got: {err}"
+            );
+        }
+
+        /// Linux path is unaffected: restore_from_infos behavior is unchanged
+        /// for slot sessions (no regression on the existing contract).
+        #[test]
+        fn restore_from_infos_slot_behavior_unchanged() {
+            let pool = VmnetPool::new(4);
+            let id = SessionId::generate();
+            let info = NetworkInfo {
+                bridge_name: "lima0".to_string(),
+                subnet: "10.209.128.0/29".to_string(),
+                gateway_ip: "10.209.128.3".to_string(),
+                vm_ip: "10.209.128.4".to_string(),
+                docker_network_name: format!("sandbox-net-{id}"),
+                vmnet_slot: Some(VmnetSlot {
+                    index: 0,
+                    daemon_label: "io.sandboxd.vmnet.0".to_string(),
+                    socket_path: "/var/run/sandbox/vmnet/slot-0.sock".to_string(),
+                }),
+            };
+            pool.restore_from_infos(&[(id, info)]).unwrap();
+            // restore_from_infos still counts the session AND marks the slot.
+            assert_eq!(pool.running_session_count(), 1);
+            assert!(pool.allocated_slot_indices().contains(&0));
         }
 
         // -- startup slot-leak release tests ----------------------------------

@@ -14,6 +14,11 @@ pub mod gateway_lima;
 pub mod guest;
 pub mod lds_ack;
 pub mod lima;
+/// Pure helpers for the lite-mode container backend on macOS:
+/// shared-root config, host→VM path translation, in-VM route-helper argv
+/// builder. Platform-neutral — compiled and tested on all platforms so the
+/// hermetic unit tests run on Linux CI without a macOS agent.
+pub mod lite_macos;
 /// macOS session lifecycle helpers: macvlan network + gateway container
 /// setup/teardown, restrict=on verification stub, host IP-forwarding check.
 /// macOS only — not compiled on Linux.
@@ -112,6 +117,11 @@ pub use lima::{
     PRODUCTION_GUEST_BINARY_PATH, SANDBOXD_STATE_ROOT, SetuidHelperExecutor, VmInfo, VmStatus,
     decide_lima_vm, ensure_operator_lima_home, enumerate_operator_uids_from_fs, guest_agent_path,
     operator_lima_home, reap_lima_orphans, vm_name,
+};
+pub use lite_macos::{
+    DEFAULT_LITE_SHARED_ROOT, IN_VM_ROUTE_HELPER_PATH, LITE_SHARED_ROOT_ENV, SharedPathError,
+    build_in_vm_route_helper_argv, lite_shared_root, lite_shared_root_9p_stanza,
+    translate_shared_path, validate_shared_path,
 };
 #[cfg(target_os = "macos")]
 pub use macos_session::{

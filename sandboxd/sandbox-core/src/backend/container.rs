@@ -383,6 +383,20 @@ pub struct ContainerRuntime {
     /// the libexec file, so the bind-mount source is always coherent
     /// without a daemon-side staging step.
     guest_bind_source: PathBuf,
+    /// macOS only: forwarded gateway-VM Docker socket. `None` on Linux
+    /// (host Docker daemon, unchanged). When `Some`, every `docker`
+    /// invocation emits `-H unix://<socket>` so all container operations
+    /// target the gateway Lima VM's Docker daemon rather than the host.
+    ///
+    /// Linux behavior is byte-for-byte identical when `None` — no `-H`
+    /// flag is ever prepended. Use [`Self::is_macos`] to test.
+    docker_socket: Option<PathBuf>,
+    /// Pinned HOME / DOCKER_CONFIG root for the Docker client config dir.
+    /// The Docker build client creates its config dir under `$HOME`; a
+    /// daemon running as a system user with a non-writable HOME would abort
+    /// a build at that mkdir. The daemon passes its `base_dir` so the
+    /// config lands in a writable, daemon-owned location on both platforms.
+    docker_home: PathBuf,
     /// Per-session network info, populated by the daemon (3D) or by
     /// tests before [`SessionRuntime::create`]. Keyed on the session id
     /// so a single runtime instance handles every session.
@@ -427,8 +441,99 @@ impl ContainerRuntime {
             user_uid,
             user_gid,
             guest_bind_source: guest_bind_source.into(),
+            docker_socket: None,
+            docker_home: PathBuf::from("/tmp"),
             sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Construct a container runtime that routes all `docker` calls through the
+    /// specified forwarded socket path, and pins `HOME` / `DOCKER_CONFIG` for
+    /// the docker client to `docker_home`.
+    ///
+    /// On macOS, sandbox containers run inside the `sandboxd-gateway` Lima VM.
+    /// Every docker command must be directed to the forwarded socket via
+    /// `-H unix://<path>`. This constructor wires that socket into every docker
+    /// call the runtime makes.
+    ///
+    /// `docker_home` is typically the daemon `base_dir` (`/var/lib/sandboxd/<uid>`),
+    /// which is the writable, daemon-owned directory the launchd plist already
+    /// pins as `HOME`. This ensures `docker build` can create its config dir
+    /// without hitting a non-writable system-user HOME.
+    ///
+    /// Linux builds can call this (the fields are non-cfg), but production Linux
+    /// code always uses [`Self::new`] (host Docker daemon, no forwarding needed).
+    // docker invocation takes the full container/exec context; bundling would not improve clarity
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_macos_socket(
+        image_tag: impl Into<String>,
+        default_memory_mb: u32,
+        default_cpus: f64,
+        user_uid: u32,
+        user_gid: u32,
+        guest_bind_source: impl Into<PathBuf>,
+        docker_socket: impl Into<PathBuf>,
+        docker_home: impl Into<PathBuf>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            capabilities: capabilities_for_container(),
+            image_tag: image_tag.into(),
+            default_memory_mb,
+            default_cpus,
+            user_uid,
+            user_gid,
+            guest_bind_source: guest_bind_source.into(),
+            docker_socket: Some(docker_socket.into()),
+            docker_home: docker_home.into(),
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Return `true` when this runtime routes docker calls through a
+    /// forwarded gateway-VM socket (macOS). `false` on Linux (host daemon).
+    pub fn is_macos(&self) -> bool {
+        self.docker_socket.is_some()
+    }
+
+    /// The forwarded Docker socket path, if this is a macOS runtime.
+    pub fn docker_socket(&self) -> Option<&Path> {
+        self.docker_socket.as_deref()
+    }
+
+    /// The pinned `HOME` / `DOCKER_CONFIG` root for the Docker client.
+    pub fn docker_home(&self) -> &Path {
+        &self.docker_home
+    }
+
+    /// Build a `docker` [`std::process::Command`] with the optional
+    /// `-H unix://<socket>` prefix pre-applied.
+    ///
+    /// All blocking `docker` invocations in this runtime go through this
+    /// helper so that macOS (forwarded socket) and Linux (host socket)
+    /// behave identically from the caller's perspective — the only
+    /// difference is the presence or absence of the `-H` flag. Linux
+    /// callers see zero overhead: `None` means no argument is prepended.
+    pub fn docker_cmd(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new("docker");
+        if let Some(sock) = &self.docker_socket {
+            cmd.args(["-H", &format!("unix://{}", sock.display())]);
+        }
+        cmd
+    }
+
+    /// Build a `docker` [`tokio::process::Command`] with the optional
+    /// `-H unix://<socket>` prefix pre-applied.
+    ///
+    /// Used for the long-lived async `docker exec … socat` transport
+    /// (the spawn_blocking carve-out in `ContainerTransport::connect`).
+    /// Mirrors [`Self::docker_cmd`] but returns a `TokioCommand` for
+    /// use in async contexts where blocking would stall the executor.
+    pub fn docker_cmd_async(&self) -> TokioCommand {
+        let mut cmd = TokioCommand::new("docker");
+        if let Some(sock) = &self.docker_socket {
+            cmd.args(["-H", &format!("unix://{}", sock.display())]);
+        }
+        cmd
     }
 
     /// Return the host path the runtime bind-mounts read-only into
@@ -889,7 +994,12 @@ impl SessionRuntime for ContainerRuntime {
                 vol_args.push(format!("sandboxd.owner={pool}"));
             }
             vol_args.push(volume_name.clone());
-            run_docker(&vol_args, "docker volume create (home volume pre-create)").await?;
+            run_docker(
+                &vol_args,
+                "docker volume create (home volume pre-create)",
+                self.docker_socket.clone(),
+            )
+            .await?;
             debug!(
                 session_id = %session_id,
                 volume = %volume_name,
@@ -931,7 +1041,12 @@ impl SessionRuntime for ContainerRuntime {
             );
             let chown_args =
                 build_home_chown_argv(session_id, &self.image_tag, effective_uid, effective_gid);
-            run_docker(&chown_args, "docker run (home chown init container)").await?;
+            run_docker(
+                &chown_args,
+                "docker run (home chown init container)",
+                self.docker_socket.clone(),
+            )
+            .await?;
         }
 
         debug!(
@@ -941,7 +1056,12 @@ impl SessionRuntime for ContainerRuntime {
             "ContainerRuntime: docker create"
         );
 
-        run_docker(&args, "docker create (container runtime)").await?;
+        run_docker(
+            &args,
+            "docker create (container runtime)",
+            self.docker_socket.clone(),
+        )
+        .await?;
         Ok(RuntimeHandle::from_session_id(session_id))
     }
 
@@ -971,6 +1091,7 @@ impl SessionRuntime for ContainerRuntime {
         run_docker(
             &["start".to_string(), container_name.clone()],
             "docker start (container runtime)",
+            self.docker_socket.clone(),
         )
         .await?;
 
@@ -983,7 +1104,7 @@ impl SessionRuntime for ContainerRuntime {
                         .to_string(),
                 )
             })?;
-            let pid = inspect_container_pid(&container_name).await?;
+            let pid = inspect_container_pid(&container_name, self.docker_socket.clone()).await?;
             invoke_route_helper(helper, pid, network.gateway_ip, for_user).await?;
         } else {
             debug!(
@@ -1012,7 +1133,13 @@ impl SessionRuntime for ContainerRuntime {
             container_name,
         ];
 
-        match run_docker(&args, "docker stop (container runtime)").await {
+        match run_docker(
+            &args,
+            "docker stop (container runtime)",
+            self.docker_socket.clone(),
+        )
+        .await
+        {
             Ok(_) => Ok(()),
             Err(SandboxError::Gateway(msg))
                 if msg.contains("is not running") || msg.contains("No such container") =>
@@ -1042,7 +1169,13 @@ impl SessionRuntime for ContainerRuntime {
         let container_name = handle.as_str().to_string();
 
         let rm_args = ["rm".to_string(), "-f".to_string(), container_name.clone()];
-        match run_docker(&rm_args, "docker rm (container runtime)").await {
+        match run_docker(
+            &rm_args,
+            "docker rm (container runtime)",
+            self.docker_socket.clone(),
+        )
+        .await
+        {
             Ok(_) => {}
             Err(SandboxError::Gateway(msg)) if msg.contains("No such container") => {}
             Err(other) => return Err(other),
@@ -1050,7 +1183,13 @@ impl SessionRuntime for ContainerRuntime {
 
         let volume = home_volume_name(&session_id);
         let vol_args = ["volume".to_string(), "rm".to_string(), volume];
-        match run_docker(&vol_args, "docker volume rm (container runtime)").await {
+        match run_docker(
+            &vol_args,
+            "docker volume rm (container runtime)",
+            self.docker_socket.clone(),
+        )
+        .await
+        {
             Ok(_) => {}
             Err(SandboxError::Gateway(msg))
                 if msg.contains("No such volume") || msg.contains("no such volume") => {}
@@ -1074,7 +1213,13 @@ impl SessionRuntime for ContainerRuntime {
             container_name,
         ];
 
-        match run_docker(&args, "docker inspect (container status)").await {
+        match run_docker(
+            &args,
+            "docker inspect (container status)",
+            self.docker_socket.clone(),
+        )
+        .await
+        {
             Ok(stdout) => Ok(parse_docker_state_status(&stdout)),
             // `docker inspect` emits "no such object" in lowercase on
             // newer Docker releases (≥24) and "No such object" in mixed
@@ -1101,6 +1246,7 @@ impl SessionRuntime for ContainerRuntime {
     ) -> Arc<dyn GuestTransport> {
         Arc::new(ContainerTransport {
             container_name: handle.as_str().to_string(),
+            docker_socket: self.docker_socket.clone(),
         })
     }
 
@@ -1141,7 +1287,13 @@ impl SessionRuntime for ContainerRuntime {
             "5".to_string(),
             container_name.clone(),
         ];
-        match run_docker(&stop_args, "docker stop (container refresh)").await {
+        match run_docker(
+            &stop_args,
+            "docker stop (container refresh)",
+            self.docker_socket.clone(),
+        )
+        .await
+        {
             Ok(_) => {}
             Err(SandboxError::Gateway(msg))
                 if msg.contains("is not running") || msg.contains("No such container") => {}
@@ -1158,7 +1310,12 @@ impl SessionRuntime for ContainerRuntime {
         //    atomically renames that file so the source is always
         //    current.
         let restart_args = build_refresh_argv(&container_name);
-        run_docker(&restart_args, "docker restart (guest refresh)").await?;
+        run_docker(
+            &restart_args,
+            "docker restart (guest refresh)",
+            self.docker_socket.clone(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -1174,8 +1331,19 @@ impl SessionRuntime for ContainerRuntime {
 /// `127.0.0.1:5123` inside the container; reaching it via `docker exec`
 /// is the dual of Lima reaching it via `limactl shell` and works
 /// regardless of the container's external network configuration.
+///
+/// On macOS the `docker_socket` field carries the forwarded gateway-VM socket
+/// path; the transport prepends `-H unix://<path>` to every `docker exec`
+/// so the long-lived socat byte pump targets the gateway VM's Docker daemon.
+/// Linux leaves `docker_socket: None` — no `-H` flag is emitted (host daemon,
+/// unchanged). This is the spawn_blocking carve-out site: the pump is held
+/// open for the entire SSH session so it uses `TokioCommand` (async pipes),
+/// NOT `spawn_blocking`. See the Async-I/O carve-out doc-comment in
+/// `sandboxd/src/proxy_http.rs` for the full rationale.
 pub struct ContainerTransport {
     container_name: String,
+    /// macOS only: forwarded gateway-VM Docker socket. `None` on Linux.
+    docker_socket: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -1184,6 +1352,10 @@ impl GuestTransport for ContainerTransport {
         debug!(container = %self.container_name, "opening docker exec socat transport");
 
         let mut command = TokioCommand::new("docker");
+        // Inject `-H unix://<socket>` when routing through the gateway VM.
+        if let Some(sock) = &self.docker_socket {
+            command.args(["-H", &format!("unix://{}", sock.display())]);
+        }
         command
             .args([
                 "exec",
@@ -1417,11 +1589,22 @@ fn parse_docker_state_status(raw: &str) -> RuntimeStatus {
 /// On success returns the trimmed stdout — most callers want a
 /// trivial value (status line, container id) and trimming once here
 /// is cheaper than re-trimming at every call site.
-async fn run_docker(args: &[String], operation: &'static str) -> Result<String, SandboxError> {
+///
+/// `docker_socket` is `None` on Linux (host daemon, no `-H` flag) and
+/// `Some(path)` on macOS (forwarded gateway-VM socket). When `Some`,
+/// `-H unix://<path>` is prepended before `args`.
+async fn run_docker(
+    args: &[String],
+    operation: &'static str,
+    docker_socket: Option<PathBuf>,
+) -> Result<String, SandboxError> {
     let owned: Vec<String> = args.to_vec();
     let op = operation.to_string();
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("docker");
+        if let Some(sock) = &docker_socket {
+            cmd.args(["-H", &format!("unix://{}", sock.display())]);
+        }
         for arg in &owned {
             cmd.arg(arg);
         }
@@ -1442,18 +1625,22 @@ async fn run_docker(args: &[String], operation: &'static str) -> Result<String, 
     .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))?
 }
 
-/// `docker inspect -f '{{.State.Pid}}' <name>` → host-namespace pid.
+/// `docker inspect -f '{{.State.Pid}}' <name>` → host-namespace pid (or
+/// in-VM pid when targeting a forwarded gateway socket on macOS).
 /// Returns the parsed integer; 0 (a stopped container's reported pid)
 /// surfaces as an error since spawning the helper against pid 0 makes
 /// no sense.
-async fn inspect_container_pid(container_name: &str) -> Result<i32, SandboxError> {
+async fn inspect_container_pid(
+    container_name: &str,
+    docker_socket: Option<PathBuf>,
+) -> Result<i32, SandboxError> {
     let args = [
         "inspect".to_string(),
         "-f".to_string(),
         "{{.State.Pid}}".to_string(),
         container_name.to_string(),
     ];
-    let stdout = run_docker(&args, "docker inspect (container pid)").await?;
+    let stdout = run_docker(&args, "docker inspect (container pid)", docker_socket).await?;
     let pid: i32 = stdout.parse().map_err(|_| {
         SandboxError::Gateway(format!(
             "docker inspect returned non-integer pid for {container_name}: {stdout:?}"
@@ -2019,6 +2206,126 @@ mod tests {
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
         )
+    }
+
+    fn test_runtime_macos() -> Arc<ContainerRuntime> {
+        ContainerRuntime::with_macos_socket(
+            DEFAULT_LITE_IMAGE_TAG,
+            2048,
+            2.0,
+            1000,
+            1000,
+            "/var/lib/sandbox/guest/sandbox-guest",
+            "/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock",
+            "/var/lib/sandboxd/501",
+        )
+    }
+
+    // -- ContainerRuntime macOS-awareness (D3) --------------------------------
+
+    /// Linux runtime: is_macos() is false, docker_socket() is None, and
+    /// docker_cmd() emits no -H flag.
+    #[test]
+    fn linux_runtime_is_not_macos() {
+        let rt = test_runtime();
+        assert!(!rt.is_macos());
+        assert!(rt.docker_socket().is_none());
+    }
+
+    /// Linux runtime: docker_cmd() produces a bare `docker` command with
+    /// no -H argument.
+    #[test]
+    fn linux_runtime_docker_cmd_has_no_h_flag() {
+        let rt = test_runtime();
+        let cmd = rt.docker_cmd();
+        let program = cmd.get_program().to_str().unwrap();
+        assert_eq!(program, "docker");
+        let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert!(
+            !args.contains(&"-H"),
+            "Linux docker_cmd must not emit -H: {args:?}"
+        );
+    }
+
+    /// macOS runtime: is_macos() is true, docker_socket() returns the path.
+    #[test]
+    fn macos_runtime_is_macos() {
+        let rt = test_runtime_macos();
+        assert!(rt.is_macos());
+        assert_eq!(
+            rt.docker_socket(),
+            Some(Path::new(
+                "/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock"
+            ))
+        );
+    }
+
+    /// macOS runtime: docker_cmd() prepends -H unix://<socket> before any args.
+    #[test]
+    fn macos_runtime_docker_cmd_prepends_h_flag() {
+        let rt = test_runtime_macos();
+        let cmd = rt.docker_cmd();
+        let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        // First arg must be -H, second must be unix://<socket>.
+        assert_eq!(args.get(0), Some(&"-H"), "first arg must be -H: {args:?}");
+        let h_val = args.get(1).expect("must have -H value");
+        assert!(
+            h_val.starts_with("unix://"),
+            "-H value must use unix:// scheme: {h_val}"
+        );
+        assert!(
+            h_val.contains("gateway-docker.sock"),
+            "-H value must contain the socket filename: {h_val}"
+        );
+    }
+
+    /// macOS runtime: docker_cmd_async() also prepends -H unix://<socket>.
+    #[test]
+    fn macos_runtime_docker_cmd_async_prepends_h_flag() {
+        let rt = test_runtime_macos();
+        let cmd = rt.docker_cmd_async();
+        let args: Vec<&str> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        assert_eq!(args.get(0), Some(&"-H"), "first arg must be -H: {args:?}");
+        let h_val = args.get(1).expect("must have -H value");
+        assert!(h_val.starts_with("unix://"));
+    }
+
+    /// macOS runtime: docker_home() returns the configured path.
+    #[test]
+    fn macos_runtime_docker_home_is_set() {
+        let rt = test_runtime_macos();
+        assert_eq!(rt.docker_home(), Path::new("/var/lib/sandboxd/501"));
+    }
+
+    /// Linux runtime: with_macos_socket constructor is callable from Linux
+    /// (non-cfg), and the resulting runtime correctly reports is_macos().
+    #[test]
+    fn with_macos_socket_constructor_callable_on_any_platform() {
+        let rt = ContainerRuntime::with_macos_socket(
+            "sandboxd-lite:test",
+            1024,
+            1.0,
+            500,
+            500,
+            "/tmp/guest",
+            "/tmp/test.sock",
+            "/tmp/home",
+        );
+        assert!(rt.is_macos());
+        assert_eq!(rt.docker_socket(), Some(Path::new("/tmp/test.sock")));
+        assert_eq!(rt.docker_home(), Path::new("/tmp/home"));
+    }
+
+    /// Linux new() constructor: docker_socket is None (host daemon, unchanged).
+    #[test]
+    fn new_constructor_has_no_socket() {
+        let rt = ContainerRuntime::new("sandboxd-lite:test", 1024, 1.0, 500, 500, "/tmp/guest");
+        assert!(!rt.is_macos());
+        assert!(rt.docker_socket().is_none());
     }
 
     /// `kind()` reports the static `BackendKind::Container` constant —
