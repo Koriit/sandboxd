@@ -9845,9 +9845,8 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         let policies = state.session_policies.lock().await;
                         policies.contains_key(&session.id)
                     };
-                    let init_dns_str = CoreDnsConfig::empty_policy_file_content();
                     let init_dns_owned = if !has_policy {
-                        Some(init_dns_str.clone())
+                        Some(CoreDnsConfig::empty_policy_file_content())
                     } else {
                         None
                     };
@@ -10173,7 +10172,7 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
     // Process sessions with bounded concurrency (~8 at a time) so the
     // gateway Docker daemon is not flooded. One session failure must not
     // abort the others.
-    let mut join_set: tokio::task::JoinSet<(sandbox_core::SessionId, Result<(), String>)> =
+    let mut join_set: tokio::task::JoinSet<(sandbox_core::SessionId, String, Result<(), String>)> =
         tokio::task::JoinSet::new();
     let max_concurrent: usize = 8;
 
@@ -10198,8 +10197,11 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
                 Ok(None) => {
                     warn!(
                         session_id = %session.id,
-                        "gateway Lima recovery: no network info for session; skipping"
+                        "gateway Lima recovery: no network info for session; marking Error"
                     );
+                    let _ = state
+                        .store
+                        .update_state_reconcile(&session.id, SessionState::Error);
                     {
                         let mut map = state.networking_status.lock().await;
                         map.remove(&session.id);
@@ -10210,8 +10212,11 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
                     warn!(
                         session_id = %session.id,
                         error = %e,
-                        "gateway Lima recovery: failed to get network info; skipping"
+                        "gateway Lima recovery: failed to get network info; marking Error"
                     );
+                    let _ = state
+                        .store
+                        .update_state_reconcile(&session.id, SessionState::Error);
                     {
                         let mut map = state.networking_status.lock().await;
                         map.remove(&session.id);
@@ -10235,6 +10240,7 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
             let pool_str = pool.clone();
             let ni = network_info.clone();
             let sid = session.id;
+            let owner = session.owner_username.clone();
 
             // Determine initial DNS policy — fail-closed.
             let has_policy = {
@@ -10269,13 +10275,13 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
                     Ok(r) => r,
                     Err(e) => Err(format!("spawn_blocking panicked: {e}")),
                 };
-                (sid, result)
+                (sid, owner, result)
             });
         }
 
         // Wait for any in-flight task to complete.
-        let (sid, result) = match join_set.join_next().await {
-            Some(Ok(pair)) => pair,
+        let (sid, owner, result) = match join_set.join_next().await {
+            Some(Ok(triple)) => triple,
             Some(Err(e)) => {
                 error!(error = %e, "gateway Lima recovery: JoinSet join error");
                 if session_iter.peek().is_none() && join_set.is_empty() {
@@ -10297,15 +10303,6 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
                     let mut map = state.networking_status.lock().await;
                     map.remove(&sid);
                 }
-                // Look up the session row for the owner_username needed by
-                // reapply_session_policy and spawn_session_ingestor.
-                let owner = state
-                    .store
-                    .list_sessions_unfiltered()
-                    .ok()
-                    .and_then(|s| s.into_iter().find(|r| r.id == sid))
-                    .map(|r| r.owner_username)
-                    .unwrap_or_default();
                 spawn_session_ingestor(&sid, state).await;
                 reapply_session_policy(&sid, &owner, state).await;
             }
