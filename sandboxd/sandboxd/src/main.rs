@@ -9216,13 +9216,31 @@ async fn reconcile_networking(state: &AppState) {
 // macOS startup reconcile (steps 6a + 6b) and pool-state restore (step 7)
 // ---------------------------------------------------------------------------
 
+/// Controls how `reconcile_operator_vms` classifies confirmed-dead VMs.
+///
+/// At daemon startup, a dead VM means the session encountered an unrecoverable
+/// failure before restart — it is marked `Error` (not resumable without manual
+/// intervention). On a fresh agent check-in (agent crash/respawn or user
+/// re-login), a dead VM reflects the login-scoped lifetime: the operator's VMs
+/// were tied to their prior login context and are now gone. The session is
+/// marked `Stopped` (resumable — the operator can restart it when they log in).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileSource {
+    /// Daemon startup (step 6b) — dead VMs are permanent failures → `Error`.
+    Startup,
+    /// Fresh agent check-in (agent crash/respawn, re-login) — dead VMs reflect
+    /// the login-scoped lifetime → `Stopped` (resumable).
+    FreshCheckin,
+}
+
 /// Verify running Lima sessions for a single operator and mark any whose VM is
-/// confirmed dead as `Error`, releasing the associated vmnet slot.
+/// confirmed dead, releasing the associated vmnet slot.
 ///
 /// Queries all sessions from the store internally, then lists VMs for the
 /// given `op_uid` via their `LimaManager`. Running sessions whose VM entry is
-/// absent or stopped are transitioned to `Error` and their slot is released.
-/// Verified-live sessions are counted but not modified.
+/// absent or stopped are transitioned (see `source` for the target state) and
+/// their slot is released. Verified-live sessions are counted but not modified.
 ///
 /// Returns `(verified, errored)` counters. Best-effort: any operator-level
 /// failure (manager lookup, `list_vms` error) is logged and treated as zero
@@ -9232,7 +9250,11 @@ async fn reconcile_networking(state: &AppState) {
 /// of step 6a in `reconcile_macos` — this function handles only the VM-side
 /// liveness check.
 #[cfg(target_os = "macos")]
-async fn reconcile_operator_vms(state: &AppState, op_uid: u32) -> (u32, u32) {
+async fn reconcile_operator_vms(
+    state: &AppState,
+    op_uid: u32,
+    source: ReconcileSource,
+) -> (u32, u32) {
     use sandbox_core::{BackendKind, SessionState};
 
     let sessions = match state.store.list_sessions_unfiltered() {
@@ -9299,14 +9321,25 @@ async fn reconcile_operator_vms(state: &AppState, op_uid: u32) -> (u32, u32) {
                 verified += 1;
             }
             Some(_) | None => {
+                // Choose the target state based on why reconcile is running.
+                // Startup: dead VM is an unrecoverable pre-restart failure → Error.
+                // Fresh check-in: dead VM reflects the login-scoped lifetime —
+                // the operator's VMs are tied to their Aqua session and vanish
+                // when the agent crashes or the user logs out and back in.
+                // The session is Stopped so the operator can resume it on next login.
+                let dead_vm_state = match source {
+                    ReconcileSource::Startup => SessionState::Error,
+                    ReconcileSource::FreshCheckin => SessionState::Stopped,
+                };
                 warn!(
                     session_id = %session.id,
                     op_uid,
-                    "reconcile_operator_vms: running session's VM is down; marking Error"
+                    target_state = ?dead_vm_state,
+                    "reconcile_operator_vms: running session's VM is down"
                 );
                 let _ = state
                     .store
-                    .update_state_reconcile(&session.id, SessionState::Error);
+                    .update_state_reconcile(&session.id, dead_vm_state);
                 // Release the slot (gateway side was cleaned in 6a above or is a no-op here).
                 let _ = state.vmnet_pool.release_lima_slot(&session.id);
                 errored += 1;
@@ -9445,7 +9478,7 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
     let mut errored_6b = 0u32;
 
     for &op_uid in &checked_in_uids {
-        let (v, e) = reconcile_operator_vms(state, op_uid).await;
+        let (v, e) = reconcile_operator_vms(state, op_uid, ReconcileSource::Startup).await;
         verified_6b += v;
         errored_6b += e;
     }
@@ -11353,7 +11386,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             while let Some(op_uid) = admit_rx.recv().await {
                 info!(op_uid, "broker admit: running operator VM reconcile");
-                reconcile_operator_vms(&reconcile_state, op_uid).await;
+                reconcile_operator_vms(&reconcile_state, op_uid, ReconcileSource::FreshCheckin)
+                    .await;
             }
         });
     }

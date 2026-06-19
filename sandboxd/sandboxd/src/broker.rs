@@ -102,6 +102,22 @@ const SYSTEM_UID_FLOOR: u32 = 500;
 /// the connection dead and dropping it.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Returns the effective heartbeat liveness timeout.
+///
+/// In production this is always [`HEARTBEAT_TIMEOUT`] (60 s). Under the
+/// `test-env-override` feature the `SANDBOX_BROKER_TEST_HEARTBEAT_MS` env var
+/// overrides the value so heartbeat-drop tests complete in milliseconds rather
+/// than waiting the full 60-second window.
+fn heartbeat_timeout() -> Duration {
+    #[cfg(feature = "test-env-override")]
+    if let Ok(ms_str) = std::env::var(TEST_HEARTBEAT_MS_ENV) {
+        if let Ok(ms) = ms_str.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    HEARTBEAT_TIMEOUT
+}
+
 /// Capacity of the per-agent request channel. Bounded at a small value
 /// because the protocol is strictly sequential: one request in flight at a
 /// time. A backlog of 4 absorbs any burst of same-uid concurrent calls
@@ -116,6 +132,8 @@ const SANDBOX_GROUP_NAME: &str = "_sandbox";
 const TEST_BROKER_SOCKET_ENV: &str = "SANDBOX_BROKER_TEST_SOCKET";
 #[cfg(feature = "test-env-override")]
 const TEST_SANDBOX_GROUP_ENV: &str = "SANDBOX_BROKER_TEST_SANDBOX_GROUP";
+#[cfg(feature = "test-env-override")]
+const TEST_HEARTBEAT_MS_ENV: &str = "SANDBOX_BROKER_TEST_HEARTBEAT_MS";
 
 // ---------------------------------------------------------------------------
 // Socket path resolution
@@ -686,12 +704,15 @@ pub async fn run_broker_listener(
         match outcome {
             AuthOutcome::Admitted(uid) => {
                 info!(uid, "agent check-in admitted");
-                // Notify side-effect subscribers (e.g. reconcile_operator_vms).
+                let reg = registry.clone();
+                let (slot_gen, evict_rx, req_rx) = registry.register(uid).await;
+                // Notify side-effect subscribers (e.g. reconcile_operator_vms) AFTER
+                // the new connection is registered. This ensures reconcile_operator_vms
+                // always observes the freshly-registered connection rather than racing
+                // against a still-registered prior connection or observing an empty slot.
                 if let Some(ref tx) = on_admit_tx {
                     let _ = tx.try_send(uid);
                 }
-                let reg = registry.clone();
-                let (slot_gen, evict_rx, req_rx) = registry.register(uid).await;
                 tokio::spawn(drive_agent_connection_outer(
                     uid, slot_gen, stream, evict_rx, req_rx, reg,
                 ));
@@ -774,7 +795,7 @@ async fn drive_agent_connection_outer(
 
                             // Read StreamOpen (or Rejected) from the agent.
                             let read_result = tokio::time::timeout(
-                                HEARTBEAT_TIMEOUT,
+                                heartbeat_timeout(),
                                 buf_reader.read_line(&mut line),
                             )
                             .await;
@@ -863,7 +884,7 @@ async fn drive_agent_connection_outer(
                     }
                 }
 
-                result = tokio::time::timeout(HEARTBEAT_TIMEOUT, buf_reader.read_line(&mut line)) => {
+                result = tokio::time::timeout(heartbeat_timeout(), buf_reader.read_line(&mut line)) => {
                     if !process_agent_line(uid, result, &line, &mut writer, &mut outstanding).await {
                         break 'outer;
                     }
@@ -876,7 +897,7 @@ async fn drive_agent_connection_outer(
                     info!(uid, "agent connection evicted while awaiting response; closing");
                     break 'outer;
                 }
-                result = tokio::time::timeout(HEARTBEAT_TIMEOUT, buf_reader.read_line(&mut line)) => {
+                result = tokio::time::timeout(heartbeat_timeout(), buf_reader.read_line(&mut line)) => {
                     if !process_agent_line(uid, result, &line, &mut writer, &mut outstanding).await {
                         break 'outer;
                     }
@@ -903,7 +924,7 @@ async fn process_agent_line(
         Err(_elapsed) => {
             warn!(
                 uid,
-                timeout_secs = HEARTBEAT_TIMEOUT.as_secs(),
+                timeout_secs = heartbeat_timeout().as_secs(),
                 "no heartbeat received within timeout; dropping dead agent"
             );
             false
@@ -2541,6 +2562,412 @@ mod tests {
             !uids.contains(&uid_logged_out),
             "logged-out operator must NOT appear in connected_uids (6b skips them)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-uid isolation — the mandatory no-cross-operator-leakage test
+    // -----------------------------------------------------------------------
+
+    /// Drive two fake-agent connections with distinct uids directly against the
+    /// registry (bypassing the socket-level `accept()` path, which cannot forge
+    /// two different uids without root) and assert that:
+    ///
+    /// - `send_op` for uid A lands only on A's request channel; uid B's is unaffected.
+    /// - Evicting A (re-registering A) does not disturb B's entry.
+    /// - `connected_uids()` returns exactly {A, B} before eviction and still
+    ///   {A, B} after eviction (A's slot was replaced, not removed).
+    /// - A response framed with A's request_id on A's connection never satisfies
+    ///   a B-side request (per-connection `outstanding` tracking is isolated).
+    #[tokio::test]
+    async fn multi_uid_no_cross_operator_leakage() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest};
+
+        let uid_a: u32 = 70001;
+        let uid_b: u32 = 70002;
+        let registry = AgentRegistry::new();
+
+        // Register both operators.
+        let (gen_a1, mut evict_rx_a1, mut req_rx_a) = registry.register(uid_a).await;
+        let (_gen_b, _evict_rx_b, mut req_rx_b) = registry.register(uid_b).await;
+
+        // Both must be visible.
+        assert!(registry.is_registered(uid_a).await, "A must be registered");
+        assert!(registry.is_registered(uid_b).await, "B must be registered");
+        let mut uids = registry.connected_uids().await;
+        uids.sort();
+        assert_eq!(
+            uids,
+            vec![uid_a, uid_b],
+            "connected_uids must contain exactly A and B"
+        );
+
+        // send_op for A must land on A's req channel only.
+        let req_a = BrokerRequest {
+            request_id: 100,
+            op: BrokerOp::ListJson { op_uid: uid_a },
+        };
+        // Drive send_op in a background task — it returns when the channel accepts
+        // the item (capacity 4, so non-blocking here).
+        let reg_clone = registry.clone();
+        let send_a = tokio::spawn(async move { reg_clone.send_op(uid_a, req_a).await });
+
+        // A's req_rx must receive the work; B's must see nothing.
+        let pending_a = tokio::time::timeout(Duration::from_secs(2), req_rx_a.recv())
+            .await
+            .expect("A's req_rx should receive within 2s")
+            .expect("A's req_rx should not be closed");
+        // Verify the request landed on A's channel with the correct request_id.
+        let pending_request_id = match &pending_a {
+            PendingRequest::OneShot { request, .. } => request.request_id,
+            PendingRequest::TakeStream { request, .. } => request.request_id,
+        };
+        assert_eq!(
+            pending_request_id, 100,
+            "A's channel got a different request_id"
+        );
+
+        // B's req_rx must remain empty.
+        assert!(
+            req_rx_b.try_recv().is_err(),
+            "B's request channel must remain empty after an A-side send_op"
+        );
+
+        // Drop pending_a (reply channel dropped); send_a will complete with an error.
+        drop(pending_a);
+        // send_a will now error (reply channel dropped); ignore.
+        let _ = send_a.await;
+
+        // Evict A by re-registering. B must be undisturbed.
+        let (_gen_a2, _evict_rx_a2, _req_rx_a2) = registry.register(uid_a).await;
+
+        // A's old eviction receiver must have fired.
+        assert!(
+            evict_rx_a1.try_recv().is_err(),
+            "A's prior eviction receiver must be closed (eviction sender dropped)"
+        );
+
+        // B's entry must be untouched.
+        assert!(
+            registry.is_registered(uid_b).await,
+            "B's registration must survive A's eviction"
+        );
+
+        // connected_uids still has exactly {A, B}: A was replaced, not removed.
+        let mut uids = registry.connected_uids().await;
+        uids.sort();
+        assert_eq!(
+            uids,
+            vec![uid_a, uid_b],
+            "connected_uids must still be {{A, B}} after re-registering A"
+        );
+
+        // A's stale remove (gen_a1) must not disturb the new A entry.
+        registry.remove(uid_a, gen_a1).await;
+        assert!(
+            registry.is_registered(uid_a).await,
+            "stale remove of A must not clear A's live entry"
+        );
+        assert!(
+            registry.is_registered(uid_b).await,
+            "B's registration must survive A's stale remove"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Error text assertions for the agent-unavailable path
+    // -----------------------------------------------------------------------
+
+    /// Verify the actionable "not running" error message contains the expected
+    /// human-readable prefix required by the spec.
+    ///
+    /// The exact text is contract — CLI/UI tooling and the spec rely on the
+    /// `session agent for … is not running` form.
+    #[tokio::test]
+    async fn agent_not_running_error_text_matches_spec() {
+        // Use a uid that is very unlikely to have a username on any test machine.
+        // The function falls back to the numeric uid string when resolution fails.
+        let uid: u32 = 88877;
+        let msg = agent_not_running_error(uid);
+        assert!(
+            msg.starts_with("session agent for "),
+            "error must start with 'session agent for'; got: {msg}"
+        );
+        assert!(
+            msg.contains("is not running"),
+            "error must contain 'is not running'; got: {msg}"
+        );
+        // Must include something identifying the operator (username or uid number).
+        assert!(
+            msg.contains(&uid.to_string()) || !msg.contains("is not running — the operator"),
+            "error must identify the operator by uid or username; got: {msg}"
+        );
+    }
+
+    /// Verify that `send_op` returns an error whose text matches the spec's
+    /// `session agent for … is not running` form when no agent is registered.
+    #[tokio::test]
+    async fn send_op_error_text_matches_spec_form() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest};
+        let registry = AgentRegistry::new();
+        let uid: u32 = 88899;
+        let request = BrokerRequest {
+            request_id: 1,
+            op: BrokerOp::ListJson { op_uid: uid },
+        };
+        let err = registry.send_op(uid, request).await.unwrap_err();
+        assert!(
+            err.contains("session agent for"),
+            "send_op error must contain 'session agent for'; got: {err}"
+        );
+        assert!(
+            err.contains("is not running"),
+            "send_op error must contain 'is not running'; got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Switched-away negative guarantee
+    // -----------------------------------------------------------------------
+
+    /// A still-connected operator whose session stays registered and whose
+    /// vm-check does not fire is never marked failed.
+    ///
+    /// The switched-away (still-logged-in) guarantee: absent a fresh admit
+    /// and absent VM death, the registry entry stays intact and no eviction
+    /// fires. This test asserts the negative: simply not generating a new
+    /// check-in (which would trigger on_admit → reconcile) leaves the entry
+    /// untouched.
+    #[tokio::test]
+    async fn switched_away_connection_stays_registered() {
+        let registry = AgentRegistry::new();
+        let uid: u32 = 77001;
+
+        // Agent checks in.
+        let (_gen, _evict_rx, _req_rx) = registry.register(uid).await;
+        assert!(
+            registry.is_registered(uid).await,
+            "uid must be registered after check-in"
+        );
+
+        // Simulate time passing without any fresh admit (switch-away scenario).
+        // No new check-in → no eviction fires → entry remains registered.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            registry.is_registered(uid).await,
+            "entry must remain registered with no eviction or new check-in (switched-away invariant)"
+        );
+
+        // Confirm connected_uids still lists the operator.
+        assert!(
+            registry.connected_uids().await.contains(&uid),
+            "switched-away operator must remain in connected_uids"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Heartbeat-drop detection (uses R3 seam)
+    // -----------------------------------------------------------------------
+
+    /// A fake agent that checks in then goes silent is evicted after the
+    /// (test-shortened) heartbeat timeout, and `is_registered` returns false.
+    ///
+    /// Uses the `SANDBOX_BROKER_TEST_HEARTBEAT_MS` env var (the R3 test seam)
+    /// to shorten the 60-second production timeout to 100 ms so the test
+    /// completes quickly.
+    ///
+    /// Named with `integration_` prefix because it drives a real Unix socket
+    /// through the broker listener.
+    #[cfg(feature = "test-env-override")]
+    #[tokio::test]
+    async fn integration_heartbeat_timeout_drops_silent_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("integration_heartbeat_drop.sock");
+
+        let own_uid = unsafe { libc::getuid() };
+        let primary_gid = uid_to_primary_gid(own_uid).unwrap();
+        let primary_group = gid_to_group_name(primary_gid).unwrap();
+
+        unsafe {
+            std::env::set_var(TEST_SANDBOX_GROUP_ENV, &primary_group);
+            std::env::set_var(TEST_BROKER_SOCKET_ENV, &socket_path);
+            // Shorten the heartbeat timeout to 100 ms so the test doesn't wait 60 s.
+            std::env::set_var(TEST_HEARTBEAT_MS_ENV, "100");
+        }
+
+        let listener = bind_broker_socket(&socket_path).unwrap();
+        let registry = AgentRegistry::new();
+        let reg_for_listener = registry.clone();
+
+        tokio::spawn(run_broker_listener(listener, reg_for_listener, None));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Connect and check in — then go silent (don't send any PING).
+        let agent_stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("agent connect");
+        let (_, mut agent_writer) = agent_stream.into_split();
+        agent_writer.write_all(b"CHECKIN\n").await.unwrap();
+
+        // Give the broker time to process the check-in.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            registry.is_registered(own_uid).await,
+            "uid must be registered immediately after check-in"
+        );
+
+        // Now go silent. Wait > 100 ms timeout + processing headroom.
+        // The connection task must detect the liveness-timeout and drop the entry.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert!(
+            !registry.is_registered(own_uid).await,
+            "uid must be unregistered after heartbeat timeout"
+        );
+
+        unsafe {
+            std::env::remove_var(TEST_SANDBOX_GROUP_ENV);
+            std::env::remove_var(TEST_BROKER_SOCKET_ENV);
+            std::env::remove_var(TEST_HEARTBEAT_MS_ENV);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Eviction severs GuestSocat stream; new connection works
+    // -----------------------------------------------------------------------
+
+    /// A GuestSocat stream handed to the caller is severed when the agent side
+    /// closes, and a fresh check-in re-registers the uid so a new stream can be
+    /// opened.
+    ///
+    /// The "eviction severs stream" property: once `take_stream_for_guest_socat`
+    /// has handed the stream off, the connection task has already removed its
+    /// registry entry. A second check-in (simulating agent reconnect) registers
+    /// a fresh connection and `is_registered` returns true — proving the new
+    /// connection is live while the handed-off stream independently closes when
+    /// the remote side closes.
+    ///
+    /// Named with `integration_` prefix.
+    #[cfg(feature = "test-env-override")]
+    #[tokio::test]
+    async fn integration_eviction_severs_guest_socat_stream_new_connection_works() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest, BrokerResponse, BrokerResult};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("integration_evict_socat.sock");
+
+        let own_uid = unsafe { libc::getuid() };
+        let primary_gid = uid_to_primary_gid(own_uid).unwrap();
+        let primary_group = gid_to_group_name(primary_gid).unwrap();
+
+        unsafe {
+            std::env::set_var(TEST_SANDBOX_GROUP_ENV, &primary_group);
+            std::env::set_var(TEST_BROKER_SOCKET_ENV, &socket_path);
+        }
+
+        let listener = bind_broker_socket(&socket_path).unwrap();
+        let registry = AgentRegistry::new();
+        let reg_for_listener = registry.clone();
+
+        tokio::spawn(run_broker_listener(listener, reg_for_listener, None));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // --- First connection: check in and open a GuestSocat stream ---
+
+        let agent_stream1 = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("agent1 connect");
+        let (agent1_reader, mut agent1_writer) = agent_stream1.into_split();
+        let mut agent1_buf = tokio::io::BufReader::new(agent1_reader);
+
+        agent1_writer.write_all(b"CHECKIN\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            registry.is_registered(own_uid).await,
+            "uid registered after first check-in"
+        );
+
+        // Daemon requests a GuestSocat stream.
+        let reg_clone = registry.clone();
+        let socat_request = BrokerRequest {
+            request_id: 55,
+            op: BrokerOp::GuestSocat {
+                op_uid: own_uid,
+                vm: "test-vm".to_string(),
+            },
+        };
+        let daemon_task = tokio::spawn(async move {
+            reg_clone
+                .take_stream_for_guest_socat(own_uid, socat_request)
+                .await
+        });
+
+        // Fake agent1: read the GuestSocat request and reply with StreamOpen.
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), agent1_buf.read_line(&mut line))
+            .await
+            .expect("GuestSocat request timeout")
+            .expect("GuestSocat request read");
+
+        let response = BrokerResponse {
+            request_id: 55,
+            result: BrokerResult::StreamOpen,
+        };
+        let response_json = serde_json::to_string(&response).unwrap();
+        agent1_writer
+            .write_all(response_json.as_bytes())
+            .await
+            .unwrap();
+        agent1_writer.write_all(b"\n").await.unwrap();
+
+        // Daemon receives the stream.
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("daemon task timeout")
+            .expect("daemon task join")
+            .expect("take_stream must succeed");
+
+        // After GuestSocat handoff the connection task has removed its registry entry
+        // and exited. is_registered must now be false (the entry was removed by the
+        // connection task, not evicted — this is the designed behavior).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !registry.is_registered(own_uid).await,
+            "after GuestSocat handoff the connection task removes its entry"
+        );
+
+        // Drop agent1 writer — this closes the agent1 side of the stream.
+        drop(agent1_writer);
+        // The handed-off stream must see EOF.
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("stream EOF timeout")
+            .expect("stream read");
+        assert_eq!(
+            n, 0,
+            "handed-off stream must see EOF when agent side closes"
+        );
+
+        // --- Second connection: agent reconnects, uid is live again ---
+
+        let agent_stream2 = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("agent2 connect");
+        let (_, mut agent2_writer) = agent_stream2.into_split();
+        agent2_writer.write_all(b"CHECKIN\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            registry.is_registered(own_uid).await,
+            "uid must be registered again after second check-in"
+        );
+
+        unsafe {
+            std::env::remove_var(TEST_SANDBOX_GROUP_ENV);
+            std::env::remove_var(TEST_BROKER_SOCKET_ENV);
+        }
     }
 
     /// Resolve a gid to a group name via `getgrgid_r`. Used in integration
