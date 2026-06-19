@@ -44,7 +44,7 @@ pub use api::{
     DenyProtocolDto, DnsEventBodyDto, DnsEventDto, EnvoyConnectionDto, EnvoyEventBodyDto,
     EnvoyEventDto, EventDto, EventName, EventsFilter, EventsQueryDto, ExecRequest, ExecResponse,
     GatewayHealth, GatewayShutdownReasonDto, HealthComponentDto, LayerKind, LifecycleEventBodyDto,
-    LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
+    LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth, NetworkingStatus,
     PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, PropagationStatusResponse,
     SessionConfigDto, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
     SessionRootlessDockerDto, SshConfigDto, UpdatePolicyRequest, VmnetSlotDto,

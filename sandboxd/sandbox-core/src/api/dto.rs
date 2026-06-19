@@ -20,6 +20,31 @@ use crate::session::{SessionId, SessionState, WorkspaceSecurityModel};
 use crate::workspace_lock::WorkspaceOp;
 
 // ---------------------------------------------------------------------------
+// Networking health DTO
+// ---------------------------------------------------------------------------
+
+/// Transient networking health status for a macOS Lima session.
+///
+/// This field is in-memory only — not persisted to SQLite. It is set by the
+/// daemon's gateway recovery orchestrator and reflects whether the session's
+/// egress path (socket_vmnet segment + gateway container) is currently
+/// operational. Absent for non-Running sessions, Linux sessions, and lite
+/// container sessions.
+///
+/// - `healthy`: the egress path is functioning normally (default for a
+///   Running macOS session when no recovery event is in progress).
+/// - `degraded`: the gateway Lima instance or this session's container has
+///   failed; recovery has not yet started.
+/// - `recovering`: recovery is actively in progress for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkingStatus {
+    Healthy,
+    Degraded,
+    Recovering,
+}
+
+// ---------------------------------------------------------------------------
 // Session DTOs
 // ---------------------------------------------------------------------------
 
@@ -153,6 +178,15 @@ pub struct SessionDto {
     /// sentinel the runtime already understands).
     #[serde(default)]
     pub guest_protocol_version: u32,
+    /// macOS only: transient egress-path health for a Running Lima session.
+    ///
+    /// Populated from the daemon's in-memory recovery map; never persisted to
+    /// SQLite. `Some(Healthy)` is the steady-state for a Running macOS Lima
+    /// session with no active recovery. `None` for non-Running sessions, Linux
+    /// sessions, and lite container sessions. Omitted from the wire when `None`
+    /// so the Linux / lite wire format is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub networking_status: Option<NetworkingStatus>,
 }
 
 /// Wire representation of the rootless-Docker probe outcome stamped
@@ -684,5 +718,112 @@ mod tests {
             assert_eq!(WorkspaceOpDto::from(domain), dto);
             assert_eq!(WorkspaceOp::from(dto), domain);
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // NetworkingStatus serde round-trip
+    // ---------------------------------------------------------------------------
+
+    /// Each `NetworkingStatus` variant serialises to its lowercase token and
+    /// deserialises back to the same variant. The `rename_all = "lowercase"`
+    /// attribute pins the wire tokens: `"healthy"`, `"degraded"`,
+    /// `"recovering"`. Changing a token without updating this test is a
+    /// breaking wire-format change.
+    #[test]
+    fn networking_status_serde_round_trip() {
+        let cases: &[(NetworkingStatus, &str)] = &[
+            (NetworkingStatus::Healthy, "\"healthy\""),
+            (NetworkingStatus::Degraded, "\"degraded\""),
+            (NetworkingStatus::Recovering, "\"recovering\""),
+        ];
+        for (variant, expected_json) in cases {
+            let serialized = serde_json::to_string(variant).unwrap();
+            assert_eq!(
+                &serialized, expected_json,
+                "NetworkingStatus::{variant:?} must serialize to {expected_json}"
+            );
+            let deserialized: NetworkingStatus = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(
+                deserialized, *variant,
+                "NetworkingStatus::{variant:?} must round-trip through serde"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // SessionDto additive-field invariant: networking_status
+    // ---------------------------------------------------------------------------
+
+    /// When `networking_status` is `None` (the Linux / lite / non-Running
+    /// default), the field must be absent from the wire — not serialised as
+    /// `"networking_status": null`. This pins the additive contract so Linux
+    /// clients that don't know about macOS never see the field.
+    #[test]
+    fn session_dto_omits_networking_status_when_none() {
+        use crate::session::Session;
+        let session = Session::new(Some("net-status-none".into()));
+        let dto = SessionDto::from(&session);
+        assert!(dto.networking_status.is_none());
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            !json.contains("\"networking_status\""),
+            "networking_status key must be absent when None (Linux / lite wire format \
+             must be unchanged); json = {json}"
+        );
+    }
+
+    /// When `networking_status` is `Some(Healthy)`, the field appears on the
+    /// wire as `"networking_status": "healthy"`. Mirrors the `vmnet_slot` DTO
+    /// pattern for additive macOS-only fields.
+    #[test]
+    fn session_dto_includes_networking_status_when_some_healthy() {
+        use crate::session::Session;
+        let session = Session::new(Some("net-status-healthy".into()));
+        let dto =
+            SessionDto::from(&session).with_networking_status(Some(NetworkingStatus::Healthy));
+
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            value["networking_status"],
+            serde_json::json!("healthy"),
+            "healthy status must serialise as the lowercase token"
+        );
+
+        // Round-trip: deserialise back and confirm the field survives.
+        let json = serde_json::to_string(&dto).unwrap();
+        let deser: SessionDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deser.networking_status,
+            Some(NetworkingStatus::Healthy),
+            "networking_status must round-trip through serde"
+        );
+    }
+
+    /// A record written by a daemon that predates `networking_status` (absent
+    /// key) must deserialise cleanly with the field defaulting to `None`.
+    /// Pins the forward-compat `#[serde(default)]` contract.
+    #[test]
+    fn session_dto_legacy_record_without_networking_status_defaults_none() {
+        let v0_json = r#"{
+            "id": "0123456789ab",
+            "state": "running",
+            "created_at": "2026-04-22T00:00:00Z",
+            "updated_at": "2026-04-22T00:00:00Z",
+            "config": {
+                "cpus": 2,
+                "memory_mb": 4096,
+                "disk_gb": 20,
+                "hardened": true
+            },
+            "backend": "lima"
+        }"#;
+
+        let dto: SessionDto = serde_json::from_str(v0_json)
+            .expect("pre-networking_status record must round-trip via #[serde(default)]");
+        assert!(
+            dto.networking_status.is_none(),
+            "absent `networking_status` key must default to None"
+        );
     }
 }

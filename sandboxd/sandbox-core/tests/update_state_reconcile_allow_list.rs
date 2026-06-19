@@ -46,10 +46,12 @@ const ALLOW_LIST: &[&str] = &[
     // of owner and reconciles persisted state against runtime state.
     "sandboxd/src/main.rs:reconcile",
     // macOS startup step 6b reconciler: agent-gated VM-side reconcile.
-    // Walks every running Lima session for checked-in operators and
-    // back-stamps Error state when the VM is found dead. Daemon-internal
-    // startup path — no operator identity in scope.
-    "sandboxd/src/main.rs:reconcile_macos",
+    // Extracted helper called by `reconcile_macos`; walks every running
+    // Lima session for a single operator uid and back-stamps Error state
+    // when the VM is found dead. Daemon-internal startup path — no
+    // operator identity in scope; called only from the background
+    // reconcile loop, never from an HTTP request handler.
+    "sandboxd/src/main.rs:reconcile_operator_vms",
 ];
 
 /// Paths excluded from the call-site scan. The crate-root file

@@ -8652,6 +8652,7 @@ mod tests {
             mounts: None,
             rootless: None,
             guest_protocol_version: 0,
+            networking_status: None,
         }
     }
 

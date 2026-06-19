@@ -17,8 +17,9 @@ use crate::policy::{AssuranceLevel, Policy, PolicyRule};
 use crate::session::{Session, SessionConfig, WorkspaceMode};
 
 use super::dto::{
-    PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
-    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto, WorkspaceModeDetailDto,
+    NetworkingStatus, PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto,
+    SessionMountInfo, SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto,
+    WorkspaceModeDetailDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ impl From<&Session> for SessionDto {
             mounts: None,
             rootless: None,
             guest_protocol_version: session.guest_protocol_version,
+            networking_status: None,
         }
     }
 }
@@ -154,6 +156,18 @@ impl SessionDto {
     /// `GET /sessions/{id}` is the sole caller.
     pub fn with_mounts(mut self, mounts: Option<SessionMountInfo>) -> Self {
         self.mounts = mounts;
+        self
+    }
+
+    /// Attach the transient egress-path health status for a macOS Lima
+    /// session.
+    ///
+    /// Sourced from the daemon's in-memory recovery map; never persisted.
+    /// Pass `Some(NetworkingStatus::Healthy)` for a Running macOS session
+    /// with no entry in the recovery map (steady state), `None` for
+    /// non-Running, Linux, or lite container sessions.
+    pub fn with_networking_status(mut self, s: Option<NetworkingStatus>) -> Self {
+        self.networking_status = s;
         self
     }
 

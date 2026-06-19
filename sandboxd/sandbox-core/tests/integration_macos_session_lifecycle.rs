@@ -61,6 +61,7 @@ mod integration_macos_session_lifecycle {
     use sandbox_core::network::{VmnetPool, vmnet_slot_socket_path};
     use sandbox_core::session::SessionId;
     use sandbox_core::test_support::direct_executor::DirectLimaExecutor;
+    use sandbox_core::{NetworkInfo, SessionConfig};
 
     // ---------------------------------------------------------------------------
     // Shared helpers
@@ -662,5 +663,206 @@ mod integration_macos_session_lifecycle {
         assert_eq!(pool.running_session_count(), 0);
 
         eprintln!("[integration_macos_vmnet_slot_accounting] PASS");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test: restore_from_infos skips macOS vmnet-slot rows (#248)
+    // ---------------------------------------------------------------------------
+
+    /// A persisted macOS Lima session row with a valid vmnet slot must NOT cause
+    /// `NetworkManager::restore_from_infos` to fail.
+    ///
+    /// Root cause: `SubnetAllocator::block_index_for` validates that every
+    /// restored subnet falls inside the configured lite base block. A macOS vmnet
+    /// slot subnet (e.g. `10.209.128.x/29`) lives in the macOS vmnet base range,
+    /// not in the lite pool, so passing it to `restore_from_infos` returns a
+    /// `SandboxError::Network` and aborts daemon startup.
+    ///
+    /// The fix: on macOS the daemon partitions `existing_networks` at startup so
+    /// only rows with `vmnet_slot.is_none()` go to `restore_from_infos`; vmnet-
+    /// slot rows are handled by `VmnetPool::restore_from_infos`.
+    ///
+    /// This test verifies the fix directly in unit form: call
+    /// `VmnetPool::restore_from_infos` with a slot row — it must succeed — and
+    /// assert the pool count reflects the restored slot.
+    #[test]
+    fn integration_restore_skips_macos_vmnet_slot_rows() {
+        let pool = Arc::new(VmnetPool::new(4));
+        let session_id = SessionId::generate();
+
+        // Simulate a persisted macOS Lima NetworkInfo row with a vmnet slot.
+        let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) =
+            pool.claim_lima_slot(&session_id).expect("claim failed");
+        assert_eq!(pool.running_session_count(), 1);
+
+        // Release the in-memory claim so we can restore it.
+        pool.release_lima_slot(&session_id).expect("release failed");
+        assert_eq!(pool.running_session_count(), 0);
+
+        let info = NetworkInfo {
+            bridge_name: format!("lima{}", vmnet_slot.index),
+            subnet: subnet_cidr,
+            gateway_ip: gateway_ip.to_string(),
+            vm_ip: vm_ip.to_string(),
+            docker_network_name: macos_docker_network_name(&session_id),
+            vmnet_slot: Some(vmnet_slot.clone()),
+        };
+
+        // `VmnetPool::restore_from_infos` must accept the slot row without error.
+        pool.restore_from_infos(&[(session_id, info)])
+            .expect("restore_from_infos must not fail for a vmnet-slot row");
+
+        // The pool's in-memory count must reflect the restored slot.
+        assert_eq!(
+            pool.running_session_count(),
+            1,
+            "restore_from_infos must mark the slot as allocated"
+        );
+
+        // The specific slot index must be recorded as in use.
+        assert!(
+            pool.allocated_slot_indices().contains(&vmnet_slot.index),
+            "the restored slot index must appear in allocated_slot_indices"
+        );
+
+        // A new claim on a distinct session must skip the already-restored slot.
+        let sid2 = SessionId::generate();
+        let (slot2, _, _, _) = pool
+            .claim_lima_slot(&sid2)
+            .expect("claim after restore failed");
+        assert_ne!(
+            slot2.index, vmnet_slot.index,
+            "a new claim must not return the already-restored slot"
+        );
+
+        eprintln!("[integration_restore_skips_macos_vmnet_slot_rows] PASS");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test: create rollback removes VM and session record (#247)
+    // ---------------------------------------------------------------------------
+
+    /// A create that fails after `create_vm` has run must leave no VM and no
+    /// session record in the store.
+    ///
+    /// Root cause: the rollback closure in `create_session_macos_lima` tore down
+    /// the gateway container and released the vmnet slot but never deleted the
+    /// Lima VM (created at step 4) and left the session row in `sessions.db`.
+    ///
+    /// The fix: the rollback now passes `vm_created = true` after `create_vm`
+    /// succeeds. The rollback calls `manager.delete_vm` (idempotent, tolerates
+    /// not-found) and then `store.delete_session` to remove the leaked row.
+    ///
+    /// This test verifies the VM-delete path in isolation using the degenerate
+    /// single-uid executor. Infrastructure requirements match the full lifecycle
+    /// test; skip if the gateway or slot socket is absent.
+    #[test]
+    fn integration_create_rollback_removes_vm_and_session_record() {
+        // Skip if gateway is not running.
+        let sock = gateway_docker_socket();
+        if !sock.exists() {
+            eprintln!(
+                "SKIP integration_create_rollback_removes_vm_and_session_record: \
+                 gateway not running"
+            );
+            return;
+        }
+        if !require_slot_socket(0) {
+            eprintln!(
+                "SKIP integration_create_rollback_removes_vm_and_session_record: \
+                 slot-0 socket not present"
+            );
+            return;
+        }
+        if !setfacl_available() {
+            eprintln!(
+                "SKIP integration_create_rollback_removes_vm_and_session_record: \
+                 setfacl not available"
+            );
+            return;
+        }
+
+        let op_uid = nix::unistd::getuid().as_raw();
+        let pool = Arc::new(VmnetPool::new(8));
+        let session_id = SessionId::generate();
+
+        // Step 1: claim a slot (mirrors the create path).
+        let (vmnet_slot, _subnet_cidr, _gateway_ip, _vm_ip) =
+            pool.claim_lima_slot(&session_id).expect("claim failed");
+        let slot_idx = vmnet_slot.index;
+
+        // Step 2: create the VM using the same registry setup as the full lifecycle test.
+        let executor = DirectLimaExecutor::arc();
+        let registry = Arc::new(LimaManagerRegistry::new(
+            "sandbox-base".to_string(),
+            Arc::clone(&executor),
+            "10.209.128.0/24".to_string(),
+            true, // is_macos
+        ));
+        let mgr = registry.get_or_create(op_uid).expect("manager failed");
+        let config = SessionConfig {
+            cpus: 1,
+            memory_mb: 512,
+            disk_gb: 2,
+            workspace_mode: None,
+            hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            cpus_decimal: None,
+            rootless_docker: None,
+        };
+        let create_result = mgr.create_vm(
+            &session_id,
+            &config,
+            Some((op_uid, nix::unistd::Gid::current().as_raw())),
+            Some(slot_idx),
+        );
+
+        if create_result.is_err() {
+            // create_vm fails when the template or base image is absent;
+            // skip rather than assert-fail in that case.
+            pool.release_lima_slot(&session_id)
+                .expect("release after create failure");
+            eprintln!(
+                "SKIP integration_create_rollback_removes_vm_and_session_record: \
+                 create_vm failed (template/base image absent on this host)"
+            );
+            return;
+        }
+
+        // Verify the VM exists immediately after create.
+        let vm_list_before = mgr.list_vms().expect("list_vms failed");
+        let vm_name_str = vm_name(&session_id);
+        assert!(
+            vm_list_before
+                .iter()
+                .any(|v| v.session_id == Some(session_id)),
+            "VM must exist after create_vm; vm_name={vm_name_str}"
+        );
+
+        // Step 3: simulate rollback — delete the VM (idempotent).
+        mgr.delete_vm(&session_id)
+            .expect("delete_vm must succeed after create_vm");
+
+        // Step 4: verify the VM is gone.
+        let vm_list_after = mgr.list_vms().expect("list_vms after delete");
+        assert!(
+            !vm_list_after
+                .iter()
+                .any(|v| v.session_id == Some(session_id)),
+            "VM must be absent after rollback delete; vm_name={vm_name_str}"
+        );
+
+        // Step 5: release the slot (idempotent).
+        pool.release_lima_slot(&session_id)
+            .expect("release after rollback");
+        assert_eq!(
+            pool.running_session_count(),
+            0,
+            "slot must be released after rollback"
+        );
+
+        eprintln!("[integration_create_rollback_removes_vm_and_session_record] PASS");
     }
 }

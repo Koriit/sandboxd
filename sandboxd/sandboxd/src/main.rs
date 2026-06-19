@@ -35,14 +35,14 @@ use sandbox_core::{
     ExecResponse, GateRequest, GateService, GateServiceOutcome, GateStatus, GatewayHealth,
     GatewayManager, GatewayShutdownReason, GatewayStatus, GuestConnector, GuestResponse,
     HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManagerRegistry, LockState, LockToken,
-    NetworkHealth, NetworkInfo, NetworkManager, OperatorIdentity, PersistConfig, PersistentSink,
-    Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session,
-    SessionConfig, SessionDto, SessionHealth, SessionId, SessionIngestor, SessionMountInfo,
-    SessionNetworkInfo, SessionState, SessionStore, UpdatePolicyRequest, UsersConfig, VmInfo,
-    VmIpSessionMap, VmStatus, WorkspaceLockAcquireRequest, WorkspaceLockAcquireResponse,
-    WorkspaceLockReleaseRequest, WorkspaceOp, attach_vm_to_bridge, bind_gate_listener,
-    detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules, hash_policy,
-    load_users_config, mac_from_session_id, propagate_dns_changes, read_resolved_json,
+    NetworkHealth, NetworkInfo, NetworkManager, NetworkingStatus, OperatorIdentity, PersistConfig,
+    PersistentSink, Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError,
+    Session, SessionConfig, SessionDto, SessionHealth, SessionId, SessionIngestor,
+    SessionMountInfo, SessionNetworkInfo, SessionState, SessionStore, UpdatePolicyRequest,
+    UsersConfig, VmInfo, VmIpSessionMap, VmStatus, WorkspaceLockAcquireRequest,
+    WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest, WorkspaceOp, attach_vm_to_bridge,
+    bind_gate_listener, detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules,
+    hash_policy, load_users_config, mac_from_session_id, propagate_dns_changes, read_resolved_json,
     remove_gate_socket, serve_gate_listener, users_conf_path, wait_for_lds_ack,
     write_file_to_container,
 };
@@ -1080,6 +1080,17 @@ struct AppState {
     /// handler that needs the forwarded socket path or the NIC map.
     #[cfg(target_os = "macos")]
     gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager>,
+    /// macOS only: in-memory transient networking health per Running Lima session.
+    ///
+    /// Written by the gateway recovery orchestrator (Pass 2) when a session
+    /// enters a degraded or recovering state; entries are removed when recovery
+    /// succeeds (→ Healthy) or the session transitions to Error. An absent
+    /// entry for a Running macOS Lima session means `Healthy`. The map is never
+    /// persisted — daemon restart seeds it from gateway health probes.
+    ///
+    /// Not accessed on Linux (cfg-gated).
+    #[cfg(target_os = "macos")]
+    networking_status: Arc<tokio::sync::Mutex<HashMap<SessionId, NetworkingStatus>>>,
 }
 
 /// Look up the runtime for a given backend kind from the dispatch
@@ -3797,6 +3808,33 @@ async fn probe_gateway_status(state: &AppState, session: &Session) -> Option<Str
     )
 }
 
+/// Look up the transient networking health for a macOS Lima session.
+///
+/// Returns `Some(Healthy)` when the session is Running on the Lima backend and
+/// has no entry in the recovery map (the steady-state). Returns the recorded
+/// status when an active recovery event is in progress. Returns `None` for
+/// non-Running sessions, Linux sessions, and lite container sessions so the
+/// field is omitted from the wire.
+///
+/// Only compiled on macOS; the Linux path simply does not produce a
+/// `networking_status` value and the field stays absent on the wire.
+#[cfg(target_os = "macos")]
+async fn macos_networking_status_for(
+    state: &AppState,
+    session: &Session,
+) -> Option<NetworkingStatus> {
+    use sandbox_core::backend::BackendKind;
+    if session.state != SessionState::Running || session.backend != BackendKind::Lima {
+        return None;
+    }
+    let map = state.networking_status.lock().await;
+    Some(
+        map.get(&session.id)
+            .copied()
+            .unwrap_or(NetworkingStatus::Healthy),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // macOS Lima session lifecycle helpers
 // ---------------------------------------------------------------------------
@@ -3929,9 +3967,11 @@ async fn create_session_macos_lima(
         vmnet_slot: Some(vmnet_slot.clone()),
     };
 
-    // Macro: full rollback (teardown gateway + release slot + remove CA + set Error).
-    // Defined as an async closure captured by the rollback calls below.
-    // We use a helper async fn instead of a macro because we need .await.
+    // Rollback helper: teardown gateway + release slot + remove CA + set Error.
+    // `vm_created` controls whether to also `limactl delete` the VM and remove
+    // the session record. Before `create_vm` succeeds the VM does not exist yet;
+    // after it succeeds a half-built create must delete the VM and remove the
+    // record so nothing leaks (slot, gateway container, VM, or session row).
     let rollback = {
         let state2 = state.clone();
         let pool2 = vmnet_pool.clone();
@@ -3942,22 +3982,64 @@ async fn create_session_macos_lima(
         let sid = session_id;
         let op_name = operator.name.clone();
         let base_dir = state.base_dir.clone();
-        move || {
+        let op_uid2 = operator.uid;
+        let lima_runtime2 = state.lima_runtime.clone();
+        move |vm_created: bool| {
             let state2 = state2.clone();
             let pool2 = pool2.clone();
             let sock2 = sock.clone();
             let op_name2 = op_name.clone();
             let base_dir2 = base_dir.clone();
+            let lima_runtime3 = lima_runtime2.clone();
             async move {
+                if vm_created {
+                    // Delete the Lima VM via the operator seam (idempotent; tolerate not-found).
+                    let del_result = tokio::task::spawn_blocking(move || {
+                        match lima_runtime3.manager_for(op_uid2) {
+                            Ok(mgr) => {
+                                if let Err(e) = mgr.delete_vm(&sid) {
+                                    // Not-found is expected if create_vm partially failed;
+                                    // log at debug so a clean delete path is not noisy.
+                                    debug!(
+                                        session_id = %sid,
+                                        error = %e,
+                                        "rollback: limactl delete returned error (tolerated)"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    session_id = %sid,
+                                    error = %e,
+                                    "rollback: could not get LimaManager for VM delete (non-fatal)"
+                                );
+                            }
+                        }
+                    })
+                    .await;
+                    if let Err(e) = del_result {
+                        warn!(
+                            session_id = %sid,
+                            error = %e,
+                            "rollback: spawn_blocking join error for VM delete (non-fatal)"
+                        );
+                    }
+                }
                 let _ = tokio::task::spawn_blocking(move || {
                     let _ = teardown_macos_gateway(&sid, &sock2);
                     let _ = pool2.release_lima_slot(&sid);
                     let _ = CaManager::remove_session_ca(&base_dir2, &sid);
                 })
                 .await;
-                let _ = state2
-                    .store
-                    .update_state(&sid, &op_name2, SessionState::Error);
+                if vm_created {
+                    // Remove the session record — a half-built create that never reached
+                    // Running must not leave a leaked row in the store.
+                    let _ = state2.store.delete_session(&sid, &op_name2);
+                } else {
+                    let _ = state2
+                        .store
+                        .update_state(&sid, &op_name2, SessionState::Error);
+                }
             }
         }
     };
@@ -3967,7 +4049,7 @@ async fn create_session_macos_lima(
         .store
         .set_network_info(&session_id, &operator.name, &network_info)
     {
-        rollback().await;
+        rollback(false).await;
         return error_response(e).into_response();
     }
 
@@ -3976,7 +4058,7 @@ async fn create_session_macos_lima(
         let manager = match state.lima_runtime.manager_for(operator.uid) {
             Ok(m) => m,
             Err(e) => {
-                rollback().await;
+                rollback(false).await;
                 return error_response(e).into_response();
             }
         };
@@ -3991,11 +4073,11 @@ async fn create_session_macos_lima(
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                rollback().await;
+                rollback(false).await;
                 return error_response(e).into_response();
             }
             Err(e) => {
-                rollback().await;
+                rollback(false).await;
                 return error_response(SandboxError::Internal(format!("task join error: {e}")))
                     .into_response();
             }
@@ -4036,11 +4118,11 @@ async fn create_session_macos_lima(
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                rollback().await;
+                rollback(true).await;
                 return error_response(e).into_response();
             }
             Err(e) => {
-                rollback().await;
+                rollback(true).await;
                 return error_response(SandboxError::Internal(format!("task join error: {e}")))
                     .into_response();
             }
@@ -4067,7 +4149,7 @@ async fn create_session_macos_lima(
                         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                 );
                 state.event_bus.unregister_session(&session_id);
-                rollback().await;
+                rollback(true).await;
                 return error_response(e).into_response();
             }
         };
@@ -4085,7 +4167,7 @@ async fn create_session_macos_lima(
                         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                 );
                 state.event_bus.unregister_session(&session_id);
-                rollback().await;
+                rollback(true).await;
                 return error_response(e).into_response();
             }
             Err(e) => {
@@ -4096,7 +4178,7 @@ async fn create_session_macos_lima(
                         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                 );
                 state.event_bus.unregister_session(&session_id);
-                rollback().await;
+                rollback(true).await;
                 return error_response(SandboxError::Internal(format!("task join error: {e}")))
                     .into_response();
             }
@@ -4120,7 +4202,7 @@ async fn create_session_macos_lima(
                         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                 );
                 state.event_bus.unregister_session(&session_id);
-                rollback().await;
+                rollback(true).await;
                 return error_response(e).into_response();
             }
         };
@@ -4138,7 +4220,7 @@ async fn create_session_macos_lima(
                         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                 );
                 state.event_bus.unregister_session(&session_id);
-                rollback().await;
+                rollback(true).await;
                 return error_response(SandboxError::Internal(format!(
                     "session rejected: restrict-verify failed ({e}). \
                      The sandbox VM was torn down. Check that the qemu-wrapper is installed \
@@ -4154,7 +4236,7 @@ async fn create_session_macos_lima(
                         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                 );
                 state.event_bus.unregister_session(&session_id);
-                rollback().await;
+                rollback(true).await;
                 return error_response(SandboxError::Internal(format!("task join error: {e}")))
                     .into_response();
             }
@@ -4182,7 +4264,7 @@ async fn create_session_macos_lima(
                             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                     );
                     state.event_bus.unregister_session(&session_id);
-                    rollback().await;
+                    rollback(true).await;
                     return error_response(e).into_response();
                 }
                 Err(e) => {
@@ -4203,7 +4285,7 @@ async fn create_session_macos_lima(
                     .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
             );
             state.event_bus.unregister_session(&session_id);
-            rollback().await;
+            rollback(true).await;
             return error_response(e).into_response();
         }
     }
@@ -4232,6 +4314,7 @@ async fn create_session_macos_lima(
     };
     let agent_status = probe_agent_status(&state, &created).await;
     let gateway_status = probe_gateway_status(&state, &created).await;
+    let networking_status = macos_networking_status_for(&state, &created).await;
     let policy_opt = {
         state
             .session_policies
@@ -4242,6 +4325,7 @@ async fn create_session_macos_lima(
     };
     let dto = SessionDto::from(&created)
         .with_status(agent_status, gateway_status)
+        .with_networking_status(networking_status)
         .with_policy(policy_opt.as_ref())
         .with_warnings(warnings);
     (StatusCode::CREATED, Json(dto)).into_response()
@@ -4624,7 +4708,15 @@ async fn list_sessions(
     for session in reconciled {
         let agent_status = probe_agent_status(&state, &session).await;
         let gateway_status = probe_gateway_status(&state, &session).await;
-        enriched.push(SessionDto::from(&session).with_status(agent_status, gateway_status));
+        #[cfg(target_os = "macos")]
+        let networking_status = macos_networking_status_for(&state, &session).await;
+        #[cfg(not(target_os = "macos"))]
+        let networking_status: Option<NetworkingStatus> = None;
+        enriched.push(
+            SessionDto::from(&session)
+                .with_status(agent_status, gateway_status)
+                .with_networking_status(networking_status),
+        );
     }
 
     (StatusCode::OK, Json(enriched)).into_response()
@@ -4705,8 +4797,13 @@ async fn get_session(
         .rootless_docker
         .as_ref()
         .map(sandbox_core::SessionRootlessDockerDto::from);
+    #[cfg(target_os = "macos")]
+    let networking_status = macos_networking_status_for(&state, &session).await;
+    #[cfg(not(target_os = "macos"))]
+    let networking_status: Option<NetworkingStatus> = None;
     let dto = SessionDto::from(&session)
         .with_status(agent_status, gateway_status)
+        .with_networking_status(networking_status)
         .with_policy(policy_opt.as_ref())
         .with_network(network)
         .with_mounts(mounts)
@@ -9078,6 +9175,107 @@ async fn reconcile_networking(state: &AppState) {
 // macOS startup reconcile (steps 6a + 6b) and pool-state restore (step 7)
 // ---------------------------------------------------------------------------
 
+/// Verify running Lima sessions for a single operator and mark any whose VM is
+/// confirmed dead as `Error`, releasing the associated vmnet slot.
+///
+/// Queries all sessions from the store internally, then lists VMs for the
+/// given `op_uid` via their `LimaManager`. Running sessions whose VM entry is
+/// absent or stopped are transitioned to `Error` and their slot is released.
+/// Verified-live sessions are counted but not modified.
+///
+/// Returns `(verified, errored)` counters. Best-effort: any operator-level
+/// failure (manager lookup, `list_vms` error) is logged and treated as zero
+/// verified/errored for that operator.
+///
+/// Gateway-side cleanup (macvlan teardown, orphan reap) is the responsibility
+/// of step 6a in `reconcile_macos` — this function handles only the VM-side
+/// liveness check.
+#[cfg(target_os = "macos")]
+async fn reconcile_operator_vms(state: &AppState, op_uid: u32) -> (u32, u32) {
+    use sandbox_core::{BackendKind, SessionState};
+
+    let sessions = match state.store.list_sessions_unfiltered() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                op_uid,
+                error = %e,
+                "reconcile_operator_vms: failed to list sessions; skipping"
+            );
+            return (0, 0);
+        }
+    };
+
+    let mgr = match state.lima_runtime.registry().get_or_create(op_uid) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                op_uid,
+                error = %e,
+                "reconcile_operator_vms: failed to get LimaManager for operator; skipping"
+            );
+            return (0, 0);
+        }
+    };
+
+    let vm_list = match tokio::task::spawn_blocking({
+        let mgr = mgr.clone();
+        move || mgr.list_vms()
+    })
+    .await
+    {
+        Ok(Ok(vms)) => vms,
+        Ok(Err(e)) => {
+            warn!(
+                op_uid,
+                error = %e,
+                "reconcile_operator_vms: failed to list VMs for operator; skipping"
+            );
+            return (0, 0);
+        }
+        Err(e) => {
+            warn!(
+                op_uid,
+                error = %e,
+                "reconcile_operator_vms: spawn_blocking join error; skipping"
+            );
+            return (0, 0);
+        }
+    };
+
+    let mut verified = 0u32;
+    let mut errored = 0u32;
+
+    for session in sessions
+        .iter()
+        .filter(|s| s.backend == BackendKind::Lima)
+        .filter(|s| s.operator_uid == Some(op_uid))
+        .filter(|s| s.state == SessionState::Running)
+    {
+        let vm = vm_list.iter().find(|v| v.session_id == Some(session.id));
+        match vm {
+            Some(info) if info.status == sandbox_core::VmStatus::Running => {
+                verified += 1;
+            }
+            Some(_) | None => {
+                warn!(
+                    session_id = %session.id,
+                    op_uid,
+                    "reconcile_operator_vms: running session's VM is down; marking Error"
+                );
+                let _ = state
+                    .store
+                    .update_state_reconcile(&session.id, SessionState::Error);
+                // Release the slot (gateway side was cleaned in 6a above or is a no-op here).
+                let _ = state.vmnet_pool.release_lima_slot(&session.id);
+                errored += 1;
+            }
+        }
+    }
+
+    (verified, errored)
+}
+
 /// macOS startup reconcile — two halves as specified.
 ///
 /// **Step 6a (unconditional):** for every non-running session, remove its
@@ -9206,71 +9404,9 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
     let mut errored_6b = 0u32;
 
     for &op_uid in &checked_in_uids {
-        // List VMs for this operator via their agent.
-        let mgr = match state.lima_runtime.registry().get_or_create(op_uid) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    op_uid,
-                    error = %e,
-                    "macOS reconcile 6b: failed to get LimaManager for operator; skipping"
-                );
-                continue;
-            }
-        };
-        let vm_list = match tokio::task::spawn_blocking({
-            let mgr = mgr.clone();
-            move || mgr.list_vms()
-        })
-        .await
-        {
-            Ok(Ok(vms)) => vms,
-            Ok(Err(e)) => {
-                warn!(
-                    op_uid,
-                    error = %e,
-                    "macOS reconcile 6b: failed to list VMs for operator; skipping"
-                );
-                continue;
-            }
-            Err(e) => {
-                warn!(
-                    op_uid,
-                    error = %e,
-                    "macOS reconcile 6b: spawn_blocking join error; skipping"
-                );
-                continue;
-            }
-        };
-
-        // For each running session owned by this operator, verify the VM is up.
-        for session in sessions
-            .iter()
-            .filter(|s| s.backend == BackendKind::Lima)
-            .filter(|s| s.operator_uid == Some(op_uid))
-            .filter(|s| s.state == SessionState::Running)
-        {
-            let vm = vm_list.iter().find(|v| v.session_id == Some(session.id));
-            match vm {
-                Some(info) if info.status == sandbox_core::VmStatus::Running => {
-                    verified_6b += 1;
-                }
-                Some(_) | None => {
-                    // VM missing or stopped — mark session Error + release slot.
-                    warn!(
-                        session_id = %session.id,
-                        op_uid,
-                        "macOS reconcile 6b: running session's VM is down; marking Error"
-                    );
-                    let _ = state
-                        .store
-                        .update_state_reconcile(&session.id, SessionState::Error);
-                    // Release the slot (gateway side was cleaned in 6a above).
-                    let _ = state.vmnet_pool.release_lima_slot(&session.id);
-                    errored_6b += 1;
-                }
-            }
-        }
+        let (v, e) = reconcile_operator_vms(state, op_uid).await;
+        verified_6b += v;
+        errored_6b += e;
     }
 
     info!(
@@ -10321,7 +10457,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             count = existing_networks.len(),
             "restoring network allocator state from existing sessions"
         );
-        network.restore_from_infos(&existing_networks)?;
+        // On macOS, macOS Lima sessions carry a vmnet slot whose subnet
+        // (e.g. 10.209.128.x/29) lives in the macOS vmnet base range, not
+        // in the lite container pool. Passing those rows to
+        // `SubnetAllocator::restore_from_infos` causes a validation failure
+        // because the slot subnet falls outside the configured lite base
+        // block. Partition: only rows without a vmnet slot go to the Linux
+        // SubnetAllocator; the vmnet-slot rows are already handled by
+        // `VmnetPool::restore_from_infos` inside `restore_macos_pool_state`.
+        //
+        // The Linux path receives the full slice unchanged — the
+        // `cfg(not(target_os = "macos"))` arm compiles to the same
+        // byte-for-byte behavior as before.
+        #[cfg(target_os = "macos")]
+        let bridge_restore_entries: Vec<(SessionId, NetworkInfo)> = existing_networks
+            .iter()
+            .filter(|(_, info)| info.vmnet_slot.is_none())
+            .cloned()
+            .collect();
+        #[cfg(not(target_os = "macos"))]
+        let bridge_restore_entries: &[(SessionId, NetworkInfo)] = &existing_networks;
+
+        if !bridge_restore_entries.is_empty() {
+            network.restore_from_infos(&bridge_restore_entries)?;
+        }
     }
 
     // Construct the event bus + vm-ip map and hydrate both from the same
@@ -10508,6 +10667,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vmnet_pool,
         #[cfg(target_os = "macos")]
         gateway_lima_manager,
+        #[cfg(target_os = "macos")]
+        networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per
