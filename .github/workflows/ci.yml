@@ -199,3 +199,100 @@ jobs:
 
       - name: Run full-matrix E2E suite
         run: make test-e2e-matrix
+
+  # macOS build + ad-hoc sign + macOS-specific checks.
+  #
+  # Runs on the stock `macos-14` runner (Apple Silicon). This lane:
+  #   (a) Builds the Rust workspace for macOS.
+  #   (b) Ad-hoc-signs every produced Mach-O binary. This is REQUIRED:
+  #       AMFI (Apple Mobile File Integrity) SIGKILLs any unsigned arm64
+  #       Mach-O at execve on macOS 14+, before Gatekeeper can prompt.
+  #       The full Developer-ID signing + notarization pipeline is deferred
+  #       to M22-S4; ad-hoc signing (`codesign -s -`) is sufficient for
+  #       CI and local dev on the same machine.
+  #   (c) Runs the D7 cross-language UUID equivalence check (Python vs Rust).
+  #   (d) Runs the D4 macOS egress regression
+  #       (test_macos_slirp_restrict_on_blocks_egress_after_gateway_route_deleted).
+  #       NOTE: the D4 e2e test requires a running sandboxd daemon with the
+  #       socket_vmnet pool, gateway Lima instance, and operator agent — all
+  #       of which need `make setup-dev-env` on a persistent Apple-Silicon
+  #       host. The stock `macos-14` runner is ephemeral and does NOT have
+  #       the full sandboxd infrastructure. Until a persistent macOS runner
+  #       is provisioned, the e2e step runs with `continue-on-error: true`
+  #       and the infra-skip is surfaced as a warning rather than a hard
+  #       failure. The full CI matrix (incl. this e2e) + Tart is deferred
+  #       to M22-S4.
+  #   (e) Runs the hermetic Rust tests (including verify_restrict_on
+  #       negative tests) for macOS-specific code paths.
+  #
+  # The `build-macos` lane is the core-promise gate: it runs in CI on real
+  # Apple Silicon as soon as M20 code exists, even before the persistent
+  # macOS runner is provisioned for the full e2e.
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sandboxd/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sandboxd/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Build workspace (macOS)
+        working-directory: sandboxd
+        run: cargo build --workspace
+
+      - name: Ad-hoc-sign all Mach-O binaries
+        # AMFI SIGKILLs unsigned arm64 Mach-Os at execve on macOS 14+.
+        # `codesign -s -` applies a local ad-hoc signature that satisfies
+        # AMFI. The full Developer-ID signing pipeline is deferred to M22-S4.
+        run: |
+          find sandboxd/target/debug -maxdepth 1 -type f -perm +111 | while read bin; do
+            if file "$bin" | grep -q 'Mach-O'; then
+              codesign -s - --force "$bin" 2>/dev/null || true
+            fi
+          done
+
+      - name: D7 — Cross-language UUID equivalence check
+        # Verify the Python (Makefile plist generator) and Rust (network.rs)
+        # vmnet slot network-identifier derivations produce identical UUIDs.
+        # Divergence would silently break L2 inter-slot isolation.
+        run: python3 scripts/check-vmnet-uuid-equivalence.py
+
+      - name: Hermetic Rust tests (macOS paths)
+        # Runs the full hermetic suite including macOS-specific tests:
+        # verify_restrict_on negative tests, macos_session tests, etc.
+        working-directory: sandboxd
+        run: cargo nextest run --workspace
+
+      - name: D4 — macOS egress regression (e2e, best-effort on ephemeral runner)
+        # The full e2e requires a running sandboxd daemon + socket_vmnet pool
+        # + gateway Lima instance + operator agent — infrastructure not present
+        # on the ephemeral macos-14 runner. Until a persistent macOS runner is
+        # provisioned (M22-S4), the test is skipped at the pytest level
+        # (the _macos_required_for_macos_tests fixture checks for the agent).
+        # continue-on-error: true so an infra-skip does not red the lane.
+        continue-on-error: true
+        run: |
+          if [ -d tests/e2e ]; then
+            cd tests/e2e
+            python3 -m venv .venv
+            .venv/bin/pip install -q -e .
+            .venv/bin/python -m pytest test_networking.py::test_macos_slirp_restrict_on_blocks_egress_after_gateway_route_deleted -v --timeout=600
+          else
+            echo "tests/e2e not present; skipping macOS e2e"
+          fi

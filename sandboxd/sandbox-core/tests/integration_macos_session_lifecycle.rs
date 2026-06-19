@@ -56,7 +56,7 @@ mod integration_macos_session_lifecycle {
     use sandbox_core::lima::{LimaManagerRegistry, operator_lima_home, vm_name};
     use sandbox_core::macos_session::{
         macos_docker_network_name, macos_gateway_container_name, setup_macos_gateway,
-        teardown_macos_gateway, verify_restrict_on,
+        teardown_macos_gateway,
     };
     use sandbox_core::network::{VmnetPool, vmnet_slot_socket_path};
     use sandbox_core::session::SessionId;
@@ -370,8 +370,9 @@ mod integration_macos_session_lifecycle {
             .expect("limactl start failed");
 
         // --- Step 5: verify restrict=on ---
-        verify_restrict_on(&session_id, &lima_home)
-            .expect("verify_restrict_on failed: wrapper marker not found or wrong content");
+        manager
+            .verify_restrict_on(&session_id)
+            .expect("verify_restrict_on failed: restrict=on not confirmed by QMP or marker");
 
         eprintln!(
             "[integration_macos_create_start_stop_rm] VM {vm} booted with restrict=on confirmed"

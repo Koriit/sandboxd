@@ -114,7 +114,7 @@ pub use lima::{
 #[cfg(target_os = "macos")]
 pub use macos_session::{
     build_macos_gateway_docker_args, check_host_ip_forwarding_disabled, macos_docker_network_name,
-    macos_gateway_container_name, setup_macos_gateway, teardown_macos_gateway, verify_restrict_on,
+    macos_gateway_container_name, setup_macos_gateway, teardown_macos_gateway,
 };
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{

@@ -940,13 +940,214 @@ async fn handle_read_owner_marker(ctx: &RunContext, vm: String) -> BrokerResult 
 // RestrictOnVerify handler
 // ---------------------------------------------------------------------------
 
+/// Attempt to verify `restrict=on` by querying the live QEMU QMP socket.
+///
+/// Lima stores the QMP socket at `{lima_home}/{vm}/qmp.sock`. The agent runs
+/// as the operator who owns those files, so it can connect to the socket.
+///
+/// Sends `query-netdev` and scans the returned netdev list for a `user`-type
+/// netdev whose `props` contain `restrict: true` (or whose ID matches the
+/// management NIC the wrapper modified). Returns `Some(netdev_token)` when
+/// confirmed, `None` when the QMP socket is absent/unreachable (caller falls
+/// back to the marker file), and `Err(reason)` when QMP is reachable but
+/// `restrict=on` cannot be confirmed.
+fn query_restrict_on_via_qmp(lima_home: &str, vm: &str) -> Result<Option<String>, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let qmp_path = format!("{lima_home}/{vm}/qmp.sock");
+
+    // If the QMP socket does not exist the QEMU process has not yet started
+    // or the path is wrong — return None so the caller can fall back to the
+    // marker file.
+    if !std::path::Path::new(&qmp_path).exists() {
+        return Ok(None);
+    }
+
+    let stream = match UnixStream::connect(&qmp_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Socket exists but connection refused: QEMU may have crashed.
+            // Return None (not Err) so the caller falls back to the marker
+            // rather than treating a crashed QEMU as "QMP says restrict=off".
+            info!(vm, qmp_path, error = %e, "QMP connect failed; falling back to marker");
+            return Ok(None);
+        }
+    };
+
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let mut reader = BufReader::new(stream);
+
+    // Read the QMP greeting {"QMP": ...}.
+    let mut greeting = String::new();
+    if reader.read_line(&mut greeting).is_err() || greeting.is_empty() {
+        return Ok(None);
+    }
+    let greeting_json: serde_json::Value = match serde_json::from_str(greeting.trim()) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if greeting_json.get("QMP").is_none() {
+        return Ok(None);
+    }
+
+    // Negotiate capabilities.
+    let capabilities_cmd = br#"{"execute":"qmp_capabilities"}"#;
+    if reader.get_mut().write_all(capabilities_cmd).is_err()
+        || reader.get_mut().write_all(b"\n").is_err()
+        || reader.get_mut().flush().is_err()
+    {
+        return Ok(None);
+    }
+    // Read the qmp_capabilities response.
+    let mut cap_resp = String::new();
+    loop {
+        cap_resp.clear();
+        if reader.read_line(&mut cap_resp).is_err() || cap_resp.is_empty() {
+            return Ok(None);
+        }
+        let v: serde_json::Value = match serde_json::from_str(cap_resp.trim()) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if v.get("return").is_some() || v.get("error").is_some() {
+            break;
+        }
+        // Async event — skip.
+    }
+
+    // Send query-netdev.
+    let query_cmd = br#"{"execute":"query-netdev"}"#;
+    if reader.get_mut().write_all(query_cmd).is_err()
+        || reader.get_mut().write_all(b"\n").is_err()
+        || reader.get_mut().flush().is_err()
+    {
+        return Ok(None);
+    }
+
+    // Read the query-netdev response (skip async events).
+    let mut resp_line = String::new();
+    let netdev_resp: serde_json::Value = loop {
+        resp_line.clear();
+        if reader.read_line(&mut resp_line).is_err() || resp_line.is_empty() {
+            return Ok(None);
+        }
+        let v: serde_json::Value = match serde_json::from_str(resp_line.trim()) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if v.get("return").is_some() || v.get("error").is_some() {
+            break v;
+        }
+        // Async event — skip.
+    };
+
+    let netdevs = match netdev_resp.get("return").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => {
+            return Err(format!(
+                "QMP query-netdev returned unexpected response: {netdev_resp}"
+            ));
+        }
+    };
+
+    // Scan for a `user`-type netdev with restrict=on. QEMU 6.0+ reports
+    // `restrict: true` in the props object for user-mode netdevs created with
+    // `restrict=on`. Older versions may not expose the field; treat its absence
+    // as "restrict unknown" rather than "restrict=off".
+    let mut user_netdev_found = false;
+    let mut user_netdev_restrict_on = false;
+    let mut netdev_token = String::new();
+
+    for nd in netdevs {
+        let nd_type = nd.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        if nd_type != "user" {
+            continue;
+        }
+        user_netdev_found = true;
+        let nd_id = nd.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        // The `restrict` field lives under the `user-net-backend-properties`
+        // `props` key in QEMU's QMP schema. Try the `restrict` field directly
+        // on the netdev object (some QEMU versions flatten it) and in `props`.
+        let restrict_direct = nd
+            .get("restrict")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let restrict_props = nd
+            .pointer("/props/restrict")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if restrict_direct || restrict_props {
+            user_netdev_restrict_on = true;
+            netdev_token = format!("qmp-confirmed: netdev id={nd_id} restrict=on");
+        }
+    }
+
+    if !user_netdev_found {
+        // No user netdev at all — abnormal; report as a QMP error so the
+        // marker fallback runs (which will also likely fail, surfacing the
+        // wrapper not running).
+        return Ok(None);
+    }
+
+    if user_netdev_restrict_on {
+        Ok(Some(netdev_token))
+    } else {
+        // QMP is reachable, a user netdev exists, but restrict is NOT on.
+        // This is a hard finding — return Err so the caller reports it as
+        // RestrictNotConfirmed without attempting the marker fallback.
+        Err(
+            "QMP query-netdev: user netdev found but restrict=on is NOT set; \
+             the qemu-wrapper may have failed to inject it"
+                .into(),
+        )
+    }
+}
+
 async fn handle_restrict_on_verify(ctx: &RunContext, vm: String) -> BrokerResult {
     if let Err(reason) = validation::validate_vm_name(&vm) {
         return BrokerResult::Rejected { reason };
     }
 
-    // The marker file is written by the qemu-wrapper into the instance dir.
-    // Path: `{lima_home}/{vm}/{RESTRICT_MARKER_FILENAME}`.
+    // PREFERRED: try the live QMP socket (query-netdev) first.
+    // The QMP socket is at `{lima_home}/{vm}/qmp.sock`; the agent runs as the
+    // operator who owns it. QMP is the authoritative source because it reads
+    // from the live QEMU process rather than a file the wrapper may have written
+    // before QEMU rewrote its own config.
+    //
+    // The fallback logic:
+    //   - QMP unavailable (socket missing / connect failed) → fall through to marker.
+    //   - QMP reachable + restrict=on → RestrictConfirmed.
+    //   - QMP reachable + restrict NOT on → RestrictNotConfirmed (hard, no marker fallback).
+    match query_restrict_on_via_qmp(&ctx.lima_home, &vm) {
+        Ok(Some(netdev_token)) => {
+            info!(vm, "restrict=on confirmed via QMP query-netdev");
+            return BrokerResult::RestrictConfirmed { vm, netdev_token };
+        }
+        Err(reason) => {
+            warn!(
+                vm,
+                reason, "QMP query-netdev confirms restrict=on is NOT set"
+            );
+            return BrokerResult::RestrictNotConfirmed { vm, reason };
+        }
+        Ok(None) => {
+            // QMP unavailable — fall through to marker file.
+            info!(
+                vm,
+                "QMP socket unavailable; falling back to wrapper marker file"
+            );
+        }
+    }
+
+    // FALLBACK: read the wrapper marker file.
+    // Written by the qemu-wrapper after it injects restrict=on into the
+    // management netdev argv. If QMP is unavailable (e.g., the QMP socket
+    // was never created because Lima didn't expose it), the marker is the
+    // fallback source of evidence.
     let marker_path = format!("{}/{}/{}", ctx.lima_home, vm, RESTRICT_MARKER_FILENAME);
     if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &marker_path) {
         return BrokerResult::Rejected { reason };
@@ -974,7 +1175,10 @@ async fn handle_restrict_on_verify(ctx: &RunContext, vm: String) -> BrokerResult
 
     // Confirm the marker contains `restrict=on`.
     if contents.contains(RESTRICT_ON_MARKER) {
-        info!(vm, marker_path, "restrict=on confirmed via wrapper marker");
+        info!(
+            vm,
+            marker_path, "restrict=on confirmed via wrapper marker (QMP fallback)"
+        );
         BrokerResult::RestrictConfirmed {
             vm,
             netdev_token: contents.trim().to_string(),
@@ -1558,6 +1762,78 @@ mod tests {
             matches!(result, BrokerResult::RestrictConfirmed { .. }),
             "marker with restrict=on must yield RestrictConfirmed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // RestrictOnVerify — QMP path unit tests (no live QEMU required)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `query_restrict_on_via_qmp` returns `Ok(None)` when the
+    /// QMP socket does not exist. The caller falls back to the marker file.
+    #[test]
+    fn qmp_verify_returns_none_when_socket_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // lima_home dir exists, but no qmp.sock inside vm subdir.
+        let vm = "sandbox-abc123def456";
+        let result = query_restrict_on_via_qmp(&dir.path().to_string_lossy(), vm);
+        assert!(
+            matches!(result, Ok(None)),
+            "absent QMP socket must return Ok(None) (marker fallback), not Err or Ok(Some): {result:?}"
+        );
+    }
+
+    /// Verify that `query_restrict_on_via_qmp` returns `Ok(None)` when the
+    /// QMP socket is a path that exists but cannot be connected to (e.g., a
+    /// regular file, not a Unix socket). The caller falls back to the marker.
+    #[test]
+    fn qmp_verify_returns_none_when_socket_is_not_connectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-abc123def456";
+        let vm_dir = dir.path().join(vm);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        // Create a plain file at qmp.sock — not a real socket.
+        let qmp_path = vm_dir.join("qmp.sock");
+        std::fs::write(&qmp_path, "not-a-socket").unwrap();
+
+        let result = query_restrict_on_via_qmp(&dir.path().to_string_lossy(), vm);
+        // Connection to a plain file returns an error; we map that to Ok(None).
+        assert!(
+            matches!(result, Ok(None)),
+            "non-connectable QMP path must return Ok(None) (marker fallback): {result:?}"
+        );
+    }
+
+    /// Verify the end-to-end negative path: when neither a QMP socket nor a
+    /// restrict marker exists, `handle_restrict_on_verify` returns
+    /// `RestrictNotConfirmed`. This is the hard-gate path the daemon uses to
+    /// refuse marking a session Running.
+    #[tokio::test]
+    async fn restrict_verify_no_qmp_no_marker_returns_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-negtest000001";
+        let own_uid = unsafe { libc::getuid() };
+        // Create the VM dir but no QMP socket and no marker file.
+        std::fs::create_dir_all(dir.path().join(vm)).unwrap();
+
+        let ctx = RunContext {
+            own_uid,
+            lima_home: dir.path().to_string_lossy().into_owned(),
+        };
+        let op = BrokerOp::RestrictOnVerify {
+            op_uid: own_uid,
+            vm: vm.to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::RestrictNotConfirmed { .. }),
+            "no QMP + no marker must yield RestrictNotConfirmed (session must not start): {result:?}"
+        );
+        if let BrokerResult::RestrictNotConfirmed { reason, .. } = result {
+            assert!(
+                reason.contains("marker") || reason.contains("restrict"),
+                "RestrictNotConfirmed reason must mention the failure cause: {reason}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

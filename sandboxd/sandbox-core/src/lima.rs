@@ -582,7 +582,37 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
         ))
     })?;
 
-    // Step 2: apply POSIX ACLs via setfacl.
+    // On macOS the per-operator LIMA_HOME is `0700`, operator-owned. The
+    // `setfacl` tool does not exist on macOS (Linux POSIX ACLs are not a
+    // macOS primitive), and the OpenSSH StrictKeyfileMode hazard from the
+    // Linux named-user ACL propagating into group bits does not arise on
+    // the single-uid macOS dev path (no named-user ACL → no mask → plain
+    // 0600 `_config/user` key). The full per-operator ACL port is deferred
+    // to M21 (todo #236).
+    #[cfg(target_os = "macos")]
+    {
+        // chmod 0700 so only the operator (and root) can enter the dir.
+        // `set_permissions` requires a `Permissions` derived from the target
+        // mode; use `std::os::unix::fs::PermissionsExt` for the raw mode.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lima_home, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| {
+                SandboxError::Internal(format!(
+                    "failed to chmod 0700 per-operator LIMA_HOME {}: {e}",
+                    lima_home.display()
+                ))
+            },
+        )?;
+        info!(
+            op_uid,
+            path = %lima_home.display(),
+            "per-operator LIMA_HOME provisioned (macOS, no setfacl)"
+        );
+        return Ok(lima_home);
+    }
+
+    // Linux only: apply POSIX ACLs via setfacl. On macOS the early return
+    // above handles LIMA_HOME provisioning without setfacl.
     //
     // setfacl -m u:<op_uid>:rwx,d:g::---,d:o::--- <dir>
     //
@@ -620,28 +650,38 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
     //
     // Numeric uid form avoids an NSS round-trip and matches the spec
     // prescription exactly.
-    let acl_spec = format!("u:{op_uid}:rwx,d:g::---,d:o::---");
-    let output = run_with_timeout(
-        Command::new("setfacl")
-            .arg("-m")
-            .arg(&acl_spec)
-            .arg(&lima_home),
-        std::time::Duration::from_secs(10),
-        "setfacl",
-    )?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::Internal(format!(
-            "setfacl on {} failed: {stderr}",
-            lima_home.display()
-        )));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let acl_spec = format!("u:{op_uid}:rwx,d:g::---,d:o::---");
+        let output = run_with_timeout(
+            Command::new("setfacl")
+                .arg("-m")
+                .arg(&acl_spec)
+                .arg(&lima_home),
+            std::time::Duration::from_secs(10),
+            "setfacl",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Internal(format!(
+                "setfacl on {} failed: {stderr}",
+                lima_home.display()
+            )));
+        }
+
+        info!(
+            op_uid,
+            path = %lima_home.display(),
+            "per-operator LIMA_HOME provisioned"
+        );
+        return Ok(lima_home);
     }
 
-    info!(
-        op_uid,
-        path = %lima_home.display(),
-        "per-operator LIMA_HOME provisioned"
-    );
+    // Unreachable on Linux (the cfg(not(macos)) block above returns); on macOS
+    // the cfg(macos) block above also returns. The trailing Ok satisfies the
+    // type-checker when both cfg blocks are absent (e.g., a hypothetical third
+    // OS).
+    #[allow(unreachable_code)]
     Ok(lima_home)
 }
 
@@ -725,6 +765,20 @@ pub enum LimaOp<'a> {
     },
     /// `sandbox-lima-helper read-owner-marker --vm <vm>`
     ReadOwnerMarker { vm: &'a str },
+    /// Post-boot `restrict=on` verification.
+    ///
+    /// On **macOS** this is routed to the `AgentBrokerExecutor`, which sends
+    /// `BrokerOp::RestrictOnVerify` to the operator's agent. The agent reads
+    /// the QMP socket (`{lima_home}/{vm}/qmp.sock`) — preferred — falling back
+    /// to the wrapper marker file (`{lima_home}/{vm}/sandboxd-restrict-marker`).
+    ///
+    /// On **Linux** the `SetuidHelperExecutor` reads the wrapper marker file
+    /// directly from the LIMA_HOME filesystem (the QMP socket is under the same
+    /// uid that called `spawn_blocking`, no broker indirection needed).
+    ///
+    /// In both cases a successful verification returns `Output { status: 0 }`
+    /// with the confirmed token in `stdout`; failure returns `status: 1`.
+    RestrictOnVerify { vm: &'a str },
 }
 
 /// Operator-execution seam — the platform-independent interface for running
@@ -1015,6 +1069,47 @@ impl LimaExecutor for SetuidHelperExecutor {
                     .arg(op_uid.to_string())
                     .arg("--vm")
                     .arg(vm);
+            }
+            LimaOp::RestrictOnVerify { vm } => {
+                // Linux: read the wrapper marker file directly. There is no
+                // `sandbox-lima-helper` subcommand for this op — on Linux the
+                // QEMU process and its files are accessible from the daemon
+                // process (same uid or root-readable), so no broker indirection
+                // is needed. On macOS this branch is unreachable: the
+                // `AgentBrokerExecutor` handles `RestrictOnVerify` by routing
+                // to the agent's `handle_restrict_on_verify`, which performs
+                // the QMP-preferred / marker-fallback check.
+                let lima_home = operator_lima_home(op_uid);
+                let marker_path = lima_home.join(vm).join("sandboxd-restrict-marker");
+                let contents = match std::fs::read_to_string(&marker_path) {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(SandboxError::Internal(format!(
+                            "{label}: restrict marker not found at {}; \
+                             the qemu-wrapper may not have run",
+                            marker_path.display()
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(SandboxError::Internal(format!(
+                            "{label}: failed to read restrict marker at {}: {e}",
+                            marker_path.display()
+                        )));
+                    }
+                };
+                if contents.contains("restrict=on") {
+                    use std::os::unix::process::ExitStatusExt;
+                    return Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: contents.trim().as_bytes().to_vec(),
+                        stderr: Vec::new(),
+                    });
+                }
+                return Err(SandboxError::Internal(format!(
+                    "{label}: restrict marker at {} does not contain 'restrict=on'; \
+                     contents: {contents:?}",
+                    marker_path.display()
+                )));
             }
         }
         run_with_timeout(&mut cmd, timeout, label).map_err(|e| match e {
@@ -2287,6 +2382,100 @@ impl LimaManager {
         Ok(())
     }
 
+    /// Verify that the sandbox VM's management NIC was locked to `restrict=on`
+    /// by the qemu-wrapper.
+    ///
+    /// This is the authoritative post-boot check that the daemon MUST call
+    /// before marking a session `Running`. On macOS, the check is brokered
+    /// through the operator's agent (which can read the QMP socket and marker
+    /// file that live under the operator-owned LIMA_HOME). On Linux, the
+    /// wrapper marker file is read directly from `self.base_dir` (the manager's
+    /// LIMA_HOME) — no helper invocation is needed because the QEMU process
+    /// runs under the same uid as the daemon.
+    ///
+    /// Returns `Ok(())` when `restrict=on` is confirmed. Returns
+    /// `Err(SandboxError::Internal(...))` when verification fails — the caller
+    /// MUST tear down the VM, gateway container, and any claimed slot before
+    /// returning an error to the API client.
+    ///
+    /// The wall-clock budget is kept short: the marker/QMP is available as
+    /// soon as the QEMU process has processed its argv, which happens during
+    /// early boot — well before the VM is considered "Running".
+    pub fn verify_restrict_on(&self, session_id: &SessionId) -> Result<(), SandboxError> {
+        let vm = vm_name(session_id);
+
+        // macOS: broker the check through the operator's agent so the QMP
+        // socket (operator-owned) can be queried. The agent uses QMP
+        // query-netdev as authoritative evidence, falling back to the marker.
+        #[cfg(target_os = "macos")]
+        {
+            const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+            let output = self.run_helper(
+                LimaOp::RestrictOnVerify { vm: &vm },
+                VERIFY_TIMEOUT,
+                "restrict-on-verify",
+            )?;
+            if output.status.success() {
+                info!(
+                    session_id = %session_id,
+                    vm = %vm,
+                    token = %String::from_utf8_lossy(&output.stdout).trim(),
+                    "restrict=on confirmed via broker"
+                );
+                return Ok(());
+            }
+            let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout_msg = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if reason.is_empty() {
+                stdout_msg
+            } else {
+                reason
+            };
+            return Err(SandboxError::Internal(format!(
+                "restrict-verify failed for session {session_id}: {detail}"
+            )));
+        }
+
+        // Linux: read the wrapper marker file directly from self.base_dir.
+        // The QEMU process and its files are accessible from the daemon
+        // (same uid or root-readable), so no broker indirection is needed.
+        #[allow(unreachable_code)]
+        {
+            let marker_path = self.base_dir.join(&vm).join("sandboxd-restrict-marker");
+            let contents = match std::fs::read_to_string(&marker_path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(SandboxError::Internal(format!(
+                        "restrict-verify failed for session {session_id}: \
+                         marker not found at {} (qemu-wrapper may not have run)",
+                        marker_path.display()
+                    )));
+                }
+                Err(e) => {
+                    return Err(SandboxError::Internal(format!(
+                        "restrict-verify failed for session {session_id}: \
+                         failed to read marker at {}: {e}",
+                        marker_path.display()
+                    )));
+                }
+            };
+            if contents.contains("restrict=on") {
+                info!(
+                    session_id = %session_id,
+                    vm = %vm,
+                    token = %contents.trim(),
+                    "restrict=on confirmed via wrapper marker"
+                );
+                return Ok(());
+            }
+            Err(SandboxError::Internal(format!(
+                "restrict-verify failed for session {session_id}: \
+                 marker at {} does not contain 'restrict=on'; contents: {contents:?}",
+                marker_path.display()
+            )))
+        }
+    }
+
     /// Query the status of a single VM.
     pub fn vm_status(&self, session_id: &SessionId) -> Result<VmStatus, SandboxError> {
         let vms = self.list_vms_raw()?;
@@ -3406,6 +3595,7 @@ provision:
       version: 2
       ethernets:
         eth0:
+          optional: true
           mtu: 1280
     NETPLAN_EOF
     netplan apply
@@ -3425,6 +3615,7 @@ provision:
       version: 2
       ethernets:
         lima0:
+          optional: true
           dhcp4: no
           addresses:
             - {vm_ip}/29
@@ -5779,6 +5970,8 @@ mod tests {
     // `/var/lib/sandboxd/`.
 
     /// Run `getfacl` on `dir` and return its stdout as a String.
+    /// Linux-only — `getfacl` is not available on macOS.
+    #[cfg(not(target_os = "macos"))]
     fn getfacl_output(dir: &std::path::Path) -> String {
         let out = std::process::Command::new("getfacl")
             .arg(dir.to_string_lossy().as_ref())
@@ -5803,22 +5996,42 @@ mod tests {
                 lima_home.display()
             ))
         })?;
-        let acl_spec = format!("u:{op_uid}:rwx,d:g::---,d:o::---");
-        let output = run_with_timeout(
-            Command::new("setfacl")
-                .arg("-m")
-                .arg(&acl_spec)
-                .arg(&lima_home),
-            std::time::Duration::from_secs(10),
-            "setfacl",
-        )?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Internal(format!(
-                "setfacl on {} failed: {stderr}",
-                lima_home.display()
-            )));
+        // On macOS setfacl does not exist; mirror the production path's macOS
+        // branch (chmod 0700 only, no setfacl).
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&lima_home, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    SandboxError::Internal(format!(
+                        "failed to chmod 0700 LIMA_HOME {}: {e}",
+                        lima_home.display()
+                    ))
+                },
+            )?;
+            return Ok(lima_home);
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let acl_spec = format!("u:{op_uid}:rwx,d:g::---,d:o::---");
+            let output = run_with_timeout(
+                Command::new("setfacl")
+                    .arg("-m")
+                    .arg(&acl_spec)
+                    .arg(&lima_home),
+                std::time::Duration::from_secs(10),
+                "setfacl",
+            )?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(SandboxError::Internal(format!(
+                    "setfacl on {} failed: {stderr}",
+                    lima_home.display()
+                )));
+            }
+            return Ok(lima_home);
+        }
+        #[allow(unreachable_code)]
         Ok(lima_home)
     }
 
@@ -5846,7 +6059,10 @@ mod tests {
             .expect("second ensure call must succeed (idempotent)");
     }
 
+    // ACL verification is Linux-only (setfacl + getfacl do not exist on macOS;
+    // the macOS production path uses chmod 0700 only — see D2/ensure_operator_lima_home).
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn ensure_operator_lima_home_acl_contains_user_entry() {
         // Verify that `getfacl` output on the provisioned directory
         // contains:
@@ -6933,5 +7149,176 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- verify_restrict_on negative tests -----------------------------------
+    //
+    // These tests confirm that `LimaManager::verify_restrict_on` fails closed:
+    // a missing or wrong marker causes `Err`, ensuring the daemon can never
+    // mark a session Running without restrict=on confirmed.
+    //
+    // The `DirectLimaExecutor` (via `SetuidHelperExecutor` on Linux, the direct
+    // marker-file read on macOS via `LimaOp::RestrictOnVerify`) reads the wrapper
+    // marker from the LIMA_HOME on the filesystem — making hermetic tempdir
+    // testing possible without a real QEMU process.
+
+    fn make_test_manager_in_tempdir(tmpdir: &std::path::Path) -> LimaManager {
+        use crate::test_support::direct_executor::DirectLimaExecutor;
+        LimaManager::new(
+            tmpdir.to_path_buf(),
+            DirectLimaExecutor::arc(),
+            nix::unistd::Uid::current().as_raw(),
+            "sandbox-base".to_string(),
+            "test-pool".to_string(),
+            true, // is_macos
+        )
+    }
+
+    /// verify_restrict_on must return Err when the wrapper marker file is absent.
+    ///
+    /// This is the mandated negative test from M20-S6: a missing marker means
+    /// the qemu-wrapper did not run or failed, and the daemon must refuse to mark
+    /// the session Running. Any weakening of this check would be a security
+    /// regression — the test failing means the egress promise is broken.
+    ///
+    /// Uses a session ID that is unlikely to exist in the system LIMA_HOME so
+    /// the test reliably sees an absent marker on macOS (where the executor reads
+    /// from operator_lima_home).
+    #[test]
+    fn verify_restrict_on_fails_closed_when_marker_absent() {
+        // Session ID chosen to be unique per this test — avoid the IDs used by
+        // other verify_restrict_on tests that write to operator_lima_home.
+        let id_str = "aabbccddee00";
+        let id = SessionId::parse(id_str).unwrap();
+
+        // Ensure the system LIMA_HOME does NOT have a marker for this session ID
+        // (could exist from a crashed previous test run — clean it up).
+        let op_uid = nix::unistd::Uid::current().as_raw();
+        let system_vm_dir = operator_lima_home(op_uid).join(format!("sandbox-{id_str}"));
+        let system_marker = system_vm_dir.join("sandboxd-restrict-marker");
+        let _ = std::fs::remove_file(&system_marker);
+
+        let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_no_marker_mgr");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).expect("failed to create tmpdir");
+
+        let mgr = make_test_manager_in_tempdir(&tmpdir);
+        // No marker file exists in tmpdir or operator_lima_home — simulates wrapper never running.
+        let result = mgr.verify_restrict_on(&id);
+        assert!(
+            result.is_err(),
+            "verify_restrict_on must return Err when the marker file is absent \
+             (the session must NOT be marked Running without restrict=on confirmed)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("restrict") || msg.contains("marker"),
+            "error message must mention 'restrict' or 'marker' for operator diagnostics; got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    /// verify_restrict_on must return Err when the marker exists but lacks restrict=on.
+    ///
+    /// A marker written by a buggy or tampered wrapper that does not contain
+    /// `restrict=on` must not pass verification — the daemon must tear down.
+    ///
+    /// Uses a distinct session ID from the positive test to avoid cross-test
+    /// state pollution (on macOS the executor reads from operator_lima_home,
+    /// not the test tmpdir).
+    #[test]
+    fn verify_restrict_on_fails_closed_when_marker_has_wrong_content() {
+        use std::io::Write;
+        // Distinct from the positive-test session ID to avoid cross-test pollution.
+        let id_str = "112233445566";
+        let session_id = SessionId::parse(id_str).unwrap();
+
+        // On macOS the executor reads from operator_lima_home(op_uid).
+        // Write the wrong-content marker there.
+        let op_uid = nix::unistd::Uid::current().as_raw();
+        let system_lima_home = operator_lima_home(op_uid);
+        let vm_dir_system = system_lima_home.join(format!("sandbox-{id_str}"));
+        std::fs::create_dir_all(&vm_dir_system).expect("failed to create vm dir");
+        let marker_system = vm_dir_system.join("sandboxd-restrict-marker");
+        let mut f = std::fs::File::create(&marker_system).unwrap();
+        writeln!(f, "-netdev user,id=net0,hostfwd=tcp::60022-:22").unwrap(); // NO restrict=on
+        drop(f);
+
+        // Also write to tmpdir for the Linux direct-read path (LimaManager.base_dir).
+        let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_wrong_content_mgr");
+        let vm_dir_tmp = tmpdir.join(format!("sandbox-{id_str}"));
+        std::fs::create_dir_all(&vm_dir_tmp).expect("failed to create vm dir in tmpdir");
+        let marker_tmp = vm_dir_tmp.join("sandboxd-restrict-marker");
+        let mut f2 = std::fs::File::create(&marker_tmp).unwrap();
+        writeln!(f2, "-netdev user,id=net0,hostfwd=tcp::60022-:22").unwrap(); // NO restrict=on
+        drop(f2);
+
+        let mgr = make_test_manager_in_tempdir(&tmpdir);
+        let result = mgr.verify_restrict_on(&session_id);
+
+        // Cleanup before asserting so a panic doesn't leave stale markers.
+        let _ = std::fs::remove_dir_all(&vm_dir_system);
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert!(
+            result.is_err(),
+            "verify_restrict_on must return Err when marker does not contain 'restrict=on'"
+        );
+    }
+
+    /// verify_restrict_on must return Ok when the marker contains restrict=on.
+    ///
+    /// Belt-and-suspenders: the positive path also needs a test so we can
+    /// detect any future regression where the success path stops working.
+    ///
+    /// On macOS the executor resolves the marker via `operator_lima_home(op_uid)`
+    /// (the broker / DirectLimaExecutor both derive the path from the current uid),
+    /// so we write the marker to that path in this test rather than a tmpdir.
+    /// On Linux the manager reads `self.base_dir` directly, so the tmpdir is used.
+    #[test]
+    fn verify_restrict_on_succeeds_when_marker_confirms_restrict_on() {
+        use std::io::Write;
+        let id_str = "aabbccddeeff";
+        let session_id = SessionId::parse(id_str).unwrap();
+
+        // The marker path the executor reads — on macOS this is derived from
+        // `operator_lima_home(current_uid)`, on Linux from `self.base_dir`.
+        // Build both and pick the one the executor will actually use.
+        let op_uid = nix::unistd::Uid::current().as_raw();
+        let system_lima_home = operator_lima_home(op_uid);
+        let vm_dir_system = system_lima_home.join(format!("sandbox-{id_str}"));
+        std::fs::create_dir_all(&vm_dir_system)
+            .expect("failed to create vm dir under system LIMA_HOME");
+        let marker_system = vm_dir_system.join("sandboxd-restrict-marker");
+        let mut f = std::fs::File::create(&marker_system).unwrap();
+        writeln!(f, "-netdev user,id=net0,hostfwd=tcp::60022-:22,restrict=on").unwrap();
+        drop(f);
+
+        // The manager's base_dir is the tmpdir; on Linux it reads from there.
+        // Also write the marker in the tmpdir for the Linux path.
+        let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_ok_mgr");
+        let vm_dir_tmp = tmpdir.join(format!("sandbox-{id_str}"));
+        std::fs::create_dir_all(&vm_dir_tmp).expect("failed to create vm dir in tmpdir");
+        let marker_tmp = vm_dir_tmp.join("sandboxd-restrict-marker");
+        let mut f2 = std::fs::File::create(&marker_tmp).unwrap();
+        writeln!(
+            f2,
+            "-netdev user,id=net0,hostfwd=tcp::60022-:22,restrict=on"
+        )
+        .unwrap();
+        drop(f2);
+
+        let mgr = make_test_manager_in_tempdir(&tmpdir);
+        let result = mgr.verify_restrict_on(&session_id);
+
+        // Clean up both marker dirs to avoid polluting real LIMA_HOME.
+        let _ = std::fs::remove_dir_all(&vm_dir_system);
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert!(
+            result.is_ok(),
+            "verify_restrict_on must return Ok when marker contains 'restrict=on': {result:?}"
+        );
     }
 }

@@ -7,11 +7,12 @@
 ///   gateway container inside the gateway Lima VM (steps 6–11 of the create flow).
 /// - `teardown_macos_gateway` — removes the gateway container and macvlan network
 ///   on stop/rm (idempotent, tolerates "not found").
-/// - `verify_restrict_on` — stub gate that confirms the QEMU qemu-wrapper applied
-///   `restrict=on` before the session is marked Running. Authoritative
-///   implementation is M20-S6; this stub reads a wrapper marker file.
 /// - `check_host_ip_forwarding_disabled` — asserts that macOS host IP forwarding
 ///   is disabled on both IPv4 and IPv6, which is required for the egress guarantee.
+///
+/// `restrict=on` verification is handled by `LimaManager::verify_restrict_on`
+/// (in `sandbox_core::lima`), which uses the broker-mediated QMP path on macOS
+/// and a direct marker read on Linux.
 ///
 /// All functions are `#[cfg(target_os = "macos")]`. The module is declared in
 /// `lib.rs` as `#[cfg(target_os = "macos")] pub mod macos_session`.
@@ -122,7 +123,7 @@ fn gateway_docker_cmd(gateway_docker_socket: &Path) -> Command {
 /// 11. Inject DNAT
 ///
 /// Returns `Ok(())` on success; caller does `limactl start` +
-/// `verify_restrict_on` + marks the session Running after.
+/// `LimaManager::verify_restrict_on` + marks the session Running after.
 ///
 /// On failure: caller must tear down (`teardown_macos_gateway`) and
 /// release the slot (`vmnet_pool.release_lima_slot`).
@@ -268,6 +269,39 @@ pub fn setup_macos_gateway(
         );
     }
 
+    // Seed the initial deny-all Envoy listener into the container.
+    //
+    // The gateway entrypoint blocks until both the bootstrap file (written
+    // above) and this listener file exist before it starts Envoy. On macOS
+    // the listener directory is not bind-mounted from the host (no host-path
+    // → gateway-VM-path bridge), so the file must be injected via `docker
+    // exec`. The `write_file_to_gateway_container` helper now creates the
+    // parent directory inline, so no separate mkdir step is needed.
+    //
+    // Note: dynamic LDS listener updates (the Linux path rewrites the
+    // bind-mounted host file via `AtomicListenerWriter` on every policy
+    // change) are not yet wired on macOS. The initial deny-all listener
+    // unblocks Envoy at startup; live policy-driven listener replacement
+    // over the forwarded socket remains future work.
+    {
+        use crate::policy::{LISTENER_FILE_IN_CONTAINER, PolicyCompiler};
+        let listener = PolicyCompiler::compile_initial_envoy_listener();
+        if let Err(e) = write_file_to_gateway_container(
+            gateway_docker_socket,
+            &container_name,
+            LISTENER_FILE_IN_CONTAINER,
+            &listener,
+        ) {
+            return Err(SandboxError::Gateway(format!(
+                "failed to write initial Envoy listener to macOS gateway {container_name}: {e}"
+            )));
+        }
+        debug!(
+            session_id = %session_id,
+            "wrote initial deny-all Envoy listener to macOS gateway container"
+        );
+    }
+
     // Write the initial DNS policy if provided.
     if let Some(policy_content) = initial_dns_policy {
         if let Err(e) = write_file_to_gateway_container(
@@ -401,11 +435,14 @@ pub fn build_macos_gateway_docker_args(
     // On macOS the listener and events host directories are not bind-mounted
     // into the gateway VM (the VM has its own filesystem). Bind-mounts from
     // the macOS host are not available inside the gateway VM's container
-    // namespace. Policy distribution for macOS is handled via the forwarded
-    // socket in M20-S6+.
+    // namespace.
     //
-    // REVISIT in M20-S6: add listener/events bind-mounts once the macOS
-    // host-path → gateway-VM-path bridge is in place.
+    // The initial deny-all Envoy listener is seeded via `docker exec` in
+    // `setup_macos_gateway` so that Envoy can start. Dynamic LDS listener
+    // updates (the Linux path rewrites the bind-mounted host file via
+    // `AtomicListenerWriter` on every policy change) are not yet wired on
+    // macOS — live policy-driven listener replacement over the forwarded
+    // socket remains future work.
 
     args.push(gateway_image_tag.to_string());
     args
@@ -518,85 +555,6 @@ pub fn teardown_macos_gateway(
 }
 
 // ---------------------------------------------------------------------------
-// verify_restrict_on
-// ---------------------------------------------------------------------------
-
-/// Verify that the sandbox VM's management NIC was locked to `restrict=on`
-/// by the qemu-wrapper before marking the session Running.
-///
-/// ## STUB (M20-S4)
-///
-/// The authoritative implementation (broker-mediated QMP `query-netdev` /
-/// wrapper marker read via the operator's agent) is M20-S6. This stub reads
-/// the wrapper marker file from the operator-owned LIMA_HOME to confirm
-/// `restrict=on` was applied.
-///
-/// If verification fails: caller must tear down VM + gateway + release slot.
-///
-/// Returns `Ok(())` when confirmed (or as a soft warning for missing markers
-/// in this stub phase), `Err` when the marker exists but does NOT confirm
-/// `restrict=on`.
-///
-/// The marker file location: `<lima_home>/sandbox-<id>/sandboxd-restrict-marker`
-/// (the filename matches the protocol constant `RESTRICT_MARKER_FILENAME` in
-/// `sandbox-agent-protocol`).
-#[cfg(target_os = "macos")]
-pub fn verify_restrict_on(
-    session_id: &SessionId,
-    operator_lima_home: &Path,
-) -> Result<(), SandboxError> {
-    // STUB: M20-S6 implements live QMP query-netdev. Here we check for the
-    // wrapper marker file written by the qemu-wrapper on success.
-    //
-    // The marker filename is `sandboxd-restrict-marker`, matching the
-    // protocol constant `RESTRICT_MARKER_FILENAME` used by the agent's
-    // `RestrictOnVerify` handler. The wrapper writes the final rewritten
-    // `-netdev user,...` token (which must contain `restrict=on`) to this
-    // path when `SANDBOX_RESTRICT_MARKER` env var is set before `limactl start`.
-    let marker_path = operator_lima_home
-        .join(format!("sandbox-{session_id}"))
-        .join("sandboxd-restrict-marker");
-
-    if marker_path.exists() {
-        let content = std::fs::read_to_string(&marker_path).unwrap_or_default();
-        if content.contains("restrict=on") {
-            debug!(
-                session_id = %session_id,
-                "restrict-verify: wrapper marker confirms restrict=on"
-            );
-            return Ok(());
-        }
-        return Err(SandboxError::Internal(format!(
-            "restrict-verify failed for session {session_id}: \
-             marker exists but does not confirm restrict=on (content: {content:?}). \
-             The qemu-wrapper may have failed to inject restrict=on. \
-             Session will be torn down."
-        )));
-    }
-
-    // Marker not found — the wrapper either didn't run or failed to write it.
-    // The caller must have invoked this after `limactl start` returns so the
-    // wrapper has had time to write the marker during QEMU startup. A missing
-    // marker means restrict=on was not confirmed and the session must NOT be
-    // marked Running.
-    //
-    // The CHECK is stubbed (marker-file read vs. live QMP query-netdev — the
-    // authoritative check is M20-S6). The FAILURE PATH is real: return Err so
-    // the caller tears down VM + gateway, releases the slot, and returns an
-    // actionable error rather than marking the session Running without egress
-    // control confirmed. A VM whose eth0 is not restrict=on would have an
-    // uncontrolled egress path — this Err enforces the core promise.
-    Err(SandboxError::Internal(format!(
-        "restrict-verify failed for session {session_id}: \
-         wrapper marker not found at {}. The qemu-wrapper did not run or failed \
-         to write the marker. Session will NOT be marked Running. \
-         (Check that the sandbox-VM qemu-wrapper is installed and executable; \
-         M20-S6 adds a live QMP query-netdev fallback.)",
-        marker_path.display()
-    )))
-}
-
-// ---------------------------------------------------------------------------
 // check_host_ip_forwarding_disabled
 // ---------------------------------------------------------------------------
 
@@ -683,15 +641,19 @@ fn write_file_to_gateway_container(
     use std::io::Write;
     use std::process::Stdio;
 
+    // Use `mkdir -p` to ensure the parent directory exists before writing.
+    // The listener file lives under `/etc/envoy/listeners/` which is not
+    // created by the container image itself — the entrypoint only creates it
+    // as part of the Envoy start sequence, which is gated on this file
+    // already existing. Creating the parent inline here avoids the race.
+    let parent = std::path::Path::new(container_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".to_string());
+    let sh_cmd = format!("mkdir -p {parent} && cat > {container_path}");
+
     let mut child = gateway_docker_cmd(gateway_docker_socket)
-        .args([
-            "exec",
-            "-i",
-            container_name,
-            "sh",
-            "-c",
-            &format!("cat > {container_path}"),
-        ])
+        .args(["exec", "-i", container_name, "sh", "-c", &sh_cmd])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1059,76 +1021,6 @@ mod tests {
             !args.iter().any(|a| a.contains("docker.sock")),
             "gateway run args must not reference docker.sock in any arg; got: {args:?}"
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_verify_restrict_on_missing_marker_is_hard_error() {
-        // When the marker file does not exist, verify_restrict_on must return Err.
-        // A missing marker means the qemu-wrapper did not confirm restrict=on, so
-        // the session must NOT be marked Running — the failure path must be a hard
-        // error regardless of whether the check is stubbed (marker) or live (QMP).
-        let id = SessionId::parse("aabbccddeeff").unwrap();
-        // Use a temp directory that definitely doesn't have the marker file.
-        let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_no_marker");
-        let _ = std::fs::remove_dir_all(&tmpdir); // Clean up from previous run.
-        let result = verify_restrict_on(&id, &tmpdir);
-        assert!(
-            result.is_err(),
-            "missing marker must return Err (hard error, not soft warn): got Ok"
-        );
-        // The error message must mention the marker path for operator diagnostics.
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("wrapper marker not found"),
-            "error message must mention 'wrapper marker not found': {msg}"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_verify_restrict_on_marker_confirms_restrict_on() {
-        use std::io::Write;
-        let id = SessionId::parse("aabbccddeeff").unwrap();
-        let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_ok");
-        let vm_dir = tmpdir.join(format!("sandbox-{id}"));
-        std::fs::create_dir_all(&vm_dir).unwrap();
-        let marker_path = vm_dir.join("sandboxd-restrict-marker");
-        let mut f = std::fs::File::create(&marker_path).unwrap();
-        writeln!(f, "restrict=on applied successfully").unwrap();
-        drop(f);
-
-        let result = verify_restrict_on(&id, &tmpdir);
-        assert!(
-            result.is_ok(),
-            "marker with 'restrict=on' must return Ok: {result:?}"
-        );
-
-        // Clean up.
-        let _ = std::fs::remove_dir_all(&tmpdir);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_verify_restrict_on_marker_wrong_content_is_error() {
-        use std::io::Write;
-        let id = SessionId::parse("aabbccddeeff").unwrap();
-        let tmpdir = std::env::temp_dir().join("test_verify_restrict_on_bad");
-        let vm_dir = tmpdir.join(format!("sandbox-{id}"));
-        std::fs::create_dir_all(&vm_dir).unwrap();
-        let marker_path = vm_dir.join("sandboxd-restrict-marker");
-        let mut f = std::fs::File::create(&marker_path).unwrap();
-        writeln!(f, "wrapper failed to inject restrict").unwrap();
-        drop(f);
-
-        let result = verify_restrict_on(&id, &tmpdir);
-        assert!(
-            result.is_err(),
-            "marker without 'restrict=on' must return Err"
-        );
-
-        // Clean up.
-        let _ = std::fs::remove_dir_all(&tmpdir);
     }
 
     #[cfg(target_os = "macos")]

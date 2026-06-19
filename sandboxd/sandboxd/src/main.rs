@@ -3826,10 +3826,8 @@ async fn create_session_macos_lima(
     state: Arc<AppState>,
 ) -> axum::response::Response {
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
-    use sandbox_core::lima::operator_lima_home;
     use sandbox_core::macos_session::{
         check_host_ip_forwarding_disabled, setup_macos_gateway, teardown_macos_gateway,
-        verify_restrict_on,
     };
 
     // Defense-in-depth (#244): re-check host IP forwarding before creating a
@@ -4105,13 +4103,31 @@ async fn create_session_macos_lima(
         }
     }
 
-    // Step 11: verify restrict=on (fails closed; caller tears down on Err).
+    // Step 11: verify restrict=on via the broker (fails closed; caller tears
+    // down on Err). The check is brokered through the operator's agent on macOS
+    // so the QMP socket (operator-owned) can be queried without the daemon
+    // needing access to operator-owned files. The agent uses QMP query-netdev as
+    // the authoritative evidence, falling back to the wrapper marker file when
+    // QMP is transiently unavailable.
     {
-        let op_lima_home = operator_lima_home(operator.uid);
+        let manager = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(m) => m,
+            Err(e) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(e).into_response();
+            }
+        };
         let sid = session_id;
-        match tokio::task::spawn_blocking(move || verify_restrict_on(&sid, &op_lima_home)).await {
+        match tokio::task::spawn_blocking(move || manager.verify_restrict_on(&sid)).await {
             Ok(Ok(())) => {
-                info!(%session_id, "restrict=on confirmed");
+                info!(%session_id, "restrict=on confirmed via broker");
             }
             Ok(Err(e)) => {
                 error!(%session_id, error = %e, "restrict-verify failed; tearing down session");
@@ -4126,7 +4142,7 @@ async fn create_session_macos_lima(
                 return error_response(SandboxError::Internal(format!(
                     "session rejected: restrict-verify failed ({e}). \
                      The sandbox VM was torn down. Check that the qemu-wrapper is installed \
-                     and the wrapper marker path is correct."
+                     and that the operator's agent is connected."
                 )))
                 .into_response();
             }
@@ -4245,10 +4261,7 @@ async fn start_session_macos_lima(
     state: Arc<AppState>,
 ) -> axum::response::Response {
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
-    use sandbox_core::lima::operator_lima_home;
-    use sandbox_core::macos_session::{
-        setup_macos_gateway, teardown_macos_gateway, verify_restrict_on,
-    };
+    use sandbox_core::macos_session::{setup_macos_gateway, teardown_macos_gateway};
 
     let session_id = session.id;
     let vmnet_pool = state.vmnet_pool.clone();
@@ -4434,13 +4447,26 @@ async fn start_session_macos_lima(
         }
     }
 
-    // Step 10: verify restrict=on.
+    // Step 10: verify restrict=on via the broker (same as create step 11).
     {
-        let op_lima_home = operator_lima_home(operator.uid);
+        let manager = match state.lima_runtime.manager_for(operator.uid) {
+            Ok(m) => m,
+            Err(e) => {
+                state.vm_ip_map.unbind(
+                    network_info
+                        .vm_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
+                state.event_bus.unregister_session(&session_id);
+                rollback().await;
+                return error_response(e).into_response();
+            }
+        };
         let sid = session_id;
-        match tokio::task::spawn_blocking(move || verify_restrict_on(&sid, &op_lima_home)).await {
+        match tokio::task::spawn_blocking(move || manager.verify_restrict_on(&sid)).await {
             Ok(Ok(())) => {
-                info!(%session_id, "restrict=on confirmed (resume)");
+                info!(%session_id, "restrict=on confirmed via broker (resume)");
             }
             Ok(Err(e)) => {
                 error!(%session_id, error = %e, "restrict-verify failed on resume; tearing down");

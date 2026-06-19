@@ -65,6 +65,8 @@ use tracing::{info, warn};
 #[cfg(target_os = "macos")]
 use crate::error::SandboxError;
 #[cfg(target_os = "macos")]
+use crate::gateway::gateway_image_tag_for_daemon;
+#[cfg(target_os = "macos")]
 use crate::lima::{LimaExecutor, LimaOp};
 #[cfg(target_os = "macos")]
 use crate::network::VmnetPool;
@@ -137,6 +139,13 @@ const DOCKER_OP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for nft injection via `nft -f -` on stdin inside the gateway VM.
 #[cfg(target_os = "macos")]
 const NFT_INJECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Filename of the cached gateway image tarball inside the daemon LIMA_HOME.
+/// The operator populates it via:
+///   make gateway-image && docker save <tag> -o <path>
+/// where <path> is `{daemon_lima_home}/gateway-image.tar`.
+#[cfg(target_os = "macos")]
+pub const GATEWAY_IMAGE_TARBALL_FILENAME: &str = "gateway-image.tar";
 
 // ---------------------------------------------------------------------------
 // NIC map
@@ -714,6 +723,14 @@ impl GatewayLimaManager {
         // the gateway VM is ready.
         self.wait_docker_ready()?;
 
+        // Step 4d.5: load the gateway container image into the gateway VM's
+        // Docker daemon if it is not already present. The image is cached as a
+        // tarball at `{daemon_lima_home}/gateway-image.tar` (populated via
+        // `make gateway-image && docker save <tag> -o <path>` by the operator
+        // before starting the daemon). If the tarball is absent, we skip and
+        // let the session-create check catch the missing image later.
+        self.load_gateway_image_if_needed();
+
         // Step 4e: discover slot→NIC map.
         let nic_map = self.discover_nics()?;
         let discovered = nic_map.discovered_count;
@@ -752,6 +769,123 @@ impl GatewayLimaManager {
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    /// Load the gateway container image into the gateway VM's Docker daemon
+    /// from a cached tarball, if the image is not already present.
+    ///
+    /// The tarball lives at `{daemon_lima_home}/gateway-image.tar`. The operator
+    /// populates it via:
+    ///   make gateway-image && \
+    ///   docker save sandbox-gateway:$(cat sandboxd/Cargo.toml | grep '^version' | cut -d'"' -f2) \
+    ///     -o {daemon_lima_home}/gateway-image.tar
+    ///
+    /// If the tarball is absent this is a best-effort no-op — the session-create
+    /// check will catch the missing image and return an actionable error.
+    ///
+    /// Non-fatal: failures are logged at `warn!` but do not abort `ensure_ready`.
+    fn load_gateway_image_if_needed(&self) {
+        let tarball = self.daemon_lima_home.join(GATEWAY_IMAGE_TARBALL_FILENAME);
+        if !tarball.exists() {
+            info!(
+                tarball = %tarball.display(),
+                "gateway image tarball not found; skipping docker load \
+                 (populate it with: make gateway-image && docker save <tag> -o {})",
+                tarball.display()
+            );
+            return;
+        }
+
+        // Check if the image is already loaded in the gateway VM's Docker daemon.
+        let image_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
+        let inspect = {
+            let mut cmd = Command::new("docker");
+            apply_docker_env(&mut cmd);
+            cmd.args(["-H", &socket_str, "image", "inspect", &image_tag]);
+            run_with_timeout(
+                &mut cmd,
+                DOCKER_OP_TIMEOUT,
+                "docker image inspect (gateway)",
+            )
+        };
+        match inspect {
+            Ok(ref out) if out.status.success() => {
+                info!(tag = %image_tag, "gateway image already loaded in gateway VM");
+                return;
+            }
+            Ok(_) => {
+                // Image not present — proceed to load.
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "docker image inspect in gateway VM failed; attempting load anyway"
+                );
+            }
+        }
+
+        // Load the tarball via stdin pipe into `docker load`.
+        info!(
+            tarball = %tarball.display(),
+            tag = %image_tag,
+            "loading gateway image into gateway VM from tarball"
+        );
+        let tarball_content = match std::fs::read(&tarball) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    tarball = %tarball.display(),
+                    error = %e,
+                    "failed to read gateway image tarball; gateway sessions may fail"
+                );
+                return;
+            }
+        };
+
+        let load_result = {
+            use std::io::Write;
+            use std::process::Stdio;
+            let mut child = match Command::new("docker")
+                .args(["-H", &socket_str, "load"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "failed to spawn docker load for gateway image");
+                    return;
+                }
+            };
+            if let Some(ref mut stdin) = child.stdin {
+                if let Err(e) = stdin.write_all(&tarball_content) {
+                    warn!(error = %e, "failed to write tarball to docker load stdin");
+                    let _ = child.kill();
+                    return;
+                }
+            }
+            child.stdin.take(); // close stdin so docker load sees EOF
+            match child.wait_with_output() {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(error = %e, "docker load wait failed");
+                    return;
+                }
+            }
+        };
+
+        if load_result.status.success() {
+            info!(tag = %image_tag, "gateway image loaded into gateway VM");
+        } else {
+            warn!(
+                tag = %image_tag,
+                stderr = %String::from_utf8_lossy(&load_result.stderr).trim(),
+                "docker load for gateway image returned non-zero; \
+                 gateway sessions may fail if image is missing"
+            );
+        }
+    }
 
     /// Query the Lima instance state by running `limactl list --json`.
     ///

@@ -748,6 +748,7 @@ fn free_kb_at(path: &Path) -> u64 {
             let block_kb = s.fragment_size() / 1024;
             // `blocks_available()` returns `u64` on Linux, `u32` on macOS;
             // cast to `u64` so the expression type is uniform across platforms.
+            #[allow(clippy::unnecessary_cast)]
             let blocks = s.blocks_available() as u64;
             blocks.saturating_mul(block_kb.max(1))
         }

@@ -1218,6 +1218,10 @@ fn lima_op_to_broker_op(
             op_uid,
             vm: vm.to_string(),
         },
+        LimaOp::RestrictOnVerify { vm } => BrokerOp::RestrictOnVerify {
+            op_uid,
+            vm: vm.to_string(),
+        },
     })
 }
 
@@ -1538,6 +1542,33 @@ fn run_limactl_direct(
                         marker.display()
                     ))
                 });
+        }
+        LimaOp::RestrictOnVerify { vm } => {
+            // Degenerate path (op_uid == daemon_uid): read the wrapper marker
+            // file directly. On macOS this path is only reached for the gateway
+            // Lima instance (which never uses restrict=on). For session VMs the
+            // brokered AgentBrokerExecutor path takes precedence (op_uid ≠ daemon_uid).
+            // On Linux the SetuidHelperExecutor handles this variant directly.
+            let marker = lima_home.join(vm).join("sandboxd-restrict-marker");
+            return match std::fs::read_to_string(&marker) {
+                Ok(contents) if contents.contains("restrict=on") => Ok(std::process::Output {
+                    status: exit_status_from_code(0),
+                    stdout: contents.trim().as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                }),
+                Ok(contents) => Err(SandboxError::Internal(format!(
+                    "{label}: restrict marker at {} does not contain 'restrict=on'; \
+                     contents: {contents:?}",
+                    marker.display()
+                ))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(SandboxError::Internal(
+                    format!("{label}: restrict marker not found at {}", marker.display()),
+                )),
+                Err(e) => Err(SandboxError::Internal(format!(
+                    "{label}: failed to read restrict marker at {}: {e}",
+                    marker.display()
+                ))),
+            };
         }
     }
 

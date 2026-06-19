@@ -239,6 +239,36 @@ fn run_limactl_direct(
                 }
             }
         }
+        LimaOp::RestrictOnVerify { vm } => {
+            // Integration-test path: read the wrapper marker file directly,
+            // matching the SetuidHelperExecutor fallback on Linux.
+            let marker = format!("{lima_home_str}/{vm}/sandboxd-restrict-marker");
+            match std::fs::read_to_string(&marker) {
+                Ok(contents) if contents.contains("restrict=on") => {
+                    return Ok(std::process::Output {
+                        status: std::process::ExitStatus::default(),
+                        stdout: contents.trim().as_bytes().to_vec(),
+                        stderr: Vec::new(),
+                    });
+                }
+                Ok(contents) => {
+                    return Err(SandboxError::Internal(format!(
+                        "{label}: restrict marker at {marker} does not contain 'restrict=on'; \
+                         contents: {contents:?}"
+                    )));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(SandboxError::Internal(format!(
+                        "{label}: restrict marker not found at {marker}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(SandboxError::Internal(format!(
+                        "{label}: failed to read restrict marker at {marker}: {e}"
+                    )));
+                }
+            }
+        }
     }
 
     run_with_timeout(&mut cmd, timeout, label)

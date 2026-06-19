@@ -73,7 +73,6 @@ FROM debian:bookworm-slim
 
 # Versions — pinned for reproducibility
 ARG MITMPROXY_VERSION=12.2.3
-ARG TARGETARCH=amd64
 
 # ---------- base packages ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -101,7 +100,15 @@ COPY --from=nft-loggers-builder /out/sandbox-nft-allow-logger /usr/local/bin/san
 RUN chmod +x /usr/local/bin/sandbox-nft-deny-logger /usr/local/bin/sandbox-nft-allow-logger
 
 # ---------- install mitmproxy static binary ----------
-RUN curl -fsSL "https://downloads.mitmproxy.org/${MITMPROXY_VERSION}/mitmproxy-${MITMPROXY_VERSION}-linux-x86_64.tar.gz" \
+# uname -m returns the exact arch strings mitmproxy uses in release filenames
+# (x86_64, aarch64), so no mapping is needed. Works with both the legacy builder
+# and BuildKit (with QEMU emulation, uname -m reflects the emulated target arch).
+RUN ARCH="$(uname -m)" \
+    && case "${ARCH}" in \
+        x86_64|aarch64) ;; \
+        *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://downloads.mitmproxy.org/${MITMPROXY_VERSION}/mitmproxy-${MITMPROXY_VERSION}-linux-${ARCH}.tar.gz" \
         | tar -xz -C /usr/local/bin/ \
     && chmod +x /usr/local/bin/mitmdump /usr/local/bin/mitmproxy /usr/local/bin/mitmweb
 

@@ -1770,3 +1770,82 @@ def backend(request) -> str:
     fixture value directly.
     """
     return request.param
+
+
+# ---------------------------------------------------------------------------
+# macOS full-backend guard
+# ---------------------------------------------------------------------------
+#
+# Tests carrying ``@pytest.mark.macos`` require the macOS full backend:
+# socket_vmnet pool daemons, a running sandboxd-gateway Lima instance, and
+# the per-operator agent checked in (GUI/Aqua session). Lite mode (container
+# backend) works over SSH without a GUI session; the full Lima backend requires
+# the operator's LaunchAgent to be running.
+#
+# This fixture distinguishes two macOS modes:
+#   - GUI/Aqua-agent-present: the operator is logged into a macOS GUI session
+#     and their per-operator agent has checked in to the daemon broker. Full
+#     backend create/start/stop work. Tests with ``@pytest.mark.macos`` need
+#     this mode.
+#   - SSH-only / no Aqua agent: the operator is connected over SSH without a
+#     GUI session. The per-operator agent LaunchAgent does not load
+#     (``LimitLoadToSessionType: Aqua``), so the daemon's broker has no agent
+#     for this operator. Full backend calls fail with an agent-unavailable
+#     error; lite mode still works. M21-S4 SSH-only lite path depends on
+#     this distinction being detectable.
+#
+# Detection heuristic for agent presence (provisional — the full seam is
+# M22-S7): check whether the daemon's broker socket exists at the expected
+# path and whether ``launchctl print user/<uid>/io.sandboxd.agent`` reports
+# the LaunchAgent as loaded. A missing socket or an unloaded agent signals
+# SSH-only mode; tests skip rather than fail on that host.
+
+@pytest.fixture(autouse=True, scope="function")
+def _macos_required_for_macos_tests(request):
+    """Per-test prereq check for tests carrying the ``macos`` marker.
+
+    Skips on non-macOS hosts. On macOS, also checks whether the
+    per-operator sandboxd agent LaunchAgent is loaded in the current
+    session (Aqua / GUI mode) — a prerequisite for the full Lima backend.
+    If the agent is not loaded, the test is skipped with an actionable
+    message; this distinguishes the GUI/Aqua-agent-present mode from the
+    SSH-only / no-Aqua-agent mode. Lite-mode tests are unaffected.
+
+    The full harness adaptation across all four cells is deferred to
+    M22-S7; this fixture provides the minimal gate for macOS egress proof
+    tests.
+    """
+    if request.node.get_closest_marker("macos") is None:
+        return
+
+    if sys.platform != "darwin":
+        pytest.skip(
+            "macOS-only test; run on an Apple-Silicon Mac with the full "
+            "sandboxd backend (socket_vmnet + restrict=on qemu-wrapper)."
+        )
+
+    # Check for GUI/Aqua mode: the per-operator sandboxd agent must be
+    # loaded in the current user's launchd session. Without it, the daemon
+    # cannot start Lima VMs for this operator (the full backend is GUI-gated
+    # per the design spec — § Login-session constraints).
+    uid = os.getuid()
+    try:
+        agent_result = subprocess.run(
+            ["launchctl", "print", f"user/{uid}/io.sandboxd.agent"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        agent_loaded = agent_result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        agent_loaded = False
+
+    if not agent_loaded:
+        pytest.skip(
+            "macOS per-operator sandboxd agent (io.sandboxd.agent) is not "
+            "loaded in this session. The full Lima backend requires a GUI "
+            "(Aqua) login session. Either: (1) log in to the macOS GUI and "
+            "run the test from a Terminal.app/iTerm2 session, or (2) use "
+            "lite mode (container backend) which works over SSH without a "
+            "GUI session."
+        )
