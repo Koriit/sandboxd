@@ -16,11 +16,15 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::backend::{
-    BackendKind, CliDockerOps, ContainerRuntime, EnsureImageOutcome, LITE_FIRST_USE_WARNING,
-    LimaRuntime, RuntimeHandle, RuntimeStartArgs, SANDBOX_CA_CONTAINER_PATH, SessionRuntime,
-    compute_default_resource_limits, ensure_image, home_volume_name, lite_image_tag_for_version,
-    map_container_uid_gid, reap_orphans, rebuild_lite_image,
+    BackendKind, CliDockerOps, ContainerRuntime, LimaRuntime, RuntimeHandle, RuntimeStartArgs,
+    SANDBOX_CA_CONTAINER_PATH, SessionRuntime, compute_default_resource_limits, home_volume_name,
+    lite_image_tag_for_version, map_container_uid_gid, reap_orphans, rebuild_lite_image,
 };
+// These symbols are only used by the Linux container-create path that calls
+// ensure_image on the host Docker daemon. On macOS, ensure_image is skipped
+// (lite containers run in the gateway VM, not host Docker).
+#[cfg(not(target_os = "macos"))]
+use sandbox_core::backend::{EnsureImageOutcome, LITE_FIRST_USE_WARNING, ensure_image};
 use sandbox_core::bridge_conf;
 use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
@@ -1932,7 +1936,16 @@ async fn create_session(
     // to the caller; steady-
     // state hits return `AlreadyPresent` and contribute nothing to
     // `warnings`.
+    //
+    // On macOS, lite containers run inside the gateway Lima VM via the
+    // forwarded Docker socket, so the host Docker has no role here —
+    // image staging into the gateway VM is handled by
+    // `load_lite_image_into_gateway` on the macOS lite create path.
+    #[cfg(not(target_os = "macos"))]
     let mut warnings: Vec<String> = Vec::new();
+    #[cfg(target_os = "macos")]
+    let warnings: Vec<String> = Vec::new();
+    #[cfg(not(target_os = "macos"))]
     if backend_kind == BackendKind::Container {
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
         let docker_home = state.base_dir.clone();
@@ -4727,6 +4740,41 @@ async fn create_session_macos_lite(
     state
         .container_runtime
         .register_session(session_id, container_network);
+
+    // Step 6.5: ensure the lite image is present in the gateway VM's Docker daemon.
+    // This is a lazy, idempotent load from the staged tarball at
+    // `{daemon_lima_home}/lite-image.tar`. The check runs on every lite
+    // session create so newly staged tarballs are picked up without a daemon
+    // restart. Steady-state cost is one `docker image inspect` round-trip.
+    // Fail-closed: propagate the error rather than proceeding to `docker create`,
+    // which would surface a less actionable "No such image" from inside the VM.
+    {
+        let glm = state.gateway_lima_manager.clone();
+        match tokio::task::spawn_blocking(move || glm.load_lite_image_into_gateway()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error in load_lite_image_into_gateway: {e}"
+                )))
+                .into_response();
+            }
+        }
+    }
 
     // Step 7: docker create (via ContainerRuntime, forwarded socket already wired).
     // On error: delete container + delete network + remove CA + release token + mark Error.

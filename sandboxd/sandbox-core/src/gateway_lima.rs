@@ -63,6 +63,8 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 #[cfg(target_os = "macos")]
+use crate::backend::container::lite_image_tag_for_version;
+#[cfg(target_os = "macos")]
 use crate::error::SandboxError;
 #[cfg(target_os = "macos")]
 use crate::gateway::gateway_image_tag_for_daemon;
@@ -156,6 +158,13 @@ const GATEWAY_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(90);
 /// where <path> is `{daemon_lima_home}/gateway-image.tar`.
 #[cfg(target_os = "macos")]
 pub const GATEWAY_IMAGE_TARBALL_FILENAME: &str = "gateway-image.tar";
+
+/// Filename of the cached lite image tarball inside the daemon LIMA_HOME.
+/// The operator populates it via:
+///   make lite-image && make stage-lite-image
+/// where the destination path is `{daemon_lima_home}/lite-image.tar`.
+#[cfg(target_os = "macos")]
+pub const LITE_IMAGE_TARBALL_FILENAME: &str = "lite-image.tar";
 
 /// Filename of the Linux aarch64 `sandbox-route-helper` binary staged in the
 /// daemon LIMA_HOME for copying into the gateway VM.
@@ -953,6 +962,110 @@ impl GatewayLimaManager {
                 "docker load for gateway image returned non-zero; \
                  gateway sessions may fail if image is missing"
             );
+        }
+    }
+
+    /// Load the lite container image into the gateway VM's Docker daemon
+    /// from a cached tarball, if the image is not already present.
+    ///
+    /// The tarball lives at `{daemon_lima_home}/lite-image.tar`. The operator
+    /// populates it via:
+    ///   make lite-image && make stage-lite-image
+    ///
+    /// Idempotent: skips the load when the image is already present in the
+    /// gateway VM's Docker daemon (checked via `docker image inspect`).
+    ///
+    /// Non-fatal: on tarball absence the function returns `Ok(())` — the
+    /// subsequent `docker create` in `create_session_macos_lite` will fail
+    /// with a clear "No such image" error, surfacing an actionable message
+    /// to the operator.  On load failure the error is propagated so the
+    /// caller can surface it before allocating any session resources.
+    pub fn load_lite_image_into_gateway(&self) -> Result<(), SandboxError> {
+        let tarball = self.daemon_lima_home.join(LITE_IMAGE_TARBALL_FILENAME);
+        if !tarball.exists() {
+            info!(
+                tarball = %tarball.display(),
+                "lite image tarball not found; skipping docker load \
+                 (populate it with: make lite-image && make stage-lite-image)"
+            );
+            return Ok(());
+        }
+
+        let image_tag = lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
+
+        // Idempotence check: skip if the image is already present.
+        let inspect = {
+            let mut cmd = Command::new("docker");
+            apply_docker_env(&mut cmd);
+            cmd.args(["-H", &socket_str, "image", "inspect", &image_tag]);
+            run_with_timeout(&mut cmd, DOCKER_OP_TIMEOUT, "docker image inspect (lite)")
+        };
+        match inspect {
+            Ok(ref out) if out.status.success() => {
+                info!(tag = %image_tag, "lite image already loaded in gateway VM");
+                return Ok(());
+            }
+            Ok(_) => {
+                // Image not present — proceed to load.
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "docker image inspect for lite image in gateway VM failed; attempting load anyway"
+                );
+            }
+        }
+
+        info!(
+            tarball = %tarball.display(),
+            tag = %image_tag,
+            "loading lite image into gateway VM from tarball"
+        );
+        let tarball_content = std::fs::read(&tarball).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to read lite image tarball {}: {e}",
+                tarball.display()
+            ))
+        })?;
+
+        let load_result = {
+            use std::io::Write;
+            use std::process::Stdio;
+            let mut child = Command::new("docker")
+                .args(["-H", &socket_str, "load"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| {
+                    SandboxError::Internal(format!(
+                        "failed to spawn docker load for lite image: {e}"
+                    ))
+                })?;
+            if let Some(ref mut stdin) = child.stdin {
+                if let Err(e) = stdin.write_all(&tarball_content) {
+                    let _ = child.kill();
+                    return Err(SandboxError::Internal(format!(
+                        "failed to write lite tarball to docker load stdin: {e}"
+                    )));
+                }
+            }
+            child.stdin.take(); // close stdin so docker load sees EOF
+            child.wait_with_output().map_err(|e| {
+                SandboxError::Internal(format!("docker load wait failed for lite image: {e}"))
+            })?
+        };
+
+        if load_result.status.success() {
+            info!(tag = %image_tag, "lite image loaded into gateway VM");
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&load_result.stderr);
+            Err(SandboxError::Internal(format!(
+                "docker load for lite image returned non-zero (tag={image_tag}): {}",
+                stderr.trim()
+            )))
         }
     }
 
@@ -2545,5 +2658,56 @@ mod tests {
         }
         // min(3, 4) = 3, not 4.
         assert!(observe_vmnet_daemon_set(plist_dir.path(), socket_dir.path(), 4) < 4);
+    }
+
+    // -- Lite image tarball staging (pure, hermetic) ---------------------------
+
+    /// The lite image tarball filename constant must match the filename the
+    /// daemon's LIMA_HOME staging target (make stage-lite-image) produces.
+    /// Both sides hard-code "lite-image.tar"; this test pins the constant so
+    /// any rename trips the build immediately.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_image_tarball_filename_is_canonical() {
+        assert_eq!(
+            LITE_IMAGE_TARBALL_FILENAME, "lite-image.tar",
+            "tarball filename must match the make stage-lite-image staging target"
+        );
+    }
+
+    /// The lite image tag produced by `lite_image_tag_for_version` must have
+    /// the `sandboxd-lite:<version>` shape. `load_lite_image_into_gateway`
+    /// passes this tag to `docker image inspect` and `docker load`; a drift
+    /// here would silently bypass the idempotency check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_image_tag_format_matches_load_path() {
+        let version = "1.2.3";
+        let tag = lite_image_tag_for_version(version);
+        assert_eq!(
+            tag, "sandboxd-lite:1.2.3",
+            "lite image tag must be sandboxd-lite:<version>"
+        );
+        assert!(
+            tag.starts_with("sandboxd-lite:"),
+            "tag repository must be sandboxd-lite"
+        );
+    }
+
+    /// The lite image tarball path is derived as
+    /// `{daemon_lima_home}/{LITE_IMAGE_TARBALL_FILENAME}`.  Verify the join
+    /// produces the expected path so a refactor to a sub-directory or a
+    /// different filename is immediately visible here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_image_tarball_path_derivation() {
+        use std::path::PathBuf;
+        let home = PathBuf::from("/var/lib/sandboxd/60/60/lima");
+        let tarball = home.join(LITE_IMAGE_TARBALL_FILENAME);
+        assert_eq!(
+            tarball,
+            PathBuf::from("/var/lib/sandboxd/60/60/lima/lite-image.tar"),
+            "tarball path must be daemon_lima_home/lite-image.tar"
+        );
     }
 }

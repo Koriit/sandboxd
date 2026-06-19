@@ -2,7 +2,7 @@
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership \
-	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64
+	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 stage-lite-image
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -386,7 +386,7 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership stage-route-helper-linux-aarch64
+setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership stage-route-helper-linux-aarch64 stage-lite-image
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -978,6 +978,56 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 	else \
 	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
 	  sudo -k install -o _sandbox -g _sandbox -m 0755 "$$_built" "$$_dst"; \
+	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
+	fi
+
+# stage-lite-image — save the sandboxd-lite Docker image as a tarball into the
+# daemon's LIMA_HOME so `GatewayLimaManager::load_lite_image_into_gateway` can
+# find it at lite session-create time on macOS.
+#
+# The staging path mirrors the daemon's derivation:
+#   {SANDBOXD_STATE_ROOT}/{_sandbox-uid}/{_sandbox-uid}/lima/lite-image.tar
+#
+# Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {_sandbox-uid} is the
+# uid of the _sandbox daemon user (derived at runtime via `id -u _sandbox`).
+# This matches operator_lima_home(daemon_uid) in lima.rs.
+#
+# Idempotence: saves to a temp file, then skips the sudo install if the
+# destination is byte-identical to the freshly saved tarball.
+# Darwin-only: the gateway VM only exists on macOS.
+stage-lite-image: lite-image
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ stage-lite-image skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_lite_tag="sandboxd-lite:$(LITE_VERSION)"; \
+	if ! docker image inspect "$$_lite_tag" >/dev/null 2>&1; then \
+	  echo "ERROR: $$_lite_tag not found in local Docker — run 'make lite-image' first"; \
+	  exit 1; \
+	fi; \
+	_sandbox_uid=$$(id -u _sandbox 2>/dev/null || echo ""); \
+	if [ -z "$$_sandbox_uid" ]; then \
+	  echo "WARNING: _sandbox user not found; skipping lite-image staging."; \
+	  echo "  Run 'make setup-dev-env' after installing sandboxd to create the _sandbox user,"; \
+	  echo "  then re-run 'make stage-lite-image'."; \
+	  exit 0; \
+	fi; \
+	_lima_home="/var/lib/sandboxd/$$_sandbox_uid/$$_sandbox_uid/lima"; \
+	_dst="$$_lima_home/lite-image.tar"; \
+	if [ ! -d "$$_lima_home" ]; then \
+	  echo "[sudo] install -d -o _sandbox -g _sandbox -m 0750 $$_lima_home"; \
+	  sudo -k install -d -o _sandbox -g _sandbox -m 0750 "$$_lima_home"; \
+	fi; \
+	_tmp=/tmp/sandboxd-lite-stage-$$$$.tar; \
+	echo "docker save $$_lite_tag -o $$_tmp"; \
+	docker save "$$_lite_tag" -o "$$_tmp"; \
+	if [ -f "$$_dst" ] && cmp -s "$$_tmp" "$$_dst"; then \
+	  rm -f "$$_tmp"; \
+	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
+	else \
+	  echo "[sudo] install -o _sandbox -g _sandbox -m 0640 $$_tmp $$_dst"; \
+	  sudo -k install -o _sandbox -g _sandbox -m 0640 "$$_tmp" "$$_dst"; \
+	  rm -f "$$_tmp"; \
 	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
 	fi
 
