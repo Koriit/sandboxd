@@ -660,7 +660,17 @@ pub fn bind_broker_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
 ///
 /// This function runs for the lifetime of the daemon. It never returns under
 /// normal operation; the caller should spawn it as a background task.
-pub async fn run_broker_listener(listener: UnixListener, registry: AgentRegistry) {
+///
+/// `on_admit_tx`: when `Some`, the sender receives the admitted uid on every
+/// successful check-in. Callers use this to trigger per-uid side-effects
+/// (e.g. `reconcile_operator_vms`) without coupling the broker to the daemon's
+/// AppState. The sender is a best-effort notification: a failed send (e.g. the
+/// receiver was dropped) is silently ignored.
+pub async fn run_broker_listener(
+    listener: UnixListener,
+    registry: AgentRegistry,
+    on_admit_tx: Option<tokio::sync::mpsc::Sender<u32>>,
+) {
     let group_name = sandbox_group_name();
     loop {
         let (stream, _peer_addr) = match listener.accept().await {
@@ -676,6 +686,10 @@ pub async fn run_broker_listener(listener: UnixListener, registry: AgentRegistry
         match outcome {
             AuthOutcome::Admitted(uid) => {
                 info!(uid, "agent check-in admitted");
+                // Notify side-effect subscribers (e.g. reconcile_operator_vms).
+                if let Some(ref tx) = on_admit_tx {
+                    let _ = tx.try_send(uid);
+                }
                 let reg = registry.clone();
                 let (slot_gen, evict_rx, req_rx) = registry.register(uid).await;
                 tokio::spawn(drive_agent_connection_outer(
@@ -1969,7 +1983,7 @@ mod tests {
         let registry = AgentRegistry::new();
         let reg_for_listener = registry.clone();
 
-        tokio::spawn(run_broker_listener(listener, reg_for_listener));
+        tokio::spawn(run_broker_listener(listener, reg_for_listener, None));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Connect as the fake agent.
@@ -2076,7 +2090,7 @@ mod tests {
         let registry = AgentRegistry::new();
         let reg_for_listener = registry.clone();
 
-        tokio::spawn(run_broker_listener(listener, reg_for_listener));
+        tokio::spawn(run_broker_listener(listener, reg_for_listener, None));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let agent_stream = tokio::net::UnixStream::connect(&socket_path)
@@ -2282,7 +2296,7 @@ mod tests {
         let reg_for_listener = registry.clone();
 
         // Spawn the broker listener.
-        tokio::spawn(run_broker_listener(listener, reg_for_listener));
+        tokio::spawn(run_broker_listener(listener, reg_for_listener, None));
 
         // Give the listener a moment to start accepting.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2352,7 +2366,7 @@ mod tests {
         let registry = AgentRegistry::new();
         let reg_for_listener = registry.clone();
 
-        tokio::spawn(run_broker_listener(listener, reg_for_listener));
+        tokio::spawn(run_broker_listener(listener, reg_for_listener, None));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Connect as the fake agent.

@@ -140,6 +140,16 @@ const DOCKER_OP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const NFT_INJECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Readiness timeout used during crash recovery restarts of the gateway Lima
+/// instance.
+///
+/// Shorter than `DOCKER_READY_TIMEOUT` (300 s for first-boot) because on
+/// recovery the VM is already provisioned — the Docker daemon typically becomes
+/// reachable in a few seconds. A stuck recovery must surface quickly so the
+/// 10-second poll loop can re-attempt rather than blocking for five minutes.
+#[cfg(target_os = "macos")]
+const GATEWAY_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Filename of the cached gateway image tarball inside the daemon LIMA_HOME.
 /// The operator populates it via:
 ///   make gateway-image && docker save <tag> -o <path>
@@ -1278,6 +1288,162 @@ impl GatewayLimaManager {
         }
 
         info!("gateway Lima instance stopped");
+        Ok(())
+    }
+
+    /// Return the current Lima instance state string.
+    ///
+    /// Returns `"Running"`, `"Stopped"`, or `"None"` (instance absent).
+    /// Thin public wrapper over `query_instance_state` so the recovery
+    /// orchestrator can snapshot instance state without calling `ensure_ready`.
+    pub fn instance_state(&self) -> Result<String, SandboxError> {
+        self.query_instance_state()
+    }
+
+    /// Probe whether the gateway Docker daemon is reachable via the forwarded
+    /// socket.
+    ///
+    /// Runs a single `docker -H <sock> info` with a short timeout.
+    ///
+    /// - `Ok(true)` — daemon healthy and reachable.
+    /// - `Ok(false)` — connection refused, timeout, or non-zero exit: the
+    ///   gateway VM is down or its Docker daemon has not started; the failure
+    ///   is retryable by the caller.
+    /// - `Err(_)` — unexpected internal error (e.g. `run_with_timeout` could
+    ///   not spawn the child).
+    pub fn probe_docker_health(&self) -> Result<bool, SandboxError> {
+        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
+        let mut cmd = Command::new("docker");
+        apply_docker_env(&mut cmd);
+        cmd.args(["-H", &socket_str, "info"]);
+
+        let result = run_with_timeout(
+            &mut cmd,
+            Duration::from_secs(5),
+            "gateway: docker info probe via forwarded socket",
+        );
+
+        match result {
+            Ok(output) => Ok(output.status.success()),
+            Err(SandboxError::Timeout { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Stop the gateway Lima instance unconditionally (`limactl stop --force`).
+    ///
+    /// Tolerates "not running" and "not found" as success so the recovery
+    /// orchestrator can call this without needing to know the current state.
+    pub fn force_stop_instance(&self) -> Result<(), SandboxError> {
+        let output = self.executor.run(
+            self.daemon_uid,
+            LimaOp::Stop {
+                vm: GATEWAY_INSTANCE_NAME,
+                force: true,
+            },
+            GATEWAY_STOP_TIMEOUT,
+            "gateway: limactl stop --force",
+        )?;
+
+        if output.status.success() {
+            info!("gateway Lima instance force-stopped");
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Tolerate "already stopped" and "not found" — idempotent.
+        if stderr.contains("not running")
+            || stderr.contains("not found")
+            || stderr.contains("no instance")
+            || stderr.contains("instance not found")
+        {
+            info!(
+                stderr = %stderr.trim(),
+                "gateway Lima force-stop: already stopped or absent (treating as success)"
+            );
+            return Ok(());
+        }
+
+        Err(SandboxError::Lima(format!(
+            "gateway: limactl stop --force failed: {stderr}"
+        )))
+    }
+
+    /// Restart the gateway Lima instance for crash recovery.
+    ///
+    /// Performs a forced stop followed by a start, then waits up to
+    /// `GATEWAY_RECOVERY_READY_TIMEOUT` (90 s) for the Docker daemon to
+    /// become reachable. Unlike `ensure_ready`'s 300-second first-boot timeout,
+    /// the 90-second recovery timeout surfaces a stuck restart quickly so the
+    /// monitor's 10-second poll can re-attempt.
+    ///
+    /// On success, re-discovers NICs and re-caches the NIC map, then
+    /// re-establishes the egress bridge and applies the baseline `eth0` nft
+    /// policy (all idempotent operations).
+    ///
+    /// Callers must wrap this in `tokio::task::spawn_blocking` because it
+    /// shells out to `limactl` and `docker`.
+    pub fn restart_instance_for_recovery(&self) -> Result<(), SandboxError> {
+        info!("gateway Lima recovery: force-stopping instance");
+        self.force_stop_instance()?;
+
+        info!("gateway Lima recovery: starting instance");
+        self.start_instance()?;
+
+        // Poll until the Docker daemon is reachable via the forwarded socket,
+        // using the shorter recovery deadline rather than the first-boot one.
+        let deadline = Instant::now() + GATEWAY_RECOVERY_READY_TIMEOUT;
+        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
+
+        info!(
+            socket = %self.gateway_docker_socket.display(),
+            timeout_s = GATEWAY_RECOVERY_READY_TIMEOUT.as_secs(),
+            "gateway Lima recovery: waiting for Docker daemon to be reachable"
+        );
+
+        loop {
+            let mut cmd = Command::new("docker");
+            apply_docker_env(&mut cmd);
+            cmd.args(["-H", &socket_str, "info"]);
+
+            let result = run_with_timeout(
+                &mut cmd,
+                Duration::from_secs(5),
+                "gateway recovery: docker info probe",
+            );
+
+            if matches!(result, Ok(ref o) if o.status.success()) {
+                info!("gateway Lima recovery: Docker daemon reachable");
+                break;
+            }
+
+            if Instant::now() >= deadline {
+                return Err(SandboxError::Gateway(format!(
+                    "gateway Lima recovery: Docker socket at {} did not become ready within {}s",
+                    self.gateway_docker_socket.display(),
+                    GATEWAY_RECOVERY_READY_TIMEOUT.as_secs(),
+                )));
+            }
+
+            thread::sleep(DOCKER_READY_POLL_INTERVAL);
+        }
+
+        // Re-discover NICs and re-cache the NIC map.
+        info!("gateway Lima recovery: re-discovering NICs");
+        let nic_map = self.discover_nics()?;
+        {
+            let mut guard = self.nic_map.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(nic_map);
+        }
+
+        // Re-establish shared gateway fabric (idempotent operations).
+        info!("gateway Lima recovery: re-establishing egress bridge");
+        self.ensure_egress_bridge()?;
+
+        info!("gateway Lima recovery: re-applying eth0 nft policy");
+        self.apply_eth0_nft_policy()?;
+
+        info!("gateway Lima recovery: instance ready");
         Ok(())
     }
 }

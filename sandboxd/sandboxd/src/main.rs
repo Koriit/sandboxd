@@ -1091,6 +1091,19 @@ struct AppState {
     /// Not accessed on Linux (cfg-gated).
     #[cfg(target_os = "macos")]
     networking_status: Arc<tokio::sync::Mutex<HashMap<SessionId, NetworkingStatus>>>,
+
+    /// macOS only: coarse latch held while the gateway Lima instance is being
+    /// crash-recovered by `recover_gateway_lima`.
+    ///
+    /// The per-session `gateway_monitor` reads this flag and skips per-session
+    /// gateway container re-creates while it is set — the instance-level
+    /// recovery orchestrator holds exclusive responsibility during the window.
+    /// Modelled on `sessions_stopping`: set before recovery begins, cleared in
+    /// a defer-guard so a panic still releases the latch.
+    ///
+    /// Not accessed on Linux (cfg-gated).
+    #[cfg(target_os = "macos")]
+    gateway_recovering: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Look up the runtime for a given backend kind from the dispatch
@@ -3833,6 +3846,34 @@ async fn macos_networking_status_for(
             .copied()
             .unwrap_or(NetworkingStatus::Healthy),
     )
+}
+
+/// Return a `GatewayManager` suitable for health probes against the given session.
+///
+/// On Linux, returns the system-socket manager held in `AppState::gateway`
+/// (unchanged from existing behaviour). On macOS, constructs a forwarded-socket
+/// manager pointing at the gateway Lima VM's Docker socket so that probes route
+/// through the VM rather than the host's Docker daemon (which is the container
+/// backend's socket and has no knowledge of the Lima gateway containers).
+///
+/// Centralising the platform branch here keeps `gateway_monitor` and
+/// `poll_and_emit_component_health` free of scattered `cfg!` blocks while
+/// keeping the Linux code path byte-identical.
+fn gateway_for_probes(state: &AppState) -> Arc<GatewayManager> {
+    #[cfg(target_os = "macos")]
+    {
+        let sock = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        // The `return` is required so the compiler does not see the
+        // `#[cfg(not(target_os = "macos"))]` expression below as unreachable on
+        // macOS builds, while the Linux build only compiles the cfg(not) arm.
+        #[allow(clippy::needless_return)]
+        return Arc::new(GatewayManager::with_gateway_socket(sock));
+    }
+    #[cfg(not(target_os = "macos"))]
+    Arc::clone(&state.gateway)
 }
 
 // ---------------------------------------------------------------------------
@@ -9544,7 +9585,7 @@ const MONITORED_COMPONENTS: &[(&str, HealthComponent)] = &[
 /// `spawn_blocking`.
 async fn poll_and_emit_component_health(state: &AppState, session_id: &SessionId) {
     for (label, component) in MONITORED_COMPONENTS {
-        let gw = Arc::clone(&state.gateway);
+        let gw = gateway_for_probes(state);
         let sid = *session_id;
         let label_owned = (*label).to_string();
         let health = match tokio::task::spawn_blocking(move || {
@@ -9631,6 +9672,21 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 continue;
             }
 
+            // macOS only: while the gateway Lima instance is being recovered by
+            // `recover_gateway_lima`, skip per-session re-creates — the instance
+            // monitor holds exclusive recovery responsibility during that window.
+            #[cfg(target_os = "macos")]
+            if state
+                .gateway_recovering
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                debug!(
+                    session_id = %session.id,
+                    "gateway monitor: skipping session (gateway instance recovery in progress)"
+                );
+                continue;
+            }
+
             // Poll per-component health and emit transitions.
             // Only components that *flipped* since
             // the last tick produce events, so the bus stays sparse
@@ -9656,7 +9712,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
             // The contract: "Docker marks the container unhealthy.
             // sandboxd's existing gateway health polling observes this
             // and restarts the gateway container."
-            let gw = Arc::clone(&state.gateway);
+            let gw = gateway_for_probes(&state);
             let sid = session.id;
             let docker_health =
                 match tokio::task::spawn_blocking(move || gw.container_health_status(&sid)).await {
@@ -9711,7 +9767,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     // Fall back to the full `gateway_status` probe —
                     // it re-runs `/healthcheck.sh` and also returns
                     // `NotRunning` if `.State.Running == false`.
-                    let gw = Arc::clone(&state.gateway);
+                    let gw = gateway_for_probes(&state);
                     let sid = session.id;
                     let status_result =
                         tokio::task::spawn_blocking(move || gw.gateway_status(&sid)).await;
@@ -9781,39 +9837,6 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         }
                     };
 
-                    // Ensure Docker network is present.
-                    let net = Arc::clone(&state.network);
-                    let sid = session.id;
-                    let ensure_result =
-                        tokio::task::spawn_blocking(move || net.ensure_network(&sid)).await;
-                    match ensure_result {
-                        Ok(Err(e)) => {
-                            warn!(
-                                session_id = %session.id,
-                                error = %e,
-                                "gateway monitor: failed to ensure Docker network"
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(
-                                session_id = %session.id,
-                                error = %e,
-                                "gateway monitor: spawn_blocking join error ensuring Docker network"
-                            );
-                            continue;
-                        }
-                        Ok(Ok(_)) => {}
-                    }
-
-                    // Get CA directory.
-                    let ca_dir = CaManager::ca_dir(&state.base_dir, &session.id);
-                    let ca_ref = if ca_dir.join("cert.pem").exists() {
-                        Some(ca_dir.as_path())
-                    } else {
-                        None
-                    };
-
                     // Determine initial DNS policy for the gateway.
                     // Fail-closed: no stored policy → empty allowed-
                     // domains list so CoreDNS returns NXDOMAIN.  Any
@@ -9823,71 +9846,559 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         policies.contains_key(&session.id)
                     };
                     let init_dns_str = CoreDnsConfig::empty_policy_file_content();
-                    let init_dns = if !has_policy {
-                        Some(init_dns_str.as_str())
+                    let init_dns_owned = if !has_policy {
+                        Some(init_dns_str.clone())
                     } else {
                         None
                     };
 
-                    // Restart the gateway.
-                    let gw = Arc::clone(&state.gateway);
-                    let sid = session.id;
-                    let ni = network_info.clone();
-                    let ca_owned = ca_ref.map(|p| p.to_path_buf());
-                    let init_dns_owned = init_dns.map(|s| s.to_string());
-                    let pool = format!(
-                        "{}/{}",
-                        state.users_conf_pool.cidr.base(),
-                        state.users_conf_pool.cidr.prefix_len()
-                    );
-                    let restart_result = tokio::task::spawn_blocking(move || {
-                        gw.restart_gateway(
-                            &sid,
-                            &ni,
-                            ca_owned.as_deref(),
-                            init_dns_owned.as_deref(),
-                            Some(&pool),
-                        )
-                    })
-                    .await;
-                    match restart_result {
-                        Ok(Ok(())) => {
-                            info!(
-                                session_id = %session.id,
-                                "gateway monitor: gateway recovered successfully"
-                            );
-                            // Spawn (or reseat) the JSONL ingestor for the
-                            // recovered gateway. `spawn_session_ingestor`
-                            // aborts any prior ingestor first, so a stale
-                            // watch on the pre-crash container's events
-                            // directory is released here rather than
-                            // leaking until daemon exit.
-                            spawn_session_ingestor(&session.id, &state).await;
-                            // Re-apply the session's policy to the fresh gateway.
-                            // Daemon-internal reconciler scope — the
-                            // session was selected via the unfiltered
-                            // listing above, so reuse the row's own
-                            // `owner_username` for the per-caller
-                            // filter on the policy lookup.
-                            reapply_session_policy(&session.id, &session.owner_username, &state)
+                    // macOS: re-create the gateway container over the forwarded
+                    // gateway Lima socket. The Linux `restart_gateway` /
+                    // `ensure_network` path does not apply here — the macOS
+                    // gateway container lives inside the gateway Lima VM, not on
+                    // the host Docker daemon.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let sid = session.id;
+                        let ni = network_info.clone();
+                        let sock = state
+                            .gateway_lima_manager
+                            .gateway_docker_socket()
+                            .to_path_buf();
+                        let nic_name = {
+                            let slot_idx = ni.vmnet_slot.as_ref().map(|s| s.index).unwrap_or(0u16);
+                            state
+                                .gateway_lima_manager
+                                .nic_map()
+                                .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
+                                .unwrap_or_else(|| format!("lima{slot_idx}"))
+                        };
+                        let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!(
+                            "CARGO_PKG_VERSION"
+                        ));
+                        let pool = format!(
+                            "{}/{}",
+                            state.users_conf_pool.cidr.base(),
+                            state.users_conf_pool.cidr.prefix_len()
+                        );
+
+                        let recreate_result = tokio::task::spawn_blocking(move || {
+                            sandbox_core::teardown_macos_gateway(&sid, &sock)?;
+                            sandbox_core::setup_macos_gateway(
+                                &sid,
+                                &ni,
+                                &nic_name,
+                                &sock,
+                                &image_tag,
+                                None,
+                                init_dns_owned.as_deref(),
+                                Some(&pool),
+                            )
+                        })
+                        .await;
+
+                        match recreate_result {
+                            Ok(Ok(())) => {
+                                info!(
+                                    session_id = %session.id,
+                                    "gateway monitor: macOS gateway recovered successfully"
+                                );
+                                spawn_session_ingestor(&session.id, &state).await;
+                                reapply_session_policy(
+                                    &session.id,
+                                    &session.owner_username,
+                                    &state,
+                                )
                                 .await;
+                            }
+                            Ok(Err(e)) => {
+                                error!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway monitor: failed to recover macOS gateway"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway monitor: spawn_blocking join error recovering macOS gateway"
+                                );
+                            }
                         }
-                        Ok(Err(e)) => {
-                            error!(
-                                session_id = %session.id,
-                                error = %e,
-                                "gateway monitor: failed to recover gateway"
-                            );
+                    }
+
+                    // Linux: ensure the Docker network is present, then use the
+                    // existing `restart_gateway` path which handles Linux-specific
+                    // bridge networking. This block is byte-identical to the
+                    // pre-macOS monitor — no behaviour change on Linux.
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        // Ensure Docker network is present.
+                        let net = Arc::clone(&state.network);
+                        let sid = session.id;
+                        let ensure_result =
+                            tokio::task::spawn_blocking(move || net.ensure_network(&sid)).await;
+                        match ensure_result {
+                            Ok(Err(e)) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway monitor: failed to ensure Docker network"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway monitor: spawn_blocking join error ensuring Docker network"
+                                );
+                                continue;
+                            }
+                            Ok(Ok(_)) => {}
                         }
-                        Err(e) => {
-                            error!(
-                                session_id = %session.id,
-                                error = %e,
-                                "gateway monitor: spawn_blocking join error recovering gateway"
-                            );
+
+                        // Get CA directory.
+                        let ca_dir = CaManager::ca_dir(&state.base_dir, &session.id);
+                        let ca_owned = if ca_dir.join("cert.pem").exists() {
+                            Some(ca_dir.clone())
+                        } else {
+                            None
+                        };
+
+                        let pool = format!(
+                            "{}/{}",
+                            state.users_conf_pool.cidr.base(),
+                            state.users_conf_pool.cidr.prefix_len()
+                        );
+
+                        let gw = Arc::clone(&state.gateway);
+                        let sid = session.id;
+                        let ni = network_info.clone();
+                        let restart_result = tokio::task::spawn_blocking(move || {
+                            gw.restart_gateway(
+                                &sid,
+                                &ni,
+                                ca_owned.as_deref(),
+                                init_dns_owned.as_deref(),
+                                Some(&pool),
+                            )
+                        })
+                        .await;
+                        match restart_result {
+                            Ok(Ok(())) => {
+                                info!(
+                                    session_id = %session.id,
+                                    "gateway monitor: gateway recovered successfully"
+                                );
+                                // Spawn (or reseat) the JSONL ingestor for the
+                                // recovered gateway. `spawn_session_ingestor`
+                                // aborts any prior ingestor first, so a stale
+                                // watch on the pre-crash container's events
+                                // directory is released here rather than
+                                // leaking until daemon exit.
+                                spawn_session_ingestor(&session.id, &state).await;
+                                // Re-apply the session's policy to the fresh gateway.
+                                // Daemon-internal reconciler scope — the
+                                // session was selected via the unfiltered
+                                // listing above, so reuse the row's own
+                                // `owner_username` for the per-caller
+                                // filter on the policy lookup.
+                                reapply_session_policy(
+                                    &session.id,
+                                    &session.owner_username,
+                                    &state,
+                                )
+                                .await;
+                            }
+                            Ok(Err(e)) => {
+                                error!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway monitor: failed to recover gateway"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway monitor: spawn_blocking join error recovering gateway"
+                                );
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS: gateway Lima instance crash monitor + recovery orchestrator
+// ---------------------------------------------------------------------------
+
+/// RAII guard that clears `gateway_recovering` on drop.
+///
+/// Used by `recover_gateway_lima` so that the latch is released on all return
+/// paths, including early returns and async cancellation (tokio drop). Defined
+/// at module scope so the `Drop` impl's `fn drop` is not mistaken for an
+/// enclosing function by the `update_state_reconcile` allow-list scanner.
+#[cfg(target_os = "macos")]
+struct GatewayRecoveringGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(target_os = "macos")]
+impl Drop for GatewayRecoveringGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Orchestrate a full recovery of the gateway Lima instance and all sessions
+/// that were running through it.
+///
+/// Called by `gateway_lima_monitor` after three consecutive probe failures.
+/// The sequence is ordered and idempotent — safe to re-enter if a prior
+/// invocation timed out partway through (e.g. if the 90 s readiness window
+/// expired and the monitor re-triggers on the next tick).
+///
+/// ## Recovery sequence
+///
+/// 1. Set the daemon-wide `gateway_recovering` latch (cleared on return via a
+///    defer-guard even if this function panics). The per-session `gateway_monitor`
+///    checks this flag and skips per-session re-creates while it is set.
+/// 2. Snapshot all Running Lima sessions and tag each `Degraded` in the
+///    networking-status map.
+/// 3. Force-stop the gateway Lima instance (`limactl stop --force`); tolerate
+///    "already stopped".
+/// 4. Start the gateway Lima instance (`limactl start`).
+/// 5. Wait up to 90 seconds for the forwarded Docker socket to become
+///    reachable. On timeout: leave sessions tagged `Degraded`, log, and return
+///    without marking them `Error` — the monitor's 10 s poll will re-trigger.
+/// 6. Re-discover NICs, re-establish the egress bridge, and re-apply the eth0
+///    nft policy (all idempotent).
+/// 7. For each previously Running session (bounded concurrency, ≤ 8 at a time):
+///    a. Tag `Recovering` in the networking-status map.
+///    b. `teardown_macos_gateway` (idempotent; tolerates missing container/network).
+///    c. Recompute NIC name from the persisted `vmnet_slot` index via the
+///    refreshed NIC map (fallback: `lima{idx}` when the slot is unmapped).
+///    d. `setup_macos_gateway` — fresh macvlan + container + deny-all +
+///    component-health wait + DNAT. Enforces the egress happens-before
+///    invariant internally.
+///    e. Re-apply stored policy and re-spawn the JSONL ingestor.
+///    f. On success: remove the session's networking-status map entry (→ Healthy).
+///    On failure: mark the session `Error` via `update_state_reconcile` and
+///    remove the map entry; continue to the next session.
+///
+/// ## What this function does NOT do
+///
+/// Recovery only re-creates per-session gateway *containers* over the forwarded
+/// gateway Lima Docker socket. It never starts, stops, or otherwise touches any
+/// sandbox VM owned by an operator — those are managed independently by their
+/// operators' agents.
+#[cfg(target_os = "macos")]
+async fn recover_gateway_lima(state: &Arc<AppState>) {
+    use sandbox_core::{BackendKind, SessionState};
+    use std::sync::atomic::Ordering;
+
+    // Set the recovering latch. The GatewayRecoveringGuard (module-level)
+    // clears it on drop so all return paths — including early returns and
+    // async cancellation — release the latch.
+    state.gateway_recovering.store(true, Ordering::SeqCst);
+    let _guard = GatewayRecoveringGuard(Arc::clone(&state.gateway_recovering));
+
+    info!("gateway Lima recovery: starting full instance recovery");
+
+    // Snapshot all Running Lima sessions up front.
+    let sessions: Vec<sandbox_core::Session> = match state.store.list_sessions_unfiltered() {
+        Ok(s) => s
+            .into_iter()
+            .filter(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima)
+            .collect(),
+        Err(e) => {
+            error!(error = %e, "gateway Lima recovery: failed to list sessions");
+            return;
+        }
+    };
+
+    // Tag all running sessions Degraded.
+    {
+        let mut map = state.networking_status.lock().await;
+        for session in &sessions {
+            map.insert(session.id, NetworkingStatus::Degraded);
+        }
+    }
+
+    let mgr = Arc::clone(&state.gateway_lima_manager);
+
+    // Force-stop → start → wait for readiness (all blocking).
+    let restart_result = tokio::task::spawn_blocking({
+        let mgr = Arc::clone(&mgr);
+        move || mgr.restart_instance_for_recovery()
+    })
+    .await;
+
+    match restart_result {
+        Ok(Ok(())) => {
+            info!("gateway Lima recovery: instance restarted and Docker daemon ready");
+        }
+        Ok(Err(e)) => {
+            // Includes the 90 s readiness timeout: leave sessions Degraded and
+            // let the monitor re-trigger on the next 10 s tick.
+            error!(
+                error = %e,
+                "gateway Lima recovery: instance restart failed; sessions remain Degraded"
+            );
+            return;
+        }
+        Err(e) => {
+            error!(
+                error = %e,
+                "gateway Lima recovery: spawn_blocking join error on instance restart"
+            );
+            return;
+        }
+    }
+
+    // Re-establish shared gateway fabric is already done inside
+    // `restart_instance_for_recovery`. Per-session re-create follows.
+
+    let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+    let pool = format!(
+        "{}/{}",
+        state.users_conf_pool.cidr.base(),
+        state.users_conf_pool.cidr.prefix_len()
+    );
+
+    // Process sessions with bounded concurrency (~8 at a time) so the
+    // gateway Docker daemon is not flooded. One session failure must not
+    // abort the others.
+    let mut join_set: tokio::task::JoinSet<(sandbox_core::SessionId, Result<(), String>)> =
+        tokio::task::JoinSet::new();
+    let max_concurrent: usize = 8;
+
+    let mut session_iter = sessions.into_iter().peekable();
+
+    loop {
+        // Fill the JoinSet up to the concurrency cap.
+        while join_set.len() < max_concurrent {
+            let session = match session_iter.next() {
+                Some(s) => s,
+                None => break,
+            };
+
+            // Tag Recovering.
+            {
+                let mut map = state.networking_status.lock().await;
+                map.insert(session.id, NetworkingStatus::Recovering);
+            }
+
+            let network_info = match state.store.get_network_info_unfiltered(&session.id) {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    warn!(
+                        session_id = %session.id,
+                        "gateway Lima recovery: no network info for session; skipping"
+                    );
+                    {
+                        let mut map = state.networking_status.lock().await;
+                        map.remove(&session.id);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = %session.id,
+                        error = %e,
+                        "gateway Lima recovery: failed to get network info; skipping"
+                    );
+                    {
+                        let mut map = state.networking_status.lock().await;
+                        map.remove(&session.id);
+                    }
+                    continue;
+                }
+            };
+
+            let sock = mgr.gateway_docker_socket().to_path_buf();
+            let nic_name = {
+                let slot_idx = network_info
+                    .vmnet_slot
+                    .as_ref()
+                    .map(|s| s.index)
+                    .unwrap_or(0u16);
+                mgr.nic_map()
+                    .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("lima{slot_idx}"))
+            };
+            let tag = image_tag.clone();
+            let pool_str = pool.clone();
+            let ni = network_info.clone();
+            let sid = session.id;
+
+            // Determine initial DNS policy — fail-closed.
+            let has_policy = {
+                let policies = state.session_policies.lock().await;
+                policies.contains_key(&session.id)
+            };
+            let init_dns_owned = if !has_policy {
+                Some(sandbox_core::CoreDnsConfig::empty_policy_file_content())
+            } else {
+                None
+            };
+
+            join_set.spawn(async move {
+                let join_result = tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<(), sandbox_core::error::SandboxError> {
+                        sandbox_core::teardown_macos_gateway(&sid, &sock)?;
+                        sandbox_core::setup_macos_gateway(
+                            &sid,
+                            &ni,
+                            &nic_name,
+                            &sock,
+                            &tag,
+                            None,
+                            init_dns_owned.as_deref(),
+                            Some(&pool_str),
+                        )
+                    })();
+                    result.map_err(|e| e.to_string())
+                })
+                .await;
+                let result = match join_result {
+                    Ok(r) => r,
+                    Err(e) => Err(format!("spawn_blocking panicked: {e}")),
+                };
+                (sid, result)
+            });
+        }
+
+        // Wait for any in-flight task to complete.
+        let (sid, result) = match join_set.join_next().await {
+            Some(Ok(pair)) => pair,
+            Some(Err(e)) => {
+                error!(error = %e, "gateway Lima recovery: JoinSet join error");
+                if session_iter.peek().is_none() && join_set.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            None => break, // JoinSet empty and no more sessions.
+        };
+
+        match result {
+            Ok(()) => {
+                info!(
+                    session_id = %sid,
+                    "gateway Lima recovery: session gateway recovered"
+                );
+                // Remove map entry → Healthy.
+                {
+                    let mut map = state.networking_status.lock().await;
+                    map.remove(&sid);
+                }
+                // Look up the session row for the owner_username needed by
+                // reapply_session_policy and spawn_session_ingestor.
+                let owner = state
+                    .store
+                    .list_sessions_unfiltered()
+                    .ok()
+                    .and_then(|s| s.into_iter().find(|r| r.id == sid))
+                    .map(|r| r.owner_username)
+                    .unwrap_or_default();
+                spawn_session_ingestor(&sid, state).await;
+                reapply_session_policy(&sid, &owner, state).await;
+            }
+            Err(e) => {
+                error!(
+                    session_id = %sid,
+                    error = %e,
+                    "gateway Lima recovery: failed to recover session gateway; marking Error"
+                );
+                let _ = state
+                    .store
+                    .update_state_reconcile(&sid, SessionState::Error);
+                // Remove map entry (session is now Error, not Running).
+                {
+                    let mut map = state.networking_status.lock().await;
+                    map.remove(&sid);
+                }
+            }
+        }
+
+        // Exit when all sessions have been processed.
+        if session_iter.peek().is_none() && join_set.is_empty() {
+            break;
+        }
+    }
+
+    info!("gateway Lima recovery: complete");
+    // _guard is dropped here, clearing gateway_recovering.
+}
+
+/// Background task that monitors the gateway Lima instance for crashes and
+/// drives full recovery when the instance Docker daemon becomes unreachable.
+///
+/// Polls every 10 seconds. Three **consecutive** `probe_docker_health() ==
+/// Ok(false)` results trigger `recover_gateway_lima` (the consecutive-failure
+/// counter resets on any healthy probe). Probe errors are logged but treated
+/// conservatively — they do not increment the failure counter — so a single
+/// transient blip does not trigger a full instance recovery.
+#[cfg(target_os = "macos")]
+async fn gateway_lima_monitor(state: Arc<AppState>) {
+    let poll_interval = Duration::from_secs(10);
+    let failure_threshold: u32 = 3;
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let mgr = Arc::clone(&state.gateway_lima_manager);
+        let probe_result = tokio::task::spawn_blocking(move || mgr.probe_docker_health()).await;
+
+        match probe_result {
+            Ok(Ok(true)) => {
+                // Gateway Docker daemon is healthy.
+                if consecutive_failures > 0 {
+                    debug!(
+                        consecutive_failures,
+                        "gateway Lima monitor: probe healthy; resetting failure counter"
+                    );
+                }
+                consecutive_failures = 0;
+            }
+            Ok(Ok(false)) => {
+                // Gateway unreachable — increment the consecutive failure counter.
+                consecutive_failures += 1;
+                warn!(
+                    consecutive_failures,
+                    threshold = failure_threshold,
+                    "gateway Lima monitor: Docker daemon unreachable"
+                );
+
+                if consecutive_failures >= failure_threshold {
+                    warn!(
+                        consecutive_failures,
+                        "gateway Lima monitor: threshold reached; triggering recovery"
+                    );
+                    consecutive_failures = 0;
+                    recover_gateway_lima(&state).await;
+                }
+            }
+            Ok(Err(e)) => {
+                // Unexpected error from the probe — log but do not count as a
+                // failure to avoid triggering recovery on a transient spawn error.
+                warn!(
+                    error = %e,
+                    "gateway Lima monitor: unexpected probe error (not counted as failure)"
+                );
+            }
+            Err(e) => {
+                // spawn_blocking join error (thread panicked).
+                warn!(
+                    error = %e,
+                    "gateway Lima monitor: spawn_blocking join error on probe (not counted)"
+                );
             }
         }
     }
@@ -10118,6 +10629,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     let agent_registry = broker::AgentRegistry::new();
 
+    // macOS only: channel for admitted operator uids. The sender is captured
+    // inside the lima_executor block and passed to `run_broker_listener`; the
+    // receiver is used after AppState is built to drive `reconcile_operator_vms`
+    // on each fresh agent check-in.
+    #[cfg(target_os = "macos")]
+    let (on_admit_tx, on_admit_rx) = tokio::sync::mpsc::channel::<u32>(32);
+
     #[cfg(target_os = "macos")]
     let lima_executor: Arc<dyn sandbox_core::lima::LimaExecutor> = {
         use broker::{
@@ -10152,9 +10670,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         info!(path = %broker_path.display(), "agent-broker socket bound");
 
-        // Spawn the broker listener as a background task for the daemon lifetime.
+        // Spawn the broker listener. The on_admit sender notifies the
+        // post-startup reconcile task on each fresh agent check-in.
         let reg_for_listener = agent_registry.clone();
-        tokio::spawn(run_broker_listener(broker_listener, reg_for_listener));
+        tokio::spawn(run_broker_listener(
+            broker_listener,
+            reg_for_listener,
+            Some(on_admit_tx),
+        ));
 
         Arc::new(AgentBrokerExecutor::new(agent_registry.clone(), daemon_uid))
     };
@@ -10479,7 +11002,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bridge_restore_entries: &[(SessionId, NetworkInfo)] = &existing_networks;
 
         if !bridge_restore_entries.is_empty() {
+            // macOS arm: bridge_restore_entries is Vec<T>; &Vec<T> coerces to &[T].
+            // Linux arm: bridge_restore_entries is &[T] already; no extra & needed.
+            #[cfg(target_os = "macos")]
             network.restore_from_infos(&bridge_restore_entries)?;
+            #[cfg(not(target_os = "macos"))]
+            network.restore_from_infos(bridge_restore_entries)?;
         }
     }
 
@@ -10669,6 +11197,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway_lima_manager,
         #[cfg(target_os = "macos")]
         networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        #[cfg(target_os = "macos")]
+        gateway_recovering: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per
@@ -10749,11 +11279,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         restore_macos_pool_state(&state).await;
     }
 
+    // macOS: startup health seed for the networking_status map.
+    //
+    // After reconcile + pool restore, probe the gateway Lima Docker daemon for
+    // each Running Lima session and seed the map accordingly.  A session whose
+    // gateway is reachable gets no entry (= Healthy via macos_networking_status_for).
+    // An unreachable session gets Degraded so the gateway_lima_monitor picks up
+    // recovery on its first tick.
+    //
+    // CROSS-PLATFORM NOTE: cfg-gated on macos; Linux unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        use sandbox_core::{BackendKind, SessionState};
+
+        let reachable = {
+            let mgr = Arc::clone(&state.gateway_lima_manager);
+            tokio::task::spawn_blocking(move || mgr.probe_docker_health())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(false)
+        };
+
+        if !reachable {
+            // Gateway is down at startup: tag every Running Lima session Degraded.
+            let sessions = state.store.list_sessions_unfiltered().unwrap_or_default();
+            let mut map = state.networking_status.lock().await;
+            for session in sessions
+                .iter()
+                .filter(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima)
+            {
+                map.insert(session.id, NetworkingStatus::Degraded);
+            }
+            info!(
+                count = map.len(),
+                "startup: gateway unreachable; tagged Running Lima sessions Degraded"
+            );
+        } else {
+            info!("startup: gateway reachable; all Running Lima sessions start Healthy");
+        }
+    }
+
     // Spawn background gateway monitor for crash recovery.
     let monitor_state = Arc::clone(&state);
     tokio::spawn(async move {
         gateway_monitor(monitor_state).await;
     });
+
+    // macOS: spawn the gateway Lima instance crash monitor.
+    //
+    // Polls every 10s; three consecutive unreachable probes trigger
+    // recover_gateway_lima, which restarts the instance and re-creates all
+    // per-session gateway containers.
+    //
+    // CROSS-PLATFORM NOTE: cfg-gated on macos; Linux unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let lima_monitor_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            gateway_lima_monitor(lima_monitor_state).await;
+        });
+    }
+
+    // macOS: spawn the per-admit reconcile task.
+    //
+    // When a fresh agent checks in, `run_broker_listener` sends the uid on
+    // `on_admit_rx`. This task calls `reconcile_operator_vms` for that uid
+    // so any confirmed-dead VMs whose operator was not checked in at startup
+    // are detected and their slot-leaks reclaimed.
+    //
+    // CROSS-PLATFORM NOTE: cfg-gated on macos; Linux unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let reconcile_state = Arc::clone(&state);
+        let mut admit_rx = on_admit_rx;
+        tokio::spawn(async move {
+            while let Some(op_uid) = admit_rx.recv().await {
+                info!(op_uid, "broker admit: running operator VM reconcile");
+                reconcile_operator_vms(&reconcile_state, op_uid).await;
+            }
+        });
+    }
 
     // Remove stale socket file if it exists.
     if socket_path.exists() {

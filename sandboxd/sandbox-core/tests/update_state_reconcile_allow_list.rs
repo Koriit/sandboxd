@@ -52,6 +52,13 @@ const ALLOW_LIST: &[&str] = &[
     // operator identity in scope; called only from the background
     // reconcile loop, never from an HTTP request handler.
     "sandboxd/src/main.rs:reconcile_operator_vms",
+    // macOS gateway Lima instance crash recovery orchestrator. Called by
+    // the background `gateway_lima_monitor` after three consecutive probe
+    // failures. Marks individual sessions Error when their gateway container
+    // cannot be re-created after the instance restarts. Daemon-internal
+    // background task — no operator identity in scope; never called from
+    // an HTTP request handler.
+    "sandboxd/src/main.rs:recover_gateway_lima",
 ];
 
 /// Paths excluded from the call-site scan. The crate-root file
