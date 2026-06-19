@@ -193,8 +193,8 @@ impl std::error::Error for SharedPathError {}
 /// On macOS the sandbox container's PID is a **gateway-VM** PID (meaningless
 /// on the host). The cap'd `sandbox-route-helper` binary is installed inside
 /// the VM at [`IN_VM_ROUTE_HELPER_PATH`]. This function builds the full
-/// `limactl shell <vm> -- sudo <helper> <args>` argv vector that the daemon
-/// passes to the lima executor's `shell` command.
+/// `limactl shell <vm> -- sudo <helper> --vm-gateway-mode <args>` argv vector
+/// that the daemon passes to the lima executor's `shell` command.
 ///
 /// # Arguments
 ///
@@ -206,11 +206,20 @@ impl std::error::Error for SharedPathError {}
 ///
 /// # Authorization
 ///
-/// Inside the gateway VM the route-helper is single-tenant: the VM is
-/// `_sandbox` infra with no per-operator identity threading. The helper is
-/// invoked as `sudo` (passwordless, configured in the VM's sudoers) without
-/// a `--for-user` flag. The VM itself is the authorization boundary — only the
-/// daemon can reach it via the Lima shell path.
+/// Inside the gateway VM the route-helper uses `--vm-gateway-mode`, which
+/// activates the degenerate single-tenant authorization path. The VM boundary
+/// replaces the host-uid + pair-membership gate:
+///
+/// - Only the daemon (`_sandbox`, running on the macOS host) can issue
+///   `limactl shell sandboxd-gateway` commands. The Lima SSH credentials for
+///   the gateway VM are exclusively owned by the daemon's LIMA_HOME.
+/// - The gateway VM is single-tenant `_sandbox` infra — no operator user can
+///   independently reach its sudo path.
+///
+/// The `sudo` invocation escalates to root (uid 0) inside the VM; the helper
+/// enforces the root-uid requirement in `--vm-gateway-mode`, so any invocation
+/// that did not go through `sudo` (and therefore is not uid 0) is rejected
+/// at the gate.
 ///
 /// # Returns
 ///
@@ -227,6 +236,7 @@ pub fn build_in_vm_route_helper_argv(
         "--".to_string(),
         "sudo".to_string(),
         IN_VM_ROUTE_HELPER_PATH.to_string(),
+        "--vm-gateway-mode".to_string(),
         vm_pid.to_string(),
         gateway_ip.to_string(),
     ]
@@ -403,15 +413,17 @@ mod tests {
     fn build_in_vm_route_helper_argv_correct_shape() {
         let argv =
             build_in_vm_route_helper_argv("sandboxd-gateway", 12345, "10.0.0.2".parse().unwrap());
-        // Expected: ["shell", "sandboxd-gateway", "--", "sudo", "<helper>", "12345", "10.0.0.2"]
+        // Expected: ["shell", "sandboxd-gateway", "--", "sudo", "<helper>",
+        //            "--vm-gateway-mode", "12345", "10.0.0.2"]
         assert_eq!(argv[0], "shell");
         assert_eq!(argv[1], "sandboxd-gateway");
         assert_eq!(argv[2], "--");
         assert_eq!(argv[3], "sudo");
         assert_eq!(argv[4], IN_VM_ROUTE_HELPER_PATH);
-        assert_eq!(argv[5], "12345");
-        assert_eq!(argv[6], "10.0.0.2");
-        assert_eq!(argv.len(), 7);
+        assert_eq!(argv[5], "--vm-gateway-mode");
+        assert_eq!(argv[6], "12345");
+        assert_eq!(argv[7], "10.0.0.2");
+        assert_eq!(argv.len(), 8);
     }
 
     #[test]
@@ -421,21 +433,45 @@ mod tests {
             999,
             "192.168.100.3".parse().unwrap(),
         );
-        assert_eq!(argv[5], "999");
-        assert_eq!(argv[6], "192.168.100.3");
+        // pid is at index 6, gateway_ip at index 7 (--vm-gateway-mode at index 5)
+        assert_eq!(argv[6], "999");
+        assert_eq!(argv[7], "192.168.100.3");
     }
 
     #[test]
     fn build_in_vm_route_helper_argv_ipv6_address() {
         let argv =
             build_in_vm_route_helper_argv("sandboxd-gateway", 42, "fd00::1".parse().unwrap());
-        assert_eq!(argv[5], "42");
-        assert_eq!(argv[6], "fd00::1");
+        assert_eq!(argv[6], "42");
+        assert_eq!(argv[7], "fd00::1");
     }
 
     #[test]
     fn build_in_vm_route_helper_argv_vm_name_propagated() {
         let argv = build_in_vm_route_helper_argv("my-custom-vm", 1, "10.1.2.3".parse().unwrap());
         assert_eq!(argv[1], "my-custom-vm");
+    }
+
+    #[test]
+    fn build_in_vm_route_helper_argv_includes_vm_gateway_mode_flag() {
+        let argv =
+            build_in_vm_route_helper_argv("sandboxd-gateway", 1, "10.0.0.1".parse().unwrap());
+        // The --vm-gateway-mode flag must appear between the helper path and the
+        // positional args so the route-helper's parse_argv processes it as a flag,
+        // not as the container_pid positional.
+        assert!(
+            argv.contains(&"--vm-gateway-mode".to_string()),
+            "argv must contain --vm-gateway-mode: {argv:?}"
+        );
+        let mode_pos = argv.iter().position(|a| a == "--vm-gateway-mode").unwrap();
+        let helper_pos = argv
+            .iter()
+            .position(|a| a == IN_VM_ROUTE_HELPER_PATH)
+            .unwrap();
+        // --vm-gateway-mode must come after the helper path and before the positionals.
+        assert!(
+            mode_pos > helper_pos,
+            "--vm-gateway-mode must appear after the helper path"
+        );
     }
 }

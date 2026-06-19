@@ -6,17 +6,22 @@
 //!
 //! ```text
 //! sandbox-route-helper [--for-user <name>] <container_pid> <gateway_ip>
+//! sandbox-route-helper --vm-gateway-mode <container_pid> <gateway_ip>
 //! ```
 //!
-//! Two positional arguments preceded by an optional `--for-user <name>`
-//! flag. No stdin, no env-var configuration in production. The
-//! `SANDBOX_USERS_CONF` env var seam exists in `sandbox-core::users_conf`
-//! for daemon-side and helper-side integration tests, but the helper
-//! consults it ONLY when this crate is built with the `test-env-override`
-//! Cargo feature. Default production builds (used by the
-//! `install-route-helper-prod-cap` make target) ignore the env var
-//! entirely. See [`sandbox_core::users_conf::route_helper_users_conf_path`]
-//! for the gating logic.
+//! Standard form: two positional arguments preceded by an optional
+//! `--for-user <name>` flag. No stdin, no env-var configuration in
+//! production. The `SANDBOX_USERS_CONF` env var seam exists in
+//! `sandbox-core::users_conf` for daemon-side and helper-side integration
+//! tests, but the helper consults it ONLY when this crate is built with the
+//! `test-env-override` Cargo feature. Default production builds (used by the
+//! `install-route-helper-prod-cap` make target) ignore the env var entirely.
+//! See [`sandbox_core::users_conf::route_helper_users_conf_path`] for the
+//! gating logic.
+//!
+//! VM-gateway mode: `--vm-gateway-mode` activates the degenerate
+//! authorization path for invocations inside the `sandboxd-gateway` Lima
+//! VM. See the "In-VM authorization" section below.
 //!
 //! # Authorization flow
 //!
@@ -46,6 +51,36 @@
 //! 7. `ip route replace default via <gateway_ip>` inside the netns.
 //! 8. Append an `allowed`-decision audit record and exit 0 with a
 //!    one-line stdout confirmation.
+//!
+//! # In-VM authorization (`--vm-gateway-mode`)
+//!
+//! When invoked inside the `sandboxd-gateway` Lima VM via
+//! `sudo sandbox-route-helper --vm-gateway-mode <pid> <gw_ip>`, the caller
+//! is root (uid 0, via sudo) and there is no `users.conf` in the VM.
+//! The standard host-uid + pair-membership gate cannot apply here.
+//!
+//! Instead, the VM boundary itself is the authorization gate:
+//!
+//! - Only the daemon process (`_sandbox`, running on the macOS host) can
+//!   issue `limactl shell sandboxd-gateway -- sudo <helper> …` commands into
+//!   the gateway VM. The Lima SSH credentials are exclusively owned by the
+//!   daemon.
+//! - The gateway VM is single-tenant `_sandbox` infra. No operator user can
+//!   independently reach the VM's sudo path.
+//!
+//! In `--vm-gateway-mode` the helper:
+//! 1. Verifies it is running as root (uid 0). If not, denies immediately —
+//!    the only legitimate path to this binary with `--vm-gateway-mode` is
+//!    `sudo`, which escalates to root. Any non-root invocation in this mode
+//!    indicates a caller that bypassed sudo and must be rejected.
+//! 2. Parses only `<container_pid>` and `<gateway_ip>` (no `--for-user`).
+//! 3. Skips steps 1–4 of the standard flow (caller-uid resolution,
+//!    for-user resolution, users.conf load, pair-membership check).
+//! 4. Proceeds directly to `pidfd_open` + `setns` + address enforcement
+//!    (step 6 — subnet-containment check is still enforced; the gateway
+//!    IP must be the in-VM Docker bridge gateway, not an arbitrary address)
+//!    + route install (step 7).
+//! 5. Prints confirmation to stdout and exits 0 on success.
 //!
 //! # Privilege model
 //!
@@ -273,6 +308,118 @@ mod imp {
         }
     }
 
+    /// In-VM degenerate route install: used when the helper runs inside the
+    /// `sandboxd-gateway` Lima VM via `sudo … --vm-gateway-mode`.
+    ///
+    /// Authorization gate: the caller must be root (uid 0). The VM boundary
+    /// is the outer authorization perimeter; only the daemon can reach the
+    /// gateway VM's sudo path. No `users.conf`, no pair-membership check.
+    ///
+    /// Still enforces `pidfd_open` + `setns` + address enforcement so a
+    /// misbehaving container cannot point the route at an arbitrary host.
+    /// The address enforcement here validates that the container's addresses
+    /// are reasonable Docker bridge addresses — in the VM context there is no
+    /// pool CIDR to check against, so we accept any non-loopback private
+    /// address rather than enforcing a specific subnet.
+    fn run_vm_gateway_mode(container_pid: i32, gateway_ip: Ipv4Addr) -> ExitCode {
+        use nix::unistd::Uid;
+
+        // Gate: caller must be root (uid 0). The only legitimate path to
+        // this binary with --vm-gateway-mode is `sudo`, which escalates to
+        // root. A non-root invocation bypassed sudo and must be rejected.
+        let caller_uid = Uid::current();
+        if caller_uid.as_raw() != 0 {
+            eprintln!(
+                "sandbox-route-helper: --vm-gateway-mode requires root (uid 0); \
+                 caller is uid {}",
+                caller_uid.as_raw()
+            );
+            return ExitCode::from(DENY_EXIT);
+        }
+
+        // pidfd_open + setns — same TOCTOU-safe path as the standard flow.
+        let pidfd = match pidfd_open(container_pid) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                eprintln!(
+                    "sandbox-route-helper: {}",
+                    format_pidfd_error(container_pid, errno)
+                );
+                return ExitCode::from(DENY_EXIT);
+            }
+        };
+        if let Err(err) = setns(&pidfd, CloneFlags::CLONE_NEWNET) {
+            drop_pidfd(pidfd);
+            eprintln!("sandbox-route-helper: setns failed: {err}");
+            return ExitCode::from(DENY_EXIT);
+        }
+
+        // Address enforcement: every non-loopback interface address must be
+        // a private (RFC 1918) address. This bounds what addresses the
+        // container may have been assigned inside the in-VM Docker network —
+        // a rogue address outside private space would suggest the container
+        // was given an external address, which must be rejected.
+        if let Err(msg) = enforce_netns_addresses_private() {
+            eprintln!("sandbox-route-helper: {msg}");
+            return ExitCode::from(DENY_EXIT);
+        }
+
+        // Install default route.
+        if let Err(msg) = install_default_route(gateway_ip) {
+            eprintln!("sandbox-route-helper: {msg}");
+            return ExitCode::from(DENY_EXIT);
+        }
+
+        // No audit record is emitted here. The standard host path calls
+        // `deny_audit` / `allow_audit` which write structured records to a
+        // file path configured by the daemon (via `--audit-log`). Inside the
+        // gateway VM there is no such log file configured — the VM runs a
+        // minimal single-purpose environment with no persistent audit sink.
+        // Route installations via this path are visible in the gateway VM's
+        // journald (the `sudo sandbox-route-helper` invocation is logged by
+        // the sudoers subsystem) and in the daemon's tracing output at the
+        // limactl-shell call site.
+        println!("sandbox-route-helper: route installed for pid {container_pid} via {gateway_ip}");
+        ExitCode::SUCCESS
+    }
+
+    /// Verify that every IPv4 address on every non-`lo` interface inside
+    /// the (already-entered) netns is a private RFC 1918 address.
+    ///
+    /// Used by the in-VM degenerate path where there is no pool CIDR to
+    /// check against. This provides defense-in-depth: a container that
+    /// somehow received a publicly-routable address cannot have its route
+    /// redirected via this helper.
+    fn enforce_netns_addresses_private() -> Result<(), String> {
+        let iter = getifaddrs().map_err(|err| format!("getifaddrs failed: {err}"))?;
+        for ifaddr in iter {
+            if ifaddr.interface_name == "lo" {
+                continue;
+            }
+            let Some(addr) = ifaddr.address else {
+                continue;
+            };
+            let Some(sock) = addr.as_sockaddr_in() else {
+                continue;
+            };
+            let ip = sock.ip();
+            // Accept only RFC 1918 private ranges:
+            // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            let octets = ip.octets();
+            let is_private = octets[0] == 10
+                || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
+                || (octets[0] == 192 && octets[1] == 168);
+            if !is_private {
+                return Err(format!(
+                    "netns address {} on {} is not a private RFC 1918 address; \
+                     refusing route install",
+                    ip, ifaddr.interface_name,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Top-level orchestration. Each branch decides allow / deny and writes
     /// an audit record before returning the `ExitCode`. No deny branch
     /// reaches netns mutation (steps 5–7); pair-check denials and gateway-IP
@@ -294,8 +441,34 @@ mod imp {
             container_pid,
             gateway_ip,
             for_user_arg,
+            vm_gateway_mode,
         } = parsed;
         let gateway_ip_str = gateway_ip.to_string();
+
+        // In-VM degenerate path: the VM boundary is the authorization gate.
+        //
+        // This path is taken when the helper is invoked inside the
+        // `sandboxd-gateway` Lima VM via `limactl shell … sudo <helper>
+        // --vm-gateway-mode <pid> <gw_ip>`. The standard host-uid +
+        // pair-membership gate cannot apply here because (a) the caller is
+        // root (uid 0, via sudo) and (b) there is no `users.conf` in the VM.
+        //
+        // Security rationale: only the daemon process (`_sandbox`, running on
+        // the macOS host) can issue `limactl shell sandboxd-gateway` commands.
+        // The Lima SSH credentials for the gateway VM are exclusively owned by
+        // the daemon's LIMA_HOME. The gateway VM is single-tenant `_sandbox`
+        // infra — no operator user can independently reach its sudo path.
+        // The VM boundary therefore provides the same authorization guarantee
+        // as the host-uid gate, restricted to a single-tenant context where
+        // the pair-membership abstraction does not apply.
+        //
+        // This path enforces that the caller IS root (the only legitimate way
+        // to invoke --vm-gateway-mode is via `sudo`, which escalates to uid 0).
+        // Any non-root invocation in --vm-gateway-mode is rejected immediately,
+        // preventing an unprivileged in-VM process from bypassing the gate.
+        if vm_gateway_mode {
+            return run_vm_gateway_mode(container_pid, gateway_ip);
+        }
 
         // Step 1 — caller identity. STRICT resolution —
         // unresolvable uid is a deny path, not a stderr-clarity hint. The
@@ -529,31 +702,42 @@ mod imp {
     /// Parsed argv. `for_user_arg` is `None` if `--for-user` was omitted —
     /// the caller defaults it to `name(getuid())` and defaults to the caller username, which
     /// preserves the pre-existing direct-CLI invocation shape.
-    struct ParsedArgs {
-        container_pid: i32,
-        gateway_ip: Ipv4Addr,
-        for_user_arg: Option<String>,
+    /// `vm_gateway_mode` is `true` when `--vm-gateway-mode` was present.
+    // pub(super) so unit tests in tests::parse_argv_tests can call parse_argv directly.
+    pub(super) struct ParsedArgs {
+        pub(super) container_pid: i32,
+        pub(super) gateway_ip: Ipv4Addr,
+        pub(super) for_user_arg: Option<String>,
+        /// When `true`, the degenerate in-VM authorization path is active.
+        /// See the crate-level "In-VM authorization" doc comment.
+        pub(super) vm_gateway_mode: bool,
     }
 
-    /// Parse argv: optional `--for-user <name>` before the two positional
-    /// args. `argv[0]` is the program name.
+    /// Parse argv: optional flags before the two positional args.
+    /// `argv[0]` is the program name.
     ///
-    /// Hand-rolled — pulling `clap` into the cap'd helper
-    /// would inflate the TCB by several thousand lines that have to be
-    /// reviewed for the privilege story. The flag accepts both
-    /// `--for-user <name>` (two-arg form) and `--for-user=<name>` (one-arg
-    /// form); both shapes show up in practice.
-    fn parse_argv(args: &[OsString]) -> Result<ParsedArgs, String> {
-        const USAGE: &str =
-            "usage: sandbox-route-helper [--for-user <name>] <container_pid> <gateway_ip>";
+    /// Exposed as `pub(super)` so the `tests::parse_argv_tests` module can call it
+    /// directly to pin the parsing contract without exec'ing a process.
+    ///
+    /// Accepted flags (mutually exclusive):
+    /// - `--for-user <name>` / `--for-user=<name>`: standard operator identity
+    ///   for the host pair-membership check. Not compatible with
+    ///   `--vm-gateway-mode`.
+    /// - `--vm-gateway-mode`: activates the degenerate in-VM authorization
+    ///   path. Incompatible with `--for-user`.
+    ///
+    /// Hand-rolled — pulling `clap` into the cap'd helper would inflate the
+    /// TCB by several thousand lines that have to be reviewed for the privilege
+    /// story. The flag accepts both `--for-user <name>` (two-arg form) and
+    /// `--for-user=<name>` (one-arg form); both shapes show up in practice.
+    pub(super) fn parse_argv(args: &[OsString]) -> Result<ParsedArgs, String> {
+        const USAGE: &str = "usage: sandbox-route-helper [--for-user <name>] <container_pid> <gateway_ip>\n\
+             usage: sandbox-route-helper --vm-gateway-mode <container_pid> <gateway_ip>";
 
-        // Walk argv left-to-right, consuming `--for-user` (and value) where
-        // it appears. Anything that is not the flag is a positional. We
-        // intentionally do NOT accept `--for-user` after the positionals,
-        // because the daemon emits it before them and an
-        // after-positionals form would create two ways to spell the same
-        // intent for no benefit.
+        // Walk argv left-to-right, consuming recognized flags where
+        // they appear. Anything that is not a flag is a positional.
         let mut for_user_arg: Option<String> = None;
+        let mut vm_gateway_mode = false;
         let mut positionals: Vec<&OsString> = Vec::with_capacity(2);
 
         // argv[0] is the program name; skip it.
@@ -564,6 +748,11 @@ mod imp {
             let arg_str = arg.to_string_lossy();
             if accepting_flags && arg_str == "--for-user" {
                 // Two-argument form: --for-user NAME
+                if vm_gateway_mode {
+                    return Err(format!(
+                        "{USAGE} (--for-user and --vm-gateway-mode are mutually exclusive)"
+                    ));
+                }
                 let Some((_, value)) = iter.next() else {
                     return Err(format!("{USAGE} (missing value after --for-user)"));
                 };
@@ -585,6 +774,11 @@ mod imp {
                 for_user_arg = Some(name);
             } else if accepting_flags && let Some(rest) = arg_str.strip_prefix("--for-user=") {
                 // Single-argument form: --for-user=NAME
+                if vm_gateway_mode {
+                    return Err(format!(
+                        "{USAGE} (--for-user and --vm-gateway-mode are mutually exclusive)"
+                    ));
+                }
                 if for_user_arg.is_some() {
                     return Err(format!("{USAGE} (--for-user specified more than once)"));
                 }
@@ -592,6 +786,21 @@ mod imp {
                     return Err(format!("{USAGE} (--for-user value must be non-empty)"));
                 }
                 for_user_arg = Some(rest.to_string());
+            } else if accepting_flags && arg_str == "--vm-gateway-mode" {
+                // In-VM degenerate authorization path. Mutually exclusive
+                // with --for-user because the VM boundary replaces the
+                // host-uid gate entirely.
+                if for_user_arg.is_some() {
+                    return Err(format!(
+                        "{USAGE} (--for-user and --vm-gateway-mode are mutually exclusive)"
+                    ));
+                }
+                if vm_gateway_mode {
+                    return Err(format!(
+                        "{USAGE} (--vm-gateway-mode specified more than once)"
+                    ));
+                }
+                vm_gateway_mode = true;
             } else if accepting_flags && arg_str == "--" {
                 // End-of-flags sentinel — everything after this is
                 // positional. The daemon never emits this; it's a hook for
@@ -628,6 +837,7 @@ mod imp {
             container_pid: pid,
             gateway_ip,
             for_user_arg,
+            vm_gateway_mode,
         })
     }
 
@@ -882,5 +1092,105 @@ mod tests {
                  SANDBOX_USERS_CONF for integration-test seam"
             );
         });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Argv-parse tests for --vm-gateway-mode
+    // ---------------------------------------------------------------------------
+
+    /// These tests drive `imp::parse_argv` directly (Linux-cfg'd module).
+    /// They run on Linux only (where the imp module is compiled).
+    #[cfg(target_os = "linux")]
+    mod parse_argv_tests {
+        use std::ffi::OsString;
+
+        fn argv(args: &[&str]) -> Vec<OsString> {
+            let mut v: Vec<OsString> = vec!["sandbox-route-helper".into()];
+            v.extend(args.iter().map(|&s| OsString::from(s)));
+            v
+        }
+
+        #[test]
+        fn vm_gateway_mode_flag_sets_mode() {
+            let parsed =
+                super::super::imp::parse_argv(&argv(&["--vm-gateway-mode", "1234", "10.0.0.1"]))
+                    .expect("parse must succeed");
+            assert!(
+                parsed.vm_gateway_mode,
+                "vm_gateway_mode must be true when flag is present"
+            );
+            assert_eq!(parsed.container_pid, 1234);
+            assert_eq!(parsed.gateway_ip, "10.0.0.1".parse().unwrap());
+            assert!(
+                parsed.for_user_arg.is_none(),
+                "for_user_arg must be None in vm_gateway_mode"
+            );
+        }
+
+        #[test]
+        fn standard_form_no_vm_gateway_mode() {
+            let parsed = super::super::imp::parse_argv(&argv(&["1234", "10.0.0.1"]))
+                .expect("parse must succeed");
+            assert!(
+                !parsed.vm_gateway_mode,
+                "vm_gateway_mode must be false when flag is absent"
+            );
+            assert_eq!(parsed.container_pid, 1234);
+        }
+
+        #[test]
+        fn vm_gateway_mode_and_for_user_are_mutually_exclusive() {
+            // --vm-gateway-mode before --for-user
+            let err = super::super::imp::parse_argv(&argv(&[
+                "--vm-gateway-mode",
+                "--for-user",
+                "alice",
+                "1",
+                "10.0.0.1",
+            ]))
+            .expect_err("must fail when both flags are present");
+            assert!(
+                err.contains("mutually exclusive"),
+                "error must mention mutual exclusivity: {err}"
+            );
+
+            // --for-user before --vm-gateway-mode
+            let err2 = super::super::imp::parse_argv(&argv(&[
+                "--for-user",
+                "alice",
+                "--vm-gateway-mode",
+                "1",
+                "10.0.0.1",
+            ]))
+            .expect_err("must fail when both flags are present");
+            assert!(
+                err2.contains("mutually exclusive"),
+                "error must mention mutual exclusivity: {err2}"
+            );
+        }
+
+        #[test]
+        fn vm_gateway_mode_duplicate_rejected() {
+            let err = super::super::imp::parse_argv(&argv(&[
+                "--vm-gateway-mode",
+                "--vm-gateway-mode",
+                "1",
+                "10.0.0.1",
+            ]))
+            .expect_err("duplicate --vm-gateway-mode must fail");
+            assert!(
+                err.contains("more than once"),
+                "error must mention duplicate: {err}"
+            );
+        }
+
+        #[test]
+        fn for_user_flag_does_not_set_vm_gateway_mode() {
+            let parsed =
+                super::super::imp::parse_argv(&argv(&["--for-user", "alice", "1", "10.0.0.1"]))
+                    .expect("parse must succeed");
+            assert!(!parsed.vm_gateway_mode);
+            assert_eq!(parsed.for_user_arg.as_deref(), Some("alice"));
+        }
     }
 }

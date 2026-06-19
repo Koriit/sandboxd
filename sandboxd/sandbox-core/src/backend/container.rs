@@ -1625,6 +1625,19 @@ async fn run_docker(
     .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))?
 }
 
+/// Public wrapper: inspect a container's PID via a forwarded Docker socket.
+///
+/// Used by the macOS lite path to get the in-VM PID of the sandbox container
+/// before invoking `sandbox-route-helper --vm-gateway-mode` inside the
+/// gateway Lima VM. The PID is meaningless on the macOS host; it is only
+/// valid as an argument to the in-VM helper.
+pub async fn inspect_container_pid_via_socket(
+    container_name: &str,
+    docker_socket: Option<PathBuf>,
+) -> Result<i32, SandboxError> {
+    inspect_container_pid(container_name, docker_socket).await
+}
+
 /// `docker inspect -f '{{.State.Pid}}' <name>` → host-namespace pid (or
 /// in-VM pid when targeting a forwarded gateway socket on macOS).
 /// Returns the parsed integer; 0 (a stopped container's reported pid)

@@ -378,6 +378,166 @@ pub fn setup_macos_gateway(
     Ok(())
 }
 
+/// Orchestrate the macOS lite-mode gateway setup inside the gateway VM.
+///
+/// Like [`setup_macos_gateway`] but for the lite (container) backend:
+/// the per-session Docker bridge already exists (created by
+/// `NetworkManager::create_network_on_socket` before this call), so step 6
+/// (network create) is skipped. The gateway container is started on the
+/// `sandboxd-egress` bridge as its upstream, then connected to the
+/// per-session bridge for the sandbox-container-facing NIC.
+///
+/// Steps (numbers mirror the Lima create flow):
+/// 7. Create gateway container (`sandbox-gw-<id>`) on `sandboxd-egress`.
+/// 8. Connect to per-session bridge with static gateway IP.
+/// 9–11. Inject deny-all nftables → wait healthy → inject DNAT.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn setup_macos_lite_gateway(
+    session_id: &SessionId,
+    network_info: &NetworkInfo,
+    gateway_docker_socket: &Path,
+    gateway_image_tag: &str,
+    _ca_dir: Option<&Path>,
+    initial_dns_policy: Option<&str>,
+    owner_pool: Option<&str>,
+) -> Result<(), SandboxError> {
+    let container_name = macos_gateway_container_name(session_id);
+    // The per-session bridge was created by create_network_on_socket
+    // and follows the same naming convention as the macvlan case.
+    let network_name = macos_docker_network_name(session_id);
+
+    info!(
+        session_id = %session_id,
+        container = %container_name,
+        bridge = %network_name,
+        gateway_ip = %network_info.gateway_ip,
+        "setting up macOS lite gateway (bridge)"
+    );
+
+    // Pre-cleanup: remove any leftover container with the same name.
+    let _ = run_with_timeout(
+        gateway_docker_cmd(gateway_docker_socket).args(["rm", "--force", &container_name]),
+        DOCKER_RM_TIMEOUT,
+        "docker rm (macOS lite pre-cleanup)",
+    );
+
+    // Step 7: Create gateway container on sandboxd-egress (upstream NIC).
+    {
+        let run_args = build_macos_gateway_docker_args(session_id, gateway_image_tag, owner_pool);
+        let args_refs: Vec<&str> = run_args.iter().map(|s| s.as_str()).collect();
+        let output = run_with_timeout(
+            gateway_docker_cmd(gateway_docker_socket).args(&args_refs),
+            DOCKER_RUN_TIMEOUT,
+            "docker run (macOS lite gateway)",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Gateway(format!(
+                "docker run failed for macOS lite gateway container {container_name}: {stderr}"
+            )));
+        }
+        debug!(
+            session_id = %session_id,
+            container = %container_name,
+            "macOS lite gateway container started on sandboxd-egress"
+        );
+    }
+
+    // Write the Envoy static bootstrap into the container.
+    {
+        use crate::policy::{BOOTSTRAP_FILE_IN_CONTAINER, PolicyCompiler};
+        let bootstrap = PolicyCompiler::compile_envoy_bootstrap();
+        if let Err(e) = write_file_to_gateway_container(
+            gateway_docker_socket,
+            &container_name,
+            BOOTSTRAP_FILE_IN_CONTAINER,
+            &bootstrap,
+        ) {
+            return Err(SandboxError::Gateway(format!(
+                "failed to write Envoy bootstrap to macOS lite gateway {container_name}: {e}"
+            )));
+        }
+    }
+
+    // Seed the initial deny-all Envoy listener.
+    {
+        use crate::policy::{LISTENER_FILE_IN_CONTAINER, PolicyCompiler};
+        let listener = PolicyCompiler::compile_initial_envoy_listener();
+        if let Err(e) = write_file_to_gateway_container(
+            gateway_docker_socket,
+            &container_name,
+            LISTENER_FILE_IN_CONTAINER,
+            &listener,
+        ) {
+            return Err(SandboxError::Gateway(format!(
+                "failed to write Envoy listener to macOS lite gateway {container_name}: {e}"
+            )));
+        }
+    }
+
+    // Write initial DNS policy if provided.
+    if let Some(policy_content) = initial_dns_policy {
+        if let Err(e) = write_file_to_gateway_container(
+            gateway_docker_socket,
+            &container_name,
+            "/etc/coredns/policy.conf",
+            policy_content,
+        ) {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to write initial DNS policy to macOS lite gateway (best-effort)"
+            );
+        }
+    }
+
+    // Step 8: Connect container to the per-session bridge with static IP.
+    // For the lite path the network is a plain bridge (not macvlan).
+    {
+        let output = run_with_timeout(
+            gateway_docker_cmd(gateway_docker_socket).args([
+                "network",
+                "connect",
+                "--ip",
+                &network_info.gateway_ip,
+                &network_name,
+                &container_name,
+            ]),
+            DOCKER_CONNECT_TIMEOUT,
+            "docker network connect (lite bridge)",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Gateway(format!(
+                "failed to connect {container_name} to lite bridge {network_name}: {stderr}"
+            )));
+        }
+        debug!(
+            session_id = %session_id,
+            container = %container_name,
+            gateway_ip = %network_info.gateway_ip,
+            "lite gateway container connected to per-session bridge"
+        );
+    }
+
+    // Steps 9-11: Use GatewayManager over the forwarded socket for nft and health.
+    {
+        use crate::gateway::GatewayManager;
+        let gm = GatewayManager::with_gateway_socket(gateway_docker_socket.to_path_buf());
+        gm.inject_deny_all(session_id)?;
+        gm.wait_for_components(session_id)?;
+        gm.inject_dnat(session_id, network_info, &network_info.gateway_ip)?;
+    }
+
+    info!(
+        session_id = %session_id,
+        container = %container_name,
+        "macOS lite gateway fully initialised"
+    );
+    Ok(())
+}
+
 /// Build the `docker run` argument vector for a macOS gateway container.
 ///
 /// Extracted from `setup_macos_gateway` so the hardening properties

@@ -48,8 +48,8 @@ pub use container::{
     ContainerNetwork, ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG,
     EnsureImageOutcome, LITE_FIRST_USE_WARNING, LITE_IMAGE_REPOSITORY, LITE_TAG_OVERRIDE_ENV,
     SANDBOX_CA_CONTAINER_PATH, WorkspaceBind, compute_default_resource_limits, ensure_image,
-    home_volume_name, lite_image_tag_for_daemon_probe, lite_image_tag_for_version,
-    map_container_uid_gid, rebuild_lite_image, stage_ssh_credentials,
+    home_volume_name, inspect_container_pid_via_socket, lite_image_tag_for_daemon_probe,
+    lite_image_tag_for_version, map_container_uid_gid, rebuild_lite_image, stage_ssh_credentials,
 };
 pub use lima::{LimaRuntime, LimaTransport};
 pub use orphan_reaper::{CliDockerOps, DockerOps, ReaperReport, reap_orphans};

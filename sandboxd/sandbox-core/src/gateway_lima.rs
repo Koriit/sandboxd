@@ -157,6 +157,25 @@ const GATEWAY_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(90);
 #[cfg(target_os = "macos")]
 pub const GATEWAY_IMAGE_TARBALL_FILENAME: &str = "gateway-image.tar";
 
+/// Filename of the Linux aarch64 `sandbox-route-helper` binary staged in the
+/// daemon LIMA_HOME for copying into the gateway VM.
+///
+/// The operator populates this once via:
+///   make build-route-helper-linux-aarch64
+/// or by downloading from the release assets. The daemon copies it into the
+/// gateway VM and setcap's it during `ensure_ready`.
+#[cfg(target_os = "macos")]
+pub const ROUTE_HELPER_LINUX_BINARY_FILENAME: &str = "sandbox-route-helper-linux-aarch64";
+
+/// In-VM install path for `sandbox-route-helper` inside the gateway Lima VM.
+/// Mirrors the host FHS install path used on Linux.
+#[cfg(target_os = "macos")]
+pub const IN_VM_ROUTE_HELPER_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-route-helper";
+
+/// Timeout for `limactl copy` (binary staging into the gateway VM).
+#[cfg(target_os = "macos")]
+const ROUTE_HELPER_COPY_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // NIC map
 // ---------------------------------------------------------------------------
@@ -278,6 +297,19 @@ pub fn generate_gateway_template(max_slots: u16) -> String {
         })
         .collect::<String>();
 
+    // Build the 9p mounts stanza for the lite shared-workspace root.
+    // The shared root is mounted read-write into the gateway VM at the same
+    // absolute path as the host, so the host→VM path translation is an
+    // identity (no remapping needed). Per-session shared: paths must be
+    // validated at create time to fall under this root.
+    //
+    // Note: the 9p read is performed by _sandbox (the gateway VM's user),
+    // NOT the operator. This is the TCC asymmetry: lite shared: gets no
+    // operator TCC consent path. Sources must be readable by _sandbox and
+    // must not live in TCC-protected directories (Desktop, Documents, Downloads).
+    let shared_root = crate::lite_macos::lite_shared_root();
+    let mounts_stanza = crate::lite_macos::lite_shared_root_9p_stanza(&shared_root);
+
     // Build the no-DHCP netplan printf lines for each limaN NIC.
     // Without this, systemd-networkd tries DHCP on every limaN NIC and
     // blocks boot on `network-online.target` waiting for leases that never arrive.
@@ -324,6 +356,13 @@ portForwards:
   - guestSocket: "/var/run/docker.sock"
     hostSocket: "{{{{.Dir}}}}/gateway-docker.sock"
 
+# 9p mount for lite-mode shared: workspaces.
+# The shared root is exposed read-write at the same absolute path so the
+# host->VM path translation is an identity. Per-session shared: paths must
+# fall under this root (validated at session-create time).
+# NOTE: reads are performed as _sandbox (the gateway VM user), not the
+# operator. Sources outside TCC-protected dirs work without consent.
+{mounts_stanza}
 containerd:
   system: false
   user: false
@@ -358,6 +397,19 @@ provision:
       for u in $(awk -F: '$3 >= 500 && $3 < 65534 {{print $1}}' /etc/passwd); do
         usermod -aG docker "$u"
       done
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Allow the daemon to invoke sandbox-route-helper inside the VM without
+      # a password prompt. The sudoers entry is scoped to exactly one binary
+      # so no other command can be run as root via this grant.
+      #
+      # printf is used instead of a heredoc because the Lima template is a
+      # YAML block scalar — heredoc terminators at column 0 would be
+      # misinterpreted by the YAML parser as end-of-scalar.
+      printf 'ALL ALL=(root) NOPASSWD: /usr/local/libexec/sandboxd/sandbox-route-helper\n' \
+        > /etc/sudoers.d/sandbox-route-helper
+      chmod 0440 /etc/sudoers.d/sandbox-route-helper
   - mode: system
     script: |
       #!/bin/bash
@@ -766,6 +818,18 @@ impl GatewayLimaManager {
 
         // Step 4g: apply baseline eth0 nft policy.
         self.apply_eth0_nft_policy()?;
+
+        // Step 4h: ensure the sandbox-route-helper is installed and setcap'd
+        // inside the gateway VM. Required for the lite-mode container path on
+        // macOS. Non-fatal if the host-side binary is not yet staged — lite
+        // sessions will fail at route-install time with an actionable error.
+        if let Err(e) = self.ensure_route_helper_in_vm() {
+            warn!(
+                error = %e,
+                "ensure_route_helper_in_vm failed (non-fatal; \
+                 lite-mode sessions will fail at route-install time)"
+            );
+        }
 
         info!("gateway Lima instance ready");
         Ok(())
@@ -1244,12 +1308,18 @@ impl GatewayLimaManager {
         Ok(())
     }
 
+    /// The Lima instance name for the daemon-owned gateway VM.
+    /// Exposed as an associated constant so daemon code that needs to pass
+    /// the VM name to `build_in_vm_route_helper_argv` can reference it without
+    /// importing the module-level constant directly.
+    pub const GATEWAY_INSTANCE_NAME: &'static str = GATEWAY_INSTANCE_NAME;
+
     /// Run a shell command inside the gateway Lima VM via `limactl shell`.
     ///
     /// This is the degenerate direct path (daemon_uid == op_uid) — the daemon
     /// runs `limactl` directly as `_sandbox`, which already owns the gateway
     /// instance's LIMA_HOME.
-    fn run_gateway_shell(
+    pub fn run_gateway_shell(
         &self,
         command: &str,
         timeout: Duration,
@@ -1259,6 +1329,170 @@ impl GatewayLimaManager {
         cmd.args(["shell", GATEWAY_INSTANCE_NAME, "--", "bash", "-c", command]);
 
         run_with_timeout(&mut cmd, timeout, "gateway: limactl shell")
+    }
+
+    /// Run an arbitrary argv inside the gateway Lima VM via `limactl shell`.
+    ///
+    /// The argv is expected to be in the form returned by
+    /// `build_in_vm_route_helper_argv`: `["shell", "<vm>", "--", <cmd>, <args>...]`.
+    /// The first two elements (`shell` and the VM name) are extracted as
+    /// positional args after `limactl`; the rest are passed verbatim.
+    ///
+    /// This is used for the in-VM `sandbox-route-helper --vm-gateway-mode`
+    /// invocation, which cannot go through `run_gateway_shell` (string command)
+    /// because the helper's argv cannot be safely shell-escaped in general.
+    pub fn run_gateway_shell_argv(
+        &self,
+        argv: &[String],
+    ) -> Result<std::process::Output, SandboxError> {
+        // argv shape: ["shell", "<vm>", "--", <rest...>]
+        // limactl shell <vm> -- <rest...>
+        if argv.len() < 4 || argv[0] != "shell" || argv[2] != "--" {
+            return Err(SandboxError::Internal(format!(
+                "run_gateway_shell_argv: unexpected argv shape: {argv:?}"
+            )));
+        }
+        let mut cmd = Command::new("limactl");
+        apply_limactl_env(&mut cmd, self.daemon_uid);
+        // argv[0] = "shell", argv[1] = vm_name, argv[2] = "--", argv[3..] = command
+        cmd.args(argv);
+        run_with_timeout(
+            &mut cmd,
+            GATEWAY_SHELL_TIMEOUT,
+            "gateway: limactl shell (argv)",
+        )
+    }
+
+    /// Ensure `sandbox-route-helper` is installed and setcap'd inside the
+    /// gateway Lima VM.
+    ///
+    /// The lite-mode container path invokes the route-helper inside the gateway
+    /// VM (via `limactl shell … sudo sandbox-route-helper --vm-gateway-mode`)
+    /// to install the default route inside the sandbox container's netns. The
+    /// helper binary must exist in the VM with the required file capabilities.
+    ///
+    /// # Provisioning mechanism
+    ///
+    /// The daemon LIMA_HOME (`{daemon_lima_home}`) is expected to contain a
+    /// pre-staged Linux aarch64 binary at
+    /// `{daemon_lima_home}/sandbox-route-helper-linux-aarch64`.
+    ///
+    /// The operator populates this binary via:
+    /// ```text
+    /// make build-route-helper-linux-aarch64
+    /// ```
+    /// or by downloading from the release assets and renaming to
+    /// `sandbox-route-helper-linux-aarch64` in the daemon LIMA_HOME.
+    ///
+    /// If the binary is not found at the host path, this method logs a
+    /// warning and returns `Ok(())` — lite-mode sessions will fail at
+    /// route-install time rather than at daemon startup. This is intentional:
+    /// the gateway VM can still serve Lima sessions without the route-helper.
+    ///
+    /// If the binary is already present in the VM and setcap'd correctly, this
+    /// method is a fast no-op (checked via a `test -x` probe).
+    ///
+    /// # Security
+    ///
+    /// The copy targets `/usr/local/libexec/sandboxd/sandbox-route-helper` in
+    /// the VM. After copying, `sudo setcap 'cap_net_admin,cap_sys_admin,
+    /// cap_sys_ptrace=eip'` is applied. The VM's sudo is passwordless for root
+    /// operations (Lima's provisioning model).
+    pub fn ensure_route_helper_in_vm(&self) -> Result<(), SandboxError> {
+        use tracing::debug;
+
+        let host_binary = self
+            .daemon_lima_home
+            .join(ROUTE_HELPER_LINUX_BINARY_FILENAME);
+
+        if !host_binary.exists() {
+            warn!(
+                path = %host_binary.display(),
+                "gateway VM route-helper binary not found at staging path; \
+                 lite-mode sessions will fail at route-install time. \
+                 Populate it with: make build-route-helper-linux-aarch64"
+            );
+            return Ok(());
+        }
+
+        // Probe: check that the binary is installed, executable, and has the expected
+        // capability set. Checking only `test -x` is insufficient — a binary that was
+        // copied but whose `setcap` step failed (or whose caps were stripped) passes
+        // the executable probe but then fails at route-install time with EPERM. The
+        // `getcap | grep` check catches that case and forces a reinstall.
+        let probe_result = self.run_gateway_shell(
+            &format!(
+                "test -x {IN_VM_ROUTE_HELPER_PATH} && \
+                 getcap {IN_VM_ROUTE_HELPER_PATH} | grep -q cap_net_admin && echo exists"
+            ),
+            ROUTE_HELPER_COPY_TIMEOUT,
+        );
+        let already_installed = match probe_result {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                output.status.success() && stdout.trim() == "exists"
+            }
+            Err(_) => false,
+        };
+
+        if already_installed {
+            debug!("gateway VM route-helper already installed with caps; skipping copy");
+            return Ok(());
+        }
+
+        info!(
+            src = %host_binary.display(),
+            dst = %format!("{}:{IN_VM_ROUTE_HELPER_PATH}", GATEWAY_INSTANCE_NAME),
+            "installing sandbox-route-helper into gateway VM"
+        );
+
+        // Create the target directory inside the VM.
+        let mkdir_output = self.run_gateway_shell(
+            "sudo mkdir -p /usr/local/libexec/sandboxd",
+            ROUTE_HELPER_COPY_TIMEOUT,
+        )?;
+        if !mkdir_output.status.success() {
+            let stderr = String::from_utf8_lossy(&mkdir_output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "ensure_route_helper_in_vm: failed to mkdir in gateway VM: {stderr}"
+            )));
+        }
+
+        // Copy the binary from the host into the gateway VM using `limactl copy`.
+        let dst = format!("{GATEWAY_INSTANCE_NAME}:{IN_VM_ROUTE_HELPER_PATH}");
+        let mut copy_cmd = Command::new("limactl");
+        apply_limactl_env(&mut copy_cmd, self.daemon_uid);
+        copy_cmd.args(["copy", host_binary.to_str().unwrap_or(""), &dst]);
+        let copy_output = run_with_timeout(
+            &mut copy_cmd,
+            ROUTE_HELPER_COPY_TIMEOUT,
+            "gateway: limactl copy",
+        )?;
+        if !copy_output.status.success() {
+            let stderr = String::from_utf8_lossy(&copy_output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "ensure_route_helper_in_vm: limactl copy failed: {stderr}"
+            )));
+        }
+
+        // Set execute bit and apply capabilities.
+        let setcap_output = self.run_gateway_shell(
+            &format!(
+                "sudo chmod +x {IN_VM_ROUTE_HELPER_PATH} && \
+                 sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' \
+                 {IN_VM_ROUTE_HELPER_PATH}"
+            ),
+            ROUTE_HELPER_COPY_TIMEOUT,
+        )?;
+        if !setcap_output.status.success() {
+            let stderr = String::from_utf8_lossy(&setcap_output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "ensure_route_helper_in_vm: setcap failed: {stderr}"
+            )));
+        }
+
+        info!("sandbox-route-helper installed and setcap'd in gateway VM");
+        Ok(())
     }
 
     /// Stop the gateway Lima instance.
@@ -1875,6 +2109,64 @@ mod tests {
         assert!(
             tmpl.contains("user: false"),
             "template must disable containerd (user)"
+        );
+    }
+
+    #[test]
+    fn template_has_lite_shared_root_9p_mounts_stanza() {
+        let tmpl = generate_gateway_template(4);
+        // The template must include a mounts: block for lite shared: workspaces.
+        assert!(
+            tmpl.contains("mounts:"),
+            "template must contain a mounts: stanza for lite shared: workspaces"
+        );
+        assert!(
+            tmpl.contains("mountType: \"9p\""),
+            "template mounts stanza must use 9p mountType"
+        );
+        assert!(
+            tmpl.contains("writable: true"),
+            "template mounts stanza must be writable"
+        );
+        assert!(
+            tmpl.contains("securityModel: \"mapped-xattr\""),
+            "template mounts stanza must use mapped-xattr security model"
+        );
+        // The mounts: block must appear between portForwards and containerd.
+        let port_pos = tmpl
+            .find("portForwards:")
+            .expect("portForwards: must exist");
+        let mounts_pos = tmpl.find("mounts:").expect("mounts: must exist");
+        let containerd_pos = tmpl.find("containerd:").expect("containerd: must exist");
+        assert!(
+            port_pos < mounts_pos,
+            "mounts: must appear after portForwards:"
+        );
+        assert!(
+            mounts_pos < containerd_pos,
+            "mounts: must appear before containerd:"
+        );
+    }
+
+    #[test]
+    fn template_has_route_helper_sudoers_provision() {
+        let tmpl = generate_gateway_template(4);
+        // The sudoers entry must be scoped to exactly the route-helper binary path.
+        assert!(
+            tmpl.contains("/usr/local/libexec/sandboxd/sandbox-route-helper"),
+            "template must reference the route-helper path in the sudoers provision"
+        );
+        assert!(
+            tmpl.contains("NOPASSWD:"),
+            "template must grant NOPASSWD for the route-helper"
+        );
+        assert!(
+            tmpl.contains("/etc/sudoers.d/sandbox-route-helper"),
+            "template must write the sudoers fragment to /etc/sudoers.d/sandbox-route-helper"
+        );
+        assert!(
+            tmpl.contains("chmod 0440"),
+            "template must set 0440 on the sudoers fragment"
         );
     }
 

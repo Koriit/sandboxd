@@ -1,7 +1,8 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
-	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership
+	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership \
+	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -385,7 +386,7 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership
+setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership stage-route-helper-linux-aarch64
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -887,6 +888,98 @@ sandboxd/target/.dev-env-stamps/guest-prod.stamp: sandboxd/target/release/sandbo
 .PHONY: sandboxd/target/release/sandbox-guest
 sandboxd/target/release/sandbox-guest:
 	cd sandboxd && cargo build --release -p sandbox-guest
+
+# build-route-helper-linux-aarch64 — cross-compile sandbox-route-helper for
+# Linux aarch64 (the gateway Lima VM's architecture).
+#
+# The gateway Lima VM is Ubuntu 24.04 aarch64 (Apple Silicon). The daemon
+# copies the compiled binary into the VM at startup via `ensure_route_helper_in_vm`
+# (gateway_lima.rs), which reads it from `{daemon_lima_home}/sandbox-route-helper-linux-aarch64`.
+#
+# Cross-compilation is done inside a `rust:1.88-bookworm` Docker container to
+# avoid requiring a host-side `aarch64-unknown-linux-gnu` toolchain. The
+# container mounts the sandboxd workspace source and the cargo registry cache
+# (read-only) so incremental builds avoid repeated crate downloads.
+#
+# The compiled binary lands at:
+#   sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-route-helper
+#
+# From there, `stage-route-helper-linux-aarch64` copies it into the daemon's
+# LIMA_HOME so `ensure_route_helper_in_vm` can find it at daemon startup.
+#
+# Manual command (run once after building):
+#   docker run --rm \
+#     -v "$(PWD)/sandboxd:/workspace/sandboxd:ro" \
+#     -v "$(PWD)/sandboxd/target:/workspace/sandboxd/target" \
+#     -w /workspace/sandboxd \
+#     rust:1.88-bookworm \
+#     sh -c "apt-get update -qq && \
+#            apt-get install -y gcc-aarch64-linux-gnu && \
+#            rustup target add aarch64-unknown-linux-gnu && \
+#            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+#            cargo build --release -p sandbox-route-helper \
+#              --target aarch64-unknown-linux-gnu"
+build-route-helper-linux-aarch64:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ build-route-helper-linux-aarch64 skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@echo "Cross-compiling sandbox-route-helper for linux/aarch64 via Docker..."
+	docker run --rm \
+	  -v "$$(pwd)/sandboxd:/workspace/sandboxd:ro" \
+	  -v "$$(pwd)/sandboxd/target:/workspace/sandboxd/target" \
+	  -w /workspace/sandboxd \
+	  rust:1.88-bookworm \
+	  sh -c "apt-get update -qq && \
+	         apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu && \
+	         rustup target add aarch64-unknown-linux-gnu && \
+	         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+	         cargo build --release -p sandbox-route-helper \
+	           --target aarch64-unknown-linux-gnu"
+	@echo "$(GREEN)✓ built: sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-route-helper$(RESET)"
+
+# stage-route-helper-linux-aarch64 — copy the Linux aarch64 route-helper into
+# the daemon's LIMA_HOME so `ensure_route_helper_in_vm` can find it at startup.
+#
+# The staging path mirrors the daemon's derivation:
+#   {SANDBOXD_STATE_ROOT}/{_sandbox-uid}/{_sandbox-uid}/lima/sandbox-route-helper-linux-aarch64
+#
+# Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {_sandbox-uid} is the
+# uid of the _sandbox daemon user (derived at runtime via `id -u _sandbox`).
+# This matches operator_lima_home(daemon_uid) in lima.rs.
+#
+# Idempotence: skipped if the installed binary is byte-identical to the built one.
+# Darwin-only: the gateway VM only exists on macOS.
+stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ stage-route-helper-linux-aarch64 skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_built=sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-route-helper; \
+	if [ ! -f "$$_built" ]; then \
+	  echo "ERROR: $$_built not found — run 'make build-route-helper-linux-aarch64' first"; \
+	  exit 1; \
+	fi; \
+	_sandbox_uid=$$(id -u _sandbox 2>/dev/null || echo ""); \
+	if [ -z "$$_sandbox_uid" ]; then \
+	  echo "WARNING: _sandbox user not found; skipping route-helper staging."; \
+	  echo "  Run 'make setup-dev-env' after installing sandboxd to create the _sandbox user,"; \
+	  echo "  then re-run 'make stage-route-helper-linux-aarch64'."; \
+	  exit 0; \
+	fi; \
+	_lima_home="/var/lib/sandboxd/$$_sandbox_uid/$$_sandbox_uid/lima"; \
+	_dst="$$_lima_home/sandbox-route-helper-linux-aarch64"; \
+	if [ ! -d "$$_lima_home" ]; then \
+	  echo "[sudo] mkdir -p $$_lima_home"; \
+	  sudo -k install -d -o _sandbox -g _sandbox -m 0750 "$$_lima_home"; \
+	fi; \
+	if [ -f "$$_dst" ] && cmp -s "$$_built" "$$_dst"; then \
+	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
+	else \
+	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
+	  sudo -k install -o _sandbox -g _sandbox -m 0755 "$$_built" "$$_dst"; \
+	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
+	fi
 
 # setup-bridge-conf — `/etc/qemu/bridge.conf`. The QEMU bridge helper
 # (qemu-bridge-helper) reads this file to decide which bridges

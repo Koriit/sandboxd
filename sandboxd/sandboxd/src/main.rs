@@ -2155,6 +2155,23 @@ async fn create_session(
         }};
     }
 
+    // macOS lite path: sandbox containers run inside the gateway Lima VM.
+    // The create flow is entirely different from both the Linux container path
+    // (which creates host Docker bridge + host gateway) and the macOS Lima path
+    // (which creates a QEMU VM). Return immediately from the dedicated function.
+    #[cfg(target_os = "macos")]
+    if backend_kind == BackendKind::Container {
+        return create_session_macos_lite(
+            session_id,
+            config.clone(),
+            operator.clone(),
+            req.clone(),
+            warnings.clone(),
+            state,
+        )
+        .await;
+    }
+
     if backend_kind == BackendKind::Container {
         // ---- Container backend: lightweight create + start + gateway wiring ----
         //
@@ -4372,6 +4389,950 @@ async fn create_session_macos_lima(
     (StatusCode::CREATED, Json(dto)).into_response()
 }
 
+/// macOS lite create: container session inside the gateway Lima VM.
+///
+/// Sandbox containers run inside the `sandboxd-gateway` Lima VM over its
+/// forwarded Docker socket. No QEMU session VM is created; no NIC slot is
+/// consumed. The lite-mode create flow mirrors the Linux container path
+/// (create_network → register_session → docker create → docker start →
+/// gateway setup → Running) with three macOS-specific differences:
+///
+/// 1. Network: an internal Docker bridge is created INSIDE the gateway VM
+///    via the forwarded socket (not a host bridge, not a macvlan).
+/// 2. Route-helper: invoked inside the gateway VM via `limactl shell …
+///    sudo sandbox-route-helper --vm-gateway-mode` (not a host subprocess).
+/// 3. Pool: claims a session-count token but NO NIC slot.
+///
+/// Egress interception is byte-for-byte identical to Linux from the
+/// container's perspective: the per-session gateway container runs the same
+/// Envoy + mitmproxy + CoreDNS + nft pipeline.
+#[cfg(target_os = "macos")]
+async fn create_session_macos_lite(
+    session_id: sandbox_core::SessionId,
+    config: sandbox_core::SessionConfig,
+    operator: OperatorIdentity,
+    req: CreateSessionRequest,
+    warnings: Vec<String>,
+    state: Arc<AppState>,
+) -> axum::response::Response {
+    use sandbox_core::backend::inspect_container_pid_via_socket;
+    use sandbox_core::gateway::gateway_image_tag_for_daemon;
+    use sandbox_core::lite_macos::{
+        SharedPathError, build_in_vm_route_helper_argv, lite_shared_root, validate_shared_path,
+    };
+    use sandbox_core::macos_session::setup_macos_lite_gateway;
+
+    let vmnet_pool = state.vmnet_pool.clone();
+    let gateway_docker_socket = state
+        .gateway_lima_manager
+        .gateway_docker_socket()
+        .to_path_buf();
+
+    // Step 1: claim a session-count token (no NIC slot).
+    {
+        let pool = vmnet_pool.clone();
+        match tokio::task::spawn_blocking(move || pool.claim_lite_token()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Step 2: generate per-session CA.
+    // On any error from here on, release the lite token + mark Error.
+    let ca_dir = {
+        let base_dir = state.base_dir.clone();
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || CaManager::generate_session_ca(&base_dir, &sid))
+            .await
+        {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(e)) => {
+                let _ = vmnet_pool.release_lite_token();
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = vmnet_pool.release_lite_token();
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    };
+
+    // Step 3: create a Docker bridge network inside the gateway VM.
+    // Uses the same /28 allocator as the Linux path but directs docker
+    // to the forwarded gateway socket so the bridge lives inside the VM.
+    // On error: release token + remove CA + mark Error.
+    let network_info = {
+        let network = state.network.clone();
+        let sid = session_id;
+        let sock = gateway_docker_socket.clone();
+        match tokio::task::spawn_blocking(move || {
+            network.create_network_on_socket(&sid, Some(&sock))
+        })
+        .await
+        {
+            Ok(Ok(info)) => info,
+            Ok(Err(e)) => {
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    };
+
+    // Persist network info. Lite sessions have no vmnet_slot.
+    // On error: delete network + remove CA + release token + mark Error.
+    if let Err(e) = state
+        .store
+        .set_network_info(&session_id, &operator.name, &network_info)
+    {
+        let _ = state.network.delete_network(&session_id);
+        let _ = vmnet_pool.release_lite_token();
+        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+        let _ = state
+            .store
+            .update_state(&session_id, &operator.name, SessionState::Error);
+        return error_response(e).into_response();
+    }
+
+    // Step 4: resolve workspace bind (shared: requires path validation).
+    // On error: delete network + remove CA + release token + mark Error.
+    let workspace_bind = match &config.workspace_mode {
+        Some(sandbox_core::WorkspaceMode::Shared {
+            host_path,
+            guest_path,
+            security_model,
+        }) => {
+            if security_model.is_some() {
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::InvalidArgument(
+                    "security_model is not supported by the container \
+                     backend (9p-only concept); omit the :<model> token \
+                     from --workspace shared:…"
+                        .to_string(),
+                ))
+                .into_response();
+            }
+            // Validate that the host path falls under the configured
+            // lite shared root. The gateway VM only mounts that root via
+            // the 9p stanza added to the gateway template.
+            let shared_root = lite_shared_root();
+            let hp = std::path::PathBuf::from(host_path);
+            if let Err(SharedPathError::OutsideRoot { .. }) =
+                validate_shared_path(&hp, &shared_root)
+            {
+                // Warn operators about the TCC asymmetry: _sandbox does the read.
+                warn!(
+                    session_id = %session_id,
+                    host_path = %hp.display(),
+                    shared_root = %shared_root.display(),
+                    "lite shared: path outside configured shared root — \
+                     move workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
+                     Note: lite shared: is read by _sandbox (the gateway VM user), \
+                     not the operator; TCC consent from the operator does not apply."
+                );
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::InvalidArgument(format!(
+                    "lite shared: path {} is outside the configured shared root {} — \
+                     move the workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
+                     Note: lite shared: access runs as _sandbox (not the operator); \
+                     sources in TCC-protected directories (Desktop, Documents, Downloads) \
+                     are not readable.",
+                    hp.display(),
+                    shared_root.display()
+                )))
+                .into_response();
+            }
+            // Emit a warning about the _sandbox TCC asymmetry for all
+            // lite shared: sessions so operators are informed.
+            warn!(
+                session_id = %session_id,
+                host_path = %hp.display(),
+                "lite shared: workspace — access runs as _sandbox (gateway VM user), \
+                 not the operator. Ensure the source is readable by _sandbox and \
+                 outside TCC-protected directories (Desktop, Documents, Downloads)."
+            );
+            Some(sandbox_core::backend::WorkspaceBind {
+                host_path: hp,
+                guest_path: std::path::PathBuf::from(guest_path),
+            })
+        }
+        _ => None,
+    };
+
+    // Step 5: stage SSH credentials.
+    // On error: delete network + remove CA + release token + mark Error.
+    let ssh_host_dir = state
+        .base_dir
+        .join("sessions")
+        .join(session_id.as_str())
+        .join("ssh");
+    let ssh_keypair_for_staging = match sandbox_core::SshKeypair::generate(session_id.as_str()) {
+        Ok(kp) => kp,
+        Err(e) => {
+            let _ = state.network.delete_network(&session_id);
+            let _ = vmnet_pool.release_lite_token();
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(e).into_response();
+        }
+    };
+    {
+        let ssh_host_dir_owned = ssh_host_dir.clone();
+        let kp_owned = ssh_keypair_for_staging.clone();
+        let operator_uid = operator.uid;
+        let operator_gid = operator.gid;
+        let stage_result = tokio::task::spawn_blocking(move || {
+            sandbox_core::backend::stage_ssh_credentials(
+                &ssh_host_dir_owned,
+                &kp_owned,
+                operator_uid,
+                operator_gid,
+            )
+        })
+        .await;
+        match stage_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "spawn_blocking join failed staging ssh credentials: {e}"
+                )))
+                .into_response();
+            }
+        }
+    }
+    if let Err(e) =
+        state
+            .store
+            .set_ssh_keypair(&session_id, &operator.name, &ssh_keypair_for_staging)
+    {
+        let _ = state.network.delete_network(&session_id);
+        let _ = vmnet_pool.release_lite_token();
+        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+        let _ = state
+            .store
+            .update_state(&session_id, &operator.name, SessionState::Error);
+        return error_response(e).into_response();
+    }
+
+    // Step 6: parse network addresses and register ContainerNetwork with the runtime.
+    // route_helper_path is None — the in-VM route helper is invoked
+    // separately after docker start (not via the path-based helper).
+    let container_ip: std::net::IpAddr = match network_info.vm_ip.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            let _ = state.network.delete_network(&session_id);
+            let _ = vmnet_pool.release_lite_token();
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(SandboxError::Internal(format!(
+                "vm_ip {:?} not parseable as IP: {e}",
+                network_info.vm_ip
+            )))
+            .into_response();
+        }
+    };
+    let gateway_ip_addr: std::net::IpAddr = match network_info.gateway_ip.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            let _ = state.network.delete_network(&session_id);
+            let _ = vmnet_pool.release_lite_token();
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(SandboxError::Internal(format!(
+                "gateway_ip {:?} not parseable as IP: {e}",
+                network_info.gateway_ip
+            )))
+            .into_response();
+        }
+    };
+    let container_network = sandbox_core::backend::ContainerNetwork {
+        docker_network: network_info.docker_network_name.clone(),
+        container_ip,
+        gateway_ip: gateway_ip_addr,
+        workspace_bind,
+        // route_helper_path is None: the in-VM helper is invoked directly
+        // via limactl shell after docker start, not via the path-based seam.
+        route_helper_path: None,
+        ca_host_path: Some(ca_dir.join("cert.pem")),
+        ssh_host_dir: Some(ssh_host_dir),
+        operator_identity: Some((operator.uid, operator.gid)),
+        owner_pool: Some(format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        )),
+    };
+    state
+        .container_runtime
+        .register_session(session_id, container_network);
+
+    // Step 7: docker create (via ContainerRuntime, forwarded socket already wired).
+    // On error: delete container + delete network + remove CA + release token + mark Error.
+    {
+        let runtime = runtime_for(&state, BackendKind::Container);
+        let spec = session_spec_from_config(
+            &config,
+            BackendKind::Container,
+            None,
+            Some((operator.uid, operator.gid)),
+        );
+        match runtime.create(&session_id, &spec).await {
+            Ok(_) => {}
+            Err(e) => {
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+        }
+    }
+
+    // Step 8: docker start.
+    // On error: delete container + delete network + remove CA + release token + mark Error.
+    let handle = RuntimeHandle::from_session_id(&session_id);
+    {
+        let runtime = runtime_for(&state, BackendKind::Container);
+        // route_helper_path is None on ContainerNetwork, so the runtime skips
+        // invoke_route_helper. Route installation happens in step 9 via the
+        // in-VM helper.
+        let args = RuntimeStartArgs {
+            lima_bridge: None,
+            lima_mac: None,
+            lima_config: None,
+            for_user: Some(operator.name.clone()),
+            operator_identity: Some((operator.uid, operator.gid)),
+            lima_unrestricted_slirp_for_provisioning: false,
+        };
+        match runtime.start(&handle, &args).await {
+            Ok(()) => {}
+            Err(e) => {
+                let runtime2 = runtime_for(&state, BackendKind::Container);
+                let _ = runtime2.delete(&handle, operator.uid).await;
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+        }
+    }
+
+    // Step 9: in-VM route helper — install the default route inside the
+    // sandbox container's netns, pointing at the per-session gateway IP.
+    // This runs inside the gateway VM via limactl shell.
+    // On error: delete container + delete network + remove CA + release token + mark Error.
+    {
+        let container_name = format!("sandbox-{session_id}");
+        // Get the container's PID as seen from inside the gateway VM.
+        let vm_pid = match inspect_container_pid_via_socket(
+            &container_name,
+            Some(gateway_docker_socket.clone()),
+        )
+        .await
+        {
+            Ok(pid) => pid,
+            Err(e) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime.delete(&handle, operator.uid).await;
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Network(format!(
+                    "failed to inspect container pid for in-VM route helper: {e}"
+                )))
+                .into_response();
+            }
+        };
+        let argv = build_in_vm_route_helper_argv(
+            sandbox_core::GATEWAY_INSTANCE_NAME,
+            vm_pid,
+            gateway_ip_addr,
+        );
+        let glm = state.gateway_lima_manager.clone();
+        match tokio::task::spawn_blocking(move || glm.run_gateway_shell_argv(&argv)).await {
+            Ok(Ok(output)) if output.status.success() => {
+                debug!(session_id = %session_id, "in-VM route helper succeeded");
+            }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime.delete(&handle, operator.uid).await;
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Network(format!(
+                    "in-VM sandbox-route-helper denied: {}",
+                    stderr.trim()
+                )))
+                .into_response();
+            }
+            Ok(Err(e)) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime.delete(&handle, operator.uid).await;
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Network(format!(
+                    "in-VM route helper invocation failed: {e}"
+                )))
+                .into_response();
+            }
+            Err(e) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime.delete(&handle, operator.uid).await;
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error in in-VM route helper: {e}"
+                )))
+                .into_response();
+            }
+        }
+    }
+
+    // Step 10: sshd-readiness probe (same as Linux container path).
+    // Non-fatal: a probe failure leaves sshd_ready as None but does not
+    // abort the session — the container is already running.
+    {
+        let container_name = format!("sandbox-{session_id}");
+        let probe_result =
+            tokio::task::spawn_blocking(move || probe_container_sshd_ready(&container_name)).await;
+        let ready_opt: Option<bool> = match probe_result {
+            Ok(Ok(ready)) => Some(ready),
+            Ok(Err(e)) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "sshd-readiness probe failed; sshd_ready left as None"
+                );
+                None
+            }
+            Err(join_err) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %join_err,
+                    "sshd-readiness probe task panicked; sshd_ready left as None"
+                );
+                None
+            }
+        };
+        if let Some(ready) = ready_opt {
+            if let Err(e) = state.store.set_sshd_ready(&session_id, ready) {
+                warn!(session_id = %session_id, error = %e, "failed to persist sshd_ready");
+            }
+        }
+    }
+
+    // Step 11: gateway setup (deny-all + health + DNAT) inside the gateway VM.
+    // The bridge was created in step 3; setup_macos_lite_gateway attaches
+    // the gateway container's second NIC via `docker network connect --ip`.
+    // On error: stop gateway (best-effort) + delete container + delete network
+    //           + remove CA + release token + mark Error.
+    {
+        let ni = network_info.clone();
+        let dns = compute_initial_dns_policy(&req);
+        let owner_pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
+        let ca = ca_dir.clone();
+        let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+        let sid = session_id;
+        let gateway_sock = gateway_docker_socket.clone();
+        match tokio::task::spawn_blocking(move || {
+            setup_macos_lite_gateway(
+                &sid,
+                &ni,
+                &gateway_sock,
+                &gateway_tag,
+                Some(&ca),
+                Some(&dns),
+                Some(&owner_pool),
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // Best-effort: stop gateway container (may not have started yet).
+                let gw = sandbox_core::GatewayManager::with_gateway_socket(
+                    gateway_docker_socket.clone(),
+                );
+                let _ = gw.stop_gateway(&session_id);
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime.delete(&handle, operator.uid).await;
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime.delete(&handle, operator.uid).await;
+                let _ = state.network.delete_network(&session_id);
+                let _ = vmnet_pool.release_lite_token();
+                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
+    // Step 12: event bus registration + IP binding.
+    state.event_bus.register_session(session_id);
+    state
+        .event_bus
+        .publish(lifecycle_events::gateway_booting(session_id));
+    if let Ok(ip) = network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
+        state.vm_ip_map.bind(ip, session_id);
+    }
+
+    // Step 13: mark Running.
+    if let Err(e) = state
+        .store
+        .update_state(&session_id, &operator.name, SessionState::Running)
+    {
+        let gw = sandbox_core::GatewayManager::with_gateway_socket(gateway_docker_socket.clone());
+        let _ = gw.stop_gateway(&session_id);
+        let runtime = runtime_for(&state, BackendKind::Container);
+        let _ = runtime.delete(&handle, operator.uid).await;
+        let _ = state.network.delete_network(&session_id);
+        let _ = vmnet_pool.release_lite_token();
+        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+        let _ = state
+            .store
+            .update_state(&session_id, &operator.name, SessionState::Error);
+        return error_response(e).into_response();
+    }
+
+    // Spawn DNS propagation, gate listener, and session ingestor.
+    start_dns_propagation_loop(&session_id, &state).await;
+    start_dns_gate_listener(&session_id, &state).await;
+    spawn_session_ingestor(&session_id, &state).await;
+
+    // Build response DTO.
+    let created = match state.store.get_session(&session_id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(session_id.to_string()))
+                .into_response();
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+    let agent_status = probe_agent_status(&state, &created).await;
+    let gateway_status = probe_gateway_status(&state, &created).await;
+    let policy_opt = {
+        state
+            .session_policies
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+    };
+    let dto = SessionDto::from(&created)
+        .with_status(agent_status, gateway_status)
+        .with_policy(policy_opt.as_ref())
+        .with_warnings(warnings);
+    (StatusCode::CREATED, Json(dto)).into_response()
+}
+
+/// macOS lite Container start (restart): socket-aware bridge + gateway recreate + route-helper.
+///
+/// A stopped lite session retains its per-session bridge network info in the DB.
+/// On restart the sequence mirrors the create path's egress-ordering invariant:
+///
+/// 1. Recreate the Docker bridge inside the gateway VM (socket-aware).
+/// 2. Recreate the per-session gateway container with deny-all/health/DNAT wired
+///    before the sandbox container starts (gateway-before-container).
+/// 3. Start the sandbox container.
+/// 4. Re-invoke the in-VM route-helper so the container's default route points at
+///    the per-session gateway — not the Docker bridge gateway.
+///
+/// Steps 1–2 run before `runtime.start` to match the create-path ordering.
+/// The pre-existing narrow window between docker-start and route-helper is unavoidable.
+#[cfg(target_os = "macos")]
+async fn start_session_macos_lite(
+    session: Session,
+    needs_refresh: bool,
+    operator: OperatorIdentity,
+    state: Arc<AppState>,
+) -> axum::response::Response {
+    use sandbox_core::backend::inspect_container_pid_via_socket;
+    use sandbox_core::lite_macos::build_in_vm_route_helper_argv;
+
+    let session_id = session.id;
+    let gateway_docker_socket = state
+        .gateway_lima_manager
+        .gateway_docker_socket()
+        .to_path_buf();
+
+    // Step 1: Recreate the per-session Docker bridge network inside the gateway VM.
+    // This is a no-op if the network already exists; if it was removed on stop, it
+    // is recreated with the original subnet.
+    {
+        let network = state.network.clone();
+        let sock = gateway_docker_socket.clone();
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || {
+            network.ensure_network_on_socket(&sid, Some(&sock))
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error ensuring lite network: {e}"
+                )))
+                .into_response();
+            }
+        }
+    }
+
+    // Step 2: Recreate the gateway container (with deny-all/health/DNAT) before
+    // starting the sandbox container. This preserves the create-path ordering:
+    // egress is intercepted by the gateway before the sandbox container goes live.
+    // restore_session_networking_lite also respawns the ingestor and DNS-gate listener.
+    if let Err(e) = restore_session_networking_lite(&session_id, &operator.name, &state).await {
+        error!(
+            session_id = %session_id,
+            error = %e,
+            "lite gateway recreate failed before container start"
+        );
+        let _ = state
+            .store
+            .update_state(&session_id, &operator.name, SessionState::Error);
+        return error_response(e).into_response();
+    }
+
+    // Step 3: Start the sandbox container. route_helper_path is None on the
+    // ContainerNetwork for macOS lite — the in-VM route-helper (step 4) takes
+    // over from here, exactly as in the create path.
+    let handle = RuntimeHandle::from_session_id(&session_id);
+    {
+        let runtime = runtime_for(&state, BackendKind::Container);
+        let args = RuntimeStartArgs {
+            lima_bridge: None,
+            lima_mac: None,
+            lima_config: None,
+            for_user: Some(operator.name.clone()),
+            operator_identity: match (session.operator_uid, session.operator_gid) {
+                (Some(uid), Some(gid)) => Some((uid, gid)),
+                _ => None,
+            },
+            lima_unrestricted_slirp_for_provisioning: false,
+        };
+        match runtime.start(&handle, &args).await {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                // Best-effort: tear down the gateway we just created.
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(e).into_response();
+            }
+        }
+    }
+
+    // Step 4: Re-invoke the in-VM route-helper so the container's default route
+    // points at the per-session gateway. Until this succeeds, the container's
+    // egress uses the Docker bridge gateway (the same narrow pre-existing window
+    // that exists on the create path between docker-start and the route-helper).
+    {
+        let container_name = format!("sandbox-{session_id}");
+        let vm_pid = match inspect_container_pid_via_socket(
+            &container_name,
+            Some(gateway_docker_socket.clone()),
+        )
+        .await
+        {
+            Ok(pid) => pid,
+            Err(e) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime
+                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
+                    .await;
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(SandboxError::Network(format!(
+                    "failed to inspect container pid for in-VM route helper on restart: {e}"
+                )))
+                .into_response();
+            }
+        };
+
+        // Obtain the gateway IP from the persisted network info.
+        let gateway_ip: std::net::IpAddr = match state
+            .store
+            .get_network_info(&session_id, &operator.name)
+        {
+            Ok(Some(ni)) => match ni.gateway_ip.parse() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    let runtime = runtime_for(&state, BackendKind::Container);
+                    let _ = runtime
+                        .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
+                        .await;
+                    let _ =
+                        state
+                            .store
+                            .update_state(&session_id, &operator.name, SessionState::Error);
+                    teardown_session_networking(&session_id, &state).await;
+                    return error_response(SandboxError::Internal(format!(
+                        "gateway_ip from network info is not a valid IP: {e}"
+                    )))
+                    .into_response();
+                }
+            },
+            Ok(None) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime
+                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
+                    .await;
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(SandboxError::Internal(
+                    "no network info in DB for lite session restart route-helper".into(),
+                ))
+                .into_response();
+            }
+            Err(e) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime
+                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
+                    .await;
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(e).into_response();
+            }
+        };
+
+        let argv =
+            build_in_vm_route_helper_argv(sandbox_core::GATEWAY_INSTANCE_NAME, vm_pid, gateway_ip);
+        let glm = state.gateway_lima_manager.clone();
+        match tokio::task::spawn_blocking(move || glm.run_gateway_shell_argv(&argv)).await {
+            Ok(Ok(output)) if output.status.success() => {
+                debug!(session_id = %session_id, "in-VM route helper succeeded on restart");
+            }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime
+                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
+                    .await;
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(SandboxError::Network(format!(
+                    "in-VM sandbox-route-helper denied on restart: {}",
+                    stderr.trim()
+                )))
+                .into_response();
+            }
+            Ok(Err(e)) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime
+                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
+                    .await;
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(SandboxError::Network(format!(
+                    "in-VM route helper invocation failed on restart: {e}"
+                )))
+                .into_response();
+            }
+            Err(e) => {
+                let runtime = runtime_for(&state, BackendKind::Container);
+                let _ = runtime
+                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
+                    .await;
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
+                teardown_session_networking(&session_id, &state).await;
+                return error_response(SandboxError::Internal(format!(
+                    "task join error in in-VM route helper on restart: {e}"
+                )))
+                .into_response();
+            }
+        }
+    }
+
+    // Step 5: Verify the guest agent is responsive.
+    match state.guest.ping(&session_id).await {
+        Ok(true) => {
+            info!(session_id = %session_id, "guest agent responsive after lite restart");
+        }
+        Ok(false) => {
+            let e = SandboxError::Internal(
+                "guest agent ping: unexpected response after lite restart".into(),
+            );
+            error!(session_id = %session_id, "guest agent ping: unexpected response");
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(e).into_response();
+        }
+        Err(e) => {
+            error!(session_id = %session_id, error = %e, "guest agent ping failed after lite restart");
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(e).into_response();
+        }
+    }
+
+    // Step 6: Mark Running.
+    if let Err(e) = state
+        .store
+        .update_state(&session_id, &operator.name, SessionState::Running)
+    {
+        return error_response(e).into_response();
+    }
+
+    // Step 7: Atomically stamp updated guest versions if a refresh ran.
+    if needs_refresh {
+        if let Err(e) = state.store.update_guest_versions(
+            &operator.name,
+            &session_id,
+            sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+            sandbox_core::guest::SANDBOX_GUEST_VERSION,
+        ) {
+            error!(
+                session_id = %session_id,
+                error = %e,
+                "update_guest_versions failed after lite restart; \
+                 next start_session will re-run refresh idempotently"
+            );
+        }
+    }
+
+    let refreshed = match state.store.get_session(&session_id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(session_id.to_string()))
+                .into_response();
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    let agent_status = probe_agent_status(&state, &refreshed).await;
+    let gateway_status = probe_gateway_status(&state, &refreshed).await;
+    let policy_opt = {
+        let policies = state.session_policies.lock().await;
+        policies.get(&refreshed.id).cloned()
+    };
+    let dto = SessionDto::from(&refreshed)
+        .with_status(agent_status, gateway_status)
+        .with_policy(policy_opt.as_ref());
+    (StatusCode::OK, Json(dto)).into_response()
+}
+
 /// macOS Lima start (resume): fresh slot claim + YAML rewrite + gateway-before-VM.
 ///
 /// Slots are not sticky across stop/start. A fresh slot is claimed, the sandbox
@@ -5038,12 +5999,20 @@ async fn start_session(
     info!(session_id = %session.id, "starting session");
 
     // macOS full-backend Lima: fresh slot claim + gateway-before-VM.
+    // macOS lite Container: socket-aware bridge + gateway recreate + route-helper.
     // Linux Lima and Container backends use the existing bridge-ensure path below.
     #[cfg(target_os = "macos")]
     if session.backend == BackendKind::Lima {
         // Clone session/operator so the Container path (below) remains
         // borrow-checker-valid on macOS. The Lima path returns immediately.
         return start_session_macos_lima(session.clone(), needs_refresh, operator.clone(), state)
+            .await;
+    }
+    #[cfg(target_os = "macos")]
+    if session.backend == BackendKind::Container {
+        // macOS lite restart: gateway is inside the gateway VM — cannot use the
+        // generic bridge-ensure or restore path (both target host Docker).
+        return start_session_macos_lite(session.clone(), needs_refresh, operator.clone(), state)
             .await;
     }
 
@@ -5353,14 +6322,29 @@ async fn stop_session(
             })
             .await;
         } else {
-            // Container backend on macOS: use host Docker (same as Linux).
-            let gateway = state.gateway.clone();
+            // Container (lite) backend on macOS: containers run inside the
+            // gateway VM. Tear down gateway + network via the forwarded socket.
+            //
+            // The session-count token is NOT released here. A stopped lite
+            // session retains its token so that a subsequent start needs no
+            // re-claim. The token is released only on remove_session (full
+            // cleanup), mirroring the Linux stop behavior where no token
+            // release happens on stop. Releasing on stop without re-claiming
+            // on start would cause the pool count to drift downward with each
+            // stop/start cycle, allowing over-admission.
+            let gateway_docker_socket = state
+                .gateway_lima_manager
+                .gateway_docker_socket()
+                .to_path_buf();
             let network = state.network.clone();
             let sid = session.id;
             let _ = tokio::task::spawn_blocking(move || {
-                debug!(session_id = %sid, "tearing down container session networking (macOS)");
-                if let Err(e) = gateway.stop_gateway(&sid) {
-                    warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+                debug!(session_id = %sid, "tearing down lite container session networking (macOS)");
+                // Use the forwarded-socket gateway manager so stop_gateway
+                // targets the gateway VM's Docker daemon, not the host.
+                let gw = sandbox_core::GatewayManager::with_gateway_socket(gateway_docker_socket);
+                if let Err(e) = gw.stop_gateway(&sid) {
+                    warn!(%sid, error = %e, "failed to stop lite gateway (best-effort)");
                 }
                 if let Err(e) = network.remove_docker_network(&sid) {
                     warn!(%sid, error = %e, "failed to remove Docker network (best-effort)");
@@ -5553,21 +6537,31 @@ async fn remove_session(
                 })
                 .await;
             } else {
-                // Container backend on macOS: use host Docker.
-                let gateway = state.gateway.clone();
+                // Container (lite) backend on macOS: tear down via forwarded
+                // gateway socket + release the session-count token.
+                let gateway_docker_socket = state
+                    .gateway_lima_manager
+                    .gateway_docker_socket()
+                    .to_path_buf();
+                let vmnet_pool = state.vmnet_pool.clone();
                 let network = state.network.clone();
                 let base_dir = state.base_dir.clone();
                 let sid = session.id;
                 let _ = tokio::task::spawn_blocking(move || {
-                    debug!(session_id = %sid, "tearing down container session networking (macOS, full cleanup)");
-                    if let Err(e) = gateway.stop_gateway(&sid) {
-                        warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+                    debug!(session_id = %sid, "tearing down lite container session networking (macOS, full cleanup)");
+                    let gw =
+                        sandbox_core::GatewayManager::with_gateway_socket(gateway_docker_socket);
+                    if let Err(e) = gw.stop_gateway(&sid) {
+                        warn!(%sid, error = %e, "failed to stop lite gateway (best-effort)");
                     }
                     if let Err(e) = network.delete_network(&sid) {
                         warn!(%sid, error = %e, "failed to delete network (best-effort)");
                     }
                     if let Err(e) = CaManager::remove_session_ca(&base_dir, &sid) {
                         warn!(%sid, error = %e, "failed to remove session CA (best-effort)");
+                    }
+                    if let Err(e) = vmnet_pool.release_lite_token() {
+                        warn!(%sid, error = %e, "lite token release failed (best-effort)");
                     }
                 })
                 .await;
@@ -7936,7 +8930,21 @@ async fn restore_session_networking_lite(
         .publish(lifecycle_events::gateway_booting(*session_id));
 
     // 3. Recreate the gateway container.
+    //
+    // On macOS, lite-mode gateway containers run inside the gateway VM.
+    // The GatewayManager must target the forwarded socket so the docker
+    // calls reach the gateway VM's daemon rather than the macOS host.
+    // On Linux, use the host GatewayManager as-is.
     {
+        #[cfg(target_os = "macos")]
+        let gw = {
+            let sock = state
+                .gateway_lima_manager
+                .gateway_docker_socket()
+                .to_path_buf();
+            Arc::new(sandbox_core::GatewayManager::with_gateway_socket(sock))
+        };
+        #[cfg(not(target_os = "macos"))]
         let gw = state.gateway.clone();
         let sid = *session_id;
         let ni = network_info.clone();
@@ -9521,32 +10529,39 @@ async fn restore_macos_pool_state(state: &AppState) {
     // Collect (session_id, NetworkInfo) for sessions that have a vmnet_slot.
     let mut running_infos: Vec<(sandbox_core::SessionId, sandbox_core::NetworkInfo)> = Vec::new();
     let mut leaked_sessions: Vec<sandbox_core::SessionId> = Vec::new();
+    // Count running lite (container-backend) sessions to restore lite tokens.
+    let mut running_lite_count: u32 = 0;
 
     for session in &sessions {
-        if session.backend != BackendKind::Lima {
-            continue;
-        }
-        let info = match state.store.get_network_info_unfiltered(&session.id) {
-            Ok(Some(i)) => i,
-            Ok(None) | Err(_) => continue,
-        };
-        if info.vmnet_slot.is_none() {
-            continue;
-        }
-        match session.state {
-            SessionState::Running => {
-                running_infos.push((session.id, info));
+        if session.backend == BackendKind::Lima {
+            let info = match state.store.get_network_info_unfiltered(&session.id) {
+                Ok(Some(i)) => i,
+                Ok(None) | Err(_) => continue,
+            };
+            if info.vmnet_slot.is_none() {
+                continue;
             }
-            _ => {
-                // Non-running session holds a slot — leak candidate.
-                // Attempt release (best-effort; slot may not be in pool yet).
-                leaked_sessions.push(session.id);
-                let _ = state.vmnet_pool.release_lima_slot(&session.id);
+            match session.state {
+                SessionState::Running => {
+                    running_infos.push((session.id, info));
+                }
+                _ => {
+                    // Non-running session holds a slot — leak candidate.
+                    leaked_sessions.push(session.id);
+                    let _ = state.vmnet_pool.release_lima_slot(&session.id);
+                }
+            }
+        } else if session.backend == BackendKind::Container {
+            // Lite sessions hold a session-count token but no NIC slot.
+            // restore_from_infos does not count them, so we track them here
+            // and call restore_lite_tokens below to keep the cap honest.
+            if session.state == SessionState::Running {
+                running_lite_count += 1;
             }
         }
     }
 
-    // Step 7: restore pool state from running sessions.
+    // Step 7: restore pool state from running Lima sessions.
     if !running_infos.is_empty() {
         let pool = state.vmnet_pool.clone();
         let infos_for_restore = running_infos.clone();
@@ -9556,7 +10571,7 @@ async fn restore_macos_pool_state(state: &AppState) {
             Ok(Ok(())) => {
                 info!(
                     count = running_infos.len(),
-                    "macOS startup step 7: pool state restored from running sessions"
+                    "macOS startup step 7: pool state restored from running Lima sessions"
                 );
             }
             Ok(Err(e)) => {
@@ -9574,8 +10589,37 @@ async fn restore_macos_pool_state(state: &AppState) {
         }
     }
 
+    // Restore lite session-count tokens. Without this the cap under-counts
+    // after a daemon restart until running lite sessions are explicitly stopped.
+    if running_lite_count > 0 {
+        let pool = state.vmnet_pool.clone();
+        let n = running_lite_count;
+        let result = tokio::task::spawn_blocking(move || pool.restore_lite_tokens(n)).await;
+        match result {
+            Ok(Ok(())) => {
+                info!(
+                    count = running_lite_count,
+                    "macOS startup: lite session-count tokens restored"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    error = %e,
+                    "macOS startup: lite token restore error (non-fatal; pool may under-count)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "macOS startup: lite token restore task panicked (non-fatal)"
+                );
+            }
+        }
+    }
+
     info!(
-        running_restored = running_infos.len(),
+        running_lima_restored = running_infos.len(),
+        running_lite_restored = running_lite_count,
         leaked_released = leaked_sessions.len(),
         "macOS pool restore complete"
     );
@@ -11202,6 +12246,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // atomically renames the libexec file, so the bind-mount source is
     // always coherent without a daemon-side staging step.
     let guest_bind_source = sandbox_core::guest_agent_path()?;
+    // On macOS, sandbox containers run inside the gateway Lima VM's Docker daemon,
+    // so every docker call must be directed to the forwarded gateway socket.
+    // The with_macos_socket constructor wires that forwarding into the runtime.
+    // base_dir serves as the docker_home so the docker build client can write its
+    // config dir to a writable daemon-owned path.
+    #[cfg(target_os = "macos")]
+    let container_runtime = {
+        let gateway_sock = gateway_lima_manager.gateway_docker_socket().to_path_buf();
+        ContainerRuntime::with_macos_socket(
+            lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
+            default_memory_mb,
+            default_cpus,
+            container_uid,
+            container_gid,
+            &guest_bind_source,
+            gateway_sock,
+            base_dir.clone(),
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
     let container_runtime = ContainerRuntime::new(
         lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
         default_memory_mb,

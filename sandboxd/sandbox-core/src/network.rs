@@ -305,6 +305,28 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// Create a Docker bridge network for the given session, optionally
+    /// targeting a forwarded Docker socket.
+    ///
+    /// Allocates a /28 subnet from the daemon's pool, shells out to
+    /// `docker [-H unix://<socket>] network create --driver bridge`, and
+    /// returns the resulting `NetworkInfo`.
+    ///
+    /// `docker_socket` is `None` on Linux (host docker daemon, unchanged) and
+    /// `Some(path)` on macOS lite-mode (forwarded gateway-VM socket). When
+    /// `Some`, `-H unix://<path>` is prepended so the bridge is created inside
+    /// the gateway VM rather than on the macOS host.
+    ///
+    /// If Docker reports a subnet pool overlap (stale network from a previous
+    /// daemon), the allocator advances to the next block and retries.
+    pub fn create_network_on_socket(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<NetworkInfo, SandboxError> {
+        self.create_network_inner(session_id, docker_socket)
+    }
+
     /// Create a Docker bridge network for the given session.
     ///
     /// Allocates a /28 subnet, shells out to `docker network create`, and
@@ -313,6 +335,14 @@ impl NetworkManager {
     /// If Docker reports a subnet pool overlap (stale network from a previous
     /// daemon), the allocator advances to the next block and retries.
     pub fn create_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
+        self.create_network_inner(session_id, None)
+    }
+
+    fn create_network_inner(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<NetworkInfo, SandboxError> {
         // Check if the session already has a network.
         {
             let nets = self
@@ -361,31 +391,38 @@ impl NetworkManager {
             );
 
             let owner_label = format!("sandboxd.owner={}", self.owner_pool);
-            let output = run_with_timeout(
-                Command::new("docker").args([
-                    "network",
-                    "create",
-                    "--driver",
-                    "bridge",
-                    "--subnet",
-                    &subnet,
-                    "--label",
-                    &format!("sandbox.session_id={session_id}"),
-                    "--label",
-                    &owner_label,
-                    "--opt",
-                    &format!("com.docker.network.bridge.name={bridge_name}"),
-                    &docker_network_name,
-                ]),
-                CREATE_NETWORK_TIMEOUT,
-                "docker network create",
-            )
-            .map_err(|e| match e {
-                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                    SandboxError::Network(format!("failed to run docker network create: {msg}"))
-                }
-                other => other,
-            })?;
+            let mut cmd = Command::new("docker");
+            // When docker_socket is Some, direct the docker client to the
+            // forwarded gateway-VM socket (macOS lite-mode). On Linux / host
+            // docker, docker_socket is None and no -H flag is prepended.
+            if let Some(sock) = docker_socket {
+                cmd.args(["-H", &format!("unix://{}", sock.display())]);
+            }
+            cmd.args([
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--subnet",
+                &subnet,
+                "--label",
+                &format!("sandbox.session_id={session_id}"),
+                "--label",
+                &owner_label,
+                "--opt",
+                &format!("com.docker.network.bridge.name={bridge_name}"),
+                &docker_network_name,
+            ]);
+            let output =
+                run_with_timeout(&mut cmd, CREATE_NETWORK_TIMEOUT, "docker network create")
+                    .map_err(|e| match e {
+                        SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                            SandboxError::Network(format!(
+                                "failed to run docker network create: {msg}"
+                            ))
+                        }
+                        other => other,
+                    })?;
 
             if output.status.success() {
                 let info = NetworkInfo {
@@ -535,7 +572,33 @@ impl NetworkManager {
     ///
     /// If the Docker network already exists, this is a no-op. If it was
     /// removed (e.g. during `stop`), it is recreated with the same subnet.
+    ///
+    /// On Linux this targets the host Docker daemon. For macOS lite-mode
+    /// sessions where the bridge lives inside the gateway VM, use
+    /// `ensure_network_on_socket` with the forwarded socket path.
     pub fn ensure_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
+        self.ensure_network_inner(session_id, None)
+    }
+
+    /// Socket-aware variant of `ensure_network`.
+    ///
+    /// When `docker_socket` is `Some`, the docker client is directed to that
+    /// forwarded socket (macOS lite-mode — the bridge lives inside the
+    /// gateway VM). When `docker_socket` is `None` this is byte-identical
+    /// to `ensure_network` and targets the host Docker daemon.
+    pub fn ensure_network_on_socket(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<NetworkInfo, SandboxError> {
+        self.ensure_network_inner(session_id, docker_socket)
+    }
+
+    fn ensure_network_inner(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<NetworkInfo, SandboxError> {
         let info = {
             let nets = self
                 .networks
@@ -551,8 +614,13 @@ impl NetworkManager {
         };
 
         // Check if the Docker network already exists.
+        let mut check_cmd = Command::new("docker");
+        if let Some(sock) = docker_socket {
+            check_cmd.args(["-H", &format!("unix://{}", sock.display())]);
+        }
+        check_cmd.args(["network", "inspect", &info.docker_network_name]);
         let check = run_with_timeout(
-            Command::new("docker").args(["network", "inspect", &info.docker_network_name]),
+            &mut check_cmd,
             INSPECT_NETWORK_TIMEOUT,
             "docker network inspect",
         )
@@ -581,20 +649,25 @@ impl NetworkManager {
             "recreating Docker bridge network"
         );
 
+        let mut create_cmd = Command::new("docker");
+        if let Some(sock) = docker_socket {
+            create_cmd.args(["-H", &format!("unix://{}", sock.display())]);
+        }
+        create_cmd.args([
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--subnet",
+            &info.subnet,
+            "--label",
+            &format!("sandbox.session_id={session_id}"),
+            "--opt",
+            &format!("com.docker.network.bridge.name={}", info.bridge_name),
+            &info.docker_network_name,
+        ]);
         let output = run_with_timeout(
-            Command::new("docker").args([
-                "network",
-                "create",
-                "--driver",
-                "bridge",
-                "--subnet",
-                &info.subnet,
-                "--label",
-                &format!("sandbox.session_id={session_id}"),
-                "--opt",
-                &format!("com.docker.network.bridge.name={}", info.bridge_name),
-                &info.docker_network_name,
-            ]),
+            &mut create_cmd,
             CREATE_NETWORK_TIMEOUT,
             "docker network create (ensure)",
         )
@@ -2199,6 +2272,63 @@ mod tests {
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("max concurrent sessions reached"));
+        }
+
+        // -- Lite stop/start token accounting --------------------------------
+        //
+        // A stopped lite session retains its token. Only remove (full cleanup)
+        // releases it. This mirrors Linux stop behavior and prevents pool drift
+        // across stop/start cycles.
+
+        #[test]
+        fn lite_token_retained_across_stop_start_no_drift() {
+            // Claim a lite token (simulate create).
+            let pool = VmnetPool::new(2);
+            pool.claim_lite_token().unwrap();
+            assert_eq!(pool.running_session_count(), 1);
+
+            // Stop does NOT release the token — the session is paused, not gone.
+            // No release_lite_token call here, matching the stop_session behavior.
+            assert_eq!(
+                pool.running_session_count(),
+                1,
+                "token must still be held after stop"
+            );
+
+            // Start also does NOT re-claim — the token was never released.
+            // Verify the pool cap is still enforced (the held token blocks a new one).
+            pool.claim_lite_token().unwrap(); // second session, still under cap=2
+            assert_eq!(pool.running_session_count(), 2);
+
+            // Third claim must fail — cap enforced by the retained first token.
+            let result = pool.claim_lite_token();
+            assert!(
+                result.is_err(),
+                "cap must be enforced by the retained stopped-session token"
+            );
+
+            // Remove (full cleanup) releases both tokens.
+            pool.release_lite_token().unwrap(); // remove first session
+            pool.release_lite_token().unwrap(); // remove second session
+            assert_eq!(pool.running_session_count(), 0);
+        }
+
+        #[test]
+        fn lite_token_stop_then_remove_single_release() {
+            // Verify that a single claim → stop (no release) → remove (release)
+            // cycle results in exactly one net release: count goes 1 → 0.
+            let pool = VmnetPool::new(4);
+            pool.claim_lite_token().unwrap();
+            assert_eq!(pool.running_session_count(), 1);
+
+            // stop: no release
+            // remove: one release
+            pool.release_lite_token().unwrap();
+            assert_eq!(pool.running_session_count(), 0);
+
+            // A new session can now be created — the slot is free.
+            pool.claim_lite_token().unwrap();
+            assert_eq!(pool.running_session_count(), 1);
         }
 
         // -- State restore ---------------------------------------------------
