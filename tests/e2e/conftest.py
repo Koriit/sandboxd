@@ -173,7 +173,17 @@ BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 # inside the prod daemon's /var/lib/sandboxd/<sandbox-uid>/ tree or the
 # legacy /var/lib/sandbox/. Created by `make setup-sandboxd-per-uid-state-dir`
 # (part of `make setup-dev-env`).
-_SANDBOX_TEST_UID: int = pwd.getpwnam("sandbox-test").pw_uid
+# Guarded for cross-platform import-safety: the ``sandbox-test`` system user
+# only exists on the Linux cross-user harness host. On hosts where it is
+# absent (e.g. macOS, where test_lite_macos.py runs without the cross-user
+# fixtures) the lookup would raise ``KeyError`` at import and abort collection
+# of the whole directory. Degrade to a ``None`` sentinel; the constants derived
+# below are consumed only by the Linux cross-user fixtures/helpers, which skip
+# cleanly when the user is absent (see _launch_daemon_as_sandbox_via_sudo).
+try:
+    _SANDBOX_TEST_UID: int | None = pwd.getpwnam("sandbox-test").pw_uid
+except KeyError:
+    _SANDBOX_TEST_UID = None
 _SANDBOX_E2E_BASE_DIR = Path(f"/var/lib/sandboxd/{_SANDBOX_TEST_UID}")
 _SANDBOX_E2E_SOCKET = _SANDBOX_E2E_BASE_DIR / "sandboxd.sock"
 
@@ -991,6 +1001,13 @@ def _launch_daemon_as_sandbox_via_sudo(
     can exec them despite the workspace living under the operator's 0750 home
     — see :func:`_stage_binaries_for_sandbox_user`.
     """
+    if _SANDBOX_TEST_UID is None:
+        pytest.skip(
+            "Linux cross-user e2e harness requires the 'sandbox-test' system "
+            "user; not present on this host. Run `make setup-dev-env` on a "
+            "Linux host to provision it, or run only the macOS-native e2e "
+            "tests (e.g. test_lite_macos.py) which do not use this fixture."
+        )
     _assert_operator_in_sandbox_group()
 
     # Assert the base dir is provisioned. The daemon writes the socket
@@ -1473,7 +1490,7 @@ def _read_log_window(path: Path, start_offset: int) -> tuple[str, int, int]:
 
 
 @pytest.fixture(autouse=True)
-def _dump_daemon_log_on_failure(request, sandbox_daemon):
+def _dump_daemon_log_on_failure(request):
     """Print the per-test window of sandboxd's stderr+stdout on failure.
 
     Captures ``os.path.getsize`` of each log before the test runs and, on
@@ -1501,7 +1518,19 @@ def _dump_daemon_log_on_failure(request, sandbox_daemon):
     autouse), but ``sandbox_daemon`` will only spin up the actual process
     on first request from any test, so the cost is just two ``stat`` calls
     plus, on failure, two bounded reads.
+
+    Autouse no-op when the cross-user ``sandbox-test`` daemon is unavailable
+    (``_SANDBOX_TEST_UID is None``, e.g. macOS-native ``test_lite_macos.py``
+    running against an ambient operator daemon). There is no cross-user
+    daemon log to dump, and requesting ``sandbox_daemon`` here would force
+    its setup — which skips — onto every test in the directory. ``sandbox_daemon``
+    is resolved lazily via ``request.getfixturevalue`` (not a fixture
+    parameter) so the guard runs before any cross-user setup.
     """
+    if _SANDBOX_TEST_UID is None:
+        yield
+        return
+    sandbox_daemon = request.getfixturevalue("sandbox_daemon")
     offsets = {
         key: _capture_log_offset(sandbox_daemon[key])
         for _, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log"))
@@ -1587,7 +1616,7 @@ def _lima_available_for_prewarm() -> bool:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
+def _ensure_base_image(request, sandbox_binaries: SandboxBinaries):
     """Pre-warm the golden base image once per test session.
 
     This runs ``sandbox rebuild-image`` so that tests using clone-based
@@ -1622,7 +1651,19 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
     if the build fails here, the operator needs to know up front rather than
     watch every Lima test fail downstream with an opaque per-test timeout.
     The container rebuild is also fatal-on-failure.
+
+    Autouse no-op when the cross-user ``sandbox-test`` daemon is unavailable
+    (``_SANDBOX_TEST_UID is None``, e.g. macOS-native ``test_lite_macos.py``
+    running against an ambient operator daemon). The pre-warm drives the
+    cross-user daemon and has no meaning without it; requesting
+    ``sandbox_daemon`` here would force its setup — which skips — onto every
+    test in the directory. ``sandbox_daemon`` is resolved lazily via
+    ``request.getfixturevalue`` (not a fixture parameter) so the guard runs
+    before any cross-user setup.
     """
+    if _SANDBOX_TEST_UID is None:
+        return
+    sandbox_daemon = request.getfixturevalue("sandbox_daemon")
     socket_path = sandbox_daemon["socket"]
 
     status = _query_base_image_status(socket_path)

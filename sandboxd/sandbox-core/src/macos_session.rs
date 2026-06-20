@@ -398,7 +398,7 @@ pub fn setup_macos_lite_gateway(
     network_info: &NetworkInfo,
     gateway_docker_socket: &Path,
     gateway_image_tag: &str,
-    _ca_dir: Option<&Path>,
+    ca_dir: Option<&Path>,
     initial_dns_policy: Option<&str>,
     owner_pool: Option<&str>,
 ) -> Result<(), SandboxError> {
@@ -442,6 +442,29 @@ pub fn setup_macos_lite_gateway(
             container = %container_name,
             "macOS lite gateway container started on sandboxd-egress"
         );
+    }
+
+    // Provision the per-session mitmproxy CA into the gateway container's
+    // `/root/.mitmproxy` tmpfs. Without this, mitmproxy self-generates a
+    // throwaway CA that the sandbox container's trust store (pinned to the
+    // per-session CA) does not recognize, so every intercepted HTTPS flow
+    // fails certificate verification. The CA key+cert are the only secret
+    // material provisioned here — they go straight into the container's tmpfs
+    // over the forwarded socket, never into the shared VM filesystem.
+    if let Some(ca_dir) = ca_dir {
+        for (container_path, content) in mitmproxy_ca_writes(ca_dir)? {
+            if let Err(e) = write_file_to_gateway_container(
+                gateway_docker_socket,
+                &container_name,
+                &container_path,
+                &content,
+            ) {
+                return Err(SandboxError::Gateway(format!(
+                    "failed to write mitmproxy CA {container_path} to macOS lite gateway \
+                     {container_name}: {e}"
+                )));
+            }
+        }
     }
 
     // Write the Envoy static bootstrap into the container.
@@ -844,6 +867,45 @@ fn write_file_to_gateway_container(
     Ok(())
 }
 
+/// Read the per-session mitmproxy CA files from the host `ca_dir` and return
+/// the `(container_path, content)` pairs to write into the gateway container's
+/// `/root/.mitmproxy` tmpfs.
+///
+/// Two files mirror the Linux bind-mount layout (see `ca.rs`):
+/// - `mitmproxy-ca.pem` — CA private key + cert concatenated (mitmproxy's
+///   signing key; the sole secret in the lite provisioning set).
+/// - `mitmproxy-ca-cert.pem` — cert only.
+///
+/// Factored out as a seam so the `setup_macos_lite_gateway` write step is unit-
+/// testable without spawning `docker exec`: a test populates a temp `ca_dir`
+/// and asserts the returned paths/contents.
+#[cfg(target_os = "macos")]
+fn mitmproxy_ca_writes(ca_dir: &Path) -> Result<Vec<(String, String)>, SandboxError> {
+    let ca_pem_src = ca_dir.join("mitmproxy-ca.pem");
+    let ca_cert_src = ca_dir.join("mitmproxy-ca-cert.pem");
+
+    let ca_pem = std::fs::read_to_string(&ca_pem_src).map_err(|e| {
+        SandboxError::Gateway(format!(
+            "failed to read mitmproxy CA {}: {e}",
+            ca_pem_src.display()
+        ))
+    })?;
+    let ca_cert = std::fs::read_to_string(&ca_cert_src).map_err(|e| {
+        SandboxError::Gateway(format!(
+            "failed to read mitmproxy CA cert {}: {e}",
+            ca_cert_src.display()
+        ))
+    })?;
+
+    Ok(vec![
+        ("/root/.mitmproxy/mitmproxy-ca.pem".to_string(), ca_pem),
+        (
+            "/root/.mitmproxy/mitmproxy-ca-cert.pem".to_string(),
+            ca_cert,
+        ),
+    ])
+}
+
 /// Compute B+1 from a subnet CIDR string (e.g. `"10.209.128.0/29"` → `"10.209.128.1"`).
 ///
 /// Used to derive the IPAM gateway address for the macvlan network.
@@ -905,6 +967,55 @@ mod tests {
         assert!(
             nname.contains("aabbccddeeff"),
             "network name must contain session id"
+        );
+    }
+
+    // -- mitmproxy CA provisioning seam (hermetic) ---------------------------
+
+    /// `mitmproxy_ca_writes` reads the two per-session CA files from the host
+    /// `ca_dir` and returns the `(container_path, content)` pairs that
+    /// `setup_macos_lite_gateway` writes into the gateway container's
+    /// `/root/.mitmproxy` tmpfs. Pins the canonical in-container paths and that
+    /// each file's bytes round-trip — the contract that makes the sandbox
+    /// container trust the same CA mitmproxy signs with.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mitmproxy_ca_writes_returns_two_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_pem = "KEY+CERT-COMBINED\n";
+        let ca_cert = "CERT-ONLY\n";
+        std::fs::write(dir.path().join("mitmproxy-ca.pem"), ca_pem).unwrap();
+        std::fs::write(dir.path().join("mitmproxy-ca-cert.pem"), ca_cert).unwrap();
+
+        let writes = mitmproxy_ca_writes(dir.path()).expect("ca writes");
+        assert_eq!(
+            writes,
+            vec![
+                (
+                    "/root/.mitmproxy/mitmproxy-ca.pem".to_string(),
+                    ca_pem.to_string()
+                ),
+                (
+                    "/root/.mitmproxy/mitmproxy-ca-cert.pem".to_string(),
+                    ca_cert.to_string()
+                ),
+            ],
+            "mitmproxy CA writes must target the two canonical tmpfs paths with \
+             the host CA file contents verbatim",
+        );
+    }
+
+    /// A missing CA file is a hard error (the caller aborts create) — the
+    /// gateway must never boot trusting an absent/empty CA.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mitmproxy_ca_writes_errors_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only the combined file exists; the cert-only file is absent.
+        std::fs::write(dir.path().join("mitmproxy-ca.pem"), "x").unwrap();
+        assert!(
+            mitmproxy_ca_writes(dir.path()).is_err(),
+            "missing mitmproxy-ca-cert.pem must surface as an error"
         );
     }
 

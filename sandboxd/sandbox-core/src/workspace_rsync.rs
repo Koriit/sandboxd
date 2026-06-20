@@ -127,6 +127,15 @@ pub struct WorkspaceRsyncOptions {
     /// When `Some`, overrides the backend-derived `-e <transport>`.
     /// Set to [`SSH_TRANSPORT_TOKEN`] by the CLI's SSH-alias path.
     pub custom_transport: Option<String>,
+    /// Forwarded gateway-VM Docker socket for the container backend on macOS
+    /// lite. When `Some` (and `custom_transport` is `None`, the daemon-side
+    /// default), the container transport becomes
+    /// `docker -H unix://<sock> exec -i` so rsync's `docker exec` reaches the
+    /// container inside the gateway VM rather than the host docker daemon.
+    /// `None` on Linux / host docker — the transport stays the historical
+    /// `docker exec -i`. Ignored for the Lima backend and when
+    /// `custom_transport` is set.
+    pub docker_socket: Option<String>,
     pub session_name: String,
     pub host_path: String,
     pub guest_path: String,
@@ -165,15 +174,24 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
     //
     // When `custom_transport` is set (e.g. `"ssh"` for the CLI's
     // SSH-alias path), it overrides the backend-derived default.
-    let transport: &str = match opts.custom_transport.as_deref() {
-        Some(t) => t,
+    let transport: String = match opts.custom_transport.as_deref() {
+        Some(t) => t.to_string(),
         None => match opts.backend {
-            BackendKind::Lima => LIMACTL_SHELL_TOKEN,
+            BackendKind::Lima => LIMACTL_SHELL_TOKEN.to_string(),
             // `-i` forwards stdin into the container so rsync can speak
             // its binary protocol both ways. No `-t` — a TTY would line-
             // buffer and corrupt the wire format. Mirrors
             // `plan_sync_command`.
-            BackendKind::Container => "docker exec -i",
+            //
+            // On macOS lite the container runs inside the gateway VM, so the
+            // `docker exec` must target the forwarded socket; otherwise rsync
+            // hits the host docker daemon and finds no such container. Linux
+            // leaves `docker_socket` `None` — the token stays the historical
+            // `docker exec -i`.
+            BackendKind::Container => match opts.docker_socket.as_deref() {
+                Some(sock) => format!("docker -H unix://{sock} exec -i"),
+                None => "docker exec -i".to_string(),
+            },
         },
     };
 
@@ -226,7 +244,7 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
         argv.push("--filter=:- .gitignore".to_string());
     }
     argv.push("-e".to_string());
-    argv.push(transport.to_string());
+    argv.push(transport);
     if opts.mkpath {
         // `--mkpath` lets rsync create missing parent directories on
         // the destination (rsync ≥ 3.2.3). Both the Lima base image
@@ -269,6 +287,7 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
 /// diagnostic (e.g. `permission denied`, `mkdir failed: EROFS`).
 pub async fn run_initial_push(
     backend: BackendKind,
+    docker_socket: Option<&str>,
     session_name: &str,
     host_path: &str,
     guest_path: &str,
@@ -279,9 +298,16 @@ pub async fn run_initial_push(
     // root, no dry-run, no safe-links toggle. Operator-driven push/
     // pull (CLI side) builds the same options struct with different
     // flags but goes through the same shared builder.
+    //
+    // `docker_socket` is `None` on Linux / host docker (transport stays
+    // `docker exec -i`); on macOS lite the forwarded gateway-VM socket
+    // rewrites the container transport to `docker -H unix://<sock> exec -i`
+    // so rsync's `docker exec` reaches the container inside the gateway VM.
+    // Ignored for the Lima backend.
     let argv = build_workspace_rsync_argv(&WorkspaceRsyncOptions {
         backend,
         custom_transport: None,
+        docker_socket: docker_socket.map(str::to_string),
         session_name: session_name.to_string(),
         host_path: host_path.to_string(),
         guest_path: guest_path.to_string(),
@@ -477,6 +503,7 @@ mod tests {
         WorkspaceRsyncOptions {
             backend,
             custom_transport: None,
+            docker_socket: None,
             session_name: session_name.to_string(),
             host_path: host_path.to_string(),
             guest_path: guest_path.to_string(),
@@ -539,6 +566,73 @@ mod tests {
                 "sandbox-def456:/home/sandbox/workspace/",
             ]
         );
+    }
+
+    /// macOS lite: a forwarded Docker socket rewrites the container transport
+    /// to `docker -H unix://<sock> exec -i` so rsync's `docker exec` reaches
+    /// the container inside the gateway VM. The rest of the argv is unchanged.
+    #[test]
+    fn build_argv_container_injects_socket_into_transport() {
+        let mut opts = push_opts(
+            BackendKind::Container,
+            "sandbox-mac1",
+            "/srv/proj",
+            "/home/sandbox/workspace",
+            false,
+        );
+        opts.docker_socket = Some("/var/lib/sandboxd/501/gateway-docker.sock".to_string());
+        let argv = build_workspace_rsync_argv(&opts);
+        assert_eq!(
+            argv,
+            vec![
+                "-aL",
+                "--delete",
+                "--filter=:- .gitignore",
+                "-e",
+                "docker -H unix:///var/lib/sandboxd/501/gateway-docker.sock exec -i",
+                "--mkpath",
+                "/srv/proj/",
+                "sandbox-mac1:/home/sandbox/workspace/",
+            ]
+        );
+    }
+
+    /// Linux / host docker: with `docker_socket = None` the container
+    /// transport stays the historical `docker exec -i` (no `-H`). Pins the
+    /// byte-identical Linux argv.
+    #[test]
+    fn build_argv_container_without_socket_is_host_docker() {
+        let opts = push_opts(
+            BackendKind::Container,
+            "sandbox-lin1",
+            "/srv/proj",
+            "/home/sandbox/workspace",
+            false,
+        );
+        let argv = build_workspace_rsync_argv(&opts);
+        let e_idx = argv.iter().position(|a| a == "-e").expect("-e present");
+        assert_eq!(
+            argv[e_idx + 1],
+            "docker exec -i",
+            "host-docker transport must not carry -H: {argv:?}"
+        );
+    }
+
+    /// The Lima backend ignores `docker_socket` — it only affects the
+    /// container transport.
+    #[test]
+    fn build_argv_lima_ignores_docker_socket() {
+        let mut opts = push_opts(
+            BackendKind::Lima,
+            "sandbox-lima1",
+            "/srv/proj",
+            "/home/sandbox/workspace",
+            false,
+        );
+        opts.docker_socket = Some("/var/lib/sandboxd/501/gateway-docker.sock".to_string());
+        let argv = build_workspace_rsync_argv(&opts);
+        let e_idx = argv.iter().position(|a| a == "-e").expect("-e present");
+        assert_eq!(argv[e_idx + 1], LIMACTL_SHELL_TOKEN);
     }
 
     /// `no_gitignore == true` drops the `--filter` flag entirely. The
@@ -673,6 +767,7 @@ mod tests {
         let argv = build_workspace_rsync_argv(&WorkspaceRsyncOptions {
             backend: BackendKind::Lima,
             custom_transport: None,
+            docker_socket: None,
             session_name: "sandbox-pull1".to_string(),
             host_path: "/home/op/work".to_string(),
             guest_path: "/home/sandbox/workspace".to_string(),

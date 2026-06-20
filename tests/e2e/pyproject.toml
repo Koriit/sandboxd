@@ -29,4 +29,5 @@ markers = [
     "lima: test runs only on the Lima/QEMU backend",
     "container: test runs only on the lite container backend",
     "macos: test runs only on macOS (full backend with socket_vmnet + restrict=on)",
+    "macos_only: test runs only on macOS (lite path; requires the sandboxd-gateway Lima VM)",
 ]

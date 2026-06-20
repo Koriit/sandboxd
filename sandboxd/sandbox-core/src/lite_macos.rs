@@ -85,18 +85,24 @@ pub fn lite_shared_root() -> PathBuf {
 ///
 /// # Format
 ///
+/// `mountType` is a TOP-LEVEL Lima key (a sibling of `mounts:`), not a
+/// per-mount field. Emitting `mountType` inside a `mounts:` list item makes
+/// Lima reject it as an unknown field (non-strict YAML) and silently fall back
+/// to the default mount type. The per-mount `9p:` options block only takes
+/// effect when the top-level mount type is 9p.
+///
 /// ```yaml
+/// mountType: "9p"
 /// mounts:
 ///   - location: "/tmp/sandbox-shared"
 ///     writable: true
-///     mountType: "9p"
 ///     9p:
 ///       securityModel: "mapped-xattr"
 ///       cache: "mmap"
 /// ```
 pub fn lite_shared_root_9p_stanza(shared_root: &Path) -> String {
     format!(
-        "mounts:\n  - location: \"{location}\"\n    writable: true\n    mountType: \"9p\"\n    9p:\n      securityModel: \"mapped-xattr\"\n      cache: \"mmap\"\n",
+        "mountType: \"9p\"\nmounts:\n  - location: \"{location}\"\n    writable: true\n    9p:\n      securityModel: \"mapped-xattr\"\n      cache: \"mmap\"\n",
         location = shared_root.display()
     )
 }
@@ -282,10 +288,16 @@ mod tests {
     fn lite_shared_root_9p_stanza_is_well_formed() {
         let root = Path::new("/tmp/sandbox-shared");
         let stanza = lite_shared_root_9p_stanza(root);
-        // Must start with the mounts: key at the top level.
+        // mountType is a top-level Lima key (sibling of mounts:), so the stanza
+        // must begin with it — not with `mounts:`.
         assert!(
-            stanza.starts_with("mounts:"),
-            "stanza must start with 'mounts:': {stanza:?}"
+            stanza.starts_with("mountType: \"9p\""),
+            "stanza must start with top-level 'mountType: \"9p\"': {stanza:?}"
+        );
+        // The mounts: key must follow at the top level too.
+        assert!(
+            stanza.contains("\nmounts:\n"),
+            "stanza must contain a top-level 'mounts:' key: {stanza:?}"
         );
         // Must contain the root path.
         assert!(

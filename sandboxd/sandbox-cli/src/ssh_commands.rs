@@ -250,6 +250,9 @@ pub fn plan_workspace_rsync_argv(plan: &WorkspaceRsyncPlan) -> Result<Vec<String
     let core_opts = WorkspaceRsyncOptions {
         backend: BackendKind::Lima,
         custom_transport: Some(SSH_TRANSPORT_TOKEN.to_string()),
+        // The CLI uses the SSH-alias transport; the forwarded-socket override
+        // is daemon-side-only and irrelevant here (`custom_transport` wins).
+        docker_socket: None,
         session_name: plan.alias.to_string(),
         host_path,
         guest_path: plan.guest_path.clone(),

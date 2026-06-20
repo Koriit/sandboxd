@@ -85,6 +85,11 @@ pub mod close_codes {
 pub struct ProxyState {
     pub store: Arc<SessionStore>,
     pub lima_registry: Arc<LimaManagerRegistry>,
+    /// Forwarded gateway-VM Docker socket for the container path on macOS
+    /// lite. `Some` on macOS (the sandbox container runs inside the gateway
+    /// VM, so `docker exec` must target the forwarded socket), `None` on Linux
+    /// (host docker daemon — the proxy `docker exec` argv stays byte-identical).
+    pub docker_socket: Option<std::path::PathBuf>,
 }
 
 /// Entry point for `GET /sessions/{id}/proxy`.
@@ -141,8 +146,15 @@ pub async fn handle_proxy(
     // The upgrade closure may not borrow state captures (it outlives
     // the handler future), so hand it owned clones.
     let lima_registry_for_upgrade = Arc::clone(&state.lima_registry);
+    let docker_socket_for_upgrade = state.docker_socket.clone();
     Ok(ws.on_upgrade(move |socket| async move {
-        run_proxy(socket, session, lima_registry_for_upgrade).await;
+        run_proxy(
+            socket,
+            session,
+            lima_registry_for_upgrade,
+            docker_socket_for_upgrade,
+        )
+        .await;
     }))
 }
 
@@ -169,11 +181,16 @@ impl axum::response::IntoResponse for ProxyHttpError {
 /// (backend dial failure, mid-stream backend exit, etc.) close the
 /// WebSocket with a structured code from [`close_codes`] so the CLI
 /// shim (`sandbox-cli::proxy`) can render a useful diagnostic.
-async fn run_proxy(socket: WebSocket, session: Session, lima_registry: Arc<LimaManagerRegistry>) {
+async fn run_proxy(
+    socket: WebSocket,
+    session: Session,
+    lima_registry: Arc<LimaManagerRegistry>,
+    docker_socket: Option<std::path::PathBuf>,
+) {
     let session_id = session.id;
     match session.backend {
         BackendKind::Container => {
-            if let Err(e) = pump_container(socket, &session_id).await {
+            if let Err(e) = pump_container(socket, &session_id, docker_socket.as_deref()).await {
                 warn!(
                     session = %session_id,
                     error = %e,
@@ -227,11 +244,41 @@ async fn run_proxy(socket: WebSocket, session: Session, lima_registry: Arc<LimaM
     }
 }
 
+/// Build the argv for the container SSH-proxy byte pump:
+/// `[-H unix://<sock>] exec -i <name> socat - TCP:127.0.0.1:22`.
+///
+/// Pure function so the socket-awareness (the `-H` prefix on macOS lite,
+/// absent on Linux/host docker) can be asserted without spawning a process.
+/// On macOS the sandbox container runs inside the gateway VM, so the proxy
+/// `docker exec` must target the forwarded socket; on Linux `docker_socket`
+/// is `None` and the argv is byte-identical to the historical shape.
+fn container_proxy_exec_argv(
+    docker_socket: Option<&std::path::Path>,
+    container_name: &str,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::with_capacity(8);
+    if let Some(sock) = docker_socket {
+        argv.push("-H".to_string());
+        argv.push(format!("unix://{}", sock.display()));
+    }
+    argv.push("exec".to_string());
+    argv.push("-i".to_string());
+    argv.push(container_name.to_string());
+    argv.push("socat".to_string());
+    argv.push("-".to_string());
+    argv.push("TCP:127.0.0.1:22".to_string());
+    argv
+}
+
 /// Container path: spawn `docker exec -i <name> socat -
 /// TCP:127.0.0.1:22` with async pipes, then ferry bytes between the
 /// WebSocket halves and the child's stdio. Same byte mover the
 /// cross-user sshd integration test used as a `ProxyCommand`.
-async fn pump_container(socket: WebSocket, session_id: &SessionId) -> Result<(), SandboxError> {
+async fn pump_container(
+    socket: WebSocket,
+    session_id: &SessionId,
+    docker_socket: Option<&std::path::Path>,
+) -> Result<(), SandboxError> {
     let container_name = format!("sandbox-{session_id}");
 
     // ASYNC-I/O CARVE-OUT (cross-user CLI access spec § Architecture
@@ -243,15 +290,9 @@ async fn pump_container(socket: WebSocket, session_id: &SessionId) -> Result<(),
     // Project-wide `spawn_blocking` convention does NOT apply to
     // long-lived byte pumps. Do not "fix" this site by wrapping it.
     let mut command = TokioCommand::new("docker");
+    let argv = container_proxy_exec_argv(docker_socket, &container_name);
     command
-        .args([
-            "exec",
-            "-i",
-            &container_name,
-            "socat",
-            "-",
-            "TCP:127.0.0.1:22",
-        ])
+        .args(&argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -744,6 +785,50 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    /// Linux / host docker: the proxy `docker exec` argv carries no `-H`
+    /// flag. Pins the byte-identical Linux argv.
+    #[test]
+    fn container_proxy_exec_argv_no_socket_is_host_docker() {
+        let argv = container_proxy_exec_argv(None, "sandbox-abc123");
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "-i",
+                "sandbox-abc123",
+                "socat",
+                "-",
+                "TCP:127.0.0.1:22",
+            ]
+        );
+        assert!(
+            !argv.iter().any(|a| a == "-H"),
+            "host-docker proxy argv must not carry -H: {argv:?}"
+        );
+    }
+
+    /// macOS lite: a forwarded socket injects `-H unix://<sock>` ahead of the
+    /// `exec` verb so the SSH proxy reaches the container inside the gateway
+    /// VM, not the host docker daemon.
+    #[test]
+    fn container_proxy_exec_argv_with_socket_prepends_host_flag() {
+        let sock = std::path::Path::new("/var/lib/sandboxd/501/gateway-docker.sock");
+        let argv = container_proxy_exec_argv(Some(sock), "sandbox-def456");
+        assert_eq!(
+            argv,
+            vec![
+                "-H",
+                "unix:///var/lib/sandboxd/501/gateway-docker.sock",
+                "exec",
+                "-i",
+                "sandbox-def456",
+                "socat",
+                "-",
+                "TCP:127.0.0.1:22",
+            ]
+        );
+    }
 
     #[test]
     fn truncate_close_reason_caps_at_123_bytes_on_char_boundary() {

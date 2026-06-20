@@ -646,6 +646,19 @@ impl ContainerRuntime {
         } else {
             cpus as f64
         };
+
+        // macOS lite: the container runs inside the gateway Lima VM (2 vCPU /
+        // 2 GiB), not on the macOS host. Clamp both the host-derived defaults
+        // and any explicit operator value to the VM's capacity so `docker
+        // create` does not reject an over-large `--cpus`/`--memory`. Linux
+        // (`docker_socket` is `None`) skips this entirely — byte-identical.
+        #[cfg(target_os = "macos")]
+        let (memory_mb, cpus) = if self.docker_socket.is_some() {
+            clamp_to_gateway_vm(memory_mb, cpus)
+        } else {
+            (memory_mb, cpus)
+        };
+
         Ok((memory_mb, cpus))
     }
 }
@@ -744,6 +757,7 @@ fn build_create_argv(
     memory_mb: u32,
     cpus: f64,
     guest_bind_source: &Path,
+    skip_guest_bind: bool,
 ) -> Vec<String> {
     let container_name = format!("sandbox-{session_id}");
     let home_volume = home_volume_name(session_id);
@@ -779,6 +793,13 @@ fn build_create_argv(
     // cache for the guest binary is shared too. The source is the
     // FHS libexec install path; `sandbox update` atomically renames
     // it so the bind-mount source is always coherent.
+    //
+    // When the runtime drives a forwarded gateway-VM Docker socket
+    // (macOS lite), the source is a macOS-host path that does not exist
+    // inside the gateway VM, so the bind cannot be applied. The lite
+    // image already bakes a version-matched `sandbox-guest` at the same
+    // in-container path (the image tag tracks the daemon version), so
+    // the overlay is skipped and the baked binary is used instead.
     let guest_bind_mount = format!(
         "{}:/usr/local/bin/sandbox-guest:ro",
         guest_bind_source.to_string_lossy()
@@ -842,14 +863,12 @@ fn build_create_argv(
         args.push(format!("sandboxd.owner={pool}"));
     }
 
-    args.extend([
-        "--mount".to_string(),
-        home_mount,
+    args.extend(["--mount".to_string(), home_mount]);
+    if !skip_guest_bind {
         // Bind-mount of the daemon-staged guest binary — read-only,
         // overlays the in-image baked `/usr/local/bin/sandbox-guest`.
-        "-v".to_string(),
-        guest_bind_mount,
-    ]);
+        args.extend(["-v".to_string(), guest_bind_mount]);
+    }
 
     if let Some(mount) = workspace_mount {
         args.push("--mount".to_string());
@@ -971,6 +990,10 @@ impl SessionRuntime for ContainerRuntime {
             memory_mb,
             cpus,
             &self.guest_bind_source,
+            // On macOS the runtime drives a forwarded gateway-VM Docker
+            // socket; the host-side guest binary path is absent in the VM,
+            // so skip the overlay and use the image-baked guest.
+            self.docker_socket.is_some(),
         );
 
         // Explicitly pre-create the home volume with ownership labels so the
@@ -1956,6 +1979,65 @@ fn read_host_cpus_or_default() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// macOS lite resource ceilings (gateway-VM-relative)
+// ---------------------------------------------------------------------------
+//
+// On macOS lite, sandbox containers run *inside* the gateway Lima VM over a
+// forwarded Docker socket — not on the macOS host. Deriving `--cpus`/`--memory`
+// from host capacity (the Linux path) yields values that exceed the small VM
+// (2 vCPU / 2 GiB), and `docker create` rejects them ("range of CPUs is from
+// 0.01 to 2.00"). These helpers clamp to the VM spec instead. Linux never
+// calls them (gated on `docker_socket.is_some()` at the call site).
+
+/// Floor for a macOS-lite container's CPU ceiling. Even on a 1-vCPU VM a
+/// session needs at least one core to make progress.
+#[cfg(target_os = "macos")]
+const MACOS_LITE_CPU_FLOOR: f64 = 1.0;
+
+/// Floor for a macOS-lite container's memory ceiling (MiB).
+#[cfg(target_os = "macos")]
+const MACOS_LITE_MEMORY_FLOOR_MB: u32 = 512;
+
+/// Headroom (MiB) reserved out of the gateway VM's RAM for the VM kernel, the
+/// per-session gateway container (Envoy + mitmproxy + CoreDNS + two
+/// nft-loggers), and the in-VM Docker daemon. The sandbox container's memory
+/// ceiling is `VM_RAM - this`, floored at `MACOS_LITE_MEMORY_FLOOR_MB`.
+#[cfg(target_os = "macos")]
+const MACOS_LITE_MEMORY_MARGIN_MB: u32 = 512;
+
+/// Largest `--cpus` value a macOS-lite container may request: the gateway VM's
+/// vCPU count. The VM is the hard ceiling — Docker inside it cannot allocate
+/// more cores than the VM has.
+#[cfg(target_os = "macos")]
+pub fn macos_container_cpu_ceiling() -> f64 {
+    crate::gateway_lima::GATEWAY_VM_CPUS as f64
+}
+
+/// Largest `--memory` (MiB) a macOS-lite container may request: the gateway
+/// VM's RAM minus [`MACOS_LITE_MEMORY_MARGIN_MB`], floored at
+/// [`MACOS_LITE_MEMORY_FLOOR_MB`].
+#[cfg(target_os = "macos")]
+pub fn macos_container_memory_ceiling_mb() -> u32 {
+    crate::gateway_lima::GATEWAY_VM_MEMORY_MB
+        .saturating_sub(MACOS_LITE_MEMORY_MARGIN_MB)
+        .max(MACOS_LITE_MEMORY_FLOOR_MB)
+}
+
+/// Clamp a resolved `(memory_mb, cpus)` pair to the gateway VM's capacity for
+/// macOS lite. Caps both the implicit host-derived defaults and any explicit
+/// operator value so neither can exceed the VM and trip a docker 500. CPU is
+/// also raised to [`MACOS_LITE_CPU_FLOOR`] / memory to
+/// [`MACOS_LITE_MEMORY_FLOOR_MB`] so a tiny VM still yields a usable container.
+#[cfg(target_os = "macos")]
+fn clamp_to_gateway_vm(memory_mb: u32, cpus: f64) -> (u32, f64) {
+    let cpu_ceiling = macos_container_cpu_ceiling();
+    let capped_cpus = cpus.clamp(MACOS_LITE_CPU_FLOOR, cpu_ceiling);
+    let mem_ceiling = macos_container_memory_ceiling_mb();
+    let capped_mem = memory_mb.clamp(MACOS_LITE_MEMORY_FLOOR_MB, mem_ceiling);
+    (capped_mem, capped_cpus)
+}
+
+// ---------------------------------------------------------------------------
 // Image ensure (Phase 3B)
 // ---------------------------------------------------------------------------
 
@@ -2606,6 +2688,7 @@ mod tests {
             512,
             1.0,
             &guest_bind_source,
+            false,
         );
 
         // Locate the `-v` flag — there is exactly one in the canonical
@@ -2686,6 +2769,7 @@ mod tests {
             512,
             1.0,
             &guest_bind_source,
+            false,
         );
 
         // The workspace bind appears as an adjacent `--mount` / spec
@@ -2943,6 +3027,95 @@ mod tests {
         assert!(
             (cpus - 1.5).abs() < f64::EPSILON,
             "fractional cpus must survive f32→f64 widening; got {cpus}"
+        );
+    }
+
+    /// macOS lite: a container runs inside the 2-vCPU / 2-GiB gateway VM, not
+    /// on the macOS host. `resource_ceilings` must clamp both the host-derived
+    /// implicit defaults AND an over-large explicit operator value to the VM's
+    /// capacity so `docker create` never sees `--cpus 6` on a 2-CPU VM.
+    ///
+    /// Built with host-sized defaults (8 vCPU / 16 GiB) to prove the clamp,
+    /// not the (already-small) constructor defaults.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resource_ceilings_macos_lite_clamps_to_gateway_vm() {
+        use crate::gateway_lima::{GATEWAY_VM_CPUS, GATEWAY_VM_MEMORY_MB};
+
+        let cpu_ceiling = macos_container_cpu_ceiling();
+        let mem_ceiling = macos_container_memory_ceiling_mb();
+        // Sanity-pin the ceilings against the VM spec so a future VM-size
+        // change updates them in lockstep.
+        assert!(
+            cpu_ceiling <= GATEWAY_VM_CPUS as f64,
+            "cpu ceiling must not exceed the VM's vCPU count"
+        );
+        assert!(
+            mem_ceiling < GATEWAY_VM_MEMORY_MB,
+            "memory ceiling must leave headroom below the VM's RAM"
+        );
+
+        let rt = ContainerRuntime::with_macos_socket(
+            DEFAULT_LITE_IMAGE_TAG,
+            16384, // host-sized default memory (16 GiB)
+            8.0,   // host-sized default cpus (8 vCPU)
+            1000,
+            1000,
+            "/var/lib/sandbox/guest/sandbox-guest",
+            "/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock",
+            "/var/lib/sandboxd/501",
+        );
+
+        // Implicit default (operator omitted --cpus/--memory): host defaults
+        // resolve, then clamp to the VM. This is the exact path that broke
+        // `sandbox create --lite` with no resource flags.
+        let spec_default = SessionSpec {
+            backend_specific: BackendSpecific::Container {
+                memory_mb: 0,
+                cpus: 0.0,
+            },
+            workspace_mode: None,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            disk_gb: None,
+            no_cache: None,
+            operator_identity: None,
+        };
+        let (mem, cpus) = rt.resource_ceilings(&spec_default).unwrap();
+        assert!(
+            cpus <= cpu_ceiling,
+            "default cpus {cpus} must be clamped to VM ceiling {cpu_ceiling}"
+        );
+        assert!(
+            mem <= mem_ceiling,
+            "default memory {mem} must be clamped to VM ceiling {mem_ceiling}"
+        );
+        assert!(cpus >= 1.0, "default cpus must stay above the 1-CPU floor");
+
+        // Explicit over-large operator value is also capped (never a docker
+        // 500), not passed through.
+        let spec_explicit = SessionSpec {
+            backend_specific: BackendSpecific::Container {
+                memory_mb: 8192,
+                cpus: 6.0,
+            },
+            workspace_mode: None,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            disk_gb: None,
+            no_cache: None,
+            operator_identity: None,
+        };
+        let (mem, cpus) = rt.resource_ceilings(&spec_explicit).unwrap();
+        assert!(
+            cpus <= cpu_ceiling,
+            "explicit over-large cpus {cpus} must be capped to {cpu_ceiling}"
+        );
+        assert!(
+            mem <= mem_ceiling,
+            "explicit over-large memory {mem} must be capped to {mem_ceiling}"
         );
     }
 
@@ -3290,6 +3463,7 @@ mod tests {
             512,
             1.0,
             &guest_bind_source,
+            false,
         );
 
         // The `--user` flag must be present with the operator's pair —
@@ -3334,6 +3508,7 @@ mod tests {
             512,
             1.0,
             &guest_bind_source,
+            false,
         );
 
         let user_idx = args
@@ -3380,6 +3555,7 @@ mod tests {
             512,
             1.0,
             &guest_bind_source,
+            false,
         );
 
         // The three SSH mounts appear as adjacent `--mount` / spec
@@ -3425,6 +3601,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// macOS lite path: when the runtime drives a forwarded gateway-VM
+    /// Docker socket, `build_create_argv` is called with
+    /// `skip_guest_bind = true`. The host-side guest binary path does not
+    /// exist inside the gateway VM, so the guest `-v` overlay must be
+    /// ABSENT (the image-baked, version-matched guest is used instead).
+    /// The CA bind + its four trust env vars and the three SSH binds must
+    /// still be present — those sources are now VM-resident staging paths,
+    /// but the argv shape is unchanged from Linux. The converse arm pins
+    /// that `skip_guest_bind = false` (Linux) keeps the guest `-v`.
+    #[test]
+    fn container_run_argv_skips_guest_bind_when_socket_forwarded() {
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+        // On macOS these are VM-resident staging paths; from the argv
+        // builder's perspective they are arbitrary source paths.
+        let ca_path = std::path::PathBuf::from("/tmp/sandbox-lite/0123456789ab/cert.pem");
+        let ssh_dir = std::path::PathBuf::from("/tmp/sandbox-lite/0123456789ab");
+        let network = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: None,
+            route_helper_path: None,
+            ca_host_path: Some(ca_path.clone()),
+            ssh_host_dir: Some(ssh_dir.clone()),
+            operator_identity: None,
+            owner_pool: None,
+        };
+        let guest_bind_source =
+            std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
+
+        let macos_args = build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            1500,
+            1500,
+            512,
+            1.0,
+            &guest_bind_source,
+            true,
+        );
+
+        // Guest `-v` overlay must be absent — the image-baked guest is used.
+        assert!(
+            !macos_args.iter().any(|a| a == "-v"),
+            "guest `-v` overlay must be absent when skip_guest_bind is set; got {macos_args:?}",
+        );
+
+        // CA bind + its four trust env vars are still emitted (sources now
+        // point at VM staging paths, but the shape is identical to Linux).
+        assert!(
+            macos_args.windows(2).any(|w| w[0] == "--mount"
+                && w[1]
+                    == format!(
+                        "type=bind,src={},dst={SANDBOX_CA_CONTAINER_PATH},readonly",
+                        ca_path.to_string_lossy()
+                    )),
+            "CA bind-mount must still be present in argv: {macos_args:?}",
+        );
+        for var in SANDBOX_CA_ENV_VARS {
+            assert!(
+                macos_args.windows(2).any(
+                    |w| w[0] == "--env" && w[1] == format!("{var}={SANDBOX_CA_CONTAINER_PATH}")
+                ),
+                "CA trust env var {var} must still be present in argv: {macos_args:?}",
+            );
+        }
+
+        // The three SSH binds are still emitted at their canonical dsts.
+        for dst in [
+            "dst=/run/sandbox/authorized_keys",
+            "dst=/etc/passwd",
+            "dst=/etc/group",
+        ] {
+            assert!(
+                macos_args
+                    .windows(2)
+                    .any(|w| w[0] == "--mount" && w[1].contains(dst)),
+                "SSH bind-mount with {dst} must still be present in argv: {macos_args:?}",
+            );
+        }
+
+        // Converse arm (Linux): skip_guest_bind = false keeps the guest `-v`
+        // overlay exactly once.
+        let linux_args = build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            1500,
+            1500,
+            512,
+            1.0,
+            &guest_bind_source,
+            false,
+        );
+        assert_eq!(
+            linux_args.iter().filter(|a| a.as_str() == "-v").count(),
+            1,
+            "guest `-v` overlay must be present exactly once when skip_guest_bind \
+             is clear (Linux); got {linux_args:?}",
+        );
     }
 
     /// `build_home_chown_argv` emits the exact `docker run --rm --user 0:0

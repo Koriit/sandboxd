@@ -489,8 +489,30 @@ impl NetworkManager {
         )))
     }
 
-    /// Delete the Docker bridge network for the given session.
+    /// Delete the Docker bridge network for the given session (host daemon).
     pub fn delete_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
+        self.delete_network_inner(session_id, None)
+    }
+
+    /// Socket-aware variant of [`delete_network`].
+    ///
+    /// When `docker_socket` is `Some`, `-H unix://<path>` is prepended so the
+    /// bridge is removed from inside the gateway VM (macOS lite-mode). When
+    /// `None` this is byte-identical to [`delete_network`] and targets the
+    /// host Docker daemon. Mirrors [`create_network_on_socket`].
+    pub fn delete_network_on_socket(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<(), SandboxError> {
+        self.delete_network_inner(session_id, docker_socket)
+    }
+
+    fn delete_network_inner(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<(), SandboxError> {
         let (block_idx, info) = {
             let nets = self
                 .networks
@@ -507,8 +529,10 @@ impl NetworkManager {
             "deleting Docker bridge network"
         );
 
+        let argv = docker_network_rm_argv(docker_socket, &info.docker_network_name);
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let output = run_with_timeout(
-            Command::new("docker").args(["network", "rm", &info.docker_network_name]),
+            Command::new("docker").args(&argv_refs),
             DELETE_NETWORK_TIMEOUT,
             "docker network rm",
         )
@@ -703,6 +727,27 @@ impl NetworkManager {
     ///
     /// If the Docker network does not exist, this is a no-op (returns Ok).
     pub fn remove_docker_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
+        self.remove_docker_network_inner(session_id, None)
+    }
+
+    /// Socket-aware variant of [`remove_docker_network`].
+    ///
+    /// When `docker_socket` is `Some`, `-H unix://<path>` is prepended so the
+    /// bridge is removed from inside the gateway VM (macOS lite-mode). When
+    /// `None` this is byte-identical to [`remove_docker_network`].
+    pub fn remove_docker_network_on_socket(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<(), SandboxError> {
+        self.remove_docker_network_inner(session_id, docker_socket)
+    }
+
+    fn remove_docker_network_inner(
+        &self,
+        session_id: &SessionId,
+        docker_socket: Option<&std::path::Path>,
+    ) -> Result<(), SandboxError> {
         let info = {
             let nets = self
                 .networks
@@ -726,8 +771,10 @@ impl NetworkManager {
             "removing Docker bridge network (keeping allocation)"
         );
 
+        let argv = docker_network_rm_argv(docker_socket, &info.docker_network_name);
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let output = run_with_timeout(
-            Command::new("docker").args(["network", "rm", &info.docker_network_name]),
+            Command::new("docker").args(&argv_refs),
             DELETE_NETWORK_TIMEOUT,
             "docker network rm (remove)",
         )
@@ -766,6 +813,27 @@ impl NetworkManager {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build the argv for `docker [-H unix://<sock>] network rm <name>`.
+///
+/// Pure function so the socket-awareness (the `-H` prefix on macOS lite,
+/// absent on Linux/host docker) can be asserted without spawning a docker
+/// subprocess. Mirrors the inline arg construction in
+/// `create_network_inner` / `ensure_network_inner`.
+fn docker_network_rm_argv(
+    docker_socket: Option<&std::path::Path>,
+    network_name: &str,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::with_capacity(5);
+    if let Some(sock) = docker_socket {
+        argv.push("-H".to_string());
+        argv.push(format!("unix://{}", sock.display()));
+    }
+    argv.push("network".to_string());
+    argv.push("rm".to_string());
+    argv.push(network_name.to_string());
+    argv
+}
 
 /// Parse the base address from a CIDR string like `"10.209.0.16/28"`.
 fn parse_subnet_base(cidr: &str) -> Result<Ipv4Addr, SandboxError> {
@@ -1438,6 +1506,39 @@ impl std::fmt::Display for OwnershipAssertionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- docker network rm argv (socket-awareness) ---------------------------
+
+    /// Linux / host docker: no `-H` flag — `docker network rm <name>`.
+    /// Pins the byte-identical Linux argv.
+    #[test]
+    fn docker_network_rm_argv_no_socket_is_host_docker() {
+        let argv = docker_network_rm_argv(None, "sandbox-net-abc123");
+        assert_eq!(argv, vec!["network", "rm", "sandbox-net-abc123"]);
+        assert!(
+            !argv.iter().any(|a| a == "-H"),
+            "host-docker argv must not carry -H: {argv:?}"
+        );
+    }
+
+    /// macOS lite: a forwarded socket injects `-H unix://<sock>` ahead of the
+    /// `network rm` verb so the delete reaches the gateway VM's daemon, not
+    /// the host. Mirrors `create_network_on_socket`.
+    #[test]
+    fn docker_network_rm_argv_with_socket_prepends_host_flag() {
+        let sock = std::path::Path::new("/var/lib/sandboxd/501/gateway-docker.sock");
+        let argv = docker_network_rm_argv(Some(sock), "sandbox-net-def456");
+        assert_eq!(
+            argv,
+            vec![
+                "-H",
+                "unix:///var/lib/sandboxd/501/gateway-docker.sock",
+                "network",
+                "rm",
+                "sandbox-net-def456",
+            ]
+        );
+    }
 
     // -- SubnetAllocator unit tests ------------------------------------------
 

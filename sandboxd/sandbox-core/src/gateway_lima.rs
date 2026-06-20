@@ -98,6 +98,25 @@ pub const UBUNTU_NOBLE_ARM64_URL: &str =
 #[cfg(target_os = "macos")]
 pub const MIN_LIMA_VERSION: &str = "1.2.0";
 
+/// vCPU count assigned to the daemon-owned gateway Lima VM.
+///
+/// On macOS lite, every sandbox container runs inside this VM via the
+/// forwarded Docker socket, so a container's `--cpus` ceiling must fit within
+/// the VM rather than the macOS host. The container backend reads this to cap
+/// its default/explicit CPU allotment (see
+/// `container::macos_container_cpu_ceiling`). Wired into
+/// `generate_gateway_template`'s `cpus:` line so the VM spec and the cap stay
+/// in lockstep.
+#[cfg(target_os = "macos")]
+pub const GATEWAY_VM_CPUS: u32 = 2;
+
+/// RAM (MiB) assigned to the daemon-owned gateway Lima VM (mirrors the
+/// template's `memory: "2GiB"`). The container backend caps a sandbox
+/// container's memory ceiling to this minus a fixed VM/gateway-overhead margin
+/// (see `container::macos_container_memory_ceiling_mb`).
+#[cfg(target_os = "macos")]
+pub const GATEWAY_VM_MEMORY_MB: u32 = 2048;
+
 /// How often to poll `docker info` during readiness wait.
 #[cfg(target_os = "macos")]
 const DOCKER_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -184,6 +203,23 @@ pub const IN_VM_ROUTE_HELPER_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-r
 /// Timeout for `limactl copy` (binary staging into the gateway VM).
 #[cfg(target_os = "macos")]
 const ROUTE_HELPER_COPY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for staging a per-session lite container file into the gateway VM
+/// (`limactl shell mkdir` and per-file `limactl copy`).
+#[cfg(target_os = "macos")]
+const LITE_FILE_STAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Parent of the per-session lite staging directories inside the gateway VM.
+///
+/// `/tmp` is `1777` (sticky, world-writable) so the operator's Lima SSH login
+/// can `mkdir` and `limactl copy` into it without sudo, while root-in-VM (the
+/// Docker daemon applying the bind) can still read it. The material staged here
+/// is non-secret: the per-session public CA cert, the operator's SSH public key
+/// (`authorized_keys`), and the synthetic `passwd`/`group` files. The sole
+/// secret — the mitmproxy CA private key — never lands here; it is written
+/// straight into the gateway container's tmpfs (see `macos_session`).
+#[cfg(target_os = "macos")]
+pub const LITE_STAGE_ROOT: &str = "/tmp/sandbox-lite";
 
 // ---------------------------------------------------------------------------
 // NIC map
@@ -344,6 +380,11 @@ pub fn generate_gateway_template(max_slots: u16) -> String {
         .map(|slot| format!("      sysctl -w net.ipv6.conf.lima{slot}.disable_ipv6=1\n"))
         .collect::<String>();
 
+    // Derive the `memory:` suffix from the MiB constant so the VM spec and the
+    // container-backend memory cap (which reads GATEWAY_VM_MEMORY_MB) cannot
+    // drift. 2048 MiB renders as the historical "2GiB".
+    let memory_gib = GATEWAY_VM_MEMORY_MB / 1024;
+    let gateway_cpus = GATEWAY_VM_CPUS;
     format!(
         r#"vmType: "qemu"
 minimumLimaVersion: "{MIN_LIMA_VERSION}"
@@ -352,8 +393,8 @@ images:
   - location: "{UBUNTU_NOBLE_ARM64_URL}"
     arch: aarch64
 
-cpus: 2
-memory: "2GiB"
+cpus: {gateway_cpus}
+memory: "{memory_gib}GiB"
 disk: "20GiB"
 
 # N socket_vmnet NICs — one per pool slot.
@@ -389,23 +430,34 @@ provision:
       done
       systemctl enable docker
       systemctl start docker
-      # Restrict the Docker socket to the docker group — never world-writable.
-      # A world-writable socket lets any in-VM process (incl. a compromised
-      # gateway container) reach Docker and escalate to root-in-gateway-VM,
-      # defeating "the gateway pipeline is isolated from operators" for ALL
-      # sessions at once.
+      # Make the in-VM Docker socket world-readable/writable.
+      #
+      # Lima's socket-forward connects to /var/run/docker.sock as the SSH login
+      # user (the operator). The obvious approach — chgrp the 0660 socket to the
+      # docker group and add the operator to that group — does NOT work here:
+      # Lima establishes a persistent ControlPersist SSH master connection at VM
+      # boot, BEFORE this provision runs, so every forwarded channel inherits the
+      # operator's boot-time supplementary groups. The docker group added now is
+      # absent from those channels' credentials (`id` for the operator over the
+      # master shows no docker group despite /etc/group listing it), so the
+      # forward can't read a 0660 socket and the host side sees EOF.
+      #
+      # 0666 is safe here: the HOST-side forwarded gateway-docker.sock is 0600
+      # (operator-only), the gateway VM is a single-tenant daemon-owned appliance,
+      # and the VM's /var/run/docker.sock is a unix socket that is never
+      # bind-mounted into any lite/gateway container — so no container can reach
+      # it. Widening the in-VM mode does not widen the external attack surface.
+      #
+      # The drop-in makes the mode survive docker.socket restarts; the direct
+      # chmod fixes the already-running socket for the current boot (the drop-in
+      # only takes effect on the next docker.socket (re)start, which we must not
+      # force here without disrupting the running dockerd).
       groupadd -f docker
-      chgrp docker /var/run/docker.sock
-      chmod 660 /var/run/docker.sock
-      # Add the Lima SSH user to the docker group so Lima's socket-forward
-      # (which connects as the login user via SSH) can read /var/run/docker.sock.
-      # Lima creates an operator user with the same UID as the macOS host user.
-      # macOS UIDs typically start at 500 (unlike Linux where they start at 1000),
-      # so we add all non-system users (UID 500–65533) to the docker group. This
-      # is portable across macOS hosts without baking in a specific username.
-      for u in $(awk -F: '$3 >= 500 && $3 < 65534 {{print $1}}' /etc/passwd); do
-        usermod -aG docker "$u"
-      done
+      mkdir -p /etc/systemd/system/docker.socket.d
+      printf '[Socket]\nSocketMode=0666\n' \
+        > /etc/systemd/system/docker.socket.d/10-socketmode.conf
+      systemctl daemon-reload
+      chmod 666 /var/run/docker.sock
   - mode: system
     script: |
       #!/bin/bash
@@ -658,6 +710,47 @@ fn apply_docker_env(cmd: &mut Command) {
     // reconstruct only the vars the docker CLI needs to locate its binary
     // dependencies.
     cmd.env_clear().env("PATH", &path_value).env("HOME", home);
+}
+
+// ---------------------------------------------------------------------------
+// Lite-session staging path + argv builders (pure, testable)
+// ---------------------------------------------------------------------------
+
+/// VM staging directory for a session's lite-container provisioning files.
+///
+/// `{LITE_STAGE_ROOT}/<session_id>`. Pure string composition — no I/O.
+#[cfg(target_os = "macos")]
+pub fn lite_stage_dir(session_id: &str) -> String {
+    format!("{LITE_STAGE_ROOT}/{session_id}")
+}
+
+/// `limactl shell` argv that creates the per-session staging directory inside
+/// the gateway VM. Shape: `["shell", "<vm>", "--", "mkdir", "-p", "<dir>"]`,
+/// matching the prefix `run_gateway_shell_argv` expects.
+#[cfg(target_os = "macos")]
+pub fn lite_stage_mkdir_argv(vm_dir: &str) -> Vec<String> {
+    vec![
+        "shell".to_string(),
+        GATEWAY_INSTANCE_NAME.to_string(),
+        "--".to_string(),
+        "mkdir".to_string(),
+        "-p".to_string(),
+        vm_dir.to_string(),
+    ]
+}
+
+/// `limactl shell` argv that removes the per-session staging directory from the
+/// gateway VM. Shape: `["shell", "<vm>", "--", "rm", "-rf", "<dir>"]`.
+#[cfg(target_os = "macos")]
+pub fn lite_stage_rm_argv(vm_dir: &str) -> Vec<String> {
+    vec![
+        "shell".to_string(),
+        GATEWAY_INSTANCE_NAME.to_string(),
+        "--".to_string(),
+        "rm".to_string(),
+        "-rf".to_string(),
+        vm_dir.to_string(),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,7 +1665,14 @@ impl GatewayLimaManager {
         }
 
         // Copy the binary from the host into the gateway VM using `limactl copy`.
-        let dst = format!("{GATEWAY_INSTANCE_NAME}:{IN_VM_ROUTE_HELPER_PATH}");
+        //
+        // `limactl copy` runs rsync-over-ssh as the unprivileged Lima SSH user
+        // (the operator), which cannot write into the root-owned
+        // /usr/local/libexec/sandboxd directory created above. So stage the
+        // binary at a writable temp path first, then `sudo install` it into the
+        // final root-owned location below.
+        const STAGED_ROUTE_HELPER_PATH: &str = "/tmp/sandbox-route-helper.staged";
+        let dst = format!("{GATEWAY_INSTANCE_NAME}:{STAGED_ROUTE_HELPER_PATH}");
         let mut copy_cmd = Command::new("limactl");
         apply_limactl_env(&mut copy_cmd, self.daemon_uid);
         copy_cmd.args(["copy", host_binary.to_str().unwrap_or(""), &dst]);
@@ -1585,6 +1685,24 @@ impl GatewayLimaManager {
             let stderr = String::from_utf8_lossy(&copy_output.stderr);
             return Err(SandboxError::Lima(format!(
                 "ensure_route_helper_in_vm: limactl copy failed: {stderr}"
+            )));
+        }
+
+        // Move the staged binary into the root-owned final location as root.
+        // `install -m 0755` places it atomically with the correct mode, then
+        // remove the staging copy. This is the privileged step the unprivileged
+        // `limactl copy` above cannot perform directly.
+        let install_output = self.run_gateway_shell(
+            &format!(
+                "sudo install -m 0755 {STAGED_ROUTE_HELPER_PATH} {IN_VM_ROUTE_HELPER_PATH} && \
+                 rm -f {STAGED_ROUTE_HELPER_PATH}"
+            ),
+            ROUTE_HELPER_COPY_TIMEOUT,
+        )?;
+        if !install_output.status.success() {
+            let stderr = String::from_utf8_lossy(&install_output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "ensure_route_helper_in_vm: install into {IN_VM_ROUTE_HELPER_PATH} failed: {stderr}"
             )));
         }
 
@@ -1606,6 +1724,122 @@ impl GatewayLimaManager {
 
         info!("sandbox-route-helper installed and setcap'd in gateway VM");
         Ok(())
+    }
+
+    /// Stage a session's lite-container provisioning files into a per-session,
+    /// operator-writable, VM-resident directory and return that directory's
+    /// path inside the gateway VM.
+    ///
+    /// On macOS the lite container runs inside the gateway VM via the forwarded
+    /// Docker socket, so Docker resolves bind-mount *sources* against the VM
+    /// filesystem — not the macOS host. The CA cert and the three SSH files
+    /// (`authorized_keys`, `passwd`, `group`) the daemon generated on the host
+    /// therefore have to be copied into the VM before `docker create` can bind
+    /// them into the container at their canonical in-container paths.
+    ///
+    /// The staging directory is `{LITE_STAGE_ROOT}/<session_id>/`. The four
+    /// files keep their canonical basenames so the existing bind builders
+    /// (`build_ca_mount_args` binds `<dir>/cert.pem`; `build_ssh_mount_args`
+    /// joins `<dir>` with the three SSH filenames) can point at the returned
+    /// VM directory unchanged.
+    ///
+    /// Idempotent: the `mkdir -p` and per-file `limactl copy` overwrite, so it
+    /// is safe to call on both the create and restart paths.
+    ///
+    /// Returns the VM staging directory path (e.g.
+    /// `/tmp/sandbox-lite/<session_id>`). The caller sets the
+    /// `ContainerNetwork`'s `ca_host_path` to `<dir>/cert.pem` and its
+    /// `ssh_host_dir` to `<dir>`.
+    pub fn stage_lite_session_files(
+        &self,
+        session_id: &str,
+        cert_pem_host: &Path,
+        authorized_keys_host: &Path,
+        passwd_host: &Path,
+        group_host: &Path,
+    ) -> Result<String, SandboxError> {
+        let vm_dir = lite_stage_dir(session_id);
+
+        // Create the per-session staging directory in the VM's sticky /tmp.
+        // Runs as the operator's Lima SSH login — no sudo needed.
+        let mkdir_argv = lite_stage_mkdir_argv(&vm_dir);
+        let mkdir_output = self.run_gateway_shell_argv(&mkdir_argv)?;
+        if !mkdir_output.status.success() {
+            let stderr = String::from_utf8_lossy(&mkdir_output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "stage_lite_session_files: failed to mkdir {vm_dir} in gateway VM: {stderr}"
+            )));
+        }
+
+        // Copy each file into the staging directory under its canonical
+        // basename so the bind builders resolve the same paths the Linux
+        // host binds use.
+        for (host_src, basename) in [
+            (cert_pem_host, "cert.pem"),
+            (authorized_keys_host, "authorized_keys"),
+            (passwd_host, "passwd"),
+            (group_host, "group"),
+        ] {
+            let dst = format!("{GATEWAY_INSTANCE_NAME}:{vm_dir}/{basename}");
+            let mut copy_cmd = Command::new("limactl");
+            apply_limactl_env(&mut copy_cmd, self.daemon_uid);
+            copy_cmd.args(["copy", host_src.to_str().unwrap_or(""), &dst]);
+            let copy_output = run_with_timeout(
+                &mut copy_cmd,
+                LITE_FILE_STAGE_TIMEOUT,
+                "gateway: limactl copy (lite session file)",
+            )?;
+            if !copy_output.status.success() {
+                let stderr = String::from_utf8_lossy(&copy_output.stderr);
+                return Err(SandboxError::Lima(format!(
+                    "stage_lite_session_files: limactl copy of {basename} into {vm_dir} failed: {stderr}"
+                )));
+            }
+        }
+
+        info!(
+            session_id = %session_id,
+            vm_dir = %vm_dir,
+            "staged lite session files into gateway VM"
+        );
+        Ok(vm_dir)
+    }
+
+    /// Remove a session's lite-container staging directory from the gateway VM.
+    ///
+    /// Best-effort: failures are logged at `warn!` and swallowed. The bind into
+    /// the container holds no lock on these files (Docker copies the bind source
+    /// at mount time), so removing the staging dir on delete simply reclaims the
+    /// non-secret bytes; a failure here never blocks teardown.
+    pub fn cleanup_lite_session_files(&self, session_id: &str) {
+        let vm_dir = lite_stage_dir(session_id);
+        let argv = lite_stage_rm_argv(&vm_dir);
+        match self.run_gateway_shell_argv(&argv) {
+            Ok(output) if output.status.success() => {
+                info!(
+                    session_id = %session_id,
+                    vm_dir = %vm_dir,
+                    "removed lite session staging dir from gateway VM"
+                );
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    session_id = %session_id,
+                    vm_dir = %vm_dir,
+                    stderr = %stderr.trim(),
+                    "cleanup_lite_session_files: rm returned non-zero (non-fatal)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    vm_dir = %vm_dir,
+                    error = %e,
+                    "cleanup_lite_session_files: rm failed (non-fatal)"
+                );
+            }
+        }
     }
 
     /// Stop the gateway Lima instance.
@@ -2119,6 +2353,26 @@ mod tests {
         );
     }
 
+    /// The VM `cpus:`/`memory:` lines render from the published
+    /// `GATEWAY_VM_CPUS` / `GATEWAY_VM_MEMORY_MB` constants (which the
+    /// container backend reads to cap a sandbox container's resources). Pins
+    /// the historical `cpus: 2` / `memory: "2GiB"` rendering so the VM spec and
+    /// the resource cap cannot silently drift apart.
+    #[test]
+    fn template_cpus_and_memory_match_published_constants() {
+        let tmpl = generate_gateway_template(4);
+        assert_eq!(GATEWAY_VM_CPUS, 2);
+        assert_eq!(GATEWAY_VM_MEMORY_MB, 2048);
+        assert!(
+            tmpl.contains("cpus: 2\n"),
+            "template must render `cpus: 2` from GATEWAY_VM_CPUS"
+        );
+        assert!(
+            tmpl.contains("memory: \"2GiB\"\n"),
+            "template must render `memory: \"2GiB\"` from GATEWAY_VM_MEMORY_MB"
+        );
+    }
+
     #[test]
     fn template_contains_correct_socket_count() {
         let tmpl = generate_gateway_template(4);
@@ -2169,6 +2423,23 @@ mod tests {
         assert!(
             tmpl.contains("apt-get install -y docker.io"),
             "template must provision docker.io"
+        );
+        // The in-VM docker socket must be made world-RW so Lima's
+        // ControlPersist-master socket-forward (whose channels carry the
+        // operator's boot-time groups, missing any docker group added later)
+        // can read it. Persisted via a docker.socket drop-in + chmod for the
+        // current boot.
+        assert!(
+            tmpl.contains("SocketMode=0666"),
+            "template must set the docker socket mode to 0666 via a drop-in"
+        );
+        assert!(
+            tmpl.contains("/etc/systemd/system/docker.socket.d/10-socketmode.conf"),
+            "template must write the docker.socket drop-in for persistent SocketMode"
+        );
+        assert!(
+            tmpl.contains("chmod 666 /var/run/docker.sock"),
+            "template must chmod the already-running docker socket for the current boot"
         );
     }
 
@@ -2709,5 +2980,73 @@ mod tests {
             PathBuf::from("/var/lib/sandboxd/60/60/lima/lite-image.tar"),
             "tarball path must be daemon_lima_home/lite-image.tar"
         );
+    }
+
+    // -- Lite-session staging argv builders (pure, hermetic) ------------------
+
+    /// The per-session staging directory is `{LITE_STAGE_ROOT}/<session_id>`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_stage_dir_derivation() {
+        assert_eq!(
+            lite_stage_dir("0123456789ab"),
+            "/tmp/sandbox-lite/0123456789ab"
+        );
+    }
+
+    /// `lite_stage_mkdir_argv` produces the `limactl shell <vm> -- mkdir -p
+    /// <dir>` shape that `run_gateway_shell_argv` expects (prefix
+    /// `["shell", "<vm>", "--", ...]`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_stage_mkdir_argv_shape() {
+        let argv = lite_stage_mkdir_argv("/tmp/sandbox-lite/0123456789ab");
+        assert_eq!(
+            argv,
+            vec![
+                "shell".to_string(),
+                GATEWAY_INSTANCE_NAME.to_string(),
+                "--".to_string(),
+                "mkdir".to_string(),
+                "-p".to_string(),
+                "/tmp/sandbox-lite/0123456789ab".to_string(),
+            ],
+        );
+    }
+
+    /// `lite_stage_rm_argv` produces the `limactl shell <vm> -- rm -rf <dir>`
+    /// shape used by the delete path's best-effort cleanup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_stage_rm_argv_shape() {
+        let argv = lite_stage_rm_argv("/tmp/sandbox-lite/0123456789ab");
+        assert_eq!(
+            argv,
+            vec![
+                "shell".to_string(),
+                GATEWAY_INSTANCE_NAME.to_string(),
+                "--".to_string(),
+                "rm".to_string(),
+                "-rf".to_string(),
+                "/tmp/sandbox-lite/0123456789ab".to_string(),
+            ],
+        );
+    }
+
+    /// The per-file `limactl copy` destination places each file under its
+    /// canonical basename inside the staging dir, so the bind builders
+    /// (`build_ca_mount_args` reading `<dir>/cert.pem`, `build_ssh_mount_args`
+    /// joining `<dir>` with the three SSH filenames) resolve unchanged.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_stage_copy_destinations() {
+        let vm_dir = lite_stage_dir("0123456789ab");
+        for basename in ["cert.pem", "authorized_keys", "passwd", "group"] {
+            let dst = format!("{GATEWAY_INSTANCE_NAME}:{vm_dir}/{basename}");
+            assert_eq!(
+                dst,
+                format!("sandboxd-gateway:/tmp/sandbox-lite/0123456789ab/{basename}"),
+            );
+        }
     }
 }

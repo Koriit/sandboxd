@@ -2,7 +2,7 @@
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership \
-	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 stage-lite-image
+	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -278,10 +278,28 @@ gateway-image:
 # that same inherited version.
 LITE_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/Cargo.toml)
 
-lite-image:
+# lite-image — build the sandboxd-lite container image.
+#
+# The lite container runs inside the linux/aarch64 gateway VM, so its baked
+# sandbox-guest must be a linux/aarch64 ELF. On Linux the host cargo build at
+# sandboxd/target/release/sandbox-guest is already the right arch. On macOS the
+# host build is a Darwin Mach-O — wrong arch — so we cross-compile a
+# linux/aarch64 guest via build-guest-linux-aarch64 (a prerequisite that
+# self-skips on Linux) and bake that instead.
+lite-image: build-guest-linux-aarch64
 	cd sandboxd && cargo build --release --workspace
 	mkdir -p sandboxd/images/lite/.context
-	cp sandboxd/target/release/sandbox-guest sandboxd/images/lite/.context/sandbox-guest
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+	  _guest=sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest; \
+	else \
+	  _guest=sandboxd/target/release/sandbox-guest; \
+	fi; \
+	if [ ! -f "$$_guest" ]; then \
+	  echo "ERROR: $$_guest not found"; \
+	  exit 1; \
+	fi; \
+	echo "cp $$_guest sandboxd/images/lite/.context/sandbox-guest"; \
+	cp "$$_guest" sandboxd/images/lite/.context/sandbox-guest
 	cp sandboxd/images/lite/Dockerfile sandboxd/images/lite/.context/Dockerfile
 	docker build -t sandboxd-lite:$(LITE_VERSION) sandboxd/images/lite/.context
 	rm -rf sandboxd/images/lite/.context
@@ -937,6 +955,35 @@ build-route-helper-linux-aarch64:
 	         cargo build --release -p sandbox-route-helper \
 	           --target aarch64-unknown-linux-gnu"
 	@echo "$(GREEN)✓ built: sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-route-helper$(RESET)"
+
+# build-guest-linux-aarch64 — cross-compile sandbox-guest for Linux aarch64
+# (the gateway VM's architecture, where lite containers run).
+#
+# On macOS the host cargo build produces a Darwin Mach-O sandbox-guest, which
+# cannot exec inside the linux/aarch64 gateway VM (Exec format error). lite-image
+# bakes the binary produced here instead. Mirrors build-route-helper-linux-aarch64:
+# Darwin-gated, dockerized rust build, no host-side aarch64 toolchain required.
+#
+# The compiled binary lands at:
+#   sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest
+build-guest-linux-aarch64:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ build-guest-linux-aarch64 skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@echo "Cross-compiling sandbox-guest for linux/aarch64 via Docker..."
+	docker run --rm \
+	  -v "$$(pwd)/sandboxd:/workspace/sandboxd:ro" \
+	  -v "$$(pwd)/sandboxd/target:/workspace/sandboxd/target" \
+	  -w /workspace/sandboxd \
+	  rust:1.88-bookworm \
+	  sh -c "apt-get update -qq && \
+	         apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu && \
+	         rustup target add aarch64-unknown-linux-gnu && \
+	         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+	         cargo build --release -p sandbox-guest \
+	           --target aarch64-unknown-linux-gnu"
+	@echo "$(GREEN)✓ built: sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest$(RESET)"
 
 # stage-route-helper-linux-aarch64 — copy the Linux aarch64 route-helper into
 # the daemon's LIMA_HOME so `ensure_route_helper_in_vm` can find it at startup.
