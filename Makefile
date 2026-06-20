@@ -376,6 +376,22 @@ TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
 #   make setup-dev-env DARWIN_VMNET_SLOTS=4
 DARWIN_VMNET_SLOTS          ?= 8
 
+# SANDBOX_DAEMON_USER / SANDBOX_DAEMON_UID — identity the daemon runs as,
+# used by the Darwin staging targets to derive the daemon's per-uid
+# LIMA_HOME (`/var/lib/sandboxd/<uid>/<uid>/lima`, matching
+# `operator_lima_home(daemon_uid)` in lima.rs).
+#
+# Default `_sandbox` is the production daemon user. An operator-run dev
+# daemon (no `_sandbox` user; the daemon runs as the operator's own uid,
+# e.g. 501) overrides on the command line so staging targets the daemon's
+# actual LIMA_HOME and installs files owned by that uid/gid:
+#   make stage-lite-image SANDBOX_DAEMON_USER=$(id -un)
+#   make stage-route-helper-linux-aarch64 SANDBOX_DAEMON_USER=youruser
+# SANDBOX_DAEMON_UID may also be set directly; it defaults to the uid of
+# SANDBOX_DAEMON_USER.
+SANDBOX_DAEMON_USER         ?= _sandbox
+SANDBOX_DAEMON_UID          ?= $(shell id -u $(SANDBOX_DAEMON_USER) 2>/dev/null)
+
 # Staged root-exec'd socket_vmnet binary (root:wheel 0755). install.sh
 # copies from the Homebrew prefix to this path so the root launchd daemons
 # never exec an admin-writable file (see § socket_vmnet access in spec).
@@ -989,11 +1005,12 @@ build-guest-linux-aarch64:
 # the daemon's LIMA_HOME so `ensure_route_helper_in_vm` can find it at startup.
 #
 # The staging path mirrors the daemon's derivation:
-#   {SANDBOXD_STATE_ROOT}/{_sandbox-uid}/{_sandbox-uid}/lima/sandbox-route-helper-linux-aarch64
+#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/{daemon-uid}/lima/sandbox-route-helper-linux-aarch64
 #
-# Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {_sandbox-uid} is the
-# uid of the _sandbox daemon user (derived at runtime via `id -u _sandbox`).
-# This matches operator_lima_home(daemon_uid) in lima.rs.
+# Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {daemon-uid} is the
+# uid of the daemon user (SANDBOX_DAEMON_UID; defaults to the uid of
+# SANDBOX_DAEMON_USER=_sandbox for prod, overridable for an operator-run dev
+# daemon). This matches operator_lima_home(daemon_uid) in lima.rs.
 #
 # Idempotence: skipped if the installed binary is byte-identical to the built one.
 # Darwin-only: the gateway VM only exists on macOS.
@@ -1007,24 +1024,26 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 	  echo "ERROR: $$_built not found — run 'make build-route-helper-linux-aarch64' first"; \
 	  exit 1; \
 	fi; \
-	_sandbox_uid=$$(id -u _sandbox 2>/dev/null || echo ""); \
-	if [ -z "$$_sandbox_uid" ]; then \
-	  echo "WARNING: _sandbox user not found; skipping route-helper staging."; \
-	  echo "  Run 'make setup-dev-env' after installing sandboxd to create the _sandbox user,"; \
+	_daemon_user="$(SANDBOX_DAEMON_USER)"; \
+	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
+	if [ -z "$$_daemon_uid" ]; then \
+	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping route-helper staging."; \
+	  echo "  For a production install, run 'make setup-dev-env' to create the _sandbox user,"; \
 	  echo "  then re-run 'make stage-route-helper-linux-aarch64'."; \
+	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 0; \
 	fi; \
-	_lima_home="/var/lib/sandboxd/$$_sandbox_uid/$$_sandbox_uid/lima"; \
+	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/sandbox-route-helper-linux-aarch64"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] mkdir -p $$_lima_home"; \
-	  sudo -k install -d -o _sandbox -g _sandbox -m 0750 "$$_lima_home"; \
+	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_user" -m 0750 "$$_lima_home"; \
 	fi; \
 	if [ -f "$$_dst" ] && cmp -s "$$_built" "$$_dst"; then \
 	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
-	  sudo -k install -o _sandbox -g _sandbox -m 0755 "$$_built" "$$_dst"; \
+	  sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0755 "$$_built" "$$_dst"; \
 	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
 	fi
 
@@ -1033,11 +1052,12 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 # find it at lite session-create time on macOS.
 #
 # The staging path mirrors the daemon's derivation:
-#   {SANDBOXD_STATE_ROOT}/{_sandbox-uid}/{_sandbox-uid}/lima/lite-image.tar
+#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/{daemon-uid}/lima/lite-image.tar
 #
-# Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {_sandbox-uid} is the
-# uid of the _sandbox daemon user (derived at runtime via `id -u _sandbox`).
-# This matches operator_lima_home(daemon_uid) in lima.rs.
+# Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {daemon-uid} is the
+# uid of the daemon user (SANDBOX_DAEMON_UID; defaults to the uid of
+# SANDBOX_DAEMON_USER=_sandbox for prod, overridable for an operator-run dev
+# daemon). This matches operator_lima_home(daemon_uid) in lima.rs.
 #
 # Idempotence: saves to a temp file, then skips the sudo install if the
 # destination is byte-identical to the freshly saved tarball.
@@ -1052,18 +1072,20 @@ stage-lite-image: lite-image
 	  echo "ERROR: $$_lite_tag not found in local Docker — run 'make lite-image' first"; \
 	  exit 1; \
 	fi; \
-	_sandbox_uid=$$(id -u _sandbox 2>/dev/null || echo ""); \
-	if [ -z "$$_sandbox_uid" ]; then \
-	  echo "WARNING: _sandbox user not found; skipping lite-image staging."; \
-	  echo "  Run 'make setup-dev-env' after installing sandboxd to create the _sandbox user,"; \
+	_daemon_user="$(SANDBOX_DAEMON_USER)"; \
+	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
+	if [ -z "$$_daemon_uid" ]; then \
+	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping lite-image staging."; \
+	  echo "  For a production install, run 'make setup-dev-env' to create the _sandbox user,"; \
 	  echo "  then re-run 'make stage-lite-image'."; \
+	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 0; \
 	fi; \
-	_lima_home="/var/lib/sandboxd/$$_sandbox_uid/$$_sandbox_uid/lima"; \
+	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/lite-image.tar"; \
 	if [ ! -d "$$_lima_home" ]; then \
-	  echo "[sudo] install -d -o _sandbox -g _sandbox -m 0750 $$_lima_home"; \
-	  sudo -k install -d -o _sandbox -g _sandbox -m 0750 "$$_lima_home"; \
+	  echo "[sudo] install -d -o $$_daemon_user -g $$_daemon_user -m 0750 $$_lima_home"; \
+	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_user" -m 0750 "$$_lima_home"; \
 	fi; \
 	_tmp=/tmp/sandboxd-lite-stage-$$$$.tar; \
 	echo "docker save $$_lite_tag -o $$_tmp"; \
@@ -1072,8 +1094,8 @@ stage-lite-image: lite-image
 	  rm -f "$$_tmp"; \
 	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
 	else \
-	  echo "[sudo] install -o _sandbox -g _sandbox -m 0640 $$_tmp $$_dst"; \
-	  sudo -k install -o _sandbox -g _sandbox -m 0640 "$$_tmp" "$$_dst"; \
+	  echo "[sudo] install -o $$_daemon_user -g $$_daemon_user -m 0640 $$_tmp $$_dst"; \
+	  sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0640 "$$_tmp" "$$_dst"; \
 	  rm -f "$$_tmp"; \
 	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
 	fi

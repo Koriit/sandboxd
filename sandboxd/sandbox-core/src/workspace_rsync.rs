@@ -118,9 +118,12 @@ pub enum Direction {
 ///   does not compose with `-L`, so the planner must drop `-L`).
 /// - `mkpath` — when `true`, appends `--mkpath` (rsync ≥ 3.2.3) so
 ///   rsync creates missing parent directories on the destination.
-///   The initial create-time push uses `mkpath = true`; operator-
-///   driven push/pull typically uses `false` because the destination
-///   should already exist.
+///   The initial create-time push uses `mkpath = true` on Linux;
+///   operator-driven push/pull typically uses `false` because the
+///   destination should already exist. On the macOS lite create path
+///   (host rsync is Apple openrsync, which has no `--mkpath`)
+///   [`run_initial_push`] sets `mkpath = false` and pre-creates the
+///   destination over the transport instead.
 #[derive(Debug, Clone)]
 pub struct WorkspaceRsyncOptions {
     pub backend: BackendKind,
@@ -285,6 +288,18 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
 /// [`SandboxError::Internal`] with the captured stderr embedded
 /// verbatim (lossy UTF-8 decoding) so the operator sees rsync's own
 /// diagnostic (e.g. `permission denied`, `mkdir failed: EROFS`).
+///
+/// ## Apple openrsync caveat (`docker_socket.is_some()` path)
+///
+/// On macOS the daemon spawns the **host** `rsync`, which is Apple
+/// **openrsync** — it has no `--mkpath` (that flag is rsync ≥ 3.2.3) and
+/// aborts before any transport runs if it is passed. The macOS lite create
+/// path is the sole caller that supplies a forwarded `docker_socket`, so
+/// `docker_socket.is_some()` is the macOS-lite discriminator: in that case
+/// `--mkpath` is dropped and the guest destination directory is created up
+/// front over the same transport (`docker -H <sock> exec <ctr> mkdir -p
+/// <guest>`). Linux passes `docker_socket = None`, keeps `--mkpath`, and
+/// skips the pre-mkdir entirely — byte-identical to the prior behaviour.
 pub async fn run_initial_push(
     backend: BackendKind,
     docker_socket: Option<&str>,
@@ -293,11 +308,29 @@ pub async fn run_initial_push(
     guest_path: &str,
     no_gitignore: bool,
 ) -> Result<(), SandboxError> {
-    // Create-time push is fixed-shape: host → guest direction,
-    // `--mkpath` enabled so rsync materialises the guest workspace
-    // root, no dry-run, no safe-links toggle. Operator-driven push/
-    // pull (CLI side) builds the same options struct with different
-    // flags but goes through the same shared builder.
+    // Apple openrsync (host rsync on macOS) rejects `--mkpath`. The forwarded
+    // socket is only ever set on the macOS lite create path, so its presence
+    // selects the openrsync-safe shape: pre-create the guest destination
+    // directory over the transport, then run rsync without `--mkpath`. Linux
+    // leaves `docker_socket` `None` and keeps the rsync-driven parent create.
+    let use_mkpath = docker_socket.is_none();
+    if let Some(sock) = docker_socket {
+        // Container backend only: the forwarded socket addresses the in-VM
+        // Docker daemon, so `docker -H unix://<sock> exec <ctr> mkdir -p
+        // <guest>` materialises the destination root before rsync runs.
+        // The Lima backend never supplies a socket (it uses the helper-
+        // pivoted push), so this branch is container-only in practice.
+        if backend == BackendKind::Container {
+            premkdir_guest_dir_via_socket(sock, session_name, guest_path).await?;
+        }
+    }
+
+    // Create-time push is fixed-shape: host → guest direction, no dry-run,
+    // no safe-links toggle. `--mkpath` is enabled only when the host rsync
+    // supports it (Linux); on macOS lite the destination was pre-created
+    // above and `--mkpath` is dropped (Apple openrsync rejects it).
+    // Operator-driven push/ pull (CLI side) builds the same options struct
+    // with different flags but goes through the same shared builder.
     //
     // `docker_socket` is `None` on Linux / host docker (transport stays
     // `docker exec -i`); on macOS lite the forwarded gateway-VM socket
@@ -315,7 +348,7 @@ pub async fn run_initial_push(
         no_gitignore,
         dry_run: false,
         safe_links: false,
-        mkpath: true,
+        mkpath: use_mkpath,
     });
 
     info!(
@@ -391,6 +424,89 @@ pub async fn run_initial_push(
     let stderr_text = String::from_utf8_lossy(&stderr_bytes);
     Err(SandboxError::Internal(format!(
         "local-workspace rsync failed (exit {code}): {stderr_text}"
+    )))
+}
+
+/// Build the `docker` argv that pre-creates the guest destination
+/// directory inside the in-VM container before the macOS-lite rsync push.
+///
+/// Pure function (no I/O) so the openrsync-safe shape is unit-testable
+/// without spawning `docker`. The returned `Vec<String>` is the full
+/// argument list following the program name `docker`:
+///
+/// ```text
+/// -H unix://<sock> exec <container> mkdir -p <guest>
+/// ```
+///
+/// `session_name` doubles as the container name (`sandbox-<id>`), matching
+/// the rsync remote spec the same call site builds. The guest path is
+/// passed verbatim — it is daemon-derived (not operator free-text on this
+/// path) and any trailing slash is harmless to `mkdir -p`.
+pub fn build_premkdir_argv(socket: &str, session_name: &str, guest_path: &str) -> Vec<String> {
+    vec![
+        "-H".to_string(),
+        format!("unix://{socket}"),
+        "exec".to_string(),
+        session_name.to_string(),
+        "mkdir".to_string(),
+        "-p".to_string(),
+        guest_path.to_string(),
+    ]
+}
+
+/// Timeout for the pre-rsync `mkdir -p` over the forwarded socket. A short
+/// ceiling: it is a single fast in-VM `docker exec`.
+const PREMKDIR_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Create the guest destination directory inside the in-VM container over
+/// the forwarded Docker socket, before the macOS-lite rsync push.
+///
+/// Apple openrsync (the host rsync on macOS) has no `--mkpath`, so the
+/// destination root must already exist when rsync starts. This runs
+/// `docker -H unix://<sock> exec <ctr> mkdir -p <guest>` against the
+/// gateway VM's Docker daemon. Non-zero exit is fatal (fail-closed: a
+/// missing destination would make the subsequent rsync fail with a less
+/// actionable error).
+async fn premkdir_guest_dir_via_socket(
+    socket: &str,
+    session_name: &str,
+    guest_path: &str,
+) -> Result<(), SandboxError> {
+    let argv = build_premkdir_argv(socket, session_name, guest_path);
+    info!(
+        session = %session_name,
+        guest_path = %guest_path,
+        "local-workspace rsync: pre-creating guest dir (openrsync, no --mkpath)"
+    );
+    let fut = Command::new("docker")
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(PREMKDIR_TIMEOUT, fut)
+        .await
+        .map_err(|_| SandboxError::Timeout {
+            operation: format!("docker exec mkdir -p (guest workspace dir {guest_path})"),
+            duration: PREMKDIR_TIMEOUT.as_secs(),
+        })?
+        .map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to spawn docker mkdir -p for local-workspace dest: {e}"
+            ))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    Err(SandboxError::Internal(format!(
+        "failed to create guest workspace dir {guest_path} (docker exec mkdir exit {code}): {stderr_text}"
     )))
 }
 
@@ -754,6 +870,61 @@ mod tests {
         assert!(
             dst.ends_with(":/home/sandbox/workspace/"),
             "destination missing :<guest>/ tail: {dst}"
+        );
+    }
+
+    /// macOS lite openrsync pre-mkdir argv: `docker -H unix://<sock> exec
+    /// <ctr> mkdir -p <guest>`. The container name is the `sandbox-<id>`
+    /// session name (same token the rsync remote spec uses), and the guest
+    /// path is passed verbatim. This is the up-front directory create that
+    /// replaces `--mkpath` on Apple openrsync.
+    #[test]
+    fn build_premkdir_argv_targets_in_vm_container() {
+        let argv = build_premkdir_argv(
+            "/var/lib/sandboxd/501/gateway-docker.sock",
+            "sandbox-mac1",
+            "/home/sandbox/workspace",
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "-H",
+                "unix:///var/lib/sandboxd/501/gateway-docker.sock",
+                "exec",
+                "sandbox-mac1",
+                "mkdir",
+                "-p",
+                "/home/sandbox/workspace",
+            ]
+        );
+    }
+
+    /// The macOS-lite shape of `run_initial_push` (`docker_socket = Some`)
+    /// must NOT emit `--mkpath` — Apple openrsync rejects it. The builder
+    /// is exercised directly with `mkpath: false` here (the value
+    /// `run_initial_push` computes from `docker_socket.is_some()`), pinning
+    /// that the openrsync-safe argv carries no `--mkpath`.
+    #[test]
+    fn macos_lite_push_argv_omits_mkpath() {
+        let mut opts = push_opts(
+            BackendKind::Container,
+            "sandbox-mac1",
+            "/srv/proj",
+            "/home/sandbox/workspace",
+            false,
+        );
+        opts.docker_socket = Some("/var/lib/sandboxd/501/gateway-docker.sock".to_string());
+        opts.mkpath = false; // run_initial_push sets this when docker_socket.is_some()
+        let argv = build_workspace_rsync_argv(&opts);
+        assert!(
+            !argv.iter().any(|a| a == "--mkpath"),
+            "macOS lite (openrsync) push argv must omit --mkpath: {argv:?}"
+        );
+        // The forwarded-socket transport is still present.
+        let e_idx = argv.iter().position(|a| a == "-e").expect("-e present");
+        assert_eq!(
+            argv[e_idx + 1],
+            "docker -H unix:///var/lib/sandboxd/501/gateway-docker.sock exec -i",
         );
     }
 

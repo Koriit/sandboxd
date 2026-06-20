@@ -5272,6 +5272,95 @@ async fn create_session_macos_lite(
     start_dns_gate_listener(&session_id, &state).await;
     spawn_session_ingestor(&session_id, &state).await;
 
+    // Post-Running provisioning (mirrors the generic container branch in
+    // `create_session`): guest-readiness ping → initial policy apply →
+    // `local:` push → `--repo` clone (+DNS pre-warm) → `--boot-cmd`.
+    //
+    // All of these are reachable on the macOS lite path because the guest-
+    // agent transport (`docker exec ... socat` over the forwarded socket)
+    // and the policy/DNS distribution plane are both socket-aware. Failures
+    // are fail-closed: each block runs the same teardown ladder the steps
+    // above use (stop gateway → delete container → cleanup stage dir →
+    // delete network over the socket → release token → remove CA → mark
+    // Error), expressed once via the `lite_provision_teardown_and_return!`
+    // macro so the ordering cannot drift between blocks.
+    macro_rules! lite_provision_teardown_and_return {
+        ($resp:expr) => {{
+            let gw =
+                sandbox_core::GatewayManager::with_gateway_socket(gateway_docker_socket.clone());
+            let _ = gw.stop_gateway(&session_id);
+            let runtime = runtime_for(&state, BackendKind::Container);
+            let _ = runtime.delete(&handle, operator.uid).await;
+            cleanup_lite_stage_dir(&state, &session_id).await;
+            let _ = state
+                .network
+                .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
+            let _ = vmnet_pool.release_lite_token();
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return $resp;
+        }};
+    }
+
+    // Guest-readiness gate. Mirrors the generic container branch: gate every
+    // guest-touching dispatch below (the guest agent's TCP listener at
+    // 127.0.0.1:5123 reached over the socket-aware `docker exec ... socat`
+    // transport). Without it, a connect-refused before the agent has bound
+    // its socket would flakily route through the provisioning failure paths.
+    match state.guest.ping(&session_id).await {
+        Ok(true) => {
+            info!(%session_id, "guest agent responded to ping (lite macOS)");
+        }
+        Ok(false) => {
+            let err =
+                SandboxError::Internal("guest agent returned unexpected response to ping".into());
+            error!(%session_id, "guest agent ping: unexpected response (lite macOS)");
+            lite_provision_teardown_and_return!(error_response(err).into_response());
+        }
+        Err(e) => {
+            error!(%session_id, error = %e, "guest agent ping failed (lite macOS)");
+            lite_provision_teardown_and_return!(error_response(e).into_response());
+        }
+    }
+
+    // Apply the explicit `--policy <file>` (or `--preset <invocation>`, which
+    // the CLI compiles into `req.policy` server-side) now that the session is
+    // Running and the gateway is live. Mirrors the generic branch: an explicit
+    // policy that fails to compile/distribute is fatal (a Running session with
+    // no policy lies to the operator). The policy plane is socket-aware on
+    // macOS (`apply_policy` → `gateway_for_policy`), so distribution reaches
+    // the gateway container inside the VM. The implicit "no policy" path never
+    // reaches this branch (the fail-closed CoreDNS default was already written
+    // by `setup_macos_lite_gateway` via `initial_dns_policy`).
+    if let Some(policy) = req.policy.clone() {
+        let initial_presets = req.source_presets.clone();
+        match apply_policy(
+            &session_id,
+            &operator.name,
+            &policy,
+            &state,
+            ApplyKind::Initial {
+                source_presets: initial_presets,
+            },
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(%session_id, "initial policy applied (lite macOS)");
+            }
+            Err(e) => {
+                error!(
+                    %session_id,
+                    error = %e,
+                    "failed to apply explicit initial policy on lite macOS session — failing create"
+                );
+                lite_provision_teardown_and_return!(error_response(e).into_response());
+            }
+        }
+    }
+
     // `local:` workspace — host→container rsync push now that the session
     // is Running and the container is up. Mirrors the generic
     // `create_session` `local:` block: host snapshot → guest workspace,
@@ -5314,22 +5403,128 @@ async fn create_session_macos_lite(
             }
             Err(e) => {
                 error!(%session_id, error = %e, "local-workspace rsync failed (lite macOS)");
-                let gw = sandbox_core::GatewayManager::with_gateway_socket(
-                    gateway_docker_socket.clone(),
-                );
-                let _ = gw.stop_gateway(&session_id);
-                let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(e).into_response();
+                lite_provision_teardown_and_return!(error_response(e).into_response());
+            }
+        }
+    }
+
+    // `--repo` symmetry on the macOS lite path.
+    //
+    // Mirrors the generic container branch: pre-warm DNS for the repo host
+    // through the guest, then dispatch `git clone <url>
+    // /home/sandbox/workspace/` via the backend-agnostic `GuestConnector`
+    // (routes through `ContainerTransport`'s socket-aware `docker exec ...
+    // socat` channel). Failures are fatal and tear down via the same ladder
+    // as the blocks above (the generic `fail_explicit_repo_clone` takes the
+    // host `state.gateway`/`state.network`, which are wrong inside the gateway
+    // VM, so we inline the forwarded-socket teardown instead).
+    if let Some(repo_url) = &req.repo {
+        if let Some(host) = extract_repo_host(repo_url) {
+            info!(%session_id, %host, "pre-warming DNS for repo clone (lite macOS)");
+            prewarm_guest_dns(&state.guest, &session_id, &host).await;
+        }
+
+        info!(%session_id, repo = %repo_url, "cloning repository into container (lite macOS)");
+        match state
+            .guest
+            .exec(
+                &session_id,
+                "git",
+                &["clone", repo_url.as_str(), "/home/sandbox/workspace/"],
+            )
+            .await
+        {
+            Ok(GuestResponse::ExecResult {
+                exit_code,
+                stdout,
+                stderr,
+            }) => {
+                if exit_code != 0 {
+                    let stderr_snip = truncate_for_diagnostic(stderr.trim(), 512);
+                    let err = SandboxError::Internal(format!(
+                        "git clone of {repo_url} failed with exit code {exit_code}: {stderr_snip}"
+                    ));
+                    error!(%session_id, error = %err, "repo clone failed (lite macOS)");
+                    lite_provision_teardown_and_return!(error_response(err).into_response());
+                } else {
+                    info!(%session_id, output = %stdout.trim(), "repository cloned successfully (lite macOS)");
+                }
+            }
+            Ok(GuestResponse::Error { message }) => {
+                let err = SandboxError::Internal(format!(
+                    "git clone of {repo_url} failed: guest agent error: {message}"
+                ));
+                error!(%session_id, error = %err, "repo clone failed (lite macOS)");
+                lite_provision_teardown_and_return!(error_response(err).into_response());
+            }
+            Ok(other) => {
+                let err = SandboxError::Internal(format!(
+                    "git clone of {repo_url} failed: unexpected guest response: {other:?}"
+                ));
+                error!(%session_id, error = %err, "repo clone failed (lite macOS)");
+                lite_provision_teardown_and_return!(error_response(err).into_response());
+            }
+            Err(e) => {
+                let err = SandboxError::Internal(format!(
+                    "git clone of {repo_url} failed: transport error: {e}"
+                ));
+                error!(%session_id, error = %err, "repo clone failed (lite macOS)");
+                lite_provision_teardown_and_return!(error_response(err).into_response());
+            }
+        }
+    }
+
+    // `--boot-cmd` symmetry on the macOS lite path.
+    //
+    // Mirrors the generic container branch: an explicit `--boot-cmd <cmd>`
+    // that fails violates the caller's stated intent, so the four reachable
+    // outcomes (non-zero exit, guest-agent error, unexpected response,
+    // transport error) are fatal. Dispatch reaches the container via the
+    // socket-aware `GuestConnector`; teardown uses the same inlined
+    // forwarded-socket ladder.
+    if let Some(boot_cmd) = &req.boot_cmd {
+        info!(%session_id, cmd = %boot_cmd, "executing boot command in container (lite macOS)");
+        match state
+            .guest
+            .exec(&session_id, "bash", &["-c", boot_cmd.as_str()])
+            .await
+        {
+            Ok(GuestResponse::ExecResult {
+                exit_code,
+                stdout,
+                stderr,
+            }) => {
+                if exit_code != 0 {
+                    let stderr_snip = truncate_for_diagnostic(stderr.trim(), 512);
+                    let err = SandboxError::Internal(format!(
+                        "boot command {boot_cmd:?} failed with exit code {exit_code}: {stderr_snip}"
+                    ));
+                    error!(%session_id, error = %err, "boot command failed (lite macOS)");
+                    lite_provision_teardown_and_return!(error_response(err).into_response());
+                } else {
+                    info!(%session_id, output = %stdout.trim(), "boot command completed successfully (lite macOS)");
+                }
+            }
+            Ok(GuestResponse::Error { message }) => {
+                let err = SandboxError::Internal(format!(
+                    "boot command {boot_cmd:?} failed: guest agent error: {message}"
+                ));
+                error!(%session_id, error = %err, "boot command failed (lite macOS)");
+                lite_provision_teardown_and_return!(error_response(err).into_response());
+            }
+            Ok(other) => {
+                let err = SandboxError::Internal(format!(
+                    "boot command {boot_cmd:?} failed: unexpected guest response: {other:?}"
+                ));
+                error!(%session_id, error = %err, "boot command failed (lite macOS)");
+                lite_provision_teardown_and_return!(error_response(err).into_response());
+            }
+            Err(e) => {
+                let err = SandboxError::Internal(format!(
+                    "boot command {boot_cmd:?} failed: transport error: {e}"
+                ));
+                error!(%session_id, error = %err, "boot command failed (lite macOS)");
+                lite_provision_teardown_and_return!(error_response(err).into_response());
             }
         }
     }
@@ -5832,6 +6027,45 @@ async fn start_session_macos_lima(
         }
     }
 
+    // Reuse-or-regenerate the per-session mitmproxy CA so the restarted
+    // gateway signs intercepted HTTPS with the same key the sandbox VM
+    // already trusts. Mirrors the restore path's reuse-or-regen. Passing
+    // `None` here (the prior behaviour) made the restarted full-backend
+    // gateway's mitmproxy self-generate a throwaway CA, breaking HTTPS
+    // interception for allowed flows after a stop/start.
+    let ca_dir = {
+        let dir = CaManager::ca_dir(&state.base_dir, &session_id);
+        if dir.join("cert.pem").exists() {
+            info!(session_id = %session_id, "reusing existing CA certificate (lima restart)");
+            dir
+        } else {
+            info!(session_id = %session_id, "regenerating CA certificate (lima restart)");
+            match CaManager::generate_session_ca(&state.base_dir, &session_id) {
+                Ok(d) => d,
+                Err(e) => {
+                    rollback().await;
+                    return error_response(e).into_response();
+                }
+            }
+        }
+    };
+
+    // Compute the initial DNS policy: fail-closed empty list when no policy
+    // is stored, else `None` so the upcoming reapply is not overwritten.
+    // Same shape as the restore branches.
+    let has_stored_policy = {
+        let policies = state.session_policies.lock().await;
+        policies.contains_key(&session_id)
+    } || matches!(
+        state.store.get_policy(&session_id, &operator.name),
+        Ok(Some(_))
+    );
+    let initial_dns_policy = if !has_stored_policy {
+        Some(sandbox_core::CoreDnsConfig::empty_policy_file_content())
+    } else {
+        None
+    };
+
     // Steps 4-8: setup gateway (gateway-before-VM invariant).
     {
         let gateway_sock = state
@@ -5847,6 +6081,8 @@ async fn start_session_macos_lima(
         );
         let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
         let sid = session_id;
+        let ca = ca_dir.clone();
+        let dns = initial_dns_policy.clone();
         match tokio::task::spawn_blocking(move || {
             setup_macos_gateway(
                 &sid,
@@ -5854,8 +6090,8 @@ async fn start_session_macos_lima(
                 &nic,
                 &gateway_sock,
                 &gateway_tag,
-                None,
-                None,
+                Some(&ca),
+                dns.as_deref(),
                 Some(&owner_pool),
             )
         })
@@ -9326,8 +9562,101 @@ async fn restore_session_networking(
         .event_bus
         .publish(lifecycle_events::gateway_booting(*session_id));
 
-    // Wrapped in spawn_blocking because create_gateway runs Docker
+    // Recreate the gateway container.
+    //
+    // On macOS the full-backend gateway runs inside the gateway Lima VM over
+    // the forwarded Docker socket; the create path uses `setup_macos_gateway`,
+    // which provisions the mitmproxy CA, Envoy bootstrap/listener, and DNS
+    // policy into the container via `docker exec` (the host bind paths the
+    // generic `create_gateway` uses do not exist in the VM). The restart path
+    // MUST use the SAME VM-aware setup so the gateway actually comes up
+    // healthy with HTTPS interception (the per-session CA) and egress enforced
+    // — `create_gateway`'s host binds silently fail to materialise inside the
+    // VM. On Linux, use the host GatewayManager's `create_gateway` unchanged.
+    // Wrapped in spawn_blocking because either path runs blocking Docker
     // commands and polls for readiness with thread::sleep loops.
+    #[cfg(target_os = "macos")]
+    {
+        use sandbox_core::gateway::gateway_image_tag_for_daemon;
+        use sandbox_core::macos_session::setup_macos_gateway;
+
+        let sock = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        // The slot NIC name is persisted as `network_info.bridge_name`
+        // (set to `lima<slot>` in `start_session_macos_lima`); fall back to
+        // the slot index if absent. `setup_macos_gateway` parents the
+        // macvlan on this NIC.
+        let nic_name = {
+            let slot_idx = network_info
+                .vmnet_slot
+                .as_ref()
+                .map(|s| s.index)
+                .unwrap_or(0u16);
+            state
+                .gateway_lima_manager
+                .nic_map()
+                .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
+                .unwrap_or_else(|| {
+                    if network_info.bridge_name.is_empty() {
+                        format!("lima{slot_idx}")
+                    } else {
+                        network_info.bridge_name.clone()
+                    }
+                })
+        };
+        let sid = *session_id;
+        let ni = network_info.clone();
+        let ca = ca_dir.clone();
+        let dns = initial_dns_policy.map(|s| s.to_string());
+        let pool = format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len()
+        );
+        let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+        let setup_sock = sock.clone();
+        match tokio::task::spawn_blocking(move || {
+            setup_macos_gateway(
+                &sid,
+                &ni,
+                &nic_name,
+                &setup_sock,
+                &gateway_tag,
+                Some(&ca),
+                dns.as_deref(),
+                Some(&pool),
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let net = state.network.clone();
+                let drop_sock = sock.clone();
+                let sid = *session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    net.remove_docker_network_on_socket(&sid, Some(&drop_sock))
+                })
+                .await;
+                return Err(e);
+            }
+            Err(e) => {
+                let net = state.network.clone();
+                let drop_sock = sock.clone();
+                let sid = *session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    net.remove_docker_network_on_socket(&sid, Some(&drop_sock))
+                })
+                .await;
+                return Err(SandboxError::Internal(format!(
+                    "task join error creating gateway: {e}"
+                )));
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     {
         let gw = state.gateway.clone();
         let sid = *session_id;
@@ -11794,16 +12123,47 @@ async fn gateway_monitor(state: Arc<AppState>) {
                             state.users_conf_pool.cidr.base(),
                             state.users_conf_pool.cidr.prefix_len()
                         );
+                        // Reuse-or-regen the per-session mitmproxy CA so the
+                        // recovered gateway signs intercepted HTTPS with the
+                        // key the sandbox VM already trusts. Passing `None`
+                        // would let mitmproxy self-generate a throwaway CA,
+                        // breaking HTTPS interception for allowed flows after
+                        // a gateway-monitor recovery.
+                        let ca_dir = {
+                            let dir = CaManager::ca_dir(&state.base_dir, &session.id);
+                            if dir.join("cert.pem").exists() {
+                                dir
+                            } else {
+                                match CaManager::generate_session_ca(&state.base_dir, &session.id) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        warn!(
+                                            session_id = %session.id,
+                                            error = %e,
+                                            "gateway monitor: failed to ensure CA for macOS recovery; \
+                                             proceeding without CA (HTTPS interception may break)"
+                                        );
+                                        CaManager::ca_dir(&state.base_dir, &session.id)
+                                    }
+                                }
+                            }
+                        };
+                        let ca_for_setup = ca_dir.clone();
 
                         let recreate_result = tokio::task::spawn_blocking(move || {
                             sandbox_core::teardown_macos_gateway(&sid, &sock)?;
+                            let ca_opt = if ca_for_setup.join("cert.pem").exists() {
+                                Some(ca_for_setup.as_path())
+                            } else {
+                                None
+                            };
                             sandbox_core::setup_macos_gateway(
                                 &sid,
                                 &ni,
                                 &nic_name,
                                 &sock,
                                 &image_tag,
-                                None,
+                                ca_opt,
                                 init_dns_owned.as_deref(),
                                 Some(&pool),
                             )
@@ -12167,17 +12527,47 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
                 None
             };
 
+            // Reuse-or-regen the per-session mitmproxy CA so the recovered
+            // gateway signs intercepted HTTPS with the key the sandbox VM
+            // already trusts. Passing `None` would let mitmproxy self-generate
+            // a throwaway CA, breaking HTTPS interception for allowed flows
+            // after a daemon-restart recovery.
+            let ca_dir = {
+                let dir = CaManager::ca_dir(&state.base_dir, &session.id);
+                if dir.join("cert.pem").exists() {
+                    dir
+                } else {
+                    match CaManager::generate_session_ca(&state.base_dir, &session.id) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "gateway Lima recovery: failed to ensure CA; proceeding \
+                                 without CA (HTTPS interception may break)"
+                            );
+                            CaManager::ca_dir(&state.base_dir, &session.id)
+                        }
+                    }
+                }
+            };
+
             join_set.spawn(async move {
                 let join_result = tokio::task::spawn_blocking(move || {
                     let result = (|| -> Result<(), sandbox_core::error::SandboxError> {
                         sandbox_core::teardown_macos_gateway(&sid, &sock)?;
+                        let ca_opt = if ca_dir.join("cert.pem").exists() {
+                            Some(ca_dir.as_path())
+                        } else {
+                            None
+                        };
                         sandbox_core::setup_macos_gateway(
                             &sid,
                             &ni,
                             &nic_name,
                             &sock,
                             &tag,
-                            None,
+                            ca_opt,
                             init_dns_owned.as_deref(),
                             Some(&pool_str),
                         )

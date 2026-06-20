@@ -116,7 +116,9 @@ fn gateway_docker_cmd(gateway_docker_socket: &Path) -> Command {
 /// Steps:
 ///  6. Create macvlan Docker network inside gateway VM: `sandbox-net-<id>`
 ///     (`--driver macvlan --opt parent=<nic_name>`)
-///  7. Create gateway container: `sandbox-gw-<id>` on `sandboxd-egress`
+///  7. Create gateway container: `sandbox-gw-<id>` on `sandboxd-egress`,
+///     then provision the per-session mitmproxy CA, Envoy bootstrap +
+///     deny-all listener, and initial DNS policy into its tmpfs
 ///  8. Connect container to macvlan with static IP (`gateway_ip`)
 ///  9. Inject deny-all nftables
 /// 10. Wait for gateway healthy
@@ -128,10 +130,10 @@ fn gateway_docker_cmd(gateway_docker_socket: &Path) -> Command {
 /// On failure: caller must tear down (`teardown_macos_gateway`) and
 /// release the slot (`vmnet_pool.release_lima_slot`).
 // The 8 parameters cover the distinct concerns: session identity,
-// networking (2 params), Docker socket target, image, CA (deferred), DNS
-// policy, and owner label. Bundling them into a struct would require a
-// public config type; the current shape matches the Linux `create_gateway`
-// parameter footprint and is clearer at the call site.
+// networking (2 params), Docker socket target, image, per-session
+// mitmproxy CA, DNS policy, and owner label. Bundling them into a struct
+// would require a public config type; the current shape matches the Linux
+// `create_gateway` parameter footprint and is clearer at the call site.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub fn setup_macos_gateway(
@@ -140,7 +142,7 @@ pub fn setup_macos_gateway(
     nic_name: &str,
     gateway_docker_socket: &Path,
     gateway_image_tag: &str,
-    _ca_dir: Option<&Path>,
+    ca_dir: Option<&Path>,
     initial_dns_policy: Option<&str>,
     owner_pool: Option<&str>,
 ) -> Result<(), SandboxError> {
@@ -248,6 +250,13 @@ pub fn setup_macos_gateway(
             "macOS gateway container started on sandboxd-egress"
         );
     }
+
+    // Provision the per-session mitmproxy CA into the container's
+    // `/root/.mitmproxy` tmpfs. Without this, mitmproxy self-generates a
+    // throwaway CA the sandbox VM does not trust, so every intercepted HTTPS
+    // flow fails certificate verification. Same write path as the lite
+    // sibling — shared via `provision_mitmproxy_ca`.
+    provision_mitmproxy_ca(gateway_docker_socket, &container_name, ca_dir)?;
 
     // Write the Envoy static bootstrap into the container (same as Linux path).
     {
@@ -448,24 +457,9 @@ pub fn setup_macos_lite_gateway(
     // `/root/.mitmproxy` tmpfs. Without this, mitmproxy self-generates a
     // throwaway CA that the sandbox container's trust store (pinned to the
     // per-session CA) does not recognize, so every intercepted HTTPS flow
-    // fails certificate verification. The CA key+cert are the only secret
-    // material provisioned here — they go straight into the container's tmpfs
-    // over the forwarded socket, never into the shared VM filesystem.
-    if let Some(ca_dir) = ca_dir {
-        for (container_path, content) in mitmproxy_ca_writes(ca_dir)? {
-            if let Err(e) = write_file_to_gateway_container(
-                gateway_docker_socket,
-                &container_name,
-                &container_path,
-                &content,
-            ) {
-                return Err(SandboxError::Gateway(format!(
-                    "failed to write mitmproxy CA {container_path} to macOS lite gateway \
-                     {container_name}: {e}"
-                )));
-            }
-        }
-    }
+    // fails certificate verification. Shared with the full-backend sibling
+    // via `provision_mitmproxy_ca`.
+    provision_mitmproxy_ca(gateway_docker_socket, &container_name, ca_dir)?;
 
     // Write the Envoy static bootstrap into the container.
     {
@@ -906,6 +900,46 @@ fn mitmproxy_ca_writes(ca_dir: &Path) -> Result<Vec<(String, String)>, SandboxEr
     ])
 }
 
+/// Provision the per-session mitmproxy CA into the gateway container's
+/// `/root/.mitmproxy` tmpfs over the forwarded Docker socket.
+///
+/// Shared by both [`setup_macos_gateway`] (full backend) and
+/// [`setup_macos_lite_gateway`] (lite backend): without it mitmproxy
+/// self-generates a throwaway CA that the sandbox VM/container's trust
+/// store (pinned to the per-session CA) does not recognize, so every
+/// intercepted HTTPS flow fails certificate verification. The CA key+cert
+/// are the only secret material provisioned here — they go straight into
+/// the container's tmpfs over the forwarded socket, never into the shared
+/// VM filesystem.
+///
+/// `None` `ca_dir` is a no-op (caller chose not to provision a CA, e.g. a
+/// degraded recovery path). A present-but-unreadable CA file is a hard
+/// error (the gateway must never boot trusting an absent/empty CA).
+#[cfg(target_os = "macos")]
+fn provision_mitmproxy_ca(
+    gateway_docker_socket: &Path,
+    container_name: &str,
+    ca_dir: Option<&Path>,
+) -> Result<(), SandboxError> {
+    let Some(ca_dir) = ca_dir else {
+        return Ok(());
+    };
+    for (container_path, content) in mitmproxy_ca_writes(ca_dir)? {
+        if let Err(e) = write_file_to_gateway_container(
+            gateway_docker_socket,
+            container_name,
+            &container_path,
+            &content,
+        ) {
+            return Err(SandboxError::Gateway(format!(
+                "failed to write mitmproxy CA {container_path} to macOS gateway \
+                 {container_name}: {e}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Compute B+1 from a subnet CIDR string (e.g. `"10.209.128.0/29"` → `"10.209.128.1"`).
 ///
 /// Used to derive the IPAM gateway address for the macvlan network.
@@ -1016,6 +1050,37 @@ mod tests {
         assert!(
             mitmproxy_ca_writes(dir.path()).is_err(),
             "missing mitmproxy-ca-cert.pem must surface as an error"
+        );
+    }
+
+    /// `provision_mitmproxy_ca(None)` is a no-op: when no CA dir is supplied
+    /// the helper returns `Ok(())` without touching the socket. The socket
+    /// path is bogus on purpose — reaching it would error, proving the
+    /// `None` branch short-circuits before any `docker exec`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provision_mitmproxy_ca_none_is_noop() {
+        let bogus_sock = std::path::Path::new("/nonexistent/gateway-docker.sock");
+        assert!(
+            provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", None).is_ok(),
+            "provision_mitmproxy_ca(None) must be a no-op Ok"
+        );
+    }
+
+    /// A present-but-incomplete CA dir is a hard error before any socket I/O:
+    /// `provision_mitmproxy_ca` surfaces the `mitmproxy_ca_writes` read
+    /// failure (missing cert-only file) rather than silently proceeding. The
+    /// error is produced reading the host CA files, so the bogus socket is
+    /// never contacted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provision_mitmproxy_ca_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mitmproxy-ca.pem"), "x").unwrap();
+        let bogus_sock = std::path::Path::new("/nonexistent/gateway-docker.sock");
+        assert!(
+            provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", Some(dir.path())).is_err(),
+            "provision_mitmproxy_ca with an incomplete CA dir must error"
         );
     }
 
