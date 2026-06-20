@@ -357,6 +357,18 @@ impl GatewayManager {
         }
     }
 
+    /// The forwarded gateway-VM Docker socket this manager routes through,
+    /// or `None` on Linux (host Docker socket, no `-H` flag).
+    ///
+    /// Exposed so the policy/DNS free functions (which receive a
+    /// `&GatewayManager` rather than carrying their own socket) can mirror
+    /// the manager's transport when they shell out to `docker` directly.
+    /// On Linux this is always `None`, so those free functions emit no
+    /// `-H` flag and behave byte-for-byte as before.
+    pub fn docker_socket(&self) -> Option<&Path> {
+        self.docker_socket.as_deref()
+    }
+
     /// Build a `docker` [`Command`] with the optional `-H unix://<socket>`
     /// prefix pre-applied.
     ///

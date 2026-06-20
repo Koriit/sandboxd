@@ -46,9 +46,9 @@ use sandbox_core::{
     UsersConfig, VmInfo, VmIpSessionMap, VmStatus, WorkspaceLockAcquireRequest,
     WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest, WorkspaceOp, attach_vm_to_bridge,
     bind_gate_listener, detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules,
-    hash_policy, load_users_config, mac_from_session_id, propagate_dns_changes, read_resolved_json,
-    remove_gate_socket, serve_gate_listener, users_conf_path, wait_for_lds_ack,
-    write_file_to_container,
+    hash_policy, load_users_config, mac_from_session_id, propagate_dns_changes,
+    read_resolved_json_on_socket, remove_gate_socket, serve_gate_listener, users_conf_path,
+    wait_for_lds_ack, write_file_to_container_on_socket,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -967,6 +967,19 @@ struct AppState {
     /// gateway's CoreDNS plugin calls into to block answer delivery on
     /// nft + Envoy LDS propagation. Aborted on stop / remove / teardown.
     dns_gate_handles: Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>,
+    /// macOS only: handles for the per-session DNS-gate bridge accept
+    /// loops. On macOS the gateway container runs inside the gateway Lima
+    /// VM with no host bind-mounts, so the in-container CoreDNS gate plugin
+    /// cannot reach the host-bound gate UDS directly. The bridge (see
+    /// `sandbox_core::dns_gate_bridge`) listens on the in-container Corefile
+    /// gate path via `docker exec ... socat UNIX-LISTEN` and pumps each
+    /// accepted connection back to the host gate listener. Started
+    /// alongside the gate listener (`start_dns_gate_listener`) and aborted
+    /// in lock-step with it (`cancel_dns_gate_listener`). On Linux the
+    /// events-dir bind-mount makes the UDS reachable directly; no bridge is
+    /// ever started and this map stays empty (the field is cfg-gated out).
+    #[cfg(target_os = "macos")]
+    dns_gate_bridge_handles: Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>,
     /// Per-session DNS cache shared between the background propagation
     /// loop and the synchronous gate handler. The loop's steady-state
     /// reconciler and the gate's per-request UNION-merge both read
@@ -3935,6 +3948,55 @@ fn gateway_for_probes(state: &AppState) -> Arc<GatewayManager> {
     }
     #[cfg(not(target_os = "macos"))]
     Arc::clone(&state.gateway)
+}
+
+/// Return a `GatewayManager` suitable for the policy/DNS distribution plane
+/// (policy apply, DNS propagation, the synchronous DNS gate) against the
+/// given session's gateway.
+///
+/// Mirrors [`gateway_for_probes`]: on Linux returns the host-socket manager
+/// in `AppState::gateway` (byte-identical behaviour, `docker_socket: None`);
+/// on macOS constructs a forwarded-socket manager pointing at the gateway
+/// Lima VM's Docker socket. Threading this into the distributor/propagation
+/// loop/gate makes their `docker exec` file writes, nft injection, and
+/// in-container listener delivery reach the gateway container running inside
+/// the VM (a host `docker exec` reports `No such container`).
+fn gateway_for_policy(state: &AppState) -> Arc<GatewayManager> {
+    #[cfg(target_os = "macos")]
+    {
+        let sock = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        #[allow(clippy::needless_return)]
+        return Arc::new(GatewayManager::with_gateway_socket(sock));
+    }
+    #[cfg(not(target_os = "macos"))]
+    Arc::clone(&state.gateway)
+}
+
+/// Return the forwarded gateway-VM Docker socket for the policy/DNS probes
+/// that shell out to `docker` directly (the LDS-ack probe, `read_resolved_json`).
+///
+/// `None` on Linux (host Docker socket, no `-H` flag — unchanged behaviour);
+/// `Some(path)` on macOS so the bare `docker exec` reaches the in-VM gateway
+/// container.
+fn policy_probe_socket(state: &AppState) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        #[allow(clippy::needless_return)]
+        return Some(
+            state
+                .gateway_lima_manager
+                .gateway_docker_socket()
+                .to_path_buf(),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7416,11 +7478,13 @@ async fn clear_session_policy(
     // `PolicyDistributor::distribute` shells out via `docker exec` and
     // performs `fs::rename` for the listener file, so it must not run on
     // the Tokio runtime thread (CLAUDE.md: blocking work in async handlers
-    // is wrapped in `spawn_blocking`). `state.gateway` is
-    // `Arc<GatewayManager>` so cloning is cheap; `compiled` is moved into
-    // the closure since it has no further use on this path.
+    // is wrapped in `spawn_blocking`). `gateway_for_policy` returns the
+    // host-socket manager on Linux (unchanged) and the forwarded
+    // gateway-VM-socket manager on macOS so the writes reach the in-VM
+    // gateway container; `compiled` is moved into the closure since it has
+    // no further use on this path.
     {
-        let gw = state.gateway.clone();
+        let gw = gateway_for_policy(state);
         let sid = *session_id;
         match tokio::task::spawn_blocking(move || {
             PolicyDistributor::distribute(&sid, &compiled, &gw)
@@ -7603,11 +7667,13 @@ async fn apply_policy_inner(
     // shells out via `docker exec` and performs `fs::rename` for the
     // listener file, so it must not run on the Tokio runtime thread
     // (CLAUDE.md: blocking work in async handlers is wrapped in
-    // `spawn_blocking`). `state.gateway` is `Arc<GatewayManager>` so
-    // cloning is cheap; `compiled` is moved into the closure since it
-    // has no further use on this path.
+    // `spawn_blocking`). `gateway_for_policy` returns the host-socket
+    // manager on Linux (unchanged) and the forwarded gateway-VM-socket
+    // manager on macOS so the writes reach the in-VM gateway container;
+    // `compiled` is moved into the closure since it has no further use
+    // on this path.
     {
-        let gw = state.gateway.clone();
+        let gw = gateway_for_policy(state);
         let sid = *session_id;
         match tokio::task::spawn_blocking(move || {
             PolicyDistributor::distribute(&sid, &compiled, &gw)
@@ -7695,7 +7761,11 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     }
 
     let sid = *session_id;
-    let gateway = Arc::clone(&state.gateway);
+    // On Linux this is `state.gateway` (host socket, unchanged). On macOS
+    // it routes the loop's listener rewrite + nft injection through the
+    // forwarded gateway-VM socket so they reach the in-VM gateway container.
+    let gateway = gateway_for_policy(state);
+    let probe_socket = policy_probe_socket(state);
     let propagation_states = Arc::clone(&state.propagation_states);
     let event_bus = state.event_bus.clone();
 
@@ -7727,6 +7797,7 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
         dns_propagation_loop(
             sid,
             gateway,
+            probe_socket,
             network_info,
             session_policies,
             propagation_states,
@@ -7776,6 +7847,11 @@ async fn shared_dns_cache(state: &AppState, session_id: &SessionId) -> Arc<Mutex
 async fn drop_dns_cache(state: &AppState, session_id: &SessionId) {
     let mut guard = state.dns_caches.lock().await;
     guard.remove(session_id);
+    drop(guard);
+    // Also drop the macOS in-container listener cache (the prior-generation
+    // diff source for the in-VM LDS writer). No-op on Linux, where that
+    // cache is never populated.
+    sandbox_core::forget_cached_listener(session_id);
 }
 
 /// Start the per-session synchronous DNS-gate listener.
@@ -7849,7 +7925,12 @@ async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
     let cache = shared_dns_cache(state, session_id).await;
     let service = Arc::new(DaemonGateService {
         session_id: *session_id,
-        gateway: Arc::clone(&state.gateway),
+        // Host-socket manager on Linux (unchanged); forwarded
+        // gateway-VM-socket manager on macOS so the gate's
+        // `propagate_dns_changes` (listener rewrite + nft) reaches the
+        // in-VM gateway container.
+        gateway: gateway_for_policy(state),
+        docker_socket: policy_probe_socket(state),
         session_policies: Arc::clone(&state.session_policies),
         dns_cache: cache,
         network_info,
@@ -7859,22 +7940,95 @@ async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
         serve_gate_listener(listener, service, DNS_GATE_DEFAULT_DEADLINE_MS * 4).await
     });
 
-    let mut handles = state.dns_gate_handles.lock().await;
-    handles.insert(*session_id, handle);
+    {
+        let mut handles = state.dns_gate_handles.lock().await;
+        handles.insert(*session_id, handle);
+    }
+
+    // macOS: also (re)start the in-VM gate bridge. On Linux the events-dir
+    // bind-mount makes the host gate UDS reachable from the gateway
+    // container directly, so this is a no-op (the helper is cfg-gated).
+    start_dns_gate_bridge(session_id, state).await;
+}
+
+/// macOS only: (re)start the per-session DNS-gate bridge that makes the
+/// host-bound gate UDS reachable from the in-VM gateway container.
+///
+/// Idempotent: aborts and replaces any prior bridge for the session
+/// (mirroring `start_dns_gate_listener`). Started right after the gate
+/// listener is bound so the in-container `socat` listener has a host
+/// listener to pump to. On Linux this is a no-op — the events-dir
+/// bind-mount delivers the gate connection directly and no bridge exists.
+///
+/// Fail-closed: if the bridge cannot be started or dies, CoreDNS's
+/// in-container dial fails → the plugin fails OPEN → the daemon injects
+/// nothing → allow stays closed (deny holds; nothing leaks). The bridge
+/// only ever *enables* a correct allow; it can never open a hole.
+async fn start_dns_gate_bridge(session_id: &SessionId, state: &AppState) {
+    #[cfg(target_os = "macos")]
+    {
+        // Abort any prior bridge before re-arming.
+        {
+            let mut handles = state.dns_gate_bridge_handles.lock().await;
+            if let Some(handle) = handles.remove(session_id) {
+                handle.abort();
+                debug!(
+                    session_id = %session_id,
+                    "cancelled existing DNS-gate bridge for restart"
+                );
+            }
+        }
+
+        let gateway_docker_socket = state
+            .gateway_lima_manager
+            .gateway_docker_socket()
+            .to_path_buf();
+        let handle = sandbox_core::start_gate_bridge(*session_id, gateway_docker_socket);
+        let mut handles = state.dns_gate_bridge_handles.lock().await;
+        handles.insert(*session_id, handle);
+        info!(
+            session_id = %session_id,
+            "macOS DNS-gate bridge started"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux: the events-dir bind-mount delivers the gate connection
+        // directly; no bridge needed.
+        let _ = (session_id, state);
+    }
 }
 
 /// Cancel the per-session DNS-gate listener and remove its socket file.
 ///
 /// Called from session stop / remove and from networking teardown.
 async fn cancel_dns_gate_listener(session_id: &SessionId, state: &AppState) {
-    let mut handles = state.dns_gate_handles.lock().await;
-    if let Some(handle) = handles.remove(session_id) {
-        handle.abort();
-        debug!(
-            session_id = %session_id,
-            "cancelled DNS-gate listener"
-        );
+    {
+        let mut handles = state.dns_gate_handles.lock().await;
+        if let Some(handle) = handles.remove(session_id) {
+            handle.abort();
+            debug!(
+                session_id = %session_id,
+                "cancelled DNS-gate listener"
+            );
+        }
     }
+
+    // macOS: abort the in-VM gate bridge in lock-step with the listener.
+    // Aborting the accept loop also reaps any in-flight per-connection
+    // `docker exec` (each child is `kill_on_drop(true)`). No-op on Linux.
+    #[cfg(target_os = "macos")]
+    {
+        let mut bridges = state.dns_gate_bridge_handles.lock().await;
+        if let Some(handle) = bridges.remove(session_id) {
+            handle.abort();
+            debug!(
+                session_id = %session_id,
+                "cancelled DNS-gate bridge"
+            );
+        }
+    }
+
     // Best-effort socket cleanup. If the events host dir is also being
     // removed by `stop_gateway`, the socket inode is reclaimed via the
     // parent removal; this call is the safe no-op fallback.
@@ -7909,6 +8063,9 @@ async fn cancel_dns_gate_listener(session_id: &SessionId, state: &AppState) {
 struct DaemonGateService {
     session_id: SessionId,
     gateway: Arc<GatewayManager>,
+    /// Forwarded gateway-VM Docker socket for the bare-`docker` LDS-ack
+    /// probe. `None` on Linux (host socket), `Some` on macOS.
+    docker_socket: Option<std::path::PathBuf>,
     session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
     dns_cache: Arc<Mutex<DnsCache>>,
     network_info: NetworkInfo,
@@ -7958,7 +8115,8 @@ impl GateService for DaemonGateService {
         }
 
         // (3) Pre-snapshot Envoy LDS counters before the rewrite.
-        let probe = DockerExecLdsProbe::new(&self.session_id);
+        let probe =
+            DockerExecLdsProbe::new_with_socket(&self.session_id, self.docker_socket.clone());
         let pre_counters = match probe.fetch_counters().await {
             Ok(c) => Some(c),
             Err(e) => {
@@ -8091,6 +8249,10 @@ impl GateService for DaemonGateService {
 async fn dns_propagation_loop(
     session_id: SessionId,
     gateway: Arc<GatewayManager>,
+    // Forwarded gateway-VM Docker socket for the bare-`docker` probes
+    // (`read_resolved_json`, the LDS-ack probe). `None` on Linux (host
+    // socket, no `-H`); `Some` on macOS so those reach the in-VM gateway.
+    probe_socket: Option<std::path::PathBuf>,
     network_info: sandbox_core::NetworkInfo,
     session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
     propagation_states: Arc<PropagationStates>,
@@ -8123,7 +8285,12 @@ async fn dns_propagation_loop(
 
         // Read resolved.json from the gateway container.
         let sid = session_id;
-        let report = match tokio::task::spawn_blocking(move || read_resolved_json(&sid)).await {
+        let resolved_socket = probe_socket.clone();
+        let report = match tokio::task::spawn_blocking(move || {
+            read_resolved_json_on_socket(&sid, resolved_socket.as_deref())
+        })
+        .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 warn!(
@@ -8200,7 +8367,7 @@ async fn dns_propagation_loop(
         // observed at <250ms in the integration test. Empty
         // (stable_cache) cycles skip both rewrite and ack-wait —
         // there is no rewrite to ack.
-        let probe = DockerExecLdsProbe::new(&session_id);
+        let probe = DockerExecLdsProbe::new_with_socket(&session_id, probe_socket.clone());
         let lds_ack_deadline = Duration::from_secs(5);
         let lds_poll_interval = Duration::from_millis(100);
         let propagate_ok = if stable_cache {
@@ -9056,8 +9223,19 @@ async fn reapply_session_policy(session_id: &SessionId, caller_username: &str, s
     } else {
         // No policy stored — write the fail-closed empty policy so CoreDNS
         // returns NXDOMAIN for every query until a policy is installed.
+        // Route through the forwarded gateway-VM socket on macOS (host
+        // socket / no `-H` on Linux) so the write reaches the in-VM gateway.
         let empty = CoreDnsConfig::empty_policy_file_content();
-        match write_file_to_container(&container, "/etc/coredns/policy.conf", &empty) {
+        let empty_write = {
+            let socket = policy_probe_socket(state);
+            write_file_to_container_on_socket(
+                socket.as_deref(),
+                &container,
+                "/etc/coredns/policy.conf",
+                &empty,
+            )
+        };
+        match empty_write {
             Ok(()) => {
                 debug!(
                     session_id = %session_id,
@@ -13181,6 +13359,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway,
         dns_loop_handles: Mutex::new(HashMap::new()),
         dns_gate_handles: Mutex::new(HashMap::new()),
+        #[cfg(target_os = "macos")]
+        dns_gate_bridge_handles: Mutex::new(HashMap::new()),
         dns_caches: Arc::new(Mutex::new(HashMap::new())),
         session_policies: Arc::new(Mutex::new(hydrated_policies)),
         sessions_stopping: Mutex::new(HashSet::new()),

@@ -1,12 +1,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tracing::{debug, info};
 
-use crate::atomic_listener_writer::{AtomicListenerWriter, session_listener_host_path};
+use crate::atomic_listener_writer::{
+    AtomicListenerWriter, session_listener_host_path, write_listener_into_container,
+};
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
 use crate::network::NetworkInfo;
@@ -278,11 +281,32 @@ pub enum DnsChangeType {
 // DNS propagation
 // ---------------------------------------------------------------------------
 
-/// Read the resolved.json file from a gateway container via `docker exec`.
+/// Read the resolved.json file from a gateway container via `docker exec`
+/// (host Docker socket).
+///
+/// Thin wrapper over [`read_resolved_json_on_socket`] with no forwarded
+/// socket — the Linux behaviour, byte-for-byte unchanged (no `-H` flag).
 pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, SandboxError> {
+    read_resolved_json_on_socket(session_id, None)
+}
+
+/// Read the resolved.json file from a gateway container via `docker exec`,
+/// optionally over a forwarded gateway-VM Docker socket.
+///
+/// `socket = None` is the Linux path (host Docker socket, no `-H`);
+/// `socket = Some(path)` routes through the in-VM gateway socket so the
+/// read reaches the gateway container running inside the gateway Lima VM.
+pub fn read_resolved_json_on_socket(
+    session_id: &SessionId,
+    socket: Option<&Path>,
+) -> Result<ResolvedReport, SandboxError> {
     let container = gateway::container_name(session_id);
 
-    let output = Command::new("docker")
+    let mut cmd = Command::new("docker");
+    if let Some(sock) = socket {
+        cmd.args(["-H", &format!("unix://{}", sock.display())]);
+    }
+    let output = cmd
         .args(["exec", &container, "cat", "/etc/coredns/resolved.json"])
         .output()
         .map_err(|e| {
@@ -448,20 +472,29 @@ pub fn propagate_dns_changes(
     network_info: &NetworkInfo,
 ) -> Result<(), SandboxError> {
     // (1) Envoy listener: compile the listener with the current DNS
-    // cache and write it via the atomic writer. Envoy's filesystem LDS
-    // watcher picks up the `MovedTo` rename and reloads the listener
-    // without dropping existing connections (only filter chains differ
-    // across generations; the writer enforces that invariant).
+    // cache and deliver it. Envoy's filesystem LDS watcher picks up the
+    // `MovedTo` rename and reloads the listener without dropping existing
+    // connections (only filter chains differ across generations; the
+    // writer enforces that invariant). The listener bytes/framing are
+    // identical across platforms; only the delivery differs:
+    //   - Linux: host-side atomic rename into the bind-mounted dir.
+    //   - macOS: in-container `docker exec` write-temp + `mv -f` over the
+    //     gateway's forwarded socket (no host bind-mount exists).
     let listener_yaml = PolicyCompiler::compile_envoy_listener(policy, cache);
-    let listener_path = session_listener_host_path(session_id);
     info!(
         session_id = %session_id,
-        listener_path = %listener_path.display(),
         "rewriting Envoy listener for DNS propagation"
     );
-    AtomicListenerWriter::new(&listener_path)
-        .write(&listener_yaml)
-        .map_err(|e| SandboxError::Gateway(format!("listener rewrite failed: {e}")))?;
+    if let Some(sock) = gateway.docker_socket() {
+        let container = gateway::container_name(session_id);
+        write_listener_into_container(session_id, sock, &container, &listener_yaml)
+            .map_err(|e| SandboxError::Gateway(format!("listener rewrite failed: {e}")))?;
+    } else {
+        let listener_path = session_listener_host_path(session_id);
+        AtomicListenerWriter::new(&listener_path)
+            .write(&listener_yaml)
+            .map_err(|e| SandboxError::Gateway(format!("listener rewrite failed: {e}")))?;
+    }
 
     // (2) nftables policy table: inject resolved-IP allow rules so the
     // kernel lets VM traffic through to Envoy. Rules for domains that

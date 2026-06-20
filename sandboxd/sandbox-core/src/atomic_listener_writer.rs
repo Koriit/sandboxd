@@ -54,14 +54,20 @@
 //! call site so both share a single enforcement point for the
 //! invariant.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use tempfile::Builder as TempFileBuilder;
 use tracing::{debug, info};
 
-use crate::policy::{FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, LISTENER_FILE_NAME};
+use crate::error::SandboxError;
+use crate::policy::{
+    FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, LISTENER_FILE_IN_CONTAINER,
+    LISTENER_FILE_NAME,
+};
 use crate::session::SessionId;
 
 /// Return the root directory on the host under which per-session listener
@@ -296,6 +302,180 @@ impl AtomicListenerWriter {
 
         Ok(is_initial)
     }
+}
+
+// ===========================================================================
+// macOS in-container listener delivery
+// ===========================================================================
+//
+// On Linux the listener file lives in a host directory bind-mounted into the
+// gateway container, so [`AtomicListenerWriter`] can `fs::rename` on the host
+// and the kernel emits the `MovedTo` event Envoy's filesystem-LDS watcher
+// needs. On macOS the gateway container runs inside the gateway Lima VM with
+// no host bind-mount — `/etc/envoy/listeners` is an in-container tmpfs. The
+// rename therefore has to happen *inside* the container, via a single
+// `docker -H <sock> exec -i <ctr> sh -c 'cat > <p>.tmp && mv -f <p>.tmp <p>'`.
+// A same-filesystem `mv` on the tmpfs is one syscall and emits the same
+// `IN_MOVED_TO` event the host-side rename does on Linux (validated live).
+//
+// The framing invariant (only the region between
+// [`FILTER_CHAINS_BEGIN_MARKER`] and [`FILTER_CHAINS_END_MARKER`] may differ
+// between generations) is enforced identically to the Linux path. Because
+// there is no host copy of the prior generation to diff against, the macOS
+// path keeps an in-daemon per-session cache of the last listener content it
+// wrote and diffs against that. A cache miss (first write for the session, or
+// the first write after a daemon restart) is treated as "initial" — exactly
+// as the Linux writer treats a not-yet-existing file — so the invariant check
+// is skipped for that one write and the cache is seeded.
+
+/// In-process cache of the last listener content delivered into each
+/// session's gateway container, used by the macOS in-container listener
+/// writer to enforce the framing invariant without re-reading the prior
+/// generation back over `docker exec` on every DNS-propagation tick.
+static MACOS_LISTENER_CACHE: Mutex<Option<HashMap<SessionId, String>>> = Mutex::new(None);
+
+/// Read the cached previous listener content for `session_id`, if any.
+fn cached_listener(session_id: &SessionId) -> Option<String> {
+    let guard = MACOS_LISTENER_CACHE.lock().unwrap();
+    guard.as_ref().and_then(|m| m.get(session_id).cloned())
+}
+
+/// Store the listener content most recently delivered for `session_id`.
+fn cache_listener(session_id: &SessionId, content: &str) {
+    let mut guard = MACOS_LISTENER_CACHE.lock().unwrap();
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(*session_id, content.to_string());
+}
+
+/// Public read of the cached previous listener content for `session_id`.
+///
+/// Used by the policy distributor's rollback-snapshot path on macOS,
+/// where there is no host listener file to read back — the in-process
+/// cache is the only record of the prior generation. Returns `None` when
+/// no generation has been delivered yet (or after a daemon restart);
+/// callers treat that as "restore the deny-all initial listener", which
+/// is fail-closed.
+pub fn cached_listener_pub(session_id: &SessionId) -> Option<String> {
+    cached_listener(session_id)
+}
+
+/// Drop the cached listener for `session_id` (called from session teardown).
+pub fn forget_cached_listener(session_id: &SessionId) {
+    let mut guard = MACOS_LISTENER_CACHE.lock().unwrap();
+    if let Some(map) = guard.as_mut() {
+        map.remove(session_id);
+    }
+}
+
+/// Deliver `new_content` as the session's Envoy listener **inside the gateway
+/// container** over the forwarded Docker socket, performing the rename in the
+/// container so Envoy's filesystem-LDS watcher fires (`IN_MOVED_TO`).
+///
+/// This is the macOS analogue of [`AtomicListenerWriter::write`]: it enforces
+/// the same marker + framing invariant (diffing against the in-process cache
+/// rather than a host file), then writes the content to a temp file in the
+/// watched directory and `mv -f`'s it onto the canonical listener path within
+/// a single `docker exec` round-trip. The write+rename is a single `sh -c` so
+/// a crash mid-delivery cannot leave a stale `.tmp` half-applied.
+///
+/// The listener bytes/framing are identical to what the Linux host writer
+/// emits — only the *delivery* changes (host rename → in-container rename).
+pub fn write_listener_into_container(
+    session_id: &SessionId,
+    gateway_docker_socket: &Path,
+    container: &str,
+    new_content: &str,
+) -> Result<(), SandboxError> {
+    use std::process::Stdio;
+
+    validate_markers(new_content).map_err(|e| SandboxError::Gateway(e.to_string()))?;
+
+    // Diff against the cached prior generation. A miss means "initial"
+    // (first write for the session, or first write after a daemon
+    // restart) — skip the invariant check exactly as the Linux writer
+    // does for a not-yet-existing file.
+    if let Some(prev) = cached_listener(session_id) {
+        enforce_invariant(&prev, new_content).map_err(|e| SandboxError::Gateway(e.to_string()))?;
+    }
+
+    // Single `sh -c`: write the new content to a temp file in the *same*
+    // (watched) directory, then `mv -f` it onto the canonical path. The
+    // rename within the tmpfs emits the `IN_MOVED_TO` event Envoy's LDS
+    // watcher subscribes to. `mkdir -p` guards against the dir not yet
+    // existing (matches `write_file_to_gateway_container`). The argv is
+    // built by `macos_listener_exec_argv` so the rename form is exactly
+    // what the unit test asserts.
+    let argv = macos_listener_exec_argv(gateway_docker_socket, container);
+    let mut child = std::process::Command::new("docker")
+        .args(&argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            SandboxError::Gateway(format!(
+                "failed to spawn docker exec for in-container listener write to {container}: {e}"
+            ))
+        })?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(new_content.as_bytes()).map_err(|e| {
+            SandboxError::Gateway(format!(
+                "failed to pipe listener content into {container}: {e}"
+            ))
+        })?;
+    }
+    child.stdin.take();
+
+    let output = child.wait_with_output().map_err(|e| {
+        SandboxError::Gateway(format!(
+            "failed to complete in-container listener write to {container}: {e}"
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Gateway(format!(
+            "in-container listener write to {container} failed: {stderr}"
+        )));
+    }
+
+    // Only update the cache once the delivery succeeded so a failed write
+    // does not poison the next generation's invariant diff.
+    cache_listener(session_id, new_content);
+
+    debug!(
+        container = %container,
+        "delivered Envoy listener into container via docker-exec rename (LDS will pick up)"
+    );
+    Ok(())
+}
+
+/// Build the argv (excluding the leading `docker`) for the macOS
+/// in-container listener delivery. Factored out so the write-temp + `mv -f`
+/// rename form can be asserted in unit tests without spawning a process.
+///
+/// Linux never calls this — the host [`AtomicListenerWriter`] path is used
+/// instead — so it has no effect on Linux behaviour.
+pub fn macos_listener_exec_argv(gateway_docker_socket: &Path, container: &str) -> Vec<String> {
+    let listener = LISTENER_FILE_IN_CONTAINER;
+    let tmp = format!("{listener}.tmp");
+    let dir = Path::new(listener)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".to_string());
+    let sh_cmd = format!("mkdir -p {dir} && cat > '{tmp}' && mv -f '{tmp}' '{listener}'");
+    vec![
+        "-H".to_string(),
+        format!("unix://{}", gateway_docker_socket.display()),
+        "exec".to_string(),
+        "-i".to_string(),
+        container.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        sh_cmd,
+    ]
 }
 
 /// Check that `content` contains both filter-chains markers **exactly
@@ -539,6 +719,74 @@ mod tests {
             }
             other => panic!("expected InvariantViolated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn macos_listener_exec_argv_uses_write_temp_then_rename() {
+        // The macOS in-container delivery MUST be write-temp + `mv -f`
+        // (the validated mechanism that fires Envoy's LDS watcher),
+        // NOT an in-place `cat >` truncate (silently ignored). Pin the
+        // rename form and the forwarded-socket `-H` prefix.
+        let sock = PathBuf::from("/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gw.sock");
+        let argv = macos_listener_exec_argv(&sock, "sandbox-gw-deadbeef");
+
+        // `-H unix://<sock>` must lead so the exec targets the forwarded
+        // in-VM Docker daemon, not the host one.
+        assert_eq!(argv[0], "-H");
+        assert_eq!(
+            argv[1],
+            "unix:///var/lib/sandboxd/501/501/lima/sandboxd-gateway/gw.sock"
+        );
+        assert_eq!(&argv[2..6], &["exec", "-i", "sandbox-gw-deadbeef", "sh"]);
+        assert_eq!(argv[6], "-c");
+
+        let sh = &argv[7];
+        let listener = LISTENER_FILE_IN_CONTAINER;
+        let tmp = format!("{listener}.tmp");
+        // Rename form, in the watched dir, single shell round-trip.
+        assert!(
+            sh.contains(&format!("cat > '{tmp}'")),
+            "must write to a temp file first; got: {sh}"
+        );
+        assert!(
+            sh.contains(&format!("mv -f '{tmp}' '{listener}'")),
+            "must rename temp onto the canonical listener path; got: {sh}"
+        );
+        // Guard against regressing to the silently-ignored truncate form.
+        assert!(
+            !sh.contains(&format!("cat > '{listener}'")),
+            "must NOT truncate-write the canonical path in place; got: {sh}"
+        );
+        // The tmp must live in the watched directory so the rename is a
+        // same-filesystem op that emits IN_MOVED_TO for the watched dir.
+        assert!(
+            tmp.starts_with(crate::policy::LISTENER_DIR_IN_CONTAINER),
+            "temp file must live in the watched listener dir; got: {tmp}"
+        );
+    }
+
+    #[test]
+    fn macos_listener_cache_roundtrips_per_session() {
+        let a = SessionId::generate();
+        let b = SessionId::generate();
+        assert!(cached_listener(&a).is_none());
+
+        cache_listener(&a, "gen-a");
+        assert_eq!(cached_listener(&a).as_deref(), Some("gen-a"));
+        assert!(cached_listener(&b).is_none(), "cache must be per-session");
+
+        cache_listener(&a, "gen-a2");
+        assert_eq!(
+            cached_listener(&a).as_deref(),
+            Some("gen-a2"),
+            "cache must update to the latest delivered generation"
+        );
+
+        forget_cached_listener(&a);
+        assert!(
+            cached_listener(&a).is_none(),
+            "forget must clear the cached generation so reuse starts fresh"
+        );
     }
 
     #[test]

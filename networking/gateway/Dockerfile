@@ -80,6 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         nftables \
         procps \
+        socat \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- install Envoy (copied from pinned official image) ----------

@@ -65,6 +65,7 @@
 //! return canned counters to exercise the success / reject /
 //! timeout paths hermetically without a real Envoy.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::SandboxError;
@@ -130,13 +131,34 @@ pub trait LdsStatsProbe: Send + Sync {
 /// once every 100ms at most.
 pub struct DockerExecLdsProbe {
     container: String,
+    /// Forwarded gateway-VM Docker socket, or `None` for the host socket.
+    /// On Linux this is always `None`, so no `-H` flag is emitted and the
+    /// `docker exec` behaves byte-for-byte as before. On macOS the probe
+    /// must target the in-VM gateway socket or `docker exec` reports
+    /// `No such container`.
+    docker_socket: Option<PathBuf>,
 }
 
 impl DockerExecLdsProbe {
-    /// Build a probe for the gateway container of `session_id`.
+    /// Build a probe for the gateway container of `session_id` targeting
+    /// the host Docker socket (no `-H` flag) — the Linux path.
     pub fn new(session_id: &SessionId) -> Self {
         Self {
             container: container_name(session_id),
+            docker_socket: None,
+        }
+    }
+
+    /// Build a probe for the gateway container of `session_id`, optionally
+    /// routing through a forwarded gateway-VM Docker socket.
+    ///
+    /// `socket = None` is identical to [`Self::new`] (host socket). On
+    /// macOS, pass `Some(path)` so the Envoy-admin `docker exec curl`
+    /// reaches the gateway container running inside the gateway Lima VM.
+    pub fn new_with_socket(session_id: &SessionId, socket: Option<PathBuf>) -> Self {
+        Self {
+            container: container_name(session_id),
+            docker_socket: socket,
         }
     }
 }
@@ -146,6 +168,7 @@ impl LdsStatsProbe for DockerExecLdsProbe {
         &self,
     ) -> impl std::future::Future<Output = Result<LdsCounters, SandboxError>> + Send {
         let container = self.container.clone();
+        let docker_socket = self.docker_socket.clone();
         async move {
             // Single round-trip pulls all three counters via Envoy's
             // regex-based `/stats` filter. Anchoring on `$` prevents
@@ -162,7 +185,11 @@ impl LdsStatsProbe for DockerExecLdsProbe {
                        filter=^listener_manager\\.lds\\.\
                        (update_attempt|update_success|update_rejected)$&\
                        format=text";
-            let output = tokio::process::Command::new("docker")
+            let mut cmd = tokio::process::Command::new("docker");
+            if let Some(sock) = &docker_socket {
+                cmd.args(["-H", &format!("unix://{}", sock.display())]);
+            }
+            let output = cmd
                 .args(["exec", &container, "curl", "-sf", url])
                 .output()
                 .await

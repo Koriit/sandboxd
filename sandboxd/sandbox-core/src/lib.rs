@@ -5,6 +5,11 @@ pub mod bridge_conf;
 pub mod ca;
 pub mod caller_identity;
 pub mod dns_gate;
+/// macOS-only reverse byte-pump bridging the host-bound DNS-policy gate
+/// UDS to the in-VM gateway container's Corefile gate path. The pure argv
+/// builder is platform-neutral (compiled + tested everywhere); the async
+/// accept-loop/pump runtime is macOS-only.
+pub mod dns_gate_bridge;
 pub mod dns_propagation;
 pub mod error;
 pub mod events;
@@ -57,8 +62,9 @@ pub use api::{
     WorkspaceModeDetailDto, WorkspaceOpDto, WorkspaceSecurityModelDto, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
-    AtomicListenerWriter, ListenerWriteError, listener_host_root, session_listener_host_dir,
-    session_listener_host_path,
+    AtomicListenerWriter, ListenerWriteError, forget_cached_listener, listener_host_root,
+    macos_listener_exec_argv, session_listener_host_dir, session_listener_host_path,
+    write_listener_into_container,
 };
 pub use backend::{
     AsyncReadWrite, BackendInfo, BackendKind, BackendSpecific, Capabilities, CliDockerOps,
@@ -77,9 +83,13 @@ pub use dns_gate::{
     GateRequest, GateRequestKind, GateService, GateServiceOutcome, GateStatus, bind_gate_listener,
     dns_gate_socket_host_path, log_serviced, remove_gate_socket, send_request, serve_gate_listener,
 };
+pub use dns_gate_bridge::gate_listener_exec_argv;
+#[cfg(target_os = "macos")]
+pub use dns_gate_bridge::start_gate_bridge;
 pub use dns_propagation::{
     DnsCache, DnsCacheEntry, DnsChange, DnsChangeType, ResolvedMapping, ResolvedReport,
     generate_domain_ip_rules, propagate_dns_changes, read_resolved_json,
+    read_resolved_json_on_socket,
 };
 pub use error::{ApiError, SandboxError};
 pub use events::{
@@ -137,7 +147,9 @@ pub use policy::{
     MitmproxyFilter, MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol, RuleSource,
     hash_policy,
 };
-pub use policy_distributor::{PolicyDistributor, write_file_to_container};
+pub use policy_distributor::{
+    PolicyDistributor, write_file_to_container, write_file_to_container_on_socket,
+};
 pub use process::run_with_timeout;
 pub use qmp::{QmpClient, mac_from_session_id};
 pub use session::{
