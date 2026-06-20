@@ -1906,6 +1906,98 @@ impl GatewayLimaManager {
         }
     }
 
+    /// Resolve the version-pinned gateway image tag the daemon expects inside
+    /// the gateway Lima instance.
+    ///
+    /// Surfaced through `/diagnostics` so doctor can show which tag the
+    /// presence check is keyed on.
+    pub fn expected_gateway_image_tag(&self) -> String {
+        gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Probe whether the version-pinned gateway image is present inside the
+    /// gateway Lima instance, via the forwarded Docker socket.
+    ///
+    /// - `Ok(true)` — `docker -H <sock> image inspect <tag>` exited 0.
+    /// - `Ok(false)` — the probe ran and the image is absent (`no such image`
+    ///   / `no such object`).
+    /// - `Err(_)` — the probe could not run to a verdict (Docker daemon
+    ///   unreachable, fork failure, unexpected stderr). The caller maps this
+    ///   to a "restart the daemon" hint rather than "image missing".
+    ///
+    /// Mirrors the host-side `gateway::gateway_image_present` three-state
+    /// contract, but targets the forwarded gateway Docker socket instead of
+    /// the host Docker daemon.
+    pub fn gateway_image_present_inside_lima(&self) -> Result<bool, SandboxError> {
+        let tag = self.expected_gateway_image_tag();
+        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
+        let mut cmd = Command::new("docker");
+        apply_docker_env(&mut cmd);
+        cmd.args(["-H", &socket_str, "image", "inspect", &tag]);
+
+        let output = run_with_timeout(
+            &mut cmd,
+            DOCKER_OP_TIMEOUT,
+            "gateway: docker image inspect via forwarded socket",
+        )?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr_lower = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        if stderr_lower.contains("no such image") || stderr_lower.contains("no such object") {
+            Ok(false)
+        } else {
+            Err(SandboxError::Internal(format!(
+                "docker image inspect {tag} via gateway socket failed unexpectedly: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    /// Probe the version string of the daemon's `limactl` binary.
+    ///
+    /// Runs `limactl --version` with the same minimal `PATH` the daemon uses
+    /// for its gateway-instance control-plane ops (Homebrew + `/usr/local/bin`
+    /// ahead of the inherited `PATH`). This is a pure binary-version read with
+    /// no operator-uid context — distinct from the privilege-pivoting
+    /// control-plane ops that must route through `sandbox-lima-helper`.
+    ///
+    /// Returns the parsed `X.Y.Z` version string (e.g. `"1.2.0"`) on success.
+    pub fn lima_version(&self) -> Result<String, SandboxError> {
+        let mut cmd = Command::new("limactl");
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
+        cmd.env("PATH", &path_value).arg("--version");
+
+        let output =
+            run_with_timeout(&mut cmd, GATEWAY_LIST_TIMEOUT, "gateway: limactl --version")?;
+        if !output.status.success() {
+            return Err(SandboxError::Lima(format!(
+                "limactl --version failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        // `limactl --version` prints `limactl version X.Y.Z`; extract the
+        // first dotted-numeric token so the doctor can compare against
+        // MIN_LIMA_VERSION regardless of surrounding wording.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let version = stdout
+            .split_whitespace()
+            .find(|tok| {
+                let trimmed = tok.trim_start_matches('v');
+                let mut parts = trimmed.split('.');
+                parts.clone().count() >= 2 && parts.all(|p| p.chars().all(|c| c.is_ascii_digit()))
+            })
+            .map(|tok| tok.trim_start_matches('v').to_string())
+            .ok_or_else(|| {
+                SandboxError::Lima(format!(
+                    "could not parse limactl version from output: {}",
+                    stdout.trim()
+                ))
+            })?;
+        Ok(version)
+    }
+
     /// Stop the gateway Lima instance unconditionally (`limactl stop --force`).
     ///
     /// Tolerates "not running" and "not found" as success so the recovery

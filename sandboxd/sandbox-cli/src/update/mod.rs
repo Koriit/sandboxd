@@ -737,7 +737,11 @@ pub fn check_disk_space(budget: &DiskBudget) -> DiskCheck {
 
 /// `statvfs`-derived free KB for the given path. Returns `0` on any
 /// error — caller treats that as "budget not met" downstream.
-fn free_kb_at(path: &Path) -> u64 {
+///
+/// `pub(crate)` so the `doctor` module's cross-platform disk-space row can
+/// reuse the same statvfs probe (with the first-existing-ancestor fallback)
+/// rather than re-deriving it.
+pub(crate) fn free_kb_at(path: &Path) -> u64 {
     // Use the path itself if it exists; otherwise walk up to the first
     // ancestor that does (this lets the per-uid base-dir probe succeed
     // on a host where the dir does not exist yet — fallback to

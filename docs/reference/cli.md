@@ -1288,4 +1288,46 @@ sandbox doctor
 sandbox doctor --verbose
 ```
 
-The check shape, individual probes, and remediation hints are an evolving surface; consult the command's output for the authoritative list.
+### Checks
+
+The check set is partitioned by platform. Cross-platform checks run everywhere; the Linux-only and macOS-only sets are skipped (absent from the report) on the other platform. A `Fail` raises the exit code to `1`; a `Skip` (including the advisory warnings) never does.
+
+**Cross-platform**
+
+| Check | What it probes |
+|-------|----------------|
+| daemon process running | The daemon is up (service manager probe, then socket-connect fallback). |
+| daemon reachable | The API socket accepts a connection. |
+| CLI ↔ daemon version match | The CLI and daemon report the same version. |
+| socket perms | The API socket has the expected ownership and mode. |
+| gateway image present | The version-pinned gateway image is present in the host Docker daemon (Linux). |
+| lite image present | The lite-mode image is present (informational — built on first lite session). |
+| state-dir mode | The per-uid state directory has the expected mode. |
+| users.conf has daemon pool | `users.conf` parses and resolves the daemon's uid to a CIDR pool. |
+| guest version drift | No running session is on a drifted guest protocol. |
+| orphan substrate resources | No substrate resources are orphaned (informational). |
+| lima base image present | The golden Lima base VM (`sandbox-base`) is present (informational). |
+| disk space | Free space on the filesystem holding `/var/lib/sandboxd/`. Warns below 10 GiB free (advisory only — the daemon does not enforce a disk budget). |
+
+**Linux-only**
+
+| Check | What it probes |
+|-------|----------------|
+| sandbox group membership | The calling account is in the `sandbox` group. |
+| KVM accessible | The daemon's uid can read+write `/dev/kvm`. |
+| route-helper caps | `sandbox-route-helper` carries the required capabilities. |
+
+**macOS-only**
+
+| Check | What it probes |
+|-------|----------------|
+| socket_vmnet installed | The staged `socket_vmnet` binary is present at `/Library/sandboxd/socket_vmnet` with root-owned, non-writable ancestry. |
+| socket_vmnet running | The configured slot sockets under `/var/run/sandbox/vmnet/` are present. |
+| gateway Lima instance | The `sandboxd-gateway` Lima instance exists, is running, and its forwarded Docker socket is reachable. |
+| vmnet pool slots | The vmnet pool has the configured slot count and no slot is leaked (claimed by a session that no longer exists). |
+| gateway image (inside Lima) | The version-pinned gateway image is present inside the gateway Lima instance (probed over the forwarded Docker socket). |
+| lima version | `limactl --version` is at least the required minimum. |
+| operator agent checked in | The calling operator's per-operator agent is connected to the broker (warns if enrolled but not connected — typically not logged in). |
+| TCC workspace access | Informational. If session create fails on a TCC-protected path (Desktop / Documents / Downloads), grant the daemon Full Disk Access. |
+
+Remediation hints accompany failures and actionable skips; consult the command's output for the authoritative wording.

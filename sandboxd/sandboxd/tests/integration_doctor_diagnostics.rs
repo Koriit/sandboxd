@@ -619,3 +619,43 @@ async fn integration_kvm_check_via_daemon_diagnostics() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test 6 — macOS-only /diagnostics fields are omitted on Linux
+// ---------------------------------------------------------------------------
+
+/// The macOS-only `/diagnostics` fields must be *omitted* (not present
+/// as null) on Linux, so the Linux wire shape is byte-stable.
+///
+/// Linux-only: this hermetic daemon fixture starts cleanly on Linux but
+/// the macOS daemon requires socket_vmnet + the gateway Lima instance to
+/// come up, which is out of reach in a hermetic test. The macOS side of
+/// the contract (fields *present* on macOS) is covered by the live
+/// `sandbox doctor` check the orchestrator runs and by the hermetic
+/// doctor row tests in `sandbox-cli`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integration_diagnostics_macos_fields_omitted_on_linux() {
+    let daemon = Daemon::spawn("10.236.0.0/24");
+
+    let (status, body) = http_get(&daemon.socket, "/diagnostics", Duration::from_secs(10)).await;
+    assert_eq!(status, hyper::StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body parses as JSON");
+
+    for key in [
+        "gateway_lima_state",
+        "vmnet_pool_size",
+        "vmnet_pool_claimed",
+        "gateway_image_tag_inside_lima",
+        "socket_vmnet_installed",
+        "socket_vmnet_running",
+        "lima_version",
+        "operator_agent_checked_in",
+        "tcc_workspace_access",
+    ] {
+        assert!(
+            parsed.get(key).is_none(),
+            "macOS-only `{key}` must be OMITTED on Linux (byte-stable wire); body={parsed}"
+        );
+    }
+}

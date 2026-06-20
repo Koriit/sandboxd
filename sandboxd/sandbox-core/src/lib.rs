@@ -97,8 +97,8 @@ pub use gateway::{
 };
 #[cfg(target_os = "macos")]
 pub use gateway_lima::{
-    EGRESS_BRIDGE_NAME, GATEWAY_INSTANCE_NAME, GatewayLimaManager, IpLinkEntry, NicMap,
-    PoolResizeDecision, UBUNTU_NOBLE_ARM64_URL, VMNET_LAUNCH_DAEMONS_DIR,
+    EGRESS_BRIDGE_NAME, GATEWAY_INSTANCE_NAME, GatewayLimaManager, IpLinkEntry, MIN_LIMA_VERSION,
+    NicMap, PoolResizeDecision, UBUNTU_NOBLE_ARM64_URL, VMNET_LAUNCH_DAEMONS_DIR,
     count_reachable_slot_sockets, count_vmnet_plists, decide_pool_resize,
     discover_nics_from_ip_json, generate_gateway_eth0_nft_policy, generate_gateway_template,
     observe_vmnet_daemon_set,

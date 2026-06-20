@@ -2,38 +2,56 @@
 //!
 //! `doctor` is the single command an operator runs after install
 //! (or when something feels off) to verify every load-bearing
-//! invariant the daemon depends on: the systemd unit is active, the
-//! socket is reachable, the CLI matches the daemon version, the
-//! caller's account is in the `sandbox` group, the socket has the
-//! expected mode, KVM is reachable from the daemon's uid, both
-//! container images are present, the route-helper has its `setcap`
-//! capability, the state-dir has the expected mode, `users.conf`
-//! parses + names the daemon's uid, no running session is on a
-//! drift'd guest protocol, and no substrate resources are orphaned.
+//! invariant the daemon depends on: the service is up, the socket is
+//! reachable, the CLI matches the daemon version, the caller's account
+//! is in the `sandbox` group, the socket has the expected mode, both
+//! container images are present, the state-dir has the expected mode,
+//! `users.conf` parses + names the daemon's uid, no running session is
+//! on a drift'd guest protocol, no substrate resources are orphaned, and
+//! the host has free disk space.
 //!
-//! The check inventory (C1-C13) is enumerated in the daemon-
-//! productionization.2. The output format is pinned in
-//! Three exact-text examples pin the output format, and it is
-//! load-bearing for the integration tests. Message tokens, glyphs,
-//! indentation, and the summary-line wording are byte-for-byte stable.
+//! # Platform split
+//!
+//! The check registry is numbered `C1..` and partitioned by platform:
+//!
+//! - **Cross-platform:** C1 (daemon running), C2 (socket reachable),
+//!   C3 (version match), C5 (socket perms), C7 (gateway image — host
+//!   docker on Linux), C8 (lite image), C10 (state-dir mode), C11
+//!   (`users.conf` pool), C12 (guest drift), C13 (orphans), C14 (lima
+//!   base image), C15 (disk space).
+//! - **Linux-only** (`cfg!(target_os = "linux")`): C4 (group
+//!   membership — `getgrouplist(3)` is absent on Apple targets in nix
+//!   0.29), C6 (KVM accessible — no `/dev/kvm` on the macOS QEMU+HVF
+//!   backend), C9 (route-helper caps — the route install lives inside
+//!   the gateway Lima VM on macOS).
+//! - **macOS-only** (`cfg!(target_os = "macos")`): C16 (socket_vmnet
+//!   installed), C17 (socket_vmnet running), C18 (gateway Lima
+//!   instance), C19 (vmnet pool slots), C20 (gateway image inside the
+//!   gateway Lima instance — distinct from the Linux host-docker C7),
+//!   C21 (lima version), C22 (operator agent checked in), C23 (TCC
+//!   workspace access — informational).
+//!
+//! The output format is load-bearing for the integration tests:
+//! message tokens, glyphs, indentation, and the summary-line wording
+//! are byte-for-byte stable.
 //!
 //! # Execution shape
 //!
-//! Two phases per.6:
+//! Two phases:
 //!
 //! 1. Serial — C1 (daemon running) and C2 (socket reachable). If
 //!    either fails, every downstream check that requires a running
-//!    daemon is short-circuited to `SKIPPED (requires daemon)`. C4
-//!    (group membership), C9 (route-helper caps), and C10 (state-dir
-//!    mode) can still run because they only consult host state.
-//! 2. Parallel — C3-C13 fan out via `tokio::task::JoinSet` so the
-//!    HTTP-bound checks (C3, C6-C8, C11-C13) and the host-side checks
-//!    (C4, C9, C10) execute concurrently. `GET /diagnostics` is
-//!    fetched once before the fan-out and shared via `Arc` so the
-//!    daemon-side checks do not refetch. Results are reimposed in
-//!    canonical order (C3 first, C13 last) before the formatter
-//!    walks the table — fan-out completion order is non-deterministic
-//!    but the rendered report is byte-stable.
+//!    daemon is short-circuited to `SKIPPED (requires daemon)`. The
+//!    host-only checks (C4 group membership, C9 route-helper caps, C10
+//!    state-dir mode, C15 disk space) can still run because they only
+//!    consult host state.
+//! 2. Parallel — the remaining rows fan out via `tokio::task::JoinSet`
+//!    so the HTTP-bound checks and host-side checks execute
+//!    concurrently. `GET /diagnostics` is fetched once before the
+//!    fan-out and shared via `Arc` so the daemon-side checks do not
+//!    refetch. Results are reimposed in canonical id order before the
+//!    formatter walks the table — fan-out completion order is
+//!    non-deterministic but the rendered report is byte-stable.
 //!
 //! # Exit codes
 //!
@@ -284,7 +302,7 @@ const DOCTOR_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// tasks join, results are sorted by check id so the rendered output
 /// is byte-stable regardless of completion order.
 pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
-    let mut rows: Vec<CheckRow> = Vec::with_capacity(14);
+    let mut rows: Vec<CheckRow> = Vec::with_capacity(24);
 
     // Phase 1 — serial gating.
     let c1 = check_daemon_running(socket_path).await;
@@ -333,6 +351,9 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
         set.spawn_blocking(move || check_socket_perms(&socket, socket_reachable));
     }
     // C6 — sync transform over the shared diagnostics payload.
+    // `/dev/kvm` is a Linux concept (the macOS QEMU+HVF backend has no
+    // such device), so the KVM row is Linux-only and absent on macOS.
+    #[cfg(target_os = "linux")]
     {
         let diag = Arc::clone(&diagnostics);
         set.spawn_blocking(move || check_kvm_accessible(diag.as_ref().as_ref(), socket_reachable));
@@ -347,11 +368,16 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
         let diag = Arc::clone(&diagnostics);
         set.spawn_blocking(move || check_lite_image(diag.as_ref().as_ref(), socket_reachable));
     }
-    // C9 — sync (forks `getcap`).
+    // C9 — sync (forks `getcap`). The route-helper is a Linux container-
+    // backend artifact; on macOS the route install happens inside the
+    // gateway Lima VM, so this host-side caps check is Linux-only.
+    #[cfg(target_os = "linux")]
     set.spawn_blocking(check_route_helper_caps);
     // C10 — sync (stat on per-uid base-dir, legacy fallback).
     set.spawn_blocking(check_state_dir_mode);
-    // C11
+    // C11 — `users.conf` is the CIDR-pool allow-list. It is loaded on both
+    // platforms (macOS uses it for the lite `/28` allocation), so the row
+    // stays on both platforms.
     {
         let diag = Arc::clone(&diagnostics);
         set.spawn_blocking(move || check_users_conf_pool(diag.as_ref().as_ref(), socket_reachable));
@@ -375,11 +401,69 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
         let diag = Arc::clone(&diagnostics);
         set.spawn_blocking(move || check_lima_base_image(diag.as_ref().as_ref(), socket_reachable));
     }
+    // C15 — disk space (platform-independent). Runs on Linux and macOS.
+    // A pure host-side statvfs probe; no daemon dependency.
+    set.spawn_blocking(check_disk_space);
+
+    // C16-C23 — macOS-only rows. Each is a thin transform over the
+    // macOS `/diagnostics` fields the daemon computes from its existing
+    // managers (vmnet pool, gateway Lima manager, agent registry).
+    #[cfg(target_os = "macos")]
+    {
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_socket_vmnet_installed(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_socket_vmnet_running(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_gateway_lima_instance(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_vmnet_pool_slots(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_gateway_image_inside_lima(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_lima_version(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_operator_agent(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_tcc_workspace_access(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
+    }
 
     // Drain the JoinSet; a panicking task surfaces as a `JoinError`
     // and is re-raised here so [`run`]'s `catch_unwind` boundary routes
     // it to exit code 2.
-    let mut parallel: Vec<CheckRow> = Vec::with_capacity(12);
+    let mut parallel: Vec<CheckRow> = Vec::with_capacity(22);
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(row) => parallel.push(row),
@@ -864,6 +948,9 @@ fn check_socket_perms(socket_path: &str, socket_reachable: bool) -> CheckRow {
 /// The CLI runs as the operator; the operative question is whether
 /// the *daemon* can read+write `/dev/kvm`. The answer comes from
 /// `GET /diagnostics`, evaluated daemon-side.
+///
+/// Linux-only: the macOS QEMU+HVF backend has no `/dev/kvm`.
+#[cfg(target_os = "linux")]
 fn check_kvm_accessible(
     diagnostics: Option<&DiagnosticsPayload>,
     socket_reachable: bool,
@@ -1144,6 +1231,495 @@ fn check_lima_base_image(
 }
 
 // ---------------------------------------------------------------------------
+// Individual checks — C15 (disk space, platform-independent)
+// ---------------------------------------------------------------------------
+
+/// Warn threshold for free space on the filesystem holding
+/// `/var/lib/sandboxd/`. Below this the disk-space row warns. This is a
+/// first-cut value; the right number depends on measuring real growth.
+const DISK_SPACE_WARN_GIB: u64 = 10;
+
+/// C15 — free space on the filesystem containing `/var/lib/sandboxd/`.
+///
+/// Platform-independent host probe (no daemon dependency). The check
+/// **warns** (renders as `Skip` with a hint, so it surfaces in default
+/// mode but never flips the exit code to `1`) when free space drops
+/// below [`DISK_SPACE_WARN_GIB`]; otherwise `Pass`. The daemon does not
+/// enforce a disk budget on `sandbox create` — this is advisory only.
+///
+/// Reuses the `update` module's `statvfs` helper (with its
+/// first-existing-ancestor fallback) so the probe path matches the
+/// `sandbox update` pre-flight rather than re-deriving it.
+fn check_disk_space() -> CheckRow {
+    // Resolve the filesystem the production daemon's state tree lives on.
+    // On a dev host where the `sandbox` user is absent, fall back to the
+    // state-root mount point.
+    let probe_path =
+        crate::update::prod_base_dir().unwrap_or_else(|| PathBuf::from("/var/lib/sandboxd"));
+    let free_kb = crate::update::free_kb_at(&probe_path);
+    let free_gib = free_kb / (1024 * 1024);
+    let warn_kb = DISK_SPACE_WARN_GIB * 1024 * 1024;
+
+    if free_kb >= warn_kb {
+        CheckRow {
+            id: "C15",
+            name: "disk space",
+            outcome: CheckOutcome::Pass {
+                detail: format!("{free_gib} GiB free on {}", probe_path.display()),
+            },
+        }
+    } else {
+        CheckRow {
+            id: "C15",
+            name: "disk space",
+            outcome: CheckOutcome::Skip {
+                detail: format!(
+                    "low: {free_gib} GiB free on {} (< {DISK_SPACE_WARN_GIB} GiB)",
+                    probe_path.display()
+                ),
+                hint: Some(
+                    "free space on the sandboxd state filesystem is low; \
+                     reclaim with `sandbox rm` of unused sessions or prune \
+                     stale VM/image artifacts"
+                        .to_string(),
+                ),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Individual checks — C16-C23 (macOS-only)
+// ---------------------------------------------------------------------------
+
+/// Shared "requires daemon" skip row for the macOS checks.
+#[cfg(target_os = "macos")]
+fn requires_daemon_skip(id: &'static str, name: &'static str) -> CheckRow {
+    CheckRow {
+        id,
+        name,
+        outcome: CheckOutcome::Skip {
+            detail: "requires daemon".to_string(),
+            hint: None,
+        },
+    }
+}
+
+/// C16 — socket_vmnet binary staged with root-owned ancestry.
+///
+/// The N socket_vmnet launchd daemons exec this binary as root, so a
+/// non-root-writable ancestor would be a privilege-escalation vector.
+/// The daemon asserts this at startup; the doctor surfaces the
+/// steady-state answer from `/diagnostics`.
+#[cfg(target_os = "macos")]
+fn check_socket_vmnet_installed(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C16", "socket_vmnet installed");
+    }
+    match diagnostics.and_then(|d| d.socket_vmnet_installed) {
+        Some(true) => CheckRow {
+            id: "C16",
+            name: "socket_vmnet installed",
+            outcome: CheckOutcome::Pass {
+                detail: sandbox_core::network::STAGED_SOCKET_VMNET_PATH.to_string(),
+            },
+        },
+        Some(false) => CheckRow {
+            id: "C16",
+            name: "socket_vmnet installed",
+            outcome: CheckOutcome::Fail {
+                detail: format!(
+                    "{} missing or has non-root-writable ancestry",
+                    sandbox_core::network::STAGED_SOCKET_VMNET_PATH
+                ),
+                hint: Some(
+                    "re-run the installer to stage socket_vmnet with root-owned \
+                     ancestry: sandbox update (or scripts/install.sh)"
+                        .to_string(),
+                ),
+            },
+        },
+        None => CheckRow {
+            id: "C16",
+            name: "socket_vmnet installed",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        },
+    }
+}
+
+/// C17 — socket_vmnet slot sockets present.
+///
+/// Verifies the N `io.sandboxd.vmnet.<n>` daemons' slot sockets exist
+/// under `/var/run/sandbox/vmnet/` (functional reachability, mirroring
+/// the daemon's startup prereq). Separate row from the binary-present
+/// check (C16) per the spec.
+#[cfg(target_os = "macos")]
+fn check_socket_vmnet_running(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C17", "socket_vmnet running");
+    }
+    let running = diagnostics.and_then(|d| d.socket_vmnet_running);
+    let count = diagnostics.and_then(|d| d.socket_vmnet_running_count);
+    let expected = diagnostics.and_then(|d| d.socket_vmnet_expected_count);
+    match (running, count, expected) {
+        (Some(true), Some(c), Some(e)) => CheckRow {
+            id: "C17",
+            name: "socket_vmnet running",
+            outcome: CheckOutcome::Pass {
+                detail: format!("{c}/{e} slot sockets present"),
+            },
+        },
+        (Some(false), Some(c), Some(e)) => CheckRow {
+            id: "C17",
+            name: "socket_vmnet running",
+            outcome: CheckOutcome::Fail {
+                detail: format!("{c}/{e} slot sockets present"),
+                hint: Some(
+                    "load the socket_vmnet launchd daemons: re-run the installer \
+                     (sandbox update), then restart sandboxd"
+                        .to_string(),
+                ),
+            },
+        },
+        _ => CheckRow {
+            id: "C17",
+            name: "socket_vmnet running",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        },
+    }
+}
+
+/// C18 — gateway Lima instance exists, is running, and its forwarded
+/// Docker socket is reachable.
+#[cfg(target_os = "macos")]
+fn check_gateway_lima_instance(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C18", "gateway Lima instance");
+    }
+    match diagnostics.and_then(|d| d.gateway_lima_state.as_deref()) {
+        Some("running") => CheckRow {
+            id: "C18",
+            name: "gateway Lima instance",
+            outcome: CheckOutcome::Pass {
+                detail: format!("{} running, docker reachable", "sandboxd-gateway"),
+            },
+        },
+        Some(state @ ("stopped" | "absent" | "error")) => {
+            let (detail, hint) = match state {
+                "stopped" => (
+                    "sandboxd-gateway stopped".to_string(),
+                    "restart sandboxd to bring up the gateway Lima instance",
+                ),
+                "absent" => (
+                    "sandboxd-gateway absent".to_string(),
+                    "restart sandboxd to create the gateway Lima instance",
+                ),
+                _ => (
+                    "sandboxd-gateway running but docker socket unreachable".to_string(),
+                    "restart sandboxd; if it persists, inspect the gateway VM's docker daemon",
+                ),
+            };
+            CheckRow {
+                id: "C18",
+                name: "gateway Lima instance",
+                outcome: CheckOutcome::Fail {
+                    detail,
+                    hint: Some(hint.to_string()),
+                },
+            }
+        }
+        _ => CheckRow {
+            id: "C18",
+            name: "gateway Lima instance",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        },
+    }
+}
+
+/// C19 — vmnet pool has the configured slot count and no leaked slots.
+///
+/// A leaked slot is one still claimed by a session that no longer exists.
+#[cfg(target_os = "macos")]
+fn check_vmnet_pool_slots(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C19", "vmnet pool slots");
+    }
+    let size = diagnostics.and_then(|d| d.vmnet_pool_size);
+    let claimed = diagnostics.and_then(|d| d.vmnet_pool_claimed);
+    let leaked = diagnostics
+        .and_then(|d| d.vmnet_pool_leaked_slots.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    match (size, claimed) {
+        (Some(size), Some(claimed)) if leaked.is_empty() => CheckRow {
+            id: "C19",
+            name: "vmnet pool slots",
+            outcome: CheckOutcome::Pass {
+                detail: format!("{claimed}/{size} slots claimed, no leaks"),
+            },
+        },
+        (Some(size), Some(claimed)) => CheckRow {
+            id: "C19",
+            name: "vmnet pool slots",
+            outcome: CheckOutcome::Fail {
+                detail: format!(
+                    "{claimed}/{size} slots claimed; leaked slots {leaked:?} (no live session)"
+                ),
+                hint: Some(
+                    "a slot is claimed by a session that no longer exists; \
+                     restart sandboxd to reconcile the pool"
+                        .to_string(),
+                ),
+            },
+        },
+        _ => CheckRow {
+            id: "C19",
+            name: "vmnet pool slots",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        },
+    }
+}
+
+/// C20 — version-pinned gateway image present inside the gateway Lima
+/// instance (probed via the forwarded Docker socket).
+///
+/// Distinct from the Linux host-docker gateway-image check (C7), which is
+/// cfg-gated off on macOS — on macOS the relevant Docker daemon is the
+/// gateway Lima instance's, reached over the forwarded socket.
+#[cfg(target_os = "macos")]
+fn check_gateway_image_inside_lima(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C20", "gateway image (inside Lima)");
+    }
+    let present = diagnostics.and_then(|d| d.gateway_image_inside_lima_present);
+    let probe_failed = diagnostics
+        .and_then(|d| d.gateway_image_inside_lima_probe_failed)
+        .unwrap_or(false);
+    let expected = diagnostics
+        .and_then(|d| d.gateway_image_inside_lima_expected_tag.clone())
+        .unwrap_or_else(|| "sandbox-gateway".to_string());
+    if probe_failed {
+        let detail =
+            match diagnostics.and_then(|d| d.gateway_image_inside_lima_probe_error.as_deref()) {
+                Some(err) if !err.is_empty() => format!("probe failed: {err}"),
+                _ => "probe failed".to_string(),
+            };
+        return CheckRow {
+            id: "C20",
+            name: "gateway image (inside Lima)",
+            outcome: CheckOutcome::Fail {
+                detail,
+                hint: Some(
+                    "verify the gateway Lima instance is up and its docker daemon \
+                     reachable; restart sandboxd once it is responsive"
+                        .to_string(),
+                ),
+            },
+        };
+    }
+    match present {
+        Some(true) => CheckRow {
+            id: "C20",
+            name: "gateway image (inside Lima)",
+            outcome: CheckOutcome::Pass {
+                // Prefer the daemon-reported present tag; fall back to the
+                // expected tag if (older daemon) it is absent.
+                detail: diagnostics
+                    .and_then(|d| d.gateway_image_tag_inside_lima.clone())
+                    .unwrap_or(expected),
+            },
+        },
+        Some(false) => CheckRow {
+            id: "C20",
+            name: "gateway image (inside Lima)",
+            outcome: CheckOutcome::Fail {
+                detail: format!("missing {expected}"),
+                hint: Some(
+                    "the daemon loads the gateway image into the gateway Lima \
+                     instance from its staged tarball at startup; restart sandboxd"
+                        .to_string(),
+                ),
+            },
+        },
+        None => CheckRow {
+            id: "C20",
+            name: "gateway image (inside Lima)",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        },
+    }
+}
+
+/// C21 — `limactl` version ≥ [`MIN_LIMA_VERSION`].
+#[cfg(target_os = "macos")]
+fn check_lima_version(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C21", "lima version");
+    }
+    match diagnostics.and_then(|d| d.lima_version.as_deref()) {
+        Some(ver) if lima_version_at_least(ver, sandbox_core::MIN_LIMA_VERSION) => CheckRow {
+            id: "C21",
+            name: "lima version",
+            outcome: CheckOutcome::Pass {
+                detail: format!("{ver} (>= {})", sandbox_core::MIN_LIMA_VERSION),
+            },
+        },
+        Some(ver) => CheckRow {
+            id: "C21",
+            name: "lima version",
+            outcome: CheckOutcome::Fail {
+                detail: format!("{ver} (< {})", sandbox_core::MIN_LIMA_VERSION),
+                hint: Some("upgrade Lima to the required minimum: brew upgrade lima".to_string()),
+            },
+        },
+        None => CheckRow {
+            id: "C21",
+            name: "lima version",
+            outcome: CheckOutcome::Skip {
+                detail: "probe failed (limactl not found or version unparsable)".to_string(),
+                hint: Some(
+                    "ensure limactl is installed and on PATH: brew install lima".to_string(),
+                ),
+            },
+        },
+    }
+}
+
+/// Compare two dotted-numeric version strings, returning `true` when
+/// `have >= want`. Tolerant of differing component counts (missing
+/// components are treated as `0`) and non-numeric tails (ignored).
+#[cfg(target_os = "macos")]
+fn lima_version_at_least(have: &str, want: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.trim_start_matches('v')
+            .split('.')
+            .map(|p| {
+                let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u64>().unwrap_or(0)
+            })
+            .collect()
+    }
+    let h = parts(have);
+    let w = parts(want);
+    let n = h.len().max(w.len());
+    for i in 0..n {
+        let hv = h.get(i).copied().unwrap_or(0);
+        let wv = w.get(i).copied().unwrap_or(0);
+        if hv != wv {
+            return hv > wv;
+        }
+    }
+    true
+}
+
+/// C22 — the calling operator's per-operator agent is checked in.
+///
+/// `limactl` control-plane ops are brokered through the operator's agent
+/// on macOS, so an enrolled-but-disconnected agent (typically: operator
+/// not logged in) is surfaced as a warning.
+#[cfg(target_os = "macos")]
+fn check_operator_agent(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C22", "operator agent checked in");
+    }
+    match diagnostics.and_then(|d| d.operator_agent_checked_in) {
+        Some(true) => CheckRow {
+            id: "C22",
+            name: "operator agent checked in",
+            outcome: CheckOutcome::Pass {
+                detail: "agent connected to broker".to_string(),
+            },
+        },
+        Some(false) => CheckRow {
+            id: "C22",
+            name: "operator agent checked in",
+            outcome: CheckOutcome::Skip {
+                detail: "agent not connected".to_string(),
+                hint: Some(
+                    "the per-operator agent (io.sandboxd.agent) is not checked in; \
+                     log in as this operator so limactl ops can be brokered"
+                        .to_string(),
+                ),
+            },
+        },
+        None => CheckRow {
+            id: "C22",
+            name: "operator agent checked in",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        },
+    }
+}
+
+/// C23 — TCC workspace access (informational stub).
+///
+/// Lands the row so operators see the check exists; the real TCC-chain
+/// attribution (which protected root denied access) is deferred. Renders
+/// as an informational `Skip`.
+#[cfg(target_os = "macos")]
+fn check_tcc_workspace_access(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C23", "TCC workspace access");
+    }
+    let detail = diagnostics
+        .and_then(|d| d.tcc_workspace_access.clone())
+        .unwrap_or_else(|| "informational".to_string());
+    CheckRow {
+        id: "C23",
+        name: "TCC workspace access",
+        outcome: CheckOutcome::Skip {
+            detail,
+            hint: Some(
+                "informational only; if session create fails on a TCC-protected \
+                 path (Desktop/Documents/Downloads), grant the daemon Full Disk \
+                 Access in System Settings > Privacy & Security"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Individual checks — C9 (route-helper caps)
 // ---------------------------------------------------------------------------
 
@@ -1161,6 +1737,10 @@ fn check_lima_base_image(
 /// Without it, container-session egress routing fails — so a helper
 /// carrying only the older two-cap set is reported as a hard failure
 /// even though that set once sufficed (pre operator-uid alignment).
+///
+/// Linux-only: on macOS the route install happens inside the gateway
+/// Lima VM, so there is no host-side route-helper to cap-check.
+#[cfg(target_os = "linux")]
 fn check_route_helper_caps() -> CheckRow {
     const HELPER_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-route-helper";
     if !std::path::Path::new(HELPER_PATH).exists() {
@@ -1579,9 +2159,12 @@ pub(crate) struct DiagnosticsPayload {
     #[serde(default)]
     #[allow(dead_code)]
     pub daemon_user: String,
+    // Read only by the Linux-only C6 KVM row; unused on macOS.
     #[serde(default)]
+    #[allow(dead_code)]
     pub kvm_readable: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     pub kvm_writable: bool,
     #[serde(default)]
     pub gateway_image_present: bool,
@@ -1633,6 +2216,91 @@ pub(crate) struct DiagnosticsPayload {
     pub guest_version_drift: Option<Vec<GuestVersionDriftEntry>>,
     #[serde(default)]
     pub substrate_orphans: Option<SubstrateOrphans>,
+
+    // -----------------------------------------------------------------
+    // macOS-only fields. Absent (not null) on Linux — the daemon omits
+    // them entirely; `#[serde(default)]` makes them `None` on any
+    // platform. The macOS doctor rows that read them are themselves
+    // `#[cfg(target_os = "macos")]`, so the Linux build never consults
+    // these (they exist on the struct on both platforms only because the
+    // CLI is cross-compiled).
+    // -----------------------------------------------------------------
+    // Each macOS field is read only by a `#[cfg(target_os = "macos")]`
+    // doctor row, so on the Linux build they are dead — `cfg_attr` the
+    // `dead_code` allow on for non-macOS targets only.
+    /// Gateway Lima instance verdict: `running` / `stopped` / `absent` /
+    /// `error`. `running` folds in a successful forwarded-docker probe.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_lima_state: Option<String>,
+    /// Configured vmnet pool size (max concurrent macOS sessions).
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub vmnet_pool_size: Option<u16>,
+    /// Number of vmnet pool slots currently claimed.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub vmnet_pool_claimed: Option<usize>,
+    /// Slot indices claimed by a session that no longer exists (leaks).
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub vmnet_pool_leaked_slots: Option<Vec<u16>>,
+    /// Version-pinned gateway image tag present inside the gateway Lima
+    /// instance — `Some(tag)` only when the image is actually present.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_image_tag_inside_lima: Option<String>,
+    /// `true` when the gateway image is present inside the gateway Lima
+    /// instance (forwarded-docker probe ran to a positive verdict).
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_image_inside_lima_present: Option<bool>,
+    /// The tag the daemon expects inside the gateway Lima instance
+    /// (rendered in the absent/probe-failed verdicts).
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_image_inside_lima_expected_tag: Option<String>,
+    /// `true` when the gateway-image-inside-lima probe could not run to a
+    /// verdict (forwarded docker unreachable, etc.).
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_image_inside_lima_probe_failed: Option<bool>,
+    /// Operator-facing reason the gateway-image-inside-lima probe failed.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_image_inside_lima_probe_error: Option<String>,
+    /// `true` when the staged `socket_vmnet` binary is present with
+    /// root-owned, non-writable ancestry.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub socket_vmnet_installed: Option<bool>,
+    /// `true` when all configured slot sockets are present on disk.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub socket_vmnet_running: Option<bool>,
+    /// Number of slot sockets present on disk.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub socket_vmnet_running_count: Option<u16>,
+    /// Number of slot sockets expected (= configured pool size).
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub socket_vmnet_expected_count: Option<u16>,
+    /// `limactl --version` of the daemon's own limactl. `None` when the
+    /// probe failed.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub lima_version: Option<String>,
+    /// `true` when the calling operator's per-operator agent is currently
+    /// checked in to the broker channel.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub operator_agent_checked_in: Option<bool>,
+    /// TCC workspace-access verdict — informational stub. Real TCC-chain
+    /// attribution is deferred.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub tcc_workspace_access: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2215,6 +2883,22 @@ mod tests {
             users_conf_pool: None,
             guest_version_drift: None,
             substrate_orphans: None,
+            gateway_lima_state: None,
+            vmnet_pool_size: None,
+            vmnet_pool_claimed: None,
+            vmnet_pool_leaked_slots: None,
+            gateway_image_tag_inside_lima: None,
+            gateway_image_inside_lima_present: None,
+            gateway_image_inside_lima_expected_tag: None,
+            gateway_image_inside_lima_probe_failed: None,
+            gateway_image_inside_lima_probe_error: None,
+            socket_vmnet_installed: None,
+            socket_vmnet_running: None,
+            socket_vmnet_running_count: None,
+            socket_vmnet_expected_count: None,
+            lima_version: None,
+            operator_agent_checked_in: None,
+            tcc_workspace_access: None,
         }
     }
 
@@ -2572,7 +3256,17 @@ mod tests {
             // — the cascade is only testable when C2 is non-Pass.
             return;
         }
-        for id in ["C3", "C5", "C6", "C7", "C8", "C11", "C12", "C13", "C14"] {
+        // Daemon-dependent rows present on every platform.
+        let mut daemon_dependent: Vec<&str> =
+            vec!["C3", "C5", "C7", "C8", "C11", "C12", "C13", "C14"];
+        // C6 (KVM) is Linux-only; the macOS gateway/vmnet/agent rows are
+        // macOS-only. C15 (disk space) and C9/C10 do NOT depend on the
+        // daemon, so they are deliberately excluded from this list.
+        #[cfg(target_os = "linux")]
+        daemon_dependent.push("C6");
+        #[cfg(target_os = "macos")]
+        daemon_dependent.extend(["C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23"]);
+        for id in daemon_dependent {
             let row = rows.iter().find(|r| r.id == id).expect("row present");
             assert!(
                 matches!(&row.outcome, CheckOutcome::Skip { .. }),
@@ -2699,5 +3393,270 @@ mod tests {
             s.contains("kaboom"),
             "must echo the panic payload; got: {s}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // C15 — disk space (platform-independent)
+    // -----------------------------------------------------------------
+
+    /// `check_disk_space` is a pure host probe with no daemon dependency.
+    /// It must always render its row as `Pass` or `Skip` (a warn) — never
+    /// `Fail`, since a low-disk advisory must not flip doctor's exit code.
+    #[test]
+    fn c15_disk_space_is_never_fail() {
+        let row = check_disk_space();
+        assert_eq!(row.id, "C15");
+        assert_eq!(row.name, "disk space");
+        match row.outcome {
+            CheckOutcome::Pass { .. } | CheckOutcome::Skip { .. } => {}
+            CheckOutcome::Fail { .. } => {
+                panic!("disk-space row must never Fail (it is advisory only)")
+            }
+        }
+    }
+
+    /// `check_disk_space` runs (and renders C15) on both platforms — it is
+    /// not cfg-gated. `execute_checks` against an unreachable socket still
+    /// includes a C15 row because the probe is host-side.
+    #[tokio::test]
+    async fn c15_present_on_all_platforms() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let phantom_socket = format!("/tmp/doctor-disk-test-{nonce}.sock");
+        let rows = execute_checks(&phantom_socket).await;
+        assert!(
+            rows.iter().any(|r| r.id == "C15"),
+            "C15 disk-space row must always be present"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Platform gating of the Linux-only / macOS-only rows
+    // -----------------------------------------------------------------
+
+    /// The Linux-only KVM (C6) and route-helper-caps (C9) rows must be
+    /// absent on macOS; the macOS gateway/vmnet/agent rows must be absent
+    /// on Linux. Pinned via `execute_checks` so a regression that drops a
+    /// cfg gate is caught.
+    #[tokio::test]
+    async fn platform_rows_are_cfg_gated() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let phantom_socket = format!("/tmp/doctor-gate-test-{nonce}.sock");
+        let rows = execute_checks(&phantom_socket).await;
+        let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.id).collect();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!ids.contains("C6"), "C6 (KVM) must be absent on macOS");
+            assert!(
+                !ids.contains("C9"),
+                "C9 (route-helper caps) must be absent on macOS"
+            );
+            for id in ["C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23"] {
+                assert!(ids.contains(id), "{id} must be present on macOS");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(ids.contains("C6"), "C6 (KVM) must be present on Linux");
+            assert!(
+                ids.contains("C9"),
+                "C9 (route-helper caps) must be present on Linux"
+            );
+            for id in ["C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23"] {
+                assert!(!ids.contains(id), "{id} must be absent on Linux");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // macOS-only check logic (hermetic, over synthetic diagnostics)
+    // -----------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lima_version_at_least_compares_dotted_numeric() {
+        assert!(lima_version_at_least("1.2.0", "1.2.0"));
+        assert!(lima_version_at_least("1.3.0", "1.2.0"));
+        assert!(lima_version_at_least("2.0.0", "1.2.0"));
+        assert!(lima_version_at_least("1.2.1", "1.2.0"));
+        assert!(!lima_version_at_least("1.1.9", "1.2.0"));
+        assert!(!lima_version_at_least("1.2", "1.2.1"));
+        // tolerant of a `v` prefix and trailing non-numerics
+        assert!(lima_version_at_least("v1.2.0-rc1", "1.2.0"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c21_lima_version_pass_fail_skip() {
+        let mut d = diag_default();
+        d.lima_version = Some(sandbox_core::MIN_LIMA_VERSION.to_string());
+        assert!(matches!(
+            check_lima_version(Some(&d), true).outcome,
+            CheckOutcome::Pass { .. }
+        ));
+
+        d.lima_version = Some("1.0.0".to_string());
+        assert!(matches!(
+            check_lima_version(Some(&d), true).outcome,
+            CheckOutcome::Fail { .. }
+        ));
+
+        d.lima_version = None;
+        assert!(matches!(
+            check_lima_version(Some(&d), true).outcome,
+            CheckOutcome::Skip { .. }
+        ));
+
+        // socket unreachable → requires-daemon skip
+        assert!(matches!(
+            check_lima_version(None, false).outcome,
+            CheckOutcome::Skip { .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c18_gateway_lima_instance_verdicts() {
+        let mut d = diag_default();
+        d.gateway_lima_state = Some("running".to_string());
+        assert!(matches!(
+            check_gateway_lima_instance(Some(&d), true).outcome,
+            CheckOutcome::Pass { .. }
+        ));
+
+        for state in ["stopped", "absent", "error"] {
+            d.gateway_lima_state = Some(state.to_string());
+            assert!(
+                matches!(
+                    check_gateway_lima_instance(Some(&d), true).outcome,
+                    CheckOutcome::Fail { .. }
+                ),
+                "state {state} must Fail"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c19_vmnet_pool_flags_leaks() {
+        let mut d = diag_default();
+        d.vmnet_pool_size = Some(8);
+        d.vmnet_pool_claimed = Some(2);
+        d.vmnet_pool_leaked_slots = Some(vec![]);
+        assert!(matches!(
+            check_vmnet_pool_slots(Some(&d), true).outcome,
+            CheckOutcome::Pass { .. }
+        ));
+
+        d.vmnet_pool_leaked_slots = Some(vec![3]);
+        match check_vmnet_pool_slots(Some(&d), true).outcome {
+            CheckOutcome::Fail { detail, .. } => {
+                assert!(detail.contains("leaked"), "got: {detail}")
+            }
+            other => panic!("expected Fail on leak, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c20_gateway_image_inside_lima_three_state() {
+        let mut d = diag_default();
+        d.gateway_image_inside_lima_present = Some(true);
+        d.gateway_image_tag_inside_lima = Some("sandbox-gateway:1.2.3".to_string());
+        match check_gateway_image_inside_lima(Some(&d), true).outcome {
+            CheckOutcome::Pass { detail } => {
+                assert!(detail.contains("sandbox-gateway:1.2.3"), "got: {detail}")
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+
+        let mut d = diag_default();
+        d.gateway_image_inside_lima_present = Some(false);
+        d.gateway_image_inside_lima_expected_tag = Some("sandbox-gateway:1.2.3".to_string());
+        match check_gateway_image_inside_lima(Some(&d), true).outcome {
+            CheckOutcome::Fail { detail, hint } => {
+                assert!(detail.contains("missing"), "got: {detail}");
+                let h = hint.expect("absent must carry hint");
+                assert!(h.contains("restart sandboxd"), "got: {h}");
+            }
+            other => panic!("expected Fail on absent, got {other:?}"),
+        }
+
+        let mut d = diag_default();
+        d.gateway_image_inside_lima_probe_failed = Some(true);
+        d.gateway_image_inside_lima_probe_error = Some("docker unreachable".to_string());
+        match check_gateway_image_inside_lima(Some(&d), true).outcome {
+            CheckOutcome::Fail { detail, .. } => {
+                assert!(detail.contains("probe failed"), "got: {detail}")
+            }
+            other => panic!("expected Fail on probe failure, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c16_c17_socket_vmnet_rows() {
+        let mut d = diag_default();
+        d.socket_vmnet_installed = Some(true);
+        assert!(matches!(
+            check_socket_vmnet_installed(Some(&d), true).outcome,
+            CheckOutcome::Pass { .. }
+        ));
+        d.socket_vmnet_installed = Some(false);
+        assert!(matches!(
+            check_socket_vmnet_installed(Some(&d), true).outcome,
+            CheckOutcome::Fail { .. }
+        ));
+
+        let mut d = diag_default();
+        d.socket_vmnet_running = Some(true);
+        d.socket_vmnet_running_count = Some(8);
+        d.socket_vmnet_expected_count = Some(8);
+        assert!(matches!(
+            check_socket_vmnet_running(Some(&d), true).outcome,
+            CheckOutcome::Pass { .. }
+        ));
+        d.socket_vmnet_running = Some(false);
+        d.socket_vmnet_running_count = Some(3);
+        assert!(matches!(
+            check_socket_vmnet_running(Some(&d), true).outcome,
+            CheckOutcome::Fail { .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c22_operator_agent_warns_when_disconnected() {
+        let mut d = diag_default();
+        d.operator_agent_checked_in = Some(true);
+        assert!(matches!(
+            check_operator_agent(Some(&d), true).outcome,
+            CheckOutcome::Pass { .. }
+        ));
+        // enrolled but not connected → warn (Skip with hint), never Fail
+        d.operator_agent_checked_in = Some(false);
+        match check_operator_agent(Some(&d), true).outcome {
+            CheckOutcome::Skip { hint, .. } => {
+                assert!(hint.is_some(), "disconnected agent must carry a hint")
+            }
+            other => panic!("expected Skip (warn), got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c23_tcc_is_informational_skip() {
+        let d = diag_default();
+        match check_tcc_workspace_access(Some(&d), true).outcome {
+            CheckOutcome::Skip { .. } => {}
+            other => panic!("TCC row must be an informational Skip, got {other:?}"),
+        }
     }
 }

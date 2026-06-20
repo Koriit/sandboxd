@@ -1383,6 +1383,25 @@ impl VmnetPool {
             .unwrap_or_default()
     }
 
+    /// Return the `(slot_index, session_id)` pairs for every slot the pool
+    /// currently believes is claimed.
+    ///
+    /// The map is the in-memory source of truth for which session owns which
+    /// slot (seeded from persisted `NetworkInfo` at startup, mutated on
+    /// claim/release). Cross-referencing the returned session ids against the
+    /// live session store surfaces leaked slots — a slot still claimed by a
+    /// session that no longer exists.
+    pub fn claimed_slot_sessions(&self) -> Vec<(u16, SessionId)> {
+        self.networks
+            .lock()
+            .map(|nets| {
+                nets.iter()
+                    .map(|(sid, (slot_idx, _))| (*slot_idx, *sid))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Return the socket path for a given slot (for the template generator).
     pub fn slot_socket_path(&self, slot: u16) -> String {
         vmnet_slot_socket_path(slot)

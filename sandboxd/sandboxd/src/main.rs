@@ -1108,6 +1108,20 @@ struct AppState {
     /// Not accessed on Linux (cfg-gated).
     #[cfg(target_os = "macos")]
     gateway_recovering: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    /// macOS only: per-operator agent broker registry.
+    ///
+    /// The same live `AgentRegistry` the broker listener and the
+    /// `AgentBrokerExecutor` share (it is `Clone` over an `Arc`-wrapped
+    /// inner map). Held on `AppState` so the `GET /diagnostics` handler can
+    /// answer whether the calling operator's agent is currently checked in
+    /// (`connected_uids()`), feeding doctor's operator-agent row. Read-only
+    /// from the handler — registration/eviction stay owned by the broker.
+    ///
+    /// Not accessed on Linux (cfg-gated; the Linux daemon reaches the
+    /// privileged helpers directly without an agent broker).
+    #[cfg(target_os = "macos")]
+    agent_registry: broker::AgentRegistry,
 }
 
 /// Look up the runtime for a given backend kind from the dispatch
@@ -9993,6 +10007,14 @@ async fn diagnostics_handler(
     // System-level: cheap host probes, ~3 file opens. Synchronous,
     // wrapped in `spawn_blocking` so we don't park the runtime on
     // the kvm/image lookups.
+    //
+    // `/dev/kvm` is a Linux concept (the QEMU+HVF macOS backend has no
+    // such device), so the probe is Linux-only. The `kvm_readable` /
+    // `kvm_writable` keys stay present on the wire on both platforms
+    // (always `false` on macOS) so the diagnostics shape is stable;
+    // doctor's C6 KVM row is itself cfg-gated off on macOS, so the
+    // false-on-macOS values are never consulted there.
+    #[cfg(target_os = "linux")]
     let kvm_readable = tokio::task::spawn_blocking(|| {
         std::fs::OpenOptions::new()
             .read(true)
@@ -10001,6 +10023,7 @@ async fn diagnostics_handler(
     })
     .await
     .unwrap_or(false);
+    #[cfg(target_os = "linux")]
     let kvm_writable = tokio::task::spawn_blocking(|| {
         std::fs::OpenOptions::new()
             .write(true)
@@ -10009,6 +10032,10 @@ async fn diagnostics_handler(
     })
     .await
     .unwrap_or(false);
+    #[cfg(not(target_os = "linux"))]
+    let kvm_readable = false;
+    #[cfg(not(target_os = "linux"))]
+    let kvm_writable = false;
 
     let gateway_tag =
         sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
@@ -10246,6 +10273,167 @@ async fn diagnostics_handler(
     .await
     .unwrap_or_default();
 
+    // macOS-only diagnostics. These keys are *omitted* (not null) on
+    // Linux so the Linux wire shape stays byte-identical; the CLI's
+    // `DiagnosticsPayload` reads them as `Option<T>` via
+    // `#[serde(default)]`. Each value is computed from the daemon's
+    // existing macOS managers (no re-implementation): the vmnet pool,
+    // the gateway Lima manager, and the per-operator agent registry.
+    #[cfg(target_os = "macos")]
+    let macos_fields: Vec<(&str, serde_json::Value)> = {
+        let mut fields: Vec<(&str, serde_json::Value)> = Vec::new();
+
+        // Gateway Lima instance state + forwarded-docker reachability.
+        // `instance_state()` returns "Running"/"Stopped"/"None"; we fold
+        // the docker-health probe into a single coarse verdict the doctor
+        // row consumes: running / stopped / absent / error.
+        let glm = state.gateway_lima_manager.clone();
+        let gateway_lima_state = tokio::task::spawn_blocking(move || match glm.instance_state() {
+            Ok(s) if s == "Running" => match glm.probe_docker_health() {
+                Ok(true) => "running".to_string(),
+                Ok(false) => "error".to_string(),
+                Err(_) => "error".to_string(),
+            },
+            Ok(s) if s == "Stopped" => "stopped".to_string(),
+            Ok(s) if s == "None" => "absent".to_string(),
+            Ok(_) => "error".to_string(),
+            Err(_) => "error".to_string(),
+        })
+        .await
+        .unwrap_or_else(|_| "error".to_string());
+        fields.push(("gateway_lima_state", serde_json::json!(gateway_lima_state)));
+
+        // vmnet slot pool: configured size + currently-claimed count.
+        // Claimed slots that no live session owns are leaks — surface
+        // both the claimed count and the leaked-slot indices so doctor's
+        // vmnet-pool row can flag leaks. The pool's in-memory claim map
+        // (`claimed_slot_sessions`) is the slot→session source of truth;
+        // a slot whose owning session id is not in the live session store
+        // is a leak.
+        let pool_size = state.vmnet_pool.max_slots();
+        let claimed = state.vmnet_pool.allocated_slot_indices();
+        let claimed_pairs = state.vmnet_pool.claimed_slot_sessions();
+        let live_ids: std::collections::HashSet<SessionId> = state
+            .store
+            .list_sessions_unfiltered()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        let mut leaked: Vec<u16> = claimed_pairs
+            .iter()
+            .filter(|(_, sid)| !live_ids.contains(sid))
+            .map(|(slot, _)| *slot)
+            .collect();
+        leaked.sort_unstable();
+        leaked.dedup();
+        fields.push(("vmnet_pool_size", serde_json::json!(pool_size)));
+        fields.push(("vmnet_pool_claimed", serde_json::json!(claimed.len())));
+        fields.push(("vmnet_pool_leaked_slots", serde_json::json!(leaked)));
+
+        // Gateway image inside the gateway Lima instance (forwarded
+        // docker socket), with the same three-state contract the
+        // host-side gateway-image probe uses.
+        let glm2 = state.gateway_lima_manager.clone();
+        let (image_present, image_probe_error) =
+            tokio::task::spawn_blocking(move || match glm2.gateway_image_present_inside_lima() {
+                Ok(true) => (true, None),
+                Ok(false) => (false, None),
+                Err(e) => (false, Some(format!("{e}"))),
+            })
+            .await
+            .unwrap_or((
+                false,
+                Some("daemon-side probe task failed to run".to_string()),
+            ));
+        let expected_tag = state.gateway_lima_manager.expected_gateway_image_tag();
+        fields.push((
+            "gateway_image_tag_inside_lima",
+            serde_json::json!(if image_present {
+                Some(expected_tag.clone())
+            } else {
+                None::<String>
+            }),
+        ));
+        fields.push((
+            "gateway_image_inside_lima_present",
+            serde_json::json!(image_present),
+        ));
+        fields.push((
+            "gateway_image_inside_lima_expected_tag",
+            serde_json::json!(expected_tag),
+        ));
+        fields.push((
+            "gateway_image_inside_lima_probe_failed",
+            serde_json::json!(image_probe_error.is_some()),
+        ));
+        fields.push((
+            "gateway_image_inside_lima_probe_error",
+            serde_json::json!(image_probe_error),
+        ));
+
+        // socket_vmnet binary staged with root-owned ancestry?
+        let socket_vmnet_installed = tokio::task::spawn_blocking(|| {
+            let path = std::path::Path::new(sandbox_core::network::STAGED_SOCKET_VMNET_PATH);
+            path.exists() && sandbox_core::network::assert_root_exec_ancestry(path).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        fields.push((
+            "socket_vmnet_installed",
+            serde_json::json!(socket_vmnet_installed),
+        ));
+
+        // socket_vmnet daemon set: how many of the configured N slot
+        // sockets are present on disk (functional reachability check,
+        // mirroring the daemon startup prereq).
+        let running_count = tokio::task::spawn_blocking(move || {
+            sandbox_core::gateway_lima::count_reachable_slot_sockets(
+                std::path::Path::new(sandbox_core::network::VMNET_SOCKET_DIR),
+                pool_size,
+            )
+        })
+        .await
+        .unwrap_or(0);
+        fields.push((
+            "socket_vmnet_running_count",
+            serde_json::json!(running_count),
+        ));
+        fields.push(("socket_vmnet_expected_count", serde_json::json!(pool_size)));
+        fields.push((
+            "socket_vmnet_running",
+            serde_json::json!(running_count >= pool_size && pool_size > 0),
+        ));
+
+        // limactl version of the daemon's own limactl (manages the
+        // gateway instance). Probe failure leaves the field null so the
+        // doctor row can render a "probe failed" skip rather than a
+        // false "too old" verdict.
+        let glm3 = state.gateway_lima_manager.clone();
+        let lima_version = tokio::task::spawn_blocking(move || glm3.lima_version().ok())
+            .await
+            .ok()
+            .flatten();
+        fields.push(("lima_version", serde_json::json!(lima_version)));
+
+        // Per-operator agent: is the calling operator's agent currently
+        // checked in to the broker channel? Scoped to the caller's uid.
+        let connected = state.agent_registry.connected_uids().await;
+        let operator_agent_checked_in = connected.contains(&operator.uid);
+        fields.push((
+            "operator_agent_checked_in",
+            serde_json::json!(operator_agent_checked_in),
+        ));
+
+        // TCC workspace access — informational stub. The real TCC-chain
+        // attribution (which protected root denied access, and to whom)
+        // is a larger probe; here we land the field as an informational
+        // marker so the doctor row exists and renders a neutral verdict.
+        fields.push(("tcc_workspace_access", serde_json::json!("informational")));
+
+        fields
+    };
+
     let body = serde_json::json!({
         "daemon_uid": state.daemon_uid,
         "daemon_user": state.daemon_user,
@@ -10284,6 +10472,20 @@ async fn diagnostics_handler(
             "session_dirs": session_dir_orphans,
         },
     });
+
+    // Merge the macOS-only fields in (omitted entirely on Linux, so the
+    // Linux wire shape is unchanged). `body` is always a JSON object by
+    // construction above.
+    #[cfg(target_os = "macos")]
+    let body = {
+        let mut body = body;
+        if let Some(obj) = body.as_object_mut() {
+            for (k, v) in macos_fields {
+                obj.insert(k.to_string(), v);
+            }
+        }
+        body
+    };
 
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -12999,6 +13201,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         #[cfg(target_os = "macos")]
         gateway_recovering: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        #[cfg(target_os = "macos")]
+        agent_registry: agent_registry.clone(),
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per
