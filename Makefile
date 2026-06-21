@@ -3,7 +3,8 @@
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
 	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
-	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image
+	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image \
+	stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -532,7 +533,7 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment stage-route-helper-linux-aarch64 stage-lite-image
+setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1806,4 +1807,142 @@ setup-darwin-test-sudoers-fragment:
 	    sudo -k install -o root -g wheel -m 0440 "$$tmp" $(TEST_SUDOERS_FRAGMENT_PATH); \
 	    rm -f "$$tmp"; \
 	  fi; \
+	fi
+
+# stage-gateway-image-test — save the sandbox-gateway Docker image as a tarball
+# at the e2e test daemon's per-uid base directory so `load_gateway_image_if_needed`
+# (gateway_lima.rs) can self-heal it into daemon_lima_home at startup.
+#
+# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/gateway-image.tar
+#   (the daemon's base dir, two levels above daemon_lima_home)
+#
+# The self-heal path in gateway_lima.rs:load_gateway_image_if_needed reads:
+#   {daemon_lima_home}/gateway-image.tar         <- primary (in LIMA_HOME)
+#   {daemon_lima_home}/../../gateway-image.tar   <- self-heal (base dir)
+# LIMA_HOME (/var/lib/sandboxd/<uid>/<uid>/lima) is created lazily by the
+# daemon at startup, so we stage to the base dir (the static location that
+# exists before the daemon ever runs).
+#
+# The image must already be built (make gateway-image). Darwin-only.
+# Idempotent: skipped when the destination is byte-identical to the saved tarball.
+# Mirrors install.sh's `stage-gateway` step.
+stage-gateway-image-test:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ stage-gateway-image-test skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_gateway_tag="sandbox-gateway:$(GATEWAY_VERSION)"; \
+	if ! docker image inspect "$$_gateway_tag" >/dev/null 2>&1; then \
+	  echo "ERROR: $$_gateway_tag not found in local Docker — run 'make gateway-image' first"; \
+	  exit 1; \
+	fi; \
+	if ! id -u _sandboxd-test >/dev/null 2>&1; then \
+	  echo "WARNING: system user '_sandboxd-test' not found; skipping gateway-image staging."; \
+	  echo "  Run 'make setup-darwin-sandboxd-test-user' first."; \
+	  exit 0; \
+	fi; \
+	_test_uid=$$(id -u _sandboxd-test); \
+	_dst="/var/lib/sandboxd/$$_test_uid/gateway-image.tar"; \
+	_tmp=/tmp/sandboxd-gateway-test-stage-$$$$.tar; \
+	echo "docker save $$_gateway_tag -o $$_tmp"; \
+	docker save "$$_gateway_tag" -o "$$_tmp"; \
+	if [ -f "$$_dst" ] && cmp -s "$$_tmp" "$$_dst"; then \
+	  rm -f "$$_tmp"; \
+	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
+	else \
+	  echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_dst"; \
+	  sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_dst"; \
+	  rm -f "$$_tmp"; \
+	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
+	fi
+
+# stage-lite-image-test — save the sandboxd-lite Docker image as a tarball at
+# the e2e test daemon's LIMA_HOME so `load_lite_image_into_gateway` can find it
+# at lite session-create time.
+#
+# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/<_sandboxd-test-uid>/lima/lite-image.tar
+#   (daemon_lima_home = operator_lima_home(daemon_uid) in lima.rs, with daemon_uid=test_uid)
+#
+# Unlike gateway-image, load_lite_image_into_gateway (gateway_lima.rs:1139-1148)
+# has NO base-dir self-heal — it reads only from daemon_lima_home. The LIMA_HOME
+# directory is created lazily by the daemon, so this target must create it when
+# absent (owned _sandboxd-test, mode 0750).
+#
+# The image must already be built (make lite-image). Darwin-only.
+# Idempotent: skipped when the destination is byte-identical to the saved tarball.
+stage-lite-image-test: lite-image
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ stage-lite-image-test skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_lite_tag="sandboxd-lite:$(LITE_VERSION)"; \
+	if ! docker image inspect "$$_lite_tag" >/dev/null 2>&1; then \
+	  echo "ERROR: $$_lite_tag not found in local Docker — run 'make lite-image' first"; \
+	  exit 1; \
+	fi; \
+	if ! id -u _sandboxd-test >/dev/null 2>&1; then \
+	  echo "WARNING: system user '_sandboxd-test' not found; skipping lite-image staging."; \
+	  echo "  Run 'make setup-darwin-sandboxd-test-user' first."; \
+	  exit 0; \
+	fi; \
+	_test_uid=$$(id -u _sandboxd-test); \
+	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
+	_dst="$$_lima_home/lite-image.tar"; \
+	if [ ! -d "$$_lima_home" ]; then \
+	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
+	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
+	fi; \
+	_tmp=/tmp/sandboxd-lite-test-stage-$$$$.tar; \
+	echo "docker save $$_lite_tag -o $$_tmp"; \
+	docker save "$$_lite_tag" -o "$$_tmp"; \
+	if [ -f "$$_dst" ] && cmp -s "$$_tmp" "$$_dst"; then \
+	  rm -f "$$_tmp"; \
+	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
+	else \
+	  echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_dst"; \
+	  sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_dst"; \
+	  rm -f "$$_tmp"; \
+	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
+	fi
+
+# stage-route-helper-linux-aarch64-test — copy the Linux aarch64 route-helper
+# into the e2e test daemon's LIMA_HOME so `ensure_route_helper_in_vm`
+# (gateway_lima.rs:1670) can install it into the gateway VM at startup.
+#
+# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/<_sandboxd-test-uid>/lima/sandbox-route-helper-linux-aarch64
+#   (daemon_lima_home; ROUTE_HELPER_LINUX_BINARY_FILENAME in gateway_lima.rs)
+#
+# ensure_route_helper_in_vm reads only from daemon_lima_home — no self-heal.
+# Creates the LIMA_HOME directory when absent (owned _sandboxd-test, mode 0750).
+#
+# Idempotent: skipped when the installed binary is byte-identical to the built one.
+# Darwin-only.
+stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ stage-route-helper-linux-aarch64-test skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_built=sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-route-helper; \
+	if [ ! -f "$$_built" ]; then \
+	  echo "ERROR: $$_built not found — run 'make build-route-helper-linux-aarch64' first"; \
+	  exit 1; \
+	fi; \
+	if ! id -u _sandboxd-test >/dev/null 2>&1; then \
+	  echo "WARNING: system user '_sandboxd-test' not found; skipping route-helper staging."; \
+	  echo "  Run 'make setup-darwin-sandboxd-test-user' first."; \
+	  exit 0; \
+	fi; \
+	_test_uid=$$(id -u _sandboxd-test); \
+	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
+	_dst="$$_lima_home/sandbox-route-helper-linux-aarch64"; \
+	if [ ! -d "$$_lima_home" ]; then \
+	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
+	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
+	fi; \
+	if [ -f "$$_dst" ] && cmp -s "$$_built" "$$_dst"; then \
+	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
+	else \
+	  echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0755 $$_built $$_dst"; \
+	  sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0755 "$$_built" "$$_dst"; \
+	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
 	fi
