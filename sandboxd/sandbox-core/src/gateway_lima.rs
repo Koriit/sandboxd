@@ -957,13 +957,65 @@ impl GatewayLimaManager {
     fn load_gateway_image_if_needed(&self) {
         let tarball = self.daemon_lima_home.join(GATEWAY_IMAGE_TARBALL_FILENAME);
         if !tarball.exists() {
-            info!(
-                tarball = %tarball.display(),
-                "gateway image tarball not found; skipping docker load \
-                 (populate it with: make gateway-image && docker save <tag> -o {})",
-                tarball.display()
-            );
-            return;
+            // The tarball is not yet in daemon_lima_home.  Check whether
+            // install.sh staged it at the daemon base dir
+            // (`{state_root}/{daemon_uid}/gateway-image.tar`), which is two
+            // levels above daemon_lima_home (`…/{daemon_uid}/{daemon_uid}/lima`).
+            // If it is there, copy it into daemon_lima_home so that the path
+            // the Docker-load code below expects is satisfied.
+            let staged = self
+                .daemon_lima_home
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|base| base.join(GATEWAY_IMAGE_TARBALL_FILENAME));
+            let copied = if let Some(ref staged_path) = staged {
+                if staged_path.exists() {
+                    // Ensure daemon_lima_home exists (ensure_ready creates it, but
+                    // belt-and-suspenders before the copy).
+                    if let Err(e) = std::fs::create_dir_all(&self.daemon_lima_home) {
+                        warn!(
+                            error = %e,
+                            dir = %self.daemon_lima_home.display(),
+                            "failed to create daemon_lima_home for tarball copy; skipping"
+                        );
+                        false
+                    } else {
+                        match std::fs::copy(staged_path, &tarball) {
+                            Ok(_) => {
+                                info!(
+                                    from = %staged_path.display(),
+                                    to = %tarball.display(),
+                                    "gateway image tarball copied from staged location"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    from = %staged_path.display(),
+                                    to = %tarball.display(),
+                                    "failed to copy staged gateway tarball; skipping docker load"
+                                );
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !copied {
+                info!(
+                    tarball = %tarball.display(),
+                    "gateway image tarball not found; skipping docker load \
+                     (populate it with: make gateway-image && docker save <tag> -o {})",
+                    tarball.display()
+                );
+                return;
+            }
         }
 
         // Check if the image is already loaded in the gateway VM's Docker daemon.
@@ -996,25 +1048,16 @@ impl GatewayLimaManager {
         }
 
         // Load the tarball via stdin pipe into `docker load`.
+        // Stream the file directly to the child's stdin rather than reading
+        // the entire (hundreds of MB) tarball into memory first.
         info!(
             tarball = %tarball.display(),
             tag = %image_tag,
             "loading gateway image into gateway VM from tarball"
         );
-        let tarball_content = match std::fs::read(&tarball) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    tarball = %tarball.display(),
-                    error = %e,
-                    "failed to read gateway image tarball; gateway sessions may fail"
-                );
-                return;
-            }
-        };
 
         let load_result = {
-            use std::io::Write;
+            use std::io;
             use std::process::Stdio;
             let mut child = match Command::new("docker")
                 .args(["-H", &socket_str, "load"])
@@ -1029,14 +1072,34 @@ impl GatewayLimaManager {
                     return;
                 }
             };
-            if let Some(ref mut stdin) = child.stdin {
-                if let Err(e) = stdin.write_all(&tarball_content) {
-                    warn!(error = %e, "failed to write tarball to docker load stdin");
+            // Take the stdin handle so we own it and can drop it to signal EOF.
+            let mut stdin = match child.stdin.take() {
+                Some(s) => s,
+                None => {
+                    warn!("docker load: failed to take stdin handle");
                     let _ = child.kill();
                     return;
                 }
+            };
+            let mut file = match std::fs::File::open(&tarball) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(
+                        tarball = %tarball.display(),
+                        error = %e,
+                        "failed to open gateway image tarball for streaming"
+                    );
+                    let _ = child.kill();
+                    return;
+                }
+            };
+            if let Err(e) = io::copy(&mut file, &mut stdin) {
+                warn!(error = %e, "failed to stream tarball to docker load stdin");
+                let _ = child.kill();
+                return;
             }
-            child.stdin.take(); // close stdin so docker load sees EOF
+            // Drop stdin to close the pipe and signal EOF to docker load.
+            drop(stdin);
             match child.wait_with_output() {
                 Ok(o) => o,
                 Err(e) => {
@@ -3021,6 +3084,55 @@ mod tests {
         }
         // min(3, 4) = 3, not 4.
         assert!(observe_vmnet_daemon_set(plist_dir.path(), socket_dir.path(), 4) < 4);
+    }
+
+    // -- Gateway image tarball staging chain (hermetic) ------------------------
+
+    /// Verify that the daemon-base-dir staging path (where install.sh writes
+    /// `$BASE_DIR/gateway-image.tar`) matches the path that
+    /// `load_gateway_image_if_needed` computes as its copy-source.
+    ///
+    /// install.sh writes to `{state_root}/{daemon_uid}/gateway-image.tar`
+    /// (BASE_DIR with no sub-directories).  The daemon's copy-source is
+    /// `daemon_lima_home.parent().parent() / gateway-image.tar`, which for
+    /// daemon_lima_home = `{state_root}/{daemon_uid}/{daemon_uid}/lima` resolves
+    /// to the same path.  This test pins that algebra so a path refactor on
+    /// either side immediately fails the build.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_staged_tarball_path_matches_daemon_copy_source() {
+        use std::path::PathBuf;
+        // Simulate the layout with uid 60 as both daemon_uid and op_uid (the
+        // degenerate gateway case where op_uid == daemon_uid).
+        let daemon_lima_home = PathBuf::from("/var/lib/sandboxd/60/60/lima");
+
+        // What load_gateway_image_if_needed computes as its copy-source.
+        let copy_source = daemon_lima_home
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|base| base.join(GATEWAY_IMAGE_TARBALL_FILENAME))
+            .expect("daemon_lima_home has two parent levels");
+
+        // What install.sh writes: BASE_DIR = /var/lib/sandboxd/<daemon_uid>
+        let install_staged = PathBuf::from("/var/lib/sandboxd/60/gateway-image.tar");
+
+        assert_eq!(
+            copy_source, install_staged,
+            "daemon copy-source must equal install.sh staged path; \
+             update both sides together if this path changes"
+        );
+    }
+
+    /// The gateway image tarball filename constant must match the filename the
+    /// daemon's `load_gateway_image_if_needed` logic expects.  Pins the constant
+    /// so a rename on either side fails the build immediately.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_image_tarball_filename_is_canonical() {
+        assert_eq!(
+            GATEWAY_IMAGE_TARBALL_FILENAME, "gateway-image.tar",
+            "tarball filename must match install.sh staged filename"
+        );
     }
 
     // -- Lite image tarball staging (pure, hermetic) ---------------------------

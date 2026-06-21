@@ -177,6 +177,22 @@ pub fn gateway_shutdown(
     )
 }
 
+/// `base_build_started`: the daemon has begun building the `sandbox-base`
+/// golden Lima VM for the first time for this operator.
+///
+/// The operator's first `sandbox create` will block until the build
+/// completes (several minutes). Subsequent creates clone from the cached
+/// base in a few seconds via APFS copy-on-write.
+pub fn base_build_started(session: SessionId) -> Event {
+    wrap(Some(session), LifecycleEvent::BaseBuildStarted)
+}
+
+/// `base_build_complete`: the `sandbox-base` build finished successfully.
+/// The session will now proceed to clone the base VM.
+pub fn base_build_complete(session: SessionId) -> Event {
+    wrap(Some(session), LifecycleEvent::BaseBuildComplete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +448,48 @@ mod tests {
             }
             other => panic!("expected GatewayShutdown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn base_build_started_sets_session_and_variant() {
+        let sid = fixture_session();
+        let event = base_build_started(sid);
+        assert_eq!(event.session(), Some(&sid));
+        assert!(matches!(
+            expect_lifecycle(&event),
+            LifecycleEvent::BaseBuildStarted
+        ));
+    }
+
+    #[test]
+    fn base_build_complete_sets_session_and_variant() {
+        let sid = fixture_session();
+        let event = base_build_complete(sid);
+        assert_eq!(event.session(), Some(&sid));
+        assert!(matches!(
+            expect_lifecycle(&event),
+            LifecycleEvent::BaseBuildComplete
+        ));
+    }
+
+    #[test]
+    fn base_build_events_have_distinct_variants() {
+        let sid = fixture_session();
+        let started = base_build_started(sid);
+        let complete = base_build_complete(sid);
+        // Variants are distinct and not interchangeable.
+        assert!(matches!(
+            expect_lifecycle(&started),
+            LifecycleEvent::BaseBuildStarted
+        ));
+        assert!(matches!(
+            expect_lifecycle(&complete),
+            LifecycleEvent::BaseBuildComplete
+        ));
+        assert!(!matches!(
+            expect_lifecycle(&started),
+            LifecycleEvent::BaseBuildComplete
+        ));
     }
 
     #[test]

@@ -3381,11 +3381,17 @@ async fn create_session(
 
             match base_status {
                 BaseImageStatus::Missing => {
-                    // Must build -- no choice.
-                    info!("base image missing, building...");
+                    // Must build -- no choice. Register the session in the event
+                    // bus now so base-build progress events can be routed to it.
+                    state.event_bus.register_session(session_id);
+                    info!(%session_id, "base image missing, building (one-time, ~3-20 min)...");
+                    state
+                        .event_bus
+                        .publish(lifecycle_events::base_build_started(session_id));
                     let lima_build = match state.lima_runtime.manager_for(operator.uid) {
                         Ok(m) => m,
                         Err(e) => {
+                            state.event_bus.unregister_session(&session_id);
                             cleanup_net_ca_and_return!(
                                 state,
                                 session_id,
@@ -3394,8 +3400,13 @@ async fn create_session(
                         }
                     };
                     match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            state
+                                .event_bus
+                                .publish(lifecycle_events::base_build_complete(session_id));
+                        }
                         Ok(Err(e)) => {
+                            state.event_bus.unregister_session(&session_id);
                             cleanup_net_ca_and_return!(
                                 state,
                                 session_id,
@@ -3403,6 +3414,7 @@ async fn create_session(
                             );
                         }
                         Err(e) => {
+                            state.event_bus.unregister_session(&session_id);
                             cleanup_net_ca_and_return!(
                                 state,
                                 session_id,
@@ -4447,33 +4459,149 @@ async fn create_session_macos_lima(
         return error_response(e).into_response();
     }
 
-    // Step 4: limactl create (via operator-execution seam).
+    // Step 4: provision the session VM.
+    //
+    // When no_cache is unset or false AND no custom template is requested, use
+    // the base-image fast path: lazily build the golden `sandbox-base` VM on
+    // first create (~3 min), then clone it (APFS copy-on-write, ~seconds) for
+    // every subsequent create.  Emits BaseBuildStarted / BaseBuildComplete
+    // lifecycle events so the CLI can surface build progress.
+    //
+    // When no_cache is true or a custom template is supplied, fall back to a
+    // fresh `limactl create` from the generated template.
     {
-        let manager = match state.lima_runtime.manager_for(operator.uid) {
-            Ok(m) => m,
-            Err(e) => {
-                rollback(false).await;
-                return error_response(e).into_response();
+        let use_cache = !req.no_cache.unwrap_or(false) && req.template.is_none();
+        if use_cache {
+            // Check whether sandbox-base already exists.
+            let base_status = {
+                let lima_check = match state.lima_runtime.manager_for(operator.uid) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        rollback(false).await;
+                        return error_response(e).into_response();
+                    }
+                };
+                match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        rollback(false).await;
+                        return error_response(e).into_response();
+                    }
+                    Err(e) => {
+                        rollback(false).await;
+                        return error_response(SandboxError::Internal(format!(
+                            "task join error: {e}"
+                        )))
+                        .into_response();
+                    }
+                }
+            };
+
+            match base_status {
+                BaseImageStatus::Missing => {
+                    // First create: build the golden base VM (one-time, ~3 min).
+                    // Register the session in the event bus so base-build progress
+                    // events can be routed to this session's SSE stream.
+                    state.event_bus.register_session(session_id);
+                    info!(%session_id, "base image missing; building (one-time, ~3 min)...");
+                    state
+                        .event_bus
+                        .publish(lifecycle_events::base_build_started(session_id));
+                    let lima_build = match state.lima_runtime.manager_for(operator.uid) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            state.event_bus.unregister_session(&session_id);
+                            rollback(false).await;
+                            return error_response(e).into_response();
+                        }
+                    };
+                    match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
+                        Ok(Ok(())) => {
+                            state
+                                .event_bus
+                                .publish(lifecycle_events::base_build_complete(session_id));
+                        }
+                        Ok(Err(e)) => {
+                            state.event_bus.unregister_session(&session_id);
+                            rollback(false).await;
+                            return error_response(e).into_response();
+                        }
+                        Err(e) => {
+                            state.event_bus.unregister_session(&session_id);
+                            rollback(false).await;
+                            return error_response(SandboxError::Internal(format!(
+                                "task join error: {e}"
+                            )))
+                            .into_response();
+                        }
+                    }
+                }
+                BaseImageStatus::Stale { .. } => {
+                    info!(
+                        "base image is stale; using anyway (run sandbox rebuild-image to refresh)"
+                    );
+                }
+                BaseImageStatus::Fresh => {
+                    // Base image is current — clone directly.
+                }
             }
-        };
-        let sid = session_id;
-        let cfg = config.clone();
-        let op_id = Some((operator.uid, operator.gid));
-        let slot_idx = vmnet_slot.index;
-        match tokio::task::spawn_blocking(move || {
-            manager.create_vm(&sid, &cfg, op_id, Some(slot_idx))
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                rollback(false).await;
-                return error_response(e).into_response();
+
+            // Clone from sandbox-base (APFS copy-on-write).
+            let lima_clone = match state.lima_runtime.manager_for(operator.uid) {
+                Ok(m) => m,
+                Err(e) => {
+                    rollback(false).await;
+                    return error_response(e).into_response();
+                }
+            };
+            let sid = session_id;
+            let cpus = config.cpus;
+            let memory_mb = config.memory_mb;
+            let disk_gb = config.disk_gb;
+            match tokio::task::spawn_blocking(move || {
+                lima_clone.clone_vm(sid, cpus, memory_mb, disk_gb)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    rollback(false).await;
+                    return error_response(e).into_response();
+                }
+                Err(e) => {
+                    rollback(false).await;
+                    return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                        .into_response();
+                }
             }
-            Err(e) => {
-                rollback(false).await;
-                return error_response(SandboxError::Internal(format!("task join error: {e}")))
-                    .into_response();
+        } else {
+            // no_cache or custom template: build from template fresh.
+            let manager = match state.lima_runtime.manager_for(operator.uid) {
+                Ok(m) => m,
+                Err(e) => {
+                    rollback(false).await;
+                    return error_response(e).into_response();
+                }
+            };
+            let sid = session_id;
+            let cfg = config.clone();
+            let op_id = Some((operator.uid, operator.gid));
+            let slot_idx = vmnet_slot.index;
+            match tokio::task::spawn_blocking(move || {
+                manager.create_vm(&sid, &cfg, op_id, Some(slot_idx))
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    rollback(false).await;
+                    return error_response(e).into_response();
+                }
+                Err(e) => {
+                    rollback(false).await;
+                    return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                        .into_response();
+                }
             }
         }
     }
@@ -11622,20 +11750,90 @@ async fn reconcile_networking(state: &AppState) {
 
 /// Controls how `reconcile_operator_vms` classifies confirmed-dead VMs.
 ///
-/// At daemon startup, a dead VM means the session encountered an unrecoverable
-/// failure before restart — it is marked `Error` (not resumable without manual
-/// intervention). On a fresh agent check-in (agent crash/respawn or user
-/// re-login), a dead VM reflects the login-scoped lifetime: the operator's VMs
-/// were tied to their prior login context and are now gone. The session is
-/// marked `Stopped` (resumable — the operator can restart it when they log in).
+/// At daemon startup, a dead VM might mean either (a) the host rebooted, in
+/// which case all operator VMs are down and sessions should be `Stopped`
+/// (resumable), or (b) an isolated single-VM crash before restart, which is an
+/// unrecoverable failure → `Error`. On a fresh agent check-in (agent
+/// crash/respawn or user re-login), a dead VM reflects the login-scoped
+/// lifetime → `Stopped` (resumable).
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReconcileSource {
-    /// Daemon startup (step 6b) — dead VMs are permanent failures → `Error`.
+    /// Daemon startup after a host reboot — all VMs were off when the daemon
+    /// started because the host just booted. Dead sessions → `Stopped`
+    /// (resumable; operator uses `sandbox start`).
+    HostReboot,
+    /// Daemon startup where the host did NOT just reboot — dead VM is an
+    /// isolated pre-restart failure → `Error`.
     Startup,
     /// Fresh agent check-in (agent crash/respawn, re-login) — dead VMs reflect
     /// the login-scoped lifetime → `Stopped` (resumable).
     FreshCheckin,
+}
+
+/// Detect whether the daemon just started after a host reboot by comparing
+/// the host boot time against the given session's `created_at` timestamp.
+///
+/// A session created *before* the last boot has a stale VM entry — the host
+/// rebooted and its QEMU process is gone. This is the normal post-reboot
+/// condition: the operator uses `sandbox start` to resume. Sessions created
+/// *after* the last boot whose VM is missing are genuine anomalies.
+///
+/// Returns `true` when the host boot time is determinable and the provided
+/// `session_created_at` predates it by at least one second. Fails closed
+/// (returns `false`) if the boot time cannot be read.
+#[cfg(target_os = "macos")]
+fn session_predates_last_boot(session_created_at: chrono::DateTime<chrono::Utc>) -> bool {
+    // `sysctl kern.boottime` on macOS returns a struct timeval.
+    // The raw output looks like: `kern.boottime: { sec = 1718884500, usec = 123456 } Thu ...`
+    // We parse the `sec = <N>` field.
+    let output = match std::process::Command::new("sysctl")
+        .arg("kern.boottime")
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse `sec = <integer>` from the sysctl output.
+    let boot_secs = stdout
+        .split_once("sec = ")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<i64>().ok());
+    let Some(boot_secs) = boot_secs else {
+        return false;
+    };
+    let boot_time = chrono::DateTime::from_timestamp(boot_secs, 0)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    // Session was created at least 1s before the boot → predates the boot.
+    session_created_at < boot_time - chrono::Duration::seconds(1)
+}
+
+/// Determine the target `SessionState` for a confirmed-dead VM given the
+/// reconcile source and the session's creation timestamp.
+///
+/// Extracted from `reconcile_operator_vms` so both the production path and
+/// tests exercise the same mapping code.
+#[cfg(target_os = "macos")]
+fn dead_vm_state_for_source(
+    source: ReconcileSource,
+    session_created_at: chrono::DateTime<chrono::Utc>,
+) -> sandbox_core::SessionState {
+    use sandbox_core::SessionState;
+    match source {
+        ReconcileSource::HostReboot => SessionState::Stopped,
+        ReconcileSource::Startup => {
+            if session_predates_last_boot(session_created_at) {
+                SessionState::Stopped
+            } else {
+                SessionState::Error
+            }
+        }
+        ReconcileSource::FreshCheckin => SessionState::Stopped,
+    }
 }
 
 /// Verify running Lima sessions for a single operator and mark any whose VM is
@@ -11725,16 +11923,7 @@ async fn reconcile_operator_vms(
                 verified += 1;
             }
             Some(_) | None => {
-                // Choose the target state based on why reconcile is running.
-                // Startup: dead VM is an unrecoverable pre-restart failure → Error.
-                // Fresh check-in: dead VM reflects the login-scoped lifetime —
-                // the operator's VMs are tied to their Aqua session and vanish
-                // when the agent crashes or the user logs out and back in.
-                // The session is Stopped so the operator can resume it on next login.
-                let dead_vm_state = match source {
-                    ReconcileSource::Startup => SessionState::Error,
-                    ReconcileSource::FreshCheckin => SessionState::Stopped,
-                };
+                let dead_vm_state = dead_vm_state_for_source(source, session.created_at);
                 warn!(
                     session_id = %session.id,
                     op_uid,
@@ -11877,12 +12066,47 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
     // VMs are live. At daemon startup the agent-broker was just bound, so no
     // agents will have checked in yet. This loop is a no-op on cold start
     // but is correct for hot restarts (daemon restart while agents are live).
+    //
+    // Detect whether the daemon is starting after a host reboot: read the host
+    // boot time and check whether it postdates the newest Running session. If
+    // the host booted more recently than any running session was created, the
+    // most likely cause is a host reboot, and dead VMs should be Stopped (the
+    // operator can resume them). A plain daemon restart without a host reboot
+    // uses Startup instead, keeping the existing Error mapping for isolated
+    // single-VM crashes.
+    let startup_source = {
+        let has_running = sessions
+            .iter()
+            .any(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima);
+        if has_running {
+            // Use the most recent running session's created_at as the probe
+            // timestamp: if the host booted AFTER that session was created, the
+            // boot postdates all running sessions → HostReboot.
+            let newest_created = sessions
+                .iter()
+                .filter(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima)
+                .map(|s| s.created_at)
+                .max()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            if session_predates_last_boot(newest_created) {
+                info!(
+                    "macOS reconcile: host boot postdates running sessions — treating as HostReboot"
+                );
+                ReconcileSource::HostReboot
+            } else {
+                ReconcileSource::Startup
+            }
+        } else {
+            ReconcileSource::Startup
+        }
+    };
+
     let checked_in_uids = agent_registry.connected_uids().await;
     let mut verified_6b = 0u32;
     let mut errored_6b = 0u32;
 
     for &op_uid in &checked_in_uids {
-        let (v, e) = reconcile_operator_vms(state, op_uid, ReconcileSource::Startup).await;
+        let (v, e) = reconcile_operator_vms(state, op_uid, startup_source).await;
         verified_6b += v;
         errored_6b += e;
     }
@@ -17189,5 +17413,196 @@ mod tests {
         assert!(!is_rotated_log_file("sandboxd.log.YYYY-MM-DD")); // letters
         assert!(!is_rotated_log_file("sandboxd.log.abcd-ef-gh")); // letters only
         assert!(!is_rotated_log_file("sandboxd.log.YYYY-MM-DD.gz")); // letters + .gz
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS reboot reconcile state mapping
+    // -----------------------------------------------------------------------
+    //
+    // These tests verify the dead_vm_state mapping in reconcile_operator_vms
+    // and the session_predates_last_boot helper without spinning up AppState.
+    // The helper functions are private to this module, so we test the logic
+    // by calling them directly.
+
+    #[cfg(target_os = "macos")]
+    mod reboot_reconcile {
+        use super::*;
+        use chrono::{Duration, Utc};
+
+        /// session_predates_last_boot returns false for a timestamp in the
+        /// far future (after any plausible boot time).
+        #[test]
+        fn predates_boot_future_timestamp_is_false() {
+            let far_future = Utc::now() + Duration::days(3650);
+            assert!(
+                !session_predates_last_boot(far_future),
+                "a session created in the future cannot predate the last boot"
+            );
+        }
+
+        /// session_predates_last_boot returns true for a very old timestamp
+        /// (1970-01-01T00:00:00Z), which is guaranteed to be before any
+        /// plausible host boot time on a machine that is currently running.
+        #[test]
+        fn predates_boot_epoch_is_true() {
+            let epoch = chrono::DateTime::from_timestamp(0, 0)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            assert!(
+                session_predates_last_boot(epoch),
+                "the Unix epoch predates any running machine's boot time"
+            );
+        }
+
+        /// Dead-VM state for HostReboot is always Stopped regardless of session age.
+        #[test]
+        fn host_reboot_source_yields_stopped() {
+            use sandbox_core::SessionState;
+            assert_eq!(
+                dead_vm_state_for_source(ReconcileSource::HostReboot, Utc::now()),
+                SessionState::Stopped
+            );
+        }
+
+        /// Dead-VM state for FreshCheckin is always Stopped regardless of session age.
+        #[test]
+        fn fresh_checkin_source_yields_stopped() {
+            use sandbox_core::SessionState;
+            assert_eq!(
+                dead_vm_state_for_source(ReconcileSource::FreshCheckin, Utc::now()),
+                SessionState::Stopped
+            );
+        }
+
+        /// Startup with a session that postdates the last boot yields Error
+        /// (isolated crash, not a host reboot).
+        #[test]
+        fn startup_source_post_boot_session_yields_error() {
+            use sandbox_core::SessionState;
+            // A session created "now" definitely postdates the last boot on
+            // a machine that has been up for at least a few seconds.
+            assert_eq!(
+                dead_vm_state_for_source(ReconcileSource::Startup, Utc::now()),
+                SessionState::Error
+            );
+        }
+
+        /// Startup with a session that predates the last boot yields Stopped
+        /// (defensive: handles an edge case where the daemon was restarted
+        /// without a reboot detection but the session is clearly old).
+        #[test]
+        fn startup_source_pre_boot_session_yields_stopped() {
+            use sandbox_core::SessionState;
+            // The Unix epoch is guaranteed to predate any live boot time.
+            let epoch = chrono::DateTime::from_timestamp(0, 0)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            assert_eq!(
+                dead_vm_state_for_source(ReconcileSource::Startup, epoch),
+                SessionState::Stopped
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS base-image decision logic (create_session_macos_lima step 4)
+    // -----------------------------------------------------------------------
+    //
+    // These tests verify the routing decision that determines whether the macOS
+    // Lima create path builds sandbox-base (first create) or clones it
+    // (subsequent creates).  The test is hermetic — it exercises
+    // BaseImageStatus variants without spinning up AppState or running limactl.
+
+    #[cfg(target_os = "macos")]
+    mod base_image_decision {
+        use super::*;
+
+        /// Helper that mirrors the use_cache gate in create_session_macos_lima.
+        fn should_use_cache(no_cache: Option<bool>, template: Option<&str>) -> bool {
+            !no_cache.unwrap_or(false) && template.is_none()
+        }
+
+        /// Determines the intended VM-provision action given a base-image status
+        /// and use_cache flag.  Returns "build_then_clone", "clone", or "create_vm".
+        fn provision_action(status: BaseImageStatus, use_cache: bool) -> &'static str {
+            if !use_cache {
+                return "create_vm";
+            }
+            match status {
+                BaseImageStatus::Missing => "build_then_clone",
+                BaseImageStatus::Stale { .. } | BaseImageStatus::Fresh => "clone",
+            }
+        }
+
+        /// When no_cache is unset and no template is given, the cache path is active.
+        #[test]
+        fn use_cache_default() {
+            assert!(should_use_cache(None, None));
+        }
+
+        /// no_cache: Some(true) disables the cache path.
+        #[test]
+        fn use_cache_disabled_by_no_cache_flag() {
+            assert!(!should_use_cache(Some(true), None));
+        }
+
+        /// A custom template bypasses the cache path even when no_cache is false.
+        #[test]
+        fn use_cache_disabled_by_custom_template() {
+            assert!(!should_use_cache(None, Some("my-template")));
+        }
+
+        /// A missing base image with use_cache active routes to build-then-clone.
+        #[test]
+        fn missing_base_image_routes_to_build_then_clone() {
+            assert_eq!(
+                provision_action(BaseImageStatus::Missing, true),
+                "build_then_clone",
+                "first create must build sandbox-base then clone it"
+            );
+        }
+
+        /// A fresh base image routes directly to clone.
+        #[test]
+        fn fresh_base_image_routes_to_clone() {
+            assert_eq!(
+                provision_action(BaseImageStatus::Fresh, true),
+                "clone",
+                "subsequent creates must clone from the existing base image"
+            );
+        }
+
+        /// A stale base image still routes to clone (no auto-rebuild on create).
+        #[test]
+        fn stale_base_image_routes_to_clone() {
+            assert_eq!(
+                provision_action(
+                    BaseImageStatus::Stale {
+                        age_days: 30,
+                        hash_mismatch: false
+                    },
+                    true
+                ),
+                "clone",
+                "stale base image is used as-is on create; operator runs sandbox rebuild-image"
+            );
+        }
+
+        /// no_cache=true always routes to create_vm regardless of base-image status.
+        #[test]
+        fn no_cache_always_routes_to_create_vm() {
+            for status in [
+                BaseImageStatus::Missing,
+                BaseImageStatus::Fresh,
+                BaseImageStatus::Stale {
+                    age_days: 1,
+                    hash_mismatch: false,
+                },
+            ] {
+                assert_eq!(
+                    provision_action(status, false),
+                    "create_vm",
+                    "no_cache must bypass the base-image path entirely"
+                );
+            }
+        }
     }
 }

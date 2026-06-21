@@ -1567,7 +1567,11 @@ _compute_plan_darwin() {
     PLAN_BRIDGE_CONF="skip"
     PLAN_USERS_CONF="skip"
     PLAN_USERS_CONF_CONTENT=""
-    PLAN_GATEWAY_IMAGE="skip"
+    # macOS: stage the gateway image tarball to the daemon LIMA_HOME so the
+    # daemon can load it into the gateway VM at first start (and self-heal on
+    # subsequent starts if the image is missing). No docker load here — the
+    # gateway VM is not yet up at install time.
+    PLAN_GATEWAY_IMAGE="stage"
     PLAN_UNIT="skip"
     PLAN_LEGACY_MIGRATE="skip"
 
@@ -2040,6 +2044,8 @@ _render_plan_linux() {
     emit "  $(osc8_link "${DOCS_BASE}#gateway-image" "$hdr")"
     if [ "$PLAN_GATEWAY_IMAGE" = "skip" ]; then
         emit "    ${GREEN}+ sandbox-gateway:${VERSION} already loaded in Docker, skip${RESET}"
+    elif [ "$PLAN_GATEWAY_IMAGE" = "stage" ]; then
+        emit "    ${YELLOW}+ stage gateway image tarball to daemon LIMA_HOME (macOS — loaded by daemon at gateway init)${RESET}"
     else
         emit "    ${YELLOW}+ docker load sandbox-gateway:${VERSION} from tarball${RESET}"
     fi
@@ -3085,7 +3091,7 @@ _step_ok
 _write_checkpoint "users-conf"
 _priv_maybe_fail_after "users-conf"
 
-# ----- Step: docker load gateway -----
+# ----- Step: docker load / stage gateway -----
 _step_begin "docker-load-gateway"
 _priv_maybe_abort_at "docker-load-gateway"
 _gateway_tag="sandbox-gateway:\$VERSION"
@@ -3100,6 +3106,23 @@ if [ "\$PLAN_GATEWAY_IMAGE" = "load" ]; then
     docker image inspect "\$_gateway_tag" >> "\$_LOG" 2>&1 \
         || { _log "step=docker_load action=verify-fail status=fail"; _step_fail; }
     _log "step=docker_load image=\$_gateway_tag action=load status=ok"
+elif [ "\$PLAN_GATEWAY_IMAGE" = "stage" ]; then
+    # macOS: the gateway Lima VM is not yet running at install time, so we
+    # cannot docker load directly.  Stage the tarball under BASE_DIR so the
+    # daemon (which knows the per-operator LIMA_HOME path) can copy it into
+    # the right location on first ensure_ready and then call docker load.
+    _image_path="\$STAGE/images/sandbox-gateway-\${VERSION}.tar"
+    if [ ! -f "\$_image_path" ]; then
+        _log "step=stage_gateway action=fail reason=missing-image status=fail"
+        _step_fail
+    fi
+    # Stage the tarball under BASE_DIR directly (BASE_DIR = /var/lib/sandboxd/<_sandboxd-uid>).
+    # The daemon copies it into the per-operator LIMA_HOME on first ensure_ready —
+    # install.sh cannot know the operator uid at install time (no operator has connected yet).
+    _dst="\$BASE_DIR/gateway-image.tar"
+    install -m 0640 -o _sandboxd -g _sandboxd "\$_image_path" "\$_dst" >> "\$_LOG" 2>&1 \
+        || { _log "step=stage_gateway action=fail reason=install-failed status=fail"; _step_fail; }
+    _log "step=stage_gateway image=\$_gateway_tag dst=\$_dst action=staged status=ok"
 else
     _log "step=docker_load image=\$_gateway_tag action=skip status=ok"
 fi

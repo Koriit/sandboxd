@@ -288,6 +288,8 @@ pub enum LifecycleEventBodyDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    BaseBuildStarted,
+    BaseBuildComplete,
 }
 
 /// Wire value of `policy_applied` / `policy_updated` `status`.

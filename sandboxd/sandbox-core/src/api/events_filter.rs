@@ -134,6 +134,8 @@ pub enum EventName {
     HealthDegraded,
     HealthRestored,
     GatewayShutdown,
+    BaseBuildStarted,
+    BaseBuildComplete,
 }
 
 impl EventName {
@@ -163,6 +165,8 @@ impl EventName {
             "health_degraded" => Ok(Self::HealthDegraded),
             "health_restored" => Ok(Self::HealthRestored),
             "gateway_shutdown" => Ok(Self::GatewayShutdown),
+            "base_build_started" => Ok(Self::BaseBuildStarted),
+            "base_build_complete" => Ok(Self::BaseBuildComplete),
             other => Err(SandboxError::InvalidArgument(format!(
                 "invalid `event` value `{other}`: not a known event name"
             ))),
@@ -190,6 +194,8 @@ impl EventName {
             Self::HealthDegraded => "health_degraded",
             Self::HealthRestored => "health_restored",
             Self::GatewayShutdown => "gateway_shutdown",
+            Self::BaseBuildStarted => "base_build_started",
+            Self::BaseBuildComplete => "base_build_complete",
         }
     }
 }
@@ -367,6 +373,8 @@ fn event_name_of(event: &Event) -> EventName {
             LifecycleEvent::HealthDegraded { .. } => EventName::HealthDegraded,
             LifecycleEvent::HealthRestored { .. } => EventName::HealthRestored,
             LifecycleEvent::GatewayShutdown { .. } => EventName::GatewayShutdown,
+            LifecycleEvent::BaseBuildStarted => EventName::BaseBuildStarted,
+            LifecycleEvent::BaseBuildComplete => EventName::BaseBuildComplete,
         },
     }
 }
@@ -721,6 +729,8 @@ mod tests {
             EventName::HealthDegraded,
             EventName::HealthRestored,
             EventName::GatewayShutdown,
+            EventName::BaseBuildStarted,
+            EventName::BaseBuildComplete,
         ];
         for en in variants {
             let s = en.as_str();

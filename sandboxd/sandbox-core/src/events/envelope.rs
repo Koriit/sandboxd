@@ -380,6 +380,14 @@ pub enum LifecycleEvent {
         /// Populated when `reason == Error`.
         error: Option<String>,
     },
+    /// The daemon is building the `sandbox-base` golden Lima VM for the first
+    /// time for this operator. Subsequent session creates will clone from the
+    /// result in a few seconds. Expected duration is several minutes on the
+    /// first run (image download + cloud-init provisioning).
+    BaseBuildStarted,
+    /// The `sandbox-base` build finished successfully. Clone-based creates can
+    /// now proceed.
+    BaseBuildComplete,
 }
 
 /// Outcome of a policy-apply / policy-update action.

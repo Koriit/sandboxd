@@ -312,6 +312,8 @@ fn lifecycle_body_dto(event: &LifecycleEvent) -> LifecycleEventBodyDto {
                 error: error.clone(),
             }
         }
+        LifecycleEvent::BaseBuildStarted => LifecycleEventBodyDto::BaseBuildStarted,
+        LifecycleEvent::BaseBuildComplete => LifecycleEventBodyDto::BaseBuildComplete,
     }
 }
 

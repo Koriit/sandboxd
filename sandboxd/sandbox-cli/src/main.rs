@@ -4317,6 +4317,11 @@ fn extract_table_fields(
                     }
                     ("gateway_shutdown", d)
                 }
+                LifecycleEventBodyDto::BaseBuildStarted => (
+                    "base_build_started",
+                    "building sandbox-base VM (one-time, ~3-20 min)".to_string(),
+                ),
+                LifecycleEventBodyDto::BaseBuildComplete => ("base_build_complete", String::new()),
             };
             (
                 l.timestamp.clone(),
