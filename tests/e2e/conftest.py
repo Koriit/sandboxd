@@ -136,7 +136,10 @@ def _read_min_supported_users_conf_schema() -> int:
 SANDBOX_GATEWAY_IMAGE_TAG = f"sandbox-gateway:{_read_workspace_version()}"
 
 # Maximum time to wait for the daemon socket to appear (seconds).
-DAEMON_STARTUP_TIMEOUT = 30
+# On macOS the daemon blocks in ensure_ready() (gateway Lima VM boot) before
+# binding its socket — this can take 5-10 minutes on first boot. On Linux the
+# daemon binds its socket immediately, so 30 s is sufficient there.
+DAEMON_STARTUP_TIMEOUT = 900 if sys.platform == "darwin" else 30
 
 # Paths to check for qemu-bridge-helper.
 QEMU_BRIDGE_HELPER_PATHS = [
@@ -285,11 +288,18 @@ if "SANDBOX_USERS_CONF" not in os.environ:
             }
         ]
     }
+    # On macOS, tempfile.NamedTemporaryFile uses $TMPDIR which resolves to
+    # a per-user /var/folders/.../.../T/ directory (mode drwx------). Even
+    # with 0644 on the file itself, _sandboxd-test cannot traverse that
+    # parent directory to reach it. Use /tmp explicitly (mode 1777,
+    # world-traversable) so the daemon can read the file.
+    _users_conf_tmpdir = "/tmp" if sys.platform == "darwin" else None
     _users_conf_tf = tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".json",
         prefix="sandbox-e2e-users-",
         delete=False,
+        dir=_users_conf_tmpdir,
     )
     json.dump(_users_conf_payload, _users_conf_tf)
     _users_conf_tf.flush()
@@ -967,14 +977,65 @@ def _reset_sandbox_state_dir() -> None:
 
     base_vm = os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
 
+    if sys.platform == "darwin":
+        # On macOS the daemon's Lima home lives at a 3-level path
+        # ``{base_dir}/{daemon_uid}/{op_uid}/lima`` where daemon_uid = op_uid =
+        # _SANDBOX_TEST_UID (the e2e daemon runs as the test user and creates
+        # sessions for itself). This subtree contains staging artifacts
+        # (gateway-image.tar, lite-image.tar, sandbox-route-helper) that the
+        # daemon needs at startup and which are not cheaply re-downloadable.
+        #
+        # Preserve ``str(_SANDBOX_TEST_UID)`` (the per-daemon subtree) from the
+        # top-level sweep so those artifacts survive. A separate, targeted reset
+        # below cleans the gateway Lima VM directory (which must be recreated
+        # fresh each session) while keeping the staging artifacts.
+        #
+        # Also preserve ``Library/`` — Lima stores its cloud-image download cache
+        # under ``{HOME}/Library/Caches/lima/download/`` (HOME = base dir).
+        # Wiping it would force a ~580 MiB Ubuntu cloud-image re-download on
+        # every test session.
+        daemon_uid_subdir = str(_SANDBOX_TEST_UID)
+        top_level_keep = [".cache", ".lima", "base-image-meta.json", daemon_uid_subdir, "Library"]
+    else:
+        top_level_keep = [".cache", ".lima", "base-image-meta.json"]
+
     # E2E base dir: remove every top-level entry — sessions.db,
     # per-session dirs, listeners, events, the socket — except the Lima
     # cache, the .lima tree, and the freshness metadata. Then prune the
     # .lima tree down to the golden base VM (dropping per-session clones).
     _sudo_rm_children_except(
-        _SANDBOX_E2E_BASE_DIR, [".cache", ".lima", "base-image-meta.json"]
+        _SANDBOX_E2E_BASE_DIR, top_level_keep
     )
     _sudo_rm_children_except(_SANDBOX_E2E_BASE_DIR / ".lima", [base_vm])
+
+    if sys.platform == "darwin":
+        # macOS: reset the daemon's Lima home. Keep the gateway VM instance so
+        # ensure_ready() can start it without re-creating (and re-downloading
+        # the cloud image). Also keep staging artifacts and the Lima SSH config.
+        #
+        # Daemon Lima home = {base_dir}/{op_uid}/lima.
+        # _SANDBOX_E2E_BASE_DIR already encodes the daemon uid (309), so the
+        # per-operator path adds just one more uid component (also 309 in the
+        # e2e cross-user setup where daemon_uid == op_uid == _SANDBOX_TEST_UID).
+        daemon_lima_home = (
+            _SANDBOX_E2E_BASE_DIR / str(_SANDBOX_TEST_UID) / "lima"
+        )
+        # Remove per-session Lima clones (if any leaked from a crashed run).
+        # Keep: staging artifacts, Lima SSH config, the gateway VM, and the
+        # golden base VM (if it exists).
+        _sudo_rm_children_except(
+            daemon_lima_home,
+            [
+                "gateway-image.tar",
+                "lite-image.tar",
+                "sandbox-route-helper-linux-aarch64",
+                "_config",
+                "sandboxd-gateway",
+                base_vm,
+                ".cache",
+                "base-image-meta.json",
+            ],
+        )
 
     # Per-operator LIMA_HOME under the 3-level path
     # (``/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima``): keep the download
@@ -1123,15 +1184,58 @@ def _launch_daemon_as_sandbox_via_sudo(
     # ``rebuild-image --backend container``) a writable config dir under
     # the test-user-owned base dir instead of /nonexistent. The base
     # dir reset wipes the resulting .docker/ subtree between sessions.
+    #
+    # On macOS, additional redirects are required:
+    # - SANDBOX_BROKER_SOCKET: the broker binds /var/run/sandbox/broker.sock
+    #   by default, which uid 309 cannot write. Redirected here via the env
+    #   wrapper so it is set after the sudo boundary (not in env_keep).
+    # - DOCKER_HOST: points the daemon's Docker client at the gateway Lima VM's
+    #   forwarded Docker socket. The daemon calls `docker image inspect
+    #   sandbox-gateway:<ver>` in gateway_image_present() during session create;
+    #   on macOS the gateway image lives in the VM's Docker (not the host's
+    #   /var/run/docker.sock which does not exist). Setting DOCKER_HOST routes
+    #   all host-docker calls through the gateway VM's forwarded socket, which
+    #   is created by ensure_ready() during daemon startup.
+    # - --log-file: without it, init_tracing() opens a rolling appender at
+    #   /var/log/sandbox (root:wheel 0744), which uid 309 cannot write and
+    #   which aborts the daemon before it binds its socket. Routing logs to
+    #   the base dir lets the harness surface them on failure.
+    # Gateway VM Docker socket path:
+    # {_SANDBOX_E2E_BASE_DIR}/{daemon_uid}/{op_uid}/lima/sandboxd-gateway/gateway-docker.sock
+    # On the e2e harness daemon_uid == op_uid == _SANDBOX_TEST_UID.
+    # _SANDBOX_E2E_BASE_DIR already contains the test uid as its last component,
+    # so the two-level path is: _SANDBOX_E2E_BASE_DIR / {_SANDBOX_TEST_UID} / lima /...
+    _gateway_docker_sock = (
+        _SANDBOX_E2E_BASE_DIR
+        / str(_SANDBOX_TEST_UID)
+        / "lima"
+        / "sandboxd-gateway"
+        / "gateway-docker.sock"
+    )
+    _macos_env_extras: list[str] = (
+        [
+            f"SANDBOX_BROKER_SOCKET={_SANDBOX_E2E_BASE_DIR / 'broker.sock'}",
+            f"DOCKER_HOST=unix://{_gateway_docker_sock}",
+        ]
+        if sys.platform == "darwin"
+        else []
+    )
+    _macos_argv_extras: list[str] = (
+        ["--log-file", str(_SANDBOX_E2E_BASE_DIR / "sandboxd.log")]
+        if sys.platform == "darwin"
+        else []
+    )
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", daemon_test_user,
             "env",
             f"HOME={_SANDBOX_E2E_BASE_DIR}",
             f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
+            *_macos_env_extras,
             str(staged["sandboxd"]),
             "--socket", str(_SANDBOX_E2E_SOCKET),
             "--base-dir", str(_SANDBOX_E2E_BASE_DIR),
+            *_macos_argv_extras,
         ],
         env={
             **daemon_env,
@@ -1174,9 +1278,18 @@ def _launch_daemon_as_sandbox_via_sudo(
             stderr_text = stderr_log.read_text()
         except OSError:
             stderr_text = "(could not read stderr log)"
+        # On macOS, tracing output goes to --log-file rather than stderr;
+        # include it in the failure dump so startup errors are visible.
+        daemon_log_text = ""
+        if sys.platform == "darwin":
+            daemon_log_path = _SANDBOX_E2E_BASE_DIR / "sandboxd.log"
+            try:
+                daemon_log_text = f"\ndaemon log ({daemon_log_path}):\n{daemon_log_path.read_text()}"
+            except OSError:
+                daemon_log_text = f"\ndaemon log ({daemon_log_path}): (could not read)"
         print(
             f"sandboxd-via-sudo startup failed.\n"
-            f"stderr: {stderr_text}",
+            f"stderr: {stderr_text}{daemon_log_text}",
             file=sys.stderr,
         )
         raise
@@ -1249,6 +1362,28 @@ def restart_test_daemon(
     daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER"] = daemon_test_user
     daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP"] = daemon_test_user
 
+    # Mirror the macOS-specific env/argv additions from the initial launcher
+    # so the restarted daemon is configured identically.
+    _restart_gateway_docker_sock = (
+        _SANDBOX_E2E_BASE_DIR
+        / str(_SANDBOX_TEST_UID)
+        / "lima"
+        / "sandboxd-gateway"
+        / "gateway-docker.sock"
+    )
+    _restart_macos_env_extras: list[str] = (
+        [
+            f"SANDBOX_BROKER_SOCKET={_SANDBOX_E2E_BASE_DIR / 'broker.sock'}",
+            f"DOCKER_HOST=unix://{_restart_gateway_docker_sock}",
+        ]
+        if sys.platform == "darwin"
+        else []
+    )
+    _restart_macos_argv_extras: list[str] = (
+        ["--log-file", str(_SANDBOX_E2E_BASE_DIR / "sandboxd.log")]
+        if sys.platform == "darwin"
+        else []
+    )
     proc = subprocess.Popen(
         [
             "sudo", "-n", "-u", daemon_test_user,
@@ -1259,9 +1394,11 @@ def restart_test_daemon(
             "env",
             f"HOME={_SANDBOX_E2E_BASE_DIR}",
             f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
+            *_restart_macos_env_extras,
             str(staged_sandboxd),
             "--socket", str(socket_path),
             "--base-dir", str(base_dir),
+            *_restart_macos_argv_extras,
         ],
         env=daemon_env,
         stdout=new_stdout_fh,
@@ -1725,23 +1862,37 @@ def _ensure_base_image(request, sandbox_binaries: SandboxBinaries):
     # Run the two backend rebuilds separately. The container rebuild is fast
     # (~30 s) and required; the Lima rebuild downloads a 580 MiB qcow2 on
     # first use and is required when Lima prereqs are present.
-    print(
-        "[conftest] pre-warming container base image",
-        file=sys.stderr,
-    )
-    container_result = subprocess.run(
-        [str(sandbox_binaries.sandbox), "--socket", socket_path,
-         "rebuild-image", "--backend", "container"],
-        capture_output=True,
-        text=True,
-        timeout=2000,
-    )
-    if container_result.returncode != 0:
-        pytest.fail(
-            "Failed to build container base image (exit "
-            f"{container_result.returncode}).\n"
-            f"stdout: {container_result.stdout}\n"
-            f"stderr: {container_result.stderr}"
+    #
+    # On macOS the container (lite) backend runs inside the gateway Lima VM.
+    # The lite image is pre-loaded via a staged tarball during ensure_ready(),
+    # so there is no host-side Docker build to run — sandbox rebuild-image
+    # --backend container would attempt to run `docker build` against the host
+    # Docker socket (/var/run/docker.sock) which does not exist, and would fail.
+    # Skip the container rebuild on macOS; the tarball-based load covers it.
+    if sys.platform != "darwin":
+        print(
+            "[conftest] pre-warming container base image",
+            file=sys.stderr,
+        )
+        container_result = subprocess.run(
+            [str(sandbox_binaries.sandbox), "--socket", socket_path,
+             "rebuild-image", "--backend", "container"],
+            capture_output=True,
+            text=True,
+            timeout=2000,
+        )
+        if container_result.returncode != 0:
+            pytest.fail(
+                "Failed to build container base image (exit "
+                f"{container_result.returncode}).\n"
+                f"stdout: {container_result.stdout}\n"
+                f"stderr: {container_result.stderr}"
+            )
+    else:
+        print(
+            "[conftest] macOS: skipping container base image pre-warm "
+            "(lite image loaded from staged tarball by the gateway VM)",
+            file=sys.stderr,
         )
 
     if not _lima_available_for_prewarm():
