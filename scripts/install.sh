@@ -33,6 +33,7 @@ set -eu
 COSIGN_VERSION="v2.4.1"
 COSIGN_SHA256_AMD64="8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
 COSIGN_SHA256_ARM64="3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a"
+COSIGN_SHA256_DARWIN_ARM64="13343856b69f70388c4fe0b986a31dde5958e444b41be22d785d3dc5e1a9cc62"
 
 # Optional override: source lib.sh if found on disk (in-tree dev
 # workflow). Resolution order:
@@ -1255,10 +1256,7 @@ cosign_bootstrap() {
     case "$ARCH" in
         x86_64-unknown-linux-gnu)   cosign_bin="cosign-linux-amd64";  expected="$COSIGN_SHA256_AMD64" ;;
         aarch64-unknown-linux-gnu)  cosign_bin="cosign-linux-arm64";  expected="$COSIGN_SHA256_ARM64" ;;
-        aarch64-apple-darwin)
-            # macOS cosign pin and tarball are added in a subsequent session.
-            # A full macOS install.sh run is not yet functional end-to-end.
-            die "macOS release artifacts (cosign pin + tarball) are not yet available in this release. Check for a newer version." ;;
+        aarch64-apple-darwin)  cosign_bin="cosign-darwin-arm64"; expected="$COSIGN_SHA256_DARWIN_ARM64" ;;
         *) die "no pinned cosign binary for $ARCH" ;;
     esac
 

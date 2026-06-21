@@ -70,12 +70,18 @@ pub const COSIGN_SHA256_AMD64: &str =
 pub const COSIGN_SHA256_ARM64: &str =
     "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a";
 
+/// SHA-256 of the cosign darwin-arm64 binary at [`COSIGN_VERSION`].
+/// **MUST match `scripts/lib.sh`'s `COSIGN_SHA256_DARWIN_ARM64`.**
+pub const COSIGN_SHA256_DARWIN_ARM64: &str =
+    "13343856b69f70388c4fe0b986a31dde5958e444b41be22d785d3dc5e1a9cc62";
+
 /// Resolve `(filename, expected sha256)` for the operator's arch
 /// triple. Returns `None` for any arch we don't ship a pin for.
 pub fn cosign_pin_for_arch(arch: &str) -> Option<(&'static str, &'static str)> {
     match arch {
         "x86_64-unknown-linux-gnu" => Some(("cosign-linux-amd64", COSIGN_SHA256_AMD64)),
         "aarch64-unknown-linux-gnu" => Some(("cosign-linux-arm64", COSIGN_SHA256_ARM64)),
+        "aarch64-apple-darwin" => Some(("cosign-darwin-arm64", COSIGN_SHA256_DARWIN_ARM64)),
         _ => None,
     }
 }
@@ -672,6 +678,7 @@ mod tests {
             ("COSIGN_VERSION", COSIGN_VERSION),
             ("COSIGN_SHA256_AMD64", COSIGN_SHA256_AMD64),
             ("COSIGN_SHA256_ARM64", COSIGN_SHA256_ARM64),
+            ("COSIGN_SHA256_DARWIN_ARM64", COSIGN_SHA256_DARWIN_ARM64),
         ] {
             let needle = format!("{name}=\"{expected}\"");
             assert!(
@@ -686,6 +693,7 @@ mod tests {
     fn cosign_pin_for_arch_known_triples() {
         assert!(cosign_pin_for_arch("x86_64-unknown-linux-gnu").is_some());
         assert!(cosign_pin_for_arch("aarch64-unknown-linux-gnu").is_some());
+        assert!(cosign_pin_for_arch("aarch64-apple-darwin").is_some());
         assert!(cosign_pin_for_arch("riscv64-unknown-linux-gnu").is_none());
     }
 

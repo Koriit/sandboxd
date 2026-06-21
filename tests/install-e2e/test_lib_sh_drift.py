@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parent.parent / "scripts"
 
-CONSTANTS = ("COSIGN_VERSION", "COSIGN_SHA256_AMD64", "COSIGN_SHA256_ARM64")
+CONSTANTS = ("COSIGN_VERSION", "COSIGN_SHA256_AMD64", "COSIGN_SHA256_ARM64", "COSIGN_SHA256_DARWIN_ARM64")
 
 
 def _parse(path: Path) -> dict[str, str]:
