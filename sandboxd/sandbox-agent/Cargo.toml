@@ -21,9 +21,9 @@ path = "src/lib.rs"
 # `test-env-override` — opts the agent into honouring environment-variable
 # seams used by unit and integration tests:
 #
-#   SANDBOX_AGENT_TEST_SANDBOX_GROUP — override the `_sandbox` group name
+#   SANDBOX_AGENT_TEST_SANDBOX_GROUP — override the `_sandboxd` group name
 #     so tests can drive the self-gate membership check against a synthetic
-#     group without requiring the real `_sandbox` group to exist.
+#     group without requiring the real `_sandboxd` group to exist.
 #
 #   SANDBOX_AGENT_TEST_BROKER_SOCKET — override the broker socket path so
 #     tests can point the agent at a temp-dir socket without needing

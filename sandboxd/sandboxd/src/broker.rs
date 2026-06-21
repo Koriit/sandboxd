@@ -11,7 +11,7 @@
 //!
 //! Path: `/var/run/sandbox/broker.sock` (overridable via `SANDBOX_BROKER_SOCKET`
 //! for tests — see below).
-//! Mode: `0660`, owner `_sandbox:_sandbox`.
+//! Mode: `0660`, owner `_sandboxd:_sandboxd`.
 //! The daemon recreates the socket with the correct mode before listening at
 //! every startup (`/var/run` is cleared on boot).
 //!
@@ -25,10 +25,10 @@
 //!    can read the broker socket (as the owner), but the daemon gates it out.
 //!
 //! 3. **Reject uid < 500** — system accounts on macOS have uids below 500
-//!    (e.g. `_sandbox` itself). Only real human operators (uid ≥ 500) may
+//!    (e.g. `_sandboxd` itself). Only real human operators (uid ≥ 500) may
 //!    check in.
 //!
-//! 4. **Re-resolve `_sandbox` membership via `getgrouplist(3)`** — the
+//! 4. **Re-resolve `_sandboxd` membership via `getgrouplist(3)`** — the
 //!    enrollment gate. `xucred.cr_groups` from `LOCAL_PEERCRED` is capped at
 //!    `NGROUPS` (16) and is unreliable across macOS versions. Membership is
 //!    re-resolved from the peer uid through Directory Services (memberd /
@@ -124,8 +124,11 @@ fn heartbeat_timeout() -> Duration {
 /// without risk of blocking the caller long enough to matter.
 const REQUEST_CHANNEL_CAPACITY: usize = 4;
 
-/// The `_sandbox` group name — the enrollment gate on macOS.
-const SANDBOX_GROUP_NAME: &str = "_sandbox";
+/// The `_sandboxd` group name — the enrollment gate on macOS.
+///
+/// macOS reserves `_sandbox` (uid/gid 60) for its Seatbelt subsystem, so
+/// sandboxd uses a dedicated `_sandboxd` account and group instead.
+const SANDBOX_GROUP_NAME: &str = "_sandboxd";
 
 // test-env-override seams
 #[cfg(feature = "test-env-override")]
@@ -163,7 +166,7 @@ pub fn broker_socket_path() -> PathBuf {
 /// Resolve the sandbox group name.
 ///
 /// In test-env-override builds, `SANDBOX_BROKER_TEST_SANDBOX_GROUP` overrides
-/// `_sandbox` so tests can drive the membership gate against a synthetic group.
+/// `_sandboxd` so tests can drive the membership gate against a synthetic group.
 pub fn sandbox_group_name() -> String {
     #[cfg(feature = "test-env-override")]
     if let Ok(v) = std::env::var(TEST_SANDBOX_GROUP_ENV)
@@ -348,7 +351,7 @@ pub enum AuthOutcome {
 /// Rules applied in order:
 /// 1. uid 0 → `RejectedRoot`.
 /// 2. uid < 500 → `RejectedSystemUid`.
-/// 3. `_sandbox` membership via `getgrouplist(3)` → Admitted / RejectedNotMember /
+/// 3. `_sandboxd` membership via `getgrouplist(3)` → Admitted / RejectedNotMember /
 ///    RejectedResolutionFailed.
 pub fn classify_peer_uid(uid: u32, group_name: &str) -> AuthOutcome {
     if uid == 0 {
@@ -371,7 +374,7 @@ pub fn classify_peer_uid(uid: u32, group_name: &str) -> AuthOutcome {
 /// from `LOCAL_PEERCRED` (kernel-attested, cannot be spoofed by the connecting
 /// process) and then delegates all classification to [`classify_peer_uid`].
 ///
-/// The `0660` socket mode is a first filter (only `_sandbox`-group members
+/// The `0660` socket mode is a first filter (only `_sandboxd`-group members
 /// can connect at the kernel DAC level); `getgrouplist` inside
 /// `classify_peer_uid` is the authoritative enrollment check.
 pub fn authenticate_peer(stream: &UnixStream, group_name: &str) -> AuthOutcome {
@@ -1002,7 +1005,7 @@ async fn process_agent_line(
 /// operation to that operator's checked-in per-operator agent, and
 /// special-cases two direct-execution paths:
 ///
-/// - `op_uid == daemon_uid` (the `_sandbox` own uid, or any foreground-dev
+/// - `op_uid == daemon_uid` (the `_sandboxd` own uid, or any foreground-dev
 ///   scenario where the daemon and the operator share the same uid): runs
 ///   `limactl` directly as the daemon process without going through the
 ///   broker. This is the "gateway degenerate case" — the daemon is already
@@ -1776,7 +1779,7 @@ mod tests {
     /// real socket where `peer_cred()` returns the test runner's own uid.
     #[test]
     fn auth_rejects_uid_zero() {
-        assert_eq!(classify_peer_uid(0, "_sandbox"), AuthOutcome::RejectedRoot);
+        assert_eq!(classify_peer_uid(0, "_sandboxd"), AuthOutcome::RejectedRoot);
     }
 
     /// Verify that `classify_peer_uid` rejects uids below the system-account
@@ -1785,7 +1788,7 @@ mod tests {
     fn auth_rejects_system_uids() {
         for uid in [1u32, 100, 499] {
             assert_eq!(
-                classify_peer_uid(uid, "_sandbox"),
+                classify_peer_uid(uid, "_sandboxd"),
                 AuthOutcome::RejectedSystemUid(uid),
                 "uid {uid} should be rejected as a system uid"
             );

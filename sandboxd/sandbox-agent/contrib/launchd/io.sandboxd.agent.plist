@@ -16,7 +16,7 @@
     ensures the agent only loads in a real user GUI session.
 
     KeepAlive is intentionally absent (equivalent to KeepAlive = false).  The
-    agent self-gates on _sandbox group membership at startup and exits with
+    agent self-gates on _sandboxd group membership at startup and exits with
     code 0 for non-enrolled users.  Without KeepAlive, launchd does not
     respawn on a successful exit, so unenrolled users do not see a throttled
     respawn loop in Console.app.  If the agent crashes (non-zero exit) launchd
@@ -36,7 +36,7 @@
     <!--
         Aqua scoping: load only in a real GUI login session.
         This is the primary defence against a LoginWindow (root) load.
-        The agent's own _sandbox membership self-gate is defence-in-depth.
+        The agent's own _sandboxd membership self-gate is defence-in-depth.
     -->
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>

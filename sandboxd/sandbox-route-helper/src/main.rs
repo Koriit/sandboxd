@@ -61,11 +61,11 @@
 //!
 //! Instead, the VM boundary itself is the authorization gate:
 //!
-//! - Only the daemon process (`_sandbox`, running on the macOS host) can
+//! - Only the daemon process (`_sandboxd`, running on the macOS host) can
 //!   issue `limactl shell sandboxd-gateway -- sudo <helper> …` commands into
 //!   the gateway VM. The Lima SSH credentials are exclusively owned by the
 //!   daemon.
-//! - The gateway VM is single-tenant `_sandbox` infra. No operator user can
+//! - The gateway VM is single-tenant `_sandboxd` infra. No operator user can
 //!   independently reach the VM's sudo path.
 //!
 //! In `--vm-gateway-mode` the helper:
@@ -453,10 +453,10 @@ mod imp {
         // pair-membership gate cannot apply here because (a) the caller is
         // root (uid 0, via sudo) and (b) there is no `users.conf` in the VM.
         //
-        // Security rationale: only the daemon process (`_sandbox`, running on
+        // Security rationale: only the daemon process (`_sandboxd`, running on
         // the macOS host) can issue `limactl shell sandboxd-gateway` commands.
         // The Lima SSH credentials for the gateway VM are exclusively owned by
-        // the daemon's LIMA_HOME. The gateway VM is single-tenant `_sandbox`
+        // the daemon's LIMA_HOME. The gateway VM is single-tenant `_sandboxd`
         // infra — no operator user can independently reach its sudo path.
         // The VM boundary therefore provides the same authorization guarantee
         // as the host-uid gate, restricted to a single-tenant context where

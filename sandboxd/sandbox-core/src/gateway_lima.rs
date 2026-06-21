@@ -4,10 +4,10 @@
 /// Linux VM that hosts all gateway containers across all sandbox sessions.
 ///
 /// The gateway instance is daemon infrastructure, not per-operator. It lives
-/// under the daemon's own LIMA_HOME (`/var/lib/sandboxd/<_sandbox-uid>/lima/`)
+/// under the daemon's own LIMA_HOME (`/var/lib/sandboxd/<_sandboxd-uid>/lima/`)
 /// and all `limactl` ops on it run via the `op_uid == daemon_uid` degenerate
 /// path of the `LimaExecutor` seam (i.e., `run_limactl_direct` in the daemon —
-/// no agent, no privilege pivot needed because the daemon already is `_sandbox`).
+/// no agent, no privilege pivot needed because the daemon already is `_sandboxd`).
 ///
 /// ## Lifecycle (startup)
 ///
@@ -348,9 +348,9 @@ pub fn generate_gateway_template(max_slots: u16) -> String {
     // identity (no remapping needed). Per-session shared: paths must be
     // validated at create time to fall under this root.
     //
-    // Note: the 9p read is performed by _sandbox (the gateway VM's user),
+    // Note: the 9p read is performed by _sandboxd (the gateway VM's user),
     // NOT the operator. This is the TCC asymmetry: lite shared: gets no
-    // operator TCC consent path. Sources must be readable by _sandbox and
+    // operator TCC consent path. Sources must be readable by _sandboxd and
     // must not live in TCC-protected directories (Desktop, Documents, Downloads).
     let shared_root = crate::lite_macos::lite_shared_root();
     let mounts_stanza = crate::lite_macos::lite_shared_root_9p_stanza(&shared_root);
@@ -410,7 +410,7 @@ portForwards:
 # The shared root is exposed read-write at the same absolute path so the
 # host->VM path translation is an identity. Per-session shared: paths must
 # fall under this root (validated at session-create time).
-# NOTE: reads are performed as _sandbox (the gateway VM user), not the
+# NOTE: reads are performed as _sandboxd (the gateway VM user), not the
 # operator. Sources outside TCC-protected dirs work without consent.
 {mounts_stanza}
 containerd:
@@ -1523,7 +1523,7 @@ impl GatewayLimaManager {
     /// Run a shell command inside the gateway Lima VM via `limactl shell`.
     ///
     /// This is the degenerate direct path (daemon_uid == op_uid) — the daemon
-    /// runs `limactl` directly as `_sandbox`, which already owns the gateway
+    /// runs `limactl` directly as `_sandboxd`, which already owns the gateway
     /// instance's LIMA_HOME.
     pub fn run_gateway_shell(
         &self,

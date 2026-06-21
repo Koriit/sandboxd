@@ -979,19 +979,19 @@ pub fn vmnet_slot_daemon_label(slot: u16) -> String {
 /// LaunchDaemon. Key design properties:
 ///
 /// - Shell wrapper as `ProgramArguments`: creates socket parent directories
-///   with explicit `_sandbox:_sandbox 0750` ownership *before* socket_vmnet
+///   with explicit `_sandboxd:_sandboxd 0750` ownership *before* socket_vmnet
 ///   binds. `/var/run` is cleared on every macOS boot; launchd imposes no
 ///   ordering between independent jobs, so the daemon cannot rely on the
 ///   directory surviving a reboot or on `sandboxd` having run first. Using
-///   `install -d -o _sandbox -g _sandbox -m 0750` is idempotent and yields
+///   `install -d -o _sandboxd -g _sandboxd -m 0750` is idempotent and yields
 ///   the correct owner regardless of which root job wins the boot race.
 /// - `--vmnet-mode=host`: isolated virtual network, no NAT to internet.
 /// - `--vmnet-network-identifier=<uuid>`: deterministic, per-slot UUID
 ///   (derived from the fixed sandboxd namespace + slot index) — each unique
 ///   identifier gets its own isolated L2 bridge, preventing cross-slot
 ///   traffic; deterministic so it is stable across daemon/host restarts.
-/// - `--socket-group=_sandbox`: overrides socket_vmnet's `staff` default;
-///   only `_sandbox`/enrolled operators can connect.
+/// - `--socket-group=_sandboxd`: overrides socket_vmnet's `staff` default;
+///   only `_sandboxd`/enrolled operators can connect.
 /// - No `--vmnet-gateway`/`--vmnet-dhcp-end`: network-identifier mode
 ///   carries no DHCP; all addresses are assigned statically.
 /// - `RunAtLoad=true` + `KeepAlive`: start at boot, restart on crash.
@@ -1007,12 +1007,12 @@ pub fn generate_vmnet_plist(slot: u16) -> String {
     // launchd un-escapes XML entities before passing the string to `/bin/sh -c`,
     // so the shell receives the literal `&&` operator at runtime.
     let exec_cmd = format!(
-        "install -d -o _sandbox -g _sandbox -m 0750 /var/run/sandbox &amp;&amp; \
-install -d -o _sandbox -g _sandbox -m 0750 /var/run/sandbox/vmnet &amp;&amp; \
+        "install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; \
+install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; \
 exec {STAGED_SOCKET_VMNET_PATH} \
 --vmnet-mode=host \
 --vmnet-network-identifier={network_identifier} \
---socket-group=_sandbox \
+--socket-group=_sandboxd \
 {socket_path}"
     );
 
@@ -2045,8 +2045,8 @@ mod tests {
                 "plist must include --vmnet-mode=host"
             );
             assert!(
-                plist.contains("--socket-group=_sandbox"),
-                "plist must include --socket-group=_sandbox"
+                plist.contains("--socket-group=_sandboxd"),
+                "plist must include --socket-group=_sandboxd"
             );
             assert!(
                 plist.contains("--vmnet-network-identifier="),
@@ -2074,10 +2074,10 @@ mod tests {
         fn test_plist_has_pre_exec_dir_creation() {
             let plist = generate_vmnet_plist(0);
             // The pre-exec wrapper must create /var/run/sandbox and
-            // /var/run/sandbox/vmnet with _sandbox ownership.
+            // /var/run/sandbox/vmnet with _sandboxd ownership.
             assert!(
-                plist.contains("install -d -o _sandbox -g _sandbox -m 0750 /var/run/sandbox"),
-                "plist must create /var/run/sandbox with _sandbox:_sandbox 0750"
+                plist.contains("install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox"),
+                "plist must create /var/run/sandbox with _sandboxd:_sandboxd 0750"
             );
             assert!(
                 plist.contains("/var/run/sandbox/vmnet"),

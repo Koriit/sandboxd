@@ -134,6 +134,9 @@ QUIET=0
 NO_COLOR=0
 NO_PROVISION=0
 
+# Detected OS: "linux" or "darwin". Set by detect_os().
+OS=""
+
 # Step-discovered state (consumed by the privileged child when writing install-state).
 ARCH=""
 TARGET_VER=""
@@ -193,6 +196,9 @@ PLAN_UNIT_DST="/etc/systemd/system/sandboxd.service"
 PLAN_USERS_CONF_CONTENT=""
 PLAN_BRIDGE_CONF_APPEND=""
 
+# Minimum limactl version required on macOS.
+MIN_LIMA_VERSION="1.2.0"
+
 # FIFO path used for the line-progress protocol between the privileged
 # child and the parent. Written by the child on a dedicated fd; read by
 # the parent. Placed inside TMPDIR_INSTALL so cleanup_tmpdir handles it.
@@ -212,7 +218,10 @@ Fetch tarball
 Verify signature
 Extract tarball"
 
-UI_INSTALL_PHASES="sandbox-user
+# Per-platform privileged-step phase lists.  UI_INSTALL_PHASES is set to the
+# appropriate list in main() after detect_os() runs.  Keep these in sync with
+# _TOTAL_STEPS in write_priv_script().
+UI_INSTALL_PHASES_LINUX="sandbox-user
 operator-group-add
 install-binaries
 install-cosign
@@ -227,6 +236,16 @@ install-systemd-unit
 daemon-reload
 enable-start-daemon
 write-install-state"
+
+UI_INSTALL_PHASES_DARWIN="sandbox-user
+operator-group-add
+install-binaries
+install-cosign
+state-dirs
+write-install-state"
+
+# Resolved in main() to the platform-appropriate list.
+UI_INSTALL_PHASES=""
 
 UI_PROVISION_PHASES="provision-lite
 provision-lima"
@@ -530,10 +549,11 @@ parse_args() {
 
 detect_os() {
     case "$(uname -s)" in
-        Linux) ;;
-        *) die "sandboxd installs on Linux only (got: $(uname -s))" ;;
+        Linux)  OS="linux" ;;
+        Darwin) OS="darwin" ;;
+        *)      die "sandboxd is not supported on this operating system (got: $(uname -s))" ;;
     esac
-    log_ok "step=os_detect os=Linux"
+    log_ok "step=os_detect os=$OS"
 }
 
 # ----------------------------------------------------------------------------
@@ -541,11 +561,20 @@ detect_os() {
 # ----------------------------------------------------------------------------
 
 detect_arch() {
-    case "$(uname -m)" in
-        x86_64)  ARCH="x86_64-unknown-linux-gnu" ;;
-        aarch64) ARCH="aarch64-unknown-linux-gnu" ;;
-        *)       die "unsupported architecture: $(uname -m)" ;;
-    esac
+    _uname_m="$(uname -m)"
+    if [ "$OS" = "darwin" ]; then
+        case "$_uname_m" in
+            arm64)  ARCH="aarch64-apple-darwin" ;;
+            x86_64) die "Intel Macs are not supported. sandboxd requires Apple Silicon (arm64). See docs for details." ;;
+            *)      die "unsupported architecture on macOS: $_uname_m" ;;
+        esac
+    else
+        case "$_uname_m" in
+            x86_64)  ARCH="x86_64-unknown-linux-gnu" ;;
+            aarch64) ARCH="aarch64-unknown-linux-gnu" ;;
+            *)       die "unsupported architecture: $_uname_m" ;;
+        esac
+    fi
     log_ok "step=arch_detect arch=$ARCH"
 }
 
@@ -808,17 +837,167 @@ check_kernel_version() {
     return 1
 }
 
-check_prereqs() {
-    qemu_arch="x86_64"
-    case "$ARCH" in
-        aarch64-*) qemu_arch="aarch64" ;;
-    esac
+# check_socket_vmnet_installed — verify the socket_vmnet binary is present at
+# the Apple Silicon Homebrew prefix.  Adds "socket_vmnet" to the missing list
+# when absent.  Called by check_prereqs on Darwin.
+check_socket_vmnet_installed() {
+    _svmnet_bin="/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet"
+    if [ ! -x "$_svmnet_bin" ]; then
+        return 1
+    fi
+    return 0
+}
 
+# check_lima_installed_and_version — verify limactl is on PATH and reports a
+# version >= MIN_LIMA_VERSION.  Returns 0 on success, 1 on failure.
+# Adds a descriptive key to the missing list when called from check_prereqs.
+check_lima_installed_and_version() {
+    if ! command -v limactl >/dev/null 2>&1; then
+        return 1
+    fi
+    _lima_ver=$(limactl --version 2>/dev/null | awk '{print $3}')
+    if [ -z "$_lima_ver" ]; then
+        return 1
+    fi
+    # sort -V -C exits 0 when the first line <= second line (i.e. MIN_LIMA_VERSION <= _lima_ver).
+    printf '%s\n%s\n' "$MIN_LIMA_VERSION" "$_lima_ver" | sort -V -C 2>/dev/null
+}
+
+# check_socket_vmnet_running — verify the io.sandboxd.vmnet.N launchd daemons
+# and their slot sockets under /var/run/sandbox/vmnet/ are in a healthy state.
+#
+# Two states:
+#   1. Daemons and sockets absent — normal on a fresh install because the
+#      vmnet pool daemons are provisioned in a separate later step, not by
+#      install.sh itself.  Treated as benign: print an informational note
+#      and return 0 so the install proceeds.
+#   2. Daemons present but unhealthy (loaded but socket missing) — indicates
+#      a broken configuration that the operator must resolve before continuing.
+#      Returns 1 and adds an entry to the missing list.
+check_socket_vmnet_running() {
+    _slot_found=0
+    _slot_broken=0
+    for _slot in 0 1 2 3 4 5 6 7; do
+        _label="io.sandboxd.vmnet.$_slot"
+        _sock="/var/run/sandbox/vmnet/slot-$_slot.sock"
+        if launchctl print "system/$_label" >/dev/null 2>&1; then
+            _slot_found=$((_slot_found + 1))
+            # Daemon is loaded; its socket must be present.
+            if [ ! -S "$_sock" ]; then
+                _slot_broken=$((_slot_broken + 1))
+            fi
+        fi
+    done
+
+    if [ "$_slot_found" -eq 0 ]; then
+        # No vmnet daemons loaded yet — this is normal on a fresh install.
+        # The daemons are provisioned separately after install.sh completes.
+        emit "  ${BLUE}i${RESET} vmnet pool daemons not yet configured — will be set up after install"
+        return 0
+    fi
+
+    if [ "$_slot_broken" -gt 0 ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+# check_socket_vmnet_access — verify the operator has _sandboxd group membership
+# and can reach the vmnet slot sockets.
+#
+# Same two-state logic as check_socket_vmnet_running:
+#   1. No slot sockets present — fresh install, benign skip.
+#   2. Sockets present but operator cannot read one — broken state, fail.
+check_socket_vmnet_access() {
+    _sock_dir="/var/run/sandbox/vmnet"
+    if [ ! -d "$_sock_dir" ]; then
+        # No vmnet sockets yet — normal on a fresh install.  Access check
+        # will become meaningful once the vmnet daemons are running.
+        return 0
+    fi
+
+    # Check operator _sandboxd group membership via dseditgroup (consults
+    # Directory Services, so it reflects dseditgroup changes immediately
+    # without requiring a re-login).
+    if [ -n "$OPERATOR_NAME" ] && [ "$OPERATOR_NAME" != "root" ]; then
+        if ! dseditgroup -o checkmember -m "$OPERATOR_NAME" _sandboxd >/dev/null 2>&1; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+check_prereqs() {
     missing=""
     add_missing() { missing="$missing $1"; }
     # Warnings emitted when --no-provision relaxes a prereq from hard to advisory.
     prov_warn=""
     add_prov_warn() { prov_warn="$prov_warn $1"; }
+
+    if [ "$OS" = "darwin" ]; then
+        # macOS prerequisite checks.
+        #
+        # Hard prerequisites: socket_vmnet binary present, limactl >= MIN_LIMA_VERSION.
+        # These are required to proceed and must be installed before running install.sh.
+        #
+        # Tolerant checks: vmnet daemon running / socket access.  On a fresh install
+        # the vmnet pool daemons do not exist yet — they are provisioned separately
+        # after install.sh completes.  These checks only fail when daemons are partially
+        # configured (present but unhealthy), not when they are simply absent.
+        check_socket_vmnet_installed || add_missing "socket_vmnet"
+        check_lima_installed_and_version || add_missing "lima-1.2.0+"
+        command -v curl    >/dev/null 2>&1 || add_missing "curl"
+        command -v shasum  >/dev/null 2>&1 || add_missing "shasum"
+        command -v tar     >/dev/null 2>&1 || add_missing "tar"
+        check_socket_vmnet_running || add_missing "socket_vmnet-daemons-unhealthy"
+        check_socket_vmnet_access  || add_missing "socket_vmnet-access"
+
+        if [ -n "$missing" ]; then
+            _emit_prereq_fail_darwin() {
+                emit "${RED}x${RESET} missing prerequisites:"
+                for m in $missing; do
+                    case "$m" in
+                        socket_vmnet)
+                            emit "    - socket_vmnet:    brew install socket_vmnet"
+                            emit "      (binary must be at /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet)"
+                            ;;
+                        lima-1.2.0+)
+                            emit "    - lima (>= $MIN_LIMA_VERSION):    brew install lima"
+                            ;;
+                        socket_vmnet-daemons-unhealthy)
+                            emit "    - vmnet daemons are loaded but unhealthy (slot socket(s) missing)"
+                            emit "      Check: sudo launchctl list | grep vmnet"
+                            ;;
+                        socket_vmnet-access)
+                            emit "    - operator '$OPERATOR_NAME' is not in the _sandboxd group"
+                            emit "      Run install.sh once to add the operator to the group."
+                            ;;
+                        *)
+                            emit "    - $m"
+                            ;;
+                    esac
+                done
+                emit "  Install these, then re-run install.sh."
+            }
+            if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
+                _emit_prereq_fail_darwin > "$SUMMARY_FILE"
+            else
+                _emit_prereq_fail_darwin
+            fi
+            log_fail "step=prereq missing=$(printf '%s' "$missing" | tr ' ' ',')"
+            exit 1
+        fi
+        log_ok "step=prereq missing=none os=darwin"
+        return 0
+    fi
+
+    # Linux prerequisite checks.
+    qemu_arch="x86_64"
+    case "$ARCH" in
+        aarch64-*) qemu_arch="aarch64" ;;
+    esac
 
     check_kernel_version || add_missing "kernel-5.8+"
 
@@ -1010,14 +1189,8 @@ check_disk() {
     if [ ! -d "$var_anchor" ]; then var_anchor=/var; fi
     if [ ! -d "$var_anchor" ]; then var_anchor=/; fi
 
-    docker_anchor=/var/lib/docker
-    if [ ! -d "$docker_anchor" ]; then docker_anchor=/var/lib; fi
-    if [ ! -d "$docker_anchor" ]; then docker_anchor=/var; fi
-    if [ ! -d "$docker_anchor" ]; then docker_anchor=/; fi
-
     usr_free=$(free_kb_at /usr/local)
     var_free=$(free_kb_at "$var_anchor")
-    docker_free=$(free_kb_at "$docker_anchor")
 
     fail=0
     if [ -z "$usr_free" ] || [ "$usr_free" -lt 50000 ]; then
@@ -1026,9 +1199,20 @@ check_disk() {
     if [ -z "$var_free" ] || [ "$var_free" -lt 200000 ]; then
         fail=1
     fi
-    if [ -z "$docker_free" ] || [ "$docker_free" -lt 500000 ]; then
-        fail=1
+
+    # On Linux, also verify the Docker storage root has sufficient space.
+    docker_free=""
+    if [ "$OS" != "darwin" ]; then
+        docker_anchor=/var/lib/docker
+        if [ ! -d "$docker_anchor" ]; then docker_anchor=/var/lib; fi
+        if [ ! -d "$docker_anchor" ]; then docker_anchor=/var; fi
+        if [ ! -d "$docker_anchor" ]; then docker_anchor=/; fi
+        docker_free=$(free_kb_at "$docker_anchor")
+        if [ -z "$docker_free" ] || [ "$docker_free" -lt 500000 ]; then
+            fail=1
+        fi
     fi
+
     if [ "$fail" -eq 1 ]; then
         _emit_disk_fail() {
             if [ -z "$usr_free" ] || [ "$usr_free" -lt 50000 ]; then
@@ -1037,8 +1221,8 @@ check_disk() {
             if [ -z "$var_free" ] || [ "$var_free" -lt 200000 ]; then
                 emit "${RED}x${RESET} $var_anchor has less than 200 MB free (${var_free:-?} KB)"
             fi
-            if [ -z "$docker_free" ] || [ "$docker_free" -lt 500000 ]; then
-                emit "${RED}x${RESET} $docker_anchor has less than 500 MB free (${docker_free:-?} KB)"
+            if [ -n "$docker_free" ] && [ "$docker_free" -lt 500000 ]; then
+                emit "${RED}x${RESET} ${docker_anchor:-/var/lib/docker} has less than 500 MB free (${docker_free:-?} KB)"
             fi
         }
         if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
@@ -1050,7 +1234,7 @@ check_disk() {
         exit 1
     fi
 
-    log_ok "step=disk_check usr_free=${usr_free}KB var_free=${var_free}KB docker_free=${docker_free}KB"
+    log_ok "step=disk_check usr_free=${usr_free}KB var_free=${var_free}KB docker_free=${docker_free:-n/a}KB"
 }
 
 # ----------------------------------------------------------------------------
@@ -1059,8 +1243,12 @@ check_disk() {
 
 cosign_bootstrap() {
     case "$ARCH" in
-        x86_64-unknown-linux-gnu)  cosign_bin="cosign-linux-amd64"; expected="$COSIGN_SHA256_AMD64" ;;
-        aarch64-unknown-linux-gnu) cosign_bin="cosign-linux-arm64"; expected="$COSIGN_SHA256_ARM64" ;;
+        x86_64-unknown-linux-gnu)   cosign_bin="cosign-linux-amd64";  expected="$COSIGN_SHA256_AMD64" ;;
+        aarch64-unknown-linux-gnu)  cosign_bin="cosign-linux-arm64";  expected="$COSIGN_SHA256_ARM64" ;;
+        aarch64-apple-darwin)
+            # macOS cosign pin and tarball are added in a subsequent session.
+            # A full macOS install.sh run is not yet functional end-to-end.
+            die "macOS release artifacts (cosign pin + tarball) are not yet available in this release. Check for a newer version." ;;
         *) die "no pinned cosign binary for $ARCH" ;;
     esac
 
@@ -1326,6 +1514,77 @@ probe_bridge_helper_path() {
 }
 
 compute_plan() {
+    if [ "$OS" = "darwin" ]; then
+        _compute_plan_darwin
+    else
+        _compute_plan_linux
+    fi
+}
+
+_compute_plan_darwin() {
+    # ---- _sandboxd system user ----
+    # macOS reserves _sandbox (GID 60) for its Seatbelt subsystem; sandboxd
+    # uses a dedicated _sandboxd account and group instead.
+    if dscl . -read /Users/_sandboxd >/dev/null 2>&1; then
+        PLAN_SANDBOX_USER="skip"
+        PLAN_SANDBOX_UID_EXISTING=$(id -u _sandboxd 2>/dev/null || true)
+        if [ -n "$PLAN_SANDBOX_UID_EXISTING" ]; then
+            BASE_DIR="/var/lib/sandboxd/$PLAN_SANDBOX_UID_EXISTING"
+            SANDBOX_UID="$PLAN_SANDBOX_UID_EXISTING"
+            STATE_PATH="$BASE_DIR/.install-state.json"
+        fi
+    else
+        PLAN_SANDBOX_USER="create"
+        PLAN_SANDBOX_UID_EXISTING=""
+    fi
+
+    # No supplementary group additions on macOS (no docker/kvm groups).
+    PLAN_GROUPS_ADD=""
+
+    # ---- operator _sandboxd-group add ----
+    if [ -z "$OPERATOR_NAME" ]; then
+        PLAN_OPERATOR_ADD="skip-no-operator"
+    elif ! dscl . -read "/Users/$OPERATOR_NAME" >/dev/null 2>&1; then
+        PLAN_OPERATOR_ADD="skip-no-operator"
+    elif dseditgroup -o checkmember -m "$OPERATOR_NAME" _sandboxd >/dev/null 2>&1; then
+        PLAN_OPERATOR_ADD="skip"
+    else
+        PLAN_OPERATOR_ADD="add"
+    fi
+
+    # macOS has no file capabilities (setcap/getcap); mark Linux-only steps skipped.
+    PLAN_ROUTE_HELPER_CAPS="skip"
+    PLAN_LIMA_HELPER_CAPS="skip"
+    PLAN_BRIDGE_HELPER_SETUID="skip"
+    PLAN_BRIDGE_CONF="skip"
+    PLAN_USERS_CONF="skip"
+    PLAN_USERS_CONF_CONTENT=""
+    PLAN_GATEWAY_IMAGE="skip"
+    PLAN_UNIT="skip"
+    PLAN_LEGACY_MIGRATE="skip"
+
+    # ---- binaries (cmp each against staged copy) ----
+    _bin_plan=""
+    for _b in \
+        "$STAGE/bin/sandboxd:/usr/local/libexec/sandboxd/sandboxd:0755" \
+        "$STAGE/bin/sandbox:/usr/local/bin/sandbox:0755" \
+        "$STAGE/bin/sandbox-guest:/usr/local/libexec/sandboxd/sandbox-guest:0755"
+    do
+        _src="${_b%%:*}"
+        _rest="${_b#*:}"
+        _dst="${_rest%%:*}"
+        if [ -f "$_dst" ] && cmp -s "$_src" "$_dst"; then
+            _bin_plan="${_bin_plan}skip-identical:${_dst};"
+        else
+            _bin_plan="${_bin_plan}install:${_dst};"
+        fi
+    done
+    PLAN_BINARIES="$_bin_plan"
+
+    log_ok "step=compute_plan os=darwin sandbox_user=$PLAN_SANDBOX_USER operator_add=$PLAN_OPERATOR_ADD"
+}
+
+_compute_plan_linux() {
     # ---- sandbox system user ----
     if getent passwd sandbox >/dev/null 2>&1; then
         PLAN_SANDBOX_USER="skip"
@@ -1498,7 +1757,7 @@ compute_plan() {
         PLAN_LEGACY_MIGRATE="skip"
     fi
 
-    log_ok "step=compute_plan sandbox_user=$PLAN_SANDBOX_USER operator_add=$PLAN_OPERATOR_ADD bridge_conf=$PLAN_BRIDGE_CONF unit=$PLAN_UNIT"
+    log_ok "step=compute_plan os=linux sandbox_user=$PLAN_SANDBOX_USER operator_add=$PLAN_OPERATOR_ADD bridge_conf=$PLAN_BRIDGE_CONF unit=$PLAN_UNIT"
 }
 
 # ----------------------------------------------------------------------------
@@ -1506,6 +1765,88 @@ compute_plan() {
 # ----------------------------------------------------------------------------
 
 render_plan() {
+    if [ "$OS" = "darwin" ]; then
+        _render_plan_darwin
+    else
+        _render_plan_linux
+    fi
+}
+
+_render_plan_darwin() {
+    DOCS_BASE="https://koriit.github.io/sandboxd/start/installation/"
+
+    emit ""
+    emit "${BLUE}sandboxd $VERSION — privileged change plan (macOS)${RESET}"
+    emit "$(osc8_link "${DOCS_BASE}" "Installation guide: ${DOCS_BASE}")"
+    emit ""
+    emit "The following changes require root. Review them before confirming."
+    emit ""
+
+    # ---- System user ----
+    hdr="System user"
+    emit "  $(osc8_link "${DOCS_BASE}#system-user" "$hdr")"
+    if [ "$PLAN_SANDBOX_USER" = "skip" ]; then
+        emit "    ${GREEN}+ _sandboxd user already exists (uid $PLAN_SANDBOX_UID_EXISTING) — skip${RESET}"
+    else
+        emit "    ${YELLOW}+ create system user '_sandboxd' (role account, no login shell)${RESET}"
+        emit "      sysadminctl -addUser _sandboxd -shell /usr/bin/false -roleAccount"
+        emit "      (or dscl . -create /Users/_sandboxd with per-attribute values)"
+    fi
+    if [ "$PLAN_OPERATOR_ADD" = "add" ]; then
+        emit "    ${YELLOW}+ add operator '$OPERATOR_NAME' to group '_sandboxd'${RESET}"
+        emit "      dseditgroup -o edit -a $OPERATOR_NAME -t user _sandboxd"
+    elif [ "$PLAN_OPERATOR_ADD" = "skip" ]; then
+        emit "    ${GREEN}+ operator '$OPERATOR_NAME' already in group '_sandboxd' — skip${RESET}"
+    else
+        emit "    ${YELLOW}! no operator to add to _sandboxd group (running as root or no effective user)${RESET}"
+    fi
+    emit ""
+
+    # ---- Binaries ----
+    hdr="Binaries"
+    emit "  $(osc8_link "${DOCS_BASE}#binaries" "$hdr")"
+    _old_IFS="$IFS"
+    IFS=";"
+    for _entry in $PLAN_BINARIES; do
+        IFS="$_old_IFS"
+        [ -z "$_entry" ] && continue
+        _action="${_entry%%:*}"
+        _dst="${_entry#*:}"
+        if [ "$_action" = "skip-identical" ]; then
+            emit "    ${GREEN}+ $_dst — identical, skip${RESET}"
+        else
+            emit "    ${YELLOW}+ install $_dst (mode 0755, root:root)${RESET}"
+        fi
+        IFS=";"
+    done
+    IFS="$_old_IFS"
+    emit ""
+
+    # ---- State directories ----
+    hdr="State directories"
+    emit "  $(osc8_link "${DOCS_BASE}#state-dirs" "$hdr")"
+    emit "    ${YELLOW}+ install -d -o root -g wheel -m 0755 /var/lib/sandboxd${RESET}"
+    if [ -n "$BASE_DIR" ]; then
+        emit "    ${YELLOW}+ install -d -o _sandboxd -g _sandboxd -m 0750 $BASE_DIR${RESET}"
+    else
+        emit "    ${YELLOW}+ install -d -o _sandboxd -g _sandboxd -m 0750 /var/lib/sandboxd/<uid> (resolved after user creation)${RESET}"
+    fi
+    emit "    ${YELLOW}+ install -d -o _sandboxd -g _sandboxd -m 0750 /var/log/sandbox${RESET}"
+    emit "    (note: /var/run/sandbox is re-created at each boot by the vmnet daemons)"
+    emit ""
+
+    # ---- Install state ----
+    if [ -n "$BASE_DIR" ]; then
+        emit "  Install state"
+        emit "    ${YELLOW}+ write $STATE_PATH (mode 0640, _sandboxd:_sandboxd)${RESET}"
+        emit ""
+    fi
+
+    emit "Documentation: ${DOCS_BASE}"
+    emit ""
+}
+
+_render_plan_linux() {
     DOCS_BASE="https://koriit.github.io/sandboxd/start/installation/"
 
     emit ""
@@ -1803,7 +2144,7 @@ fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
-_TOTAL_STEPS=15
+_TOTAL_STEPS=$(if [ "$OS" = "darwin" ]; then printf '6'; else printf '15'; fi)
 # Tracks the label of the last successfully completed step (set by _step_ok).
 # Used by _write_checkpoint to populate last_completed_step correctly on
 # failure checkpoints (the failing step should appear in failed_step, not
@@ -1959,10 +2300,17 @@ _write_checkpoint() {
     } > "\$_cp_staged"
 
     # Only install to disk if BASE_DIR is resolved (after sandbox-user step).
+    # User/group names differ by platform: _sandboxd:_sandboxd on macOS, sandbox:sandbox on Linux.
     if [ -n "\$BASE_DIR" ]; then
-        install -d -o root -g root -m 0755 /var/lib/sandboxd >> "\$_LOG" 2>/dev/null || true
-        install -d -o sandbox -g sandbox -m 0750 "\$BASE_DIR" >> "\$_LOG" 2>/dev/null || true
-        install -m 0640 -o sandbox -g sandbox "\$_cp_staged" "\$STATE_PATH" >> "\$_LOG" 2>/dev/null || true
+        if [ "\$OS" = "darwin" ]; then
+            install -d -o root -g wheel -m 0755 /var/lib/sandboxd >> "\$_LOG" 2>/dev/null || true
+            install -d -o _sandboxd -g _sandboxd -m 0750 "\$BASE_DIR" >> "\$_LOG" 2>/dev/null || true
+            install -m 0640 -o _sandboxd -g _sandboxd "\$_cp_staged" "\$STATE_PATH" >> "\$_LOG" 2>/dev/null || true
+        else
+            install -d -o root -g root -m 0755 /var/lib/sandboxd >> "\$_LOG" 2>/dev/null || true
+            install -d -o sandbox -g sandbox -m 0750 "\$BASE_DIR" >> "\$_LOG" 2>/dev/null || true
+            install -m 0640 -o sandbox -g sandbox "\$_cp_staged" "\$STATE_PATH" >> "\$_LOG" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -1989,6 +2337,7 @@ PLAN_USERS_CONF='$(_sq "$PLAN_USERS_CONF")'
 PLAN_USERS_CONF_CONTENT='$_users_conf_esc'
 PLAN_GATEWAY_IMAGE='$(_sq "$PLAN_GATEWAY_IMAGE")'
 PLAN_BINARIES='$_plan_bins_esc'
+OS='$(_sq "$OS")'
 PLAN_UNIT='$(_sq "$PLAN_UNIT")'
 PLAN_LEGACY_MIGRATE='$(_sq "$PLAN_LEGACY_MIGRATE")'
 PLAN_ROUTE_HELPER_PATH='$(_sq "$PLAN_ROUTE_HELPER_PATH")'
@@ -2085,32 +2434,88 @@ _priv_maybe_abort_at() {
 _step_begin "sandbox-user"
 _priv_maybe_abort_at "sandbox-user"
 SANDBOX_USER_CREATED=0
-if [ "\$PLAN_SANDBOX_USER" = "create" ]; then
-    useradd \\
-        --system \\
-        --user-group \\
-        --no-create-home \\
-        --home-dir /nonexistent \\
-        --shell /usr/sbin/nologin \\
-        --comment "sandboxd - isolated environment broker" \\
-        sandbox >> "\$_LOG" 2>&1 || { _log "step=useradd action=fail status=fail"; _step_fail; }
-    SANDBOX_USER_CREATED=1
-    _log "step=useradd action=create status=ok"
+if [ "\$OS" = "darwin" ]; then
+    # macOS: create the _sandboxd role account via sysadminctl when available,
+    # else fall back to per-attribute dscl -create calls.
+    # macOS reserves _sandbox (GID 60) for its Seatbelt subsystem; sandboxd
+    # creates a dedicated _sandboxd group at the next free GID below 500.
+    if [ "\$PLAN_SANDBOX_USER" = "create" ]; then
+        # Determine a free UID below 500.  Apple reserves UIDs < 500 for system accounts.
+        _next_uid=\$(dscl . -list /Users UniqueID | awk '{print \$2}' | sort -n | awk 'BEGIN{uid=300} {if (\$1==uid){uid++}} END{print uid}')
+        # Create a fresh _sandboxd group at the next free GID below 500 (not GID 60,
+        # which belongs to Apple's reserved _sandbox Seatbelt group).
+        if dscl . -read /Groups/_sandboxd >/dev/null 2>&1; then
+            _sandbox_gid=\$(dscl . -read /Groups/_sandboxd PrimaryGroupID 2>/dev/null | awk '{print \$2}')
+            _log "step=sandbox_group action=exists gid=\$_sandbox_gid status=ok"
+        else
+            # Pick next free GID below 500 (skip 60 — that belongs to Apple's _sandbox).
+            _sandbox_gid=\$(dscl . -list /Groups PrimaryGroupID | awk '{print \$2}' | sort -n | awk 'BEGIN{gid=300} {if (\$1==gid){gid++}} END{print gid}')
+            dscl . -create /Groups/_sandboxd >> "\$_LOG" 2>&1 \\
+                || { _log "step=sandbox_group action=create-fail status=fail"; _step_fail; }
+            dscl . -create /Groups/_sandboxd PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
+            dscl . -create /Groups/_sandboxd RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
+            _log "step=sandbox_group action=create gid=\$_sandbox_gid status=ok"
+        fi
+        # Prefer sysadminctl (handles RealName and Password automatically).
+        # Fall back to per-attribute dscl -create when sysadminctl is absent.
+        if command -v sysadminctl >/dev/null 2>&1; then
+            _home="/var/lib/sandboxd/\$_next_uid"
+            sysadminctl -addUser _sandboxd \\
+                -UID "\$_next_uid" -GID "\$_sandbox_gid" \\
+                -home "\$_home" \\
+                -shell /usr/bin/false \\
+                -roleAccount >> "\$_LOG" 2>&1 \\
+                || { _log "step=sysadminctl_addUser action=fail status=fail"; _step_fail; }
+        else
+            _home="/var/lib/sandboxd/\$_next_uid"
+            dscl . -create /Users/_sandboxd >> "\$_LOG" 2>&1 \\
+                || { _log "step=dscl_create_user action=fail status=fail"; _step_fail; }
+            dscl . -create /Users/_sandboxd UniqueID "\$_next_uid" >> "\$_LOG" 2>&1 || true
+            dscl . -create /Users/_sandboxd PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
+            dscl . -create /Users/_sandboxd NFSHomeDirectory "\$_home" >> "\$_LOG" 2>&1 || true
+            dscl . -create /Users/_sandboxd UserShell /usr/bin/false >> "\$_LOG" 2>&1 || true
+            dscl . -create /Users/_sandboxd RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
+            dscl . -create /Users/_sandboxd Password '*' >> "\$_LOG" 2>&1 || true
+        fi
+        SANDBOX_USER_CREATED=1
+        _log "step=sandbox_user action=create uid=\$_next_uid gid=\$_sandbox_gid status=ok"
+    else
+        _log "step=sandbox_user action=skip status=ok"
+    fi
+    # Resolve uid after user is guaranteed to exist.
+    SANDBOX_UID=\$(id -u _sandboxd 2>/dev/null) \\
+        || { _log "step=resolve_sandbox_uid action=fail status=fail"; _step_fail; }
+    BASE_DIR="/var/lib/sandboxd/\$SANDBOX_UID"
+    STATE_PATH="\$BASE_DIR/.install-state.json"
+    _log "step=resolve_sandbox_uid uid=\$SANDBOX_UID base_dir=\$BASE_DIR status=ok"
 else
-    _log "step=useradd action=skip status=ok"
+    # Linux: create sandbox user via useradd.
+    if [ "\$PLAN_SANDBOX_USER" = "create" ]; then
+        useradd \\
+            --system \\
+            --user-group \\
+            --no-create-home \\
+            --home-dir /nonexistent \\
+            --shell /usr/sbin/nologin \\
+            --comment "sandboxd - isolated environment broker" \\
+            sandbox >> "\$_LOG" 2>&1 || { _log "step=useradd action=fail status=fail"; _step_fail; }
+        SANDBOX_USER_CREATED=1
+        _log "step=useradd action=create status=ok"
+    else
+        _log "step=useradd action=skip status=ok"
+    fi
+    if [ -n "\$PLAN_GROUPS_ADD" ]; then
+        for _g in \$PLAN_GROUPS_ADD; do
+            usermod -aG "\$_g" sandbox >> "\$_LOG" 2>&1 || true
+            _log "step=usermod_group group=\$_g action=add status=ok"
+        done
+    fi
+    # Resolve uid now that the user is guaranteed to exist.
+    SANDBOX_UID=\$(id -u sandbox)
+    BASE_DIR="/var/lib/sandboxd/\$SANDBOX_UID"
+    STATE_PATH="\$BASE_DIR/.install-state.json"
+    _log "step=resolve_sandbox_uid uid=\$SANDBOX_UID base_dir=\$BASE_DIR status=ok"
 fi
-if [ -n "\$PLAN_GROUPS_ADD" ]; then
-    for _g in \$PLAN_GROUPS_ADD; do
-        usermod -aG "\$_g" sandbox >> "\$_LOG" 2>&1 || true
-        _log "step=usermod_group group=\$_g action=add status=ok"
-    done
-fi
-# Resolve uid now that the user is guaranteed to exist. Must happen before
-# _write_checkpoint so the checkpoint function has BASE_DIR available.
-SANDBOX_UID=\$(id -u sandbox)
-BASE_DIR="/var/lib/sandboxd/\$SANDBOX_UID"
-STATE_PATH="\$BASE_DIR/.install-state.json"
-_log "step=resolve_sandbox_uid uid=\$SANDBOX_UID base_dir=\$BASE_DIR status=ok"
 
 _step_ok
 _write_checkpoint "sandbox-user"
@@ -2120,12 +2525,24 @@ _priv_maybe_fail_after "sandbox-user"
 _step_begin "operator-group-add"
 _priv_maybe_abort_at "operator-group-add"
 OPERATORS_ADDED=""
-if [ "\$PLAN_OPERATOR_ADD" = "add" ] && [ -n "\$_OPERATOR" ]; then
-    usermod -aG sandbox "\$_OPERATOR" >> "\$_LOG" 2>&1 || { _log "step=operator_add action=fail status=fail"; _step_fail; }
-    OPERATORS_ADDED="\$_OPERATOR"
-    _log "step=operator_add operator=\$_OPERATOR action=add status=ok"
+if [ "\$OS" = "darwin" ]; then
+    if [ "\$PLAN_OPERATOR_ADD" = "add" ] && [ -n "\$_OPERATOR" ]; then
+        dseditgroup -o edit -a "\$_OPERATOR" -t user _sandboxd >> "\$_LOG" 2>&1 \\
+            || { _log "step=operator_add action=fail status=fail"; _step_fail; }
+        OPERATORS_ADDED="\$_OPERATOR"
+        _log "step=operator_add operator=\$_OPERATOR action=add status=ok"
+    else
+        _log "step=operator_add action=\$PLAN_OPERATOR_ADD status=ok"
+    fi
 else
-    _log "step=operator_add action=\$PLAN_OPERATOR_ADD status=ok"
+    if [ "\$PLAN_OPERATOR_ADD" = "add" ] && [ -n "\$_OPERATOR" ]; then
+        usermod -aG sandbox "\$_OPERATOR" >> "\$_LOG" 2>&1 \\
+            || { _log "step=operator_add action=fail status=fail"; _step_fail; }
+        OPERATORS_ADDED="\$_OPERATOR"
+        _log "step=operator_add operator=\$_OPERATOR action=add status=ok"
+    else
+        _log "step=operator_add action=\$PLAN_OPERATOR_ADD status=ok"
+    fi
 fi
 _step_ok
 _write_checkpoint "operator-group-add"
@@ -2165,7 +2582,11 @@ for _entry in \$PLAN_BINARIES; do
         esac
         install -D -m 0755 -o root -g root "\$_src" "\$_dst" >> "\$_LOG" 2>&1 \
             || { _log "step=install_binary path=\$_dst action=fail status=fail"; _step_fail; }
-        _sha=\$(sha256sum "\$_dst" | awk '{print \$1}')
+        if command -v sha256sum >/dev/null 2>&1; then
+            _sha=\$(sha256sum "\$_dst" | awk '{print \$1}')
+        else
+            _sha=\$(shasum -a 256 "\$_dst" | awk '{print \$1}')
+        fi
         _log "step=install_binary path=\$_dst sha256=\$_sha action=install status=ok"
     else
         _log "step=install_binary path=\$_dst action=skip status=ok"
@@ -2185,6 +2606,34 @@ _log "step=install_cosign path=/usr/local/libexec/sandboxd/cosign action=install
 _step_ok
 _write_checkpoint "install-cosign"
 _priv_maybe_fail_after "install-cosign"
+
+if [ "\$OS" = "darwin" ]; then
+
+# ----- Step: state dirs (macOS) -----
+_step_begin "state-dirs"
+_priv_maybe_abort_at "state-dirs"
+# /var/lib/sandboxd — root:wheel 0755 (traversable root for all daemon-uid subtrees).
+install -d -o root -g wheel -m 0755 /var/lib/sandboxd >> "\$_LOG" 2>&1 \
+    || { _log "step=state_dirs action=fail reason=/var/lib/sandboxd status=fail"; _step_fail; }
+_log "step=state_dirs path=/var/lib/sandboxd action=create status=ok"
+# Per-uid state dir for _sandboxd.
+install -d -o _sandboxd -g _sandboxd -m 0750 "\$BASE_DIR" >> "\$_LOG" 2>&1 \
+    || { _log "step=state_dirs action=fail reason=BASE_DIR status=fail"; _step_fail; }
+_log "step=state_dirs path=\$BASE_DIR action=create status=ok"
+# Log dir: /var/log/sandbox is persistent (survives reboots unlike /var/run).
+install -d -o _sandboxd -g _sandboxd -m 0750 /var/log/sandbox >> "\$_LOG" 2>&1 \
+    || { _log "step=state_dirs action=fail reason=/var/log/sandbox status=fail"; _step_fail; }
+_log "step=state_dirs path=/var/log/sandbox action=create status=ok"
+# /var/run/sandbox is NOT created here — /var/run clears on every macOS boot.
+# The vmnet pool daemons and the daemon itself re-create /var/run/sandbox at
+# each boot.  install.sh does not need to (and should not) pre-create it.
+_step_ok
+_write_checkpoint "state-dirs"
+_priv_maybe_fail_after "state-dirs"
+
+else
+
+# ----- Linux-only steps: setcap, bridge, users.conf, docker, systemd -----
 
 # ----- Step: setcap route-helper -----
 _step_begin "setcap-route-helper"
@@ -2424,6 +2873,8 @@ _log "step=enable_start_daemon action=ready status=ok"
 _step_ok
 _write_checkpoint "enable-start-daemon"
 _priv_maybe_fail_after "enable-start-daemon"
+
+fi
 
 # ----- Step: write install-state (final, status=complete) -----
 _step_begin "write-install-state"
@@ -2931,10 +3382,21 @@ run_provision() {
 # operator is not a member of the group at all.
 maybe_emit_group_activation_hint() {
     [ -n "$OPERATOR_NAME" ] || return 0
-    getent group sandbox >/dev/null 2>&1 || return 0
-    # Member of the group? (group database; also covers primary group.)
-    if id -nG "$OPERATOR_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
-        emit "  Activate group in existing shells: ${BLUE}run: newgrp sandbox${RESET}, or log out and back in"
+    if [ "$OS" = "darwin" ]; then
+        # On macOS, dseditgroup updates Directory Services immediately, so
+        # sandbox doctor reports _sandboxd group membership at once.  However,
+        # new socket access (socket mode 0660, group _sandboxd) still requires
+        # a fresh login for the new credentials to be active in the shell session.
+        if dseditgroup -o checkmember -m "$OPERATOR_NAME" _sandboxd >/dev/null 2>&1; then
+            emit "  ${YELLOW}!${RESET} Log out and back in for _sandboxd group socket access to take effect"
+            emit "    (sandbox doctor will already report group membership; this is about socket credentials)"
+        fi
+    else
+        getent group sandbox >/dev/null 2>&1 || return 0
+        # Member of the group? (group database; also covers primary group.)
+        if id -nG "$OPERATOR_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
+            emit "  Activate group in existing shells: ${BLUE}run: newgrp sandbox${RESET}, or log out and back in"
+        fi
     fi
 }
 
@@ -2959,6 +3421,12 @@ main() {
     parse_args "$@"
     detect_os
     detect_arch
+    # Set the platform-appropriate phase list now that OS is known.
+    if [ "$OS" = "darwin" ]; then
+        UI_INSTALL_PHASES="$UI_INSTALL_PHASES_DARWIN"
+    else
+        UI_INSTALL_PHASES="$UI_INSTALL_PHASES_LINUX"
+    fi
     detect_tty
 
     TMPDIR_INSTALL=$(mktemp -d "/var/tmp/sandbox-install.XXXXXX")

@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Install sandboxd on Linux via the signed install.sh, with a developer-mode fallback for repository contributors.
+description: Install sandboxd via the signed install.sh on Linux or macOS (Apple Silicon), with a developer-mode fallback for repository contributors.
 ---
 
 This guide covers two install paths:
@@ -11,6 +11,8 @@ This guide covers two install paths:
 If you want the fast path through create/exec/ssh once installed, see [Quickstart](/sandboxd/start/quickstart/).
 
 ## System requirements
+
+### Linux
 
 | Requirement                 | Minimum                   | Notes                                                                                                                                          |
 | --------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -26,7 +28,21 @@ If you want the fast path through create/exec/ssh once installed, see [Quickstar
 | Python                      | 3.12+                     | Developer install only — for E2E tests                                                                                                         |
 | `acl` (`setfacl`/`getfacl`) | any recent                | Lima backend only — required at runtime for per-operator LIMA_HOME ACL setup; Debian/Ubuntu: `apt install acl`, RHEL/Fedora: `dnf install acl` |
 
-Sections below cover the prerequisites in detail. If `install.sh` finds any missing it will refuse and print the exact package names per detected distro.
+### macOS
+
+| Requirement      | Minimum                | Notes                                                                                          |
+| ---------------- | ---------------------- | ---------------------------------------------------------------------------------------------- |
+| OS               | macOS 13+ (Apple Silicon only) | Intel Macs are not supported. `install.sh` rejects `x86_64` on macOS.               |
+| `socket_vmnet`   | any recent             | Homebrew: `brew install socket_vmnet`. Binary must be at `/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet`. |
+| Lima             | 1.2.0+                 | Homebrew: `brew install lima`. `limactl` must be on PATH.                                      |
+| `curl`, `shasum`, `tar` | any recent      | All ship with macOS.                                                                           |
+| Rust             | 1.88+ (stable)         | Developer install only — for building from source.                                             |
+| Go               | 1.22+                  | Developer install only — for the CoreDNS policy plugin.                                        |
+| Python           | 3.12+                  | Developer install only — for E2E tests.                                                        |
+
+`install.sh` performs the following macOS-specific checks before proceeding: verifies `socket_vmnet` is present at the Homebrew prefix, verifies `limactl --version` meets the minimum, and verifies (tolerantly) that the vmnet pool daemons are healthy if already running. Intel Mac detection is a hard rejection.
+
+Sections below cover the prerequisites in detail. If `install.sh` finds any missing it will refuse and print actionable `brew install …` hints.
 
 ## Operator install (`curl | sh`)
 
@@ -74,6 +90,8 @@ Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes
 
 ### What it installs
 
+**Linux:**
+
 | Artifact               | Destination                                                                                                                 |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `sandboxd` binary      | `/usr/local/libexec/sandboxd/sandboxd`                                                                                      |
@@ -88,7 +106,24 @@ Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes
 | Install state record   | `/var/lib/sandboxd/<sandbox-uid>/.install-state.json`                                                                       |
 | Install log            | `/var/log/sandbox-install.log`                                                                                              |
 
-The `sandbox` system user is created (if not already present); the invoking operator (from `$SUDO_USER`) is added to the `sandbox` group.
+The `sandbox` system user is created (if not already present); the invoking operator is added to the `sandbox` group.
+
+**macOS (Apple Silicon):**
+
+| Artifact            | Destination                                                                                                                   |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `sandboxd` binary   | `/usr/local/libexec/sandboxd/sandboxd`                                                                                        |
+| `sandbox` CLI       | `/usr/local/bin/sandbox`                                                                                                      |
+| `sandbox-guest`     | `/usr/local/libexec/sandboxd/sandbox-guest`                                                                                   |
+| `cosign`            | `/usr/local/libexec/sandboxd/cosign`                                                                                          |
+| Daemon state root   | `/var/lib/sandboxd/` (root:wheel, 0755); per-uid dir `/var/lib/sandboxd/<_sandboxd-uid>/` (_sandboxd:_sandboxd, 0750)         |
+| Log dir             | `/var/log/sandbox/` (_sandboxd:_sandboxd, 0750)                                                                               |
+| Install state record | `/var/lib/sandboxd/<_sandboxd-uid>/.install-state.json`                                                                      |
+| Install log         | `/var/log/sandbox-install.log`                                                                                                |
+
+The `_sandboxd` system role account is created via `sysadminctl` (or `dscl` if unavailable); the invoking operator is added to the `_sandboxd` group via `dseditgroup`. After install, log out and back in for socket access to take effect — `sandbox doctor` reports group membership immediately, but socket credentials require a fresh login session.
+
+Note: `/var/run/sandbox/` is intentionally not created by `install.sh` — `/var/run` is cleared on every macOS boot. The vmnet pool daemons and the daemon itself re-create it at each boot.
 
 ### Why a dedicated `sandbox` user
 

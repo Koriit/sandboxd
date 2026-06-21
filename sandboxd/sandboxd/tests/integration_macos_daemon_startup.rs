@@ -8,7 +8,7 @@
 //!
 //! The `spawn_and_wait` helper redirects every production path the macOS
 //! startup binds or creates before the IP-forwarding check, so the test
-//! runs as the current user without root or `_sandbox` membership:
+//! runs as the current user without root or `_sandboxd` membership:
 //!
 //! | Production path | Override | Notes |
 //! |---|---|---|
@@ -151,7 +151,7 @@ mod macos_startup_tests {
             .env("SANDBOX_USERS_CONF", &users_conf_path)
             // Redirect the broker socket so the daemon can bind it as the current
             // user. Production default is /var/run/sandbox/broker.sock which is
-            // owned 0750 _sandbox:_sandbox and not writable by a non-_sandbox uid.
+            // owned 0750 _sandboxd:_sandboxd and not writable by a non-_sandboxd uid.
             .env("SANDBOX_BROKER_SOCKET", &broker_socket_path)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())

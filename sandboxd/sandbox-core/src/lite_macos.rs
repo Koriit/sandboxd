@@ -34,7 +34,7 @@ pub const LITE_SHARED_ROOT_ENV: &str = "SANDBOX_LITE_SHARED_ROOT";
 /// Default path exposed to the gateway Lima VM via Lima's 9p `mounts:` stanza.
 /// Chosen as `/tmp/sandbox-shared` — a writable, world-accessible directory
 /// that is outside TCC-protected folders (Desktop, Documents, Downloads) and
-/// does not require operator consent for `_sandbox` to read. Operators whose
+/// does not require operator consent for `_sandboxd` to read. Operators whose
 /// workspaces live elsewhere must either (a) move the workspace under this
 /// root, (b) set `SANDBOX_LITE_SHARED_ROOT` to a parent of their workspace,
 /// or (c) use `local:` / `clone:` instead of `shared:`.
@@ -216,10 +216,10 @@ impl std::error::Error for SharedPathError {}
 /// activates the degenerate single-tenant authorization path. The VM boundary
 /// replaces the host-uid + pair-membership gate:
 ///
-/// - Only the daemon (`_sandbox`, running on the macOS host) can issue
+/// - Only the daemon (`_sandboxd`, running on the macOS host) can issue
 ///   `limactl shell sandboxd-gateway` commands. The Lima SSH credentials for
 ///   the gateway VM are exclusively owned by the daemon's LIMA_HOME.
-/// - The gateway VM is single-tenant `_sandbox` infra — no operator user can
+/// - The gateway VM is single-tenant `_sandboxd` infra — no operator user can
 ///   independently reach its sudo path.
 ///
 /// The `sudo` invocation escalates to root (uid 0) inside the VM; the helper

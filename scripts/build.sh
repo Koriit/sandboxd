@@ -227,6 +227,23 @@ _verify() {
 # (chmod --reference preserved) with no further processing.  This handles
 # scripts that will adopt the marker in a later phase.
 # ---------------------------------------------------------------------------
+# _chmod_like — copy file mode bits from src to dst portably.
+# GNU chmod has --reference=; BSD chmod (macOS) does not.
+_chmod_like() {
+    _cl_src="$1"
+    _cl_dst="$2"
+    if chmod --reference="$_cl_src" "$_cl_dst" 2>/dev/null; then
+        return 0
+    fi
+    # BSD fallback: read the octal mode and apply it.
+    _cl_mode=$(stat -f '%Lp' "$_cl_src" 2>/dev/null \
+               || stat --printf='%a' "$_cl_src" 2>/dev/null \
+               || true)
+    if [ -n "$_cl_mode" ]; then
+        chmod "$_cl_mode" "$_cl_dst"
+    fi
+}
+
 _build_script() {
     _bs_src="$1"
     _bs_dst_name="$2"
@@ -236,7 +253,7 @@ _build_script() {
 
     if ! grep -q '^# BEGIN_INLINE ui\.sh$' "$_bs_src"; then
         cp "$_bs_src" "$_bs_dst"
-        chmod --reference="$_bs_src" "$_bs_dst"
+        _chmod_like "$_bs_src" "$_bs_dst"
         printf 'build.sh: copied %s (no inline marker)\n' "$_bs_dst"
         return
     fi
@@ -247,7 +264,7 @@ _build_script() {
         _strip_test_env "$_bs_dst"
     fi
 
-    chmod --reference="$_bs_src" "$_bs_dst"
+    _chmod_like "$_bs_src" "$_bs_dst"
 
     _verify "$_bs_dst" "$_bs_is_install"
 

@@ -1,7 +1,7 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
-	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership \
+	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
 	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
@@ -381,15 +381,15 @@ DARWIN_VMNET_SLOTS          ?= 8
 # LIMA_HOME (`/var/lib/sandboxd/<uid>/<uid>/lima`, matching
 # `operator_lima_home(daemon_uid)` in lima.rs).
 #
-# Default `_sandbox` is the production daemon user. An operator-run dev
-# daemon (no `_sandbox` user; the daemon runs as the operator's own uid,
+# Default `_sandboxd` is the production daemon user. An operator-run dev
+# daemon (no `_sandboxd` user; the daemon runs as the operator's own uid,
 # e.g. 501) overrides on the command line so staging targets the daemon's
 # actual LIMA_HOME and installs files owned by that uid/gid:
 #   make stage-lite-image SANDBOX_DAEMON_USER=$(id -un)
 #   make stage-route-helper-linux-aarch64 SANDBOX_DAEMON_USER=youruser
 # SANDBOX_DAEMON_UID may also be set directly; it defaults to the uid of
 # SANDBOX_DAEMON_USER.
-SANDBOX_DAEMON_USER         ?= _sandbox
+SANDBOX_DAEMON_USER         ?= _sandboxd
 SANDBOX_DAEMON_UID          ?= $(shell id -u $(SANDBOX_DAEMON_USER) 2>/dev/null)
 
 # Staged root-exec'd socket_vmnet binary (root:wheel 0755). install.sh
@@ -414,13 +414,13 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 # Linux: the existing setcap-helper, bridge-conf, users-conf, qemu-bridge-helper,
 #        sandbox user/group, and state-dir steps.
 # Darwin: socket_vmnet staging, plist generation + bootstrap, state dirs,
-#         _sandbox group, and operator group membership. The Linux-only steps
+#         _sandboxd group, and operator group membership. The Linux-only steps
 #         (setcap helpers, bridge.conf, users.conf, qemu-bridge-helper, kvm group)
 #         are skipped on Darwin — macOS has none of these mechanisms.
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandbox-group setup-darwin-operator-group-membership stage-route-helper-linux-aarch64 stage-lite-image
+setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership stage-route-helper-linux-aarch64 stage-lite-image
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1009,7 +1009,7 @@ build-guest-linux-aarch64:
 #
 # Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {daemon-uid} is the
 # uid of the daemon user (SANDBOX_DAEMON_UID; defaults to the uid of
-# SANDBOX_DAEMON_USER=_sandbox for prod, overridable for an operator-run dev
+# SANDBOX_DAEMON_USER=_sandboxd for prod, overridable for an operator-run dev
 # daemon). This matches operator_lima_home(daemon_uid) in lima.rs.
 #
 # Idempotence: skipped if the installed binary is byte-identical to the built one.
@@ -1028,7 +1028,7 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
 	if [ -z "$$_daemon_uid" ]; then \
 	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping route-helper staging."; \
-	  echo "  For a production install, run 'make setup-dev-env' to create the _sandbox user,"; \
+	  echo "  For a production install, run 'make setup-dev-env' to create the _sandboxd user,"; \
 	  echo "  then re-run 'make stage-route-helper-linux-aarch64'."; \
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 0; \
@@ -1056,7 +1056,7 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 #
 # Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {daemon-uid} is the
 # uid of the daemon user (SANDBOX_DAEMON_UID; defaults to the uid of
-# SANDBOX_DAEMON_USER=_sandbox for prod, overridable for an operator-run dev
+# SANDBOX_DAEMON_USER=_sandboxd for prod, overridable for an operator-run dev
 # daemon). This matches operator_lima_home(daemon_uid) in lima.rs.
 #
 # Idempotence: saves to a temp file, then skips the sudo install if the
@@ -1076,7 +1076,7 @@ stage-lite-image: lite-image
 	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
 	if [ -z "$$_daemon_uid" ]; then \
 	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping lite-image staging."; \
-	  echo "  For a production install, run 'make setup-dev-env' to create the _sandbox user,"; \
+	  echo "  For a production install, run 'make setup-dev-env' to create the _sandboxd user,"; \
 	  echo "  then re-run 'make stage-lite-image'."; \
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 0; \
@@ -1342,7 +1342,7 @@ setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging
 	  network_id=$$(python3 -c "import sys,hashlib,struct; ns=bytes([0x6d,0x4f,0x6e,0x2b,0x95,0x8a,0x4f,0x1a,0xa2,0x31,0x7e,0x8c,0xd0,0x12,0x3e,0x5b]); h=hashlib.sha1(ns+struct.pack('>H',int(sys.argv[1]))).digest(); b=bytearray(h[:16]); b[6]=(b[6]&0x0f)|0x50; b[8]=(b[8]&0x3f)|0x80; print('%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x'%tuple(b))" $$slot); \
 	  \
 	  tmp=$$(mktemp -t io.sandboxd.vmnet); \
-	  exec_cmd="install -d -o _sandbox -g _sandbox -m 0750 /var/run/sandbox &amp;&amp; install -d -o _sandbox -g _sandbox -m 0750 /var/run/sandbox/vmnet &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=_sandbox $$socket_path"; \
+	  exec_cmd="install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=_sandboxd $$socket_path"; \
 	  python3 -c "import sys; label,exec_cmd,slot,uuid=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]; print('<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>'+label+'</string>\n\n    <key>ProgramArguments</key>\n    <array>\n        <string>/bin/sh</string>\n        <string>-c</string>\n        <string>'+exec_cmd+'</string>\n    </array>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n        <key>Crashed</key>\n        <true/>\n    </dict>\n\n    <key>ThrottleInterval</key>\n    <integer>5</integer>\n\n    <key>StandardOutPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stdout.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stderr.log</string>\n</dict>\n</plist>')" "$$label" "$$exec_cmd" "$$slot" "$$network_id" > "$$tmp"; \
 	  \
 	  if [ -f "$$plist_path" ] && cmp -s "$$tmp" "$$plist_path" 2>/dev/null; then \
@@ -1411,7 +1411,7 @@ setup-darwin-vmnet-daemons: setup-darwin-vmnet-plists
 #
 # Creates:
 #   /var/lib/sandboxd             root:wheel 0755 (traversable root)
-#   /var/log/sandbox              _sandbox:_sandbox 0750
+#   /var/log/sandbox              _sandboxd:_sandboxd 0750
 #
 # /var/run/sandbox and /var/run/sandbox/vmnet are created by the vmnet daemons'
 # pre-exec wrapper (and by the daemon itself at startup), not here —
@@ -1419,7 +1419,7 @@ setup-darwin-vmnet-daemons: setup-darwin-vmnet-plists
 # would not survive a reboot. The daemon and vmnet daemons handle /var/run
 # creation at each boot.
 #
-# The per-uid daemon state dir (/var/lib/sandboxd/<_sandbox-uid>/) is created
+# The per-uid daemon state dir (/var/lib/sandboxd/<_sandboxd-uid>/) is created
 # lazily by the daemon itself at startup (daemon knows its own uid). This target
 # creates only the root dir (common to all daemon uid subtrees).
 #
@@ -1445,47 +1445,42 @@ setup-darwin-state-dirs:
 	  fi; \
 	fi
 	@if [ ! -d /var/log/sandbox ]; then \
-	  echo "[sudo] install -d -o _sandbox -g _sandbox -m 0750 /var/log/sandbox"; \
-	  sudo -k install -d -o _sandbox -g _sandbox -m 0750 /var/log/sandbox 2>/dev/null || \
-	    { echo "  (note: _sandbox user may not exist yet; /var/log/sandbox will be created on first daemon start)"; }; \
+	  echo "[sudo] install -d -o _sandboxd -g _sandboxd -m 0750 /var/log/sandbox"; \
+	  sudo -k install -d -o _sandboxd -g _sandboxd -m 0750 /var/log/sandbox 2>/dev/null || \
+	    { echo "  (note: _sandboxd user may not exist yet; /var/log/sandbox will be created on first daemon start)"; }; \
 	else \
 	  echo "$(GREEN)✓ already configured: /var/log/sandbox present$(RESET)"; \
 	fi
 
-# setup-darwin-sandbox-group — ensure the `_sandbox` system group exists with
-# GID 60 (Apple reserves GIDs below 500 for system accounts; GID 60 is used by
-# `_sandbox` per Apple conventions).
+# setup-darwin-sandboxd-group — ensure the sandboxd `_sandboxd` system group exists.
 #
-# On macOS the `_sandbox` group (GID 60) is a pre-existing Apple system group
-# present on all modern macOS versions. This target verifies it exists and prints
-# a skip notice — it does NOT create it (creation is install.sh's job).
+# macOS reserves `_sandbox` (GID 60) for its Seatbelt subsystem, so sandboxd uses
+# a dedicated `_sandboxd` group (next free GID below 500). This target verifies the
+# group exists — it does NOT create it (creation is install.sh's job).
 #
 # Idempotence:
 #   - Group exists → ✓ already configured (no sudo).
-#   - Group missing → warn (should not happen on a standard macOS install;
-#     run install.sh to create it properly via dscl/sysadminctl).
-setup-darwin-sandbox-group:
+#   - Group missing → informational note; run install.sh to create it.
+setup-darwin-sandboxd-group:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
-	  echo "$(GREEN)✓ already configured: setup-darwin-sandbox-group skipped (not macOS)$(RESET)"; \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-group skipped (not macOS)$(RESET)"; \
 	  exit 0; \
 	fi
-	@if dscl . -read /Groups/_sandbox >/dev/null 2>&1; then \
-	  echo "$(GREEN)✓ already configured: system group '_sandbox' exists$(RESET)"; \
+	@if dscl . -read /Groups/_sandboxd >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: system group '_sandboxd' exists$(RESET)"; \
 	else \
-	  echo "WARNING: system group '_sandbox' does not exist on this macOS host."; \
-	  echo "  On standard macOS, _sandbox (GID 60) is a pre-existing system group."; \
-	  echo "  If absent, run 'scripts/install.sh' to create it via sysadminctl/dscl."; \
+	  echo "INFO: system group '_sandboxd' does not exist on this macOS host."; \
+	  echo "  Run 'scripts/install.sh' to create it via sysadminctl/dscl."; \
 	fi
 
 # setup-darwin-operator-group-membership — add the invoking developer ($USER)
-# to the `_sandbox` group so the operator's CLI can connect to the daemon socket
-# (mode 0660, group=_sandbox) and the per-operator agent can check in.
+# to the `_sandboxd` group so the operator's CLI can connect to the daemon socket
+# (mode 0660, group=_sandboxd) and the per-operator agent can check in.
 #
 # Idempotence: dseditgroup membership check; sudo only when not yet a member.
 #
 # Note: the new group membership takes effect for NEW processes only (a re-login
-# or a `newgrp _sandbox` invocation in the current shell). The step prints a
-# reminder when the membership is newly added.
+# in the current shell). The step prints a reminder when the membership is newly added.
 setup-darwin-operator-group-membership:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-operator-group-membership skipped (not macOS)$(RESET)"; \
@@ -1493,10 +1488,10 @@ setup-darwin-operator-group-membership:
 	fi
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
 	  echo "$(GREEN)✓ already configured: operator-group-add skipped (no non-root $$USER set)$(RESET)"; \
-	elif dseditgroup -o checkmember -m "$$USER" _sandbox >/dev/null 2>&1; then \
-	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '_sandbox'$(RESET)"; \
+	elif dseditgroup -o checkmember -m "$$USER" _sandboxd >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '_sandboxd'$(RESET)"; \
 	else \
-	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandbox  (operator-group membership; takes effect at next login)"; \
-	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandbox; \
-	  echo "$(GREEN)✓ added '$$USER' to group '_sandbox' — re-login required for the change to take effect in the current shell$(RESET)"; \
+	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandboxd  (operator-group membership; takes effect at next login)"; \
+	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandboxd; \
+	  echo "$(GREEN)✓ added '$$USER' to group '_sandboxd' — re-login required for the change to take effect in the current shell$(RESET)"; \
 	fi

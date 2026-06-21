@@ -373,7 +373,7 @@ class TestLiteMacosWorkspace:
     def test_shared_workspace_tcc_warning(self, tmp_path):
         """``shared:`` workspace on lite emits a TCC-asymmetry warning.
 
-        The gateway VM reads the shared path as ``_sandbox``, not the
+        The gateway VM reads the shared path as ``_sandboxd``, not the
         operator. The daemon must emit a warning at create time.
 
         This test only verifies the path is accepted (not rejected) when the

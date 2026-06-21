@@ -3,7 +3,7 @@
 //!
 //! # Role
 //!
-//! On macOS, the daemon runs as `_sandbox` and cannot switch to an
+//! On macOS, the daemon runs as `_sandboxd` and cannot switch to an
 //! operator's uid directly (no `cap_setuid`, no setuid binary). Instead,
 //! each enrolled operator runs this agent as a LaunchAgent in their own
 //! login session. The agent connects *out* to the daemon's broker socket,
@@ -14,7 +14,7 @@
 //! # Self-gate
 //!
 //! On startup the agent resolves its own uid (via `getuid()`), looks up
-//! the `_sandbox` group membership of that uid via `getgrouplist(3)`
+//! the `_sandboxd` group membership of that uid via `getgrouplist(3)`
 //! (Directory Services — not the runtime group array), and **exits cleanly
 //! (code 0) if the uid is not a member**. This prevents a respawn loop for
 //! users who are not enrolled operators: the LaunchAgent plist omits
@@ -79,7 +79,10 @@ mod imp {
     // ---------------------------------------------------------------------------
 
     /// The group name that gates operator enrollment on macOS.
-    const SANDBOX_GROUP_NAME: &str = "_sandbox";
+    ///
+    /// macOS reserves `_sandbox` (uid/gid 60) for its Seatbelt subsystem, so
+    /// sandboxd uses a dedicated `_sandboxd` account and group instead.
+    const SANDBOX_GROUP_NAME: &str = "_sandboxd";
 
     /// Default broker socket path. Overridable via `SANDBOX_BROKER_SOCKET`
     /// (or `SANDBOX_AGENT_TEST_BROKER_SOCKET` in test builds) so tests can
@@ -165,7 +168,7 @@ mod imp {
     /// database (memberd / opendirectoryd on macOS), not just the
     /// runtime supplementary group array which is capped at `NGROUPS` (16)
     /// and unreliable across macOS versions. An operator with more than 16
-    /// groups (common in corporate / MDM environments) may have `_sandbox`
+    /// groups (common in corporate / MDM environments) may have `_sandboxd`
     /// past position 16 in their full list; `getgrouplist` returns it
     /// regardless.
     ///
@@ -309,8 +312,8 @@ mod imp {
 
     /// Read the daemon uid from the broker socket file's owner.
     ///
-    /// The broker socket is created by the daemon (running as `_sandbox`) with
-    /// mode 0660 and owned by `_sandbox:_sandbox`. The socket owner uid is
+    /// The broker socket is created by the daemon (running as `_sandboxd`) with
+    /// mode 0660 and owned by `_sandboxd:_sandboxd`. The socket owner uid is
     /// therefore the daemon uid, which we need to construct the LIMA_HOME path:
     ///   `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima`.
     ///
@@ -584,7 +587,7 @@ mod imp {
         let own_uid = unsafe { libc::getuid() };
 
         // Self-gate: exit cleanly if this uid is not a member of the
-        // _sandbox group. launchd is configured with no KeepAlive on
+        // _sandboxd group. launchd is configured with no KeepAlive on
         // successful exit, so this produces no respawn loop for non-enrolled
         // users.
         let sandbox_group = resolve_sandbox_group_name();
@@ -606,7 +609,7 @@ mod imp {
         let broker_socket = resolve_broker_socket_path();
 
         // Resolve the daemon uid from the broker socket owner for LIMA_HOME.
-        // In production the socket is owned by `_sandbox`; in tests it is
+        // In production the socket is owned by `_sandboxd`; in tests it is
         // overridden via TEST_DAEMON_UID_ENV.
         let daemon_uid = resolve_daemon_uid_from_socket(&broker_socket).unwrap_or_else(|| {
             warn!("could not resolve daemon uid from broker socket; defaulting to own uid");
@@ -639,23 +642,23 @@ mod imp {
 
         /// Verify that a uid below 500 (the system-account floor) is not a
         /// member of the sandbox group. This test drives the `uid_in_group`
-        /// logic indirectly: uid 0 (root) should not be in `_sandbox` on
+        /// logic indirectly: uid 0 (root) should not be in `_sandboxd` on
         /// any correctly-configured macOS host, so this is a safe assertion.
         ///
-        /// We cannot test actual membership without `_sandbox` existing and
+        /// We cannot test actual membership without `_sandboxd` existing and
         /// the test user being enrolled; the integration tests in the broker
         /// module cover that path.
         #[test]
         fn uid_zero_not_in_sandbox_group() {
             // On a correctly configured host, uid 0 (root) is never a member
-            // of _sandbox. If this fails it means _sandbox is misconfigured.
-            // The test is intentionally conservative: if _sandbox doesn't exist
+            // of _sandboxd. If this fails it means _sandboxd is misconfigured.
+            // The test is intentionally conservative: if _sandboxd doesn't exist
             // on this host, uid_in_group returns false (can't resolve group),
             // which also passes.
-            let in_group = uid_in_group(0, "_sandbox");
+            let in_group = uid_in_group(0, "_sandboxd");
             assert!(
                 !in_group,
-                "uid 0 must not be a member of _sandbox — check host configuration"
+                "uid 0 must not be a member of _sandboxd — check host configuration"
             );
         }
 

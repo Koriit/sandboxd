@@ -259,7 +259,7 @@ pub enum BrokerOp {
     /// `BrokerResult::RestrictNotConfirmed`.
     ///
     /// This op rides the broker channel because the QEMU process and its
-    /// associated files are operator-owned and unreadable by the `_sandbox`
+    /// associated files are operator-owned and unreadable by the `_sandboxd`
     /// daemon; the daemon cannot perform this check directly.
     ///
     /// Same own-uid + VM-name re-validation as every other op.

@@ -4684,14 +4684,14 @@ async fn create_session_macos_lite(
             if let Err(SharedPathError::OutsideRoot { .. }) =
                 validate_shared_path(&hp, &shared_root)
             {
-                // Warn operators about the TCC asymmetry: _sandbox does the read.
+                // Warn operators about the TCC asymmetry: _sandboxd does the read.
                 warn!(
                     session_id = %session_id,
                     host_path = %hp.display(),
                     shared_root = %shared_root.display(),
                     "lite shared: path outside configured shared root — \
                      move workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
-                     Note: lite shared: is read by _sandbox (the gateway VM user), \
+                     Note: lite shared: is read by _sandboxd (the gateway VM user), \
                      not the operator; TCC consent from the operator does not apply."
                 );
                 let _ = state
@@ -4705,7 +4705,7 @@ async fn create_session_macos_lite(
                 return error_response(SandboxError::InvalidArgument(format!(
                     "lite shared: path {} is outside the configured shared root {} — \
                      move the workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
-                     Note: lite shared: access runs as _sandbox (not the operator); \
+                     Note: lite shared: access runs as _sandboxd (not the operator); \
                      sources in TCC-protected directories (Desktop, Documents, Downloads) \
                      are not readable.",
                     hp.display(),
@@ -4713,13 +4713,13 @@ async fn create_session_macos_lite(
                 )))
                 .into_response();
             }
-            // Emit a warning about the _sandbox TCC asymmetry for all
+            // Emit a warning about the _sandboxd TCC asymmetry for all
             // lite shared: sessions so operators are informed.
             warn!(
                 session_id = %session_id,
                 host_path = %hp.display(),
-                "lite shared: workspace — access runs as _sandbox (gateway VM user), \
-                 not the operator. Ensure the source is readable by _sandbox and \
+                "lite shared: workspace — access runs as _sandboxd (gateway VM user), \
+                 not the operator. Ensure the source is readable by _sandboxd and \
                  outside TCC-protected directories (Desktop, Documents, Downloads)."
             );
             Some(sandbox_core::backend::WorkspaceBind {
@@ -5368,14 +5368,14 @@ async fn create_session_macos_lite(
     // is handled by the 9p bind, `clone:` runs in the guest agent).
     //
     // Transport: the sandbox container runs inside the gateway VM, reachable
-    // only over the forwarded `_sandbox`-only Docker socket, so the rsync
+    // only over the forwarded `_sandboxd`-only Docker socket, so the rsync
     // `docker exec` must target that socket (`docker -H unix://<sock> exec -i`)
     // — a host `docker exec` would report "No such container". The forwarded
-    // socket is `_sandbox`-only; the daemon (`_sandbox`) is the only principal
+    // socket is `_sandboxd`-only; the daemon (`_sandboxd`) is the only principal
     // that can connect to it, so the push runs as the daemon via the
     // direct-spawn `run_initial_push` rather than the operator-pivoted helper
     // path (there is no `sandbox-lima-helper`/setuid on macOS). The host
-    // source is read by `_sandbox`, same as lite `shared:`.
+    // source is read by `_sandboxd`, same as lite `shared:`.
     //
     // Failure is fatal — fail-closed, matching the generic path (which tears
     // the session down on push failure rather than returning a half-seeded
@@ -11530,7 +11530,7 @@ async fn reconcile_operator_vms(
 /// gateway container + macvlan network (via `teardown_macos_gateway`) and
 /// release its vmnet slot. Remove orphaned gateway containers (no matching
 /// session). Runs regardless of operator login state — gateway infra is
-/// daemon-owned (_sandbox), reachable without an agent.
+/// daemon-owned (_sandboxd), reachable without an agent.
 ///
 /// **Step 6b (agent-gated):** for each operator uid in
 /// `agent_registry.connected_uids()`, verify their running
@@ -13826,7 +13826,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    container + macvlan network and release its slot. Also remove orphaned
     //    gateway containers with no matching session. Runs for all operators
     //    regardless of login state, because the gateway runs as the daemon
-    //    (_sandbox) and is reachable without an agent.
+    //    (_sandboxd) and is reachable without an agent.
     //
     // 6b (agent-gated): for each operator whose agent is checked in, verify
     //    their running sessions' VMs are live (mark error if dead, release slot).

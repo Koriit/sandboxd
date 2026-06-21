@@ -796,7 +796,7 @@ pub enum LimaOp<'a> {
 /// - **macOS** (`AgentBrokerExecutor`, defined in the daemon crate): routes
 ///   each operation to the operator's checked-in `sandbox-agent` LaunchAgent
 ///   over the broker channel. The agent already runs as the operator, so no
-///   setuid or capability is involved. The daemon's own uid (`_sandbox`, or
+///   setuid or capability is involved. The daemon's own uid (`_sandboxd`, or
 ///   the operator in single-uid foreground-dev mode) is special-cased to run
 ///   `limactl` directly rather than routing through the broker.
 ///
