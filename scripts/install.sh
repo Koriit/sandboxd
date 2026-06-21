@@ -1827,9 +1827,8 @@ _render_plan_darwin() {
     if [ "$PLAN_SANDBOX_USER" = "skip" ]; then
         emit "    ${GREEN}+ _sandboxd user already exists (uid $PLAN_SANDBOX_UID_EXISTING) — skip${RESET}"
     else
-        emit "    ${YELLOW}+ create system user '_sandboxd' (role account, no login shell)${RESET}"
-        emit "      sysadminctl -addUser _sandboxd -shell /usr/bin/false -roleAccount"
-        emit "      (or dscl . -create /Users/_sandboxd with per-attribute values)"
+        emit "    ${YELLOW}+ create system user '_sandboxd' (system account, no login shell)${RESET}"
+        emit "      dscl . -create /Users/_sandboxd (with per-attribute UID/GID/home/shell)"
     fi
     if [ "$PLAN_OPERATOR_ADD" = "add" ]; then
         emit "    ${YELLOW}+ add operator '$OPERATOR_NAME' to group '_sandboxd'${RESET}"
@@ -2522,8 +2521,7 @@ _step_begin "sandbox-user"
 _priv_maybe_abort_at "sandbox-user"
 SANDBOX_USER_CREATED=0
 if [ "\$OS" = "darwin" ]; then
-    # macOS: create the _sandboxd role account via sysadminctl when available,
-    # else fall back to per-attribute dscl -create calls.
+    # macOS: create the _sandboxd system user and group via per-attribute dscl.
     # macOS reserves _sandbox (GID 60) for its Seatbelt subsystem; sandboxd
     # creates a dedicated _sandboxd group at the next free GID below 500.
     if [ "\$PLAN_SANDBOX_USER" = "create" ]; then
@@ -2543,27 +2541,20 @@ if [ "\$OS" = "darwin" ]; then
             dscl . -create /Groups/_sandboxd RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
             _log "step=sandbox_group action=create gid=\$_sandbox_gid status=ok"
         fi
-        # Prefer sysadminctl (handles RealName and Password automatically).
-        # Fall back to per-attribute dscl -create when sysadminctl is absent.
-        if command -v sysadminctl >/dev/null 2>&1; then
-            _home="/var/lib/sandboxd/\$_next_uid"
-            sysadminctl -addUser _sandboxd \\
-                -UID "\$_next_uid" -GID "\$_sandbox_gid" \\
-                -home "\$_home" \\
-                -shell /usr/bin/false \\
-                -roleAccount >> "\$_LOG" 2>&1 \\
-                || { _log "step=sysadminctl_addUser action=fail status=fail"; _step_fail; }
-        else
-            _home="/var/lib/sandboxd/\$_next_uid"
-            dscl . -create /Users/_sandboxd >> "\$_LOG" 2>&1 \\
-                || { _log "step=dscl_create_user action=fail status=fail"; _step_fail; }
-            dscl . -create /Users/_sandboxd UniqueID "\$_next_uid" >> "\$_LOG" 2>&1 || true
-            dscl . -create /Users/_sandboxd PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
-            dscl . -create /Users/_sandboxd NFSHomeDirectory "\$_home" >> "\$_LOG" 2>&1 || true
-            dscl . -create /Users/_sandboxd UserShell /usr/bin/false >> "\$_LOG" 2>&1 || true
-            dscl . -create /Users/_sandboxd RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
-            dscl . -create /Users/_sandboxd Password '*' >> "\$_LOG" 2>&1 || true
-        fi
+        # Use per-attribute dscl for user creation. sysadminctl -roleAccount
+        # silently exits 0 without creating any record when the requested UID
+        # falls outside the 450-499 range it reserves for role accounts; a
+        # next-free UID starting at 300 lands below that range on a typical
+        # macOS host. dscl works unconditionally regardless of UID value.
+        _home="/var/lib/sandboxd/\$_next_uid"
+        dscl . -create /Users/_sandboxd >> "\$_LOG" 2>&1 \\
+            || { _log "step=dscl_create_user action=fail status=fail"; _step_fail; }
+        dscl . -create /Users/_sandboxd UniqueID "\$_next_uid" >> "\$_LOG" 2>&1 || true
+        dscl . -create /Users/_sandboxd PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
+        dscl . -create /Users/_sandboxd NFSHomeDirectory "\$_home" >> "\$_LOG" 2>&1 || true
+        dscl . -create /Users/_sandboxd UserShell /usr/bin/false >> "\$_LOG" 2>&1 || true
+        dscl . -create /Users/_sandboxd RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
+        dscl . -create /Users/_sandboxd Password '*' >> "\$_LOG" 2>&1 || true
         SANDBOX_USER_CREATED=1
         _log "step=sandbox_user action=create uid=\$_next_uid gid=\$_sandbox_gid status=ok"
     else
