@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-e2e-macos test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image gateway-image-multiarch lite-image docs-dev docs-build clean \
+.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-e2e-linux test-e2e-macos test-linux test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image gateway-image-multiarch lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
@@ -174,18 +174,91 @@ test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-pro
 	  echo "[make] wrapping pytest in 'sg sandbox-test' (daemon socket is group=sandbox-test)"; \
 	  sg sandbox-test -c "$$_pytest"
 
-# Back-compat alias. `make test-e2e` continues to run the full matrix.
-test-e2e: test-e2e-matrix
-
-# Native macOS e2e suite — runs the full pytest suite against real QEMU+HVF
-# sandbox VMs on a bare Apple-Silicon host with no nested virtualization.
-# Requires a host with socket_vmnet, the gateway Lima VM pool, and the
-# operator agent running (see `make setup-dev-env`). On ephemeral CI runners
-# without this infrastructure the suite's platform guard skips the tests.
-test-e2e-macos: $(VENV_STAMP)
+# Linux e2e suite — explicit, host-asserting target for CI and as the canonical
+# Linux entry point. Hard-fails if invoked on macOS so a misconfigured CI
+# runner surfaces loudly rather than silently running the wrong platform.
+# Runs the full Linux-native matrix (Lima + container backends), excluding
+# macos_only tests. SCOPE=container limits to the container-only slice
+# (PR-time gate; avoids Lima VM boot cost).
+#
+# The daemon socket is mode 0660 group=sandbox-test. Wrapping pytest in
+# `sg sandbox-test` activates the group without requiring a re-login.
+test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap install-guest-prod
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+	  echo "ERROR: test-e2e-linux must run on a Linux host (detected: $$(uname -s))"; \
+	  echo "       Use make test-e2e-macos on macOS, or make test-e2e for auto-detect."; \
+	  exit 1; \
+	fi
 	cd tests/e2e && \
 	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
-	  python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $(TEST)
+	  if [ "$${SCOPE:-full}" = "container" ]; then \
+	    _extra="-m \"not lima and not macos_only\" -k \"not [lima]\""; \
+	  else \
+	    _extra="-m \"not macos_only\""; \
+	  fi; \
+	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $$_extra $(TEST)"; \
+	  echo "[make] wrapping pytest in 'sg sandbox-test' (daemon socket is group=sandbox-test)"; \
+	  sg sandbox-test -c "$$_pytest"
+
+# macOS e2e suite — explicit, host-asserting target for CI and as the canonical
+# macOS entry point. Hard-fails if invoked on Linux so a misconfigured CI
+# runner surfaces loudly. Runs the macOS-native matrix (QEMU+HVF sandbox VMs
+# + gateway-Lima container backend), excluding linux_only tests.
+# SCOPE=container limits to the container-only slice (PR-time gate on macOS).
+# Requires: socket_vmnet pool, the sandboxd-gateway Lima VM, and the operator
+# agent running. See `make setup-dev-env`.
+#
+# macOS has no `sg`; group membership is activated by re-execing pytest under
+# `sudo -n -u <op>` so the fresh process picks up _sandboxd-test membership.
+test-e2e-macos: $(VENV_STAMP)
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "ERROR: test-e2e-macos must run on a macOS host (detected: $$(uname -s))"; \
+	  echo "       Use make test-e2e-linux on Linux, or make test-e2e for auto-detect."; \
+	  exit 1; \
+	fi
+	cd tests/e2e && \
+	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
+	  if [ "$${SCOPE:-full}" = "container" ]; then \
+	    _extra="-m \"not lima and not linux_only\" -k \"not [lima]\""; \
+	  else \
+	    _extra="-m \"not linux_only\""; \
+	  fi; \
+	  . .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $$_extra $(TEST)
+
+# Auto-detecting dev-convenience entry point. Reads `uname -s` and dispatches
+# to the host's native flow: test-e2e-linux on Linux, test-e2e-macos on macOS.
+# Selects the host-appropriate platform marker exclusion automatically.
+# For explicit pipelines use the host-asserting test-e2e-linux / test-e2e-macos.
+test-e2e:
+	@case "$$(uname -s)" in \
+	  Linux)  $(MAKE) test-e2e-linux  SCOPE=$${SCOPE:-full} TEST="$(TEST)" ;; \
+	  Darwin) $(MAKE) test-e2e-macos  SCOPE=$${SCOPE:-full} TEST="$(TEST)" ;; \
+	  *)      echo "ERROR: unsupported OS: $$(uname -s)"; exit 1 ;; \
+	esac
+
+# Dev-only: run the full Linux suite (hermetic + integration + e2e) inside a
+# Linux Lima VM — lets a macOS developer verify Linux behavior without a
+# separate Linux machine. On a Linux host this is a simple alias to the
+# native test sequence. NEVER used in CI (CI runs the Linux suite natively
+# on ubuntu-latest).
+#
+# Nesting caveat: the Linux e2e VM-backend tests boot QEMU VMs inside the
+# Lima VM, which requires nested virtualization — available only on M3+/
+# macOS 15. On M1/M2 those tests fall to slow TCG emulation. The container-
+# backend subset needs no nesting (Docker-in-Lima works on any Apple Silicon),
+# so `make test-linux SCOPE=container` is the practical choice on older Macs.
+test-linux:
+	@if [ "$$(uname -s)" = "Linux" ]; then \
+	  echo "[make] test-linux on Linux: running native test sequence"; \
+	  $(MAKE) test test-integration test-e2e SCOPE=$${SCOPE:-full} TEST="$(TEST)"; \
+	else \
+	  echo "[make] test-linux on macOS: running Linux suite in a Lima VM"; \
+	  limactl start test-linux-runner 2>/dev/null || \
+	    limactl create --name test-linux-runner --cpus 4 --memory 4096 template://ubuntu; \
+	  limactl start test-linux-runner || true; \
+	  limactl shell test-linux-runner -- bash -c \
+	    "cd $(shell pwd) && make test test-integration test-e2e SCOPE=$${SCOPE:-full} TEST='$(TEST)'"; \
+	fi
 
 # Re-run only the tests that failed in the previous run (reads .pytest_cache/).
 # Falls back to running all tests when no failures are cached.

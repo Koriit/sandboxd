@@ -691,7 +691,7 @@ def test_lima_slirp_route_fallback_cannot_bypass_gateway(sandbox_cli):
             sandbox_cli("rm", session_name, timeout=120)
 
 
-@pytest.mark.macos
+@pytest.mark.macos_only
 @pytest.mark.lima
 @pytest.mark.timeout(600)
 def test_macos_slirp_restrict_on_blocks_egress_after_gateway_route_deleted(sandbox_cli):
@@ -1485,7 +1485,7 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
 
 
 # ---------------------------------------------------------------------------
-# macOS full-backend recovery tests (gated on @pytest.mark.macos)
+# macOS full-backend recovery tests (gated on @pytest.mark.macos_only)
 #
 # These tests require:
 # - macOS host with Lima ≥ 1.2.0, QEMU, socket_vmnet pool daemons.
@@ -1588,7 +1588,7 @@ def _inspect_networking_status(sandbox_cli, name: str) -> str | None:
     return None
 
 
-@pytest.mark.macos
+@pytest.mark.macos_only
 @pytest.mark.lima
 @pytest.mark.timeout(600)
 def test_macos_gateway_lima_crash_recovery(sandbox_cli):
@@ -1606,7 +1606,7 @@ def test_macos_gateway_lima_crash_recovery(sandbox_cli):
     event-ingest-based because the macOS inotify→kqueue/FSEvents watcher
     is deferred (todo #246).
 
-    Gated on @pytest.mark.macos: skips on non-macOS and when the operator
+    Gated on @pytest.mark.macos_only: skips on non-macOS and when the operator
     LaunchAgent is not loaded (SSH-only / no-Aqua mode). Also gated on
     todo #249 (first-boot timeout); if sessions cannot reach Running the
     test will fail at ``wait_for_state`` rather than producing a false
@@ -1758,7 +1758,7 @@ def test_macos_gateway_lima_crash_recovery(sandbox_cli):
             cleanup_policy_file(policy_path)
 
 
-@pytest.mark.macos
+@pytest.mark.macos_only
 @pytest.mark.lima
 @pytest.mark.timeout(600)
 def test_macos_gateway_lima_recovery_one_session_errors_others_continue(sandbox_cli):
@@ -1858,7 +1858,7 @@ def test_macos_gateway_lima_recovery_one_session_errors_others_continue(sandbox_
             cleanup_policy_file(policy_path)
 
 
-@pytest.mark.macos
+@pytest.mark.macos_only
 @pytest.mark.lima
 @pytest.mark.timeout(600)
 def test_macos_slot_reclaimed_after_vm_death(sandbox_cli, sandbox_binaries, sandbox_daemon):
@@ -1878,7 +1878,7 @@ def test_macos_slot_reclaimed_after_vm_death(sandbox_cli, sandbox_binaries, sand
     The slot-availability assertion (new session create succeeds) is the
     primary exit criterion for this test.
 
-    Gated on @pytest.mark.macos; also gated on todo #249 (first-boot timeout).
+    Gated on @pytest.mark.macos_only; also gated on todo #249 (first-boot timeout).
     """
     policy_path = None
     session_id_dead = None

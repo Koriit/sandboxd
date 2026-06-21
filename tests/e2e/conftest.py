@@ -147,41 +147,85 @@ QEMU_BRIDGE_HELPER_PATHS = [
 BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 
 # ---------------------------------------------------------------------------
+# Platform seam
+# ---------------------------------------------------------------------------
+#
+# A thin dataclass records the per-platform values that differ between the
+# Linux cross-user harness and the macOS operator-uid harness.  Everything
+# else — state paths, limactl_cmd(), the daemon HTTP API — is platform-
+# agnostic and remains unchanged.
+#
+# PLATFORM is selected once at import time on sys.platform; every downstream
+# constant and fixture reads it instead of hard-coding Linux values.
+
+
+@dataclass
+class _PlatformConfig:
+    """Per-platform constants for the e2e harness."""
+
+    #: Username of the dedicated e2e daemon system user on this platform.
+    daemon_test_user: str
+
+    #: Name of the group the operator must belong to for socket access.
+    group_name: str
+
+
+def _make_platform_config() -> _PlatformConfig:
+    if sys.platform == "darwin":
+        # macOS: a dedicated _sandboxd-test system user + group (created by
+        # `make setup-dev-env`), isolated from the operator's real environment —
+        # the macOS equivalent of Linux's sandbox-test. The e2e daemon runs as
+        # this user (via `sudo -u _sandboxd-test`); its per-uid state tree,
+        # LIMA_HOME, gateway VM, and socket live under that user, never touching
+        # the operator's own sandboxd state.
+        return _PlatformConfig(
+            daemon_test_user="_sandboxd-test",
+            group_name="_sandboxd-test",
+        )
+    # Linux: dedicated sandbox-test system user + group.
+    return _PlatformConfig(
+        daemon_test_user="sandbox-test",
+        group_name="sandbox-test",
+    )
+
+
+PLATFORM: _PlatformConfig = _make_platform_config()
+
+# ---------------------------------------------------------------------------
 # Cross-user harness
 # ---------------------------------------------------------------------------
 #
-# The e2e harness launches the daemon as the ``sandbox-test`` system user via
-# ``sudo -u sandbox-test``, the single cross-user path. All sudo is
-# pre-authorized at ``make setup-dev-env`` time via a NOPASSWD sudoers
-# fragment (``/etc/sudoers.d/sandboxd-test``); no runtime root sudo is
-# ever issued.
+# The e2e harness launches the daemon as a dedicated system user via
+# ``sudo -u <daemon_test_user>``.  On Linux this is ``sandbox-test``; on
+# macOS this is ``_sandboxd-test``.  All sudo is pre-authorized at
+# ``make setup-dev-env`` time via a NOPASSWD sudoers fragment; no runtime
+# root sudo is ever issued.
 #
-# The operator must be a member of the ``sandbox-test`` group so the pytest
-# process can reach the e2e daemon socket (mode 0660, group=sandbox-test).
-# Group changes from ``usermod -aG sandbox-test <operator>`` do not take
-# effect in the current login session; ``make test-e2e`` /
-# ``make test-e2e-container`` wrap pytest in ``sg sandbox-test -c '…'`` to
-# activate the group without requiring a re-login.
+# The operator must be a member of the daemon-test group so the pytest
+# process can reach the e2e daemon socket (mode 0660, group=<daemon_test_user>).
+# On Linux: ``make test-e2e`` wraps pytest in ``sg sandbox-test -c '…'`` to
+# activate the group without requiring a re-login.  On macOS there is no
+# ``sg``; ``make test-e2e-macos`` re-execs pytest under
+# ``sudo -n -u $(id -un)`` so a fresh process picks up the group.
 
-# The e2e daemon runs as the dedicated `sandbox-test` system user so its
-# per-uid state tree is structurally disjoint from the prod daemon's tree
+# The e2e daemon runs as the dedicated test system user so its per-uid
+# state tree is structurally disjoint from the prod daemon's tree
 # (/var/lib/sandboxd/<sandbox-uid>/). Base-dir and socket are keyed on the
-# sandbox-test uid: /var/lib/sandboxd/<sandbox-test-uid>/.
+# daemon-test uid: /var/lib/sandboxd/<daemon-test-uid>/.
 #
 # Isolation guarantee: the state-dir reset operates only within
 # /var/lib/sandboxd/<_SANDBOX_TEST_UID>/ and can never name a path
-# inside the prod daemon's /var/lib/sandboxd/<sandbox-uid>/ tree or the
-# legacy /var/lib/sandbox/. Created by `make setup-sandboxd-per-uid-state-dir`
-# (part of `make setup-dev-env`).
-# Guarded for cross-platform import-safety: the ``sandbox-test`` system user
-# only exists on the Linux cross-user harness host. On hosts where it is
-# absent (e.g. macOS, where test_lite_macos.py runs without the cross-user
-# fixtures) the lookup would raise ``KeyError`` at import and abort collection
-# of the whole directory. Degrade to a ``None`` sentinel; the constants derived
-# below are consumed only by the Linux cross-user fixtures/helpers, which skip
-# cleanly when the user is absent (see _launch_daemon_as_sandbox_via_sudo).
+# inside the prod daemon's /var/lib/sandboxd/<sandbox-uid>/ tree.
+# Created by `make setup-sandboxd-per-uid-state-dir` (part of
+# `make setup-dev-env`).
+#
+# Guarded for cross-platform import-safety: the daemon test user only exists
+# on a provisioned harness host. On hosts where it is absent the lookup
+# degrades to a None sentinel; the constants derived below are consumed only
+# by the cross-user fixtures/helpers, which skip cleanly when the user is
+# absent (see _launch_daemon_as_sandbox_via_sudo).
 try:
-    _SANDBOX_TEST_UID: int | None = pwd.getpwnam("sandbox-test").pw_uid
+    _SANDBOX_TEST_UID: int | None = pwd.getpwnam(PLATFORM.daemon_test_user).pw_uid
 except KeyError:
     _SANDBOX_TEST_UID = None
 _SANDBOX_E2E_BASE_DIR = Path(f"/var/lib/sandboxd/{_SANDBOX_TEST_UID}")
@@ -224,24 +268,20 @@ E2E_TEST_POOL_CIDR = "10.220.0.0/20"
 import atexit  # noqa: E402  -- after module-level setup
 import getpass  # noqa: E402
 if "SANDBOX_USERS_CONF" not in os.environ:
-    # ``allow_users`` lists the operator AND the ``sandbox-test`` system
-    # user.  The e2e daemon runs as ``sandbox-test`` (``sudo -u
-    # sandbox-test``); its startup-time ``find_subnet_by_uid`` lookup
-    # requires the daemon's own uid to appear in some pool's
-    # ``allow_users``.  Names that do not resolve to a uid on a given host
-    # are silently skipped by the daemon ("unresolvable allow_users entries
-    # are treated as non-matches"), so listing ``sandbox-test`` is a no-op
-    # on hosts that have not provisioned the system user.
+    # ``allow_users`` lists the operator AND the daemon test system user.
+    # The e2e daemon runs as the test user (``sudo -u <daemon_test_user>``);
+    # its startup-time ``find_subnet_by_uid`` lookup requires the daemon's
+    # own uid to appear in some pool's ``allow_users``.  Names that do not
+    # resolve to a uid on a given host are silently skipped by the daemon
+    # ("unresolvable allow_users entries are treated as non-matches"), so
+    # listing the test user is a no-op on un-provisioned hosts.
     _users_conf_payload = {
         "_schema_version": _read_min_supported_users_conf_schema(),
         "subnets": [
             {
-                "comment": (
-                    "E2E test daemon pool — see "
-                    "docs/internal/milestones/M12.md S13."
-                ),
+                "comment": "E2E test daemon pool (disjoint from the production pool).",
                 "cidr": E2E_TEST_POOL_CIDR,
-                "allow_users": [getpass.getuser(), "sandbox-test"],
+                "allow_users": [getpass.getuser(), PLATFORM.daemon_test_user],
             }
         ]
     }
@@ -712,37 +752,36 @@ def sandbox_binaries() -> SandboxBinaries:
 
 
 def _assert_operator_in_sandbox_group() -> None:
-    """Fail loudly if the calling pytest process is not in the ``sandbox-test`` group.
+    """Fail loudly if the calling pytest process is not in the daemon-test group.
 
-    The e2e daemon socket is mode 0660 with ``group=sandbox-test``. A test
-    process whose effective groups do not include ``sandbox-test`` cannot read
+    The e2e daemon socket is mode 0660 with ``group=<daemon_test_user>``. A
+    test process whose effective groups do not include that group cannot read
     or write the socket and every CLI invocation fails with EACCES — a setup
     gap, not the cross-user bug under test.
 
-    Group changes from ``usermod -aG sandbox-test <operator>`` do **not** take
-    effect in the current login session. The remediation depends on context:
-
-      * Interactive: log out + log back in, or re-launch the shell.
-      * Scripted: wrap the invocation in ``sg sandbox-test -c '…'``.
-      * CI: ensure the user that runs pytest was added to the group at
-        image-build time (before the session starts).
+    On Linux, group changes from ``usermod -aG sandbox-test <operator>`` do
+    **not** take effect in the current login session; the Makefile wraps pytest
+    in ``sg sandbox-test -c '…'`` to activate the group without a re-login.
+    On macOS there is no ``sg``; the Makefile re-execs pytest under
+    ``sudo -n -u $(id -un)`` so the fresh process carries the group.
     """
     import grp
+    group_name = PLATFORM.group_name
     try:
-        sandbox_gid = grp.getgrnam("sandbox-test").gr_gid
+        sandbox_gid = grp.getgrnam(group_name).gr_gid
     except KeyError:
         pytest.fail(
-            "The `sandbox-test` system group does not exist on this host. "
-            "Run `make setup-sandbox-test-user` from the workspace root and "
+            f"The `{group_name}` system group does not exist on this host. "
+            "Run `make setup-dev-env` from the workspace root and "
             "re-run the tests."
         )
-    # The socket is mode 0660, group=sandbox-test, so access is granted when
-    # the sandbox-test gid is the process's effective GID *or* in its
-    # supplementary set. `sg sandbox-test -c …` (how the make targets wrap
-    # pytest) sets sandbox-test as the *primary/effective* GID and does not
-    # add it to the supplementary list — and Linux `getgroups()` does not
-    # report the effective GID — so checking `os.getgroups()` alone spuriously
-    # fails under the sg wrap even though the process can read the socket.
+    # The socket is mode 0660, group=<daemon_test_user>, so access is granted
+    # when that gid is the process's effective GID *or* in its supplementary
+    # set. `sg sandbox-test -c …` (how Linux make targets wrap pytest) sets
+    # the group as the *primary/effective* GID and does not add it to the
+    # supplementary list — and Linux `getgroups()` does not report the
+    # effective GID — so checking `os.getgroups()` alone spuriously fails
+    # under the sg wrap even though the process can read the socket.
     # Accept either.
     if sandbox_gid == os.getegid() or sandbox_gid in os.getgroups():
         return
@@ -755,23 +794,32 @@ def _assert_operator_in_sandbox_group() -> None:
         ["id", "-nG", operator],
         capture_output=True, text=True, timeout=5,
     ).stdout.split()
-    if "sandbox-test" in static_groups:
+    if group_name in static_groups:
+        if sys.platform == "darwin":
+            group_activate_hint = (
+                f"re-run pytest under `sudo -n -u {operator} python -m pytest …` "
+                f"(macOS has no `sg`; a fresh sudo process picks up the group)"
+            )
+        else:
+            group_activate_hint = (
+                f"`sg {group_name} -c 'python -m pytest …'` "
+                f"so the new group is visible to the test process"
+            )
         remediation = (
             "Operator '{op}' is listed in /etc/group as a member of "
-            "'sandbox-test' but the group is not active in the current "
+            "'{grp}' but the group is not active in the current "
             "process. Log out and back in, or re-run pytest under "
-            "`sg sandbox-test -c 'python -m pytest …'` so the new group "
-            "is visible to the test process."
-        ).format(op=operator)
+            "{hint}."
+        ).format(op=operator, grp=group_name, hint=group_activate_hint)
     else:
         remediation = (
-            "Operator '{op}' is not a member of the 'sandbox-test' group. "
-            "Run `make setup-sandbox-test-user` from the workspace root, "
+            "Operator '{op}' is not a member of the '{grp}' group. "
+            "Run `make setup-dev-env` from the workspace root, "
             "log out and back in, then re-run pytest."
-        ).format(op=operator)
+        ).format(op=operator, grp=group_name)
     pytest.fail(
-        "The pytest process must be a member of the 'sandbox-test' system "
-        "group (the e2e daemon socket is mode 0660, group=sandbox-test). "
+        f"The pytest process must be a member of the '{group_name}' system "
+        f"group (the e2e daemon socket is mode 0660, group={group_name}). "
         f"{remediation}"
     )
 
@@ -839,7 +887,7 @@ def _sudo_rm_children_except(directory: Path, keep: list[str]) -> None:
     if not directory.exists():
         return
     argv = [
-        "sudo", "-n", "-u", "sandbox-test",
+        "sudo", "-n", "-u", PLATFORM.daemon_test_user,
         "find", str(directory), "-mindepth", "1", "-maxdepth", "1",
     ]
     for name in keep:
@@ -904,14 +952,15 @@ def _reset_sandbox_state_dir() -> None:
     except KeyError:
         prod_uid = None  # dev host without prod daemon user — no collision risk
 
+    daemon_test_user = PLATFORM.daemon_test_user
     assert _SANDBOX_TEST_UID != operator_uid, (
-        f"FATAL: sandbox-test uid ({_SANDBOX_TEST_UID}) equals the operator uid "
+        f"FATAL: {daemon_test_user} uid ({_SANDBOX_TEST_UID}) equals the operator uid "
         f"({operator_uid}). This would allow the state reset to wipe operator "
         "files. Aborting to prevent data loss."
     )
     if prod_uid is not None:
         assert _SANDBOX_TEST_UID != prod_uid, (
-            f"FATAL: sandbox-test uid ({_SANDBOX_TEST_UID}) equals the prod daemon "
+            f"FATAL: {daemon_test_user} uid ({_SANDBOX_TEST_UID}) equals the prod daemon "
             f"uid ({prod_uid}). This would allow the state reset to wipe the prod "
             "daemon's /var/lib/sandboxd tree. Aborting to prevent data loss."
         )
@@ -984,29 +1033,29 @@ def _launch_daemon_as_sandbox_via_sudo(
     sandbox_binaries: SandboxBinaries,
     tmp_path: Path,
 ) -> dict:
-    """Start the daemon as the ``sandbox-test`` user via ``sudo -u sandbox-test``.
+    """Start the daemon as the dedicated test user via ``sudo -u <daemon_test_user>``.
 
     This is the sole launch path. Requires the NOPASSWD sudoers fragment
     at ``/etc/sudoers.d/sandboxd-test`` (installed by
-    ``make setup-test-sudoers-fragment``); a missing fragment causes sudo
-    to prompt and hang the wait-for-socket deadline, so the harness probes
-    up front and fails with a precise error.
+    ``make setup-dev-env``); a missing fragment causes sudo to prompt and
+    hang the wait-for-socket deadline, so the harness probes up front and
+    fails with a precise error.
 
     The base dir ``/var/lib/sandboxd/<_SANDBOX_TEST_UID>`` must already exist
-    with ``sandbox-test:sandbox-test`` ownership and mode 0750 — provisioned
-    once by ``make setup-sandboxd-per-uid-state-dir`` (part of
+    with ``<daemon_test_user>:<daemon_test_user>`` ownership and mode 0750 —
+    provisioned once by ``make setup-sandboxd-per-uid-state-dir`` (part of
     ``make setup-dev-env``).  The socket lives inside the base dir so the
     daemon can create it without root.  The daemon (and guest) binaries are
-    staged into a world-traversable ``/tmp`` dir so the ``sandbox-test`` user
-    can exec them despite the workspace living under the operator's 0750 home
-    — see :func:`_stage_binaries_for_sandbox_user`.
+    staged into a world-traversable ``/tmp`` dir so the daemon test user can
+    exec them despite the workspace living under the operator's 0750 home —
+    see :func:`_stage_binaries_for_sandbox_user`.
     """
+    daemon_test_user = PLATFORM.daemon_test_user
     if _SANDBOX_TEST_UID is None:
         pytest.skip(
-            "Linux cross-user e2e harness requires the 'sandbox-test' system "
-            "user; not present on this host. Run `make setup-dev-env` on a "
-            "Linux host to provision it, or run only the macOS-native e2e "
-            "tests (e.g. test_lite_macos.py) which do not use this fixture."
+            f"The e2e harness requires the '{daemon_test_user}' system user; "
+            "not present on this host. Run `make setup-dev-env` to provision "
+            "it, then re-run the tests."
         )
     _assert_operator_in_sandbox_group()
 
@@ -1022,13 +1071,13 @@ def _launch_daemon_as_sandbox_via_sudo(
     staged = _stage_binaries_for_sandbox_user(sandbox_binaries)
 
     # Probe NOPASSWD authorisation *and* binary reachability in one shot.
-    # ``sudo -n -u sandbox-test <staged-binary> --version`` returns rc=1 with
-    # "a password is required" on stderr when the sudoers fragment is
-    # absent/mis-scoped, or "Permission denied" if the sandbox-test user cannot
-    # exec the staged binary. rc=0 confirms the full chain works. Failing
-    # here prevents a silent hang at the wait-for-socket deadline.
+    # ``sudo -n -u <daemon_test_user> <staged-binary> --version`` returns
+    # rc=1 with "a password is required" on stderr when the sudoers fragment
+    # is absent/mis-scoped, or "Permission denied" if the daemon test user
+    # cannot exec the staged binary. rc=0 confirms the full chain works.
+    # Failing here prevents a silent hang at the wait-for-socket deadline.
     probe = subprocess.run(
-        ["sudo", "-n", "-u", "sandbox-test",
+        ["sudo", "-n", "-u", daemon_test_user,
          str(staged["sandboxd"]), "--version"],
         capture_output=True, text=True, timeout=10,
     )
@@ -1036,10 +1085,9 @@ def _launch_daemon_as_sandbox_via_sudo(
         shutil.rmtree(staged["dir"], ignore_errors=True)
         pytest.fail(
             "The NOPASSWD sudoers fragment at /etc/sudoers.d/sandboxd-test "
-            "is missing or does not authorise the operator to run commands "
-            "as the `sandbox-test` user. "
-            "Run `make setup-test-sudoers-fragment` from the workspace "
-            "root and re-run.\n"
+            f"is missing or does not authorise the operator to run commands "
+            f"as the `{daemon_test_user}` user. "
+            "Run `make setup-dev-env` from the workspace root and re-run.\n"
             f"sudo probe stderr: {probe.stderr.strip()!r}"
         )
 
@@ -1051,33 +1099,33 @@ def _launch_daemon_as_sandbox_via_sudo(
     stderr_fh = open(stderr_log, "w")
 
     daemon_env = os.environ.copy()
-    # The sudoers fragment installed by ``make setup-test-sudoers-fragment``
-    # declares ``Defaults:$USER env_keep += "SANDBOX_USERS_CONF ..."``
-    # so the variables propagate through sudo without ``--preserve-env``
-    # (which is more brittle to whitelist).
+    # The sudoers fragment installed by ``make setup-dev-env`` declares
+    # ``Defaults:$USER env_keep += "SANDBOX_USERS_CONF ..."`` so the
+    # variables propagate through sudo without ``--preserve-env`` (which
+    # is more brittle to whitelist).
     #
     # The e2e suite uses the TEST-cap lima-helper
     # (/usr/local/libexec/sandboxd-test/sandbox-lima-helper, installed by
     # ``make install-lima-helper-test-cap``) with ``SANDBOX_LIMA_HELPER_PATH``
     # pointing at it. This helper is built with ``--features test-env-override``
     # and resolves its sandbox-user name via the
-    # ``SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER`` seam, which we set to
-    # ``sandbox-test`` so the caller-uid gate accepts the e2e daemon's uid.
+    # ``SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER`` seam, which we set to the
+    # daemon test user so the caller-uid gate accepts the e2e daemon's uid.
     # ``SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP`` is set identically so the
-    # helper's group gate matches.  Both env vars are in the sudoers env_keep
-    # list so they propagate through ``sudo -u sandbox-test``.
+    # helper's group gate matches. Both env vars are in the sudoers env_keep
+    # list so they propagate through the sudo invocation.
     #
     # HOME and DOCKER_CONFIG are NOT in env_keep, so sudo's env_reset
-    # always sets HOME=/nonexistent for sandbox-test regardless of what
-    # the Popen env dict contains. We use an ``env KEY=VAL ...`` wrapper
+    # always sets HOME=/nonexistent for the daemon test user regardless of
+    # what the Popen env dict contains. We use an ``env KEY=VAL ...`` wrapper
     # *after* the sudo user switch to override HOME before execing the
     # daemon. This gives docker (invoked by the daemon for
     # ``rebuild-image --backend container``) a writable config dir under
-    # the sandbox-test-owned base dir instead of /nonexistent. The base
+    # the test-user-owned base dir instead of /nonexistent. The base
     # dir reset wipes the resulting .docker/ subtree between sessions.
     proc = subprocess.Popen(
         [
-            "sudo", "-n", "-u", "sandbox-test",
+            "sudo", "-n", "-u", daemon_test_user,
             "env",
             f"HOME={_SANDBOX_E2E_BASE_DIR}",
             f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
@@ -1090,18 +1138,17 @@ def _launch_daemon_as_sandbox_via_sudo(
             "SANDBOX_USERS_CONF": os.environ["SANDBOX_USERS_CONF"],
             "SANDBOX_BASE_VM_NAME": os.environ["SANDBOX_BASE_VM_NAME"],
             # Pin the ephemeral runtime dirs under the test base dir. The
-            # daemon runs via `sudo -u sandbox-test` with no XDG_RUNTIME_DIR,
-            # so without these they fall back to $HOME (/nonexistent) and fail.
-            # The state-dir reset wipes these along with the rest of the test
-            # base dir. (Prod pins them to /run/sandbox via the systemd unit.)
+            # daemon runs via sudo with no XDG_RUNTIME_DIR, so without these
+            # they fall back to $HOME (/nonexistent) and fail. The state-dir
+            # reset wipes these along with the rest of the test base dir.
             "SANDBOX_LISTENER_DIR": str(_SANDBOX_E2E_BASE_DIR / "listeners"),
             "SANDBOX_EVENTS_DIR": str(_SANDBOX_E2E_BASE_DIR / "events"),
             # Point at the TEST-cap lima-helper; the helper resolves the
-            # sandbox-user name to sandbox-test via these seams so the
-            # caller-uid gate accepts the e2e daemon (running as sandbox-test).
+            # sandbox-user name to the daemon test user via these seams so
+            # the caller-uid gate accepts the e2e daemon.
             "SANDBOX_LIMA_HELPER_PATH": "/usr/local/libexec/sandboxd-test/sandbox-lima-helper",
-            "SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER": "sandbox-test",
-            "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP": "sandbox-test",
+            "SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER": daemon_test_user,
+            "SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP": daemon_test_user,
         },
         stdout=stdout_fh,
         stderr=stderr_fh,
@@ -1191,6 +1238,7 @@ def restart_test_daemon(
     # one it replaces, including the TEST-cap helper path and sandbox-user seams.
     staged_sandboxd = sandbox_daemon["_staged_sandboxd"]
     daemon_env = os.environ.copy()
+    daemon_test_user = PLATFORM.daemon_test_user
     daemon_env["SANDBOX_USERS_CONF"] = os.environ["SANDBOX_USERS_CONF"]
     daemon_env["SANDBOX_BASE_VM_NAME"] = os.environ["SANDBOX_BASE_VM_NAME"]
     # Pin the ephemeral runtime dirs under the test base dir (see launcher).
@@ -1198,16 +1246,16 @@ def restart_test_daemon(
     daemon_env["SANDBOX_EVENTS_DIR"] = str(_SANDBOX_E2E_BASE_DIR / "events")
     # Mirror the TEST-cap helper env from the initial launcher.
     daemon_env["SANDBOX_LIMA_HELPER_PATH"] = "/usr/local/libexec/sandboxd-test/sandbox-lima-helper"
-    daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER"] = "sandbox-test"
-    daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP"] = "sandbox-test"
+    daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER"] = daemon_test_user
+    daemon_env["SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP"] = daemon_test_user
 
     proc = subprocess.Popen(
         [
-            "sudo", "-n", "-u", "sandbox-test",
+            "sudo", "-n", "-u", daemon_test_user,
             # Mirror the HOME/DOCKER_CONFIG env wrapper from the initial
-            # launcher: sudo env_reset sets HOME=/nonexistent for sandbox-test
-            # regardless of the Popen env dict, so we must override after the
-            # user switch via an explicit ``env`` prefix.
+            # launcher: sudo env_reset sets HOME=/nonexistent for the daemon
+            # test user regardless of the Popen env dict, so we must
+            # override after the user switch via an explicit ``env`` prefix.
             "env",
             f"HOME={_SANDBOX_E2E_BASE_DIR}",
             f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
@@ -1635,8 +1683,8 @@ def _ensure_base_image(request, sandbox_binaries: SandboxBinaries):
     not consume any per-test budget. Without the autouse hoist this
     fixture would fire transitively from ``sandbox_cli`` the first time
     a test pulls it in, and a 600 s pytest-timeout on that test would
-    end up racing the 580 MiB download — exactly the failure mode that
-    M18-S9 unblocking work exists to eliminate.
+    end up racing the 580 MiB download — exactly the failure mode the
+    autouse-hoist was introduced to eliminate.
 
     If the daemon reports the image is already ``fresh`` (e.g. a previous
     test run left a valid base VM on disk), the rebuild is skipped.
@@ -1816,77 +1864,75 @@ def backend(request) -> str:
 # ---------------------------------------------------------------------------
 # macOS full-backend guard
 # ---------------------------------------------------------------------------
+# Platform-axis marker gates
+# ---------------------------------------------------------------------------
 #
-# Tests carrying ``@pytest.mark.macos`` require the macOS full backend:
-# socket_vmnet pool daemons, a running sandboxd-gateway Lima instance, and
-# the per-operator agent checked in (GUI/Aqua session). Lite mode (container
-# backend) works over SSH without a GUI session; the full Lima backend requires
-# the operator's LaunchAgent to be running.
+# Two orthogonal axes control test selection:
 #
-# This fixture distinguishes two macOS modes:
-#   - GUI/Aqua-agent-present: the operator is logged into a macOS GUI session
-#     and their per-operator agent has checked in to the daemon broker. Full
-#     backend create/start/stop work. Tests with ``@pytest.mark.macos`` need
-#     this mode.
-#   - SSH-only / no Aqua agent: the operator is connected over SSH without a
-#     GUI session. The per-operator agent LaunchAgent does not load
-#     (``LimitLoadToSessionType: Aqua``), so the daemon's broker has no agent
-#     for this operator. Full backend calls fail with an agent-unavailable
-#     error; lite mode still works. M21-S4 SSH-only lite path depends on
-#     this distinction being detectable.
+#   Backend axis  — ``@pytest.mark.lima`` / ``@pytest.mark.container``
+#   Platform axis — ``@pytest.mark.linux_only`` / ``@pytest.mark.macos_only``
 #
-# Detection heuristic for agent presence (provisional — the full seam is
-# M22-S7): check whether the daemon's broker socket exists at the expected
-# path and whether ``launchctl print user/<uid>/io.sandboxd.agent`` reports
-# the LaunchAgent as loaded. A missing socket or an unloaded agent signals
-# SSH-only mode; tests skip rather than fail on that host.
+# No platform marker → the test runs on both platforms (the majority).
+# ``linux_only`` → qemu-bridge-helper, /dev/kvm, route-helper netns, systemd.
+# ``macos_only`` → socket_vmnet pool lifecycle, gateway Lima instance lifecycle,
+#   vmnet NIC discovery, per-operator agent check-in/broker, launchd control.
+#
+# For ``macos_only`` tests the fixture also checks whether the per-operator
+# sandboxd agent is loaded (Aqua/GUI mode), because the full Lima backend
+# requires an operator-local agent brokered by launchd.  SSH-only sessions
+# can still run lite (container) tests.
+
 
 @pytest.fixture(autouse=True, scope="function")
-def _macos_required_for_macos_tests(request):
-    """Per-test prereq check for tests carrying the ``macos`` marker.
+def _platform_axis_gate(request):
+    """Enforce the platform axis (linux_only / macos_only) per test.
 
-    Skips on non-macOS hosts. On macOS, also checks whether the
-    per-operator sandboxd agent LaunchAgent is loaded in the current
-    session (Aqua / GUI mode) — a prerequisite for the full Lima backend.
-    If the agent is not loaded, the test is skipped with an actionable
-    message; this distinguishes the GUI/Aqua-agent-present mode from the
-    SSH-only / no-Aqua-agent mode. Lite-mode tests are unaffected.
-
-    The full harness adaptation across all four cells is deferred to
-    M22-S7; this fixture provides the minimal gate for macOS egress proof
-    tests.
+    Tests with no platform marker are platform-agnostic and pass through
+    unconditionally.  ``linux_only`` tests skip on macOS; ``macos_only``
+    tests skip on Linux.  On macOS, ``macos_only`` tests that require
+    the full Lima backend also check for a loaded per-operator agent.
     """
-    if request.node.get_closest_marker("macos") is None:
-        return
+    has_linux_only = request.node.get_closest_marker("linux_only") is not None
+    has_macos_only = request.node.get_closest_marker("macos_only") is not None
 
-    if sys.platform != "darwin":
+    if has_linux_only and sys.platform == "darwin":
         pytest.skip(
-            "macOS-only test; run on an Apple-Silicon Mac with the full "
-            "sandboxd backend (socket_vmnet + restrict=on qemu-wrapper)."
+            "linux_only test; run on Linux (requires qemu-bridge-helper, "
+            "/dev/kvm, route-helper netns, or systemd)."
         )
 
-    # Check for GUI/Aqua mode: the per-operator sandboxd agent must be
-    # loaded in the current user's launchd session. Without it, the daemon
-    # cannot start Lima VMs for this operator (the full backend is GUI-gated
-    # per the design spec — § Login-session constraints).
-    uid = os.getuid()
-    try:
-        agent_result = subprocess.run(
-            ["launchctl", "print", f"user/{uid}/io.sandboxd.agent"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        agent_loaded = agent_result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        agent_loaded = False
-
-    if not agent_loaded:
+    if has_macos_only and sys.platform != "darwin":
         pytest.skip(
-            "macOS per-operator sandboxd agent (io.sandboxd.agent) is not "
-            "loaded in this session. The full Lima backend requires a GUI "
-            "(Aqua) login session. Either: (1) log in to the macOS GUI and "
-            "run the test from a Terminal.app/iTerm2 session, or (2) use "
-            "lite mode (container backend) which works over SSH without a "
-            "GUI session."
+            "macos_only test; run on an Apple-Silicon Mac with the full "
+            "sandboxd backend (socket_vmnet + restrict=on)."
         )
+
+    if has_macos_only and sys.platform == "darwin":
+        # Check for GUI/Aqua mode: the per-operator sandboxd agent must be
+        # loaded in the current user's launchd session. Without it, the daemon
+        # cannot start Lima VMs for this operator (the full backend requires
+        # the operator's LaunchAgent running in a GUI/Aqua session). Lite
+        # (container) mode works over SSH and is not gated here.
+        has_lima = request.node.get_closest_marker("lima") is not None
+        if has_lima:
+            uid = os.getuid()
+            try:
+                agent_result = subprocess.run(
+                    ["launchctl", "print", f"user/{uid}/io.sandboxd.agent"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                agent_loaded = agent_result.returncode == 0
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                agent_loaded = False
+
+            if not agent_loaded:
+                pytest.skip(
+                    "macOS per-operator sandboxd agent (io.sandboxd.agent) is "
+                    "not loaded in this session. The full Lima backend requires "
+                    "a GUI (Aqua) login session. Either: (1) log in to the "
+                    "macOS GUI and run the test from a Terminal.app/iTerm2 "
+                    "session, or (2) use lite mode (container backend) which "
+                    "works over SSH without a GUI session."
+                )
