@@ -242,6 +242,11 @@ operator-group-add
 install-binaries
 install-cosign
 state-dirs
+stage-socket-vmnet
+install-vmnet-plists
+bootstrap-vmnet-daemons
+install-agent
+install-daemon-plist
 write-install-state"
 
 # Resolved in main() to the platform-appropriate list.
@@ -866,14 +871,15 @@ check_lima_installed_and_version() {
 # check_socket_vmnet_running — verify the io.sandboxd.vmnet.N launchd daemons
 # and their slot sockets under /var/run/sandbox/vmnet/ are in a healthy state.
 #
-# Two states:
-#   1. Daemons and sockets absent — normal on a fresh install because the
-#      vmnet pool daemons are provisioned in a separate later step, not by
-#      install.sh itself.  Treated as benign: print an informational note
-#      and return 0 so the install proceeds.
-#   2. Daemons present but unhealthy (loaded but socket missing) — indicates
-#      a broken configuration that the operator must resolve before continuing.
-#      Returns 1 and adds an entry to the missing list.
+# Two states, with different consequences:
+#   1. No daemons loaded — benign on a fresh install (install.sh will provision
+#      them in the bootstrap-vmnet-daemons step later in this run).  Print an
+#      informational note and return 0 so the pre-install check passes.
+#   2. Daemons present but a socket is missing — broken configuration.  This
+#      means a daemon was bootstrapped but failed to create its socket (e.g.
+#      codesign failure, staged binary missing, or a /var/run/sandbox permission
+#      problem).  The operator must diagnose and fix before re-running install.
+#      Returns 1 so the install aborts with an actionable error.
 check_socket_vmnet_running() {
     _slot_found=0
     _slot_broken=0
@@ -890,9 +896,8 @@ check_socket_vmnet_running() {
     done
 
     if [ "$_slot_found" -eq 0 ]; then
-        # No vmnet daemons loaded yet — this is normal on a fresh install.
-        # The daemons are provisioned separately after install.sh completes.
-        emit "  ${BLUE}i${RESET} vmnet pool daemons not yet configured — will be set up after install"
+        # No vmnet daemons loaded yet — normal on a fresh install.
+        emit "  ${BLUE}i${RESET} vmnet pool daemons not yet configured — will be bootstrapped during install"
         return 0
     fi
 
@@ -906,14 +911,18 @@ check_socket_vmnet_running() {
 # check_socket_vmnet_access — verify the operator has _sandboxd group membership
 # and can reach the vmnet slot sockets.
 #
-# Same two-state logic as check_socket_vmnet_running:
-#   1. No slot sockets present — fresh install, benign skip.
-#   2. Sockets present but operator cannot read one — broken state, fail.
+# Two states, with different consequences:
+#   1. No slot socket directory — fresh install (daemons not yet bootstrapped).
+#      The directory is created at boot by the vmnet daemons; it does not exist
+#      on a host that has never run the daemon pool.  Benign skip: return 0.
+#   2. Socket directory present but operator lacks _sandboxd group membership —
+#      broken state.  The daemons are running but the operator cannot reach
+#      their sockets.  Returns 1 so the install aborts with an actionable error.
 check_socket_vmnet_access() {
     _sock_dir="/var/run/sandbox/vmnet"
     if [ ! -d "$_sock_dir" ]; then
-        # No vmnet sockets yet — normal on a fresh install.  Access check
-        # will become meaningful once the vmnet daemons are running.
+        # Socket dir not present — daemons not yet bootstrapped.  The access
+        # check will be meaningful on the next invocation once the pool is up.
         return 0
     fi
 
@@ -943,9 +952,10 @@ check_prereqs() {
         # These are required to proceed and must be installed before running install.sh.
         #
         # Tolerant checks: vmnet daemon running / socket access.  On a fresh install
-        # the vmnet pool daemons do not exist yet — they are provisioned separately
-        # after install.sh completes.  These checks only fail when daemons are partially
-        # configured (present but unhealthy), not when they are simply absent.
+        # the vmnet pool daemons do not exist yet — they are provisioned by the
+        # bootstrap-vmnet-daemons step later in this same install.sh run.  These
+        # checks only fail when daemons are partially configured (present but
+        # unhealthy), not when they are simply absent.
         check_socket_vmnet_installed || add_missing "socket_vmnet"
         check_lima_installed_and_version || add_missing "lima-1.2.0+"
         command -v curl    >/dev/null 2>&1 || add_missing "curl"
@@ -1568,7 +1578,8 @@ _compute_plan_darwin() {
     for _b in \
         "$STAGE/bin/sandboxd:/usr/local/libexec/sandboxd/sandboxd:0755" \
         "$STAGE/bin/sandbox:/usr/local/bin/sandbox:0755" \
-        "$STAGE/bin/sandbox-guest:/usr/local/libexec/sandboxd/sandbox-guest:0755"
+        "$STAGE/bin/sandbox-guest:/usr/local/libexec/sandboxd/sandbox-guest:0755" \
+        "$STAGE/bin/sandbox-agent:/usr/local/libexec/sandboxd/sandbox-agent:0755"
     do
         _src="${_b%%:*}"
         _rest="${_b#*:}"
@@ -1581,7 +1592,33 @@ _compute_plan_darwin() {
     done
     PLAN_BINARIES="$_bin_plan"
 
-    log_ok "step=compute_plan os=darwin sandbox_user=$PLAN_SANDBOX_USER operator_add=$PLAN_OPERATOR_ADD"
+    # ---- vmnet pool staging (socket_vmnet + N plists + bootstrap) ----
+    _svmnet_brew="/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet"
+    _svmnet_staged="/Library/sandboxd/socket_vmnet"
+    if [ -f "$_svmnet_staged" ] && cmp -s "$_svmnet_brew" "$_svmnet_staged" 2>/dev/null; then
+        PLAN_STAGE_SOCKET_VMNET="skip"
+    else
+        PLAN_STAGE_SOCKET_VMNET="install"
+    fi
+
+    # Always install/refresh the N vmnet plists (they embed the codesign guard
+    # and must be up-to-date after any socket_vmnet upgrade).
+    PLAN_VMNET_POOL="install"
+
+    # ---- agent LaunchAgent ----
+    _agent_plist_dst="/Library/LaunchAgents/io.sandboxd.agent.plist"
+    if [ -f "$_agent_plist_dst" ] && cmp -s "$STAGE/launchd/io.sandboxd.agent.plist" "$_agent_plist_dst" 2>/dev/null; then
+        PLAN_AGENT="skip"
+    else
+        PLAN_AGENT="install"
+    fi
+
+    # ---- daemon LaunchDaemon plist ----
+    # Always render and install: the plist contains the resolved BASE_DIR, so it
+    # must be refreshed on every install regardless of whether it exists already.
+    PLAN_DAEMON_PLIST="install"
+
+    log_ok "step=compute_plan os=darwin sandbox_user=$PLAN_SANDBOX_USER operator_add=$PLAN_OPERATOR_ADD vmnet=$PLAN_STAGE_SOCKET_VMNET agent=$PLAN_AGENT"
 }
 
 _compute_plan_linux() {
@@ -1815,7 +1852,7 @@ _render_plan_darwin() {
         if [ "$_action" = "skip-identical" ]; then
             emit "    ${GREEN}+ $_dst — identical, skip${RESET}"
         else
-            emit "    ${YELLOW}+ install $_dst (mode 0755, root:root)${RESET}"
+            emit "    ${YELLOW}+ install $_dst (mode 0755, root:wheel)${RESET}"
         fi
         IFS=";"
     done
@@ -1833,6 +1870,52 @@ _render_plan_darwin() {
     fi
     emit "    ${YELLOW}+ install -d -o _sandboxd -g _sandboxd -m 0750 /var/log/sandbox${RESET}"
     emit "    (note: /var/run/sandbox is re-created at each boot by the vmnet daemons)"
+    emit ""
+
+    # ---- socket_vmnet staging ----
+    hdr="socket_vmnet staging"
+    emit "  $(osc8_link "${DOCS_BASE}#vmnet-pool" "$hdr")"
+    if [ "${PLAN_STAGE_SOCKET_VMNET:-install}" = "skip" ]; then
+        emit "    ${GREEN}+ /Library/sandboxd/socket_vmnet — identical, skip${RESET}"
+    else
+        emit "    ${YELLOW}+ install -d -o root -g wheel -m 0755 /Library/sandboxd${RESET}"
+        emit "    ${YELLOW}+ stage /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet → /Library/sandboxd/socket_vmnet (root:wheel 0755)${RESET}"
+        emit "    ${YELLOW}+ verify: otool -L closure system-only (reject non-system dylib paths)${RESET}"
+        emit "    ${YELLOW}+ verify: codesign --verify --strict /Library/sandboxd/socket_vmnet${RESET}"
+    fi
+    emit ""
+
+    # ---- vmnet pool plists ----
+    hdr="vmnet pool plists + daemons"
+    emit "  $(osc8_link "${DOCS_BASE}#vmnet-pool" "$hdr")"
+    emit "    ${YELLOW}+ generate and install /Library/LaunchDaemons/io.sandboxd.vmnet.{0..7}.plist (root:wheel 0644)${RESET}"
+    emit "      (each plist includes a pre-exec codesign --verify guard)"
+    emit "    ${YELLOW}+ launchctl bootstrap system + enable each daemon${RESET}"
+    emit "    ${YELLOW}+ wait for slot sockets under /var/run/sandbox/vmnet/${RESET}"
+    emit ""
+
+    # ---- agent LaunchAgent ----
+    hdr="sandbox-agent LaunchAgent"
+    emit "  $(osc8_link "${DOCS_BASE}#agent" "$hdr")"
+    if [ "${PLAN_AGENT:-install}" = "skip" ]; then
+        emit "    ${GREEN}+ /Library/LaunchAgents/io.sandboxd.agent.plist — identical, skip${RESET}"
+    else
+        emit "    ${YELLOW}+ install /Library/LaunchAgents/io.sandboxd.agent.plist (root:wheel 0644)${RESET}"
+        emit "      (LimitLoadToSessionType=Aqua; loads only in operator GUI login sessions)"
+    fi
+    emit ""
+
+    # ---- daemon LaunchDaemon plist ----
+    hdr="sandboxd LaunchDaemon"
+    emit "  $(osc8_link "${DOCS_BASE}#daemon" "$hdr")"
+    if [ -n "$BASE_DIR" ]; then
+        emit "    ${YELLOW}+ render io.sandboxd.daemon.plist (substitute $BASE_DIR)${RESET}"
+    else
+        emit "    ${YELLOW}+ render io.sandboxd.daemon.plist (substitute /var/lib/sandboxd/<uid>)${RESET}"
+    fi
+    emit "    ${YELLOW}+ install /Library/LaunchDaemons/io.sandboxd.daemon.plist (root:wheel 0644)${RESET}"
+    emit "    ${YELLOW}+ launchctl bootstrap system + enable io.sandboxd.daemon${RESET}"
+    emit "    ${YELLOW}+ wait for /var/run/sandbox/sandboxd.sock${RESET}"
     emit ""
 
     # ---- Install state ----
@@ -2144,7 +2227,7 @@ fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
-_TOTAL_STEPS=$(if [ "$OS" = "darwin" ]; then printf '6'; else printf '15'; fi)
+_TOTAL_STEPS=$(if [ "$OS" = "darwin" ]; then printf '11'; else printf '15'; fi)
 # Tracks the label of the last successfully completed step (set by _step_ok).
 # Used by _write_checkpoint to populate last_completed_step correctly on
 # failure checkpoints (the failing step should appear in failed_step, not
@@ -2575,6 +2658,8 @@ for _entry in \$PLAN_BINARIES; do
                 _src="\$STAGE/bin/sandbox-lima-helper" ;;
             /usr/local/libexec/sandboxd/sandbox-guest)
                 _src="\$STAGE/bin/sandbox-guest" ;;
+            /usr/local/libexec/sandboxd/sandbox-agent)
+                _src="\$STAGE/bin/sandbox-agent" ;;
             *)
                 printf 'priv-child: unknown binary dst: %s\n' "\$_dst" >> "\$_LOG" 2>&1
                 _step_fail
@@ -2630,6 +2715,257 @@ _log "step=state_dirs path=/var/log/sandbox action=create status=ok"
 _step_ok
 _write_checkpoint "state-dirs"
 _priv_maybe_fail_after "state-dirs"
+
+# ----- Step: stage socket_vmnet (macOS) -----
+_step_begin "stage-socket-vmnet"
+_priv_maybe_abort_at "stage-socket-vmnet"
+_svmnet_brew="/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet"
+_svmnet_staged="/Library/sandboxd/socket_vmnet"
+if [ ! -f "\$_svmnet_brew" ]; then
+    _log "step=stage_socket_vmnet action=fail reason=brew-binary-absent path=\$_svmnet_brew status=fail"
+    _step_fail
+fi
+# Verify the dylib closure is system-only before staging.
+# Reject any path outside /System/Library or /usr/lib to prevent staging a
+# binary that would silently load admin-writable dylibs at root exec time.
+_bad_dylib=\$(otool -L "\$_svmnet_brew" 2>/dev/null | tail -n +2 | awk '{print \$1}' \
+    | grep -v '^/System/Library' | grep -v '^/usr/lib' || true)
+if [ -n "\$_bad_dylib" ]; then
+    _log "step=stage_socket_vmnet action=fail reason=non-system-dylib path=\$_svmnet_brew status=fail"
+    printf 'priv-child: socket_vmnet has non-system dylib closure:\n%s\n' "\$_bad_dylib" >> "\$_LOG" 2>&1
+    _step_fail
+fi
+# Verify the code signature before staging.  The staged copy is exec'd as root
+# by launchd daemons; an invalid signature at stage time is an early signal of
+# a tampered or unsigned binary.
+codesign --verify --strict "\$_svmnet_brew" >> "\$_LOG" 2>&1 || {
+    _log "step=stage_socket_vmnet action=fail reason=codesign-verify path=\$_svmnet_brew status=fail"
+    _step_fail
+}
+# Stage the binary at the root-owned path.  /Library/sandboxd is root:wheel 0755
+# so non-root principals cannot replace the binary after staging.
+install -d -o root -g wheel -m 0755 /Library/sandboxd >> "\$_LOG" 2>&1 \
+    || { _log "step=stage_socket_vmnet action=fail reason=mkdir status=fail"; _step_fail; }
+install -o root -g wheel -m 0755 "\$_svmnet_brew" "\$_svmnet_staged" >> "\$_LOG" 2>&1 \
+    || { _log "step=stage_socket_vmnet action=fail reason=install status=fail"; _step_fail; }
+_log "step=stage_socket_vmnet path=\$_svmnet_staged action=install status=ok"
+_step_ok
+_write_checkpoint "stage-socket-vmnet"
+_priv_maybe_fail_after "stage-socket-vmnet"
+
+# ----- Step: install vmnet plists (macOS) -----
+_step_begin "install-vmnet-plists"
+_priv_maybe_abort_at "install-vmnet-plists"
+# Generate and install N launchd plist files for the socket_vmnet pool.
+# The plist content is generated inline to match generate_vmnet_plist in
+# sandbox-core/src/network.rs — same namespace UUID, same UUIDv5 derivation,
+# same wrapper including the codesign --verify pre-exec guard.
+_vmnet_slots="\${DARWIN_VMNET_SLOTS:-8}"
+_svmnet_staged="/Library/sandboxd/socket_vmnet"
+_namespace_hex="6d4f6e2b958a4f1aa2317e8cd0123e5b"
+_i=0
+while [ "\$_i" -lt "\$_vmnet_slots" ]; do
+    _slot="\$_i"
+    _label="io.sandboxd.vmnet.\$_slot"
+    _plist_dst="/Library/LaunchDaemons/\$_label.plist"
+    _socket_path="/var/run/sandbox/vmnet/slot-\$_slot.sock"
+
+    # Derive the UUIDv5 network-identifier (SHA1 of namespace || slot_be_u16).
+    _network_id=\$(python3 -c "
+import sys, hashlib, struct
+ns = bytes.fromhex(sys.argv[1])
+slot = int(sys.argv[2])
+h = hashlib.sha1(ns + struct.pack('>H', slot)).digest()
+b = bytearray(h[:16])
+b[6] = (b[6] & 0x0f) | 0x50
+b[8] = (b[8] & 0x3f) | 0x80
+print('%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x' % tuple(b))
+" "\$_namespace_hex" "\$_slot") || {
+        _log "step=install_vmnet_plists action=fail reason=uuid-derive slot=\$_slot status=fail"
+        _step_fail
+    }
+
+    # Build the exec_cmd — must match generate_vmnet_plist in network.rs and
+    # the Makefile Python generator exactly.
+    _exec_cmd="install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict \$_svmnet_staged || { echo 'sandboxd: codesign verify failed for \$_svmnet_staged -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec \$_svmnet_staged --vmnet-mode=host --vmnet-network-identifier=\$_network_id --socket-group=_sandboxd \$_socket_path"
+
+    _tmp=\$(mktemp -t io.sandboxd.vmnet) || { _step_fail; }
+    python3 -c "
+import sys
+label, exec_cmd, slot, uuid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+print('<?xml version=\"1.0\" encoding=\"UTF-8\"?>')
+print('<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">')
+print('<plist version=\"1.0\">')
+print('<dict>')
+print('    <key>Label</key>')
+print('    <string>' + label + '</string>')
+print('')
+print('    <key>ProgramArguments</key>')
+print('    <array>')
+print('        <string>/bin/sh</string>')
+print('        <string>-c</string>')
+print('        <string>' + exec_cmd + '</string>')
+print('    </array>')
+print('')
+print('    <key>RunAtLoad</key>')
+print('    <true/>')
+print('')
+print('    <key>KeepAlive</key>')
+print('    <dict>')
+print('        <key>SuccessfulExit</key>')
+print('        <false/>')
+print('        <key>Crashed</key>')
+print('        <true/>')
+print('    </dict>')
+print('')
+print('    <key>ThrottleInterval</key>')
+print('    <integer>5</integer>')
+print('')
+print('    <key>StandardOutPath</key>')
+print('    <string>/var/log/sandbox/vmnet-' + slot + '.stdout.log</string>')
+print('')
+print('    <key>StandardErrorPath</key>')
+print('    <string>/var/log/sandbox/vmnet-' + slot + '.stderr.log</string>')
+print('</dict>')
+print('</plist>')
+" "\$_label" "\$_exec_cmd" "\$_slot" "\$_network_id" > "\$_tmp" || {
+        rm -f "\$_tmp"
+        _log "step=install_vmnet_plists action=fail reason=plist-gen slot=\$_slot status=fail"
+        _step_fail
+    }
+
+    install -o root -g wheel -m 0644 "\$_tmp" "\$_plist_dst" >> "\$_LOG" 2>&1 || {
+        rm -f "\$_tmp"
+        _log "step=install_vmnet_plists action=fail reason=install slot=\$_slot path=\$_plist_dst status=fail"
+        _step_fail
+    }
+    rm -f "\$_tmp"
+    _log "step=install_vmnet_plists slot=\$_slot path=\$_plist_dst uuid=\$_network_id action=install status=ok"
+
+    _i=\$((_i + 1))
+done
+_step_ok
+_write_checkpoint "install-vmnet-plists"
+_priv_maybe_fail_after "install-vmnet-plists"
+
+# ----- Step: bootstrap vmnet daemons (macOS) -----
+_step_begin "bootstrap-vmnet-daemons"
+_priv_maybe_abort_at "bootstrap-vmnet-daemons"
+_vmnet_slots="\${DARWIN_VMNET_SLOTS:-8}"
+_i=0
+while [ "\$_i" -lt "\$_vmnet_slots" ]; do
+    _slot="\$_i"
+    _label="io.sandboxd.vmnet.\$_slot"
+    _plist_dst="/Library/LaunchDaemons/\$_label.plist"
+    _socket_path="/var/run/sandbox/vmnet/slot-\$_slot.sock"
+
+    if launchctl print "system/\$_label" >> "\$_LOG" 2>&1; then
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=skip reason=already-loaded status=ok"
+    else
+        launchctl bootstrap system "\$_plist_dst" >> "\$_LOG" 2>&1 || {
+            _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=bootstrap status=fail"
+            _step_fail
+        }
+        launchctl enable "system/\$_label" >> "\$_LOG" 2>&1 || {
+            _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=enable status=fail"
+            _step_fail
+        }
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=bootstrap-enable status=ok"
+    fi
+
+    # Wait for the slot socket to appear (up to 30 s).
+    _ready=0
+    _w=0
+    while [ "\$_w" -lt 30 ]; do
+        if [ -S "\$_socket_path" ]; then
+            _ready=1; break
+        fi
+        _w=\$((_w + 1))
+        sleep 1
+    done
+    if [ "\$_ready" -ne 1 ]; then
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=socket-wait-fail path=\$_socket_path status=fail"
+        _step_fail
+    fi
+    _log "step=bootstrap_vmnet_daemons slot=\$_slot socket=\$_socket_path action=ready status=ok"
+
+    _i=\$((_i + 1))
+done
+_step_ok
+_write_checkpoint "bootstrap-vmnet-daemons"
+_priv_maybe_fail_after "bootstrap-vmnet-daemons"
+
+# ----- Step: install sandbox-agent LaunchAgent (macOS) -----
+_step_begin "install-agent"
+_priv_maybe_abort_at "install-agent"
+# The agent binary is already installed by the install-binaries step.
+# Install the LaunchAgent plist so launchd loads the agent in each operator's
+# GUI session (LimitLoadToSessionType=Aqua).  No setuid/setcap is needed; launchd
+# starts the agent as the operator's own uid.
+_agent_plist_src="\$STAGE/launchd/io.sandboxd.agent.plist"
+_agent_plist_dst="/Library/LaunchAgents/io.sandboxd.agent.plist"
+if [ ! -f "\$_agent_plist_src" ]; then
+    _log "step=install_agent action=fail reason=plist-not-in-stage path=\$_agent_plist_src status=fail"
+    _step_fail
+fi
+install -d -o root -g wheel -m 0755 /Library/LaunchAgents >> "\$_LOG" 2>&1 || true
+install -o root -g wheel -m 0644 "\$_agent_plist_src" "\$_agent_plist_dst" >> "\$_LOG" 2>&1 \
+    || { _log "step=install_agent action=fail reason=install status=fail"; _step_fail; }
+_log "step=install_agent path=\$_agent_plist_dst action=install status=ok"
+_step_ok
+_write_checkpoint "install-agent"
+_priv_maybe_fail_after "install-agent"
+
+# ----- Step: install daemon plist + bootstrap/enable (macOS) -----
+_step_begin "install-daemon-plist"
+_priv_maybe_abort_at "install-daemon-plist"
+_daemon_plist_src="\$STAGE/launchd/io.sandboxd.daemon.plist"
+_daemon_plist_dst="/Library/LaunchDaemons/io.sandboxd.daemon.plist"
+_daemon_plist_rendered="\$TMPDIR_INSTALL/io.sandboxd.daemon.plist.rendered"
+if [ ! -f "\$_daemon_plist_src" ]; then
+    _log "step=install_daemon_plist action=fail reason=plist-not-in-stage path=\$_daemon_plist_src status=fail"
+    _step_fail
+fi
+# Substitute the BASE_DIR placeholder with the resolved per-uid path.
+sed "s|@SANDBOX_BASE_DIR@|\$BASE_DIR|g" "\$_daemon_plist_src" > "\$_daemon_plist_rendered"
+if grep -q '@SANDBOX_BASE_DIR@' "\$_daemon_plist_rendered"; then
+    _log "step=install_daemon_plist action=fail reason=placeholder-not-substituted status=fail"
+    _step_fail
+fi
+install -o root -g wheel -m 0644 "\$_daemon_plist_rendered" "\$_daemon_plist_dst" >> "\$_LOG" 2>&1 \
+    || { _log "step=install_daemon_plist action=fail reason=install status=fail"; _step_fail; }
+_log "step=install_daemon_plist path=\$_daemon_plist_dst base_dir=\$BASE_DIR action=install status=ok"
+
+# Bootstrap and enable the daemon.  RunAtLoad=true means it starts immediately.
+if launchctl print "system/io.sandboxd.daemon" >> "\$_LOG" 2>&1; then
+    # Already loaded (e.g. re-install): bootout first so the new plist takes effect.
+    launchctl bootout "system/io.sandboxd.daemon" >> "\$_LOG" 2>&1 || true
+    _log "step=install_daemon_plist action=bootout-existing status=ok"
+fi
+launchctl bootstrap system "\$_daemon_plist_dst" >> "\$_LOG" 2>&1 \
+    || { _log "step=install_daemon_plist action=fail reason=bootstrap status=fail"; _step_fail; }
+launchctl enable "system/io.sandboxd.daemon" >> "\$_LOG" 2>&1 \
+    || { _log "step=install_daemon_plist action=fail reason=enable status=fail"; _step_fail; }
+_log "step=install_daemon_plist action=bootstrap-enable status=ok"
+
+# Wait for the daemon socket to appear (up to 30 s).
+_ready=0
+_i=0
+while [ "\$_i" -lt 30 ]; do
+    if [ -S /var/run/sandbox/sandboxd.sock ]; then
+        _ready=1; break
+    fi
+    _i=\$((_i + 1))
+    sleep 1
+done
+if [ "\$_ready" -ne 1 ]; then
+    _log "step=install_daemon_plist action=socket-wait-fail path=/var/run/sandbox/sandboxd.sock status=fail"
+    _step_fail
+fi
+_log "step=install_daemon_plist action=ready socket=/var/run/sandbox/sandboxd.sock status=ok"
+_step_ok
+_write_checkpoint "install-daemon-plist"
+_priv_maybe_fail_after "install-daemon-plist"
 
 else
 

@@ -461,15 +461,58 @@ fn resolve_log_destination(log_file: Option<&std::path::Path>) -> std::io::Resul
     }
 }
 
-/// Install the global tracing subscriber, routing output per
-/// [`resolve_log_destination`].
+/// Install the global tracing subscriber, routing output per the log
+/// destination policy:
+///
+/// - **macOS, no `--log-file`**: structured output goes to
+///   `/var/log/sandbox/sandboxd.log` via a daily rolling appender.
+///   Returns `Some(WorkerGuard)` which the caller must keep alive for the
+///   process lifetime — dropping it flushes and terminates the background
+///   writer thread.
+/// - **explicit `--log-file`** (any platform): append to the given file.
+/// - **otherwise**: write to stderr (caught by the init system's log capture).
 ///
 /// Uses `RUST_LOG` via `EnvFilter`, defaulting to `info` when unset.
-fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
-    let dest = resolve_log_destination(log_file)?;
+fn init_tracing(
+    log_file: Option<&std::path::Path>,
+) -> std::io::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
+    // macOS with no explicit --log-file: use a rolling daily appender that
+    // writes the structured daemon log to /var/log/sandbox/sandboxd.log.
+    // Rotated files are named sandboxd.log.YYYY-MM-DD. The log_rotation
+    // reaper (called at startup and on a daily interval) gzip-compresses
+    // rotated files and retains the newest 7 generations.
+    //
+    // Note: tracing-appender's time-based rotation does not enforce a
+    // per-file size cap. The 50-MiB intra-day cap from the spec is not
+    // implemented here; it would require a custom size-aware MakeWriter
+    // wrapper. Daily rotation + 7 generations + gzip is the implemented
+    // policy. The size cap is deferred.
+    #[cfg(target_os = "macos")]
+    if log_file.is_none() {
+        let appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("sandboxd.log")
+            .build("/var/log/sandbox")
+            .map_err(|e| {
+                std::io::Error::other(format!("failed to build rolling log appender: {e}"))
+            })?;
+
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_writer(non_blocking)
+            .init();
+
+        return Ok(Some(guard));
+    }
+
+    // Non-macOS path, or explicit --log-file on any platform.
+    let dest = resolve_log_destination(log_file)?;
     match dest {
         LogDestination::File(file) => {
             // `std::sync::Mutex<File>` implements `MakeWriter`, so we can
@@ -487,7 +530,194 @@ fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
             tracing_subscriber::fmt().with_env_filter(env_filter).init();
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Log rotation reaper (macOS)
+// ---------------------------------------------------------------------------
+//
+// The daily rolling appender rotates the active log file at midnight,
+// leaving behind files named `sandboxd.log.YYYY-MM-DD`. The reaper:
+//   1. Gzip-compresses any rotated file not yet ending in `.gz`.
+//   2. Keeps only the newest `ROTATION_KEEP_COUNT` rotated files
+//      (counting both `.gz` and plain), deleting older ones.
+//
+// The reaper is called once at daemon startup (so files from a previous
+// run are immediately compressed) and then on a daily tokio interval so
+// rotation passes stay compressed without requiring a daemon restart.
+//
+// The tracing-appender `max_log_files` option is intentionally NOT set
+// because the reaper is the sole retention authority; dual pruning would
+// race and produce surprising results.
+
+/// Number of rotated generations to keep (the active log file does not count).
+const ROTATION_KEEP_COUNT: usize = 7;
+
+/// Default log directory on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_LOG_DIR: &str = "/var/log/sandbox";
+
+/// Prefix that `tracing-appender` uses for the active log file and rotated
+/// files (`sandboxd.log` and `sandboxd.log.YYYY-MM-DD`).
+const LOG_FILE_PREFIX: &str = "sandboxd.log";
+
+/// Scan `log_dir` for rotated log files, gzip-compress any that are not yet
+/// compressed, and delete all but the newest `ROTATION_KEEP_COUNT`.
+///
+/// "Rotated files" are files whose name matches `sandboxd.log.YYYY-MM-DD`
+/// (with or without a trailing `.gz`). The active `sandboxd.log` file is
+/// intentionally excluded — the appender holds it open and rotating it from
+/// outside the appender would corrupt the stream.
+///
+/// Returns a summary of what was compressed and deleted (useful in tests).
+pub fn run_log_reaper(log_dir: &std::path::Path) -> std::io::Result<LogReaperSummary> {
+    use std::io::{BufReader, BufWriter, Read, Write};
+
+    // Collect all rotated files in the log directory.
+    let read_dir = match std::fs::read_dir(log_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Log directory doesn't exist yet; nothing to do.
+            return Ok(LogReaperSummary::default());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut rotated: Vec<std::path::PathBuf> = Vec::new();
+    for entry in read_dir {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_rotated_log_file(&name_str) {
+            rotated.push(entry.path());
+        }
+    }
+
+    // Sort by name (YYYY-MM-DD suffix sorts chronologically as a string).
+    rotated.sort();
+
+    let mut compressed_count = 0usize;
+    let mut deleted_count = 0usize;
+
+    // Step 1: gzip any plain (non-.gz) rotated files.
+    for path in &rotated {
+        let name = path
+            .file_name()
+            .expect("rotated path has a filename")
+            .to_string_lossy();
+        if name.ends_with(".gz") {
+            continue; // Already compressed.
+        }
+
+        // Append ".gz" to the full filename — do not use Path::with_extension
+        // because that replaces only the last segment after the final dot,
+        // which would mangle "sandboxd.log.2026-06-10" into "sandboxd.log.2026-06-.gz".
+        let gz_path = path.with_file_name(format!("{name}.gz"));
+        // If the .gz already exists (e.g. from a previous partial run), skip.
+        if gz_path.exists() {
+            continue;
+        }
+
+        // Compress the plain rotated file into a sibling .gz file, then
+        // remove the plain original. We write to a temp file first to avoid
+        // leaving a partial .gz on failure.
+        let tmp_path = path.with_file_name(format!("{name}.gz.tmp"));
+        {
+            let src = std::fs::File::open(path)?;
+            let mut reader = BufReader::new(src);
+            let dst = std::fs::File::create(&tmp_path)?;
+            let mut encoder =
+                flate2::write::GzEncoder::new(BufWriter::new(dst), flate2::Compression::default());
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                encoder.write_all(&buf[..n])?;
+            }
+            encoder.finish()?;
+        }
+
+        std::fs::rename(&tmp_path, &gz_path)?;
+        std::fs::remove_file(path)?;
+        compressed_count += 1;
+    }
+
+    // Re-collect after compression to get the updated file list (plain files
+    // may now be .gz). Sort again for consistent ordering.
+    let read_dir = std::fs::read_dir(log_dir)?;
+    let mut rotated_after: Vec<std::path::PathBuf> = Vec::new();
+    for entry in read_dir {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_rotated_log_file(&name_str) {
+            rotated_after.push(entry.path());
+        }
+    }
+    rotated_after.sort();
+
+    // Step 2: delete all but the newest ROTATION_KEEP_COUNT files.
+    if rotated_after.len() > ROTATION_KEEP_COUNT {
+        let to_delete = rotated_after.len() - ROTATION_KEEP_COUNT;
+        for path in rotated_after.iter().take(to_delete) {
+            std::fs::remove_file(path)?;
+            deleted_count += 1;
+        }
+    }
+
+    Ok(LogReaperSummary {
+        compressed: compressed_count,
+        deleted: deleted_count,
+    })
+}
+
+/// Returns true if `name` looks like a rotated log file produced by the
+/// daily appender: `sandboxd.log.YYYY-MM-DD` or `sandboxd.log.YYYY-MM-DD.gz`.
+///
+/// The active log file (`sandboxd.log`) does not match because it has no
+/// date suffix.
+fn is_rotated_log_file(name: &str) -> bool {
+    // Must start with the log prefix followed by a dot and a date.
+    let Some(rest) = name.strip_prefix(LOG_FILE_PREFIX) else {
+        return false;
+    };
+    // rest must be ".YYYY-MM-DD" or ".YYYY-MM-DD.gz"
+    let rest = rest.strip_prefix('.').unwrap_or("");
+    if rest.is_empty() {
+        return false; // This is the active log file "sandboxd.log".
+    }
+    // Accept both plain date and .gz
+    let date_part = rest.strip_suffix(".gz").unwrap_or(rest);
+    // Validate YYYY-MM-DD shape: exactly 10 chars, dashes at positions 4 and 7,
+    // and all non-dash characters are ASCII digits. This rejects names that
+    // have the right length and dash positions but contain non-digit characters
+    // (e.g. "sandboxd.log.YYYY-MM-DD" with letters in the numeric fields).
+    if date_part.len() != 10 {
+        return false;
+    }
+    let b = date_part.as_bytes();
+    b[4] == b'-'
+        && b[7] == b'-'
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
+}
+
+/// Summary returned by [`run_log_reaper`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LogReaperSummary {
+    /// Number of plain rotated files that were gzip-compressed.
+    pub compressed: usize,
+    /// Number of old rotated files that were deleted.
+    pub deleted: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -12716,12 +12946,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install the tracing subscriber. If `--log-file` was provided but the
     // file cannot be opened, abort early with a clear error -- we do NOT
     // silently fall back to stderr.
-    if let Err(e) = init_tracing(args.log_file.as_deref()) {
-        eprintln!(
-            "sandboxd: failed to open log file {:?}: {}",
-            args.log_file, e
-        );
-        return Err(e.into());
+    //
+    // On macOS without an explicit --log-file, init_tracing returns a
+    // WorkerGuard that must be kept alive for the process lifetime. Dropping
+    // it early would flush and terminate the background writer thread, losing
+    // buffered log lines. Binding it here ensures it lives until main() exits.
+    let _tracing_guard = match init_tracing(args.log_file.as_deref()) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!(
+                "sandboxd: failed to open log file {:?}: {}",
+                args.log_file, e
+            );
+            return Err(e.into());
+        }
+    };
+
+    // On macOS, run the log reaper once at startup to compress and prune any
+    // rotated files left over from a previous run, then spawn a daily interval
+    // task to keep the log directory tidy without requiring a daemon restart.
+    #[cfg(target_os = "macos")]
+    if args.log_file.is_none() {
+        let log_dir = std::path::Path::new(MACOS_LOG_DIR);
+        if let Err(e) = run_log_reaper(log_dir) {
+            warn!(?e, "log reaper failed at startup; continuing");
+        }
+        let log_dir_owned = log_dir.to_path_buf();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                if let Err(e) = run_log_reaper(&log_dir_owned) {
+                    warn!(?e, "log reaper failed on daily tick; will retry tomorrow");
+                }
+            }
+        });
     }
 
     let base_dir = PathBuf::from(&args.base_dir);
@@ -13956,6 +14216,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = PeerCredListener::new(listener);
 
     // Graceful shutdown on SIGTERM / SIGINT.
+    //
+    // Shutdown contract (matches the launchd/systemd service spec):
+    //   1. Stop accepting new API connections — axum's graceful shutdown
+    //      stops the listener as soon as shutdown_signal() returns.
+    //   2. Drain in-flight HTTP requests — axum waits for all active
+    //      connections to close before returning from `.await`.
+    //      There is no explicit internal timeout here; the daemon relies on
+    //      the init system's wall-clock budget (launchd ExitTimeOut=20,
+    //      systemd TimeoutStopSec) to SIGKILL if draining stalls. 20 seconds
+    //      is comfortably more than the expected drain budget for in-flight API
+    //      calls, so no hardcoded internal timeout is needed.
+    //   3. Tear down the persistent event sink (step below).
+    //   4. Remove the unix socket file (step below).
+    //   5. Exit 0.
+    //
+    // What graceful shutdown does NOT do: it does not stop the gateway Lima
+    // instance or any running sandbox VMs. Those continue running; the reconcile
+    // loop on the next daemon startup handles state recovery.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<PeerCredAddr>(),
@@ -13968,7 +14246,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // their owned file handles are closed deterministically.
     persistent_sink.shutdown().await;
 
-    // Clean up the socket file on exit.
+    // Remove the socket file so a subsequent daemon start doesn't see a stale
+    // socket at its bind path and fail. Errors are silently ignored: if the
+    // file is already gone (e.g. the admin removed it) the daemon still exits 0.
     let _ = tokio::fs::remove_file(&socket_path).await;
     info!("sandboxd shut down");
 
@@ -16753,5 +17033,161 @@ mod tests {
             roundtripped.version, SCHEMA_VERSION,
             "version must survive round-trip"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Log reaper unit tests.
+    //
+    // These create fake rotated log files in a tempdir and verify the reaper's
+    // compress-and-prune behaviour without touching any production paths.
+    // -----------------------------------------------------------------------
+
+    /// Create a fake plain rotated log file in `dir` named
+    /// `sandboxd.log.YYYY-MM-DD` with a small body.
+    fn fake_rotated(dir: &std::path::Path, date: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("sandboxd.log.{date}"));
+        std::fs::write(&path, format!("log line for {date}\n")).expect("write fake rotated log");
+        path
+    }
+
+    #[test]
+    fn log_reaper_compresses_plain_rotated_files() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Create two plain rotated files.
+        fake_rotated(dir, "2026-06-10");
+        fake_rotated(dir, "2026-06-11");
+
+        let summary = run_log_reaper(dir).expect("reaper must succeed");
+        assert_eq!(
+            summary.compressed, 2,
+            "both plain files should be compressed"
+        );
+        assert_eq!(summary.deleted, 0, "fewer than 7 files; none deleted");
+
+        // The plain files must be gone; .gz files must exist.
+        assert!(!dir.join("sandboxd.log.2026-06-10").exists());
+        assert!(dir.join("sandboxd.log.2026-06-10.gz").exists());
+        assert!(!dir.join("sandboxd.log.2026-06-11").exists());
+        assert!(dir.join("sandboxd.log.2026-06-11.gz").exists());
+    }
+
+    #[test]
+    fn log_reaper_keeps_newest_7_deletes_older() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Create 10 plain rotated files.
+        for d in 1..=10u32 {
+            fake_rotated(dir, &format!("2026-06-{d:02}"));
+        }
+
+        let summary = run_log_reaper(dir).expect("reaper must succeed");
+        assert_eq!(summary.compressed, 10, "all 10 plain files compressed");
+        assert_eq!(summary.deleted, 3, "10 - 7 = 3 oldest files deleted");
+
+        // The 3 oldest (2026-06-01 through 2026-06-03) must be gone.
+        for d in 1..=3u32 {
+            assert!(
+                !dir.join(format!("sandboxd.log.2026-06-{d:02}.gz")).exists(),
+                "oldest file for day {d} should have been deleted"
+            );
+        }
+        // The newest 7 (2026-06-04 through 2026-06-10) must survive.
+        for d in 4..=10u32 {
+            assert!(
+                dir.join(format!("sandboxd.log.2026-06-{d:02}.gz")).exists(),
+                "newest file for day {d} should have been kept"
+            );
+        }
+    }
+
+    #[test]
+    fn log_reaper_does_not_touch_active_log_file() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Active log file must not be treated as a rotated file.
+        let active = dir.join("sandboxd.log");
+        std::fs::write(&active, "current log\n").expect("write active log");
+        fake_rotated(dir, "2026-06-15");
+
+        let summary = run_log_reaper(dir).expect("reaper must succeed");
+        assert_eq!(summary.compressed, 1, "one rotated file compressed");
+        assert!(active.exists(), "active log must not be touched");
+    }
+
+    #[test]
+    fn log_reaper_skips_already_compressed_files() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Write an already-compressed rotated file.
+        let gz_path = dir.join("sandboxd.log.2026-06-10.gz");
+        std::fs::write(&gz_path, b"\x1f\x8b...fake gz...").expect("write .gz");
+
+        let summary = run_log_reaper(dir).expect("reaper must succeed");
+        assert_eq!(
+            summary.compressed, 0,
+            "already-compressed file must not be re-compressed"
+        );
+        assert_eq!(summary.deleted, 0, "only one file; none deleted");
+    }
+
+    #[test]
+    fn log_reaper_is_idempotent() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Three plain rotated files.
+        for d in ["2026-06-10", "2026-06-11", "2026-06-12"] {
+            fake_rotated(dir, d);
+        }
+
+        let first = run_log_reaper(dir).expect("first run");
+        assert_eq!(first.compressed, 3);
+
+        // Second run: nothing to compress, nothing to delete.
+        let second = run_log_reaper(dir).expect("second run");
+        assert_eq!(
+            second.compressed, 0,
+            "no new files to compress on second run"
+        );
+        assert_eq!(second.deleted, 0, "no files to delete on second run");
+    }
+
+    #[test]
+    fn log_reaper_noop_when_dir_absent() {
+        let absent = std::path::Path::new("/tmp/sandboxd-test-absent-log-dir-xyz");
+        let summary = run_log_reaper(absent).expect("reaper must not fail on absent dir");
+        assert_eq!(summary, LogReaperSummary::default());
+    }
+
+    #[test]
+    fn is_rotated_log_file_classification() {
+        // Should match (rotated files):
+        assert!(is_rotated_log_file("sandboxd.log.2026-06-10"));
+        assert!(is_rotated_log_file("sandboxd.log.2026-06-10.gz"));
+        assert!(is_rotated_log_file("sandboxd.log.2024-01-01"));
+        assert!(is_rotated_log_file("sandboxd.log.2024-01-01.gz"));
+
+        // Should not match (active file, unrelated files):
+        assert!(!is_rotated_log_file("sandboxd.log")); // active log
+        assert!(!is_rotated_log_file("sandboxd.log.gz")); // no date suffix
+        assert!(!is_rotated_log_file("other.log.2026-06-10")); // wrong prefix
+        assert!(!is_rotated_log_file("launchd.stdout.log")); // completely unrelated
+        assert!(!is_rotated_log_file("")); // empty
+
+        // Should not match: right length and dash positions but non-digit chars.
+        // Ensures the classifier rejects names that look date-shaped but aren't.
+        assert!(!is_rotated_log_file("sandboxd.log.YYYY-MM-DD")); // letters
+        assert!(!is_rotated_log_file("sandboxd.log.abcd-ef-gh")); // letters only
+        assert!(!is_rotated_log_file("sandboxd.log.YYYY-MM-DD.gz")); // letters + .gz
     }
 }

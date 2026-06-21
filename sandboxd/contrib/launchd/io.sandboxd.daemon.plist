@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    io.sandboxd.daemon — system LaunchDaemon for sandboxd.
+
+    Installed at /Library/LaunchDaemons/io.sandboxd.daemon.plist (root:wheel
+    0644) by install.sh, which sed-substitutes @SANDBOX_BASE_DIR@ with the
+    resolved per-uid path (/var/lib/sandboxd/<_sandboxd-uid>) at install time.
+    The placeholder must not appear in the installed plist on a real host.
+
+    UserName / GroupName: the daemon runs as the dedicated _sandboxd system
+    account, not as root.  macOS reserves _sandbox (UID/GID 60) for the
+    Seatbelt subsystem; sandboxd therefore uses a separate _sandboxd account.
+
+    KeepAlive: restart on crash (Crashed=true), do not respawn on clean exit
+    (SuccessfulExit=false).  This matches the intent: a deliberate stop (e.g.
+    during an upgrade) should stay stopped; only unexpected exits are bounced.
+    launchd has no direct equivalent of systemd's StartLimitBurst; the daemon
+    itself implements any give-up-after-N-failures policy if needed.
+
+    HOME: launchd does not populate HOME from Directory Services records for
+    system daemons.  The daemon and its subprocesses (e.g. docker build) may
+    consult $HOME to locate config directories.  Pinning HOME to the base dir
+    ensures those paths land on a writable, daemon-owned location rather than
+    an unset or non-existent path.
+
+    ExitTimeOut: launchd sends SIGTERM and waits 20 seconds before SIGKILL.
+    The daemon's tokio-based graceful-shutdown handler drains in-flight
+    requests, tears down the event sink, and removes the socket file — all
+    within this budget.
+
+    SessionCreate is intentionally absent.  System daemons launched by launchd
+    in the system context must not create a login session.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.sandboxd.daemon</string>
+
+    <!--
+        Run the daemon binary with an explicit base-dir and socket path.
+        install.sh replaces @SANDBOX_BASE_DIR@ with the resolved per-uid path
+        (/var/lib/sandboxd/<_sandboxd-uid>) at install time.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/sandboxd/sandboxd</string>
+        <string>--base-dir</string>
+        <string>@SANDBOX_BASE_DIR@</string>
+        <string>--socket</string>
+        <string>/var/run/sandbox/sandboxd.sock</string>
+    </array>
+
+    <key>UserName</key>
+    <string>_sandboxd</string>
+
+    <key>GroupName</key>
+    <string>_sandboxd</string>
+
+    <!--
+        Restart on crash, do not respawn on clean exit.
+        See the header comment for the rationale.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!--
+        5-second minimum between restarts, matching the vmnet daemon convention.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!--
+        Start the daemon immediately after the plist is bootstrapped, and on
+        every subsequent boot.
+    -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+        The daemon's base state directory (per-uid subtree under /var/lib/sandboxd).
+        Resolved by install.sh; placeholder replaced at install time.
+    -->
+    <key>WorkingDirectory</key>
+    <string>@SANDBOX_BASE_DIR@</string>
+
+    <!--
+        Launchd sends SIGTERM and waits this many seconds before escalating to
+        SIGKILL.  20 seconds gives the graceful-shutdown handler enough headroom
+        to drain in-flight requests and remove the socket file cleanly.
+    -->
+    <key>ExitTimeOut</key>
+    <integer>20</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!--
+            Explicit PATH so the daemon and its child processes (limactl, docker,
+            etc.) can locate their binaries regardless of how launchd was started.
+        -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+
+        <!--
+            Pin HOME to the daemon base dir.  launchd does not populate HOME from
+            Directory Services records for system daemons.  Without this, any
+            subprocess that consults $HOME to create a config directory would either
+            fail or write to an unexpected location.
+            install.sh replaces @SANDBOX_BASE_DIR@ with the resolved per-uid path.
+        -->
+        <key>HOME</key>
+        <string>@SANDBOX_BASE_DIR@</string>
+    </dict>
+
+    <!--
+        Standard output and error streams are captured to persistent log files.
+        The daemon's structured tracing output goes to /var/log/sandbox/sandboxd.log
+        via the in-process rotating appender; these paths capture pre-tracing-init
+        messages and unexpected panics.
+    -->
+    <key>StandardOutPath</key>
+    <string>/var/log/sandbox/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/sandbox/launchd.stderr.log</string>
+</dict>
+</plist>

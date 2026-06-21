@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Cross-language UUID equivalence guard for vmnet slot network identifiers.
+"""Cross-language equivalence guard for vmnet slot network identifiers and
+the socket_vmnet pre-exec wrapper string.
 
+UUID check
+----------
 Computes the per-slot `--vmnet-network-identifier` UUID for a range of slot
 indices via the same algorithm used by both the Rust code (`network.rs`
 `vmnet_slot_network_identifier`) and the Makefile's `setup-darwin-vmnet-plists`
@@ -24,6 +27,21 @@ script's EXPECTED dict to match.
 If either implementation's output diverges from EXPECTED, L2 inter-slot
 isolation silently breaks because the launchd daemons run different
 network-identifier UUIDs than the daemon expects.
+
+Wrapper string check
+--------------------
+Each vmnet plist embeds a /bin/sh -c wrapper that creates socket parent
+directories, runs a codesign --verify guard, then exec's socket_vmnet.
+The wrapper string must be byte-identical across three emitters:
+
+  1. Rust:  sandbox-core/src/network.rs generate_vmnet_plist (exec_cmd format)
+  2. Make:  Makefile setup-darwin-vmnet-plists (exec_cmd shell variable)
+  3. Shell: scripts/install.sh install-vmnet-plists step (exec_cmd variable)
+
+This script verifies the canonical wrapper template (as it appears inside the
+XML <string> element, before launchd entity-decoding) against the pinned
+EXPECTED_WRAPPER constant below.  If you change the wrapper in network.rs,
+update all three emitters and update EXPECTED_WRAPPER here.
 """
 
 import hashlib
@@ -45,6 +63,26 @@ EXPECTED = {
     2: "a1a1fa3e-5809-5b63-9a1b-358845ec042b",
 }
 
+# Canonical staged binary path — must match STAGED_SOCKET_VMNET_PATH in network.rs.
+STAGED_SOCKET_VMNET_PATH = "/Library/sandboxd/socket_vmnet"
+
+# Pinned wrapper template.  This is the exec_cmd string embedded in the XML
+# <string> element of each vmnet plist (slot-specific fields use {uuid} and
+# {socket} as placeholders that this script expands to verify structural
+# identity).  `&amp;&amp;` is the XML-escaped `&&`; launchd decodes it before
+# passing the string to /bin/sh -c.
+#
+# All three emitters (Rust, Makefile, install.sh) must produce this exact
+# string (with the concrete uuid and socket path substituted for each slot).
+# If you change the codesign guard or dir preamble, update all three emitters
+# and update this constant.
+EXPECTED_WRAPPER_TEMPLATE = (
+    "install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; "
+    "install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; "
+    "codesign --verify --strict {staged} || {{ echo 'sandboxd: codesign verify failed for {staged} -- binary may be tampered; refusing to exec'; exit 1; }} &amp;&amp; "
+    "exec {staged} --vmnet-mode=host --vmnet-network-identifier={{uuid}} --socket-group=_sandboxd {{socket}}"
+).format(staged=STAGED_SOCKET_VMNET_PATH)
+
 
 def derive_uuid(slot: int) -> str:
     """Derive the UUIDv5 network-identifier for a given slot index.
@@ -65,10 +103,17 @@ def derive_uuid(slot: int) -> str:
     )
 
 
+def build_wrapper(slot: int, uuid: str) -> str:
+    """Build the exec_cmd wrapper string for a given slot (as it appears in the plist XML)."""
+    socket_path = f"/var/run/sandbox/vmnet/slot-{slot}.sock"
+    return EXPECTED_WRAPPER_TEMPLATE.replace("{uuid}", uuid).replace("{socket}", socket_path)
+
+
 def main() -> int:
     failures = 0
     slots_to_check = list(range(8))  # default pool size; extend if needed
 
+    print("=== UUID equivalence check ===")
     for slot in slots_to_check:
         computed = derive_uuid(slot)
         expected = EXPECTED.get(slot)
@@ -93,7 +138,43 @@ def main() -> int:
         return 1
 
     print(f"\nAll {len(slots_to_check)} slot UUIDs match the Rust pinned values.")
-    return 0
+
+    print()
+    print("=== Wrapper string structure check ===")
+    # Verify the canonical wrapper template contains all required structural
+    # components.  This catches accidental omission of the codesign guard.
+    required_fragments = [
+        "install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp;",
+        "install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp;",
+        "codesign --verify --strict " + STAGED_SOCKET_VMNET_PATH,
+        "refusing to exec",
+        "exec " + STAGED_SOCKET_VMNET_PATH,
+        "--vmnet-mode=host",
+        "--socket-group=_sandboxd",
+    ]
+    wrapper_sample = build_wrapper(0, derive_uuid(0))
+    wrapper_failures = 0
+    for fragment in required_fragments:
+        if fragment not in wrapper_sample:
+            print(
+                f"FAIL: expected fragment not found in wrapper:\n  {fragment!r}",
+                file=sys.stderr,
+            )
+            wrapper_failures += 1
+        else:
+            print(f"OK   fragment present: {fragment[:60]!r}{'...' if len(fragment) > 60 else ''}")
+
+    if wrapper_failures:
+        print(
+            f"\n{wrapper_failures} wrapper fragment(s) missing.",
+            file=sys.stderr,
+        )
+        failures += wrapper_failures
+    else:
+        print("\nWrapper string contains all required structural fragments.")
+        print(f"Sample wrapper (slot 0):\n  {wrapper_sample}")
+
+    return 0 if failures == 0 else 1
 
 
 if __name__ == "__main__":

@@ -1271,9 +1271,8 @@ setup-bridge-helper-setuid:
 #     binary → ✓ already configured.
 #   - Binary differs or missing → stage it (sudo cp + chown + chmod).
 #
-# Note: install.sh should also re-check the dylib closure (otool -L) and reject
-# if it gains any non-system path. That check is left to install.sh for the
-# release path; the dev-env step does only the staging.
+# Note: the otool -L dylib-closure check and codesign --verify are also
+# performed here (matching install.sh) so dev and prod stay in lockstep.
 setup-darwin-socket-vmnet-staging:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-socket-vmnet-staging skipped (not macOS)$(RESET)"; \
@@ -1284,6 +1283,19 @@ setup-darwin-socket-vmnet-staging:
 	  echo "Install it first:  brew install socket_vmnet"; \
 	  exit 1; \
 	fi
+	@_bad_dylib=$$(otool -L "$(DARWIN_SOCKET_VMNET_BREW)" 2>/dev/null | tail -n +2 | awk '{print $$1}' | grep -v '^/System/Library' | grep -v '^/usr/lib' || true); \
+	if [ -n "$$_bad_dylib" ]; then \
+	  echo "ERROR: $(DARWIN_SOCKET_VMNET_BREW) has non-system dylib dependencies:"; \
+	  echo "$$_bad_dylib"; \
+	  echo "Refusing to stage a binary with non-system dylib closure."; \
+	  exit 1; \
+	fi
+	@codesign --verify --strict "$(DARWIN_SOCKET_VMNET_BREW)" 2>/dev/null || { \
+	  echo "ERROR: codesign --verify --strict $(DARWIN_SOCKET_VMNET_BREW) failed."; \
+	  echo "The socket_vmnet binary from Homebrew has an invalid or missing code signature."; \
+	  echo "Re-install socket_vmnet:  brew reinstall socket_vmnet"; \
+	  exit 1; \
+	}
 	@if [ -f "$(DARWIN_SOCKET_VMNET_STAGED)" ] && cmp -s "$(DARWIN_SOCKET_VMNET_BREW)" "$(DARWIN_SOCKET_VMNET_STAGED)"; then \
 	  echo "$(GREEN)✓ already configured: $(DARWIN_SOCKET_VMNET_STAGED) is up to date$(RESET)"; \
 	else \
@@ -1342,7 +1354,7 @@ setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging
 	  network_id=$$(python3 -c "import sys,hashlib,struct; ns=bytes([0x6d,0x4f,0x6e,0x2b,0x95,0x8a,0x4f,0x1a,0xa2,0x31,0x7e,0x8c,0xd0,0x12,0x3e,0x5b]); h=hashlib.sha1(ns+struct.pack('>H',int(sys.argv[1]))).digest(); b=bytearray(h[:16]); b[6]=(b[6]&0x0f)|0x50; b[8]=(b[8]&0x3f)|0x80; print('%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x'%tuple(b))" $$slot); \
 	  \
 	  tmp=$$(mktemp -t io.sandboxd.vmnet); \
-	  exec_cmd="install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=_sandboxd $$socket_path"; \
+	  exec_cmd="install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict $$staged_binary || { echo 'sandboxd: codesign verify failed for $$staged_binary -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=_sandboxd $$socket_path"; \
 	  python3 -c "import sys; label,exec_cmd,slot,uuid=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]; print('<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>'+label+'</string>\n\n    <key>ProgramArguments</key>\n    <array>\n        <string>/bin/sh</string>\n        <string>-c</string>\n        <string>'+exec_cmd+'</string>\n    </array>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n        <key>Crashed</key>\n        <true/>\n    </dict>\n\n    <key>ThrottleInterval</key>\n    <integer>5</integer>\n\n    <key>StandardOutPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stdout.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stderr.log</string>\n</dict>\n</plist>')" "$$label" "$$exec_cmd" "$$slot" "$$network_id" > "$$tmp"; \
 	  \
 	  if [ -f "$$plist_path" ] && cmp -s "$$tmp" "$$plist_path" 2>/dev/null; then \

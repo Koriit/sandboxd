@@ -62,7 +62,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-appender = "0.2"
 tracing-subscriber.workspace = true
+# `flate2` provides DEFLATE-based gzip compression used by the macOS log
+# reaper to compress rotated `sandboxd.log.YYYY-MM-DD` files in place.
+# The `zlib` feature uses the system zlib; the pure-Rust `rust_backend`
+# feature avoids that system dependency at the cost of a larger binary.
+# The default feature set on this platform includes a suitable backend.
+flate2 = "1"
 uuid.workspace = true
 
 # The broker wire-protocol types (BrokerRequest / BrokerResponse / BrokerOp)

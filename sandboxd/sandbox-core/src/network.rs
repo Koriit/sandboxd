@@ -1001,14 +1001,26 @@ pub fn generate_vmnet_plist(slot: u16) -> String {
     let socket_path = vmnet_slot_socket_path(slot);
     let network_identifier = vmnet_slot_network_identifier(slot);
 
-    // Shell command: create parent dirs with correct ownership, then exec socket_vmnet.
+    // Shell command: create parent dirs with correct ownership, verify the staged
+    // binary's code signature, then exec socket_vmnet.
+    //
     // `&&` is escaped as `&amp;&amp;` because this string is embedded in an XML
     // `<string>` element — bare `&` is illegal XML and `plutil -lint` rejects it.
     // launchd un-escapes XML entities before passing the string to `/bin/sh -c`,
     // so the shell receives the literal `&&` operator at runtime.
+    //
+    // The codesign --verify --strict check runs after the dir preamble and before
+    // exec.  These daemons run as root; the `codesign --verify` step makes any
+    // content tampering fail-closed before socket_vmnet is exec'd with root
+    // privileges.  Root-owned /Library/sandboxd blocks non-root writes; this check
+    // catches tampering that bypasses that protection (e.g. root-level compromise).
+    // No pinned cdhash: cdhash changes on every brew upgrade, which would break
+    // the pool silently on every socket_vmnet update.  The Apple code signature
+    // covers integrity without requiring a manually-maintained pin.
     let exec_cmd = format!(
         "install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; \
 install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; \
+codesign --verify --strict {STAGED_SOCKET_VMNET_PATH} || {{ echo 'sandboxd: codesign verify failed for {STAGED_SOCKET_VMNET_PATH} -- binary may be tampered; refusing to exec'; exit 1; }} &amp;&amp; \
 exec {STAGED_SOCKET_VMNET_PATH} \
 --vmnet-mode=host \
 --vmnet-network-identifier={network_identifier} \
@@ -2083,6 +2095,26 @@ mod tests {
                 plist.contains("/var/run/sandbox/vmnet"),
                 "plist must create /var/run/sandbox/vmnet"
             );
+        }
+
+        /// The pre-exec wrapper must include a codesign --verify --strict check
+        /// before exec'ing the staged binary.  This guard makes content tampering
+        /// fail-closed: the daemon refuses to exec a binary that fails verification.
+        #[test]
+        fn test_plist_has_codesign_guard() {
+            for slot in 0u16..4 {
+                let plist = generate_vmnet_plist(slot);
+                let guard_fragment =
+                    format!("codesign --verify --strict {STAGED_SOCKET_VMNET_PATH}");
+                assert!(
+                    plist.contains(&guard_fragment),
+                    "slot {slot}: plist must include codesign --verify --strict guard before exec"
+                );
+                assert!(
+                    plist.contains("refusing to exec"),
+                    "slot {slot}: plist must include actionable error message in guard failure path"
+                );
+            }
         }
 
         #[test]
