@@ -36,22 +36,27 @@ permissions:
   attestations: write
 
 jobs:
-  build:
-    # Two parallel jobs, one per supported arch. The arch is the
-    # tarball's <arch> component and the MANIFEST.arch value.
-    #
-    # fail-fast: false so an aarch64 build failure does not cancel a
-    # successful x86_64 build mid-flight — the release is publishable
-    # partial (single arch attached, second arch missing) which is
-    # recoverable; a fast-fail would orphan sigstore attestations.
+  # Linux builds: one job per Linux arch. Produces the Linux tarballs AND
+  # the per-arch gateway image tarballs. The aarch64-unknown-linux-gnu
+  # (Ubuntu ARM64) cell also uploads the linux-arm64 gateway image tarball
+  # as a workflow artifact so the macOS cell can download it without
+  # performing its own Docker build.
+  #
+  # fail-fast: false so an aarch64 build failure does not cancel a
+  # successful x86_64 build mid-flight — the release is publishable
+  # partial (single arch attached, second arch missing) which is
+  # recoverable; a fast-fail would orphan sigstore attestations.
+  build-linux:
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+            gateway_arch: linux-amd64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm   # GitHub-hosted ARM64 Linux runner; GA since 2025
+            gateway_arch: linux-arm64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write       # for attaching artifacts to the GitHub Release
@@ -85,9 +90,7 @@ jobs:
       - name: Install Rust toolchain (pinned)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Read from rust-toolchain.toml in the workspace; ensures CI and
-          # release use the same channel (currently 1.88.0, see
-          # sandboxd/rust-toolchain.toml).
+          # Ensures CI and release use the same channel (see sandboxd/rust-toolchain.toml).
           toolchain: '1.88.0'
           components: clippy, rustfmt
 
@@ -105,27 +108,44 @@ jobs:
         run: cargo build --workspace --release --target ${{ matrix.target }}
 
       - name: Build gateway image
-        # Note: `make gateway-image` invokes `docker build -t sandbox-gateway -f
-        # networking/gateway/Dockerfile .` (Makefile:139-140). The target tags
-        # with $(GATEWAY_VERSION) — the same as the daemon's Cargo.toml version.
-        # We invoke the target and then re-tag for clarity below.
+        # `make gateway-image` builds a single-arch image for the current
+        # runner's native architecture and saves it with the unqualified name
+        # install.sh expects inside each release tarball:
+        #   images/sandbox-gateway-<ver>.tar  /  tag sandbox-gateway:<ver>
+        # Because each Linux cell runs on a single architecture, "unqualified"
+        # is unambiguous per tarball. An arch-qualified copy is also saved as
+        # a CI workflow artifact so the macOS cell can download the linux-arm64
+        # tarball without running Docker itself.
         env:
           GATEWAY_VERSION: ${{ steps.version.outputs.ver }}
         run: |
           make gateway-image
-          docker tag sandbox-gateway:${GATEWAY_VERSION} \
-                     sandbox-gateway:${GATEWAY_VERSION}-${{ matrix.target }}
+          # Unqualified — for inside the release tarball; matches install.sh:3093.
           docker save sandbox-gateway:${GATEWAY_VERSION} \
               -o sandbox-gateway-${GATEWAY_VERSION}.tar
+          # Arch-qualified — for the cross-cell CI artifact only.
+          cp sandbox-gateway-${GATEWAY_VERSION}.tar \
+             sandbox-gateway-${{ matrix.gateway_arch }}-${GATEWAY_VERSION}.tar
 
-      - name: Assemble tarball
+      - name: Upload gateway image tarball (for macOS cell)
+        # The macOS runner cannot build Docker images. The linux-arm64 gateway
+        # tarball (arch-qualified name used only within CI artifacts) is uploaded
+        # here so the build-macos job can download it via actions/download-artifact.
+        # The macOS cell renames it to the unqualified in-tarball name before staging.
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-image-${{ matrix.gateway_arch }}-${{ steps.version.outputs.ver }}
+          path: sandbox-gateway-${{ matrix.gateway_arch }}-${{ steps.version.outputs.ver }}.tar
+          retention-days: 1
+
+      - name: Assemble Linux tarball
         env:
           VER: ${{ steps.version.outputs.ver }}
           ARCH: ${{ matrix.target }}
           BUILD_SHA: ${{ github.sha }}
         run: |
           stage="sandboxd-${VER}-${ARCH}"
-          mkdir -p "$stage"/{bin,libexec,systemd,images,attestations}
+          mkdir -p "$stage"/{bin,systemd,images}
           install -m 0755 \
               sandboxd/target/${ARCH}/release/sandboxd \
               "$stage/bin/sandboxd"
@@ -144,9 +164,15 @@ jobs:
           install -m 0644 \
               sandboxd/contrib/systemd/sandboxd.service \
               "$stage/systemd/sandboxd.service"
-          mv sandbox-gateway-${VER}.tar \
+          # Use the unqualified gateway tarball name: install.sh:3093 expects
+          # $STAGE/images/sandbox-gateway-${VERSION}.tar and loads it as tag
+          # sandbox-gateway:${VERSION}. Each per-arch release tarball contains
+          # exactly one gateway image (its own arch), so "unqualified" is
+          # unambiguous within a given tarball. The arch-qualified copy used as
+          # a CI workflow artifact (see Upload step above) is separate.
+          cp sandbox-gateway-${VER}.tar \
              "$stage/images/sandbox-gateway-${VER}.tar"
-          # Generate MANIFEST (§ 2.3 shape).
+          # Generate MANIFEST.
           python3 - <<'PY' "$stage" "$VER" "$ARCH" "$BUILD_SHA"
           import hashlib, json, os, sys, datetime
           stage, ver, arch, build_sha = sys.argv[1:5]
@@ -172,7 +198,7 @@ jobs:
               "version":     ver,
               "arch":        arch,
               "build_sha":   build_sha,
-              "build_time":  datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "build_time":  datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "artifacts":   artifacts,
           }
           with open(os.path.join(stage, "MANIFEST"), "w") as f:
@@ -187,7 +213,7 @@ jobs:
 
       - name: Sign tarball (keyless OIDC)
         env:
-          VER: ${{ steps.version.outputs.ver }}    # collapsed to one space here to satisfy yamllint
+          VER: ${{ steps.version.outputs.ver }}
           ARCH: ${{ matrix.target }}
         run: |
           cosign sign-blob --yes \
@@ -207,6 +233,185 @@ jobs:
           files: |
             sandboxd-${{ steps.version.outputs.ver }}-${{ matrix.target }}.tar.gz
             sandboxd-${{ steps.version.outputs.ver }}-${{ matrix.target }}.tar.gz.sigstore
+
+  # macOS build: native Apple Silicon runner. Assembles the macOS tarball
+  # (Mach-O host binaries + linux/arm64 sandbox-guest ELF + launchd plists
+  # + linux-arm64 gateway image). The gateway image tarball is produced by
+  # the Linux cells above and downloaded via artifact handoff — the macOS
+  # runner does not run Docker or buildx.
+  build-macos:
+    needs: build-linux
+    runs-on: macos-14
+    permissions:
+      contents: write       # for attaching artifacts to the GitHub Release
+      id-token: write       # for sigstore keyless signing via GH Actions OIDC
+      attestations: write   # for actions/attest-build-provenance
+    steps:
+      - name: Checkout (at the tag)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          ver="${tag#v}"
+          echo "tag=$tag"  >> "$GITHUB_OUTPUT"
+          echo "ver=$ver"  >> "$GITHUB_OUTPUT"
+          cargo_ver=$(awk -F'"' '/^version/ { print $2; exit }' \
+              sandboxd/Cargo.toml)
+          if [ "$cargo_ver" != "$ver" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $cargo_ver" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sandboxd/target
+          key: release-aarch64-apple-darwin-${{ hashFiles('sandboxd/**/Cargo.lock') }}
+
+      - name: Build macOS host binaries (release profile)
+        # Produces sandboxd, sandbox, sandbox-agent as native arm64 Mach-Os.
+        working-directory: sandboxd
+        run: cargo build --workspace --release
+
+      - name: Cross-compile linux/arm64 sandbox-guest
+        # sandbox-guest must be a linux/arm64 ELF — not a Mach-O — so it can
+        # exec inside the gateway Lima VM. The Makefile target uses Docker
+        # (rust:1.88-bookworm) to perform the cross-compilation; Docker is
+        # available on GitHub-hosted macos-14 runners via the pre-installed
+        # Docker CLI + Colima/Docker Desktop provided by the runner image.
+        run: make build-guest-linux-aarch64
+
+      - name: Download linux-arm64 gateway image tarball
+        # The linux-arm64 gateway image was built by the build-linux cell running
+        # on ubuntu-22.04-arm. The CI artifact is arch-qualified
+        # (sandbox-gateway-linux-arm64-<ver>.tar); after download it is renamed
+        # to the unqualified in-tarball name (sandbox-gateway-<ver>.tar) that
+        # install.sh and build-local-tarball.sh expect at
+        # $STAGE/images/sandbox-gateway-${VERSION}.tar.
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-image-linux-arm64-${{ steps.version.outputs.ver }}
+
+      - name: Ad-hoc-sign macOS Mach-O binaries
+        # AMFI (Apple Mobile File Integrity) refuses to execve() any arm64 Mach-O
+        # that lacks a valid code signature, including ad-hoc ones, before
+        # Gatekeeper is consulted. strip(1) invalidates the linker-applied
+        # signature, so we re-sign after any strip step. sandbox-guest is a
+        # linux/arm64 ELF — not a Mach-O — and is intentionally skipped.
+        env:
+          VER: ${{ steps.version.outputs.ver }}
+        run: |
+          for bin in sandboxd/target/release/sandboxd \
+                     sandboxd/target/release/sandbox \
+                     sandboxd/target/release/sandbox-agent; do
+            codesign -s - --force "$bin"
+            codesign -v "$bin"
+          done
+
+      - name: Assemble macOS tarball
+        env:
+          VER: ${{ steps.version.outputs.ver }}
+          ARCH: aarch64-apple-darwin
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          stage="sandboxd-${VER}-${ARCH}"
+          mkdir -p "$stage"/{bin,launchd,images}
+          install -m 0755 \
+              sandboxd/target/release/sandboxd \
+              "$stage/bin/sandboxd"
+          install -m 0755 \
+              sandboxd/target/release/sandbox \
+              "$stage/bin/sandbox"
+          install -m 0755 \
+              sandboxd/target/release/sandbox-agent \
+              "$stage/bin/sandbox-agent"
+          install -m 0755 \
+              sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest \
+              "$stage/bin/sandbox-guest"
+          install -m 0644 \
+              sandboxd/contrib/launchd/io.sandboxd.daemon.plist \
+              "$stage/launchd/io.sandboxd.daemon.plist"
+          install -m 0644 \
+              sandboxd/sandbox-agent/contrib/launchd/io.sandboxd.agent.plist \
+              "$stage/launchd/io.sandboxd.agent.plist"
+          # The downloaded CI artifact is arch-qualified; rename to the
+          # unqualified in-tarball name that install.sh:3093 and
+          # build-local-tarball.sh:500 both expect.
+          cp sandbox-gateway-linux-arm64-${VER}.tar \
+             "$stage/images/sandbox-gateway-${VER}.tar"
+          # Generate MANIFEST (same shape as Linux tarball, macOS artifact set).
+          python3 - <<'PY' "$stage" "$VER" "$ARCH" "$BUILD_SHA"
+          import hashlib, json, os, sys, datetime
+          stage, ver, arch, build_sha = sys.argv[1:5]
+          def sha256(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for blk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(blk)
+              return h.hexdigest()
+          artifacts = {
+              "sandboxd":               {"path": "bin/sandboxd"},
+              "sandbox":                {"path": "bin/sandbox"},
+              "sandbox-agent":          {"path": "bin/sandbox-agent"},
+              "sandbox-guest":          {"path": "bin/sandbox-guest"},
+              "gateway-image":          {"path": f"images/sandbox-gateway-{ver}.tar",
+                                          "docker_tag": f"sandbox-gateway:{ver}"},
+              "launchd-daemon-plist":   {"path": "launchd/io.sandboxd.daemon.plist"},
+              "launchd-agent-plist":    {"path": "launchd/io.sandboxd.agent.plist"},
+          }
+          for a in artifacts.values():
+              a["sha256"] = sha256(os.path.join(stage, a["path"]))
+          manifest = {
+              "version":     ver,
+              "arch":        arch,
+              "build_sha":   build_sha,
+              "build_time":  datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "artifacts":   artifacts,
+          }
+          with open(os.path.join(stage, "MANIFEST"), "w") as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+          PY
+          tar -czf "${stage}.tar.gz" "$stage"
+
+      - name: Install cosign (pinned)
+        uses: sigstore/cosign-installer@v3.7.0   # pinned by major+minor
+        with:
+          cosign-release: 'v2.4.1'                # pinned exact
+
+      - name: Sign macOS tarball (keyless OIDC)
+        env:
+          VER: ${{ steps.version.outputs.ver }}
+        run: |
+          cosign sign-blob --yes \
+              --bundle "sandboxd-${VER}-aarch64-apple-darwin.tar.gz.sigstore" \
+              "sandboxd-${VER}-aarch64-apple-darwin.tar.gz"
+
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'sandboxd-${{ steps.version.outputs.ver }}-aarch64-apple-darwin.tar.gz'
+
+      - name: Upload macOS artifacts to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            sandboxd-${{ steps.version.outputs.ver }}-aarch64-apple-darwin.tar.gz
+            sandboxd-${{ steps.version.outputs.ver }}-aarch64-apple-darwin.tar.gz.sigstore
 
   # publish-install-script:
   #

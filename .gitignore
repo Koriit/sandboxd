@@ -26,3 +26,6 @@ __pycache__/
 
 # graphify knowledge-graph artefacts (project-level tooling — generated)
 /graphify-out/
+
+# Generated installer artifacts (scripts/build.sh output)
+/build/

@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
+.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-e2e-macos test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image gateway-image-multiarch lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
@@ -177,6 +177,16 @@ test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-pro
 # Back-compat alias. `make test-e2e` continues to run the full matrix.
 test-e2e: test-e2e-matrix
 
+# Native macOS e2e suite — runs the full pytest suite against real QEMU+HVF
+# sandbox VMs on a bare Apple-Silicon host with no nested virtualization.
+# Requires a host with socket_vmnet, the gateway Lima VM pool, and the
+# operator agent running (see `make setup-dev-env`). On ephemeral CI runners
+# without this infrastructure the suite's platform guard skips the tests.
+test-e2e-macos: $(VENV_STAMP)
+	cd tests/e2e && \
+	  if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then _color=yes; else _color=no; fi; \
+	  python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $(TEST)
+
 # Re-run only the tests that failed in the previous run (reads .pytest_cache/).
 # Falls back to running all tests when no failures are cached.
 test-e2e-lf: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap install-lima-helper-test-cap install-guest-prod
@@ -257,6 +267,34 @@ GATEWAY_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/C
 
 gateway-image:
 	docker build -t sandbox-gateway:$(GATEWAY_VERSION) -f networking/gateway/Dockerfile .
+
+# gateway-image-multiarch — build and export separate per-arch gateway image
+# tarballs via `docker buildx`. Used by the release pipeline to produce the
+# two arch-specific image tarballs that ship inside the Linux release tarballs
+# (and whose linux-arm64 tarball is cross-shared to the macOS release tarball).
+#
+# Prerequisites: a buildx builder with linux/amd64 + linux/arm64 support must
+# be active (`docker buildx ls` to inspect; `docker buildx create --use` to
+# create one if needed). On CI the runner's default buildx builder suffices.
+#
+# Produces:
+#   sandbox-gateway-linux-amd64-$(GATEWAY_VERSION).tar
+#   sandbox-gateway-linux-arm64-$(GATEWAY_VERSION).tar
+#
+# (two separate `--output type=docker` invocations — buildx does not support
+# saving two platform-tagged images to a single tar in docker format).
+gateway-image-multiarch:
+	docker buildx build \
+	  --platform linux/amd64 \
+	  --output type=docker,dest=sandbox-gateway-linux-amd64-$(GATEWAY_VERSION).tar \
+	  --tag sandbox-gateway:$(GATEWAY_VERSION)-linux-amd64 \
+	  -f networking/gateway/Dockerfile .
+	docker buildx build \
+	  --platform linux/arm64 \
+	  --output type=docker,dest=sandbox-gateway-linux-arm64-$(GATEWAY_VERSION).tar \
+	  --tag sandbox-gateway:$(GATEWAY_VERSION)-linux-arm64 \
+	  -f networking/gateway/Dockerfile .
+	@echo "$(GREEN)✓ gateway-image-multiarch: amd64 + arm64 tarballs written$(RESET)"
 
 # Build the lite-mode container image as `sandboxd-lite:<workspace-version>`,
 # matching the `<repository>:<daemon-version>` tag scheme that
