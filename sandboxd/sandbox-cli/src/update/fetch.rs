@@ -420,6 +420,10 @@ impl StagedTarball {
     pub fn lima_helper_bin(&self) -> PathBuf {
         self.stage_dir.join("bin/sandbox-lima-helper")
     }
+    /// `<stage>/bin/sandbox-agent`. macOS per-operator agent binary.
+    pub fn agent_bin(&self) -> PathBuf {
+        self.stage_dir.join("bin/sandbox-agent")
+    }
     /// `<stage>/systemd/sandboxd.service`.
     pub fn systemd_unit(&self) -> PathBuf {
         self.stage_dir.join("systemd/sandboxd.service")

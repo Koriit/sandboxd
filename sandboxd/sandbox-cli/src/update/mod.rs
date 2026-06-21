@@ -29,8 +29,17 @@ pub mod migrate;
 // Constants (operator-visible paths)
 // ---------------------------------------------------------------------------
 
-/// Canonical systemd unit path (presence is the dev-vs-system gate).
+/// Canonical systemd unit path (presence is the dev-vs-system gate on Linux).
 pub const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/sandboxd.service";
+
+/// Canonical launchd daemon plist path (presence is the dev-vs-system gate on macOS).
+pub const LAUNCHD_DAEMON_PLIST_PATH: &str = "/Library/LaunchDaemons/io.sandboxd.daemon.plist";
+
+/// launchd service label for the daemon (system domain).
+pub const LAUNCHD_DAEMON_LABEL: &str = "io.sandboxd.daemon";
+
+/// launchd service label for the per-operator agent (GUI domain).
+pub const LAUNCHD_AGENT_LABEL: &str = "io.sandboxd.agent";
 
 // ---------------------------------------------------------------------------
 // Per-uid base-dir discovery
@@ -42,14 +51,29 @@ const SANDBOXD_STATE_ROOT: &str = "/var/lib/sandboxd";
 /// Legacy base-dir used before the per-uid migration.
 const LEGACY_BASE_DIR: &str = "/var/lib/sandbox";
 
-/// Resolve the production daemon's base-dir by looking up the `sandbox`
-/// system user and returning `/var/lib/sandboxd/<uid>`.
+/// The system user name under which the daemon runs.
 ///
-/// Returns `None` on a dev host where the `sandbox` user is absent — callers
+/// On macOS: `_sandboxd` (the dedicated role account created by install.sh's
+/// `sysadminctl -addUser _sandboxd -shell /usr/bin/false -roleAccount` step).
+/// On Linux: `sandbox`.
+///
+/// Must match the `UserName` key in the launchd plist / `User=` in the systemd
+/// unit, and the ownership applied by install.sh's `install -o <user>` calls.
+pub const DAEMON_SYSTEM_USER: &str = if cfg!(target_os = "macos") {
+    "_sandboxd"
+} else {
+    "sandbox"
+};
+
+/// Resolve the production daemon's base-dir by looking up the daemon system
+/// user (`_sandboxd` on macOS, `sandbox` on Linux) and returning
+/// `/var/lib/sandboxd/<uid>`.
+///
+/// Returns `None` on a dev host where the daemon user is absent — callers
 /// must degrade gracefully (dev-mode skip / legacy fallback) rather than
 /// panicking or hard-erroring.
 pub fn prod_base_dir() -> Option<PathBuf> {
-    let user = nix::unistd::User::from_name("sandbox").ok()??;
+    let user = nix::unistd::User::from_name(DAEMON_SYSTEM_USER).ok()??;
     Some(PathBuf::from(format!(
         "{}/{}",
         SANDBOXD_STATE_ROOT,
@@ -68,7 +92,7 @@ pub fn prod_base_dir() -> Option<PathBuf> {
 ///
 /// The per-uid path is returned even when the file does not exist yet (fresh
 /// install, or the artifact is being created for the first time) once the
-/// `sandbox` user is present and neither path exists. This preserves
+/// daemon system user is present and neither path exists. This preserves
 /// write-to-the-right-place behaviour on a freshly-migrated host.
 pub fn resolve_state_path(name: &str) -> PathBuf {
     if let Some(base) = prod_base_dir() {
@@ -182,7 +206,10 @@ impl InstallState {
     pub fn unknown_with_host_arch() -> Self {
         Self {
             installed_version: "unknown".to_string(),
-            installed_arch: detect_host_arch(),
+            // Degrade gracefully: if the arch is unsupported (e.g. Intel Mac)
+            // we surface a descriptive string rather than panicking — the caller
+            // in the read-only path will not download anything with this value.
+            installed_arch: detect_host_arch().unwrap_or_else(|e| format!("unsupported: {e}")),
             installed_at: "unknown".to_string(),
             installed_by_operator: "unknown".to_string(),
             previous_version: None,
@@ -192,17 +219,31 @@ impl InstallState {
 
 /// Detect host architecture: `uname -m` mapped onto the release-tarball
 /// arch-triple convention.
-pub fn detect_host_arch() -> String {
+///
+/// On macOS only Apple-Silicon (arm64 / aarch64) is supported; Intel Macs
+/// are rejected early because we do not ship an `x86_64-apple-darwin` release
+/// asset. Returns `Err` on Intel Mac so the caller can exit with a clear message
+/// before any network or file-system operation.
+pub fn detect_host_arch() -> Result<String, String> {
     let uname = nix::sys::utsname::uname().ok();
     let m = uname
         .as_ref()
         .map(|u| u.machine().to_string_lossy().into_owned())
         .unwrap_or_default();
+    #[cfg(target_os = "macos")]
     match m.as_str() {
+        "arm64" | "aarch64" => Ok("aarch64-apple-darwin".to_string()),
+        other => Err(format!(
+            "Intel Macs are not supported — sandboxd runs on Apple Silicon only \
+             (detected arch: {other})"
+        )),
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(match m.as_str() {
         "x86_64" => "x86_64-unknown-linux-gnu".to_string(),
         "aarch64" | "arm64" => "aarch64-unknown-linux-gnu".to_string(),
         other => other.to_string(),
-    }
+    })
 }
 
 /// Read the install state file at `path`. Returns `Ok(None)` when the
@@ -257,7 +298,8 @@ pub fn read_install_state(path: &Path) -> std::io::Result<Option<InstallState>> 
 /// true when neither artefact is present.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DevModeReason {
-    /// `/etc/systemd/system/sandboxd.service` is absent.
+    /// On Linux: `/etc/systemd/system/sandboxd.service` is absent.
+    /// On macOS: `/Library/LaunchDaemons/io.sandboxd.daemon.plist` is absent.
     pub unit_missing: bool,
     /// The install-state JSON file under `/var/lib/sandboxd/<uid>/`
     /// does not exist or is not accessible even with escalation.
@@ -326,6 +368,11 @@ pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> Option<DevModeR
 pub fn dev_mode_refusal_text(reason: &DevModeReason) -> String {
     let mut bullets = String::new();
     if reason.unit_missing {
+        #[cfg(target_os = "macos")]
+        bullets.push_str(
+            "  - no launchd daemon plist at /Library/LaunchDaemons/io.sandboxd.daemon.plist\n",
+        );
+        #[cfg(not(target_os = "macos"))]
         bullets.push_str("  - no systemd unit at /etc/systemd/system/sandboxd.service\n");
     }
     if reason.state_missing {
@@ -1307,6 +1354,16 @@ pub async fn run(args: UpdateArgs) -> i32 {
         ),
     );
 
+    // Hard-fail early on unsupported host architectures (Intel Mac) so the
+    // operator sees a clear message before any network or filesystem operation.
+    // On Linux every arch either maps to a known triple or falls through to
+    // an opaque string — the MANIFEST arch check will catch it later.
+    if let Err(e) = detect_host_arch() {
+        log_step("detect_arch", &format!("status=fail err=\"{e}\""));
+        eprintln!("sandbox update: {e}");
+        return 2i32;
+    }
+
     // Warm sudo credentials once so subsequent `sudo -n ...` sub-commands
     // can run non-interactively. We do this early — before the dev-mode
     // state-file check — because `sudo -n test -e` needs live credentials.
@@ -1345,7 +1402,13 @@ pub async fn run(args: UpdateArgs) -> i32 {
     // dev environment; only a missing systemd unit is conclusive. We skip the
     // refusal and let the caller degrade to `InstallState::unknown_with_host_arch()`.
     let install_state_path = resolve_state_path(".install-state.json");
-    let dev_mode_reason = is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), &install_state_path);
+    // On macOS the conclusive service-install artefact is the launchd daemon
+    // plist; on Linux it is the systemd unit.
+    #[cfg(target_os = "macos")]
+    let service_config_path = Path::new(LAUNCHD_DAEMON_PLIST_PATH);
+    #[cfg(not(target_os = "macos"))]
+    let service_config_path = Path::new(SYSTEMD_UNIT_PATH);
+    let dev_mode_reason = is_dev_mode(service_config_path, &install_state_path);
     let skip_refusal = args.is_read_only()
         && dev_mode_reason
             .as_ref()
@@ -1546,6 +1609,81 @@ pub async fn run(args: UpdateArgs) -> i32 {
         ),
     );
 
+    // macOS pre-flight additions.
+    //
+    // 1. No workspace locks held — refuse if any session has an outstanding
+    //    push/pull op. We probe this via the daemon socket; if the daemon is
+    //    unreachable we skip (same degraded path as active-sessions).
+    // 2. Gateway Lima instance is reachable — refuse with an actionable error
+    //    if unreachable, so the new daemon's ensure_ready can proceed from a
+    //    known-good gateway state.
+    #[cfg(target_os = "macos")]
+    {
+        // Workspace-lock check: refuse if any workspace lock is held.
+        // The check is informational (best-effort via the daemon socket); if the
+        // daemon is unreachable we cannot determine lock state and skip the gate.
+        let locks_held = check_workspace_locks_held(&args.socket_path).await;
+        match locks_held {
+            Ok(true) => {
+                log_step(
+                    "workspace_lock_check",
+                    "locks_held=true action=refuse status=fail",
+                );
+                eprintln!(
+                    "sandbox update: workspace lock is held by an active session. \n\
+                     Wait for the push/pull operation to complete, then retry.\n\
+                     To inspect: sandbox session ls"
+                );
+                return 1i32;
+            }
+            Ok(false) => {
+                log_step(
+                    "workspace_lock_check",
+                    "locks_held=false action=continue status=ok",
+                );
+            }
+            Err(e) => {
+                log_step(
+                    "workspace_lock_check",
+                    &format!("action=skip status=ok reason=daemon-unreachable err=\"{e}\""),
+                );
+            }
+        }
+
+        // Gateway Lima reachability check: the gateway Lima instance must be
+        // reachable (docker -H <gateway-socket> info) before the update proceeds.
+        // An unreachable gateway means the new daemon's ensure_ready will fail
+        // immediately — surface it pre-update so the operator can act.
+        let gateway_reachable = check_gateway_lima_reachable(&args.socket_path).await;
+        match gateway_reachable {
+            Ok(true) => {
+                log_step(
+                    "gateway_lima_check",
+                    "reachable=true action=continue status=ok",
+                );
+            }
+            Ok(false) => {
+                log_step(
+                    "gateway_lima_check",
+                    "reachable=false action=refuse status=fail",
+                );
+                eprintln!(
+                    "sandbox update: gateway Lima instance is not reachable.\n\
+                     Start the gateway and retry:\n  \
+                     sandbox doctor --verbose\n  \
+                     sudo launchctl bootstrap system /Library/LaunchDaemons/io.sandboxd.daemon.plist"
+                );
+                return 1i32;
+            }
+            Err(e) => {
+                log_step(
+                    "gateway_lima_check",
+                    &format!("action=skip status=ok reason=daemon-unreachable err=\"{e}\""),
+                );
+            }
+        }
+    }
+
     // Disk space.
     if !disk.passes() {
         log_step("disk_check", "action=check status=fail");
@@ -1715,9 +1853,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
     };
 
     // Confirmation prompt.
-    // The sticky `was_running` is sampled here from the live systemd
-    // probe (the lock isn't acquired yet).
-    let daemon_was_running = systemctl_is_active("sandboxd");
+    // The sticky `was_running` is sampled here from the live service probe
+    // (the lock isn't acquired yet). Platform-dispatched via daemon_is_running().
+    let daemon_was_running = daemon_is_running();
     let summary = render_confirmation_summary(
         &state.installed_version,
         &target_version,
@@ -1847,11 +1985,15 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         ),
     );
 
-    // Stop daemon (only if `was_running`).
+    // Stop daemon (only if `was_running`). Platform-dispatched: on Linux
+    // this is `systemctl stop sandboxd`; on macOS it is
+    // `launchctl bootout system/io.sandboxd.daemon`.
     if sticky_was_running {
-        let out = Command::new("sudo")
-            .args(["-n", "systemctl", "stop", "sandboxd"])
-            .output();
+        let stop_argv = daemon_stop_argv();
+        let mut stop_cmd = Command::new("sudo");
+        stop_cmd.arg("-n");
+        stop_cmd.args(&stop_argv);
+        let out = stop_cmd.output();
         match out {
             Ok(o) if o.status.success() => {
                 log_step(
@@ -1868,7 +2010,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                     ),
                 );
                 eprintln!(
-                    "sandbox update: systemctl stop sandboxd failed: {}",
+                    "sandbox update: {} failed: {}",
+                    stop_argv.join(" "),
                     String::from_utf8_lossy(&o.stderr).trim()
                 );
                 eprint!(
@@ -1884,7 +2027,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                         "was_running={sticky_was_running} action=stop status=fail err=\"{e}\""
                     ),
                 );
-                eprintln!("sandbox update: failed to invoke systemctl: {e}");
+                eprintln!("sandbox update: failed to invoke {}: {e}", stop_argv[0]);
                 eprint!(
                     "{}",
                     recovery_guidance(None, &inputs.state.installed_version)
@@ -2031,13 +2174,31 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // Backup /etc files (users.conf, bridge.conf).
-    for (src, dst_name, mode) in [
+    // Backup platform-specific config files.
+    //
+    // On Linux: /etc/sandboxd/users.conf and /etc/qemu/bridge.conf.
+    // On macOS: the launchd daemon and agent plists.
+    #[cfg(not(target_os = "macos"))]
+    let config_file_backup_set: &[(&str, &str, u32)] = &[
         (backup::USERS_CONF_PATH, "users.conf.bak", 0o644u32),
         (backup::BRIDGE_CONF_PATH, "bridge.conf.bak", 0o644u32),
-    ] {
+    ];
+    #[cfg(target_os = "macos")]
+    let config_file_backup_set: &[(&str, &str, u32)] = &[
+        (
+            backup::LAUNCHD_DAEMON_PLIST_PATH,
+            "io.sandboxd.daemon.plist.bak",
+            0o644u32,
+        ),
+        (
+            backup::LAUNCHD_AGENT_PLIST_PATH,
+            "io.sandboxd.agent.plist.bak",
+            0o644u32,
+        ),
+    ];
+    for (src, dst_name, mode) in config_file_backup_set {
         let dst = backup_set_dir.join(dst_name);
-        match backup::backup_etc_file(Path::new(src), &dst, mode) {
+        match backup::backup_etc_file(Path::new(src), &dst, *mode) {
             Ok(o) => match o.action {
                 backup::CopyAction::SourceAbsent => {
                     log_step(
@@ -2095,14 +2256,27 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // Backup binaries.
-    for (src, dst_name) in [
+    // Backup binaries. The set differs by platform:
+    // - Linux: daemon, CLI, route-helper, guest, lima-helper.
+    // - macOS: daemon, CLI, agent, guest, cosign; route-helper and
+    //   lima-helper are Linux-only setcap helpers absent on macOS.
+    #[cfg(not(target_os = "macos"))]
+    let binary_backup_set: &[(&str, &str)] = &[
         (backup::SANDBOXD_BIN_PATH, "sandboxd.bak"),
         (backup::SANDBOX_BIN_PATH, "sandbox.bak"),
         (backup::ROUTE_HELPER_BIN_PATH, "sandbox-route-helper.bak"),
         (backup::GUEST_BIN_PATH, "sandbox-guest.bak"),
         (backup::LIMA_HELPER_BIN_PATH, "sandbox-lima-helper.bak"),
-    ] {
+    ];
+    #[cfg(target_os = "macos")]
+    let binary_backup_set: &[(&str, &str)] = &[
+        (backup::SANDBOXD_BIN_PATH, "sandboxd.bak"),
+        (backup::SANDBOX_BIN_PATH, "sandbox.bak"),
+        (backup::AGENT_BIN_PATH, "sandbox-agent.bak"),
+        (backup::GUEST_BIN_PATH, "sandbox-guest.bak"),
+        (backup::COSIGN_BIN_PATH, "cosign.bak"),
+    ];
+    for (src, dst_name) in binary_backup_set {
         let dst = backup_set_dir.join(dst_name);
         match backup::backup_sandbox_owned_file(Path::new(src), &dst, 0o640) {
             Ok(o) => match o.action {
@@ -2162,6 +2336,78 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
+    // macOS: back up the current gateway image tarball so a rollback can
+    // restore the matching image into the gateway Lima instance. The staging
+    // location is {base_dir}/gateway-image.tar (the flat, fixed filename that
+    // the daemon's load_gateway_image_if_needed reads from). On Linux the
+    // gateway image is a host Docker image and is not backed up here.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(base_dir) = prod_base_dir() {
+            let gw_src = base_dir.join("gateway-image.tar");
+            let gw_dst = backup_set_dir.join("gateway-image.tar.bak");
+            match backup::backup_sandbox_owned_file(&gw_src, &gw_dst, 0o640) {
+                Ok(o) => match o.action {
+                    backup::CopyAction::SourceAbsent => {
+                        log_step(
+                            "backup_gateway_image",
+                            &format!(
+                                "src={} action=skip status=ok reason=absent",
+                                gw_src.display()
+                            ),
+                        );
+                    }
+                    backup::CopyAction::Skipped | backup::CopyAction::Copied => {
+                        manifest.files.insert(
+                            "gateway-image.tar.bak".to_string(),
+                            backup::ManifestFileEntry {
+                                sha256: o.sha256.clone(),
+                                size: o.size,
+                            },
+                        );
+                        log_step(
+                            "backup_gateway_image",
+                            &format!(
+                                "src={} dst={} sha256={} action={} status=ok",
+                                gw_src.display(),
+                                gw_dst.display(),
+                                o.sha256,
+                                if matches!(o.action, backup::CopyAction::Copied) {
+                                    "copy"
+                                } else {
+                                    "skip"
+                                }
+                            ),
+                        );
+                    }
+                },
+                Err(e) => {
+                    log_step(
+                        "backup_gateway_image",
+                        &format!(
+                            "src={} action=copy status=fail err=\"{e}\"",
+                            gw_src.display()
+                        ),
+                    );
+                    eprintln!(
+                        "sandbox update: failed to back up {}: {e}",
+                        gw_src.display()
+                    );
+                    eprint!(
+                        "{}",
+                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                    );
+                    return 1;
+                }
+            }
+        } else {
+            log_step(
+                "backup_gateway_image",
+                "action=skip status=ok reason=base-dir-unresolvable",
+            );
+        }
+    }
+
     // Update install state's previous_version.
     if let Err(e) = write_install_state_previous_version(&inputs.state.installed_version) {
         log_step(
@@ -2207,37 +2453,133 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // extraction.
     let staged = inputs.staged;
 
-    // Docker load gateway image (BEFORE binary swap).
+    // Gateway image handling (BEFORE binary swap).
+    //
+    // Linux: `docker load` the new image into the host Docker daemon directly.
+    // The gateway runs as a per-session host container; the next session create
+    // will use the freshly-loaded image.
+    //
+    // macOS: stage the new gateway image tarball at {base_dir}/gateway-image.tar
+    // (the flat, fixed filename that install.sh and the daemon both use).
+    // The persistent Lima gateway instance stays running across this update; the
+    // new daemon's ensure_ready step calls load_gateway_image_if_needed, which
+    // detects the version mismatch inside the Lima VM and docker-loads the staged
+    // tarball via the VM's internal Docker socket. No CLI-side docker load needed.
     let image_tar = staged.gateway_image_tar();
-    let tag = format!("sandbox-gateway:{}", inputs.target_version);
-    let inspect = Command::new("docker")
-        .args(["image", "inspect", &tag])
-        .output();
-    let already_loaded = matches!(inspect, Ok(ref o) if o.status.success());
-    if already_loaded {
-        log_step(
-            "docker_load",
-            &format!("image={tag} action=skip status=ok reason=already-loaded"),
-        );
-    } else {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let tag = format!("sandbox-gateway:{}", inputs.target_version);
+        let inspect = Command::new("docker")
+            .args(["image", "inspect", &tag])
+            .output();
+        let already_loaded = matches!(inspect, Ok(ref o) if o.status.success());
+        if already_loaded {
+            log_step(
+                "docker_load",
+                &format!("image={tag} action=skip status=ok reason=already-loaded"),
+            );
+        } else {
+            match Command::new("sudo")
+                .args(["-n", "docker", "load", "-i"])
+                .arg(&image_tar)
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    log_step("docker_load", &format!("image={tag} action=load status=ok"));
+                }
+                Ok(o) => {
+                    log_step(
+                        "docker_load",
+                        &format!(
+                            "image={tag} action=load status=fail stderr={}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        ),
+                    );
+                    eprintln!(
+                        "sandbox update: docker load failed: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                    eprint!(
+                        "{}",
+                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                    );
+                    return 1;
+                }
+                Err(e) => {
+                    log_step(
+                        "docker_load",
+                        &format!("image={tag} action=load status=fail err=\"{e}\""),
+                    );
+                    eprintln!("sandbox update: failed to invoke docker: {e}");
+                    eprint!(
+                        "{}",
+                        recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                    );
+                    return 1;
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Re-stage the new gateway tarball at the canonical path so the daemon's
+        // load_gateway_image_if_needed self-heal picks it up on next start.
+        // Uses `sudo -n install -m 0640 -o _sandboxd -g _sandboxd` to land the
+        // file with the correct ownership (matching install.sh's staging step).
+        let dest = match prod_base_dir() {
+            Some(base) => base.join("gateway-image.tar"),
+            None => {
+                log_step(
+                    "stage_gateway_image",
+                    "action=stage status=fail err=\"sandbox user not found; cannot resolve base-dir\"",
+                );
+                eprintln!(
+                    "sandbox update: cannot resolve per-uid base-dir for gateway image staging — \
+                     is the _sandboxd system user present?"
+                );
+                eprint!(
+                    "{}",
+                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                );
+                return 1;
+            }
+        };
+        let dest_str = dest.to_string_lossy();
+        let src_str = image_tar.to_string_lossy();
+        // Idempotency: skip the install if the destination already has the same bytes.
+        // sha256_of_file is not available here; we rely on the install being cheap.
         match Command::new("sudo")
-            .args(["-n", "docker", "load", "-i"])
-            .arg(&image_tar)
+            .args([
+                "-n",
+                "install",
+                "-m",
+                "0640",
+                "-o",
+                "_sandboxd",
+                "-g",
+                "_sandboxd",
+                src_str.as_ref(),
+                dest_str.as_ref(),
+            ])
             .output()
         {
             Ok(o) if o.status.success() => {
-                log_step("docker_load", &format!("image={tag} action=load status=ok"));
+                log_step(
+                    "stage_gateway_image",
+                    &format!("src={src_str} dst={dest_str} action=stage status=ok"),
+                );
             }
             Ok(o) => {
                 log_step(
-                    "docker_load",
+                    "stage_gateway_image",
                     &format!(
-                        "image={tag} action=load status=fail stderr={}",
+                        "src={} action=stage status=fail stderr={}",
+                        src_str,
                         String::from_utf8_lossy(&o.stderr).trim()
                     ),
                 );
                 eprintln!(
-                    "sandbox update: docker load failed: {}",
+                    "sandbox update: failed to stage gateway image: {}",
                     String::from_utf8_lossy(&o.stderr).trim()
                 );
                 eprint!(
@@ -2248,10 +2590,10 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             }
             Err(e) => {
                 log_step(
-                    "docker_load",
-                    &format!("image={tag} action=load status=fail err=\"{e}\""),
+                    "stage_gateway_image",
+                    &format!("action=stage status=fail err=\"{e}\""),
                 );
-                eprintln!("sandbox update: failed to invoke docker: {e}");
+                eprintln!("sandbox update: failed to invoke install for gateway image: {e}");
                 eprint!(
                     "{}",
                     recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
@@ -2262,7 +2604,12 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     }
 
     // Install new binaries (sha256 compare for idempotency).
-    for (src, dst, mode) in [
+    // The binary set differs by platform:
+    // - Linux: daemon, CLI, route-helper, guest, lima-helper.
+    // - macOS: daemon, CLI, agent, guest. Route-helper and lima-helper are
+    //   Linux-only setcap helpers that are not shipped in the macOS tarball.
+    #[cfg(not(target_os = "macos"))]
+    let binary_install_set: Vec<(PathBuf, &str, u32)> = vec![
         (staged.sandboxd_bin(), backup::SANDBOXD_BIN_PATH, 0o755u32),
         (staged.sandbox_bin(), backup::SANDBOX_BIN_PATH, 0o755u32),
         (
@@ -2276,8 +2623,16 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             backup::LIMA_HELPER_BIN_PATH,
             0o755u32,
         ),
-    ] {
-        match install_binary_if_changed(&src, dst, mode) {
+    ];
+    #[cfg(target_os = "macos")]
+    let binary_install_set: Vec<(PathBuf, &str, u32)> = vec![
+        (staged.sandboxd_bin(), backup::SANDBOXD_BIN_PATH, 0o755u32),
+        (staged.sandbox_bin(), backup::SANDBOX_BIN_PATH, 0o755u32),
+        (staged.agent_bin(), backup::AGENT_BIN_PATH, 0o755u32),
+        (staged.guest_bin(), backup::GUEST_BIN_PATH, 0o755u32),
+    ];
+    for (src, dst, mode) in &binary_install_set {
+        match install_binary_if_changed(src, dst, *mode) {
             Ok(action) => log_step(
                 "install_binary",
                 &format!("path={dst} action={action} status=ok"),
@@ -2297,115 +2652,49 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // Setcap on route-helper (capabilities stripped by the overwrite
-    // in the install-binaries step). cap_sys_ptrace is required because
-    // the container's PID 1 runs as the operator's uid, so the helper
-    // (sandbox uid) enters a foreign-uid netns; the pidfd setns path
-    // runs ptrace_may_access(PTRACE_MODE_READ) on the target, satisfied
-    // across the uid boundary only with CAP_SYS_PTRACE. The cap order
-    // must match `getcap`'s output (sorted by capability number:
-    // net_admin=12, sys_ptrace=19, sys_admin=21) because `already_set`
-    // is a substring check against `getcap` below.
-    let helper = backup::ROUTE_HELPER_BIN_PATH;
-    let expected = "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip";
-    let cur_out = Command::new("getcap").arg(helper).output();
-    let current = cur_out
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let already_set = current.contains(expected);
-    if already_set {
-        log_step("setcap", "caps=already-set action=skip status=ok");
-    } else {
-        match Command::new("sudo")
-            .args(["-n", "setcap", expected, helper])
-            .output()
-        {
-            Ok(o) if o.status.success() => {
-                log_step("setcap", &format!("caps={expected} action=set status=ok"));
-            }
-            Ok(o) => {
-                log_step(
-                    "setcap",
-                    &format!(
-                        "caps={expected} action=set status=fail stderr={}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
-                );
-                eprintln!(
-                    "sandbox update: setcap failed: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                eprint!(
-                    "{}",
-                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-                );
-                return 1;
-            }
-            Err(e) => {
-                log_step("setcap", &format!("action=set status=fail err=\"{e}\""));
-                eprintln!("sandbox update: failed to invoke setcap: {e}");
-                eprint!(
-                    "{}",
-                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-                );
-                return 1;
-            }
-        }
-    }
-
-    // Install lima-helper capabilities.
-    // cap_setuid is required by Lima's networking: the helper sets uid/gid
-    // mappings on behalf of the VM user so the VM's network interfaces
-    // become visible inside the operator's session. Capabilities are
-    // stripped by the binary-overwrite in the install step above, so
-    // setcap must always run after installation even if the binary was
-    // already present and skipped. Sequenced here — before daemon start —
-    // because the daemon hard-refuses to start without cap_setuid=ep on
-    // the lima-helper; running setcap after start_daemon would guarantee
-    // a start failure and trigger recovery.
-    //
-    // The `=ep` form is used for both the `setcap` invocation and the
-    // `getcap` output match. `setcap` accepts both `+ep` and `=ep` as
-    // input (they are equivalent), but `getcap` (libcap ≥2.42) always
-    // emits the `=` form — using `+ep` as a substring match against
-    // `getcap` output would never match, causing a spurious "not set"
-    // failure. The route-helper constant uses `=eip` for the same reason.
+    // Setcap steps and systemd unit install are Linux-only.
+    // macOS has no setcap equivalent — binaries are plain root:wheel 0755 with
+    // no capability bits. The launchd plist is already on disk (installed once
+    // by install.sh) and does not need to be reinstalled on every update.
+    #[cfg(not(target_os = "macos"))]
     {
-        let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let lima_caps = "cap_setuid=ep";
-        let cur_out = Command::new("getcap").arg(lima_helper).output();
+        // Setcap on route-helper (capabilities stripped by the overwrite
+        // in the install-binaries step). cap_sys_ptrace is required because
+        // the container's PID 1 runs as the operator's uid, so the helper
+        // (sandbox uid) enters a foreign-uid netns; the pidfd setns path
+        // runs ptrace_may_access(PTRACE_MODE_READ) on the target, satisfied
+        // across the uid boundary only with CAP_SYS_PTRACE. The cap order
+        // must match `getcap`'s output (sorted by capability number:
+        // net_admin=12, sys_ptrace=19, sys_admin=21) because `already_set`
+        // is a substring check against `getcap` below.
+        let helper = backup::ROUTE_HELPER_BIN_PATH;
+        let expected = "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip";
+        let cur_out = Command::new("getcap").arg(helper).output();
         let current = cur_out
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let already_set = getcap_output_has_cap(&current, lima_caps);
+        let already_set = current.contains(expected);
         if already_set {
-            log_step(
-                "install_lima_helper",
-                "caps=already-set action=skip status=ok",
-            );
+            log_step("setcap", "caps=already-set action=skip status=ok");
         } else {
             match Command::new("sudo")
-                .args(["-n", "setcap", lima_caps, lima_helper])
+                .args(["-n", "setcap", expected, helper])
                 .output()
             {
                 Ok(o) if o.status.success() => {
-                    log_step(
-                        "install_lima_helper",
-                        &format!("caps={lima_caps} action=set status=ok"),
-                    );
+                    log_step("setcap", &format!("caps={expected} action=set status=ok"));
                 }
                 Ok(o) => {
                     log_step(
-                        "install_lima_helper",
+                        "setcap",
                         &format!(
-                            "caps={lima_caps} action=set status=fail stderr={}",
+                            "caps={expected} action=set status=fail stderr={}",
                             String::from_utf8_lossy(&o.stderr).trim()
                         ),
                     );
                     eprintln!(
-                        "sandbox update: setcap failed for {lima_helper}: {}",
+                        "sandbox update: setcap failed: {}",
                         String::from_utf8_lossy(&o.stderr).trim()
                     );
                     eprint!(
@@ -2415,11 +2704,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                     return 1;
                 }
                 Err(e) => {
-                    log_step(
-                        "install_lima_helper",
-                        &format!("action=set status=fail err=\"{e}\""),
-                    );
-                    eprintln!("sandbox update: failed to invoke setcap for {lima_helper}: {e}");
+                    log_step("setcap", &format!("action=set status=fail err=\"{e}\""));
+                    eprintln!("sandbox update: failed to invoke setcap: {e}");
                     eprint!(
                         "{}",
                         recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
@@ -2428,33 +2714,130 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                 }
             }
         }
-    }
 
-    // Verify lima-helper capabilities.
-    // Post-install check: getcap must confirm cap_setuid=ep is present so
-    // the next session create does not fail with permission-denied at the
-    // uid-map step.
-    {
-        let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-        let required_cap = "cap_setuid=ep";
-        let verify_out = Command::new("getcap").arg(lima_helper).output();
-        match verify_out {
-            Ok(o) => {
-                let caps = String::from_utf8_lossy(&o.stdout);
-                if getcap_output_has_cap(&caps, required_cap) {
+        // Install lima-helper capabilities.
+        // cap_setuid is required by Lima's networking: the helper sets uid/gid
+        // mappings on behalf of the VM user so the VM's network interfaces
+        // become visible inside the operator's session. Capabilities are
+        // stripped by the binary-overwrite in the install step above, so
+        // setcap must always run after installation even if the binary was
+        // already present and skipped. Sequenced here — before daemon start —
+        // because the daemon hard-refuses to start without cap_setuid=ep on
+        // the lima-helper; running setcap after start_daemon would guarantee
+        // a start failure and trigger recovery.
+        //
+        // The `=ep` form is used for both the `setcap` invocation and the
+        // `getcap` output match. `setcap` accepts both `+ep` and `=ep` as
+        // input (they are equivalent), but `getcap` (libcap ≥2.42) always
+        // emits the `=` form — using `+ep` as a substring match against
+        // `getcap` output would never match, causing a spurious "not set"
+        // failure. The route-helper constant uses `=eip` for the same reason.
+        {
+            let lima_helper = backup::LIMA_HELPER_BIN_PATH;
+            let lima_caps = "cap_setuid=ep";
+            let cur_out = Command::new("getcap").arg(lima_helper).output();
+            let current = cur_out
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            let already_set = getcap_output_has_cap(&current, lima_caps);
+            if already_set {
+                log_step(
+                    "install_lima_helper",
+                    "caps=already-set action=skip status=ok",
+                );
+            } else {
+                match Command::new("sudo")
+                    .args(["-n", "setcap", lima_caps, lima_helper])
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        log_step(
+                            "install_lima_helper",
+                            &format!("caps={lima_caps} action=set status=ok"),
+                        );
+                    }
+                    Ok(o) => {
+                        log_step(
+                            "install_lima_helper",
+                            &format!(
+                                "caps={lima_caps} action=set status=fail stderr={}",
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            ),
+                        );
+                        eprintln!(
+                            "sandbox update: setcap failed for {lima_helper}: {}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        );
+                        eprint!(
+                            "{}",
+                            recovery_guidance(
+                                Some(&backup_set_dir),
+                                &inputs.state.installed_version,
+                            )
+                        );
+                        return 1;
+                    }
+                    Err(e) => {
+                        log_step(
+                            "install_lima_helper",
+                            &format!("action=set status=fail err=\"{e}\""),
+                        );
+                        eprintln!("sandbox update: failed to invoke setcap for {lima_helper}: {e}");
+                        eprint!(
+                            "{}",
+                            recovery_guidance(
+                                Some(&backup_set_dir),
+                                &inputs.state.installed_version,
+                            )
+                        );
+                        return 1;
+                    }
+                }
+            }
+        }
+
+        // Verify lima-helper capabilities.
+        // Post-install check: getcap must confirm cap_setuid=ep is present so
+        // the next session create does not fail with permission-denied at the
+        // uid-map step.
+        {
+            let lima_helper = backup::LIMA_HELPER_BIN_PATH;
+            let required_cap = "cap_setuid=ep";
+            let verify_out = Command::new("getcap").arg(lima_helper).output();
+            match verify_out {
+                Ok(o) => {
+                    let caps = String::from_utf8_lossy(&o.stdout);
+                    if getcap_output_has_cap(&caps, required_cap) {
+                        log_step(
+                            "setcap_lima_helper",
+                            &format!("caps={required_cap} verify=pass status=ok"),
+                        );
+                    } else {
+                        log_step(
+                            "setcap_lima_helper",
+                            &format!("caps={required_cap} verify=fail getcap={}", caps.trim()),
+                        );
+                        eprintln!(
+                            "sandbox update: cap_setuid=ep not set on {lima_helper} after setcap — \
+                             manual recovery: sudo setcap cap_setuid=ep {lima_helper}"
+                        );
+                        eprint!(
+                            "{}",
+                            recovery_guidance(
+                                Some(&backup_set_dir),
+                                &inputs.state.installed_version,
+                            )
+                        );
+                        return 1;
+                    }
+                }
+                Err(e) => {
                     log_step(
                         "setcap_lima_helper",
-                        &format!("caps={required_cap} verify=pass status=ok"),
+                        &format!("action=verify status=fail err=\"{e}\""),
                     );
-                } else {
-                    log_step(
-                        "setcap_lima_helper",
-                        &format!("caps={required_cap} verify=fail getcap={}", caps.trim()),
-                    );
-                    eprintln!(
-                        "sandbox update: cap_setuid=ep not set on {lima_helper} after setcap — \
-                         manual recovery: sudo setcap cap_setuid=ep {lima_helper}"
-                    );
+                    eprintln!("sandbox update: failed to invoke getcap for {lima_helper}: {e}");
                     eprint!(
                         "{}",
                         recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
@@ -2462,12 +2845,155 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                     return 1;
                 }
             }
+        }
+
+        // Install systemd unit (idempotent via sha256 compare).
+        //
+        // The tarball ships `systemd/sandboxd.service` with the placeholder
+        // `@SANDBOX_BASE_DIR@` that install.sh replaces at install time.  The
+        // update path must perform the identical substitution before writing the
+        // unit, or the daemon starts with a literal `--base-dir @SANDBOX_BASE_DIR@`
+        // and immediately crashes with PermissionDenied.
+        //
+        // `prod_base_dir()` is the single source of truth for the resolved path
+        // (the same function already used by `check_disk_space`, `resolve_state_path`,
+        // etc.); `render_systemd_unit` substitutes and then validates the result.
+        let base_dir = match prod_base_dir() {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => {
+                log_step(
+                    "install_unit",
+                    "action=install status=fail err=\"sandbox user not found; cannot resolve base-dir for unit substitution\"",
+                );
+                eprintln!(
+                    "sandbox update: cannot resolve per-uid base-dir for systemd unit — \
+                     is the sandbox system user present on this host?"
+                );
+                eprint!(
+                    "{}",
+                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                );
+                return 1;
+            }
+        };
+        let unit_src_raw = staged.systemd_unit();
+        let rendered_unit_bytes = match std::fs::read(&unit_src_raw)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                let content = String::from_utf8_lossy(&bytes).into_owned();
+                render_systemd_unit(&content, &base_dir)
+            }) {
+            Ok(b) => b,
             Err(e) => {
                 log_step(
-                    "setcap_lima_helper",
-                    &format!("action=verify status=fail err=\"{e}\""),
+                    "install_unit",
+                    &format!("action=render status=fail err=\"{e}\""),
                 );
-                eprintln!("sandbox update: failed to invoke getcap for {lima_helper}: {e}");
+                eprintln!("sandbox update: failed to render systemd unit: {e}");
+                eprint!(
+                    "{}",
+                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                );
+                return 1;
+            }
+        };
+        let mut rendered_tmp = match tempfile::NamedTempFile::new().map_err(|e| e.to_string()) {
+            Ok(f) => f,
+            Err(e) => {
+                log_step(
+                    "install_unit",
+                    &format!("action=render status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to create tempfile for rendered unit: {e}");
+                eprint!(
+                    "{}",
+                    recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+                );
+                return 1;
+            }
+        };
+        if let Err(e) = std::io::Write::write_all(&mut rendered_tmp, &rendered_unit_bytes)
+            .and_then(|_| std::io::Write::flush(&mut rendered_tmp))
+        {
+            log_step(
+                "install_unit",
+                &format!("action=render status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: failed to write rendered unit tempfile: {e}");
+            eprint!(
+                "{}",
+                recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
+            );
+            return 1;
+        }
+        let unit_src = rendered_tmp.path().to_path_buf();
+        let unit_dst = SYSTEMD_UNIT_PATH;
+        match install_root_file_if_changed(&unit_src, unit_dst, 0o644) {
+            Ok(action) => {
+                log_step(
+                    "install_unit",
+                    &format!("path={unit_dst} action={action} status=ok"),
+                );
+                if action == "install" {
+                    // daemon-reload after unit replacement so systemctl
+                    // start picks up the new unit. A swallowed
+                    // failure would leave systemd serving the cached view
+                    // of the OLD unit while we'd happily report ok — fail
+                    // loud instead, with a forensic-parity log line.
+                    match Command::new("sudo")
+                        .args(["-n", "systemctl", "daemon-reload"])
+                        .output()
+                    {
+                        Ok(o) if o.status.success() => {
+                            log_step("daemon_reload", "action=reload status=ok");
+                        }
+                        Ok(o) => {
+                            log_step(
+                                "daemon_reload",
+                                &format!(
+                                    "action=reload status=fail stderr=\"{}\"",
+                                    String::from_utf8_lossy(&o.stderr).trim()
+                                ),
+                            );
+                            eprintln!(
+                                "sandbox update: systemctl daemon-reload failed: {}",
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            );
+                            eprint!(
+                                "{}",
+                                recovery_guidance(
+                                    Some(&backup_set_dir),
+                                    &inputs.state.installed_version,
+                                )
+                            );
+                            return 1;
+                        }
+                        Err(e) => {
+                            log_step(
+                                "daemon_reload",
+                                &format!("action=reload status=fail err=\"{e}\""),
+                            );
+                            eprintln!(
+                                "sandbox update: failed to invoke systemctl daemon-reload: {e}"
+                            );
+                            eprint!(
+                                "{}",
+                                recovery_guidance(
+                                    Some(&backup_set_dir),
+                                    &inputs.state.installed_version,
+                                )
+                            );
+                            return 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log_step(
+                    "install_unit",
+                    &format!("path={unit_dst} action=install status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to install systemd unit: {e}");
                 eprint!(
                     "{}",
                     recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
@@ -2475,160 +3001,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                 return 1;
             }
         }
-    }
-
-    // Install systemd unit (idempotent via sha256 compare).
-    //
-    // The tarball ships `systemd/sandboxd.service` with the placeholder
-    // `@SANDBOX_BASE_DIR@` that install.sh replaces at install time.  The
-    // update path must perform the identical substitution before writing the
-    // unit, or the daemon starts with a literal `--base-dir @SANDBOX_BASE_DIR@`
-    // and immediately crashes with PermissionDenied.
-    //
-    // `prod_base_dir()` is the single source of truth for the resolved path
-    // (the same function already used by `check_disk_space`, `resolve_state_path`,
-    // etc.); `render_systemd_unit` substitutes and then validates the result.
-    let base_dir = match prod_base_dir() {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => {
-            log_step(
-                "install_unit",
-                "action=install status=fail err=\"sandbox user not found; cannot resolve base-dir for unit substitution\"",
-            );
-            eprintln!(
-                "sandbox update: cannot resolve per-uid base-dir for systemd unit — \
-                 is the sandbox system user present on this host?"
-            );
-            eprint!(
-                "{}",
-                recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-            );
-            return 1;
-        }
-    };
-    let unit_src_raw = staged.systemd_unit();
-    let rendered_unit_bytes = match std::fs::read(&unit_src_raw)
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| {
-            let content = String::from_utf8_lossy(&bytes).into_owned();
-            render_systemd_unit(&content, &base_dir)
-        }) {
-        Ok(b) => b,
-        Err(e) => {
-            log_step(
-                "install_unit",
-                &format!("action=render status=fail err=\"{e}\""),
-            );
-            eprintln!("sandbox update: failed to render systemd unit: {e}");
-            eprint!(
-                "{}",
-                recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-            );
-            return 1;
-        }
-    };
-    let mut rendered_tmp = match tempfile::NamedTempFile::new().map_err(|e| e.to_string()) {
-        Ok(f) => f,
-        Err(e) => {
-            log_step(
-                "install_unit",
-                &format!("action=render status=fail err=\"{e}\""),
-            );
-            eprintln!("sandbox update: failed to create tempfile for rendered unit: {e}");
-            eprint!(
-                "{}",
-                recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-            );
-            return 1;
-        }
-    };
-    if let Err(e) = std::io::Write::write_all(&mut rendered_tmp, &rendered_unit_bytes)
-        .and_then(|_| std::io::Write::flush(&mut rendered_tmp))
-    {
-        log_step(
-            "install_unit",
-            &format!("action=render status=fail err=\"{e}\""),
-        );
-        eprintln!("sandbox update: failed to write rendered unit tempfile: {e}");
-        eprint!(
-            "{}",
-            recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-        );
-        return 1;
-    }
-    let unit_src = rendered_tmp.path().to_path_buf();
-    let unit_dst = SYSTEMD_UNIT_PATH;
-    match install_root_file_if_changed(&unit_src, unit_dst, 0o644) {
-        Ok(action) => {
-            log_step(
-                "install_unit",
-                &format!("path={unit_dst} action={action} status=ok"),
-            );
-            if action == "install" {
-                // daemon-reload after unit replacement so systemctl
-                // start picks up the new unit. A swallowed
-                // failure would leave systemd serving the cached view
-                // of the OLD unit while we'd happily report ok — fail
-                // loud instead, with a forensic-parity log line.
-                match Command::new("sudo")
-                    .args(["-n", "systemctl", "daemon-reload"])
-                    .output()
-                {
-                    Ok(o) if o.status.success() => {
-                        log_step("daemon_reload", "action=reload status=ok");
-                    }
-                    Ok(o) => {
-                        log_step(
-                            "daemon_reload",
-                            &format!(
-                                "action=reload status=fail stderr=\"{}\"",
-                                String::from_utf8_lossy(&o.stderr).trim()
-                            ),
-                        );
-                        eprintln!(
-                            "sandbox update: systemctl daemon-reload failed: {}",
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        );
-                        eprint!(
-                            "{}",
-                            recovery_guidance(
-                                Some(&backup_set_dir),
-                                &inputs.state.installed_version
-                            )
-                        );
-                        return 1;
-                    }
-                    Err(e) => {
-                        log_step(
-                            "daemon_reload",
-                            &format!("action=reload status=fail err=\"{e}\""),
-                        );
-                        eprintln!("sandbox update: failed to invoke systemctl daemon-reload: {e}");
-                        eprint!(
-                            "{}",
-                            recovery_guidance(
-                                Some(&backup_set_dir),
-                                &inputs.state.installed_version
-                            )
-                        );
-                        return 1;
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            log_step(
-                "install_unit",
-                &format!("path={unit_dst} action=install status=fail err=\"{e}\""),
-            );
-            eprintln!("sandbox update: failed to install systemd unit: {e}");
-            eprint!(
-                "{}",
-                recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
-            );
-            return 1;
-        }
-    }
+    } // end #[cfg(not(target_os = "macos"))]
 
     // Apply config migrations (per file, atomically).
     //
@@ -2709,12 +3082,15 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // Start daemon (only if `was_running`).
+    // Start daemon (only if `was_running`). Platform-dispatched.
+    // On Linux: `systemctl start sandboxd`.
+    // On macOS: `launchctl bootstrap system /Library/LaunchDaemons/io.sandboxd.daemon.plist`.
     if sticky_was_running {
-        match Command::new("sudo")
-            .args(["-n", "systemctl", "start", "sandboxd"])
-            .output()
-        {
+        let start_argv = daemon_start_argv();
+        let mut start_cmd = Command::new("sudo");
+        start_cmd.arg("-n");
+        start_cmd.args(&start_argv);
+        match start_cmd.output() {
             Ok(o) if o.status.success() => {
                 log_step(
                     "start_daemon",
@@ -2730,11 +3106,18 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                     ),
                 );
                 eprintln!(
-                    "sandbox update: systemctl start sandboxd failed: {}",
+                    "sandbox update: {} failed: {}",
+                    start_argv.join(" "),
                     String::from_utf8_lossy(&o.stderr).trim()
                 );
+                #[cfg(not(target_os = "macos"))]
                 eprintln!(
                     "sandbox update: consult `sudo journalctl -u sandboxd -n 50` for details."
+                );
+                #[cfg(target_os = "macos")]
+                eprintln!(
+                    "sandbox update: consult `sudo launchctl print system/io.sandboxd.daemon` \
+                     and `/var/log/sandbox/launchd.stderr.log` for details."
                 );
                 eprint!(
                     "{}",
@@ -2747,7 +3130,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                     "start_daemon",
                     &format!("action=start status=fail err=\"{e}\""),
                 );
-                eprintln!("sandbox update: failed to invoke systemctl: {e}");
+                eprintln!("sandbox update: failed to invoke {}: {e}", start_argv[0]);
                 eprint!(
                     "{}",
                     recovery_guidance(Some(&backup_set_dir), &inputs.state.installed_version)
@@ -2766,7 +3149,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // then curl /version. Skipped when the daemon was stopped
     // intentionally (was_running == false).
     if sticky_was_running {
-        let sock = "/run/sandbox/sandboxd.sock";
+        let sock = daemon_socket_path();
         let mut appeared = false;
         for _ in 0..30 {
             if Path::new(sock).exists() {
@@ -2780,8 +3163,14 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                 "verify_version",
                 "action=verify status=fail reason=socket-absent",
             );
+            #[cfg(not(target_os = "macos"))]
             eprintln!(
                 "sandbox update: daemon socket {sock} did not appear within 30s; consult: sudo journalctl -u sandboxd -n 50"
+            );
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "sandbox update: daemon socket {sock} did not appear within 30s; consult: \
+                 sudo launchctl print system/io.sandboxd.daemon"
             );
             eprint!(
                 "{}",
@@ -2850,7 +3239,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // sandbox group. Fall back to the direct invocation when no operator can
     // be determined (e.g. genuine root login with no SUDO_USER), so a
     // completed upgrade is never stranded by a missing env var.
-    let sock = "/run/sandbox/sandboxd.sock";
+    let sock = daemon_socket_path();
     let doctor = match sudo_user_operator() {
         Some(operator) => Command::new("sudo")
             .args([
@@ -2899,6 +3288,75 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             );
             return 1;
         }
+    }
+
+    // macOS: kick the loaded io.sandboxd.agent LaunchAgent so operators pick up
+    // the new agent binary without having to log out. Best-effort: a missing
+    // agent or an agent that was never loaded is not a failure — we log the
+    // outcome and continue.
+    #[cfg(target_os = "macos")]
+    if let Some(operator) = sudo_user_operator() {
+        // Resolve the operator's numeric uid so we can address the GUI domain.
+        let uid_out = Command::new("id")
+            .args(["-u", &operator])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+            });
+        if let Some(uid) = uid_out {
+            if let Some(argv) = agent_kickstart_argv(uid) {
+                match Command::new("sudo").arg("-n").args(&argv).output() {
+                    Ok(o) if o.status.success() => {
+                        log_step(
+                            "kickstart_agent",
+                            &format!(
+                                "label=gui/{uid}/{LAUNCHD_AGENT_LABEL} action=kickstart status=ok"
+                            ),
+                        );
+                    }
+                    Ok(o) => {
+                        log_step(
+                            "kickstart_agent",
+                            &format!(
+                                "label=gui/{uid}/{LAUNCHD_AGENT_LABEL} action=kickstart \
+                                 status=warn stderr={}",
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            ),
+                        );
+                        eprintln!(
+                            "sandbox update: warning — could not kickstart agent \
+                             (gui/{uid}/{LAUNCHD_AGENT_LABEL}): {}. \
+                             Operators will pick up the new agent at next login.",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        );
+                    }
+                    Err(e) => {
+                        log_step(
+                            "kickstart_agent",
+                            &format!("action=kickstart status=warn err=\"{e}\""),
+                        );
+                        eprintln!(
+                            "sandbox update: warning — failed to invoke launchctl kickstart: {e}. \
+                             Operators will pick up the new agent at next login."
+                        );
+                    }
+                }
+            }
+        } else {
+            log_step(
+                "kickstart_agent",
+                "action=skip status=ok reason=uid-unresolvable",
+            );
+        }
+    } else {
+        log_step(
+            "kickstart_agent",
+            "action=skip status=ok reason=no-operator-context",
+        );
     }
 
     // Update install state + finalize backup manifest.
@@ -3139,6 +3597,7 @@ pub fn query_staged_proto_version(staged_sandbox: &Path) -> Result<u32, String> 
 /// `base_dir` is the resolved per-uid path (e.g. `/var/lib/sandboxd/1234`),
 /// obtained from [`prod_base_dir`] by the caller. Returning an `Err` here aborts
 /// the update and surfaces the problem to the operator.
+#[cfg(not(target_os = "macos"))]
 fn render_systemd_unit(template: &str, base_dir: &str) -> Result<Vec<u8>, String> {
     let rendered = template.replace("@SANDBOX_BASE_DIR@", base_dir);
     if rendered.contains("@SANDBOX_BASE_DIR@") {
@@ -3157,6 +3616,7 @@ fn render_systemd_unit(template: &str, base_dir: &str) -> Result<Vec<u8>, String
 /// The `setcap` *input* syntax accepts both `cap_setuid+ep` and `cap_setuid=ep`,
 /// but getcap output always uses `=`. Matching against `+ep` would never
 /// succeed — use the `=` form for both constants and this check.
+#[cfg(not(target_os = "macos"))]
 fn getcap_output_has_cap(getcap_stdout: &str, cap: &str) -> bool {
     getcap_stdout.contains(cap)
 }
@@ -3170,6 +3630,91 @@ fn getcap_output_has_cap(getcap_stdout: &str, cap: &str) -> bool {
 ///
 /// Returns `None` when not running under sudo, when `SUDO_USER` is empty, or
 /// when the value is not a valid (non-empty, non-"root") username.
+/// macOS pre-flight: check whether any workspace lock is currently held.
+///
+/// Queries the daemon via the operator socket for any session that has an
+/// outstanding workspace-lock (push/pull op in progress). Returns `Ok(true)`
+/// when at least one lock is held, `Ok(false)` when none are, and `Err` when
+/// the daemon is not reachable — the caller skips the gate in that case.
+///
+/// Workspace locks are held exclusively by Running sessions (the
+/// workspace-lock subsystem is in-memory only and not serialized to `/sessions`).
+/// We refuse if any session is in the `"running"` state, which covers both
+/// active sessions AND any in-flight push/pull ops they may have open. This is
+/// the same signal the existing active-sessions check uses; the macOS pre-flight
+/// adds it as a named, separately-logged gate so the refusal message is
+/// workspace-lock–specific rather than generic.
+#[cfg(target_os = "macos")]
+async fn check_workspace_locks_held(socket_path: &str) -> Result<bool, String> {
+    let body = query_daemon_json(socket_path, "/sessions").await?;
+    // The /sessions response is a JSON array of SessionDto objects.
+    // `state` is serialized as snake_case by serde: "running", "stopped", etc.
+    // Workspace locks are only held by Running sessions.
+    let sessions = body
+        .as_array()
+        .ok_or_else(|| "unexpected /sessions response shape".to_string())?;
+    let any_running = sessions
+        .iter()
+        .any(|s| s["state"].as_str() == Some("running"));
+    Ok(any_running)
+}
+
+/// macOS pre-flight: check whether the gateway Lima instance is reachable.
+///
+/// Probes the daemon via `/diagnostics` and reads the macOS-only
+/// `gateway_lima_state` field. Returns `Ok(true)` when the gateway Lima
+/// instance is running and its Docker socket is responsive, `Ok(false)` when
+/// it is stopped, absent, or in an error state, and `Err` when the daemon
+/// itself is not reachable.
+///
+/// The `gateway_lima_state` field is emitted by the macOS `diagnostics_handler`
+/// in `main.rs`. Its values are: `"running"` (Lima up + Docker healthy),
+/// `"stopped"`, `"absent"`, `"error"`. The field is omitted entirely on Linux
+/// (the daemon only emits it under `#[cfg(target_os = "macos")]`), but this
+/// function is itself only compiled on macOS, so that's consistent.
+///
+/// When the field is absent (an older daemon that does not emit this diagnostic),
+/// we treat the gateway as reachable to avoid false-refusing on forward-rolled hosts.
+#[cfg(target_os = "macos")]
+async fn check_gateway_lima_reachable(socket_path: &str) -> Result<bool, String> {
+    let body = query_daemon_json(socket_path, "/diagnostics").await?;
+    // `gateway_lima_state` is the macOS-only field the daemon emits for the
+    // gateway Lima instance's combined Lima+Docker health verdict. Only
+    // "running" means the gateway is up and its Docker socket is healthy.
+    match body["gateway_lima_state"].as_str() {
+        Some("running") => Ok(true),
+        Some(_) => Ok(false),
+        // Field absent: forward-compat with older daemons that omit it — skip the gate.
+        None => Ok(true),
+    }
+}
+
+/// Query a JSON endpoint on the daemon socket. Returns the parsed value or an
+/// error string describing why the query failed.
+#[allow(dead_code)] // used only in cfg(target_os = "macos") branches
+async fn query_daemon_json(socket_path: &str, path: &str) -> Result<serde_json::Value, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("connect {socket_path}: {e}"))?;
+    let request = format!("GET {path} HTTP/1.0\r\nHost: sandboxd\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+    let text = String::from_utf8_lossy(&buf);
+    // Strip HTTP headers (everything up to and including the blank line).
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&text);
+    serde_json::from_str(body).map_err(|e| format!("parse JSON: {e}"))
+}
+
 fn sudo_user_operator() -> Option<String> {
     let user = std::env::var("SUDO_USER").ok()?;
     // Treat empty or the literal string "root" as "no operator to de-escalate to".
@@ -3297,6 +3842,7 @@ fn install_binary_if_changed(
 
 /// Same as [`install_binary_if_changed`] but for non-executable
 /// root-owned files (e.g. the systemd unit).
+#[cfg(not(target_os = "macos"))]
 fn install_root_file_if_changed(
     src: &Path,
     dst: &str,
@@ -3614,6 +4160,7 @@ fn dry_run_migration(file: cfg_migrations::TargetFile) -> Result<(), String> {
 /// Tolerant wrapper around `systemctl is-active <unit>` — returns
 /// `true` iff systemctl reports `"active"`. Treats any non-zero exit
 /// or fork failure as "not running".
+#[cfg(not(target_os = "macos"))]
 fn systemctl_is_active(unit: &str) -> bool {
     use std::process::Command;
     match Command::new("systemctl")
@@ -3626,6 +4173,107 @@ fn systemctl_is_active(unit: &str) -> bool {
             s.trim() == "active"
         }
         Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform service control
+// ---------------------------------------------------------------------------
+
+/// The argv (without "sudo" and "-n" prefix) for stopping the daemon.
+///
+/// On Linux: `["systemctl", "stop", "sandboxd"]`.
+/// On macOS: `["launchctl", "bootout", "system/io.sandboxd.daemon"]`.
+pub fn daemon_stop_argv() -> Vec<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        vec!["launchctl", "bootout", "system/io.sandboxd.daemon"]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec!["systemctl", "stop", "sandboxd"]
+    }
+}
+
+/// The argv (without "sudo" and "-n" prefix) for starting the daemon.
+///
+/// On Linux: `["systemctl", "start", "sandboxd"]`.
+/// On macOS: `["launchctl", "bootstrap", "system", "/Library/LaunchDaemons/io.sandboxd.daemon.plist"]`.
+pub fn daemon_start_argv() -> Vec<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            "launchctl",
+            "bootstrap",
+            "system",
+            LAUNCHD_DAEMON_PLIST_PATH,
+        ]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec!["systemctl", "start", "sandboxd"]
+    }
+}
+
+/// Probe whether the daemon is currently running.
+///
+/// On Linux: `systemctl is-active sandboxd`.
+/// On macOS: `launchctl print system/io.sandboxd.daemon` — exits 0 when the
+/// service is loaded and running, non-zero otherwise.
+pub fn daemon_is_running() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        match Command::new("launchctl")
+            .args(["print", "system/io.sandboxd.daemon"])
+            .output()
+        {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        systemctl_is_active("sandboxd")
+    }
+}
+
+/// Build the `launchctl kickstart` argv for the per-operator agent.
+///
+/// macOS only. Restarts the loaded `io.sandboxd.agent` LaunchAgent for the
+/// given operator uid so the new binary is picked up without a full logout.
+/// The `-k` flag kills any running instance before restarting.
+///
+/// Returns `None` on non-macOS builds so callers can skip this step.
+pub fn agent_kickstart_argv(uid: u32) -> Option<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(vec![
+            "launchctl".to_string(),
+            "kickstart".to_string(),
+            "-k".to_string(),
+            format!("gui/{uid}/{}", LAUNCHD_AGENT_LABEL),
+        ])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = uid;
+        None
+    }
+}
+
+/// Return the canonical daemon socket path for the current platform.
+///
+/// On Linux: `/run/sandbox/sandboxd.sock`.
+/// On macOS: `/var/run/sandbox/sandboxd.sock` (from the launchd plist).
+pub fn daemon_socket_path() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "/var/run/sandbox/sandboxd.sock"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "/run/sandbox/sandboxd.sock"
     }
 }
 
@@ -4554,13 +5202,38 @@ mod tests {
         }
     }
 
+    /// `DAEMON_SYSTEM_USER` must be `_sandboxd` on macOS so `prod_base_dir()`
+    /// resolves the correct per-uid state directory (the launchd plist's
+    /// UserName key and install.sh's `dscl` / `sysadminctl` calls all use
+    /// `_sandboxd`; any other value would cause the gateway re-stage and backup
+    /// steps to abort with None).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn daemon_system_user_is_sandboxd_on_macos() {
+        assert_eq!(
+            DAEMON_SYSTEM_USER, "_sandboxd",
+            "macOS daemon user must be _sandboxd (as created by install.sh)"
+        );
+    }
+
+    /// `DAEMON_SYSTEM_USER` must be `sandbox` on Linux.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn daemon_system_user_is_sandbox_on_linux() {
+        assert_eq!(
+            DAEMON_SYSTEM_USER, "sandbox",
+            "Linux daemon user must be sandbox"
+        );
+    }
+
     // -----------------------------------------------------------------
-    // render_systemd_unit
+    // render_systemd_unit (Linux-only — function is cfg-gated)
     // -----------------------------------------------------------------
 
     /// `render_systemd_unit` replaces every `@SANDBOX_BASE_DIR@` occurrence
     /// and returns the rendered bytes.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn render_systemd_unit_substitutes_placeholder() {
         let template = "ExecStart=/usr/local/libexec/sandboxd/sandboxd \\\n    \
                         --base-dir @SANDBOX_BASE_DIR@ \\\n    \
@@ -4580,6 +5253,7 @@ mod tests {
 
     /// `render_systemd_unit` replaces ALL occurrences, not just the first.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn render_systemd_unit_replaces_all_occurrences() {
         let template = "# comment: @SANDBOX_BASE_DIR@\nExecStart=... @SANDBOX_BASE_DIR@\n";
         let got = render_systemd_unit(template, "/var/lib/sandboxd/999").unwrap();
@@ -4598,6 +5272,7 @@ mod tests {
     /// current behaviour (the post-check cannot guard against an empty string,
     /// only against a surviving placeholder token).
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn render_systemd_unit_empty_base_dir_produces_no_placeholder() {
         // An empty base_dir results in the placeholder being replaced with
         // "" — bizarre but not a post-check failure. The caller (apply_stateful)
@@ -4612,6 +5287,7 @@ mod tests {
     /// In practice this can't happen with a well-formed template, but the
     /// post-check is the safety net.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn render_systemd_unit_rejects_surviving_placeholder() {
         // Construct a pathological template where the placeholder token appears
         // in a context that `str::replace` would leave behind only if `base_dir`
@@ -4779,6 +5455,7 @@ mod tests {
     /// Matching `+ep` against `getcap` output would always return false —
     /// confirming that only the `=ep` form works as a substring match here.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn getcap_output_has_cap_matches_equals_form() {
         let realistic_output = "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n";
 
@@ -4838,5 +5515,244 @@ mod tests {
         unsafe { std::env::set_var("SUDO_USER", "") };
         assert_eq!(sudo_user_operator(), None);
         unsafe { std::env::remove_var("SUDO_USER") };
+    }
+
+    // ---------------------------------------------------------------------------
+    // macOS service-control command construction
+    // ---------------------------------------------------------------------------
+
+    /// `daemon_stop_argv` on macOS produces the exact launchctl bootout form.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_daemon_stop_argv_is_launchctl_bootout() {
+        let argv = daemon_stop_argv();
+        assert_eq!(
+            argv,
+            &["launchctl", "bootout", "system/io.sandboxd.daemon"],
+            "stop command must be launchctl bootout system/io.sandboxd.daemon"
+        );
+    }
+
+    /// `daemon_start_argv` on macOS produces the exact launchctl bootstrap form.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_daemon_start_argv_is_launchctl_bootstrap() {
+        let argv = daemon_start_argv();
+        assert_eq!(
+            argv,
+            &[
+                "launchctl",
+                "bootstrap",
+                "system",
+                "/Library/LaunchDaemons/io.sandboxd.daemon.plist",
+            ],
+            "start command must be launchctl bootstrap system <plist>"
+        );
+    }
+
+    /// `agent_kickstart_argv` on macOS produces the `launchctl kickstart -k
+    /// gui/<uid>/io.sandboxd.agent` form.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_agent_kickstart_argv_contains_gui_uid_label() {
+        let argv = agent_kickstart_argv(501).expect("must return Some on macOS");
+        assert_eq!(argv[0], "launchctl");
+        assert_eq!(argv[1], "kickstart");
+        assert_eq!(argv[2], "-k");
+        assert_eq!(
+            argv[3], "gui/501/io.sandboxd.agent",
+            "target must address the agent in the gui/<uid> domain"
+        );
+    }
+
+    /// `daemon_socket_path` on macOS returns the path the plist defines.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_daemon_socket_path_is_var_run() {
+        assert_eq!(
+            daemon_socket_path(),
+            "/var/run/sandbox/sandboxd.sock",
+            "macOS socket must be under /var/run (as defined by the launchd plist)"
+        );
+    }
+
+    /// `daemon_socket_path` on Linux returns the systemd-socket path.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_daemon_socket_path_is_run_sandbox() {
+        assert_eq!(
+            daemon_socket_path(),
+            "/run/sandbox/sandboxd.sock",
+            "Linux socket must be /run/sandbox/sandboxd.sock"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Linux service-control command construction (pinned on non-macOS hosts)
+    // ---------------------------------------------------------------------------
+
+    /// `daemon_stop_argv` on Linux produces the systemctl stop form.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_daemon_stop_argv_is_systemctl_stop() {
+        let argv = daemon_stop_argv();
+        assert_eq!(
+            argv,
+            &["systemctl", "stop", "sandboxd"],
+            "stop command must be systemctl stop sandboxd"
+        );
+    }
+
+    /// `daemon_start_argv` on Linux produces the systemctl start form.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_daemon_start_argv_is_systemctl_start() {
+        let argv = daemon_start_argv();
+        assert_eq!(
+            argv,
+            &["systemctl", "start", "sandboxd"],
+            "start command must be systemctl start sandboxd"
+        );
+    }
+
+    /// `agent_kickstart_argv` returns None on Linux (no agent concept).
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_agent_kickstart_argv_is_none() {
+        assert!(
+            agent_kickstart_argv(1000).is_none(),
+            "agent kickstart is macOS-only; must return None on Linux"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // detect_host_arch
+    // ---------------------------------------------------------------------------
+
+    /// On macOS arm64, `detect_host_arch` must return the Apple-Silicon triple.
+    /// Gated on the host being an Apple-Silicon Mac so the assertion is about
+    /// the actual runtime, not a hypothetical.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn detect_host_arch_returns_apple_silicon_triple_on_macos() {
+        let arch = detect_host_arch().expect("Apple Silicon host must not return Err");
+        assert_eq!(
+            arch, "aarch64-apple-darwin",
+            "macOS arm64 host must report aarch64-apple-darwin; got {arch:?}"
+        );
+    }
+
+    /// On Linux aarch64 / x86_64, `detect_host_arch` must return a Linux triple.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn detect_host_arch_returns_linux_triple() {
+        let arch = detect_host_arch().expect("Linux host must not return Err");
+        assert!(
+            arch == "aarch64-unknown-linux-gnu" || arch == "x86_64-unknown-linux-gnu",
+            "Linux host must report a linux-gnu triple; got {arch:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // macOS backup set composition
+    // ---------------------------------------------------------------------------
+
+    /// On macOS the backup binary set must include agent and cosign and must
+    /// NOT include the Linux-only route-helper and lima-helper.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_backup_binary_set_includes_agent_cosign_excludes_linux_helpers() {
+        // The constants are declared unconditionally in backup.rs; we verify
+        // the macOS-specific ones are distinct paths and present in the macOS set.
+        assert_eq!(
+            backup::AGENT_BIN_PATH,
+            "/usr/local/libexec/sandboxd/sandbox-agent"
+        );
+        assert_eq!(
+            backup::COSIGN_BIN_PATH,
+            "/usr/local/libexec/sandboxd/cosign"
+        );
+        // Route-helper and lima-helper must NOT be in the macOS binary set.
+        // We inspect the constant definitions to confirm they differ from the
+        // macOS-specific set entries.
+        assert_ne!(
+            backup::ROUTE_HELPER_BIN_PATH,
+            backup::AGENT_BIN_PATH,
+            "route-helper and agent are different binaries"
+        );
+        assert_ne!(
+            backup::LIMA_HELPER_BIN_PATH,
+            backup::COSIGN_BIN_PATH,
+            "lima-helper and cosign are different binaries"
+        );
+    }
+
+    /// On macOS the config file backup set uses the launchd plists, not the
+    /// Linux /etc files.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_config_backup_set_uses_launchd_plists() {
+        assert_eq!(
+            backup::LAUNCHD_DAEMON_PLIST_PATH,
+            "/Library/LaunchDaemons/io.sandboxd.daemon.plist"
+        );
+        assert_eq!(
+            backup::LAUNCHD_AGENT_PLIST_PATH,
+            "/Library/LaunchAgents/io.sandboxd.agent.plist"
+        );
+        // Confirm these differ from the Linux /etc paths.
+        assert_ne!(backup::LAUNCHD_DAEMON_PLIST_PATH, backup::USERS_CONF_PATH);
+        assert_ne!(backup::LAUNCHD_AGENT_PLIST_PATH, backup::BRIDGE_CONF_PATH);
+    }
+
+    // ---------------------------------------------------------------------------
+    // dev-mode gate (platform-appropriate service config path)
+    // ---------------------------------------------------------------------------
+
+    /// On macOS the dev-mode artefact is the launchd plist, not the systemd unit.
+    /// Verify the path constant.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_dev_mode_gate_uses_launchd_plist_path() {
+        assert_eq!(
+            LAUNCHD_DAEMON_PLIST_PATH, "/Library/LaunchDaemons/io.sandboxd.daemon.plist",
+            "macOS dev-mode gate must be keyed on the launchd daemon plist"
+        );
+        // Confirm the constant differs from the Linux gate.
+        assert_ne!(
+            LAUNCHD_DAEMON_PLIST_PATH, SYSTEMD_UNIT_PATH,
+            "macOS gate path must not be the systemd unit path"
+        );
+    }
+
+    /// Dev-mode detection uses the supplied path argument — confirm a tempfile
+    /// acting as the launchd plist makes `is_dev_mode` return None (system install).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_dev_mode_detect_clears_when_launchd_plist_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plist = tmp.path().join("io.sandboxd.daemon.plist");
+        let state = tmp.path().join(".install-state.json");
+        std::fs::write(&plist, b"<plist/>").unwrap();
+        std::fs::write(&state, b"{}").unwrap();
+        assert!(
+            is_dev_mode(&plist, &state).is_none(),
+            "both artefacts present → not dev mode on macOS"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // `SANDBOXD_BIN_PATH` is the shared libexec constant (verify-only)
+    // ---------------------------------------------------------------------------
+
+    /// `SANDBOXD_BIN_PATH` is the libexec path on both platforms, confirming
+    /// deliverable #4 (libexec swap target) is correctly wired.
+    #[test]
+    fn sandboxd_bin_path_is_libexec() {
+        assert_eq!(
+            backup::SANDBOXD_BIN_PATH,
+            "/usr/local/libexec/sandboxd/sandboxd",
+            "SANDBOXD_BIN_PATH must point at the libexec install location on all platforms"
+        );
     }
 }

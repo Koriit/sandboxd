@@ -97,6 +97,20 @@ pub const GUEST_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-guest";
 /// via `setcap` after install. Mirrors the install.sh layout.
 pub const LIMA_HELPER_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-lima-helper";
 
+// macOS-only paths — binaries and service configs that differ from the Linux set.
+// These constants are declared unconditionally so they can be referenced in
+// cfg-gated code without triggering dead-code warnings on Linux builds.
+
+/// Per-operator agent binary path on macOS. Plain `root:wheel 0755`; no
+/// capability is required.
+pub const AGENT_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-agent";
+/// cosign binary path on macOS. Same location as on Linux.
+pub const COSIGN_BIN_PATH: &str = "/usr/local/libexec/sandboxd/cosign";
+/// Installed launchd system daemon plist.
+pub const LAUNCHD_DAEMON_PLIST_PATH: &str = "/Library/LaunchDaemons/io.sandboxd.daemon.plist";
+/// Installed launchd agent plist (per-user LaunchAgent).
+pub const LAUNCHD_AGENT_PLIST_PATH: &str = "/Library/LaunchAgents/io.sandboxd.agent.plist";
+
 // ---------------------------------------------------------------------------
 // Manifest shape
 // ---------------------------------------------------------------------------
@@ -159,14 +173,20 @@ pub fn backup_set_name(started_at: &str, from_version: &str, to_version: &str) -
 
 /// Create the backup-set directory under the runtime-resolved backups root
 /// (see [`backups_root_path`]). Idempotent — re-running on an existing
-/// directory is a no-op. Mode `0700 sandbox:sandbox`.
+/// directory is a no-op. Mode `0700 <daemon-user>:<daemon-user>`.
 ///
-/// In production this shells out to `sudo -n -u sandbox mkdir -p`; for
+/// In production this shells out to `sudo -n -u <daemon-user> mkdir -p`; for
 /// tests we expose [`create_backup_set_dir_at`] which uses plain
 /// `std::fs` against a test-owned parent dir.
 pub fn create_backup_set_dir(set_name: &str) -> Result<PathBuf, BackupError> {
     let target = backups_root_path().join(set_name);
-    run_sudo(&["-u", "sandbox", "mkdir", "-p", target.to_str().unwrap()])?;
+    run_sudo(&[
+        "-u",
+        crate::update::DAEMON_SYSTEM_USER,
+        "mkdir",
+        "-p",
+        target.to_str().unwrap(),
+    ])?;
     Ok(target)
 }
 
@@ -245,7 +265,7 @@ pub fn backup_sandbox_owned_file(
     let mode_str = format!("{mode:04o}");
     run_sudo(&[
         "-u",
-        "sandbox",
+        crate::update::DAEMON_SYSTEM_USER,
         "install",
         "-m",
         &mode_str,
@@ -290,7 +310,13 @@ pub fn backup_etc_file(src: &Path, dst: &Path, mode: u32) -> Result<CopyOutcome,
     // pipe and the destination is created at the right ownership.
     pipe_sudo_cat_to_sandbox_tee(src, dst)?;
     let mode_str = format!("{mode:04o}");
-    run_sudo(&["-u", "sandbox", "chmod", &mode_str, dst.to_str().unwrap()])?;
+    run_sudo(&[
+        "-u",
+        crate::update::DAEMON_SYSTEM_USER,
+        "chmod",
+        &mode_str,
+        dst.to_str().unwrap(),
+    ])?;
     Ok(CopyOutcome {
         action: CopyAction::Copied,
         sha256: src_sha,
@@ -551,7 +577,13 @@ fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupErro
         .take()
         .ok_or_else(|| BackupError::Io(std::io::Error::other("cat stdout missing")))?;
     let writer = Command::new("sudo")
-        .args(["-n", "-u", "sandbox", "tee", dst.to_str().unwrap()])
+        .args([
+            "-n",
+            "-u",
+            crate::update::DAEMON_SYSTEM_USER,
+            "tee",
+            dst.to_str().unwrap(),
+        ])
         .stdin(Stdio::from(reader_stdout))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -652,7 +684,13 @@ fn remove_dir_all_sudo(path: &Path) -> Result<(), BackupError> {
     if std::fs::remove_dir_all(path).is_ok() {
         return Ok(());
     }
-    run_sudo(&["-u", "sandbox", "rm", "-rf", path.to_str().unwrap()])
+    run_sudo(&[
+        "-u",
+        crate::update::DAEMON_SYSTEM_USER,
+        "rm",
+        "-rf",
+        path.to_str().unwrap(),
+    ])
 }
 
 // ---------------------------------------------------------------------------
