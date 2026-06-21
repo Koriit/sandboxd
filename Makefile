@@ -2,6 +2,7 @@
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
+	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
 	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
@@ -531,7 +532,7 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership stage-route-helper-linux-aarch64 stage-lite-image
+setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment stage-route-helper-linux-aarch64 stage-lite-image
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1617,4 +1618,192 @@ setup-darwin-operator-group-membership:
 	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandboxd  (operator-group membership; takes effect at next login)"; \
 	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandboxd; \
 	  echo "$(GREEN)✓ added '$$USER' to group '_sandboxd' — re-login required for the change to take effect in the current shell$(RESET)"; \
+	fi
+
+# setup-darwin-sandboxd-test-group — create the `_sandboxd-test` system group
+# used by the e2e harness. The daemon socket (mode 0660, group=_sandboxd-test)
+# and the state dir are group-owned by this group; the operator must be a
+# member to connect to the socket without root.
+#
+# GID selection: next free GID ≥ 300, skipping GID 60 (Apple's reserved
+# _sandbox Seatbelt group). Mirrors the _sandboxd group creation in install.sh.
+#
+# Idempotence:
+#   - Group exists → ✓ already configured (no sudo).
+#   - Group missing → emit [sudo] announce lines, then create via dscl.
+setup-darwin-sandboxd-test-group:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-test-group skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@if dscl . -read /Groups/_sandboxd-test >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: system group '_sandboxd-test' exists$(RESET)"; \
+	else \
+	  _gid=$$(dscl . -list /Groups PrimaryGroupID | awk '{print $$2}' | sort -n | awk 'BEGIN{gid=300} {if ($$1==gid){gid++}; if (gid==60){gid++}} END{print gid}'); \
+	  echo "[sudo] dscl . -create /Groups/_sandboxd-test  (GID $$_gid)"; \
+	  sudo -k dscl . -create /Groups/_sandboxd-test; \
+	  sudo -k dscl . -create /Groups/_sandboxd-test PrimaryGroupID "$$_gid"; \
+	  sudo -k dscl . -create /Groups/_sandboxd-test RealName "sandboxd test daemon"; \
+	  echo "$(GREEN)✓ created system group '_sandboxd-test' (GID $$_gid)$(RESET)"; \
+	fi
+
+# setup-darwin-sandboxd-test-user — create the `_sandboxd-test` system user
+# that the e2e harness runs the daemon as (via `sudo -u _sandboxd-test`).
+# Mirrors the _sandboxd user creation in install.sh but for the e2e test uid.
+#
+# UID selection: next free UID ≥ 300 (same ≥ 300 range Apple uses for system
+# accounts). Home directory is /var/lib/sandboxd/<uid> — the daemon's per-uid
+# base dir, created by setup-darwin-sandboxd-test-state-dir.
+#
+# Created via per-attribute dscl (sysadminctl -roleAccount requires UIDs in the
+# 450-499 range, which conflicts with next-free-at-300 selection and is not
+# required for a plain system user).
+#
+# Idempotence:
+#   - User exists → ✓ already configured (no sudo).
+#   - User missing → emit [sudo] announce lines, then create.
+#
+# Ordering: must run after setup-darwin-sandboxd-test-group.
+setup-darwin-sandboxd-test-user: setup-darwin-sandboxd-test-group
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-test-user skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@if dscl . -read /Users/_sandboxd-test >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: system user '_sandboxd-test' exists$(RESET)"; \
+	else \
+	  _uid=$$(dscl . -list /Users UniqueID | awk '{print $$2}' | sort -n | awk 'BEGIN{uid=300} {if ($$1==uid){uid++}} END{print uid}'); \
+	  _gid=$$(dscl . -read /Groups/_sandboxd-test PrimaryGroupID 2>/dev/null | awk '{print $$2}'); \
+	  _home="/var/lib/sandboxd/$$_uid"; \
+	  echo "[sudo] dscl . -create /Users/_sandboxd-test  (UID $$_uid GID $$_gid home $$_home)"; \
+	  sudo -k dscl . -create /Users/_sandboxd-test; \
+	  sudo -k dscl . -create /Users/_sandboxd-test UniqueID "$$_uid"; \
+	  sudo -k dscl . -create /Users/_sandboxd-test PrimaryGroupID "$$_gid"; \
+	  sudo -k dscl . -create /Users/_sandboxd-test NFSHomeDirectory "$$_home"; \
+	  sudo -k dscl . -create /Users/_sandboxd-test UserShell /usr/bin/false; \
+	  sudo -k dscl . -create /Users/_sandboxd-test RealName "sandboxd test daemon"; \
+	  sudo -k dscl . -create /Users/_sandboxd-test Password '*'; \
+	  echo "$(GREEN)✓ created system user '_sandboxd-test' (UID $$_uid GID $$_gid)$(RESET)"; \
+	fi
+
+# setup-darwin-sandboxd-test-state-dir — create the e2e daemon's per-uid base
+# directory /var/lib/sandboxd/<_sandboxd-test-uid> owned by
+# _sandboxd-test:_sandboxd-test mode 0750. This is where the e2e daemon stores
+# sessions.db, per-session state, and the unix socket.
+#
+# Mirrors setup-sandboxd-per-uid-state-dir (Linux) and the per-uid dir created
+# by install.sh for the production _sandboxd user.
+#
+# Idempotence:
+#   - Directory present with correct ownership and mode → ✓ already configured.
+#   - Directory present but wrong ownership/mode → correct in place.
+#   - Directory absent → create it.
+#
+# Ordering: must run after setup-darwin-sandboxd-test-user and
+# setup-darwin-state-dirs (which creates /var/lib/sandboxd itself).
+setup-darwin-sandboxd-test-state-dir: setup-darwin-sandboxd-test-user setup-darwin-state-dirs
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-test-state-dir skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@if ! dscl . -read /Users/_sandboxd-test >/dev/null 2>&1; then \
+	  echo "ERROR: system user '_sandboxd-test' does not exist; run 'make setup-darwin-sandboxd-test-user' first"; \
+	  exit 1; \
+	fi
+	@_test_uid=$$(id -u _sandboxd-test 2>/dev/null); \
+	  per_uid_dir="/var/lib/sandboxd/$$_test_uid"; \
+	  if [ ! -d "$$per_uid_dir" ]; then \
+	    echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$per_uid_dir"; \
+	    sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$per_uid_dir"; \
+	    echo "$(GREEN)✓ created $$per_uid_dir (_sandboxd-test:_sandboxd-test 0750)$(RESET)"; \
+	  else \
+	    owner=$$(stat -f '%Su:%Sg' "$$per_uid_dir" 2>/dev/null || echo "?:?"); \
+	    mode=$$(stat -f '%Lp' "$$per_uid_dir" 2>/dev/null || echo "?"); \
+	    if [ "$$owner" = "_sandboxd-test:_sandboxd-test" ] && [ "$$mode" = "750" ]; then \
+	      echo "$(GREEN)✓ already configured: $$per_uid_dir (_sandboxd-test:_sandboxd-test 0750)$(RESET)"; \
+	    else \
+	      echo "[sudo] chown _sandboxd-test:_sandboxd-test $$per_uid_dir (was: $$owner 0$$mode)"; \
+	      sudo -k chown _sandboxd-test:_sandboxd-test "$$per_uid_dir"; \
+	      echo "[sudo] chmod 0750 $$per_uid_dir"; \
+	      sudo -k chmod 0750 "$$per_uid_dir"; \
+	    fi; \
+	  fi
+
+# setup-darwin-sandboxd-test-operator-group-membership — add the invoking
+# developer ($USER) to the `_sandboxd-test` group so the pytest process can
+# connect to the e2e daemon socket (mode 0660, group=_sandboxd-test).
+#
+# On macOS there is no `sg`; the test-e2e-macos target re-execs pytest under
+# `sudo -n -u $(id -un)` to activate the group in a fresh process without
+# requiring a full re-login.
+#
+# Idempotence: dseditgroup membership check; sudo only when not yet a member.
+#
+# Ordering: must run after setup-darwin-sandboxd-test-group.
+setup-darwin-sandboxd-test-operator-group-membership: setup-darwin-sandboxd-test-group
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-test-operator-group-membership skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	  echo "$(GREEN)✓ already configured: operator-group-add skipped (no non-root $$USER set)$(RESET)"; \
+	elif dseditgroup -o checkmember -m "$$USER" _sandboxd-test >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '_sandboxd-test'$(RESET)"; \
+	else \
+	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandboxd-test  (operator-group membership; takes effect at next login or fresh sudo process)"; \
+	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandboxd-test; \
+	  echo "$(GREEN)✓ added '$$USER' to group '_sandboxd-test' — re-login or re-exec under sudo required for the group to be active in the current shell$(RESET)"; \
+	fi
+
+# setup-darwin-test-sudoers-fragment — install a NOPASSWD sudoers fragment at
+# /etc/sudoers.d/sandboxd-test granting the invoking operator ($USER) blanket
+# passwordless impersonation of the unprivileged `_sandboxd-test` system user.
+# The e2e harness launches the daemon and runs state-reset commands exclusively
+# as `_sandboxd-test` via `sudo -n -u _sandboxd-test`; no root sudo is issued.
+#
+# `_sandboxd-test` is an unprivileged system user (no-login shell, no sudo of
+# its own, no capabilities), so this grant is not a privilege escalation.
+# Appropriate for test/dev hosts only.
+#
+# The env_keep directive propagates test-harness environment variables through
+# sudo's default env_reset so the daemon inherits them without --preserve-env.
+#
+# The fragment is validated via `visudo -c -f` on a tempfile before install so
+# a malformed fragment never reaches /etc/sudoers.d/ (a broken fragment there
+# can disable sudo system-wide).
+#
+# Idempotence: if the canonical path already contains the exact text we would
+# write, print ✓ already configured and invoke no sudo.
+#
+# Mirrors setup-test-sudoers-fragment (Linux) adapted for the macOS daemon test user.
+setup-darwin-test-sudoers-fragment:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-test-sudoers-fragment skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	  echo "$(GREEN)✓ already configured: sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
+	else \
+	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP\""; \
+	  fragment="$$USER ALL=(_sandboxd-test) NOPASSWD: ALL"; \
+	  tmp=$$(mktemp); \
+	  printf '# Managed by `make setup-darwin-test-sudoers-fragment` -- do not edit.\n# Grants the operator passwordless impersonation of the unprivileged\n# `_sandboxd-test` system user for the e2e harness on macOS.\n# Runtime sudo is exclusively `sudo -u _sandboxd-test`\n# (never root). `_sandboxd-test` is an unprivileged system user (nologin,\n# no sudo of its own, no caps); test/dev hosts only.\n#\n# The env_keep directive propagates test-harness variables through\n# sudo (which strips the environment by default).\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
+	  chmod 0440 "$$tmp"; \
+	  if sudo -k visudo -c -f "$$tmp" >/dev/null 2>&1; then \
+	    : ok; \
+	  else \
+	    echo "ERROR: generated sudoers fragment failed visudo validation. Contents:"; \
+	    cat "$$tmp"; \
+	    rm -f "$$tmp"; \
+	    exit 1; \
+	  fi; \
+	  if sudo -k test -f $(TEST_SUDOERS_FRAGMENT_PATH) && sudo -k cmp -s "$$tmp" $(TEST_SUDOERS_FRAGMENT_PATH); then \
+	    echo "$(GREEN)✓ already configured: $(TEST_SUDOERS_FRAGMENT_PATH) matches expected NOPASSWD fragment$(RESET)"; \
+	    rm -f "$$tmp"; \
+	  else \
+	    echo "[sudo] install -o root -g wheel -m 0440 <validated-fragment> $(TEST_SUDOERS_FRAGMENT_PATH)"; \
+	    echo "      contents: $$fragment_envkeep | $$fragment"; \
+	    sudo -k install -o root -g wheel -m 0440 "$$tmp" $(TEST_SUDOERS_FRAGMENT_PATH); \
+	    rm -f "$$tmp"; \
+	  fi; \
 	fi
