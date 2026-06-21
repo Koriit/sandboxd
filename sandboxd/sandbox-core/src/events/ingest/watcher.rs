@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::events::ingest::coredns::parse_coredns_line;
@@ -123,10 +123,15 @@ impl Layer {
 ///
 /// Runs until the surrounding task is aborted. Any recoverable error
 /// (e.g., watcher setup failure, transient read error on a single
-/// tailer) is logged and the loop keeps going; unrecoverable errors
-/// (e.g., cannot construct the inotify watcher at all) log and then
-/// return so the ingestor task exits quietly rather than panicking a
-/// whole daemon.
+/// tailer) is logged and the loop keeps going — watcher setup failure is
+/// recoverable because the 2 s fallback poll still discovers and drains
+/// new files.
+///
+/// The 2 s fallback poll starts immediately without waiting for the
+/// filesystem-notification watcher to finish setting up. On platforms
+/// where watcher initialization has non-trivial latency (e.g., macOS
+/// FSEvents scheduling its CFRunLoop thread), this ensures the poll
+/// path fires on schedule regardless of initialization time.
 pub async fn run_watcher(
     session_id: SessionId,
     events_dir: PathBuf,
@@ -136,46 +141,35 @@ pub async fn run_watcher(
     // Trampoline: notify's sync handler → tokio-owned channel. Every
     // filesystem notification lands here as `notify::Result<Event>`.
     let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
-    let events_dir_for_watcher = events_dir.clone();
-    let watcher = tokio::task::spawn_blocking(move || -> notify::Result<RecommendedWatcher> {
-        let mut w = notify::recommended_watcher(move |res| {
-            // Send failure means the receiver has been dropped
-            // (ingestor aborted); ignore and let this closure die
-            // when the watcher is dropped.
-            let _ = tx.send(res);
-        })?;
-        w.watch(&events_dir_for_watcher, RecursiveMode::NonRecursive)?;
-        Ok(w)
-    })
-    .await;
 
-    // `_watcher` must stay alive for the duration of the loop — the
-    // inotify backend registers watches only while this handle lives.
-    let _watcher = match watcher {
-        Ok(Ok(w)) => w,
-        Ok(Err(e)) => {
-            warn!(
-                session_id = %session_id,
-                events_dir = %events_dir.display(),
-                error = %e,
-                "ingest: failed to construct inotify watcher; ingestor exiting"
-            );
-            return;
-        }
-        Err(join_err) => {
-            warn!(
-                session_id = %session_id,
-                error = %join_err,
-                "ingest: spawn_blocking for notify watcher panicked; ingestor exiting"
-            );
-            return;
-        }
-    };
+    // Watcher setup is kicked off concurrently — the result arrives on
+    // `watcher_rx` when ready. The select loop starts immediately so
+    // the 2 s fallback poll fires on schedule even before the watcher
+    // finishes initializing (relevant on macOS where FSEvents schedules
+    // a CFRunLoop thread before the first event can be delivered).
+    let (watcher_tx, mut watcher_rx) =
+        oneshot::channel::<Result<RecommendedWatcher, notify::Error>>();
+    let events_dir_for_watcher = events_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = (|| -> notify::Result<RecommendedWatcher> {
+            let mut w = notify::recommended_watcher(move |res| {
+                // Send failure means the receiver has been dropped
+                // (ingestor aborted); ignore and let this closure die
+                // when the watcher is dropped.
+                let _ = tx.send(res);
+            })?;
+            w.watch(&events_dir_for_watcher, RecursiveMode::NonRecursive)?;
+            Ok(w)
+        })();
+        // Ignore send error: the ingestor task may have been aborted
+        // before the watcher finished setting up.
+        let _ = watcher_tx.send(result);
+    });
 
     info!(
         session_id = %session_id,
         events_dir = %events_dir.display(),
-        "ingest: watcher started"
+        "ingest: watcher starting (poll running immediately)"
     );
 
     let mut tailers: HashMap<Layer, JsonlTailer> = HashMap::new();
@@ -221,8 +215,42 @@ pub async fn run_watcher(
     // first tick.
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // `_watcher` is set once the background setup task delivers its
+    // result. Kept alive here so the notify backend continues to
+    // register watches for the duration of the loop.
+    let mut _watcher: Option<RecommendedWatcher> = None;
+
     loop {
         tokio::select! {
+            // Receive the watcher setup result when it's ready.
+            watcher_result = &mut watcher_rx, if _watcher.is_none() => {
+                match watcher_result {
+                    Ok(Ok(w)) => {
+                        info!(
+                            session_id = %session_id,
+                            events_dir = %events_dir.display(),
+                            "ingest: filesystem watcher ready"
+                        );
+                        _watcher = Some(w);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            session_id = %session_id,
+                            events_dir = %events_dir.display(),
+                            error = %e,
+                            "ingest: filesystem watcher failed to start; continuing with poll-only mode"
+                        );
+                        // Leave `_watcher` as None; the 2 s fallback poll
+                        // remains the sole delivery mechanism.
+                    }
+                    Err(_) => {
+                        // spawn_blocking task was dropped before sending
+                        // (ingestor aborted during setup). The loop will
+                        // be aborted too, so this arm is effectively
+                        // unreachable in practice.
+                    }
+                }
+            }
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(Ok(ev)) => {

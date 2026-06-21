@@ -490,27 +490,52 @@ pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<StagedTarball,
 /// Read the MANIFEST out of a tarball without extracting it. Used by
 /// the pre-flight to surface arch / version mismatches against the
 /// installed state **before** the stateful phase touches anything on
-/// disk. Mirrors install.sh's `tar -O -xf "$FROM" --wildcards
-/// '*/MANIFEST'` pattern.
+/// disk.
+///
+/// Locates the MANIFEST entry by listing the archive first (`tar -tzf`)
+/// then extracting it by its exact path (`tar -O -xzf <path>`). This
+/// avoids `--wildcards`, which is a GNU tar extension not available on
+/// BSD tar (macOS).
 pub fn peek_manifest_in_tarball(tarball: &Path) -> Result<Manifest, ManifestError> {
-    let out = Command::new("tar")
-        .args([
-            "-O",
-            "-xzf",
-            tarball.to_str().unwrap(),
-            "--wildcards",
-            "*/MANIFEST",
-        ])
-        .output()?;
-    if !out.status.success() {
+    let tarball_str = tarball.to_str().unwrap();
+
+    // Step 1: list all entries and find the MANIFEST path.
+    let list_out = Command::new("tar").args(["-tzf", tarball_str]).output()?;
+    if !list_out.status.success() {
         return Err(ManifestError::Io(std::io::Error::other(format!(
-            "tar -O -xzf {} '*/MANIFEST' failed (exit {:?}): {}",
+            "tar -tzf {} failed (exit {:?}): {}",
             tarball.display(),
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            list_out.status.code(),
+            String::from_utf8_lossy(&list_out.stderr).trim()
         ))));
     }
-    serde_json::from_slice(&out.stdout).map_err(ManifestError::Parse)
+
+    let manifest_entry = String::from_utf8_lossy(&list_out.stdout)
+        .lines()
+        .find(|l| l.ends_with("/MANIFEST"))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ManifestError::Io(std::io::Error::other(format!(
+                "{}: tarball contains no MANIFEST entry",
+                tarball.display()
+            )))
+        })?;
+
+    // Step 2: extract the MANIFEST entry by its exact path (no wildcards).
+    let extract_out = Command::new("tar")
+        .args(["-O", "-xzf", tarball_str, &manifest_entry])
+        .output()?;
+    if !extract_out.status.success() {
+        return Err(ManifestError::Io(std::io::Error::other(format!(
+            "tar -O -xzf {} '{}' failed (exit {:?}): {}",
+            tarball.display(),
+            manifest_entry,
+            extract_out.status.code(),
+            String::from_utf8_lossy(&extract_out.stderr).trim()
+        ))));
+    }
+
+    serde_json::from_slice(&extract_out.stdout).map_err(ManifestError::Parse)
 }
 
 // ---------------------------------------------------------------------------
