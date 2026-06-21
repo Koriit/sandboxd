@@ -31,9 +31,17 @@ INSTALL_LOG="${SANDBOXD_INSTALL_LOG:-/var/log/sandbox-install.log}"
 # Computed by resolve_state_path() after argument parsing.
 STATE_PATH=""
 SCRIPT_NAME="uninstall.sh"
-SOCK_PATH="/run/sandbox/sandboxd.sock"
+# SOCK_PATH is set per-OS in main() after detect_os().
+# Linux: /run/sandbox/sandboxd.sock
+# Darwin: /var/run/sandbox/sandboxd.sock
+SOCK_PATH=""
 # SANDBOX_UID is resolved before any userdel so the uid is still known.
 SANDBOX_UID=""
+# OS is set by detect_os(): linux or darwin.
+OS=""
+# OPERATOR_NAME: the effective human operator (non-root user invoking the script).
+# Used for Darwin agent-bootout (gui/<uid>/io.sandboxd.agent).
+OPERATOR_NAME=""
 
 PURGE=0
 FORCE=0
@@ -74,11 +82,13 @@ Usage: uninstall.sh [OPTIONS]
 Uninstall sandboxd, reversing the changes recorded by install.sh.
 
 Options:
-  --purge       Also delete the sandbox daemon's per-uid state directory
+  --purge, --purge-state
+                Also delete the sandbox daemon's per-uid state directory
                 (/var/lib/sandboxd/<sandbox-uid>/), the sandbox user,
                 operator group memberships, the gateway docker image, and
-                /etc/systemd/system/sandboxd.service.d/.
-                Prompts unless --yes.
+                /etc/systemd/system/sandboxd.service.d/ (Linux) or
+                /var/log/sandbox/ + _sandboxd user/group (macOS).
+                Prompts unless --yes. (--purge-state is an alias for --purge.)
   --force       Proceed even if sandboxd is running (default: refuse).
                 A per-session active-session probe lands with
                 'sandbox update' in a future release; for now the check
@@ -213,6 +223,47 @@ purge-group
 purge-image
 purge-service-drop-in"
 
+# Darwin remove phases: base set always present; purge phases appended when PURGE=1.
+# Darwin base: bootout-daemon, remove-launchd-plists, remove-binaries-agent
+# Darwin purge: purge-state, purge-user-group
+UI_REMOVE_PHASES_DARWIN_BASE="bootout-daemon
+remove-launchd-plists
+remove-binaries-agent"
+
+UI_REMOVE_PHASES_DARWIN_PURGE="purge-state
+purge-user-group"
+
+# ----------------------------------------------------------------------------
+# OS detection.
+# ----------------------------------------------------------------------------
+
+detect_os() {
+    case "$(uname -s)" in
+        Linux)  OS="linux" ;;
+        Darwin) OS="darwin" ;;
+        *)      die "sandboxd is not supported on this operating system (got: $(uname -s))" ;;
+    esac
+    log_ok "step=os_detect os=$OS"
+}
+
+# ----------------------------------------------------------------------------
+# Operator detection (Darwin only).
+#
+# Identifies the human operator running the script (the non-root effective
+# user). Used for agent-bootout (gui/<uid>/io.sandboxd.agent) on macOS.
+# ----------------------------------------------------------------------------
+
+detect_operator() {
+    OPERATOR_NAME=$(id -un 2>/dev/null || true)
+    if [ -z "$OPERATOR_NAME" ] || [ "$OPERATOR_NAME" = "root" ]; then
+        OPERATOR_NAME="${SUDO_USER:-}"
+        if [ "$OPERATOR_NAME" = "root" ]; then
+            OPERATOR_NAME=""
+        fi
+    fi
+    log_ok "step=detect_operator operator=${OPERATOR_NAME:-(root/none)}"
+}
+
 # ----------------------------------------------------------------------------
 # Resolve the install-state path.
 #
@@ -228,6 +279,31 @@ purge-service-drop-in"
 # ----------------------------------------------------------------------------
 
 resolve_state_path() {
+    if [ "$OS" = "darwin" ]; then
+        _resolve_state_path_darwin
+    else
+        _resolve_state_path_linux
+    fi
+}
+
+_resolve_state_path_darwin() {
+    if dscl . -read /Users/_sandboxd >/dev/null 2>&1; then
+        SANDBOX_UID=$(id -u _sandboxd 2>/dev/null || true)
+        if [ -n "$SANDBOX_UID" ]; then
+            per_uid_path="/var/lib/sandboxd/$SANDBOX_UID/.install-state.json"
+            if [ -r "$per_uid_path" ]; then
+                STATE_PATH="$per_uid_path"
+                log_ok "step=resolve_state_path path=$STATE_PATH reason=per-uid os=darwin"
+                return 0
+            fi
+        fi
+    fi
+    # No state file found — best-effort mode.
+    STATE_PATH=""
+    log_warn "step=resolve_state_path reason=not-found fallback=best-effort os=darwin"
+}
+
+_resolve_state_path_linux() {
     if getent passwd sandbox >/dev/null 2>&1; then
         SANDBOX_UID=$(id -u sandbox)
         per_uid_path="/var/lib/sandboxd/$SANDBOX_UID/.install-state.json"
@@ -257,7 +333,7 @@ resolve_state_path() {
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            --purge)    PURGE=1; shift ;;
+            --purge|--purge-state) PURGE=1; shift ;;
             --force)    FORCE=1; shift ;;
             --yes)      YES=1;   shift ;;
             --verbose)  VERBOSE=1; shift ;;
@@ -315,11 +391,19 @@ check_daemon_running() {
     fi
     if [ "$FORCE" -eq 0 ]; then
         log_fail "step=daemon_check running=1 force=0 action=refuse"
-        _emit_daemon_refuse() {
-            printf '%b\n' "${RED}x${RESET} sandboxd is running; stop it first:"
-            printf '%s\n'  "    sudo systemctl stop sandboxd"
-            printf '%s\n'  "Or pass --force to proceed anyway."
-        }
+        if [ "$OS" = "darwin" ]; then
+            _emit_daemon_refuse() {
+                printf '%b\n' "${RED}x${RESET} sandboxd is running; stop it first:"
+                printf '%s\n'  "    sudo launchctl bootout system/io.sandboxd.daemon"
+                printf '%s\n'  "Or pass --force to proceed anyway."
+            }
+        else
+            _emit_daemon_refuse() {
+                printf '%b\n' "${RED}x${RESET} sandboxd is running; stop it first:"
+                printf '%s\n'  "    sudo systemctl stop sandboxd"
+                printf '%s\n'  "Or pass --force to proceed anyway."
+            }
+        fi
         if [ "$RICH_UI" -eq 1 ] && [ -n "$SUMMARY_FILE" ]; then
             _emit_daemon_refuse > "$SUMMARY_FILE"
         else
@@ -377,6 +461,86 @@ $1"
 }
 
 compute_plan() {
+    if [ "$OS" = "darwin" ]; then
+        _compute_plan_darwin
+    else
+        _compute_plan_linux
+    fi
+}
+
+_compute_plan_darwin() {
+    _UNINSTALL_PLAN_LINES=""
+
+    _plan_append "The following changes will be made (as root):"
+    _plan_append ""
+
+    # Daemon LaunchDaemon
+    _d_plist=/Library/LaunchDaemons/io.sandboxd.daemon.plist
+    if [ -f "$_d_plist" ]; then
+        _plan_append "  bootout + remove         io.sandboxd.daemon"
+    else
+        _plan_append "  skip (absent)            io.sandboxd.daemon plist"
+    fi
+
+    # vmnet pool plists
+    _vmnet_present=0
+    _i=0
+    while [ "$_i" -lt 8 ]; do
+        _vp="/Library/LaunchDaemons/io.sandboxd.vmnet.${_i}.plist"
+        if [ -f "$_vp" ]; then
+            _vmnet_present=$((_vmnet_present + 1))
+        fi
+        _i=$((_i + 1))
+    done
+    if [ "$_vmnet_present" -gt 0 ]; then
+        _plan_append "  bootout + remove         io.sandboxd.vmnet.{0..} (${_vmnet_present} plists)"
+    else
+        _plan_append "  skip (absent)            io.sandboxd.vmnet.* plists"
+    fi
+
+    # Agent LaunchAgent
+    _a_plist=/Library/LaunchAgents/io.sandboxd.agent.plist
+    if [ -f "$_a_plist" ]; then
+        _plan_append "  bootout (gui domain) + remove  io.sandboxd.agent"
+    else
+        _plan_append "  skip (absent)            io.sandboxd.agent plist"
+    fi
+
+    # Binaries + /Library/sandboxd
+    _plan_append "  remove (if present)      /usr/local/bin/sandbox"
+    _plan_append "  remove (if present)      /usr/local/libexec/sandboxd/ (binaries)"
+    _plan_append "  remove (if present)      /Library/sandboxd/ (staged socket_vmnet)"
+
+    if [ "$PURGE" -eq 1 ]; then
+        _plan_append ""
+        _plan_append "  --purge was requested — the following will also be removed:"
+        if [ -n "$SANDBOX_UID" ]; then
+            _plan_append "  purge                    /var/lib/sandboxd/$SANDBOX_UID/"
+        fi
+        _plan_append "  purge                    /var/log/sandbox/"
+        _plan_append "  purge                    /var/run/sandbox/ (if present)"
+        _plan_append "  dseditgroup -o delete    _sandboxd group (members stripped first)"
+        _plan_append "  dscl . -delete           /Users/_sandboxd"
+        _plan_append ""
+        _plan_append "  WARNING: --purge is irreversible. All session data will be lost."
+    else
+        _plan_append ""
+        _plan_append "  The following will be KEPT (pass --purge to remove them):"
+        if [ -n "$SANDBOX_UID" ]; then
+            _plan_append "  keep  /var/lib/sandboxd/$SANDBOX_UID/  (state, sessions DB, LIMA_HOME)"
+            _plan_append "        (remove with: sudo rm -rf /var/lib/sandboxd/$SANDBOX_UID/)"
+        fi
+        _plan_append "  keep  /var/log/sandbox/"
+        _plan_append "        (remove with: sudo rm -rf /var/log/sandbox)"
+        _plan_append "  keep  _sandboxd system group and user"
+        _plan_append "        (remove with: sudo dseditgroup -o delete _sandboxd && sudo dscl . -delete /Users/_sandboxd)"
+    fi
+
+    _plan_append ""
+    _plan_append "Uninstall log: $INSTALL_LOG"
+}
+
+_compute_plan_linux() {
     _UNINSTALL_PLAN_LINES=""
 
     _plan_append "The following changes will be made (as root):"
@@ -578,18 +742,30 @@ write_priv_script() {
     # the privileged child receives it even though sudo strips the env.
     _fail_after_esc=$(_sq "${SANDBOX_UNINSTALL_PRIV_CHILD_FAIL_AFTER:-}")
 
-    # Compute total steps: base 6, plus 5 purge steps if --purge.
-    _total_steps=6
-    if [ "$PURGE" -eq 1 ]; then
-        _total_steps=$((_total_steps + 5))
-    fi
-
-    # Assemble the remove-phase list for the rich checklist re-init.
-    if [ "$PURGE" -eq 1 ]; then
-        UI_REMOVE_PHASES="$UI_REMOVE_PHASES_BASE
-$UI_REMOVE_PHASES_PURGE"
+    # Compute total steps and phase list per OS.
+    if [ "$OS" = "darwin" ]; then
+        # Darwin: 3 base steps (bootout-daemon, remove-launchd-plists,
+        # remove-binaries-agent), plus 2 purge steps (purge-state, purge-user-group).
+        _total_steps=3
+        if [ "$PURGE" -eq 1 ]; then
+            _total_steps=$((_total_steps + 2))
+            UI_REMOVE_PHASES="$UI_REMOVE_PHASES_DARWIN_BASE
+$UI_REMOVE_PHASES_DARWIN_PURGE"
+        else
+            UI_REMOVE_PHASES="$UI_REMOVE_PHASES_DARWIN_BASE"
+        fi
     else
-        UI_REMOVE_PHASES="$UI_REMOVE_PHASES_BASE"
+        # Linux: base 6, plus 5 purge steps if --purge.
+        _total_steps=6
+        if [ "$PURGE" -eq 1 ]; then
+            _total_steps=$((_total_steps + 5))
+        fi
+        if [ "$PURGE" -eq 1 ]; then
+            UI_REMOVE_PHASES="$UI_REMOVE_PHASES_BASE
+$UI_REMOVE_PHASES_PURGE"
+        else
+            UI_REMOVE_PHASES="$UI_REMOVE_PHASES_BASE"
+        fi
     fi
 
     # In rich mode, re-initialise phases for the Remove screen before child runs.
@@ -693,10 +869,240 @@ OPS_ADDED='$_ops_added_esc'
 INSTALLED_VERSION='$(_sq "$INSTALLED_VERSION")'
 SANDBOX_UID='$(_sq "$SANDBOX_UID")'
 PURGE='$(_sq "$PURGE")'
+OPERATOR_NAME='$(_sq "$OPERATOR_NAME")'
 
 # Determine home-dir for users.conf backup (resolved in parent, passed in).
 _HOME_DIR='$(_sq "${HOME:-}")'
 _SUDO_USER='$(_sq "${SUDO_USER:-}")'
+
+PRIV_SCRIPT_EOF
+
+    if [ "$OS" = "darwin" ]; then
+        cat >> "$PRIV_SCRIPT" <<DARWIN_STEPS_EOF
+
+# ----- Step 1: bootout-daemon -----
+_step_begin "bootout-daemon"
+_daemon_plist="/Library/LaunchDaemons/io.sandboxd.daemon.plist"
+if launchctl print system/io.sandboxd.daemon >/dev/null 2>&1; then
+    launchctl bootout system/io.sandboxd.daemon >> "\$_LOG" 2>&1 || true
+    _log "step=bootout_daemon action=bootout"
+else
+    _log "step=bootout_daemon action=skip reason=not-loaded"
+fi
+if [ -f "\$_daemon_plist" ]; then
+    rm -f "\$_daemon_plist"
+    _log "step=bootout_daemon path=\$_daemon_plist action=rm"
+else
+    _log "step=bootout_daemon path=\$_daemon_plist action=skip reason=absent"
+fi
+_step_ok
+_priv_maybe_fail_after "\$_label"
+
+# ----- Step 2: remove-launchd-plists -----
+# Bootout and remove the vmnet pool daemons (N slots, default 8).
+_step_begin "remove-launchd-plists"
+_vmnet_slots="\${DARWIN_VMNET_SLOTS:-8}"
+_i=0
+while [ "\$_i" -lt "\$_vmnet_slots" ]; do
+    _slot=\$_i
+    _label_vmnet="io.sandboxd.vmnet.\$_slot"
+    _plist_vmnet="/Library/LaunchDaemons/\${_label_vmnet}.plist"
+    if launchctl print "system/\$_label_vmnet" >/dev/null 2>&1; then
+        launchctl bootout "system/\$_label_vmnet" >> "\$_LOG" 2>&1 || true
+        _log "step=bootout_vmnet slot=\$_slot action=bootout"
+    else
+        _log "step=bootout_vmnet slot=\$_slot action=skip reason=not-loaded"
+    fi
+    if [ -f "\$_plist_vmnet" ]; then
+        rm -f "\$_plist_vmnet"
+        _log "step=remove_vmnet_plist slot=\$_slot path=\$_plist_vmnet action=rm"
+    else
+        _log "step=remove_vmnet_plist slot=\$_slot path=\$_plist_vmnet action=skip reason=absent"
+    fi
+    _i=\$((_i + 1))
+done
+_step_ok
+_priv_maybe_fail_after "\$_label"
+
+# ----- Step 3: remove-binaries-agent -----
+# Best-effort bootout of any currently-loaded operator agent LaunchAgents
+# before removing the plist. The agent is Aqua-scoped (gui domain), loaded
+# per logged-in operator. We enumerate _sandboxd group members (who are the
+# authorized operators) and derive their uids for the gui/<uid> domain target.
+_step_begin "remove-binaries-agent"
+
+# Agent bootout: enumerate _sandboxd group members, resolve each uid, bootout.
+_grp_members=\$(dscl . -read /Groups/_sandboxd GroupMembership 2>/dev/null \
+    | sed 's/GroupMembership: //' | tr ' ' '\n' | awk 'NF' || true)
+# Also add the invoking operator (OPERATOR_NAME) in case they are not in the
+# group yet (e.g. partial install state).
+if [ -n "\$OPERATOR_NAME" ]; then
+    _grp_members=\$(printf '%s\n%s\n' "\$_grp_members" "\$OPERATOR_NAME" | awk 'NF' | sort -u)
+fi
+printf '%s\n' "\$_grp_members" | while IFS= read -r _op; do
+    [ -n "\$_op" ] || continue
+    _op_uid=\$(id -u "\$_op" 2>/dev/null || true)
+    [ -n "\$_op_uid" ] || continue
+    if launchctl print "gui/\$_op_uid/io.sandboxd.agent" >/dev/null 2>&1; then
+        launchctl bootout "gui/\$_op_uid/io.sandboxd.agent" >> "\$_LOG" 2>&1 || true
+        _log "step=bootout_agent operator=\$_op uid=\$_op_uid action=bootout"
+    else
+        _log "step=bootout_agent operator=\$_op uid=\$_op_uid action=skip reason=not-loaded"
+    fi
+done
+_agent_plist="/Library/LaunchAgents/io.sandboxd.agent.plist"
+if [ -f "\$_agent_plist" ]; then
+    rm -f "\$_agent_plist"
+    _log "step=remove_agent_plist path=\$_agent_plist action=rm"
+else
+    _log "step=remove_agent_plist path=\$_agent_plist action=skip reason=absent"
+fi
+
+# Remove binaries.
+for _bin in /usr/local/libexec/sandboxd/sandboxd \
+            /usr/local/libexec/sandboxd/sandbox-agent \
+            /usr/local/libexec/sandboxd/sandbox-guest \
+            /usr/local/libexec/sandboxd/cosign \
+            /usr/local/bin/sandbox \
+            /usr/local/bin/git-remote-sandbox
+do
+    if [ -f "\$_bin" ] || [ -L "\$_bin" ]; then
+        rm -f "\$_bin"
+        _log "step=remove_binary path=\$_bin action=rm"
+    else
+        _log "step=remove_binary path=\$_bin action=skip reason=absent"
+    fi
+done
+if [ -d /usr/local/libexec/sandboxd ]; then
+    if [ -z "\$(ls -A /usr/local/libexec/sandboxd 2>/dev/null)" ]; then
+        rmdir /usr/local/libexec/sandboxd 2>/dev/null || true
+        _log "step=remove_libexec_dir action=rmdir"
+    else
+        _log "step=remove_libexec_dir action=skip reason=not-empty"
+    fi
+fi
+
+# Remove /Library/sandboxd (staged socket_vmnet).
+if [ -d /Library/sandboxd ]; then
+    rm -rf /Library/sandboxd
+    _log "step=remove_library_sandboxd action=rm"
+else
+    _log "step=remove_library_sandboxd action=skip reason=absent"
+fi
+
+_step_ok
+_priv_maybe_fail_after "\$_label"
+DARWIN_STEPS_EOF
+
+        if [ "$PURGE" -eq 1 ]; then
+            cat >> "$PRIV_SCRIPT" <<DARWIN_PURGE_EOF
+
+# ----- Step 4: purge-state -----
+_step_begin "purge-state"
+if [ -n "\$SANDBOX_UID" ]; then
+    _per_uid_dir="/var/lib/sandboxd/\$SANDBOX_UID"
+    if [ -d "\$_per_uid_dir" ]; then
+        rm -rf "\$_per_uid_dir"
+        _log "step=purge_state path=\$_per_uid_dir action=rm"
+    else
+        _log "step=purge_state path=\$_per_uid_dir action=skip reason=absent"
+    fi
+else
+    _log "step=purge_state action=skip reason=no-uid"
+fi
+if [ -d /var/lib/sandboxd ]; then
+    if rmdir /var/lib/sandboxd 2>/dev/null; then
+        _log "step=purge_sandboxd_root action=rmdir"
+    else
+        _log "step=purge_sandboxd_root action=skip reason=not-empty"
+    fi
+fi
+if [ -d /var/log/sandbox ]; then
+    rm -rf /var/log/sandbox
+    _log "step=purge_log_dir path=/var/log/sandbox action=rm"
+else
+    _log "step=purge_log_dir path=/var/log/sandbox action=skip reason=absent"
+fi
+if [ -d /var/run/sandbox ]; then
+    rm -rf /var/run/sandbox
+    _log "step=purge_run_dir path=/var/run/sandbox action=rm"
+else
+    _log "step=purge_run_dir path=/var/run/sandbox action=skip reason=absent"
+fi
+_step_ok
+_priv_maybe_fail_after "\$_label"
+
+# ----- Step 5: purge-user-group -----
+# Order matters: strip group members before deleting the group (prevents
+# dangling gid references), then delete group, then user.
+_step_begin "purge-user-group"
+
+# Derive current _sandboxd group members from Directory Services, merged
+# with the recorded OPS_ADDED list (mirrors the Linux purge-group merge).
+_live_members=\$(dscl . -read /Groups/_sandboxd GroupMembership 2>/dev/null \
+    | sed 's/GroupMembership: //' | tr ' ' '\n' | awk 'NF' || true)
+_all_ops=\$(
+    { printf '%s\n' "\$OPS_ADDED"; printf '%s\n' "\$_live_members"; } \
+    | awk 'NF' | sort -u
+)
+if [ -n "\$_all_ops" ]; then
+    printf '%s\n' "\$_all_ops" | while IFS= read -r _op; do
+        [ -n "\$_op" ] || continue
+        dseditgroup -o edit -d "\$_op" -t user _sandboxd >> "\$_LOG" 2>&1 && _de_rc=0 || _de_rc=\$?
+        if [ "\$_de_rc" -eq 0 ]; then
+            _log "step=group_revoke operator=\$_op action=remove"
+        else
+            _log "step=group_revoke operator=\$_op action=skip rc=\$_de_rc"
+        fi
+    done
+fi
+
+if dscl . -read /Groups/_sandboxd >/dev/null 2>&1; then
+    dseditgroup -o delete _sandboxd >> "\$_LOG" 2>&1 && _gd_rc=0 || _gd_rc=\$?
+    if [ "\$_gd_rc" -eq 0 ]; then
+        _log "step=dseditgroup_delete action=remove"
+    else
+        _log "step=dseditgroup_delete action=fail rc=\$_gd_rc"
+        _step_fail
+    fi
+else
+    _log "step=dseditgroup_delete action=skip reason=absent"
+fi
+
+if dscl . -read /Users/_sandboxd >/dev/null 2>&1; then
+    # Guard: confirm this is the genuine sandboxd role account before deleting.
+    _gecos=\$(dscl . -read /Users/_sandboxd RealName 2>/dev/null \
+        | sed 's/RealName: //' || true)
+    _actual_uid=\$(id -u _sandboxd 2>/dev/null || true)
+    _uid_ok=1
+    if [ -n "\$SANDBOX_UID" ] && [ -n "\$_actual_uid" ] \
+       && [ "\$_actual_uid" != "\$SANDBOX_UID" ]; then
+        _uid_ok=0
+    fi
+    if [ "\$WE_CREATED_SANDBOX_USER" = "true" ] \
+       || { [ "\$_gecos" = "sandboxd daemon" ] && [ "\$_uid_ok" -eq 1 ]; }; then
+        dscl . -delete /Users/_sandboxd >> "\$_LOG" 2>&1 && _du_rc=0 || _du_rc=\$?
+        if [ "\$_du_rc" -eq 0 ]; then
+            _log "step=dscl_delete_user action=remove"
+        else
+            _log "step=dscl_delete_user action=fail rc=\$_du_rc"
+            _step_fail
+        fi
+    else
+        _log "step=dscl_delete_user action=skip reason=alien-account gecos_len=\${#_gecos} uid_ok=\${_uid_ok}"
+    fi
+else
+    _log "step=dscl_delete_user action=skip reason=absent"
+fi
+
+_step_ok
+_priv_maybe_fail_after "\$_label"
+DARWIN_PURGE_EOF
+        fi
+
+    else
+        # Linux steps.
+        cat >> "$PRIV_SCRIPT" <<LINUX_STEPS_EOF
 
 # ----- Step 1: stop-disable-unit -----
 _step_begin "stop-disable-unit"
@@ -850,11 +1256,10 @@ if [ -d /usr/local/libexec/sandboxd ]; then
 fi
 _step_ok
 _priv_maybe_fail_after "\$_label"
+LINUX_STEPS_EOF
 
-PRIV_SCRIPT_EOF
-
-    if [ "$PURGE" -eq 1 ]; then
-        cat >> "$PRIV_SCRIPT" <<PURGE_EOF
+        if [ "$PURGE" -eq 1 ]; then
+            cat >> "$PRIV_SCRIPT" <<PURGE_EOF
 
 # ----- Step 7: purge-state -----
 _step_begin "purge-state"
@@ -1024,6 +1429,7 @@ fi
 _step_ok
 _priv_maybe_fail_after "\$_label"
 PURGE_EOF
+        fi
     fi
 
     # Append the DONE sentinel.
@@ -1306,6 +1712,48 @@ _print_failure_report() {
 # ----------------------------------------------------------------------------
 
 print_next_steps() {
+    if [ "$OS" = "darwin" ]; then
+        _print_next_steps_darwin
+    else
+        _print_next_steps_linux
+    fi
+}
+
+_print_next_steps_darwin() {
+    emit ""
+    emit "${GREEN}+${RESET} sandboxd uninstalled."
+
+    if [ -n "$REMOVED_ITEMS" ]; then
+        emit ""
+        emit "Removed:"
+        printf '%s\n' "$REMOVED_ITEMS" | while IFS= read -r item; do
+            [ -n "$item" ] || continue
+            emit "  - $item"
+        done
+    fi
+
+    if [ "$PURGE" -eq 0 ]; then
+        emit ""
+        emit "${YELLOW}Kept (pass --purge to remove):${RESET}"
+        if [ -n "$SANDBOX_UID" ]; then
+            emit "  - /var/lib/sandboxd/$SANDBOX_UID/  (state, sessions DB, LIMA_HOME)"
+            emit "    remove: sudo rm -rf /var/lib/sandboxd/$SANDBOX_UID/"
+        else
+            emit "  - /var/lib/sandboxd/  (state directory — uid not resolved)"
+            emit "    remove: sudo rm -rf /var/lib/sandboxd/"
+        fi
+        emit "  - /var/log/sandbox/  (daemon and agent logs)"
+        emit "    remove: sudo rm -rf /var/log/sandbox"
+        emit "  - '_sandboxd' system group and user"
+        emit "    remove: sudo dseditgroup -o delete _sandboxd && sudo dscl . -delete /Users/_sandboxd"
+    fi
+
+    emit ""
+    emit "Uninstall log: $INSTALL_LOG"
+    log_ok "step=done"
+}
+
+_print_next_steps_linux() {
     emit ""
     emit "${GREEN}+${RESET} sandboxd uninstalled."
 
@@ -1356,6 +1804,17 @@ print_next_steps() {
 
 main() {
     parse_args "$@"
+    detect_os
+
+    # Set the platform-appropriate daemon socket path.
+    if [ "$OS" = "darwin" ]; then
+        SOCK_PATH="/var/run/sandbox/sandboxd.sock"
+        # Detect operator for Darwin agent bootout (gui/<uid>/io.sandboxd.agent).
+        detect_operator
+    else
+        SOCK_PATH="/run/sandbox/sandboxd.sock"
+    fi
+
     detect_tty
 
     TMPDIR_UNINSTALL=$(mktemp -d "/var/tmp/sandbox-uninstall.XXXXXX")
