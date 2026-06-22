@@ -13,7 +13,8 @@
 //!
 //! ## Ownership / mode contract
 //!
-//! All artefacts in the set are owned `sandbox:sandbox`. Binaries land
+//! All artefacts in the set are owned by the daemon system user
+//! (`_sandboxd` on macOS, `sandbox` on Linux). Binaries land
 //! at mode `0640` — **not executable** — so a wandering operator
 //! cannot accidentally invoke the old binary from PATH (the rollback
 //! recipe `install -m 0755`s them back in place). The `sessions.db`
@@ -30,15 +31,16 @@
 //!
 //! ## Sudo elevation
 //!
-//! All file operations that need to land at `sandbox:sandbox` ownership
-//! shell out via `sudo -n -u sandbox install ...` (matching install.sh
-//! conventions). `/etc` files require a two-step `sudo -n cat |
-//! sudo -n -u sandbox tee` because the destination directory is owned by
-//! `sandbox:sandbox` but the source is `root:root`-only readable; the
-//! intermediate "read as root, write as sandbox" pipeline keeps both
-//! ends honest. `-n` (non-interactive) relies on the upfront `sudo -v`
-//! credential warm done at the start of `sandbox update` — it never
-//! busts the cache mid-run.
+//! All file operations that need to land at daemon-user ownership shell
+//! out via `sudo -n -u <daemon-user> install ...` (matching install.sh
+//! conventions; daemon user is `_sandboxd` on macOS and `sandbox` on
+//! Linux). `/etc` files require a two-step `sudo -n cat |
+//! sudo -n -u <daemon-user> tee` because the destination directory is
+//! owned by the daemon user but the source is `root:root`-only readable;
+//! the intermediate "read as root, write as daemon-user" pipeline keeps
+//! both ends honest. `-n` (non-interactive) relies on the upfront
+//! `sudo -v` credential warm done at the start of `sandbox update` — it
+//! never busts the cache mid-run.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -227,14 +229,14 @@ pub enum CopyAction {
     SourceAbsent,
 }
 
-/// Copy `src` to `dst` as `sandbox:sandbox` at `mode`, with sha256
-/// idempotency.
+/// Copy `src` to `dst` owned by the daemon system user at `mode`, with
+/// sha256 idempotency.
 ///
 /// Behaviour:
 /// * Source missing → returns `CopyAction::SourceAbsent` (no file
 ///   mutation).
 /// * Destination exists with identical bytes → `CopyAction::Skipped`.
-/// * Otherwise → invokes `sudo -n -u sandbox install -m <mode>`.
+/// * Otherwise → invokes `sudo -n -u <daemon-user> install -m <mode>`.
 pub fn backup_sandbox_owned_file(
     src: &Path,
     dst: &Path,
@@ -249,7 +251,7 @@ pub fn backup_sandbox_owned_file(
     }
     let (src_sha, src_size) = sha256_of_file(src)?;
     if dst.exists() {
-        // The destination is owned `sandbox:sandbox` and may not be
+        // The destination is owned by the daemon user and may not be
         // world-readable (sessions.db is 0600). Hash via sudo so a
         // root-invoked rerun can compare.
         if let Ok((dst_sha, _)) = sha256_of_file_sudo(dst)
@@ -280,8 +282,8 @@ pub fn backup_sandbox_owned_file(
 }
 
 /// Backup an `/etc` file (root-owned, world-readable at `0644`) into
-/// the `sandbox`-owned backup set. The two-step
-/// `sudo cat | sudo -u sandbox tee` pipeline lets the daemon-user
+/// the daemon-user-owned backup set. The two-step
+/// `sudo cat | sudo -u <daemon-user> tee` pipeline lets the daemon user
 /// land bytes it cannot read in-place but can be handed via the
 /// pipeline.
 pub fn backup_etc_file(src: &Path, dst: &Path, mode: u32) -> Result<CopyOutcome, BackupError> {
@@ -303,8 +305,8 @@ pub fn backup_etc_file(src: &Path, dst: &Path, mode: u32) -> Result<CopyOutcome,
             size: src_size,
         });
     }
-    // `sudo -n cat <src> | sudo -n -u sandbox tee <dst> >/dev/null` —
-    // we drive the pipeline via `std::process::Command` so the parent
+    // `sudo -n cat <src> | sudo -n -u <daemon-user> tee <dst> >/dev/null`
+    // — we drive the pipeline via `std::process::Command` so the parent
     // process can wait on both ends. `tee` is preferred over `cp`
     // because we cross a uid boundary; the bytes are explicit on the
     // pipe and the destination is created at the right ownership.
@@ -328,10 +330,10 @@ pub fn backup_etc_file(src: &Path, dst: &Path, mode: u32) -> Result<CopyOutcome,
 // Manifest write / finalise
 // ---------------------------------------------------------------------------
 
-/// Write the in-progress manifest at `<set>/manifest.json`. Owned `sandbox:sandbox`
-/// at mode `0644`. Idempotent: the
-/// write goes through a tempfile under the set directory so a re-run
-/// overwrites whatever was there.
+/// Write the in-progress manifest at `<set>/manifest.json`. Owned by
+/// the daemon system user at mode `0644`. Idempotent: the write goes
+/// through a tempfile in `/tmp` so a re-run overwrites whatever was
+/// there.
 pub fn write_in_progress_manifest(
     set_dir: &Path,
     manifest: &BackupManifest,
@@ -563,7 +565,7 @@ fn run_sudo_capture(args: &[&str]) -> Result<Vec<u8>, BackupError> {
     Ok(out.stdout)
 }
 
-/// `sudo -n cat <src>` piped into `sudo -n -u sandbox tee <dst>`.
+/// `sudo -n cat <src>` piped into `sudo -n -u <daemon-user> tee <dst>`.
 fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupError> {
     use std::process::Stdio;
     let mut reader = Command::new("sudo")
@@ -600,7 +602,11 @@ fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupErro
     }
     if !w_out.status.success() {
         return Err(BackupError::Subprocess {
-            cmd: format!("sudo -n -u sandbox tee {}", dst.display()),
+            cmd: format!(
+                "sudo -n -u {} tee {}",
+                crate::update::DAEMON_SYSTEM_USER,
+                dst.display()
+            ),
             code: w_out.status.code(),
             stderr: String::from_utf8_lossy(&w_out.stderr).into_owned(),
         });
@@ -608,18 +614,27 @@ fn pipe_sudo_cat_to_sandbox_tee(src: &Path, dst: &Path) -> Result<(), BackupErro
     Ok(())
 }
 
-/// Write `bytes` to a `sandbox`-owned file at `mode`. Uses a tempfile
-/// under `/tmp` written by the current process, then `sudo -n -u
-/// sandbox install -m <mode> <tmp> <dst>` to atomically land it at
-/// the right ownership.
+/// Write `bytes` to a daemon-owned file at `mode`. Uses a tempfile
+/// under `/tmp` written by the current process, then
+/// `sudo -n -u <daemon-user> install -m <mode> <tmp> <dst>` to
+/// atomically land it at the right ownership.
+///
+/// The temp file is explicitly created in `/tmp` (world-traversable)
+/// rather than via `NamedTempFile::new()` whose default directory is
+/// `$TMPDIR`.  On macOS, `sudo` sets `$TMPDIR` to the invoking root
+/// user's per-session private tmp dir (mode 0700), which the dropped
+/// daemon user cannot traverse, causing the `install` step to fail
+/// with EPERM (exit 71).  `/tmp` on both macOS and Linux is always
+/// world-traversable (mode 1777), so the daemon user can read the
+/// staged file regardless of which uid started the outer process.
 fn write_sandbox_owned_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), BackupError> {
-    let mut tmp = tempfile::NamedTempFile::new().map_err(BackupError::Io)?;
+    let mut tmp = tempfile::NamedTempFile::new_in("/tmp").map_err(BackupError::Io)?;
     use std::io::Write;
     tmp.write_all(bytes).map_err(BackupError::Io)?;
     tmp.flush().map_err(BackupError::Io)?;
     // `NamedTempFile` defaults to mode 0600 owned by the running process
     // (root, when invoked via `sudo sandbox update`). The downstream
-    // `sudo -u sandbox install` reads this file as the `sandbox` user;
+    // `sudo -u <daemon-user> install` reads this file as the daemon user;
     // widen the read bit so the install succeeds. The destination mode is
     // set independently by `install -m <mode>`.
     use std::os::unix::fs::PermissionsExt;
@@ -632,7 +647,7 @@ fn write_sandbox_owned_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), B
     let mode_str = format!("{mode:04o}");
     run_sudo(&[
         "-u",
-        "sandbox",
+        crate::update::DAEMON_SYSTEM_USER,
         "install",
         "-m",
         &mode_str,

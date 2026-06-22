@@ -247,6 +247,7 @@ stage-socket-vmnet
 install-vmnet-plists
 bootstrap-vmnet-daemons
 install-agent
+stage-gateway-image
 install-daemon-plist
 write-install-state"
 
@@ -2292,7 +2293,7 @@ fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
-_TOTAL_STEPS=$(if [ "$OS" = "darwin" ]; then printf '12'; else printf '15'; fi)
+_TOTAL_STEPS=$(if [ "$OS" = "darwin" ]; then printf '13'; else printf '15'; fi)
 # Tracks the label of the last successfully completed step (set by _step_ok).
 # Used by _write_checkpoint to populate last_completed_step correctly on
 # failure checkpoints (the failing step should appear in failed_step, not
@@ -3004,6 +3005,34 @@ _log "step=install_agent path=\$_agent_plist_dst action=install status=ok"
 _step_ok
 _write_checkpoint "install-agent"
 _priv_maybe_fail_after "install-agent"
+
+# ----- Step: stage gateway image tarball (macOS) -----
+_step_begin "stage-gateway-image"
+_priv_maybe_abort_at "stage-gateway-image"
+_gateway_tag="sandbox-gateway:\$VERSION"
+if [ "\$PLAN_GATEWAY_IMAGE" = "stage" ]; then
+    # macOS: the gateway Lima VM is not yet running at install time, so we
+    # cannot docker load directly.  Stage the tarball under BASE_DIR so the
+    # daemon (which knows the per-operator LIMA_HOME path) can copy it into
+    # the right location on first ensure_ready and then call docker load.
+    _image_path="\$STAGE/images/sandbox-gateway-\${VERSION}.tar"
+    if [ ! -f "\$_image_path" ]; then
+        _log "step=stage_gateway action=fail reason=missing-image status=fail"
+        _step_fail
+    fi
+    # Stage the tarball under BASE_DIR directly (BASE_DIR = /var/lib/sandboxd/<_sandboxd-uid>).
+    # The daemon copies it into the per-operator LIMA_HOME on first ensure_ready —
+    # install.sh cannot know the operator uid at install time (no operator has connected yet).
+    _dst="\$BASE_DIR/gateway-image.tar"
+    install -m 0640 -o _sandboxd -g _sandboxd "\$_image_path" "\$_dst" >> "\$_LOG" 2>&1 \
+        || { _log "step=stage_gateway action=fail reason=install-failed status=fail"; _step_fail; }
+    _log "step=stage_gateway image=\$_gateway_tag dst=\$_dst action=staged status=ok"
+else
+    _log "step=stage_gateway image=\$_gateway_tag action=skip status=ok"
+fi
+_step_ok
+_write_checkpoint "stage-gateway-image"
+_priv_maybe_fail_after "stage-gateway-image"
 
 # ----- Step: install daemon plist + bootstrap/enable (macOS) -----
 _step_begin "install-daemon-plist"
