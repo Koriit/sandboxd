@@ -3798,8 +3798,24 @@ fn recovery_guidance_ex(
     }
 }
 
-/// `install -D -m <mode> -o root -g root <src> <dst>` via sudo, with
-/// sha256 compare for idempotency. Returns `"install"` or `"skip"`.
+/// The root-group name for system-owned directories and files.
+///
+/// GNU `install` and BSD `install` both accept `-g root` on Linux, but macOS
+/// has no `root` group — the equivalent wheel-of-root is `wheel`. Use this
+/// constant so every `sudo install -g <group>` call is portable.
+const ROOT_GROUP: &str = if cfg!(target_os = "macos") {
+    "wheel"
+} else {
+    "root"
+};
+
+/// Install `src` at `dst` owned `root:<ROOT_GROUP> <mode>` via sudo, with
+/// byte-equal compare for idempotency. Returns `"install"` or `"skip"`.
+///
+/// BSD `install` (macOS) does not support the GNU `-D` flag (which creates
+/// missing parent directories). Instead we first ensure the parent exists with
+/// `sudo install -d`, then install the file. GNU `install` accepts `-d` as
+/// well, so this two-step is portable across both.
 fn install_binary_if_changed(
     src: &Path,
     dst: &str,
@@ -3808,6 +3824,26 @@ fn install_binary_if_changed(
     let mode_str = format!("{mode:04o}");
     if files_byte_equal(src, Path::new(dst))? {
         return Ok("skip");
+    }
+    // Ensure the parent directory exists. `install -d` is POSIX-portable and
+    // a no-op when the directory already exists.
+    let dst_parent = Path::new(dst)
+        .parent()
+        .ok_or_else(|| std::io::Error::other(format!("no parent directory for {dst}")))?;
+    let parent_str = dst_parent
+        .to_str()
+        .ok_or_else(|| std::io::Error::other(format!("non-UTF-8 parent for {dst}")))?;
+    let mkdir = std::process::Command::new("sudo")
+        .args([
+            "-n", "install", "-d", "-m", "0755", "-o", "root", "-g", ROOT_GROUP, parent_str,
+        ])
+        .output()?;
+    if !mkdir.status.success() {
+        return Err(std::io::Error::other(format!(
+            "install -d {parent_str}: exit {:?}: {}",
+            mkdir.status.code(),
+            String::from_utf8_lossy(&mkdir.stderr).trim()
+        )));
     }
     // INVARIANT: install with a FRESH mtime — `install(1)` WITHOUT `-p`, never
     // preserving the source mtime. The dev workspace's `make` time-shares the
@@ -3819,13 +3855,12 @@ fn install_binary_if_changed(
         .args([
             "-n",
             "install",
-            "-D",
             "-m",
             &mode_str,
             "-o",
             "root",
             "-g",
-            "root",
+            ROOT_GROUP,
             src.to_str().unwrap(),
             dst,
         ])

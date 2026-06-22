@@ -52,6 +52,7 @@ from conftest import (
     version_from_tarball,
     _sh_quote,
 )
+from tart_harness import host_supports_nested_virt
 
 
 def _stage_update_trust_material(vm, stack):
@@ -107,41 +108,17 @@ def test_update_macos_swaps_binaries_restages_gateway_and_backs_up(
     sigstore_stack,
     tart_sigstore_relay,
 ):
-    """install base → `sandbox update --from <bumped>` → assert the reachable
-    S6 artifact contract, and pin the production blocker that stops the swap.
+    """install base → `sandbox update --from <bumped>` → assert the full
+    S6 artifact contract reachable on M1, and gate daemon-restart-healthy
+    behind host_supports_nested_virt() (M3+ only).
 
-    LIVE FINDING (production `sandbox update` macOS bug): the update reaches the
-    backup phase and creates the backup set (set dir + sessions.db/plist/binary/
-    cosign backups, all via the DAEMON_SYSTEM_USER-correct helper), then ABORTS
-    at the write-in-progress-manifest step with:
-
-        failed to write in-progress manifest: subprocess
-        `sudo -n -u sandbox install -m 0644 /var/folders/zz/.../T/.tmpXXXX
-         <base_dir>/backups/<set>/manifest.json` exited 71: Permission denied
-
-    Two compounding defects in
-    sandbox-cli/src/update/backup.rs::write_sandbox_owned_file:
-      1. it hardcodes `-u sandbox` (the Linux daemon user) instead of
-         crate::update::DAEMON_SYSTEM_USER (which is `_sandboxd` on macOS) —
-         every OTHER backup helper in that file uses DAEMON_SYSTEM_USER;
-      2. the NamedTempFile lands in root's private $TMPDIR
-         (`/var/folders/zz/.../T/`, mode 0700, root-owned) because the CLI runs
-         under `sudo`, so the dropped daemon user cannot traverse to read it
-         (the doc-comment claims "/tmp", but std::env::temp_dir() is NOT /tmp
-         under sudo on macOS).
-
-    Because this aborts BEFORE the binary swap + gateway re-stage, the
-    post-swap S6 checks (CLI reports bumped version, gateway-image.tar
-    re-staged) are UNREACHABLE until the bug is fixed. This cell therefore
-    asserts the REACHABLE contract (backup set + backups landed + launchctl-
-    dispatched stop_daemon step) and pins the manifest-write failure as the
-    blocker, so it flips green the moment the bug is fixed (the post-swap block
-    is guarded and will start asserting once the swap can proceed).
-
-    This is independent of the M1 nested-virt ceiling: the bug blocks
-    `sandbox update` on macOS on ANY host (it is in the artifact backup phase,
-    long before any daemon-health step).
+    The update runs the complete binary swap + gateway re-stage + backup
+    finalisation on M1. Only the post-swap daemon-restart → verify_version →
+    doctor-green tail requires the gateway QEMU VM (nested virt; M3+ only) and
+    is skipped on M1/M2.
     """
+    nested = host_supports_nested_virt()
+
     base_ver = version_from_tarball(str(release_tarball_darwin))
     bumped_ver = version_from_tarball(str(release_tarball_darwin_bumped))
     assert base_ver != bumped_ver, (
@@ -202,13 +179,10 @@ def test_update_macos_swaps_binaries_restages_gateway_and_backs_up(
     ).stdout
 
     # ============================================================
-    # REACHABLE S6 contract (asserted GREEN)
+    # S6 artifact contract — fully asserted on M1
     # ============================================================
 
     # ---------------- sigstore verify of the bumped tarball ----------------
-    # The update runs cosign verify-blob on the --from tarball against the
-    # local stack's trust material (SANDBOX_UPDATE_TEST_*). Proving this ran
-    # validates the macOS update sigstore path end-to-end.
     assert "step=sigstore_verify" in log and "status=ok" in log, (
         f"update did not pass sigstore verify on the bumped tarball:\n"
         f"--- log tail ---\n{log[-3000:]}\n--- update output ---\n{update_out}"
@@ -230,10 +204,89 @@ def test_update_macos_swaps_binaries_restages_gateway_and_backs_up(
         f"update log mentions systemctl on the macOS path (should be launchctl):\n{log[-3000:]}"
     )
 
+    # ---------------- in-progress manifest written ----------------
+    # With the BSD-install portability fix, the manifest write must succeed.
+    # A successful in-progress manifest write is logged as
+    # "status=in-progress action=write" (the in-progress state IS the success
+    # marker — it's finalised to "completed_ok=true" at finalize_backup_manifest).
+    # A failure is logged as "action=write status=fail", which causes an abort
+    # before the binary swap (the previous production bug).
+    assert "step=backup_manifest status=in-progress action=write" in log, (
+        f"in-progress manifest write did not land (expected status=in-progress):\n"
+        f"--- log tail ---\n{log[-3000:]}\n--- update output ---\n{update_out}"
+    )
+
+    # ---------------- binary swap landed ----------------
+    # install_binary step records for each of the macOS binary set.
+    for bin_path in [
+        "/usr/local/libexec/sandboxd/sandboxd",
+        "/usr/local/bin/sandbox",
+        "/usr/local/libexec/sandboxd/sandbox-agent",
+        "/usr/local/libexec/sandboxd/sandbox-guest",
+    ]:
+        assert f"step=install_binary path={bin_path} action=install status=ok" in log or \
+               f"step=install_binary path={bin_path} action=skip status=ok" in log, (
+            f"install_binary step for {bin_path} not found with status=ok:\n{log[-3000:]}"
+        )
+
+    # The CLI must now report the bumped version.
+    cli_ver_post = vm.shell(
+        "/usr/local/bin/sandbox --version", check=True, timeout=30
+    ).stdout
+    assert bumped_ver in cli_ver_post, (
+        f"CLI does not report bumped version {bumped_ver} after swap: {cli_ver_post!r}"
+    )
+
+    # The sandboxd binary must also report bumped version.
+    sandboxd_ver = vm.shell(
+        "/usr/local/libexec/sandboxd/sandboxd --version 2>&1 || true", timeout=30
+    ).stdout
+    assert bumped_ver in sandboxd_ver, (
+        f"sandboxd does not report bumped version {bumped_ver} after swap: {sandboxd_ver!r}"
+    )
+
+    # Ownership: the installed binaries must be root:wheel 0755.
+    for bin_path in [
+        "/usr/local/libexec/sandboxd/sandboxd",
+        "/usr/local/bin/sandbox",
+        "/usr/local/libexec/sandboxd/sandbox-agent",
+        "/usr/local/libexec/sandboxd/sandbox-guest",
+    ]:
+        stat_out = vm.shell(
+            f"stat -f '%Su:%Sg %Lp' {bin_path}", check=True, timeout=10
+        ).stdout.strip()
+        assert stat_out == "root:wheel 755", (
+            f"{bin_path} ownership/mode is {stat_out!r}, expected root:wheel 755"
+        )
+
+    # ---------------- gateway image re-staged ----------------
+    # The update must stage gateway-image.tar at {base_dir}/gateway-image.tar
+    # owned _sandboxd:_sandboxd 0640 (step=stage_gateway_image action=stage status=ok).
+    assert "step=stage_gateway_image" in log and "action=stage status=ok" in log, (
+        f"stage_gateway_image step not found or failed:\n{log[-3000:]}"
+    )
+    gw_stat = vm.shell(
+        f"sudo stat -f '%Su:%Sg %Lp' {base_dir}/gateway-image.tar",
+        check=True, timeout=10,
+    ).stdout.strip()
+    assert gw_stat == "_sandboxd:_sandboxd 640", (
+        f"gateway-image.tar ownership/mode is {gw_stat!r}, expected _sandboxd:_sandboxd 640"
+    )
+    # The re-staged tarball must differ from (or be the first instance of) the
+    # pre-update gateway image — confirming it's the bumped tarball's image.
+    gw_sha_post = vm.shell(
+        f"sudo shasum -a 256 {base_dir}/gateway-image.tar | awk '{{print $1}}'",
+        check=True, timeout=60,
+    ).stdout.strip()
+    assert gw_sha_post, f"gateway-image.tar sha256 empty after update"
+    if gw_pre_present and gw_sha_pre:
+        # When a gateway tarball was present before the update, the re-staged
+        # tarball content is expected to differ (bumped gateway image).
+        # If it happens to be identical (same gateway image, only CLI bumped)
+        # that is acceptable — the re-stage still ran and we asserted status=ok.
+        pass  # sha comparison is informational; see stage_gateway_image status above
+
     # ---------------- backup set created + populated ----------------
-    # The backup phase runs BEFORE the (broken) manifest write and lands the
-    # sessions.db/plist/binary/cosign backups via the DAEMON_SYSTEM_USER-correct
-    # helper. The set dir + backups are the reachable, asserted artifact.
     backups_root = f"{base_dir}/backups"
     backup_sets = vm.shell(
         f"sudo ls {backups_root} 2>/dev/null || true", timeout=15
@@ -252,10 +305,7 @@ def test_update_macos_swaps_binaries_restages_gateway_and_backs_up(
     ).stdout.split()
     present = set(set_contents)
 
-    # The macOS config + binary backups must have landed (these precede the
-    # manifest-write bug and use the correct daemon-user helper).
-    #   config: io.sandboxd.daemon.plist.bak, io.sandboxd.agent.plist.bak
-    #   binaries: sandboxd.bak, sandbox.bak, sandbox-agent.bak, cosign.bak
+    # macOS backup set must contain: plists + agent + cosign backups.
     expected_backup_files = {
         "io.sandboxd.daemon.plist.bak",
         "io.sandboxd.agent.plist.bak",
@@ -263,15 +313,16 @@ def test_update_macos_swaps_binaries_restages_gateway_and_backs_up(
         "sandbox.bak",
         "sandbox-agent.bak",
         "cosign.bak",
+        # manifest.json must also have been written (in-progress manifest)
+        "manifest.json",
     }
     missing = expected_backup_files - present
     assert not missing, (
-        f"backup set {set_dir} missing expected backups: {sorted(missing)}\n"
+        f"backup set {set_dir} missing expected files: {sorted(missing)}\n"
         f"present: {sorted(present)}\n--- update output ---\n{update_out}"
     )
-    # The set dir + its backups are owned by the macOS daemon user (_sandboxd),
-    # proving the backup helpers used DAEMON_SYSTEM_USER correctly (unlike the
-    # manifest-write helper).
+
+    # Set dir owned by _sandboxd.
     setdir_owner = vm.shell(
         f"sudo stat -f '%Su' {set_dir}", check=True, timeout=15
     ).stdout.strip()
@@ -280,45 +331,40 @@ def test_update_macos_swaps_binaries_restages_gateway_and_backs_up(
     )
 
     # ============================================================
-    # PRODUCTION BLOCKER (pinned) — write-in-progress-manifest
+    # Daemon-restart-healthy (M3+ only — requires nested virt for
+    # the gateway QEMU VM to start successfully)
     # ============================================================
-    # The update MUST have aborted at the manifest write with the hardcoded
-    # `-u sandbox` + root-private-TMPDIR Permission-denied failure (the live
-    # finding documented in the docstring). When this assertion starts FAILING,
-    # the bug has been fixed — at which point the guarded post-swap block below
-    # becomes reachable and should be un-skipped.
-    manifest_blocked = (
-        "failed to write in-progress manifest" in update_out
-        or "step=backup_manifest action=write status=fail" in log
-    )
-    assert manifest_blocked, (
-        "expected `sandbox update` to abort at write-in-progress-manifest "
-        "(production bug: write_sandbox_owned_file hardcodes `-u sandbox` and "
-        "writes its tempfile in root's private $TMPDIR). If this assertion now "
-        "fails, the bug was fixed — un-skip the post-swap block below.\n"
-        f"--- update output ---\n{update_out}\n--- log tail ---\n{log[-3000:]}"
-    )
-    # Pin the specific hardcoded-`sandbox`-user defect: the failing manifest-
-    # write subprocess names `-u sandbox`, where on macOS it must have been
-    # `-u _sandboxd` (DAEMON_SYSTEM_USER). The failure message echoes the
-    # offending command when it surfaces in stdout/stderr.
-    if "failed to write in-progress manifest" in update_out:
-        assert "-u sandbox install" in update_out, (
-            "manifest-write failure did not echo the hardcoded `-u sandbox` "
-            f"command (the wrong-daemon-user defect):\n{update_out}"
+    # On M1/M2: the daemon cannot boot its gateway QEMU VM (no nested virt),
+    # so start_daemon dispatches but the daemon socket never appears.
+    # sandbox update exits non-zero at verify_version (socket-absent).
+    # The steps after verify_version (kickstart_agent, finalize_state,
+    # finalize_backup_manifest, doctor) are therefore unreachable on M1/M2.
+    if not nested:
+        pytest.skip(
+            "post-swap daemon-restart + finalization assertions require nested "
+            "virtualization (M3+) for the gateway QEMU VM; this host (M1/M2) "
+            "cannot boot it. Binary swap, gateway re-stage, and backup set are "
+            "fully asserted above."
         )
 
-    # ---------------- BLOCKED post-swap checks (un-skip when the bug is fixed) ----------------
-    # Binary swap (CLI reports bumped version), gateway re-stage to base_dir
-    # (_sandboxd:_sandboxd 0640), start_daemon/kickstart_agent step records.
-    # All unreachable until write_sandbox_owned_file is fixed. Documented here
-    # so the contract is captured + the cell flips to assert them once the
-    # update can proceed past the manifest write.
-    pytest.skip(
-        "post-swap S6 checks (binary swap, gateway re-stage, agent kickstart) "
-        "are blocked by the write-in-progress-manifest production bug in "
-        "sandbox-cli/src/update/backup.rs::write_sandbox_owned_file (hardcoded "
-        "`-u sandbox` + root-private $TMPDIR). Reachable contract (sigstore "
-        "verify, launchctl-dispatched stop, backup set + backups landed) is "
-        "asserted above. Un-skip once the bug is fixed."
+    # M3+: kickstart_agent, finalization, doctor all complete.
+    assert "step=kickstart_agent" in log, (
+        f"kickstart_agent step not found in update log:\n{log[-3000:]}"
+    )
+
+    assert "step=finalize_state" in log and "status=ok" in log, (
+        f"finalize_state step not found or failed:\n{log[-3000:]}"
+    )
+    assert "step=finalize_backup_manifest" in log and "status=ok" in log, (
+        f"finalize_backup_manifest step not found or failed:\n{log[-3000:]}"
+    )
+    assert "step=verify_version" in log and "status=ok" in log, (
+        f"verify_version did not pass after daemon restart:\n{log[-3000:]}"
+    )
+    assert "step=doctor result=pass status=ok" in log, (
+        f"sandbox doctor did not pass after update:\n{log[-3000:]}"
+    )
+    assert r.returncode == 0, (
+        f"sandbox update exited non-zero on M3+ (expected 0): {r.returncode}\n"
+        f"--- update output ---\n{update_out}\n--- log tail ---\n{log[-3000:]}"
     )

@@ -474,29 +474,43 @@ fn sha256_of_file(path: &Path) -> Result<(String, u64), BackupError> {
     Ok((hex_encode(ctx.finish().as_ref()), total))
 }
 
-/// Compute sha256 + size of a `sandbox`-owned file. Tries an
-/// unprivileged read first and falls back to `sudo sha256sum` when
+/// Compute sha256 + size of a daemon-owned file. Tries an
+/// unprivileged read first and falls back to a privileged hash when
 /// that fails — mirrors `read_sandbox_owned_file`.
+///
+/// The privileged hash uses `shasum -a 256` (available on macOS and most
+/// Linux distros) with a fallback to `sha256sum` (GNU coreutils, Linux).
+/// The file size is obtained via `wc -c` (POSIX, portable across both).
 fn sha256_of_file_sudo(path: &Path) -> Result<(String, u64), BackupError> {
     // Tests pass a tempdir we own; production passes /var/lib/...
     // For the test path we can hash directly; production needs sudo.
     if let Ok(result) = sha256_of_file(path) {
         return Ok(result);
     }
-    let out = run_sudo_capture(&["sha256sum", path.to_str().unwrap()])?;
-    let stdout = String::from_utf8_lossy(&out);
+    let path_str = path.to_str().unwrap();
+    // Try `shasum -a 256` first (available on macOS and Linux); fall back to
+    // `sha256sum` (GNU coreutils) if shasum is absent.
+    let (hash_out, hash_cmd) = if let Ok(out) = run_sudo_capture(&["shasum", "-a", "256", path_str])
+    {
+        (out, "shasum")
+    } else {
+        (run_sudo_capture(&["sha256sum", path_str])?, "sha256sum")
+    };
+    let stdout = String::from_utf8_lossy(&hash_out);
     let first = stdout.split_whitespace().next().unwrap_or("");
     if first.len() != 64 {
         return Err(BackupError::Subprocess {
-            cmd: "sha256sum".to_string(),
+            cmd: hash_cmd.to_string(),
             code: Some(0),
-            stderr: format!("unexpected sha256sum output: {stdout}"),
+            stderr: format!("unexpected {hash_cmd} output: {stdout}"),
         });
     }
-    let size = match run_sudo_capture(&["stat", "-c", "%s", path.to_str().unwrap()]) {
+    // `wc -c` is POSIX-portable (macOS + Linux); output is "<whitespace><count> <path>".
+    let size = match run_sudo_capture(&["wc", "-c", path_str]) {
         Ok(bytes) => String::from_utf8_lossy(&bytes)
-            .trim()
-            .parse::<u64>()
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0),
         Err(_) => 0,
     };
