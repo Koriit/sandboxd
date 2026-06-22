@@ -101,11 +101,29 @@ fi
 # before invoking cargo, then restores them via an EXIT trap.
 VER="${SANDBOX_RELEASE_BUMP_VERSION:-$BASE_VER}"
 
-case "$(uname -m)" in
-    x86_64)  ARCH="x86_64-unknown-linux-gnu" ;;
-    aarch64) ARCH="aarch64-unknown-linux-gnu" ;;
+OS_NAME=$(uname -s)
+case "$OS_NAME" in
+    Darwin)
+        case "$(uname -m)" in
+            arm64) ARCH="aarch64-apple-darwin" ;;
+            *)
+                printf 'build-local-tarball.sh: unsupported Darwin arch %s\n' "$(uname -m)" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    Linux)
+        case "$(uname -m)" in
+            x86_64)  ARCH="x86_64-unknown-linux-gnu" ;;
+            aarch64) ARCH="aarch64-unknown-linux-gnu" ;;
+            *)
+                printf 'build-local-tarball.sh: unsupported Linux arch %s\n' "$(uname -m)" >&2
+                exit 1
+                ;;
+        esac
+        ;;
     *)
-        printf 'build-local-tarball.sh: unsupported host arch %s\n' "$(uname -m)" >&2
+        printf 'build-local-tarball.sh: unsupported host OS %s\n' "$OS_NAME" >&2
         exit 1
         ;;
 esac
@@ -206,60 +224,68 @@ fi
 # ----------------------------------------------------------------------------
 # Decide native vs. portable (docker) build.
 #
-# We need the resulting binaries to run on glibc 2.35 (Ubuntu 22.04 floor).
-# Hosts at or below 2.35 build natively; newer hosts build inside
+# Darwin always builds natively — there is no glibc floor constraint on
+# macOS, and the portable ubuntu:22.04 docker indirection is Linux-only.
+#
+# Linux: we need the resulting binaries to run on glibc 2.35 (Ubuntu 22.04
+# floor). Hosts at or below 2.35 build natively; newer hosts build inside
 # `ubuntu:22.04` so the dynamic linker is satisfied on every distro in
 # the test matrix.
 # ----------------------------------------------------------------------------
 
-host_glibc=$(ldd --version 2>/dev/null | awk '/^ldd/ { print $NF; exit }')
-case "$host_glibc" in
-    [0-9]*.[0-9]*) : ;;
-    *) host_glibc="" ;;
-esac
+if [ "$OS_NAME" = "Darwin" ]; then
+    portable_build=0
+    portable_reason="Darwin host always builds natively"
+else
+    host_glibc=$(ldd --version 2>/dev/null | awk '/^ldd/ { print $NF; exit }')
+    case "$host_glibc" in
+        [0-9]*.[0-9]*) : ;;
+        *) host_glibc="" ;;
+    esac
 
-# Compare host_glibc to the 2.35 floor using awk (POSIX sh has no float
-# arithmetic). Result: 1 = host > floor, 0 = host <= floor or unknown.
-host_newer_than_floor=0
-if [ -n "$host_glibc" ]; then
-    host_newer_than_floor=$(awk -v h="$host_glibc" -v f="2.35" 'BEGIN {
-        # split "2.39" into major/minor; lexicographic compare on (major,minor)
-        nh = split(h, hp, ".");
-        nf = split(f, fp, ".");
-        for (i = 1; i <= (nh > nf ? nh : nf); i++) {
-            a = (i <= nh ? hp[i] + 0 : 0);
-            b = (i <= nf ? fp[i] + 0 : 0);
-            if (a > b) { print 1; exit }
-            if (a < b) { print 0; exit }
-        }
-        print 0
-    }')
-fi
+    # Compare host_glibc to the 2.35 floor using awk (POSIX sh has no float
+    # arithmetic). Result: 1 = host > floor, 0 = host <= floor or unknown.
+    host_newer_than_floor=0
+    if [ -n "$host_glibc" ]; then
+        host_newer_than_floor=$(awk -v h="$host_glibc" -v f="2.35" 'BEGIN {
+            # split "2.39" into major/minor; lexicographic compare on (major,minor)
+            nh = split(h, hp, ".");
+            nf = split(f, fp, ".");
+            for (i = 1; i <= (nh > nf ? nh : nf); i++) {
+                a = (i <= nh ? hp[i] + 0 : 0);
+                b = (i <= nf ? fp[i] + 0 : 0);
+                if (a > b) { print 1; exit }
+                if (a < b) { print 0; exit }
+            }
+            print 0
+        }')
+    fi
 
-case "${SANDBOX_RELEASE_PORTABLE_BUILD:-auto}" in
-    1|true|yes|on)
-        portable_build=1
-        portable_reason="forced by SANDBOX_RELEASE_PORTABLE_BUILD=$SANDBOX_RELEASE_PORTABLE_BUILD"
-        ;;
-    0|false|no|off)
-        portable_build=0
-        portable_reason="disabled by SANDBOX_RELEASE_PORTABLE_BUILD=$SANDBOX_RELEASE_PORTABLE_BUILD"
-        ;;
-    auto|"")
-        if [ "$host_newer_than_floor" = "1" ]; then
+    case "${SANDBOX_RELEASE_PORTABLE_BUILD:-auto}" in
+        1|true|yes|on)
             portable_build=1
-            portable_reason="host glibc ${host_glibc} > 2.35 floor"
-        else
+            portable_reason="forced by SANDBOX_RELEASE_PORTABLE_BUILD=$SANDBOX_RELEASE_PORTABLE_BUILD"
+            ;;
+        0|false|no|off)
             portable_build=0
-            portable_reason="host glibc ${host_glibc:-unknown} <= 2.35 floor"
-        fi
-        ;;
-    *)
-        printf 'build-local-tarball.sh: invalid SANDBOX_RELEASE_PORTABLE_BUILD=%s\n' \
-            "$SANDBOX_RELEASE_PORTABLE_BUILD" >&2
-        exit 1
-        ;;
-esac
+            portable_reason="disabled by SANDBOX_RELEASE_PORTABLE_BUILD=$SANDBOX_RELEASE_PORTABLE_BUILD"
+            ;;
+        auto|"")
+            if [ "$host_newer_than_floor" = "1" ]; then
+                portable_build=1
+                portable_reason="host glibc ${host_glibc} > 2.35 floor"
+            else
+                portable_build=0
+                portable_reason="host glibc ${host_glibc:-unknown} <= 2.35 floor"
+            fi
+            ;;
+        *)
+            printf 'build-local-tarball.sh: invalid SANDBOX_RELEASE_PORTABLE_BUILD=%s\n' \
+                "$SANDBOX_RELEASE_PORTABLE_BUILD" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 printf 'build-local-tarball.sh: portable_build=%s (%s)\n' \
     "$portable_build" "$portable_reason"
@@ -294,6 +320,26 @@ RELEASE_DIR="$ROOT/sandboxd/${CARGO_TARGET_SUBDIR}/release"
 
 if [ "${SANDBOX_RELEASE_SKIP_BUILD:-0}" = "1" ]; then
     printf 'build-local-tarball.sh: SKIP_BUILD=1, reusing existing release artifacts\n'
+elif [ "$OS_NAME" = "Darwin" ]; then
+    printf 'build-local-tarball.sh: cargo build --workspace --release (native macOS) ...\n'
+    # `--features sandbox-cli/test-env-override` opts the cosign verify-blob
+    # path into honoring SANDBOX_UPDATE_TEST_* env vars (see Linux comment
+    # in the portable-build arm below for full rationale).
+    ( cd "$ROOT/sandboxd" \
+        && cargo build --workspace --release \
+            --features sandbox-cli/test-env-override )
+
+    # Cross-compile sandbox-guest for linux/aarch64. On macOS the native
+    # host build produces a Mach-O guest — wrong ABI for the gateway Lima
+    # VM (linux/aarch64). The Makefile target uses Docker (rust:1.88-bookworm)
+    # and is self-skipping on Linux. The compiled ELF lands at:
+    #   sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest
+    if [ "${SANDBOX_RELEASE_SKIP_GUEST_CROSS:-0}" != "1" ]; then
+        printf 'build-local-tarball.sh: cross-compiling sandbox-guest for linux/aarch64 ...\n'
+        ( cd "$ROOT" && make build-guest-linux-aarch64 )
+    else
+        printf 'build-local-tarball.sh: SKIP_GUEST_CROSS=1, reusing existing linux/aarch64 sandbox-guest\n'
+    fi
 elif [ "$portable_build" = "1" ]; then
     if ! command -v docker >/dev/null 2>&1; then
         printf 'build-local-tarball.sh: portable build requires docker, not found in PATH\n' >&2
@@ -410,13 +456,33 @@ else
             --features sandbox-cli/test-env-override )
 fi
 
-for bin in sandboxd sandbox sandbox-route-helper sandbox-lima-helper sandbox-guest; do
-    if [ ! -x "$RELEASE_DIR/$bin" ]; then
-        printf 'build-local-tarball.sh: missing release binary: %s/%s\n' \
-            "$RELEASE_DIR" "$bin" >&2
+if [ "$OS_NAME" = "Darwin" ]; then
+    # macOS tarball: Mach-O host binaries + linux/aarch64 ELF guest.
+    # sandbox-route-helper and sandbox-lima-helper are Linux-only (setcap
+    # unavailable on macOS); sandbox-agent is macOS-only.
+    for bin in sandboxd sandbox sandbox-agent; do
+        if [ ! -x "$RELEASE_DIR/$bin" ]; then
+            printf 'build-local-tarball.sh: missing Darwin release binary: %s/%s\n' \
+                "$RELEASE_DIR" "$bin" >&2
+            exit 1
+        fi
+    done
+    GUEST_ELF="$ROOT/sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest"
+    if [ ! -f "$GUEST_ELF" ]; then
+        printf 'build-local-tarball.sh: missing linux/aarch64 sandbox-guest: %s\n' \
+            "$GUEST_ELF" >&2
+        printf 'build-local-tarball.sh: run `make build-guest-linux-aarch64` or unset SANDBOX_RELEASE_SKIP_GUEST_CROSS\n' >&2
         exit 1
     fi
-done
+else
+    for bin in sandboxd sandbox sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+        if [ ! -x "$RELEASE_DIR/$bin" ]; then
+            printf 'build-local-tarball.sh: missing release binary: %s/%s\n' \
+                "$RELEASE_DIR" "$bin" >&2
+            exit 1
+        fi
+    done
+fi
 
 # ----------------------------------------------------------------------------
 # Build gateway image and `docker save` it.
@@ -475,37 +541,122 @@ fi
 
 STAGE_DIR="${OUT_DIR}/${STAGE_NAME}"
 rm -rf "$STAGE_DIR"
-mkdir -p "$STAGE_DIR/bin" \
-         "$STAGE_DIR/libexec" \
-         "$STAGE_DIR/systemd" \
-         "$STAGE_DIR/images" \
-         "$STAGE_DIR/attestations"
 
-install -m 0755 "$RELEASE_DIR/sandboxd" \
-    "$STAGE_DIR/bin/sandboxd"
-install -m 0755 "$RELEASE_DIR/sandbox" \
-    "$STAGE_DIR/bin/sandbox"
-install -m 0755 "$RELEASE_DIR/sandbox-route-helper" \
-    "$STAGE_DIR/bin/sandbox-route-helper"
-install -m 0755 "$RELEASE_DIR/sandbox-lima-helper" \
-    "$STAGE_DIR/bin/sandbox-lima-helper"
-# sandbox-guest is a daemon-internal helper; install.sh lands it
-# under /usr/local/libexec/sandboxd/ on the host (FHS § 4.7).
-# The tarball uses a flat bin/ layout for simplicity — install.sh
-# owns the FHS placement.
-install -m 0755 "$RELEASE_DIR/sandbox-guest" \
-    "$STAGE_DIR/bin/sandbox-guest"
-install -m 0644 "$ROOT/sandboxd/contrib/systemd/sandboxd.service" \
-    "$STAGE_DIR/systemd/sandboxd.service"
-cp "$GATEWAY_TAR" "$STAGE_DIR/images/sandbox-gateway-${VER}.tar"
+if [ "$OS_NAME" = "Darwin" ]; then
+    # macOS tarball layout mirrors release.yml build-macos:
+    #   bin/  — Mach-O host daemons + linux/aarch64 ELF guest
+    #   launchd/ — LaunchDaemon + LaunchAgent plists
+    #   images/ — linux/arm64 gateway image tarball
+    mkdir -p "$STAGE_DIR/bin" \
+             "$STAGE_DIR/launchd" \
+             "$STAGE_DIR/images"
 
-# ----------------------------------------------------------------------------
-# Generate MANIFEST.
-# ----------------------------------------------------------------------------
+    # Stage Mach-O binaries.
+    install -m 0755 "$RELEASE_DIR/sandboxd"      "$STAGE_DIR/bin/sandboxd"
+    install -m 0755 "$RELEASE_DIR/sandbox"       "$STAGE_DIR/bin/sandbox"
+    install -m 0755 "$RELEASE_DIR/sandbox-agent" "$STAGE_DIR/bin/sandbox-agent"
 
-BUILD_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'local-build')
+    # Stage the linux/aarch64 ELF guest — NOT a Mach-O; must not be codesigned.
+    install -m 0755 "$GUEST_ELF" "$STAGE_DIR/bin/sandbox-guest"
 
-python3 - "$STAGE_DIR" "$VER" "$ARCH" "$BUILD_SHA" <<'PY'
+    # Ad-hoc-sign every Mach-O. AMFI refuses execve() on arm64 Mach-Os that
+    # lack a valid code signature (including ad-hoc ones) before Gatekeeper
+    # is consulted. strip(1) invalidates the linker-applied signature, so we
+    # sign here after all stripping is done. sandbox-guest is a linux/aarch64
+    # ELF and is intentionally skipped.
+    printf 'build-local-tarball.sh: ad-hoc-signing macOS Mach-O binaries ...\n'
+    for macho in "$STAGE_DIR/bin/sandboxd" \
+                 "$STAGE_DIR/bin/sandbox" \
+                 "$STAGE_DIR/bin/sandbox-agent"; do
+        codesign -s - --force "$macho"
+        codesign -v "$macho"
+    done
+
+    # LaunchDaemon + LaunchAgent plists.
+    install -m 0644 \
+        "$ROOT/sandboxd/contrib/launchd/io.sandboxd.daemon.plist" \
+        "$STAGE_DIR/launchd/io.sandboxd.daemon.plist"
+    install -m 0644 \
+        "$ROOT/sandboxd/sandbox-agent/contrib/launchd/io.sandboxd.agent.plist" \
+        "$STAGE_DIR/launchd/io.sandboxd.agent.plist"
+
+    cp "$GATEWAY_TAR" "$STAGE_DIR/images/sandbox-gateway-${VER}.tar"
+
+    # ---- Generate macOS MANIFEST ----
+    BUILD_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'local-build')
+
+    python3 - "$STAGE_DIR" "$VER" "$ARCH" "$BUILD_SHA" <<'PY'
+import hashlib
+import json
+import os
+import sys
+import datetime
+
+stage, ver, arch, build_sha = sys.argv[1:5]
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+artifacts = {
+    "sandboxd":             {"path": "bin/sandboxd"},
+    "sandbox":              {"path": "bin/sandbox"},
+    "sandbox-agent":        {"path": "bin/sandbox-agent"},
+    "sandbox-guest":        {"path": "bin/sandbox-guest"},
+    "gateway-image":        {"path": f"images/sandbox-gateway-{ver}.tar",
+                             "docker_tag": f"sandbox-gateway:{ver}"},
+    "launchd-daemon-plist": {"path": "launchd/io.sandboxd.daemon.plist"},
+    "launchd-agent-plist":  {"path": "launchd/io.sandboxd.agent.plist"},
+}
+for entry in artifacts.values():
+    entry["sha256"] = sha256(os.path.join(stage, entry["path"]))
+
+manifest = {
+    "version":    ver,
+    "arch":       arch,
+    "build_sha":  build_sha,
+    "build_time": datetime.datetime.now(datetime.timezone.utc)
+                          .strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "artifacts":  artifacts,
+}
+
+with open(os.path.join(stage, "MANIFEST"), "w") as f:
+    json.dump(manifest, f, indent=2, sort_keys=True)
+PY
+
+else
+    # Linux tarball layout.
+    mkdir -p "$STAGE_DIR/bin" \
+             "$STAGE_DIR/libexec" \
+             "$STAGE_DIR/systemd" \
+             "$STAGE_DIR/images" \
+             "$STAGE_DIR/attestations"
+
+    install -m 0755 "$RELEASE_DIR/sandboxd" \
+        "$STAGE_DIR/bin/sandboxd"
+    install -m 0755 "$RELEASE_DIR/sandbox" \
+        "$STAGE_DIR/bin/sandbox"
+    install -m 0755 "$RELEASE_DIR/sandbox-route-helper" \
+        "$STAGE_DIR/bin/sandbox-route-helper"
+    install -m 0755 "$RELEASE_DIR/sandbox-lima-helper" \
+        "$STAGE_DIR/bin/sandbox-lima-helper"
+    # sandbox-guest is a daemon-internal helper; install.sh lands it
+    # under /usr/local/libexec/sandboxd/ on the host (FHS § 4.7).
+    # The tarball uses a flat bin/ layout for simplicity — install.sh
+    # owns the FHS placement.
+    install -m 0755 "$RELEASE_DIR/sandbox-guest" \
+        "$STAGE_DIR/bin/sandbox-guest"
+    install -m 0644 "$ROOT/sandboxd/contrib/systemd/sandboxd.service" \
+        "$STAGE_DIR/systemd/sandboxd.service"
+    cp "$GATEWAY_TAR" "$STAGE_DIR/images/sandbox-gateway-${VER}.tar"
+
+    # ---- Generate Linux MANIFEST ----
+    BUILD_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'local-build')
+
+    python3 - "$STAGE_DIR" "$VER" "$ARCH" "$BUILD_SHA" <<'PY'
 import hashlib
 import json
 import os
@@ -546,6 +697,7 @@ manifest = {
 with open(os.path.join(stage, "MANIFEST"), "w") as f:
     json.dump(manifest, f, indent=2, sort_keys=True)
 PY
+fi
 
 # ----------------------------------------------------------------------------
 # Tar it up.

@@ -694,6 +694,64 @@ def release_tarball_x86_64_bumped_chain(
     return chain_tarballs
 
 
+@pytest.fixture(scope="session")
+def release_tarball_darwin(sigstore_stack, pinned_cosign_binary) -> Path:
+    """Build the local macOS (aarch64-apple-darwin) release tarball once per
+    test session.
+
+    Mirrors ``release_tarball_x86_64`` but targets Darwin arm64. Drives
+    ``build-local-tarball.sh`` which detects the Darwin host and takes the
+    macOS-specific assembly path:
+
+    * native ``cargo build --workspace --release`` for the Mach-O host
+      binaries (sandboxd, sandbox, sandbox-agent);
+    * ``make build-guest-linux-aarch64`` for the linux/aarch64 ELF guest;
+    * ad-hoc ``codesign -s -`` on every Mach-O (required for execve on
+      Apple Silicon);
+    * ``docker save sandbox-gateway:<ver>`` for the linux/arm64 gateway
+      image (the local image on Apple Silicon is already linux/arm64);
+    * MANIFEST written + cosign-signed against the local Sigstore stack.
+
+    Output: ``tests/install-e2e/dist/sandboxd-<ver>-aarch64-apple-darwin.tar.gz``
+    and a sibling ``.sigstore`` bundle.
+
+    Skips when not running on a Darwin arm64 host so the Linux x86_64
+    suite is unaffected.
+    """
+    host_os = subprocess.run(
+        ["uname", "-s"], capture_output=True, text=True
+    ).stdout.strip()
+    host_arch = subprocess.run(
+        ["uname", "-m"], capture_output=True, text=True
+    ).stdout.strip()
+    if host_os != "Darwin" or host_arch != "arm64":
+        pytest.skip(
+            f"release_tarball_darwin only assembles on Darwin arm64 "
+            f"(host is {host_os}/{host_arch})"
+        )
+
+    ver = _read_workspace_version()
+    arch = "aarch64-apple-darwin"
+    tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
+
+    # Ensure the pinned cosign binary is executable on the host — the
+    # build script needs to exec it directly to sign the tarball.
+    pinned_cosign_binary.chmod(pinned_cosign_binary.stat().st_mode | 0o111)
+
+    env = os.environ.copy()
+    env["COSIGN_BIN"] = str(pinned_cosign_binary)
+
+    subprocess.run(
+        [str(HERE / "build-local-tarball.sh")],
+        check=True,
+        timeout=1800,
+        env=env,
+    )
+
+    assert tarball.exists(), f"Darwin tarball not produced: {tarball}"
+    return tarball
+
+
 def _read_workspace_version() -> str:
     """Extract the workspace version from the root Cargo.toml.
 
@@ -1294,6 +1352,9 @@ COSIGN_SHA256_AMD64 = (
 COSIGN_SHA256_ARM64 = (
     "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a"
 )
+COSIGN_SHA256_DARWIN_ARM64 = (
+    "13343856b69f70388c4fe0b986a31dde5958e444b41be22d785d3dc5e1a9cc62"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1460,14 +1521,20 @@ def pinned_cosign_binary() -> Path:
     machine = subprocess.run(
         ["uname", "-m"], capture_output=True, text=True
     ).stdout.strip()
+    host_os = subprocess.run(
+        ["uname", "-s"], capture_output=True, text=True
+    ).stdout.strip()
     if machine == "x86_64":
         cosign_bin = "cosign-linux-amd64"
         expected_sha = COSIGN_SHA256_AMD64
     elif machine == "aarch64":
         cosign_bin = "cosign-linux-arm64"
         expected_sha = COSIGN_SHA256_ARM64
+    elif machine == "arm64" and host_os == "Darwin":
+        cosign_bin = "cosign-darwin-arm64"
+        expected_sha = COSIGN_SHA256_DARWIN_ARM64
     else:
-        pytest.skip(f"no pinned cosign for {machine}")
+        pytest.skip(f"no pinned cosign for {host_os}/{machine}")
     dest = cosign_dir / cosign_bin
     if not dest.exists() or hashlib.sha256(dest.read_bytes()).hexdigest() != expected_sha:
         url = (
