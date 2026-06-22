@@ -207,10 +207,15 @@ if [ -n "$BUMP_SNAPSHOT_DIR" ]; then
     printf 'build-local-tarball.sh: rewriting workspace root Cargo.toml version=%s -> %s\n' \
         "$BASE_VER" "$VER"
     cp -p "$WORKSPACE_CARGO_TOML" "$BUMP_SNAPSHOT_DIR/workspace-root.cargo-toml"
-    # The workspace root has exactly one `version = "X.Y.Z"` line,
-    # under `[workspace.package]`. A first-match replacement is safe
-    # and sufficient; no dependency version lines carry this pattern.
-    sed -i.bak -e "0,/^version = \"[^\"]*\"\$/{s/^version = \"[^\"]*\"\$/version = \"${VER}\"/}" \
+    # The workspace root has exactly one `version = "X.Y.Z"` line anchored
+    # at column 0 — the `[workspace.package]` version. Every dependency
+    # `version = ...` carries a leading prefix (`axum = { version`) or
+    # indentation, and `rust-version` is a distinct key, so a plain
+    # column-0-anchored substitution targets only the workspace version
+    # without the GNU-only `0,/re/{...}` first-match address (BSD sed on
+    # macOS rejects the line-zero address + single-line block form, which
+    # is why the bumped Darwin build needs the portable form here).
+    sed -i.bak -e "s/^version = \"[^\"]*\"\$/version = \"${VER}\"/" \
         "$WORKSPACE_CARGO_TOML"
     rm -f "${WORKSPACE_CARGO_TOML}.bak"
     # Confirm the rewrite landed.
@@ -325,8 +330,17 @@ elif [ "$OS_NAME" = "Darwin" ]; then
     # `--features sandbox-cli/test-env-override` opts the cosign verify-blob
     # path into honoring SANDBOX_UPDATE_TEST_* env vars (see Linux comment
     # in the portable-build arm below for full rationale).
+    #
+    # CARGO_TARGET_DIR honors CARGO_TARGET_SUBDIR so the bumped build
+    # (target/bumped) lands where RELEASE_DIR expects it. Without this the
+    # native build always wrote target/release, which is correct only for
+    # the base build (release → target); the bumped Darwin build
+    # (release-bumped → target/bumped) looked for binaries the native
+    # invocation never produced there. The docker portable arm already
+    # exports CARGO_TARGET_DIR; the native arms must too.
     ( cd "$ROOT/sandboxd" \
-        && cargo build --workspace --release \
+        && CARGO_TARGET_DIR="$ROOT/sandboxd/${CARGO_TARGET_SUBDIR}" \
+           cargo build --workspace --release \
             --features sandbox-cli/test-env-override )
 
     # Cross-compile sandbox-guest for linux/aarch64. On macOS the native
@@ -451,8 +465,11 @@ else
     printf 'build-local-tarball.sh: cargo build --workspace --release (host) ...\n'
     # See the comment in the docker arm above for why
     # `--features sandbox-cli/test-env-override` is enabled here.
+    # CARGO_TARGET_DIR honors CARGO_TARGET_SUBDIR for the bumped variant —
+    # same rationale as the native macOS arm above.
     ( cd "$ROOT/sandboxd" \
-        && cargo build --workspace --release \
+        && CARGO_TARGET_DIR="$ROOT/sandboxd/${CARGO_TARGET_SUBDIR}" \
+           cargo build --workspace --release \
             --features sandbox-cli/test-env-override )
 fi
 
