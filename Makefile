@@ -4,7 +4,8 @@
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
 	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
 	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image \
-	stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test
+	stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test \
+	setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -533,7 +534,7 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image
+setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1687,10 +1688,20 @@ setup-darwin-sandboxd-test-user: setup-darwin-sandboxd-test-group
 	  echo "$(GREEN)✓ created system user '_sandboxd-test' (UID $$_uid GID $$_gid)$(RESET)"; \
 	fi
 
-# setup-darwin-sandboxd-test-state-dir — create the e2e daemon's per-uid base
-# directory /var/lib/sandboxd/<_sandboxd-test-uid> owned by
-# _sandboxd-test:_sandboxd-test mode 0750. This is where the e2e daemon stores
-# sessions.db, per-session state, and the unix socket.
+# setup-darwin-sandboxd-test-state-dir — create the e2e daemon's per-uid state
+# tree under /var/lib/sandboxd/<uid>/:
+#   /var/lib/sandboxd/<uid>/          — base dir (sessions.db, socket) — 0750
+#   /var/lib/sandboxd/<uid>/<uid>/    — per-operator LIMA_HOME parent  — 0755
+#
+# The three-level path {state_root}/{daemon_uid}/{op_uid}/lima (lima.rs:198)
+# means the daemon's own LIMA_HOME is {uid}/{uid}/lima. The intermediate
+# {uid}/{uid}/ directory must be owned by _sandboxd-test so the daemon can
+# create its LIMA_HOME there without root; leaving it root-owned causes EACCES
+# on the daemon's ensure_operator_lima_home call.
+#
+# Note: the LIMA_HOME directory itself ({uid}/{uid}/lima) is NOT pre-created
+# here — the daemon creates it at first startup via ensure_operator_lima_home.
+# The stage-{gateway,lite}-image-test targets create it when staging tarballs.
 #
 # Mirrors setup-sandboxd-per-uid-state-dir (Linux) and the per-uid dir created
 # by install.sh for the production _sandboxd user.
@@ -1727,6 +1738,24 @@ setup-darwin-sandboxd-test-state-dir: setup-darwin-sandboxd-test-user setup-darw
 	      sudo -k chown _sandboxd-test:_sandboxd-test "$$per_uid_dir"; \
 	      echo "[sudo] chmod 0750 $$per_uid_dir"; \
 	      sudo -k chmod 0750 "$$per_uid_dir"; \
+	    fi; \
+	  fi
+	@_test_uid=$$(id -u _sandboxd-test 2>/dev/null); \
+	  op_dir="/var/lib/sandboxd/$$_test_uid/$$_test_uid"; \
+	  if [ ! -d "$$op_dir" ]; then \
+	    echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0755 $$op_dir"; \
+	    sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0755 "$$op_dir"; \
+	    echo "$(GREEN)✓ created $$op_dir (_sandboxd-test:_sandboxd-test 0755)$(RESET)"; \
+	  else \
+	    owner=$$(stat -f '%Su:%Sg' "$$op_dir" 2>/dev/null || echo "?:?"); \
+	    mode=$$(stat -f '%Lp' "$$op_dir" 2>/dev/null || echo "?"); \
+	    if [ "$$owner" = "_sandboxd-test:_sandboxd-test" ] && [ "$$mode" = "755" ]; then \
+	      echo "$(GREEN)✓ already configured: $$op_dir (_sandboxd-test:_sandboxd-test 0755)$(RESET)"; \
+	    else \
+	      echo "[sudo] chown _sandboxd-test:_sandboxd-test $$op_dir (was: $$owner 0$$mode)"; \
+	      sudo -k chown _sandboxd-test:_sandboxd-test "$$op_dir"; \
+	      echo "[sudo] chmod 0755 $$op_dir"; \
+	      sudo -k chmod 0755 "$$op_dir"; \
 	    fi; \
 	  fi
 
@@ -1810,22 +1839,21 @@ setup-darwin-test-sudoers-fragment:
 	fi
 
 # stage-gateway-image-test — save the sandbox-gateway Docker image as a tarball
-# at the e2e test daemon's per-uid base directory so `load_gateway_image_if_needed`
-# (gateway_lima.rs) can self-heal it into daemon_lima_home at startup.
+# directly into the e2e test daemon's LIMA_HOME so `load_gateway_image_if_needed`
+# (gateway_lima.rs:958) finds it as the PRIMARY path at daemon startup.
 #
-# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/gateway-image.tar
-#   (the daemon's base dir, two levels above daemon_lima_home)
+# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/<_sandboxd-test-uid>/lima/gateway-image.tar
+#   (daemon_lima_home = operator_lima_home(daemon_uid) = {state_root}/{uid}/{uid}/lima)
 #
-# The self-heal path in gateway_lima.rs:load_gateway_image_if_needed reads:
-#   {daemon_lima_home}/gateway-image.tar         <- primary (in LIMA_HOME)
-#   {daemon_lima_home}/../../gateway-image.tar   <- self-heal (base dir)
-# LIMA_HOME (/var/lib/sandboxd/<uid>/<uid>/lima) is created lazily by the
-# daemon at startup, so we stage to the base dir (the static location that
-# exists before the daemon ever runs).
+# The daemon reads:
+#   {daemon_lima_home}/gateway-image.tar         <- primary (checked first)
+#   {daemon_lima_home}/../../gateway-image.tar   <- self-heal fallback (base dir)
+# Staging to the primary path means the tarball survives the conftest between-session
+# reset, which keeps {uid}/{uid}/lima/ but wipes top-level base-dir files.
+# Creates the LIMA_HOME directory when absent (owned _sandboxd-test, mode 0750).
 #
 # The image must already be built (make gateway-image). Darwin-only.
 # Idempotent: skipped when the destination is byte-identical to the saved tarball.
-# Mirrors install.sh's `stage-gateway` step.
 stage-gateway-image-test:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ stage-gateway-image-test skipped (not macOS)$(RESET)"; \
@@ -1842,11 +1870,16 @@ stage-gateway-image-test:
 	  exit 0; \
 	fi; \
 	_test_uid=$$(id -u _sandboxd-test); \
-	_dst="/var/lib/sandboxd/$$_test_uid/gateway-image.tar"; \
+	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
+	_dst="$$_lima_home/gateway-image.tar"; \
+	if [ ! -d "$$_lima_home" ]; then \
+	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
+	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
+	fi; \
 	_tmp=/tmp/sandboxd-gateway-test-stage-$$$$.tar; \
 	echo "docker save $$_gateway_tag -o $$_tmp"; \
 	docker save "$$_gateway_tag" -o "$$_tmp"; \
-	if [ -f "$$_dst" ] && cmp -s "$$_tmp" "$$_dst"; then \
+	if sudo -k cmp -s "$$_tmp" "$$_dst" 2>/dev/null; then \
 	  rm -f "$$_tmp"; \
 	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
 	else \
@@ -1895,7 +1928,7 @@ stage-lite-image-test: lite-image
 	_tmp=/tmp/sandboxd-lite-test-stage-$$$$.tar; \
 	echo "docker save $$_lite_tag -o $$_tmp"; \
 	docker save "$$_lite_tag" -o "$$_tmp"; \
-	if [ -f "$$_dst" ] && cmp -s "$$_tmp" "$$_dst"; then \
+	if sudo -k cmp -s "$$_tmp" "$$_dst" 2>/dev/null; then \
 	  rm -f "$$_tmp"; \
 	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
 	else \
@@ -1939,10 +1972,76 @@ stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64
 	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
 	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
 	fi; \
-	if [ -f "$$_dst" ] && cmp -s "$$_built" "$$_dst"; then \
+	if sudo -k cmp -s "$$_built" "$$_dst" 2>/dev/null; then \
 	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
 	else \
 	  echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0755 $$_built $$_dst"; \
 	  sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0755 "$$_built" "$$_dst"; \
 	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
+	fi
+
+# setup-darwin-sandboxd-test-vmnet-group-membership — add `_sandboxd-test` to
+# the vmnet socket group so the daemon (running as `_sandboxd-test`) can reach
+# the vmnet pool sockets at /var/run/sandbox/vmnet/slot-*.sock.
+#
+# The socket group is detected dynamically from the running vmnet sockets rather
+# than hardcoded. New installs (from setup-darwin-vmnet-plists) use `_sandboxd`
+# as the socket group; hosts provisioned before that change may use `_sandbox`
+# (macOS's built-in Seatbelt group, GID 60). Reading the actual socket's group
+# keeps this target correct for both.
+#
+# Idempotence: dseditgroup membership check; sudo only when not yet a member.
+#
+# Ordering: must run after setup-darwin-sandboxd-test-user.
+setup-darwin-sandboxd-test-vmnet-group-membership: setup-darwin-sandboxd-test-user
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-test-vmnet-group-membership skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_sock=$$(ls /var/run/sandbox/vmnet/slot-0.sock 2>/dev/null); \
+	if [ -z "$$_sock" ]; then \
+	  echo "WARNING: /var/run/sandbox/vmnet/slot-0.sock not found; skipping vmnet group membership."; \
+	  echo "  The vmnet pool daemons may not be running. Run 'make setup-darwin-vmnet-daemons' first,"; \
+	  echo "  then re-run this target."; \
+	  exit 0; \
+	fi; \
+	_vmnet_group=$$(stat -f '%Sg' /var/run/sandbox/vmnet/slot-0.sock 2>/dev/null); \
+	if [ -z "$$_vmnet_group" ]; then \
+	  echo "WARNING: could not determine vmnet socket group; skipping."; \
+	  exit 0; \
+	fi; \
+	if dseditgroup -o checkmember -m _sandboxd-test "$$_vmnet_group" >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: _sandboxd-test is in vmnet socket group '$$_vmnet_group'$(RESET)"; \
+	else \
+	  echo "[sudo] dseditgroup -o edit -a _sandboxd-test -t user $$_vmnet_group  (vmnet socket access)"; \
+	  sudo -k dseditgroup -o edit -a _sandboxd-test -t user "$$_vmnet_group"; \
+	  echo "$(GREEN)✓ added _sandboxd-test to group '$$_vmnet_group'$(RESET)"; \
+	fi
+
+# setup-darwin-sandbox-shared — create /tmp/sandbox-shared as drwxr-xr-x (0755)
+# for the shared workspace mount that QEMU (running as _sandboxd-test) must access.
+# /tmp is mode 1777 so any user can create entries there; the 0755 mode makes the
+# directory world-traversable (required for QEMU's VirtFS/9p mount point).
+#
+# Idempotent: mkdir -p is a no-op when the directory exists; chmod is a no-op when
+# the mode is already correct.
+setup-darwin-sandbox-shared:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandbox-shared skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@if [ -d /tmp/sandbox-shared ]; then \
+	  mode=$$(stat -f '%Lp' /tmp/sandbox-shared 2>/dev/null || echo "?"); \
+	  if [ "$$mode" = "755" ]; then \
+	    echo "$(GREEN)✓ already configured: /tmp/sandbox-shared (0755)$(RESET)"; \
+	  else \
+	    echo "chmod 0755 /tmp/sandbox-shared (was: 0$$mode)"; \
+	    chmod 0755 /tmp/sandbox-shared; \
+	    echo "$(GREEN)✓ /tmp/sandbox-shared mode corrected to 0755$(RESET)"; \
+	  fi; \
+	else \
+	  echo "mkdir -p /tmp/sandbox-shared && chmod 0755 /tmp/sandbox-shared"; \
+	  mkdir -p /tmp/sandbox-shared; \
+	  chmod 0755 /tmp/sandbox-shared; \
+	  echo "$(GREEN)✓ created /tmp/sandbox-shared (0755)$(RESET)"; \
 	fi
