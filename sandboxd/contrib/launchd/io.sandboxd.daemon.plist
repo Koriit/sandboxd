@@ -105,7 +105,7 @@
             etc.) can locate their binaries regardless of how launchd was started.
         -->
         <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 
         <!--
             Pin HOME to the daemon base dir.  launchd does not populate HOME from

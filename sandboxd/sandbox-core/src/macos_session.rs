@@ -754,14 +754,14 @@ pub fn teardown_macos_gateway(
 /// with a descriptive message when either is confirmed non-zero.
 #[cfg(target_os = "macos")]
 pub fn check_host_ip_forwarding_disabled() -> Result<(), SandboxError> {
-    let out4 = std::process::Command::new("sysctl")
+    let out4 = std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "net.inet.ip.forwarding"])
         .output()
         .map_err(|e| SandboxError::Internal(format!("sysctl failed: {e}")))?;
     // The correct macOS IPv6 forwarding key is net.inet6.ip6.forwarding (note:
     // "inet6", not "inet.ip6"). The key net.inet.ip6.forwarding does not exist
     // on macOS and returns "unknown oid" on stderr with no stdout output.
-    let out6 = std::process::Command::new("sysctl")
+    let out6 = std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "net.inet6.ip6.forwarding"])
         .output()
         .map_err(|e| SandboxError::Internal(format!("sysctl failed: {e}")))?;

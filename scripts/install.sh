@@ -854,6 +854,22 @@ check_socket_vmnet_installed() {
     return 0
 }
 
+# check_qemu_installed — verify qemu-system-aarch64 is present on Apple Silicon.
+# The gateway Lima VM uses QEMU under the hood; without it the daemon fails
+# to start the gateway with "failed to find the QEMU binary for the architecture aarch64".
+# Returns 0 when found, 1 when absent.
+check_qemu_installed() {
+    if command -v qemu-system-aarch64 >/dev/null 2>&1; then
+        return 0
+    fi
+    # Homebrew on Apple Silicon places QEMU under /opt/homebrew/bin; check
+    # explicitly in case it is not yet on PATH (e.g. fresh launchd environment).
+    if [ -x "/opt/homebrew/bin/qemu-system-aarch64" ]; then
+        return 0
+    fi
+    return 1
+}
+
 # check_lima_installed_and_version — verify limactl is on PATH and reports a
 # version >= MIN_LIMA_VERSION.  Returns 0 on success, 1 on failure.
 # Adds a descriptive key to the missing list when called from check_prereqs.
@@ -959,6 +975,7 @@ check_prereqs() {
         # unhealthy), not when they are simply absent.
         check_socket_vmnet_installed || add_missing "socket_vmnet"
         check_lima_installed_and_version || add_missing "lima-1.2.0+"
+        check_qemu_installed || add_missing "qemu-system-aarch64"
         command -v curl    >/dev/null 2>&1 || add_missing "curl"
         command -v shasum  >/dev/null 2>&1 || add_missing "shasum"
         command -v tar     >/dev/null 2>&1 || add_missing "tar"
@@ -976,6 +993,11 @@ check_prereqs() {
                             ;;
                         lima-1.2.0+)
                             emit "    - lima (>= $MIN_LIMA_VERSION):    brew install lima"
+                            ;;
+                        qemu-system-aarch64)
+                            emit "    - qemu:    brew install qemu"
+                            emit "      (or: brew install lima — Homebrew's lima formula depends on qemu)"
+                            emit "      (binary must be at /opt/homebrew/bin/qemu-system-aarch64)"
                             ;;
                         socket_vmnet-daemons-unhealthy)
                             emit "    - vmnet daemons are loaded but unhealthy (slot socket(s) missing)"
@@ -1264,9 +1286,10 @@ cosign_bootstrap() {
     dest="$TMPDIR_INSTALL/cosign"
     source_kind="download"
 
+    _sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
     download_with_bar "$cosign_url" "$dest"
     if [ "$DOWNLOAD_BAR_FAILED" -eq 0 ]; then
-        actual=$(sha256sum "$dest" | awk '{print $1}')
+        actual=$(_sha256 "$dest")
         if [ "$actual" != "$expected" ]; then
             die "cosign checksum mismatch (expected $expected got $actual)"
         fi
@@ -1274,7 +1297,7 @@ cosign_bootstrap() {
     elif [ -x /usr/local/bin/cosign ]; then
         # Air-gapped fallback: operator pre-staged cosign.
         cp /usr/local/bin/cosign "$dest"
-        actual=$(sha256sum "$dest" | awk '{print $1}')
+        actual=$(_sha256 "$dest")
         if [ "$actual" != "$expected" ]; then
             die "pre-staged /usr/local/bin/cosign sha256 mismatch (expected $expected got $actual)"
         fi
@@ -1330,7 +1353,11 @@ tarball_fetch() {
     fi
 
     size_kb=$(du -k "$tarball_dest" 2>/dev/null | awk '{print $1}')
-    TARBALL_SHA256=$(sha256sum "$tarball_dest" | awk '{print $1}')
+    if command -v sha256sum >/dev/null 2>&1; then
+        TARBALL_SHA256=$(sha256sum "$tarball_dest" | awk '{print $1}')
+    else
+        TARBALL_SHA256=$(shasum -a 256 "$tarball_dest" | awk '{print $1}')
+    fi
     log_ok "step=tarball_fetch source=$source_label version=$VERSION size=${size_kb}KB"
 }
 
@@ -1463,8 +1490,13 @@ extract_tarball() {
     MANIFEST_BUILD_SHA=$(jq -r '.build_sha // empty' "$manifest")
 
     # Per-artifact sha256 checks.
+    if command -v sha256sum >/dev/null 2>&1; then
+        _sha256_check() { (cd "$STAGE" && sha256sum -c --status -); }
+    else
+        _sha256_check() { (cd "$STAGE" && shasum -a 256 -c --status -); }
+    fi
     jq -r '.artifacts | to_entries[] | "\(.value.sha256)  \(.value.path)"' "$manifest" \
-        | (cd "$STAGE" && sha256sum -c --status -) \
+        | _sha256_check \
         || { spinner_stop 1 "extracting and verifying tarball"; \
              die "MANIFEST sha256 check failed for at least one artifact"; }
 
@@ -1565,8 +1597,25 @@ _compute_plan_darwin() {
     PLAN_LIMA_HELPER_CAPS="skip"
     PLAN_BRIDGE_HELPER_SETUID="skip"
     PLAN_BRIDGE_CONF="skip"
-    PLAN_USERS_CONF="skip"
-    PLAN_USERS_CONF_CONTENT=""
+
+    # ---- /etc/sandboxd/users.conf (macOS) ----
+    if [ -f /etc/sandboxd/users.conf ]; then
+        PLAN_USERS_CONF="skip"
+        PLAN_USERS_CONF_CONTENT=""
+    else
+        PLAN_USERS_CONF="create"
+        _op_for_pool="${OPERATOR_NAME:-_sandboxd}"
+        PLAN_USERS_CONF_CONTENT=$(printf '{
+  "_schema_version": 1,
+  "subnets": [
+    {
+      "comment": "Production pool. Daemon user is '"'"'_sandboxd'"'"'; the installing operator is also listed.",
+      "cidr": "10.209.0.0/20",
+      "allow_users": ["_sandboxd", "%s"]
+    }
+  ]
+}' "$_op_for_pool")
+    fi
     # macOS: stage the gateway image tarball to the daemon LIMA_HOME so the
     # daemon can load it into the gateway VM at first start (and self-heal on
     # subsequent starts if the image is missing). No docker load here — the
@@ -1906,6 +1955,19 @@ _render_plan_darwin() {
     fi
     emit ""
 
+    # ---- /etc/sandboxd/users.conf (macOS) ----
+    hdr="/etc/sandboxd/users.conf"
+    emit "  $(osc8_link "${DOCS_BASE}#users-conf" "$hdr")"
+    if [ "$PLAN_USERS_CONF" = "skip" ]; then
+        emit "    ${GREEN}+ /etc/sandboxd/users.conf already exists, skip${RESET}"
+    else
+        emit "    ${YELLOW}+ create /etc/sandboxd/users.conf (mode 0644, root:wheel):${RESET}"
+        printf '%s\n' "$PLAN_USERS_CONF_CONTENT" | while IFS= read -r _line; do
+            emit "        $_line"
+        done
+    fi
+    emit ""
+
     # ---- daemon LaunchDaemon plist ----
     hdr="sandboxd LaunchDaemon"
     emit "  $(osc8_link "${DOCS_BASE}#daemon" "$hdr")"
@@ -2230,7 +2292,7 @@ fi
 exec 3>&- 2>/dev/null || true' EXIT
 
 _n=0
-_TOTAL_STEPS=$(if [ "$OS" = "darwin" ]; then printf '11'; else printf '15'; fi)
+_TOTAL_STEPS=$(if [ "$OS" = "darwin" ]; then printf '12'; else printf '15'; fi)
 # Tracks the label of the last successfully completed step (set by _step_ok).
 # Used by _write_checkpoint to populate last_completed_step correctly on
 # failure checkpoints (the failing step should appear in failed_step, not
@@ -2336,7 +2398,11 @@ _write_checkpoint() {
 
     _cp_users_conf_sha="null"
     if [ "\$_cp_eff_created_conf" = "1" ] && [ -f /etc/sandboxd/users.conf ]; then
-        _cp_h=\$(sha256sum /etc/sandboxd/users.conf | awk '{print \$1}')
+        if command -v sha256sum >/dev/null 2>&1; then
+            _cp_h=\$(sha256sum /etc/sandboxd/users.conf | awk '{print \$1}')
+        else
+            _cp_h=\$(shasum -a 256 /etc/sandboxd/users.conf | awk '{print \$1}')
+        fi
         _cp_users_conf_sha=\$(json_str "\$_cp_h")
     fi
     if [ -n "\$MANIFEST_BUILD_SHA" ]; then
@@ -2660,7 +2726,11 @@ for _entry in \$PLAN_BINARIES; do
                 _step_fail
                 ;;
         esac
-        install -D -m 0755 -o root -g root "\$_src" "\$_dst" >> "\$_LOG" 2>&1 \
+        _grp="\$(if [ "\$OS" = "darwin" ]; then printf 'wheel'; else printf 'root'; fi)"
+        _dst_dir="\$(dirname "\$_dst")"
+        install -d -o root -g "\$_grp" -m 0755 "\$_dst_dir" >> "\$_LOG" 2>&1 \
+            || { _log "step=install_binary path=\$_dst action=fail reason=mkdir status=fail"; _step_fail; }
+        install -m 0755 -o root -g "\$_grp" "\$_src" "\$_dst" >> "\$_LOG" 2>&1 \
             || { _log "step=install_binary path=\$_dst action=fail status=fail"; _step_fail; }
         if command -v sha256sum >/dev/null 2>&1; then
             _sha=\$(sha256sum "\$_dst" | awk '{print \$1}')
@@ -2680,7 +2750,10 @@ _write_checkpoint "install-binaries"
 # ----- Step: install cosign -----
 _step_begin "install-cosign"
 _priv_maybe_abort_at "install-cosign"
-install -D -m 0755 -o root -g root "\$COSIGN" /usr/local/libexec/sandboxd/cosign >> "\$_LOG" 2>&1 \
+_cosign_grp="\$(if [ "\$OS" = "darwin" ]; then printf 'wheel'; else printf 'root'; fi)"
+install -d -o root -g "\$_cosign_grp" -m 0755 /usr/local/libexec/sandboxd >> "\$_LOG" 2>&1 \
+    || { _log "step=install_cosign action=fail reason=mkdir status=fail"; _step_fail; }
+install -m 0755 -o root -g "\$_cosign_grp" "\$COSIGN" /usr/local/libexec/sandboxd/cosign >> "\$_LOG" 2>&1 \
     || { _log "step=install_cosign path=/usr/local/libexec/sandboxd/cosign action=fail status=fail"; _step_fail; }
 _log "step=install_cosign path=/usr/local/libexec/sandboxd/cosign action=install status=ok"
 _step_ok
@@ -2889,6 +2962,27 @@ done
 _step_ok
 _write_checkpoint "bootstrap-vmnet-daemons"
 _priv_maybe_fail_after "bootstrap-vmnet-daemons"
+
+# ----- Step: users.conf (macOS) -----
+_step_begin "users-conf"
+_priv_maybe_abort_at "users-conf"
+WE_CREATED_USERS_CONF=0
+if [ "\$PLAN_USERS_CONF" = "create" ]; then
+    mkdir -p /etc/sandboxd >> "\$_LOG" 2>&1 \
+        || { _log "step=users_conf mkdir action=fail status=fail"; _step_fail; }
+    _staged="\$TMPDIR_INSTALL/users.conf"
+    printf '%s\n' "\$PLAN_USERS_CONF_CONTENT" > "\$_staged" \
+        || { _log "step=users_conf stage action=fail status=fail"; _step_fail; }
+    install -m 0644 -o root -g wheel "\$_staged" /etc/sandboxd/users.conf >> "\$_LOG" 2>&1 \
+        || { _log "step=users_conf install action=fail status=fail"; _step_fail; }
+    WE_CREATED_USERS_CONF=1
+    _log "step=users_conf action=create status=ok"
+else
+    _log "step=users_conf action=skip status=ok"
+fi
+_step_ok
+_write_checkpoint "users-conf"
+_priv_maybe_fail_after "users-conf"
 
 # ----- Step: install sandbox-agent LaunchAgent (macOS) -----
 _step_begin "install-agent"
