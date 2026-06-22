@@ -144,3 +144,183 @@ resolvers into the running gateway VM is not implemented in the current
 release. The manual restart is the supported remedy. Watch the issue tracker
 for a future `sandbox update-resolvers` command or a daemon-triggered
 auto-refresh.
+
+## Workspace access and TCC (Transparency, Consent, and Control)
+
+macOS TCC governs access to user data in protected directories: `~/Documents`,
+`~/Desktop`, `~/Downloads`, `~/Pictures`, `~/Movies`, `~/Music`, and similar
+locations. sandboxd interacts with TCC only through `shared:` workspace mounts
+on the full Lima backend.
+
+### Zero-prompt default
+
+If you keep your workspace outside protected directories — for example
+`~/projects/my-repo`, `~/dev/work`, `/tmp/scratch` — TCC never triggers.
+No consent dialog, no System Settings entry needed. This is the recommended
+starting point.
+
+```sh
+# No TCC involvement:
+sandbox create --workspace shared:~/projects/my-repo
+```
+
+### One-time TCC consent for protected directories
+
+`sandbox create --workspace shared:~/Documents/my-project` makes the sandbox
+VM access `~/Documents` on the host via a 9p shared mount whose host-side file
+access is performed by the `sandbox-agent` process running in your login
+session.
+
+Because the agent runs in your Aqua session as your own uid, macOS can show you
+a normal "allow access to your Documents?" consent prompt — the first time you
+use a protected directory. After you click Allow, the grant persists across
+subsequent uses.
+
+**Which binary triggers the prompt** depends on how macOS TCC attributes the
+file access within the `sandbox-agent` → `limactl` → `qemu-system` process
+chain. The possible outcomes are:
+
+| Attribution | Effect |
+|---|---|
+| `sandbox-agent` | One clean grant, stable across `brew upgrade qemu` and `brew upgrade lima` |
+| `qemu-system` or `limactl` | Grant re-triggers on every `brew upgrade qemu`/`lima` because the cdhash changes |
+
+Both cases produce a working grant; only the upgrade-invalidation behavior
+differs. See the manual verification procedure at the end of this section for
+the step to confirm which binary your system attributes the access to.
+
+### Full Disk Access fallback
+
+If no TCC prompt appears when you first use a protected directory — possible
+when `qemu-system` is fully daemonized and detached from the agent's
+responsibility chain — the access is silently denied. The remedy is a one-time
+manual grant via System Settings:
+
+1. Open **System Settings → Privacy & Security → Full Disk Access**.
+2. Click the `+` button and add the binary that owns the access (either
+   `sandbox-agent` at `/usr/local/libexec/sandboxd/sandbox-agent`, or
+   `/opt/homebrew/bin/qemu-system-aarch64` if TCC attributed the access there).
+3. Toggle the switch to On and authenticate.
+
+After granting Full Disk Access, the protected-directory mount works without
+further prompts.
+
+**`brew upgrade` caveat.** If TCC granted access to `qemu-system` or `limactl`
+rather than to `sandbox-agent`, any `brew upgrade qemu` or `brew upgrade lima`
+changes the binary's cdhash and invalidates the grant, re-triggering a prompt
+on next use. To avoid repeated grants, either use the Full Disk Access option
+(which is stable across upgrades) or keep workspaces outside protected
+directories.
+
+### TCC and the lite (container) backend
+
+The lite backend uses `_sandboxd` (the system daemon user) to perform host-side
+file access for `shared:` mounts, not the operator's session. TCC consent from
+the operator does not apply to the daemon user — access is silently denied for
+protected directories regardless of any per-operator grant. Keep lite-backend
+`shared:` sources outside TCC-protected directories.
+
+### `sandbox doctor` TCC check
+
+`sandbox doctor` displays a **C23 — TCC workspace access** row. This row is
+informational only; it does not block doctor from passing or prevent session
+creation. If a `shared:` mount into a protected directory fails, consult
+the Full Disk Access grant steps above rather than the doctor row.
+
+---
+
+## Real-chain TCC verification procedure (manual, Aqua GUI session required)
+
+This procedure records which binary in the agent → `limactl` → `qemu-system`
+chain TCC attributes a protected-directory file access to, and whether a
+consent prompt appears at all. Run it on a real Apple-Silicon Mac with an
+active GUI login session. It cannot be performed headlessly or in a CI
+environment.
+
+**Prerequisites before starting:**
+
+- [ ] sandboxd installed and the daemon running (`sandbox doctor` reports
+      healthy).
+- [ ] The `io.sandboxd.agent` LaunchAgent is loaded in your login session
+      (check: `launchctl print gui/$(id -u)/io.sandboxd.agent` — should not
+      return error).
+- [ ] No existing TCC grant for `sandbox-agent`, `qemu-system-aarch64`, or
+      `limactl` in **System Settings → Privacy & Security → Full Disk Access**.
+      Remove any pre-existing grants before running this test to avoid masking
+      a denial.
+- [ ] `~/Documents/tcc-test/` directory exists and contains at least one file
+      the test session can read.
+
+**Steps:**
+
+1. Open a terminal in your GUI login session (not SSH-only).
+
+2. Confirm the agent is running in your Aqua session:
+   ```sh
+   launchctl print gui/$(id -u)/io.sandboxd.agent
+   ```
+   The output should show `state = running`. If it shows `state = not running`,
+   the agent has not checked in with the daemon yet — wait a moment and retry,
+   or check `/var/log/sandbox/agent.stderr.log` for errors.
+
+3. Create a full-backend session with a `shared:` mount into `~/Documents`:
+   ```sh
+   sandbox create --workspace shared:~/Documents/tcc-test my-tcc-test
+   ```
+
+4. **Observe:** Does a TCC consent dialog appear?
+
+   - **If yes:** Note the binary name shown in the dialog. It is either
+     `sandbox-agent`, `limactl`, or `qemu-system-aarch64`. Record it in the
+     results table below.
+   - **If no dialog appears and the mount fails:** TCC silently denied access
+     (fully daemonized qemu with no Aqua responsibility chain). Record
+     "no prompt, access denied" and use the Full Disk Access fallback.
+   - **If no dialog appears and the mount succeeds:** A pre-existing grant
+     is masking the test. Re-check and clear all relevant grants, then retry.
+
+5. If a dialog appeared, click **Allow**.
+
+6. Verify the mount works:
+   ```sh
+   sandbox exec my-tcc-test -- ls /workspace
+   ```
+   You should see the files from `~/Documents/tcc-test/`.
+
+7. Test grant persistence across a session restart:
+   ```sh
+   sandbox stop my-tcc-test
+   sandbox start my-tcc-test
+   sandbox exec my-tcc-test -- ls /workspace
+   ```
+   No second prompt should appear; the mount should succeed.
+
+8. Test upgrade invalidation (only relevant if the dialog named `qemu-system`
+   or `limactl`):
+   ```sh
+   brew upgrade qemu  # or: brew upgrade lima
+   sandbox stop my-tcc-test
+   sandbox start my-tcc-test
+   sandbox exec my-tcc-test -- ls /workspace
+   ```
+   If a new consent prompt appears after the upgrade, the grant was keyed to
+   the Homebrew binary's cdhash. Record this behavior in the table below.
+
+9. Clean up:
+   ```sh
+   sandbox rm --force my-tcc-test
+   ```
+
+**Results table — record outcome here:**
+
+| Item | Result |
+|---|---|
+| macOS version | |
+| Apple Silicon model | |
+| Prompt appeared on first `shared:~/Documents` access? | yes / no |
+| If yes — binary named in the prompt | sandbox-agent / qemu-system-aarch64 / limactl / other |
+| Mount succeeded after Allow? | yes / no |
+| Grant persisted across session restart? | yes / no |
+| After `brew upgrade qemu` — new prompt appeared? | yes / no / not tested |
+| Full Disk Access required as fallback? | yes / no |
+| Notes | |
