@@ -1018,7 +1018,31 @@ def _harvest_logs(vm, dest_dir):
 
 @pytest.fixture(scope="session", autouse=True)
 def _preflight():
-    """Skip the whole suite if Lima or /dev/kvm is unavailable."""
+    """Skip the whole suite if no supported VM backend is available.
+
+    Two backends, selected by host OS:
+
+    * **Linux** — the install-e2e VMs are Lima/QEMU guests; the suite
+      needs ``limactl`` on PATH and ``/dev/kvm`` for hardware accel.
+    * **macOS (Darwin/arm64)** — the install-e2e VMs are Tart guests
+      (see ``tart_vm_factory``); the suite needs the ``tart`` CLI. The
+      Lima/KVM guard is deliberately *not* applied on Darwin: a Mac has
+      no ``/dev/kvm`` and the macOS install path is exercised inside a
+      Tart VM, not a Lima one.
+
+    The autouse fixture only gates the session as a whole on the
+    presence of *some* backend. Per-test applicability is enforced by
+    the individual fixtures: the Linux-only ``vm_factory`` /
+    ``release_tarball_x86_64`` skip on non-x86_64 hosts, and the
+    macOS-only Tart fixtures skip on non-Darwin hosts.
+    """
+    host_os = subprocess.run(
+        ["uname", "-s"], capture_output=True, text=True
+    ).stdout.strip()
+    if host_os == "Darwin":
+        if shutil.which("tart") is None:
+            pytest.skip("tart not installed on host; macOS install-e2e requires Tart")
+        return
     if shutil.which("limactl") is None:
         pytest.skip("limactl not installed on host")
     if not Path("/dev/kvm").exists():
@@ -1875,3 +1899,380 @@ def read_route_helper_audit_log(vm, audit_log_path):
             continue
         records.append(json.loads(line))
     return records
+
+
+# ===========================================================================
+# macOS / Tart install-e2e harness.
+# ===========================================================================
+#
+# The macOS analog of the Lima ``vm_factory`` above. Boots a fresh Tart guest
+# per test, ``brew install``s install.sh's Darwin hard prereqs
+# (socket_vmnet + lima >= 1.2.0), copies the locally-built darwin tarball +
+# the unmodified install.sh into it, and runs the install path end-to-end.
+# Each guest is stopped + deleted on teardown.
+#
+# Sigstore reachability: the local stack publishes on the host's 127.0.0.1
+# only, which a Tart guest cannot reach. ``tart_sigstore_relay`` opens a
+# host-side TCP forwarder bound to 0.0.0.0 for each sigstore port so the guest
+# reaches the stack at its vmnet gateway IP (the macOS analog of Lima's
+# ``host.lima.internal``). See ``tart_harness.SigstoreRelay``.
+
+from tart_harness import (  # noqa: E402
+    GUEST_PATH_PREFIX,
+    SigstoreRelay,
+    TART_BASE_IMAGE,
+    TartVM,
+    generate_keypair,
+    host_supports_nested_virt,
+    seed_ssh_key,
+    tart_clone,
+    tart_delete,
+    tart_ip,
+    tart_run_headless,
+    tart_set_resources,
+    tart_stop,
+    wait_for_ssh,
+)
+
+# Sigstore ports the guest must reach during install.sh's cosign verify-blob.
+# Rekor (3000) is the only network call cosign makes when the Fulcio root and
+# the Rekor/CT pubkeys are supplied as local files (the test-env vars below);
+# Fulcio (5555) is relayed too for robustness / future sign-in-guest paths.
+SIGSTORE_RELAY_PORTS = (5555, 3000)
+
+
+def _is_darwin_arm64() -> bool:
+    host_os = subprocess.run(
+        ["uname", "-s"], capture_output=True, text=True
+    ).stdout.strip()
+    host_arch = subprocess.run(
+        ["uname", "-m"], capture_output=True, text=True
+    ).stdout.strip()
+    return host_os == "Darwin" and host_arch == "arm64"
+
+
+@pytest.fixture(scope="session")
+def tart_ssh_key(tmp_path_factory) -> Path:
+    """Generate one ephemeral ed25519 keypair for the whole session.
+
+    Reused across every Tart guest: each guest gets the same public key
+    seeded into ``admin``'s authorized_keys on first contact, then key auth is
+    used for everything after.
+    """
+    if not _is_darwin_arm64():
+        pytest.skip("tart_ssh_key only applies on Darwin arm64")
+    key_dir = tmp_path_factory.mktemp("tart-ssh-key")
+    return generate_keypair(key_dir)
+
+
+@pytest.fixture(scope="session")
+def tart_sigstore_relay(sigstore_stack):
+    """Host-side TCP relay exposing the sigstore ports on all interfaces.
+
+    Depends on ``sigstore_stack`` so the stack is up (and its ports bound on
+    127.0.0.1) before the relay starts forwarding. Bound for the whole session
+    and torn down at the end.
+    """
+    if not _is_darwin_arm64():
+        pytest.skip("tart_sigstore_relay only applies on Darwin arm64")
+    relay = SigstoreRelay(SIGSTORE_RELAY_PORTS).start()
+    try:
+        yield relay
+    finally:
+        relay.stop()
+
+
+@pytest.fixture
+def tart_vm_factory(request, built_scripts, tart_ssh_key):
+    """Spawn-on-demand factory for Tart macOS guests scoped to one test.
+
+    Each invocation clones the base image, boots it headless, seeds the ssh
+    key, optionally ``brew install``s install.sh's Darwin hard prereqs
+    (socket_vmnet + lima), and stages the built install.sh into /tmp. Returns
+    a ``TartVM`` handle. Every guest is stopped + deleted on teardown; the run
+    log + install log are harvested to ``logs/<test>/<vm>/`` on failure.
+    """
+    if not _is_darwin_arm64():
+        pytest.skip("tart_vm_factory only applies on Darwin arm64")
+
+    # (name, proc_or_none, vm_or_none). Name registered before boot so a crash
+    # mid-create still triggers cleanup (mirrors the Lima factory).
+    created = []
+    test_name = request.node.name.replace("/", "_").replace(":", "_")[:80]
+
+    def _factory(*, install_prereqs=True, install_scripts=True):
+        name = tart_vm_name_unique()
+        created.append([name, None, None])
+
+        tart_clone(TART_BASE_IMAGE, name)
+        tart_set_resources(name)
+
+        run_log = LOGS_DIR / test_name / name / "tart-run.log"
+        run_log.parent.mkdir(parents=True, exist_ok=True)
+        # Boot with --nested when the host supports it (M3+) so the daemon's
+        # gateway QEMU VM (accel=hvf) can boot inside the guest. On M1/M2 the
+        # daemon can never reach "healthy" inside a Tart guest (see the
+        # nested-virt note in the M22-S8 findings handoff).
+        proc = tart_run_headless(name, run_log, nested=host_supports_nested_virt())
+        created[-1][1] = proc
+
+        ip = tart_ip(name)
+        wait_for_ssh(ip)
+        seed_ssh_key(ip, str(tart_ssh_key) + ".pub")
+
+        vm = TartVM(name=name, ip=ip, key_path=tart_ssh_key)
+        created[-1][2] = vm
+
+        # Sanity: key auth + passwordless sudo both work before proceeding.
+        r = vm.shell("whoami && sudo -n true && echo SUDO_OK", check=True, timeout=30)
+        assert "SUDO_OK" in r.stdout, f"passwordless sudo unavailable in guest: {r.stdout!r}"
+
+        if install_prereqs:
+            _install_prereqs_tart(vm)
+
+        if install_scripts:
+            _stage_scripts_tart(vm, built_scripts)
+
+        return vm
+
+    yield _factory
+
+    # --- teardown ---
+    rep = getattr(request.node, "rep_call", None)
+    failed = rep is not None and rep.failed
+    for name, proc, vm in created:
+        if failed and vm is not None:
+            _harvest_logs_tart(vm, LOGS_DIR / test_name / name)
+        tart_stop(name)
+        if proc is not None:
+            try:
+                proc.wait(timeout=30)
+            except Exception:  # noqa: BLE001
+                proc.kill()
+        tart_delete(name)
+
+
+def tart_vm_name_unique():
+    """A short unique Tart VM name (re-exported helper)."""
+    import tart_harness
+    return tart_harness.tart_vm_name()
+
+
+def _install_prereqs_tart(vm):
+    """brew install the guest prerequisites needed for a healthy install.
+
+    install.sh's Darwin ``check_prereqs`` hard-requires:
+      * socket_vmnet at /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet
+      * limactl >= 1.2.0 on PATH
+      * curl, shasum, tar (present in the base macOS install)
+    cosign is auto-bootstrapped by install.sh (pinned download).
+
+    **qemu** is NOT in install.sh's prereq check (see GAP #5 in the M22-S8
+    findings), but the daemon's macOS full backend boots a *QEMU* gateway Lima
+    VM at startup — without ``qemu-system-aarch64`` on PATH the daemon can
+    never reach "healthy". We install it here so the harness reflects the
+    daemon's real runtime needs; the gap itself is reported for an install.sh
+    fix.
+
+    This is the slow step (~5-10 min for the three bottle installs).
+    """
+    # `brew install` prints progress to stderr and can take minutes; give it a
+    # generous budget. The env vars keep brew non-interactive / fast.
+    vm.shell(
+        "export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 "
+        "HOMEBREW_NO_INSTALL_CLEANUP=1; "
+        "brew install socket_vmnet lima qemu",
+        check=True,
+        timeout=1800,
+    )
+    # Verify the hard-prereq landing spots install.sh probes.
+    r = vm.shell(
+        "test -x /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet && echo SVMNET_OK; "
+        "limactl --version; "
+        "command -v qemu-system-aarch64 && echo QEMU_OK",
+        check=True,
+        timeout=60,
+    )
+    assert "SVMNET_OK" in r.stdout, (
+        f"socket_vmnet not at expected path after brew install: {r.stdout!r} {r.stderr!r}"
+    )
+    assert "QEMU_OK" in r.stdout, (
+        f"qemu-system-aarch64 not on PATH after brew install: {r.stdout!r} {r.stderr!r}"
+    )
+
+
+def _stage_scripts_tart(vm, built_dir: Path) -> None:
+    """Copy the built install.sh / uninstall.sh into /tmp inside the guest.
+
+    Stages the artifacts from ``scripts/build.sh --keep-test-env`` (ui.sh
+    inlined, SANDBOX_INSTALL_TEST_* spans retained). scp targets /tmp because
+    the ``admin`` user can write there without sudo.
+    """
+    vm.cp(built_dir / "install.sh", "/tmp/install.sh")
+    vm.cp(built_dir / "uninstall.sh", "/tmp/uninstall.sh")
+    vm.shell("chmod +x /tmp/install.sh /tmp/uninstall.sh", check=True)
+
+
+def _harvest_logs_tart(vm, dest_dir):
+    """Best-effort: dump the install log + launchctl/dscl state on failure."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    targets = [
+        ("install.log", "sudo cat /var/log/sandbox-install.log 2>/dev/null || true"),
+        ("cosign-debug.log", "cat /tmp/sandbox-install-cosign-debug.log 2>/dev/null || true"),
+        ("install-state",
+         "SUID=$(id -u _sandboxd 2>/dev/null || echo ''); "
+         "if [ -n \"$SUID\" ]; then sudo cat \"/var/lib/sandboxd/$SUID/.install-state.json\" 2>/dev/null || true; fi"),
+        ("launchctl-daemon", "sudo launchctl print system/io.sandboxd.daemon 2>&1 || true"),
+        ("launchctl-vmnet", "for s in 0 1 2 3 4 5 6 7; do echo \"--- slot $s ---\"; sudo launchctl print system/io.sandboxd.vmnet.$s 2>&1 | head -40 || true; done"),
+        ("dscl-user", "dscl . -read /Users/_sandboxd 2>&1 || true"),
+        ("dscl-group", "dscl . -read /Groups/_sandboxd 2>&1 || true"),
+        ("ls-libexec", "ls -la /usr/local/libexec/sandboxd/ /usr/local/bin/sandbox /Library/sandboxd/ 2>&1 || true"),
+        ("ls-plists", "ls -la /Library/LaunchDaemons/io.sandboxd.* /Library/LaunchAgents/io.sandboxd.* 2>&1 || true"),
+        ("vmnet-sock", "ls -la /var/run/sandbox/ /var/run/sandbox/vmnet/ 2>&1 || true"),
+        ("daemon-stderr", "sudo cat /var/log/sandbox/daemon.stderr.log 2>/dev/null | tail -80 || true"),
+    ]
+    for fname, cmd in targets:
+        try:
+            r = vm.shell(cmd, timeout=40)
+            (dest_dir / fname).write_text(
+                f"=== stdout ===\n{r.stdout}\n=== stderr ===\n{r.stderr}\n"
+            )
+        except Exception as exc:  # noqa: BLE001
+            (dest_dir / fname).write_text(f"harvest error: {exc}\n")
+
+
+# ---------------------------------------------------------------------------
+# macOS trust-material staging + install.sh invocation builder.
+# ---------------------------------------------------------------------------
+
+SIGSTORE_TRUST_MATERIAL_TART_DIR = "/tmp/sandboxd-sigstore-trust"
+
+
+def stage_sigstore_trust_material_in_tart_vm(vm, stack):
+    """Copy the local Sigstore trust material into the Tart guest.
+
+    macOS analog of ``stage_sigstore_trust_material_in_vm`` (Lima). Plants the
+    Fulcio root, Rekor pubkey, and CT-log pubkey under
+    ``/tmp/sandboxd-sigstore-trust/`` and returns the SANDBOX_INSTALL_TEST_*
+    env dict. The Rekor URL is rewritten from 127.0.0.1 to the guest's vmnet
+    gateway IP, which reaches the host-side sigstore relay (bound 0.0.0.0).
+    """
+    vm.shell(f"mkdir -p {SIGSTORE_TRUST_MATERIAL_TART_DIR}", check=True, timeout=15)
+
+    in_vm_fulcio = f"{SIGSTORE_TRUST_MATERIAL_TART_DIR}/fulcio-root.pem"
+    in_vm_rekor = f"{SIGSTORE_TRUST_MATERIAL_TART_DIR}/rekor.pub.pem"
+    in_vm_ctlog = f"{SIGSTORE_TRUST_MATERIAL_TART_DIR}/ct-log.pub.pem"
+
+    vm.cp(stack.fulcio_root_path, in_vm_fulcio)
+    vm.cp(stack.rekor_public_key_path, in_vm_rekor)
+    vm.cp(stack.ct_log_public_key_path, in_vm_ctlog)
+
+    # Rewrite the localhost-bound URLs to the guest's vmnet gateway IP. The
+    # host-side relay (tart_sigstore_relay) forwards <gateway>:PORT ->
+    # 127.0.0.1:PORT.
+    rekor_url = stack.rekor_url.replace("127.0.0.1", vm.gateway_ip)
+    fulcio_url = stack.fulcio_url.replace("127.0.0.1", vm.gateway_ip)
+
+    return {
+        "SANDBOX_INSTALL_TEST_FULCIO_ROOT": in_vm_fulcio,
+        "SANDBOX_INSTALL_TEST_REKOR_URL": rekor_url,
+        "SANDBOX_INSTALL_TEST_REKOR_PUBLIC_KEY": in_vm_rekor,
+        "SANDBOX_INSTALL_TEST_CT_LOG_PUBLIC_KEY": in_vm_ctlog,
+        "SANDBOX_INSTALL_TEST_FULCIO_URL": fulcio_url,
+        # Route cosign verify-blob output to a fixed log so failures are
+        # triageable from the host. MUST NEVER BE SET IN PRODUCTION.
+        "SANDBOX_INSTALL_TEST_DEBUG_COSIGN_STDERR": "1",
+    }
+
+
+def copy_tarball_to_tart_vm(vm, tarball_path, dst="/tmp"):
+    """Copy a release tarball + its sigstore bundle into the guest.
+
+    Both land next to each other in /tmp so install.sh's ``--from`` flow finds
+    the sibling ``.sigstore`` bundle. Returns the in-guest tarball path.
+    """
+    tarball_path = Path(tarball_path)
+    dst_path = f"{dst.rstrip('/')}/{tarball_path.name}"
+    vm.cp(tarball_path, dst_path)
+
+    sig = Path(str(tarball_path) + ".sigstore")
+    if not sig.exists():
+        sig.write_bytes(b"")
+    vm.cp(sig, f"{dst_path}.sigstore")
+    return dst_path
+
+
+def install_sh_cmd_macos(tarball_in_vm, *extra_flags, env=None,
+                         vm=None, sigstore_stack=None):
+    """Build the canonical macOS install.sh invocation.
+
+    Mirrors ``install_sh_cmd`` (Linux) but with two Darwin-specific
+    differences:
+
+    1. **No outer ``sudo``.** Unlike the Linux harness (which runs
+       ``sudo bash install.sh``), install.sh on macOS is designed to be run as
+       the *unprivileged operator* — it self-elevates only the privileged
+       child via an internal ``sudo sh "$PRIV_SCRIPT"`` (install.sh line
+       ~3333). Running the whole script under outer sudo makes its prereq
+       probe ``limactl --version`` execute as root, and ``limactl`` *refuses
+       to run as root* ("limactl: must not run as the root user"), causing a
+       spurious ``lima (>= 1.2.0)`` prereq failure. We therefore run the
+       operator-context part as ``admin`` (who has passwordless sudo, so the
+       internal child elevation works without a tty prompt).
+
+    2. **No ``--no-provision``.** Darwin has no provisioning step to relax.
+
+    Always passes ``--from``, ``--version``, ``--yes``, ``--no-color``. When
+    ``vm`` + ``sigstore_stack`` are passed, the trust material is staged into
+    the guest and the SANDBOX_INSTALL_TEST_* env vars are merged in. The env
+    vars are exported into the operator process (``VAR=val ... bash ...``);
+    install.sh forwards the ones the privileged child needs across the sudo
+    boundary itself (it cannot rely on sudo preserving them). The Homebrew
+    prefix is prepended to PATH so the operator-context ``limactl`` /
+    ``socket_vmnet`` / cosign probes resolve.
+    """
+    ver = version_from_tarball(tarball_in_vm)
+    merged_env = {}
+    if vm is not None and sigstore_stack is not None:
+        merged_env.update(stage_sigstore_trust_material_in_tart_vm(vm, sigstore_stack))
+    if env:
+        merged_env.update(env)
+    env_prefix = "PATH=" + _sh_quote(f"{GUEST_PATH_PREFIX}:/usr/bin:/bin:/usr/sbin:/sbin") + " "
+    if merged_env:
+        env_prefix += " ".join(
+            f"{k}={_sh_quote(v)}" for k, v in merged_env.items()
+        ) + " "
+    base = [
+        f"{env_prefix}bash /tmp/install.sh",
+        f"--from {tarball_in_vm}",
+        f"--version {ver}",
+        "--yes",
+        "--no-color",
+    ]
+    base.extend(extra_flags)
+    return " ".join(base)
+
+
+def assert_doctor_passes_macos(vm, *, timeout=60, sock_path=None):
+    """Run ``sandbox doctor`` as the operator and assert green.
+
+    On macOS the daemon socket is /var/run/sandbox/sandboxd.sock. doctor runs
+    as the operator (the ``admin`` account that installed), which must be in
+    the _sandboxd group to reach the socket.
+    """
+    if sock_path is None:
+        sock_path = "/var/run/sandbox/sandboxd.sock"
+    cmd = f"SANDBOX_SOCKET={sock_path} /usr/local/bin/sandbox doctor"
+    r = vm.shell(cmd, timeout=timeout)
+    text = r.stdout + r.stderr
+    if r.returncode != 0:
+        raise AssertionError(f"sandbox doctor exited {r.returncode}\n{text}")
+    # The summary line is "{passed} checks passed, {failed} failed, {skipped}
+    # skipped" (doctor.rs::summary_line). Green == 0 failed; exit code alone is
+    # insufficient (a broken doctor could exit 0 without running checks).
+    if "0 failed" not in r.stdout:
+        raise AssertionError(
+            f"sandbox doctor missing '0 failed' token\n"
+            f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        )
+    return text
