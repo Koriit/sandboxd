@@ -52,6 +52,8 @@ pub use container::{
     lite_image_tag_for_version, map_container_uid_gid, rebuild_lite_image, stage_ssh_credentials,
 };
 pub use lima::{LimaRuntime, LimaTransport};
+#[cfg(target_os = "macos")]
+pub use orphan_reaper::CliDockerOpsWithSocket;
 pub use orphan_reaper::{CliDockerOps, DockerOps, ReaperReport, reap_orphans};
 pub use spec::{BackendSpecific, SessionSpec};
 

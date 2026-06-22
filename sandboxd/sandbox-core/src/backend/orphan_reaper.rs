@@ -65,6 +65,8 @@
 //! `docker` exactly like the rest of the container backend.
 
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -297,6 +299,192 @@ impl DockerOps for CliDockerOps {
             Err(e) => Err(e),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// macOS: socket-scoped Docker ops for the gateway VM
+// ---------------------------------------------------------------------------
+
+/// Production [`DockerOps`] impl for macOS that routes every docker command
+/// through the gateway VM's forwarded Unix socket rather than the host
+/// `dockerd`. On production macOS there is no host Docker — the daemon,
+/// gateway, and lite containers all live inside the `sandboxd-gateway` Lima
+/// VM whose Docker is reachable only via the forwarded socket path.
+///
+/// The `-H unix://<socket>` flag is the sole authority for which Docker
+/// daemon is targeted; `env_clear` strips any ambient `DOCKER_HOST` or
+/// other Docker env vars that could redirect the command to a different
+/// daemon.
+#[cfg(target_os = "macos")]
+pub struct CliDockerOpsWithSocket(pub PathBuf);
+
+#[cfg(target_os = "macos")]
+#[async_trait]
+impl DockerOps for CliDockerOpsWithSocket {
+    async fn list_owned_containers(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+        let label_filter = format!("label=sandboxd.owner={pool}");
+        let socket = self.0.clone();
+        let stdout = run_docker_raw_with_socket(
+            socket,
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "name=sandbox-",
+                "--filter",
+                &label_filter,
+                "--format",
+                "{{.Names}}",
+            ],
+            "docker ps (orphan reaper)",
+        )
+        .await?;
+        Ok(parse_one_per_line(&stdout))
+    }
+
+    async fn list_owned_home_volumes(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+        let label_filter = format!("label=sandboxd.owner={pool}");
+        let socket = self.0.clone();
+        let stdout = run_docker_raw_with_socket(
+            socket,
+            &[
+                "volume",
+                "ls",
+                "--filter",
+                "name=sandbox-home-",
+                "--filter",
+                &label_filter,
+                "--format",
+                "{{.Name}}",
+            ],
+            "docker volume ls (orphan reaper)",
+        )
+        .await?;
+        Ok(parse_one_per_line(&stdout))
+    }
+
+    async fn list_owned_networks(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
+        let label_filter = format!("label=sandboxd.owner={pool}");
+        let socket = self.0.clone();
+        let stdout = run_docker_raw_with_socket(
+            socket,
+            &[
+                "network",
+                "ls",
+                "--filter",
+                "name=sandbox-net-",
+                "--filter",
+                &label_filter,
+                "--format",
+                "{{.Name}}",
+            ],
+            "docker network ls (orphan reaper)",
+        )
+        .await?;
+        Ok(parse_one_per_line(&stdout))
+    }
+
+    async fn remove_container(&self, name: &str) -> Result<(), SandboxError> {
+        let socket = self.0.clone();
+        let name = name.to_string();
+        match run_docker_raw_with_socket(socket, &["rm", "-f", &name], "docker rm (orphan reaper)")
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(SandboxError::Gateway(msg)) if msg.contains("No such container") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
+        let socket = self.0.clone();
+        let name = name.to_string();
+        match run_docker_raw_with_socket(
+            socket,
+            &["volume", "rm", &name],
+            "docker volume rm (orphan reaper)",
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(SandboxError::Gateway(msg))
+                if msg.contains("No such volume") || msg.contains("no such volume") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn remove_network(&self, name: &str) -> Result<(), SandboxError> {
+        let socket = self.0.clone();
+        let name = name.to_string();
+        match run_docker_raw_with_socket(
+            socket,
+            &["network", "rm", &name],
+            "docker network rm (orphan reaper)",
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(SandboxError::Gateway(msg))
+                if msg.contains("No such network") || msg.contains("network not found") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Docker CLI helpers
+// ---------------------------------------------------------------------------
+
+/// `docker <args>` with the standard 60s wall-clock timeout, targeting the
+/// gateway VM's forwarded socket. Passes `-H unix://<socket>` as the first
+/// arguments and clears the environment so no ambient `DOCKER_HOST` or
+/// other Docker env vars can redirect the command to a different daemon.
+#[cfg(target_os = "macos")]
+async fn run_docker_raw_with_socket(
+    socket: PathBuf,
+    args: &[&str],
+    operation: &'static str,
+) -> Result<String, SandboxError> {
+    use std::time::Duration;
+
+    let socket_str = format!("unix://{}", socket.display());
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    let op = operation.to_string();
+    tokio::task::spawn_blocking(move || {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut cmd = std::process::Command::new("docker");
+        // Isolate from ambient Docker env: env_clear strips DOCKER_HOST and
+        // other overrides; -H is the sole authority for the target daemon.
+        cmd.env_clear()
+            .env("PATH", &path_value)
+            .env("HOME", home)
+            .args(["-H", &socket_str]);
+        for arg in &owned {
+            cmd.arg(arg);
+        }
+        let output = crate::process::run_with_timeout(&mut cmd, Duration::from_secs(60), &op)
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Gateway(format!("failed to run {op}: {msg}"))
+                }
+                other => other,
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(SandboxError::Gateway(format!("{op} failed: {stderr}")));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
+    .await
+    .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))?
 }
 
 /// `docker <args>` with the standard 60s wall-clock timeout, returning
@@ -932,5 +1120,18 @@ mod tests {
     fn parse_one_per_line_empty_input_is_empty_vec() {
         assert!(parse_one_per_line("").is_empty());
         assert!(parse_one_per_line("\n\n   \n").is_empty());
+    }
+
+    // -- macOS socket-scoped DockerOps compile check -------------------------
+
+    /// Compile-time check: `CliDockerOpsWithSocket` implements `DockerOps` on
+    /// macOS, so it can be passed to `reap_orphans` exactly like `CliDockerOps`.
+    /// If the impl is absent or signature-mismatched, the `_assert` function
+    /// below fails to compile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cli_docker_ops_with_socket_satisfies_docker_ops_trait() {
+        fn _assert_docker_ops<T: DockerOps>() {}
+        _assert_docker_ops::<CliDockerOpsWithSocket>();
     }
 }

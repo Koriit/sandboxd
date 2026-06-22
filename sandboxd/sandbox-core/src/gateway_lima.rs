@@ -2017,6 +2017,40 @@ impl GatewayLimaManager {
         }
     }
 
+    /// Check whether the daemon-versioned lite image is present inside the
+    /// gateway VM's Docker.
+    ///
+    /// Mirrors [`gateway_image_present_inside_lima`] but targets the lite
+    /// image tag (`sandboxd-lite:<version>`). On macOS the lite image lives in
+    /// the gateway VM's Docker — there is no host Docker — so this is the only
+    /// correct probe site.
+    pub fn lite_image_present_inside_lima(&self) -> Result<bool, SandboxError> {
+        use crate::backend::lite_image_tag_for_version;
+        let tag = lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
+        let mut cmd = Command::new("docker");
+        apply_docker_env(&mut cmd);
+        cmd.args(["-H", &socket_str, "image", "inspect", &tag]);
+
+        let output = run_with_timeout(
+            &mut cmd,
+            DOCKER_OP_TIMEOUT,
+            "gateway: docker image inspect lite via forwarded socket",
+        )?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr_lower = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        if stderr_lower.contains("no such image") || stderr_lower.contains("no such object") {
+            Ok(false)
+        } else {
+            Err(SandboxError::Internal(format!(
+                "docker image inspect {tag} via gateway socket failed unexpectedly: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
     /// Probe the version string of the daemon's `limactl` binary.
     ///
     /// Runs `limactl --version` with the same minimal `PATH` the daemon uses

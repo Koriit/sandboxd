@@ -16,10 +16,16 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::backend::{
-    BackendKind, CliDockerOps, ContainerRuntime, LimaRuntime, RuntimeHandle, RuntimeStartArgs,
+    BackendKind, ContainerRuntime, LimaRuntime, RuntimeHandle, RuntimeStartArgs,
     SANDBOX_CA_CONTAINER_PATH, SessionRuntime, compute_default_resource_limits, home_volume_name,
     lite_image_tag_for_version, map_container_uid_gid, reap_orphans, rebuild_lite_image,
 };
+// On macOS the orphan reaper uses CliDockerOpsWithSocket (routes through the
+// gateway VM's forwarded socket). On Linux, CliDockerOps targets host Docker.
+#[cfg(not(target_os = "macos"))]
+use sandbox_core::CliDockerOps;
+#[cfg(target_os = "macos")]
+use sandbox_core::CliDockerOpsWithSocket;
 // These symbols are only used by the Linux container-create path that calls
 // ensure_image on the host Docker daemon. On macOS, ensure_image is skipped
 // (lite containers run in the gateway VM, not host Docker).
@@ -290,7 +296,11 @@ fn bind_socket(socket_path: &std::path::Path) -> std::io::Result<UnixListener> {
 // live in `sandbox-core::gateway` so the integration test suite (which
 // imports from sandbox-core, not the daemon binary) can pin the same
 // byte sequence the daemon emits.
-use sandbox_core::gateway::{gateway_image_present, missing_gateway_image_hint};
+// `gateway_image_present` targets host Docker, which exists only on Linux.
+// `missing_gateway_image_hint` is used on both platforms (error message text).
+#[cfg(not(target_os = "macos"))]
+use sandbox_core::gateway::gateway_image_present;
+use sandbox_core::gateway::missing_gateway_image_hint;
 
 // ---------------------------------------------------------------------------
 // users.conf startup validation
@@ -1912,20 +1922,33 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // Pre-flight: refuse the request when the daemon-version-tagged
-    // gateway image is not loaded on the host. Both backends spin up
-    // a per-session gateway container; without the image, every
-    // downstream path (Lima or container) would fail several hundred
-    // lines later inside `GatewayManager::create_gateway` with a
-    // less informative `docker run` stderr. The early bail produces
-    // the operator-visible hint that points at `sandbox update`. The
-    // check is cheap (one `docker image inspect`) and is run per
-    // request so a post-startup image load is picked up without
-    // bouncing the daemon.
+    // gateway image is not present. Both backends spin up a per-session
+    // gateway container; without the image every downstream path (Lima or
+    // container) would fail several hundred lines later inside
+    // `GatewayManager::create_gateway` with a less informative `docker run`
+    // stderr. The early bail produces the operator-visible hint that points
+    // at `sandbox update`. The check is cheap (one `docker image inspect`)
+    // and is run per request so a post-startup image load is picked up
+    // without bouncing the daemon.
+    //
+    // On macOS there is no host Docker; the gateway image lives inside the
+    // persistent `sandboxd-gateway` Lima VM whose Docker is reachable only
+    // via the forwarded socket. `gateway_image_present_inside_lima` targets
+    // that forwarded socket directly, bypassing any ambient DOCKER_HOST.
+    // On Linux the image lives on host Docker and is checked via the
+    // standard `gateway_image_present` path.
     let gateway_tag =
         sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
-    let gateway_tag_for_check = gateway_tag.clone();
-    let present_result =
-        tokio::task::spawn_blocking(move || gateway_image_present(&gateway_tag_for_check)).await;
+    #[cfg(target_os = "macos")]
+    let present_result = {
+        let glm = Arc::clone(&state.gateway_lima_manager);
+        tokio::task::spawn_blocking(move || glm.gateway_image_present_inside_lima()).await
+    };
+    #[cfg(not(target_os = "macos"))]
+    let present_result = {
+        let gateway_tag_for_check = gateway_tag.clone();
+        tokio::task::spawn_blocking(move || gateway_image_present(&gateway_tag_for_check)).await
+    };
     match present_result {
         Ok(Ok(true)) => { /* image present — proceed */ }
         Ok(Ok(false)) => {
@@ -10902,8 +10925,14 @@ async fn diagnostics_handler(
     #[cfg(not(target_os = "linux"))]
     let kvm_writable = false;
 
+    // On Linux: image tags are passed to `docker image inspect` against host
+    // Docker. On macOS: probes go through the forwarded socket and use
+    // `gateway_image_present_inside_lima` / `lite_image_present_inside_lima`
+    // which derive the tag internally — the variables below are not used.
+    #[cfg(not(target_os = "macos"))]
     let gateway_tag =
         sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+    #[cfg(not(target_os = "macos"))]
     let lite_tag = sandbox_core::lite_image_tag_for_daemon_probe(env!("CARGO_PKG_VERSION"));
 
     // Probe outcome: the daemon distinguishes three states per
@@ -10915,6 +10944,27 @@ async fn diagnostics_handler(
     // as `false` on probe failure, while newer CLIs read the
     // `gateway_image_probe_failed` companion field for the rich
     // outcome.
+    //
+    // On macOS there is no host Docker. Both the gateway image and the lite
+    // image live inside the `sandboxd-gateway` Lima VM; probes route through
+    // the forwarded socket so they succeed on production hosts where
+    // /var/run/docker.sock does not exist.
+    #[cfg(target_os = "macos")]
+    let gateway_probe = {
+        let glm = Arc::clone(&state.gateway_lima_manager);
+        let join =
+            tokio::task::spawn_blocking(move || glm.gateway_image_present_inside_lima()).await;
+        match join {
+            Ok(Ok(true)) => (true, None),
+            Ok(Ok(false)) => (false, None),
+            Ok(Err(e)) => (false, Some(format!("{e}"))),
+            Err(e) => (
+                false,
+                Some(format!("daemon-side probe task failed to run: {e}")),
+            ),
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let gateway_probe = {
         let tag = gateway_tag.clone();
         let join =
@@ -10930,6 +10980,21 @@ async fn diagnostics_handler(
             ),
         }
     };
+    #[cfg(target_os = "macos")]
+    let lite_probe = {
+        let glm = Arc::clone(&state.gateway_lima_manager);
+        let join = tokio::task::spawn_blocking(move || glm.lite_image_present_inside_lima()).await;
+        match join {
+            Ok(Ok(true)) => (true, None),
+            Ok(Ok(false)) => (false, None),
+            Ok(Err(e)) => (false, Some(format!("{e}"))),
+            Err(e) => (
+                false,
+                Some(format!("daemon-side probe task failed to run: {e}")),
+            ),
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let lite_probe = {
         let tag = lite_tag.clone();
         let join = tokio::task::spawn_blocking(move || {
@@ -13244,8 +13309,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // immediately, and `create_session` returns
     // `SandboxError::Gateway` with the same hint so the failure
     // surface is consistent.
+    //
+    // On macOS this check is deferred: the gateway VM is not initialized
+    // until the macOS startup block below, so the forwarded Docker socket
+    // does not exist yet at this point in startup. The image check runs
+    // inside `ensure_ready` (step 4 of the macOS startup sequence) and on
+    // every `create_session` call via `gateway_image_present_inside_lima`.
+    // There is no host Docker on production macOS — querying
+    // /var/run/docker.sock here would always fail.
     let gateway_image_tag =
         sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+    #[cfg(not(target_os = "macos"))]
     {
         let tag = gateway_image_tag.clone();
         let present = tokio::task::spawn_blocking(move || gateway_image_present(&tag))
@@ -13276,6 +13350,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        info!(
+            tag = %gateway_image_tag,
+            "startup gateway-image check deferred on macOS until gateway VM is ready"
+        );
     }
 
     // Create the socket directory if it doesn't exist.
@@ -14154,6 +14235,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // out-of-pool networks' container/volume siblings inherit the same
     // exemption. See the `orphan_reaper.rs` module docs for the
     // dual-anchor model.
+    //
+    // On macOS there is no host Docker; lite containers and their volumes
+    // and networks live inside the `sandboxd-gateway` Lima VM. The reaper
+    // routes through that VM's forwarded Docker socket so it can enumerate
+    // and prune orphaned resources correctly.
+    #[cfg(target_os = "macos")]
+    {
+        let docker_ops =
+            CliDockerOpsWithSocket(gateway_lima_manager.gateway_docker_socket().to_path_buf());
+        // `let _ =` is intentional: ReaperReport is logged inside reap_orphans.
+        let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
+    }
+    #[cfg(not(target_os = "macos"))]
     {
         let docker_ops = CliDockerOps;
         // `let _ =` is intentional: ReaperReport is logged inside reap_orphans.

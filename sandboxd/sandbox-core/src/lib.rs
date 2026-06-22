@@ -66,6 +66,8 @@ pub use atomic_listener_writer::{
     macos_listener_exec_argv, session_listener_host_dir, session_listener_host_path,
     write_listener_into_container,
 };
+#[cfg(target_os = "macos")]
+pub use backend::CliDockerOpsWithSocket;
 pub use backend::{
     AsyncReadWrite, BackendInfo, BackendKind, BackendSpecific, Capabilities, CliDockerOps,
     ContainerNetwork, ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG, DockerOps,
