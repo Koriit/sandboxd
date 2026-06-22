@@ -752,6 +752,61 @@ def release_tarball_darwin(sigstore_stack, pinned_cosign_binary) -> Path:
     return tarball
 
 
+@pytest.fixture(scope="session")
+def release_tarball_darwin_bumped(
+    release_tarball_darwin, sigstore_stack, pinned_cosign_binary,
+) -> Path:
+    """Build a Darwin release tarball at a patch-bumped version.
+
+    The macOS analog of ``release_tarball_x86_64_bumped``. Produces a genuine
+    v' binary whose ``/version`` endpoint reports a different value than the base
+    Darwin tarball — what ``test_update_macos`` feeds to ``sandbox update`` so
+    the version compare sees ``update-available`` rather than ``up-to-date``.
+
+    The bump rewrites every crate's Cargo.toml to ``X.Y.(Z+1)``, native-builds
+    the workspace into ``sandboxd/target/portable-bumped/`` (isolated from the
+    base build's target dir), assembles + cosign-signs the tarball, and restores
+    the Cargo.toml files via the EXIT trap inside ``build-local-tarball.sh``. The
+    bumped build reuses the base tarball's gateway-image bytes (identical) rather
+    than re-running the gateway image build (see the build script's bumped
+    short-circuit), so the only extra cost is the cargo recompile.
+
+    Depends on ``release_tarball_darwin`` so the base tarball builds first; the
+    bumped build then runs against a warm cargo cache.
+
+    Skips when not on a Darwin arm64 host.
+    """
+    if not _is_darwin_arm64():
+        pytest.skip("release_tarball_darwin_bumped only assembles on Darwin arm64")
+
+    base_ver = _read_workspace_version()
+    bumped_ver = os.environ.get("SANDBOX_RELEASE_BUMP_VERSION") \
+        or _bump_patch_version(base_ver)
+    if bumped_ver == base_ver:
+        raise AssertionError(
+            f"bumped version equals base version ({bumped_ver}); "
+            "the update harness requires distinct versions"
+        )
+
+    arch = "aarch64-apple-darwin"
+    tarball = DIST_DIR / f"sandboxd-{bumped_ver}-{arch}.tar.gz"
+
+    pinned_cosign_binary.chmod(pinned_cosign_binary.stat().st_mode | 0o111)
+
+    env = os.environ.copy()
+    env["SANDBOX_RELEASE_BUMP_VERSION"] = bumped_ver
+    env["COSIGN_BIN"] = str(pinned_cosign_binary)
+    subprocess.run(
+        [str(HERE / "build-local-tarball.sh")],
+        check=True,
+        timeout=3600,  # first bumped build recompiles every crate
+        env=env,
+    )
+
+    assert tarball.exists(), f"bumped Darwin tarball not produced: {tarball}"
+    return tarball
+
+
 def _read_workspace_version() -> str:
     """Extract the workspace version from the root Cargo.toml.
 
@@ -2246,6 +2301,42 @@ def install_sh_cmd_macos(tarball_in_vm, *extra_flags, env=None,
         f"{env_prefix}bash /tmp/install.sh",
         f"--from {tarball_in_vm}",
         f"--version {ver}",
+        "--yes",
+        "--no-color",
+    ]
+    base.extend(extra_flags)
+    return " ".join(base)
+
+
+def uninstall_sh_cmd_macos(*extra_flags, env=None):
+    """Build the canonical macOS uninstall.sh invocation.
+
+    Like ``install_sh_cmd_macos``, uninstall.sh on macOS is designed to run as
+    the *unprivileged operator* (the ``admin`` account) — it self-elevates only
+    the privileged child via an internal ``sudo sh "$PRIV_SCRIPT"`` (uninstall.sh
+    ``run_priv_child``). Two Darwin-specific reasons NOT to wrap the whole script
+    in an outer ``sudo``:
+
+    1. ``detect_operator()`` resolves ``OPERATOR_NAME`` via ``id -un``; under outer
+       sudo it would be ``root`` and fall back to ``SUDO_USER``. The agent-bootout
+       (``gui/<uid>/io.sandboxd.agent``) needs the *human* operator's uid, so running
+       as the operator directly keeps ``OPERATOR_NAME=admin`` exact.
+    2. Symmetry with the install harness (``install_sh_cmd_macos``), which proved
+       outer-sudo breaks macOS assumptions.
+
+    Always passes ``--yes`` and ``--no-color`` for parser-friendly, non-interactive
+    output. ``--force`` is appended by callers that need to proceed past the
+    coarse daemon-running check (the daemon is bootstrapped on M1 even though it
+    never reaches healthy). The Homebrew prefix is prepended to PATH so the
+    operator-context probes resolve.
+    """
+    env_prefix = "PATH=" + _sh_quote(f"{GUEST_PATH_PREFIX}:/usr/bin:/bin:/usr/sbin:/sbin") + " "
+    if env:
+        env_prefix += " ".join(
+            f"{k}={_sh_quote(v)}" for k, v in env.items()
+        ) + " "
+    base = [
+        f"{env_prefix}bash /tmp/uninstall.sh",
         "--yes",
         "--no-color",
     ]
