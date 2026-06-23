@@ -246,6 +246,7 @@ state-dirs
 stage-socket-vmnet
 install-vmnet-plists
 bootstrap-vmnet-daemons
+users-conf
 install-agent
 stage-gateway-image
 install-daemon-plist

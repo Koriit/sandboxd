@@ -256,6 +256,125 @@ Networking is created and destroyed with the session, in a specific order:
 
 See [sessions](/sandboxd/concepts/sessions/) for the broader lifecycle picture.
 
+## macOS networking topology
+
+On macOS, sandboxd builds the same enforcement model — isolated network segment, gateway container, deny-all nftables, CoreDNS, Envoy, mitmproxy — but the substrate is different. The gateway runs inside a persistent Linux VM (the `sandboxd-gateway` Lima instance), not directly on the macOS host. Everything below describes what runs inside that VM; the enforcement components themselves are unchanged.
+
+### The gateway Lima instance
+
+A single daemon-owned Lima VM named `sandboxd-gateway` hosts all gateway containers across all sessions. It is persistent — started once at daemon startup, not torn down between sessions — and runs as the `_sandboxd` daemon user.
+
+The gateway instance exposes the Linux Docker daemon running inside it to the macOS host via Lima socket forwarding:
+
+| Resource | Path |
+| -------- | ---- |
+| Lima instance name | `sandboxd-gateway` |
+| Daemon's `LIMA_HOME` | `/var/lib/sandboxd/<_sandboxd-uid>/lima/` |
+| Forwarded Docker socket (host side) | `/var/lib/sandboxd/<_sandboxd-uid>/lima/sandboxd-gateway/gateway-docker.sock` |
+
+All `docker` commands the daemon issues for gateway container lifecycle (create, inspect, nft injection, image load) target this forwarded socket via `DOCKER_HOST`, never the host Docker daemon. The forwarded socket is `0600` owned by `_sandboxd` — group-readable only by the daemon, not by enrolled operators. Controlling this socket is root-equivalent inside the gateway VM and therefore a cross-session blast radius; restricting it is load-bearing.
+
+Upstream DNS resolution works end-to-end without any daemon intervention: Lima discovers the macOS host's resolvers via `scutil --dns` at VM boot and writes them into the gateway VM's `/etc/resolv.conf`; the Docker daemon inside the VM exposes those resolvers via its embedded resolver at `127.0.0.11`; CoreDNS in the gateway container forwards permitted queries to `127.0.0.11` — the same `forward . 127.0.0.11` directive as Linux.
+
+### The socket_vmnet pool
+
+socket_vmnet provides isolated L2 segments to QEMU VMs without requiring root in the calling process. Each segment is a separate socket_vmnet **instance** — an independent virtual switch — so the pool of N concurrent sessions needs N running instances.
+
+sandboxd manages its own set of N socket_vmnet daemons, one per pool slot, installed by `install.sh` as root-owned launchd system daemons:
+
+```
+io.sandboxd.vmnet.0   →  /var/run/sandbox/vmnet/slot-0.sock
+io.sandboxd.vmnet.1   →  /var/run/sandbox/vmnet/slot-1.sock
+…
+io.sandboxd.vmnet.N-1 →  /var/run/sandbox/vmnet/slot-N-1.sock
+```
+
+Each daemon runs:
+
+```
+socket_vmnet --vmnet-mode=host \
+  --vmnet-network-identifier=<per-slot-UUID> \
+  --socket-group=_sandboxd \
+  /var/run/sandbox/vmnet/slot-<n>.sock
+```
+
+The `--vmnet-network-identifier` is a deterministic UUID derived from a sandboxd namespace UUID and the slot index. A unique identifier places each slot on its own isolated vmnet network — verified hardware-confirmed: same-subnet ARP across identifiers fails, so inter-slot L2 leakage is absent. `--vmnet-mode=host` means the segment has no NAT to the internet. `--socket-group=_sandboxd` restricts socket access to the daemon and enrolled operators.
+
+The gateway Lima instance pre-attaches all N NICs at instance-creation time, one per slot, because Lima fixes a VM's `networks:` NIC set at creation and has no supported way to add NICs later. Each entry is an unmanaged `socket:` attach in the VM's `lima.yaml`:
+
+```yaml
+networks:
+  - socket: /var/run/sandbox/vmnet/slot-0.sock
+  - socket: /var/run/sandbox/vmnet/slot-1.sock
+  # … through slot-N-1
+```
+
+Lima names these NICs `lima0`, `lima1`, … in `networks:` order; the management NIC is `eth0`. At daemon startup, after the gateway instance is ready, sandboxd discovers the actual NIC names by running `ip -json link show` inside the VM and selects `limaN` interfaces, building a `slot_index → NIC_name` map used for all subsequent macvlan `--opt parent=` arguments.
+
+### Per-session /29 layout
+
+Linux uses a /28 per session. macOS uses a /29 per slot — smaller because the socket_vmnet segment carries only three L3 participants. Subnets are carved from `10.209.128.0/24` by default (distinct from Linux's `10.209.0.0/24` to avoid conflicts on dual-boot setups).
+
+Slot _n_ occupies the /29 at base `B = 10.209.128.0 + 8·n`:
+
+| Offset | Role |
+| ------ | ---- |
+| `B+0`  | Network address |
+| `B+1`  | Host-side vmnet bridge gateway (exists per segment; `host` mode provides no internet transit) |
+| `B+2`  | Gateway Lima VM's slot NIC (`limaN`), the macvlan parent — link-up only, no L3 address |
+| `B+3`  | Gateway container IP — assigned statically by Docker macvlan `--ip`; serves as the VM's default route and DNS resolver |
+| `B+4`  | Sandbox VM IP — assigned statically via cloud-init; default route set to `B+3` |
+| `B+5–6` | Unused |
+| `B+7`  | Broadcast |
+
+There is no DHCP on the segment. All addresses are static.
+
+### Two-NIC gateway container
+
+The gateway container has two NICs, serving opposite directions:
+
+| NIC | Type | IP | Role |
+| --- | ---- | --- | ---- |
+| VM-facing | `macvlan(private)` child of `limaN` | `B+3` | Receives traffic from the sandbox VM; nftables DNAT intercepts it |
+| Upstream egress | NIC on the shared `sandboxd-egress` Docker bridge | DHCP from bridge | Default route out; re-originated upstream traffic exits here → gateway VM `eth0` → host → internet |
+
+`macvlan(private)` mode prevents macvlan-to-parent and macvlan-to-macvlan traffic — the gateway cannot egress over the VM-facing NIC, and two gateway containers on the same parent cannot reach each other at L2. The upstream egress NIC is on the shared `sandboxd-egress` NAT-masqueraded bridge, which the daemon creates once at gateway init. That bridge is the inside (trusted-infra) side only — no sandbox VM ever touches it.
+
+The end-to-end path:
+
+```
+sandbox VM (B+4) → macvlan slot segment → gateway container (B+3)
+  → nft DNAT → Envoy/mitmproxy/CoreDNS → re-originated upstream
+  → sandboxd-egress bridge → NAT → gateway VM eth0 → macOS host → internet
+```
+
+The gateway VM's `eth0` is the one sanctioned use of SLIRP on macOS — it is the upstream uplink, not a guest-facing NIC. Because a compromised gateway component would otherwise have an unfiltered path to the internet via `eth0`, the daemon applies a baseline nftables policy on the gateway VM's `eth0` at startup: default-drop, with explicit allows only for conntrack-established responses and DNS egress. This is the macOS gateway VM's egress control; the sandbox VMs enforce via `restrict=on` on their management NIC (see below).
+
+### The baseline `eth0` split: `restrict=on` vs. the baseline egress policy
+
+The macOS topology has two kinds of `eth0` — sandbox VM management NIC and gateway VM uplink — and they are treated oppositely:
+
+**Sandbox VM `eth0` — `restrict=on`.** Every sandbox VM runs under QEMU (HVF-accelerated on Apple Silicon) and must have its sole egress path be the socket_vmnet segment through the gateway. Lima's management NIC (`eth0`, QEMU user-mode SLIRP) reaches the internet by default and cannot be removed — but sandboxd wraps each sandbox VM launch with a narrow QEMU wrapper that rewrites the management netdev to `restrict=on` before QEMU sees it. `restrict=on` makes libslirp drop all guest-initiated external traffic while leaving the explicitly-configured SSH `hostfwd` working. With `restrict=on`, a root guest that deletes the gateway route and tries to use `eth0` for egress gets no connectivity — the slirp layer blocks it at the hypervisor, below any guest routing table. The socket_vmnet gateway segment is then the only remaining path, fully under the gateway container's nftables.
+
+**Gateway VM `eth0` — never `restrict=on`.** The gateway Lima instance's `eth0` is the sanctioned egress uplink for all policed traffic. Restricting it would block every session's upstream connections. It is bounded instead by the baseline nftables policy described above (default-drop on output; allow only established/related and DNS).
+
+The daemon verifies `restrict=on` is in effect on each sandbox VM before marking the session `Running`. If the wrapper fails to inject it — or the verification does not confirm — the VM is torn down and the create operation fails rather than starting a session with an unrestricted management NIC.
+
+The `sandboxd-gateway` VM's `eth0` is also **never** `restrict=on` for the same reason — but enforced via the baseline nft policy applied once at gateway init, not per session. These two distinct enforcement paths on the same physical NIC type (`eth0`) are what make the topology work: sandbox VMs are locked out, gateway containers are let through but filtered.
+
+### Session networking lifecycle on macOS
+
+| Event | Action |
+| ----- | ------ |
+| `session create` | Claim slot from pool; write slot index to `NetworkInfo` in `sessions.db`; create macvlan Docker network inside gateway VM; start gateway container; inject deny-all nftables; wait for component health; inject DNAT; then `limactl start` for the sandbox VM |
+| `session stop` | Stop sandbox VM; stop and remove gateway container; remove macvlan network; release slot back to pool |
+| `session start` (resume) | Claim a fresh slot (not necessarily the same index); update sandbox VM Lima YAML with the new slot's socket path; re-create gateway container and macvlan network on the new slot; `limactl start` |
+| `session rm` | Release slot if held (idempotent) |
+
+Slots are not sticky across stop/start. The gateway-before-VM ordering is maintained on every path — the gateway container must be healthy with deny-all and DNAT in place before the sandbox VM's socket_vmnet NIC is brought up, so the VM's very first egress is already intercepted.
+
+The daemon asserts `net.inet.ip.forwarding == 0` on the macOS host at startup and surfaces a hard error if IP forwarding is enabled. An IP-forwarding host could route a guest's on-link `B+1` traffic off-segment via the host's own vmnet bridge, bypassing the gateway nftables entirely. `sandbox doctor` checks both `net.inet.ip.forwarding` and `net.inet6.ip6.forwarding`.
+
 ## Related reading
 
 - [Policy model](/sandboxd/concepts/policy-model/) — how assurance levels map onto the components above.

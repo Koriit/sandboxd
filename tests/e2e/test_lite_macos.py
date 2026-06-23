@@ -38,6 +38,7 @@ import json
 import os
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -140,6 +141,58 @@ def _session_exists(session_name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _route_cli_to_e2e_daemon(sandbox_binaries, sandbox_daemon):
+    """Point this module's bare ``sandbox`` calls at the e2e daemon socket.
+
+    The helpers in this file (``_sandbox`` and friends) invoke the ``sandbox``
+    CLI by bare name and without an explicit ``--socket`` flag. By default that
+    resolves whatever ``sandbox`` is on ``PATH`` (usually nothing on a dev host)
+    talking to the *operator's* default socket
+    (``$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock`` or
+    ``~/.local/share/sandboxd/sandboxd.sock``). The e2e harness, however, builds
+    the CLI under ``sandboxd/target/debug/`` and runs the daemon as the
+    cross-user ``_sandboxd-test`` system user with a socket under
+    ``/var/lib/sandboxd/<daemon-test-uid>/sandboxd.sock`` (mode 0660, group
+    ``_sandboxd-test``) — exactly the daemon the green ``test_lite.py`` /
+    ``test_policy.py`` suites drive via the ``sandbox_cli`` fixture's
+    ``--socket {sandbox_daemon["socket"]}`` against ``sandbox_binaries.sandbox``.
+
+    Rather than rewrite every bare ``_sandbox`` call site, this autouse,
+    module-scoped fixture brings the file into line with that working pattern:
+
+    1. depends on ``sandbox_daemon`` so the cross-user daemon is launched (and
+       torn down) by the standard conftest fixture — the same daemon the rest
+       of the e2e suite uses;
+    2. prepends the harness-built CLI's directory
+       (``sandbox_binaries.sandbox``'s parent) to ``PATH`` so the bare
+       ``sandbox`` invocations resolve the freshly-built binary, not a stray
+       installed one; and
+    3. exports ``SANDBOX_SOCKET`` into the process environment for the duration
+       of this module so those invocations reach the e2e daemon. The CLI
+       honours ``SANDBOX_SOCKET`` as the socket override (``--socket`` still
+       takes precedence, but none of the helpers pass it).
+
+    The previous values are restored on teardown so other modules are
+    unaffected.
+    """
+    socket_path = sandbox_daemon["socket"]
+    cli_dir = str(Path(sandbox_binaries.sandbox).resolve().parent)
+
+    prev_socket = os.environ.get("SANDBOX_SOCKET")
+    prev_path = os.environ.get("PATH", "")
+    os.environ["SANDBOX_SOCKET"] = socket_path
+    os.environ["PATH"] = os.pathsep.join([cli_dir, prev_path]) if prev_path else cli_dir
+    try:
+        yield
+    finally:
+        if prev_socket is None:
+            os.environ.pop("SANDBOX_SOCKET", None)
+        else:
+            os.environ["SANDBOX_SOCKET"] = prev_socket
+        os.environ["PATH"] = prev_path
 
 
 @pytest.fixture()
