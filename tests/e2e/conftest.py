@@ -134,6 +134,7 @@ def _read_min_supported_users_conf_schema() -> int:
 
 
 SANDBOX_GATEWAY_IMAGE_TAG = f"sandbox-gateway:{_read_workspace_version()}"
+SANDBOX_LITE_IMAGE_TAG = f"sandboxd-lite:{_read_workspace_version()}"
 
 # Maximum time to wait for the daemon socket to appear (seconds).
 # On macOS the daemon blocks in ensure_ready() (gateway Lima VM boot) before
@@ -1894,6 +1895,51 @@ def _ensure_base_image(request, sandbox_binaries: SandboxBinaries):
             "(lite image loaded from staged tarball by the gateway VM)",
             file=sys.stderr,
         )
+        # Verify the lite image is present in the gateway VM's Docker. The
+        # daemon loads it from the staged tarball at startup, but if the
+        # tarball was never staged (e.g. `make stage-lite-image` not run)
+        # the first `sandbox create --lite` fails with an obscure "No such
+        # image" error from inside the VM. Catch the absence here with a
+        # clear message so the operator knows what to fix.
+        if _SANDBOX_TEST_UID is not None:
+            _gw_sock = (
+                _SANDBOX_E2E_BASE_DIR
+                / str(_SANDBOX_TEST_UID)
+                / "lima"
+                / "sandboxd-gateway"
+                / "gateway-docker.sock"
+            )
+            if _gw_sock.exists():
+                _inspect = subprocess.run(
+                    [
+                        "docker",
+                        "-H", f"unix://{_gw_sock}",
+                        "image", "inspect", SANDBOX_LITE_IMAGE_TAG,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if _inspect.returncode != 0:
+                    pytest.fail(
+                        f"macOS preflight: lite image {SANDBOX_LITE_IMAGE_TAG!r} is "
+                        f"not present in the gateway VM's Docker daemon "
+                        f"(socket: {_gw_sock}).\n"
+                        f"Run: make lite-image && make stage-lite-image\n"
+                        f"docker stderr: {_inspect.stderr.strip()}"
+                    )
+                else:
+                    print(
+                        f"[conftest] macOS: lite image {SANDBOX_LITE_IMAGE_TAG} "
+                        f"confirmed present in gateway VM",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    f"[conftest] macOS: gateway socket {_gw_sock} not yet present "
+                    f"(daemon not started); skipping lite image pre-flight check",
+                    file=sys.stderr,
+                )
 
     if not _lima_available_for_prewarm():
         print(

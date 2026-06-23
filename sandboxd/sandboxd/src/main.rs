@@ -502,23 +502,33 @@ fn init_tracing(
     // policy. The size cap is deferred.
     #[cfg(target_os = "macos")]
     if log_file.is_none() {
-        let appender = tracing_appender::rolling::Builder::new()
+        match tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("sandboxd.log")
             .build("/var/log/sandbox")
-            .map_err(|e| {
-                std::io::Error::other(format!("failed to build rolling log appender: {e}"))
-            })?;
-
-        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_ansi(false)
-            .with_writer(non_blocking)
-            .init();
-
-        return Ok(Some(guard));
+        {
+            Ok(appender) => {
+                let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+                tracing_subscriber::fmt()
+                    .with_env_filter(env_filter)
+                    .with_ansi(false)
+                    .with_writer(non_blocking)
+                    .init();
+                return Ok(Some(guard));
+            }
+            Err(e) => {
+                // /var/log/sandbox is unwritable (e.g. daemon running under a
+                // test user without the directory provisioned). sandboxd.log is
+                // operational logging only — the egress audit trail flows via
+                // the nft-loggers → JSONL bus, independently of this writer.
+                // Fall back to stderr and continue rather than hard-exiting.
+                eprintln!(
+                    "sandboxd: rolling log appender unavailable ({e}); \
+                     falling back to stderr"
+                );
+                // Fall through to install a stderr subscriber below.
+            }
+        }
     }
 
     // Non-macOS path, or explicit --log-file on any platform.
@@ -4933,6 +4943,27 @@ async fn create_session_macos_lite(
     // before dispatching here, so this is a plain read of the request flag.
     let no_gitignore_initial_push = req.no_gitignore.unwrap_or(false);
 
+    // Early-phase cleanup helper: undo the resources acquired through step 6
+    // (token + CA + Docker network) and mark the session Error, then return.
+    // Called from error branches starting at step 3.5, where a network already
+    // exists and must be deleted. Error branches in step 3 (network creation
+    // failure) omit the delete_network call and use the manual pattern below.
+    // Callers that have also succeeded at step 5.5 (vm_stage_dir) must invoke
+    // `cleanup_lite_stage_dir` explicitly before this macro.
+    macro_rules! early_lite_cleanup_and_return {
+        ($err_resp:expr) => {{
+            let _ = state
+                .network
+                .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
+            let _ = vmnet_pool.release_lite_token();
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return $err_resp;
+        }};
+    }
+
     // Step 1: claim a session-count token (no NIC slot).
     {
         let pool = vmnet_pool.clone();
@@ -5021,15 +5052,7 @@ async fn create_session_macos_lite(
         .store
         .set_network_info(&session_id, &operator.name, &network_info)
     {
-        let _ = state
-            .network
-            .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-        let _ = vmnet_pool.release_lite_token();
-        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-        let _ = state
-            .store
-            .update_state(&session_id, &operator.name, SessionState::Error);
-        return error_response(e).into_response();
+        early_lite_cleanup_and_return!(error_response(e).into_response());
     }
 
     // Step 4: resolve workspace bind (shared: requires path validation).
@@ -5041,21 +5064,15 @@ async fn create_session_macos_lite(
             security_model,
         }) => {
             if security_model.is_some() {
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(SandboxError::InvalidArgument(
-                    "security_model is not supported by the container \
+                early_lite_cleanup_and_return!(
+                    error_response(SandboxError::InvalidArgument(
+                        "security_model is not supported by the container \
                      backend (9p-only concept); omit the :<model> token \
                      from --workspace shared:…"
-                        .to_string(),
-                ))
-                .into_response();
+                            .to_string(),
+                    ))
+                    .into_response()
+                );
             }
             // Validate that the host path falls under the configured
             // lite shared root. The gateway VM only mounts that root via
@@ -5075,24 +5092,18 @@ async fn create_session_macos_lite(
                      Note: lite shared: is read by _sandboxd (the gateway VM user), \
                      not the operator; TCC consent from the operator does not apply."
                 );
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(SandboxError::InvalidArgument(format!(
-                    "lite shared: path {} is outside the configured shared root {} — \
-                     move the workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
-                     Note: lite shared: access runs as _sandboxd (not the operator); \
-                     sources in TCC-protected directories (Desktop, Documents, Downloads) \
-                     are not readable.",
-                    hp.display(),
-                    shared_root.display()
-                )))
-                .into_response();
+                early_lite_cleanup_and_return!(
+                    error_response(SandboxError::InvalidArgument(format!(
+                        "lite shared: path {} is outside the configured shared root {} — \
+                         move the workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
+                         Note: lite shared: access runs as _sandboxd (not the operator); \
+                         sources in TCC-protected directories (Desktop, Documents, Downloads) \
+                         are not readable.",
+                        hp.display(),
+                        shared_root.display()
+                    ),))
+                    .into_response()
+                );
             }
             // Emit a warning about the _sandboxd TCC asymmetry for all
             // lite shared: sessions so operators are informed.
@@ -5120,17 +5131,7 @@ async fn create_session_macos_lite(
         .join("ssh");
     let ssh_keypair_for_staging = match sandbox_core::SshKeypair::generate(session_id.as_str()) {
         Ok(kp) => kp,
-        Err(e) => {
-            let _ = state
-                .network
-                .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-            let _ = vmnet_pool.release_lite_token();
-            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-            let _ = state
-                .store
-                .update_state(&session_id, &operator.name, SessionState::Error);
-            return error_response(e).into_response();
-        }
+        Err(e) => early_lite_cleanup_and_return!(error_response(e).into_response()),
     };
     {
         let ssh_host_dir_owned = ssh_host_dir.clone();
@@ -5148,31 +5149,13 @@ async fn create_session_macos_lite(
         .await;
         match stage_result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(e).into_response();
-            }
-            Err(e) => {
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
+            Ok(Err(e)) => early_lite_cleanup_and_return!(error_response(e).into_response()),
+            Err(e) => early_lite_cleanup_and_return!(
+                error_response(SandboxError::Internal(format!(
                     "spawn_blocking join failed staging ssh credentials: {e}"
                 )))
-                .into_response();
-            }
+                .into_response()
+            ),
         }
     }
     if let Err(e) =
@@ -5180,15 +5163,7 @@ async fn create_session_macos_lite(
             .store
             .set_ssh_keypair(&session_id, &operator.name, &ssh_keypair_for_staging)
     {
-        let _ = state
-            .network
-            .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-        let _ = vmnet_pool.release_lite_token();
-        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-        let _ = state
-            .store
-            .update_state(&session_id, &operator.name, SessionState::Error);
-        return error_response(e).into_response();
+        early_lite_cleanup_and_return!(error_response(e).into_response());
     }
 
     // Step 5.5: stage the per-session provisioning files into the gateway VM.
@@ -5219,31 +5194,13 @@ async fn create_session_macos_lite(
         .await
         {
             Ok(Ok(dir)) => dir,
-            Ok(Err(e)) => {
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(e).into_response();
-            }
-            Err(e) => {
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
+            Ok(Err(e)) => early_lite_cleanup_and_return!(error_response(e).into_response()),
+            Err(e) => early_lite_cleanup_and_return!(
+                error_response(SandboxError::Internal(format!(
                     "task join error in stage_lite_session_files: {e}"
                 )))
-                .into_response();
-            }
+                .into_response()
+            ),
         }
     };
 
@@ -5252,39 +5209,23 @@ async fn create_session_macos_lite(
     // separately after docker start (not via the path-based helper).
     let container_ip: std::net::IpAddr = match network_info.vm_ip.parse() {
         Ok(ip) => ip,
-        Err(e) => {
-            let _ = state
-                .network
-                .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-            let _ = vmnet_pool.release_lite_token();
-            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-            let _ = state
-                .store
-                .update_state(&session_id, &operator.name, SessionState::Error);
-            return error_response(SandboxError::Internal(format!(
+        Err(e) => early_lite_cleanup_and_return!(
+            error_response(SandboxError::Internal(format!(
                 "vm_ip {:?} not parseable as IP: {e}",
                 network_info.vm_ip
             )))
-            .into_response();
-        }
+            .into_response()
+        ),
     };
     let gateway_ip_addr: std::net::IpAddr = match network_info.gateway_ip.parse() {
         Ok(ip) => ip,
-        Err(e) => {
-            let _ = state
-                .network
-                .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-            let _ = vmnet_pool.release_lite_token();
-            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-            let _ = state
-                .store
-                .update_state(&session_id, &operator.name, SessionState::Error);
-            return error_response(SandboxError::Internal(format!(
+        Err(e) => early_lite_cleanup_and_return!(
+            error_response(SandboxError::Internal(format!(
                 "gateway_ip {:?} not parseable as IP: {e}",
                 network_info.gateway_ip
             )))
-            .into_response();
-        }
+            .into_response()
+        ),
     };
     let container_network = sandbox_core::backend::ContainerNetwork {
         docker_network: network_info.docker_network_name.clone(),
@@ -5323,30 +5264,16 @@ async fn create_session_macos_lite(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 cleanup_lite_stage_dir(&state, &session_id).await;
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(e).into_response();
+                early_lite_cleanup_and_return!(error_response(e).into_response());
             }
             Err(e) => {
                 cleanup_lite_stage_dir(&state, &session_id).await;
-                let _ = state
-                    .network
-                    .delete_network_on_socket(&session_id, Some(&gateway_docker_socket));
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error in load_lite_image_into_gateway: {e}"
-                )))
-                .into_response();
+                early_lite_cleanup_and_return!(
+                    error_response(SandboxError::Internal(format!(
+                        "task join error in load_lite_image_into_gateway: {e}"
+                    )))
+                    .into_response()
+                );
             }
         }
     }

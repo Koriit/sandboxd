@@ -698,7 +698,7 @@ async fn handle_install_guest_agent(ctx: &RunContext, vm: String) -> BrokerResul
     let unit_step_arg = format!(
         "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{GUEST_AGENT_SERVICE_UNIT}\nUNIT_EOF"
     );
-    let guest_src = format!("{}:{}", vm, "/tmp/sandbox-guest");
+    let guest_src = format!("{vm}:/tmp/sandbox-guest");
 
     let steps: Vec<Vec<&str>> = vec![
         // Step 1: copy binary into VM.
@@ -1148,7 +1148,7 @@ async fn handle_restrict_on_verify(ctx: &RunContext, vm: String) -> BrokerResult
     // management netdev argv. If QMP is unavailable (e.g., the QMP socket
     // was never created because Lima didn't expose it), the marker is the
     // fallback source of evidence.
-    let marker_path = format!("{}/{}/{}", ctx.lima_home, vm, RESTRICT_MARKER_FILENAME);
+    let marker_path = format!("{}/{vm}/{RESTRICT_MARKER_FILENAME}", ctx.lima_home);
     if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &marker_path) {
         return BrokerResult::Rejected { reason };
     }
@@ -1348,7 +1348,7 @@ mod tests {
     fn ctx(own_uid: u32) -> RunContext {
         RunContext {
             own_uid,
-            lima_home: format!("/var/lib/sandboxd/501/{}/lima", own_uid),
+            lima_home: format!("/var/lib/sandboxd/501/{own_uid}/lima"),
         }
     }
 
@@ -1649,30 +1649,25 @@ mod tests {
         let argv = start_argv_for_test("sandbox-abc", 300);
         assert_eq!(
             argv[0], "start",
-            "Start argv must begin with 'start' subcommand; got {:?}",
-            argv
+            "Start argv must begin with 'start' subcommand; got {argv:?}",
         );
         assert_eq!(
             argv[1], "sandbox-abc",
-            "Second Start argv element must be the VM name; got {:?}",
-            argv
+            "Second Start argv element must be the VM name; got {argv:?}",
         );
         assert_eq!(
             argv[2], "--timeout=300s",
-            "Third Start argv element must be the timeout flag; got {:?}",
-            argv
+            "Third Start argv element must be the timeout flag; got {argv:?}",
         );
         assert_eq!(
             argv[3], "--tty=false",
-            "Fourth Start argv element must be --tty=false; got {:?}",
-            argv
+            "Fourth Start argv element must be --tty=false; got {argv:?}",
         );
         // Exactly four elements — no extra flags that would pass unknown args to limactl.
         assert_eq!(
             argv.len(),
             4,
-            "Start argv must have exactly 4 elements [start, vm, timeout, tty]; got {:?}",
-            argv
+            "Start argv must have exactly 4 elements [start, vm, timeout, tty]; got {argv:?}",
         );
     }
 

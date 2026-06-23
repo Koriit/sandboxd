@@ -616,10 +616,8 @@ pub fn build_macos_gateway_docker_args(
     //
     // The initial deny-all Envoy listener is seeded via `docker exec` in
     // `setup_macos_gateway` so that Envoy can start. Dynamic LDS listener
-    // updates (the Linux path rewrites the bind-mounted host file via
-    // `AtomicListenerWriter` on every policy change) are not yet wired on
-    // macOS — live policy-driven listener replacement over the forwarded
-    // socket remains future work.
+    // updates use `AtomicListenerWriter` over the forwarded Docker socket
+    // (`write_listener_into_container`) — see `PolicyDistributor::distribute`.
 
     args.push(gateway_image_tag.to_string());
     args

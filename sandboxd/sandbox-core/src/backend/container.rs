@@ -2362,7 +2362,7 @@ mod tests {
         let cmd = rt.docker_cmd();
         let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
         // First arg must be -H, second must be unix://<socket>.
-        assert_eq!(args.get(0), Some(&"-H"), "first arg must be -H: {args:?}");
+        assert_eq!(args.first(), Some(&"-H"), "first arg must be -H: {args:?}");
         let h_val = args.get(1).expect("must have -H value");
         assert!(
             h_val.starts_with("unix://"),
@@ -2384,7 +2384,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_str().unwrap())
             .collect();
-        assert_eq!(args.get(0), Some(&"-H"), "first arg must be -H: {args:?}");
+        assert_eq!(args.first(), Some(&"-H"), "first arg must be -H: {args:?}");
         let h_val = args.get(1).expect("must have -H value");
         assert!(h_val.starts_with("unix://"));
     }

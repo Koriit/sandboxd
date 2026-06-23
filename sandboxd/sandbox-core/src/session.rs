@@ -643,6 +643,14 @@ fn parse_host_guest_pair_from_tokens(
             }
             normalized
         }
+        // When no guest_path is supplied, the host path is echoed as the guest
+        // path. This is intentional: `local:<host>` is a shorthand for mounting
+        // the same absolute path on both sides, which is the dominant use case
+        // when the host and guest share the same directory layout (e.g. a Lima
+        // VM or a macOS lite container whose 9p mount mirrors the host tree).
+        // Changing this default to a fixed path (e.g. `/home/sandbox/workspace`)
+        // would break callers that rely on the echo semantics and is locked by
+        // the existing pin tests.
         None => host_path.clone(),
     };
 

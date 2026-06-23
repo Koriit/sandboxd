@@ -174,7 +174,6 @@ fn integration_graceful_shutdown_exits_zero_and_removes_socket() {
     assert!(
         !socket_path.exists(),
         "sandboxd must remove the socket file on graceful shutdown, \
-         but {:?} still exists",
-        socket_path
+         but {socket_path:?} still exists"
     );
 }

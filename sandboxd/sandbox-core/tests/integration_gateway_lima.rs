@@ -16,7 +16,6 @@
 /// - `sandboxd-gateway` Lima instance not yet created (or already deleted)
 /// - The daemon uid must have write access to its LIMA_HOME
 ///   (`/var/lib/sandboxd/<uid>/lima/`)
-
 // These tests are macOS-only; the module is macOS-only to keep the Linux
 // build clean.
 #[cfg(target_os = "macos")]
