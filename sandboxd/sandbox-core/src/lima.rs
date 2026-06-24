@@ -2747,7 +2747,14 @@ impl LimaManager {
                 // Cast is safe: BASE_START_TIMEOUT is 600 s, well within u32.
                 start_timeout_s: BASE_START_TIMEOUT.as_secs() as u32,
                 bridge: None,
-                unrestricted_slirp_for_provisioning: false,
+                // On macOS the only NIC is Lima's slirp eth0; the macOS QEMU
+                // wrapper applies restrict=on unless this flag is true. The base
+                // VM must reach the internet over eth0 during cloud-init to
+                // install socat/git/rsync/docker.io. On Linux the restrict
+                // rewrite is gated on SANDBOX_DOCKER_BRIDGE being set, so base
+                // builds keep unrestricted slirp as a side effect of having no
+                // bridge — the flag is not needed there and stays false.
+                unrestricted_slirp_for_provisioning: cfg!(target_os = "macos"),
             },
             // Host-side wall-clock kill: slightly longer than Lima's own
             // --timeout so Lima can report its own error message.

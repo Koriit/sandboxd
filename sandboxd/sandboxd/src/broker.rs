@@ -1473,9 +1473,15 @@ fn run_limactl_direct(
             if let Some((bridge_name, vm_mac)) = bridge {
                 cmd.env("SANDBOX_DOCKER_BRIDGE", bridge_name)
                     .env("SANDBOX_VM_MAC", vm_mac);
-                if unrestricted_slirp_for_provisioning {
-                    cmd.env("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING", "1");
-                }
+            }
+            // Set the provisioning escape-hatch env var whenever the flag is
+            // true, independent of whether a bridge is present. On macOS the
+            // base-image build passes true with no bridge; the macOS QEMU
+            // wrapper checks this env var to decide whether to skip its
+            // restrict=on rewrite. On Linux the flag is always false at the
+            // base-build call site, so this branch is effectively dead there.
+            if unrestricted_slirp_for_provisioning {
+                cmd.env("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING", "1");
             }
         }
         LimaOp::Stop { vm, force } => {
