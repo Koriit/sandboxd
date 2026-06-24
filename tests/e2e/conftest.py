@@ -65,6 +65,12 @@ CARGO_WORKSPACE = PROJECT_ROOT / "sandboxd"
 SANDBOXD_BIN = CARGO_WORKSPACE / "target" / "debug" / "sandboxd"
 SANDBOX_BIN = CARGO_WORKSPACE / "target" / "debug" / "sandbox"
 
+# Test-feature sandbox-agent binary installed by `make install-agent-test`.
+# Built with --features sandbox-agent/test-env-override so it honours the
+# SANDBOX_AGENT_TEST_* env-var seams without an Aqua/GUI session or
+# _sandboxd group membership.  Used by the _macos_operator_agent fixture.
+AGENT_TEST_BIN = Path("/usr/local/libexec/sandboxd-test/sandbox-agent")
+
 # Rust source-of-truth files we extract values from at test-collection time
 # so the harness never drifts out of step with the daemon it drives.
 WORKSPACE_CARGO_TOML = CARGO_WORKSPACE / "Cargo.toml"
@@ -689,30 +695,39 @@ def _lima_required_for_lima_tests(request):
             "(macOS) or your distribution package (Linux), then re-run."
         )
 
-    # 2. qemu-bridge-helper installed (Lima/QEMU-specific).
-    helper = _find_qemu_bridge_helper()
-    if helper is None:
-        searched = ", ".join(str(p) for p in QEMU_BRIDGE_HELPER_PATHS)
-        pytest.skip(
-            f"qemu-bridge-helper not found (checked: {searched}). "
-            "Install the qemu-system-x86 (or qemu-utils) package."
-        )
+    # Checks 2-4 are LINUX full-backend preconditions. The Linux Lima/QEMU
+    # backend bridges the session VM through a host TAP via the setuid
+    # qemu-bridge-helper governed by /etc/qemu/bridge.conf. macOS uses
+    # socket_vmnet instead (a per-slot pool provisioned by `make setup-dev-env`
+    # and validated at daemon startup) — there is no qemu-bridge-helper or
+    # bridge.conf on the macOS full-backend path — so these checks are
+    # Linux-only. (A missing/broken socket_vmnet pool surfaces as a clear
+    # daemon-startup error rather than a silent skip.)
+    if sys.platform != "darwin":
+        # 2. qemu-bridge-helper installed (Lima/QEMU-specific).
+        helper = _find_qemu_bridge_helper()
+        if helper is None:
+            searched = ", ".join(str(p) for p in QEMU_BRIDGE_HELPER_PATHS)
+            pytest.skip(
+                f"qemu-bridge-helper not found (checked: {searched}). "
+                "Install the qemu-system-x86 (or qemu-utils) package."
+            )
 
-    # 3. qemu-bridge-helper has setuid bit.
-    helper_stat = helper.stat()
-    if not (helper_stat.st_mode & stat.S_ISUID):
-        pytest.skip(
-            f"qemu-bridge-helper at {helper} is missing the setuid bit. "
-            f"Run: sudo chmod u+s {helper}"
-        )
+        # 3. qemu-bridge-helper has setuid bit.
+        helper_stat = helper.stat()
+        if not (helper_stat.st_mode & stat.S_ISUID):
+            pytest.skip(
+                f"qemu-bridge-helper at {helper} is missing the setuid bit. "
+                f"Run: sudo chmod u+s {helper}"
+            )
 
-    # 4. bridge.conf exists.
-    if not BRIDGE_CONF_PATH.exists():
-        pytest.skip(
-            f"{BRIDGE_CONF_PATH} not found. Create it with: "
-            f"sudo mkdir -p {BRIDGE_CONF_PATH.parent} && "
-            f'echo "allow all" | sudo tee {BRIDGE_CONF_PATH}'
-        )
+        # 4. bridge.conf exists.
+        if not BRIDGE_CONF_PATH.exists():
+            pytest.skip(
+                f"{BRIDGE_CONF_PATH} not found. Create it with: "
+                f"sudo mkdir -p {BRIDGE_CONF_PATH.parent} && "
+                f'echo "allow all" | sudo tee {BRIDGE_CONF_PATH}'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -747,12 +762,25 @@ def sandbox_binaries() -> SandboxBinaries:
         )
         env["PATH"] = result.stdout.strip()
 
+    # On macOS the daemon's broker gate honours SANDBOX_BROKER_TEST_SANDBOX_GROUP
+    # only when the daemon is compiled with sandboxd/test-env-override.  Build
+    # with that feature (and the companion sandbox-agent seam) so the e2e
+    # harness can redirect the broker's enrollment-group check to _sandboxd-test
+    # without requiring the real _sandboxd group.
+    build_cmd = ["cargo", "build", "--workspace"]
+    if sys.platform == "darwin":
+        build_cmd += ["--features", "sandboxd/test-env-override"]
+
+    # macOS feature-builds compile from a cold cache (the test-env-override
+    # feature changes the build graph) and the host's syspolicyd stall slows
+    # fresh-binary exec, so the workspace build legitimately exceeds 5 min there.
+    _build_timeout = 1800 if sys.platform == "darwin" else 300
     subprocess.run(
-        ["cargo", "build", "--workspace"],
+        build_cmd,
         cwd=str(CARGO_WORKSPACE),
         env=env,
         check=True,
-        timeout=300,
+        timeout=_build_timeout,
         capture_output=True,
     )
 
@@ -1217,6 +1245,11 @@ def _launch_daemon_as_sandbox_via_sudo(
         [
             f"SANDBOX_BROKER_SOCKET={_SANDBOX_E2E_BASE_DIR / 'broker.sock'}",
             f"DOCKER_HOST=unix://{_gateway_docker_sock}",
+            # Override the broker's enrollment-group check so the operator (uid
+            # 501), who is in _sandboxd-test but not _sandboxd, can check in.
+            # Requires the daemon to be compiled with sandboxd/test-env-override
+            # (sandbox_binaries adds that feature on Darwin).
+            f"SANDBOX_BROKER_TEST_SANDBOX_GROUP={PLATFORM.daemon_test_user}",
         ]
         if sys.platform == "darwin"
         else []
@@ -1376,6 +1409,7 @@ def restart_test_daemon(
         [
             f"SANDBOX_BROKER_SOCKET={_SANDBOX_E2E_BASE_DIR / 'broker.sock'}",
             f"DOCKER_HOST=unix://{_restart_gateway_docker_sock}",
+            f"SANDBOX_BROKER_TEST_SANDBOX_GROUP={PLATFORM.daemon_test_user}",
         ]
         if sys.platform == "darwin"
         else []
@@ -2078,16 +2112,137 @@ def backend(request) -> str:
 # sandboxd agent is loaded (Aqua/GUI mode), because the full Lima backend
 # requires an operator-local agent brokered by launchd.  SSH-only sessions
 # can still run lite (container) tests.
+#
+# Cross-user SSH/Background sessions bypass the Aqua gate by using the
+# test-feature agent binary (AGENT_TEST_BIN, installed by `make install-agent-test`)
+# launched by the _macos_operator_agent session-scoped fixture below.
+
+
+def _agent_test_bin_available() -> bool:
+    """Return True when the test-feature agent binary is installed and executable."""
+    return AGENT_TEST_BIN.exists() and os.access(AGENT_TEST_BIN, os.X_OK)
+
+
+@pytest.fixture(scope="session")
+def _macos_operator_agent(sandbox_daemon):
+    """Launch the test-feature sandbox-agent as the operator on macOS.
+
+    On macOS, the full (Lima) backend requires a per-operator agent connected
+    to the daemon's broker socket.  In production this agent runs as a
+    LaunchAgent in the operator's Aqua/GUI session.  In the cross-user e2e
+    harness (SSH / Background session) we launch the test-feature binary
+    directly as the operator (no sudo — we ARE the operator) with env-var
+    seams that bypass the _sandboxd group check and point it at the test
+    broker socket.
+
+    Prerequisites (installed by `make setup-dev-env` / `make install-agent-test`):
+    - AGENT_TEST_BIN (/usr/local/libexec/sandboxd-test/sandbox-agent) exists
+    - The daemon is running (sandbox_daemon dependency)
+
+    On non-macOS or when _SANDBOX_TEST_UID is None (no cross-user harness),
+    this fixture is a no-op so it can be declared as a dependency without
+    gating non-macOS tests.
+
+    Yields the Popen process (or None when the fixture is a no-op).
+    """
+    if sys.platform != "darwin" or _SANDBOX_TEST_UID is None:
+        yield None
+        return
+
+    if not _agent_test_bin_available():
+        # Binary absent — tests that strictly require the agent will fail
+        # at _platform_axis_gate (the launchctl fallback also fails).
+        yield None
+        return
+
+    broker_socket = str(_SANDBOX_E2E_BASE_DIR / "broker.sock")
+    daemon_uid = str(_SANDBOX_TEST_UID)
+    # State root for LIMA_HOME construction: {state_root}/{daemon_uid}/{op_uid}/lima.
+    # Use the same base tree as the e2e daemon so LIMA_HOME paths are consistent.
+    state_root = "/var/lib/sandboxd"
+
+    agent_env = os.environ.copy()
+    # Test-env-override seams (sandbox-agent/test-env-override feature):
+    #   skip _sandboxd group check → use _sandboxd-test (operator 501 is a member)
+    agent_env["SANDBOX_AGENT_TEST_SANDBOX_GROUP"] = PLATFORM.daemon_test_user
+    #   broker socket: point at the e2e daemon's broker, not /var/run/sandbox/broker.sock
+    agent_env["SANDBOX_AGENT_TEST_BROKER_SOCKET"] = broker_socket
+    #   daemon uid: the e2e daemon runs as _sandboxd-test (uid 309)
+    agent_env["SANDBOX_AGENT_TEST_DAEMON_UID"] = daemon_uid
+    #   state root: /var/lib/sandboxd (same as production; LIMA_HOME = state_root/309/501/lima)
+    agent_env["SANDBOX_AGENT_TEST_STATE_ROOT"] = state_root
+    # The non-feature-gated SANDBOX_BROKER_SOCKET override is also honoured
+    # by the agent (checked before the test seam) — set it as a belt-and-suspenders
+    # fallback for any future code path that reaches broker_socket_path() first.
+    agent_env["SANDBOX_BROKER_SOCKET"] = broker_socket
+    # Structured logging: surface agent info/warn lines in pytest output.
+    agent_env.setdefault("RUST_LOG", "sandbox_agent=info")
+
+    # The agent takes no command-line arguments; all config is via env.
+    proc = subprocess.Popen(
+        [str(AGENT_TEST_BIN)],
+        env=agent_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    # Wait up to 10 s for the agent to connect and send its CHECKIN frame.
+    # The daemon logs "agent check-in admitted uid=<uid>" on success.
+    _daemon_log = _SANDBOX_E2E_BASE_DIR / "sandboxd.log"
+    deadline = time.monotonic() + 10.0
+    agent_uid = str(os.getuid())
+    checked_in = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            # Agent exited early — self-gate or connection error.
+            out, _ = proc.communicate()
+            raise RuntimeError(
+                f"sandbox-agent exited before check-in (rc={proc.returncode}). "
+                f"Output: {(out or b'').decode(errors='replace')[:500]}"
+            )
+        if _daemon_log.exists():
+            try:
+                log_text = _daemon_log.read_text(errors="replace")
+                if f"agent check-in admitted uid={agent_uid}" in log_text:
+                    checked_in = True
+                    break
+            except OSError:
+                pass
+        time.sleep(0.25)
+
+    if not checked_in:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise RuntimeError(
+            f"sandbox-agent did not check in within 10 s "
+            f"(uid={agent_uid}, broker={broker_socket}). "
+            "Check daemon log for broker rejection details."
+        )
+
+    yield proc
+
+    # Teardown: stop the agent gracefully.
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 @pytest.fixture(autouse=True, scope="function")
-def _platform_axis_gate(request):
+def _platform_axis_gate(request, _macos_operator_agent):
     """Enforce the platform axis (linux_only / macos_only) per test.
 
     Tests with no platform marker are platform-agnostic and pass through
     unconditionally.  ``linux_only`` tests skip on macOS; ``macos_only``
     tests skip on Linux.  On macOS, ``macos_only`` tests that require
-    the full Lima backend also check for a loaded per-operator agent.
+    the full Lima backend check that an operator agent is available —
+    either the test-built agent launched by _macos_operator_agent, or
+    the production agent loaded via launchctl (Aqua/GUI session).
     """
     has_linux_only = request.node.get_closest_marker("linux_only") is not None
     has_macos_only = request.node.get_closest_marker("macos_only") is not None
@@ -2105,31 +2260,41 @@ def _platform_axis_gate(request):
         )
 
     if has_macos_only and sys.platform == "darwin":
-        # Check for GUI/Aqua mode: the per-operator sandboxd agent must be
-        # loaded in the current user's launchd session. Without it, the daemon
-        # cannot start Lima VMs for this operator (the full backend requires
-        # the operator's LaunchAgent running in a GUI/Aqua session). Lite
-        # (container) mode works over SSH and is not gated here.
+        # Check whether the per-operator agent is available.  Two acceptable paths:
+        # (1) The test-feature agent is running (launched by _macos_operator_agent) —
+        #     covers SSH/Background sessions on the dev host.
+        # (2) The production agent is loaded via launchctl in an Aqua/GUI session.
         has_lima = request.node.get_closest_marker("lima") is not None
         if has_lima:
-            uid = os.getuid()
-            try:
-                agent_result = subprocess.run(
-                    ["launchctl", "print", f"user/{uid}/io.sandboxd.agent"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                agent_loaded = agent_result.returncode == 0
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                agent_loaded = False
-
-            if not agent_loaded:
+            agent_available = (
+                # Path 1: test-feature agent is up and running.
+                (_macos_operator_agent is not None and _macos_operator_agent.poll() is None)
+                # Path 2: production agent loaded via launchd (Aqua session).
+                or _launchctl_agent_loaded()
+            )
+            if not agent_available:
                 pytest.skip(
-                    "macOS per-operator sandboxd agent (io.sandboxd.agent) is "
-                    "not loaded in this session. The full Lima backend requires "
-                    "a GUI (Aqua) login session. Either: (1) log in to the "
-                    "macOS GUI and run the test from a Terminal.app/iTerm2 "
-                    "session, or (2) use lite mode (container backend) which "
-                    "works over SSH without a GUI session."
+                    "macOS per-operator sandboxd agent is not available. "
+                    "Two ways to satisfy this requirement: "
+                    "(1) run `make install-agent-test` and use the cross-user "
+                    "e2e harness (SSH/Background session) — the _macos_operator_agent "
+                    "fixture will launch the test-feature agent automatically; "
+                    "(2) log in to the macOS GUI and run the test from a "
+                    "Terminal.app/iTerm2 session so the production LaunchAgent "
+                    "(io.sandboxd.agent) is active."
                 )
+
+
+def _launchctl_agent_loaded() -> bool:
+    """Return True when the production io.sandboxd.agent is loaded via launchctl."""
+    uid = os.getuid()
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"user/{uid}/io.sandboxd.agent"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False

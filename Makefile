@@ -1,5 +1,5 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-e2e-linux test-e2e-macos test-linux test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image gateway-image-multiarch lite-image docs-dev docs-build clean \
-	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
+	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod install-agent-test setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
 	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
@@ -470,6 +470,7 @@ ROUTE_HELPER_PROD_PATH      := /usr/local/libexec/sandboxd/sandbox-route-helper
 ROUTE_HELPER_TEST_PATH      := /usr/local/libexec/sandboxd-test/sandbox-route-helper
 LIMA_HELPER_PROD_PATH       := /usr/local/libexec/sandboxd/sandbox-lima-helper
 LIMA_HELPER_TEST_PATH       := /usr/local/libexec/sandboxd-test/sandbox-lima-helper
+AGENT_TEST_PATH             := /usr/local/libexec/sandboxd-test/sandbox-agent
 GUEST_PROD_PATH             := /usr/local/libexec/sandboxd/sandbox-guest
 USERS_CONF_PATH             := /etc/sandboxd/users.conf
 BRIDGE_CONF_PATH            := /etc/qemu/bridge.conf
@@ -534,7 +535,7 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image
+setup-dev-env: install-guest-prod install-agent-test setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1012,6 +1013,62 @@ sandboxd/target/.dev-env-stamps/lima-helper-test.stamp: sandboxd/target/debug/sa
 sandboxd/target/debug/sandbox-lima-helper:
 	cd sandboxd && cargo build --workspace --tests \
 	  --features sandbox-lima-helper/test-env-override
+
+# install-agent-test — install the test-feature `sandbox-agent` binary at
+# `$(AGENT_TEST_PATH)` so the e2e conftest can launch it as the operator
+# on macOS without an Aqua/GUI session.
+#
+# Unlike the route-helper and lima-helper, `sandbox-agent` is unprivileged
+# (no file capabilities, no setuid), so no `setcap` is needed. The install
+# still uses sudo to write into `/usr/local/libexec/sandboxd-test/` (root:wheel).
+#
+# The binary is built with `--features sandbox-agent/test-env-override` so it
+# honours:
+#   SANDBOX_AGENT_TEST_SANDBOX_GROUP — override the enrollment group check
+#   SANDBOX_AGENT_TEST_BROKER_SOCKET — override the broker socket path
+#   SANDBOX_AGENT_TEST_DAEMON_UID   — override daemon uid for LIMA_HOME
+#   SANDBOX_AGENT_TEST_STATE_ROOT   — override the state root for LIMA_HOME
+#
+# `SANDBOX_BROKER_SOCKET` (no feature gate) can also be used to point the
+# agent at the test broker socket directly.
+#
+# Idempotent: skipped when the installed binary is byte-identical to the
+# freshly-built one. Mirrors the install-lima-helper-test-cap structure but
+# without the capability step.
+install-agent-test: sandboxd/target/.dev-env-stamps/agent-test.stamp
+	@true
+
+sandboxd/target/.dev-env-stamps/agent-test.stamp: sandboxd/target/debug/sandbox-agent-test
+	@mkdir -p $(dir $@)
+	@# Guard: skip sudo when the installed binary is byte-identical to the
+	@# freshly-built debug artifact. The .PHONY prerequisite above has already
+	@# rebuilt sandboxd/target/debug/sandbox-agent-test with
+	@# --features sandbox-agent/test-env-override.
+	@_built=sandboxd/target/debug/sandbox-agent-test; \
+	_dst="$(AGENT_TEST_PATH)"; \
+	_dst_dir="$$(dirname $$_dst)"; \
+	if [ -f "$$_dst" ] && cmp -s "$$_built" "$$_dst"; then \
+	  echo "$(GREEN)✓ already current: $$_dst (content matches build)$(RESET)"; \
+	else \
+	  echo "[sudo] install -d $$_dst_dir"; \
+	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
+	  sudo -k install -d "$$_dst_dir"; \
+	  sudo -k install -m 0755 "$$_built" "$$_dst"; \
+	fi
+	@touch $@
+
+# The .PHONY declaration forces an unconditional cargo build so that a
+# git checkout that changes sandbox-agent sources (which updates the src
+# mtime but not the binary mtime) always produces a fresh artifact.
+# This mirrors the rationale in the install-lima-helper-test-cap section.
+.PHONY: sandboxd/target/debug/sandbox-agent-test
+sandboxd/target/debug/sandbox-agent-test:
+	cd sandboxd && cargo build -p sandbox-agent \
+	  --features sandbox-agent/test-env-override
+	@# Rename to avoid overwriting the production debug binary that a plain
+	@# `cargo build --workspace` places at the same path.
+	cp sandboxd/target/debug/sandbox-agent \
+	   sandboxd/target/debug/sandbox-agent-test
 
 # install-guest-prod — install the workspace `sandbox-guest` release build at
 # the canonical libexec path /usr/local/libexec/sandboxd/sandbox-guest. Unlike

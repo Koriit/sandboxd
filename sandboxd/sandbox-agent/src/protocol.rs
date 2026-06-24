@@ -168,10 +168,11 @@ pub enum BrokerResult {
 pub enum BrokerOp {
     /// Create a new Lima VM instance from a daemon-rendered `lima.yaml`.
     ///
-    /// The agent validates the YAML's shape (socket_vmnet-only NICs, no extra
-    /// NICs beyond the mandatory management NIC, no vmType override, qemu-wrapper
-    /// path absolute and no `..`) and writes it verbatim to
-    /// `{lima_home}/{vm}/lima.yaml` before running `limactl create`.
+    /// The agent validates the YAML's shape (vmType must be "qemu"; when
+    /// `is_hardened_session` is true, a single socket_vmnet NIC entry is also
+    /// required; no extra NICs; qemu-wrapper path absolute and no `..`) and
+    /// writes it verbatim to `{lima_home}/{vm}/lima.yaml` before running
+    /// `limactl create`.
     ///
     /// After `limactl create` succeeds, the agent writes the owner marker to
     /// `{lima_home}/{vm}/sandboxd-owner`.
@@ -186,6 +187,10 @@ pub enum BrokerOp {
         /// Absolute path to the sandboxd-shipped qemu-wrapper. The agent asserts
         /// the wrapper is present and executable before running `limactl create`.
         qemu_wrapper: String,
+        /// True when creating a real session VM (socket_vmnet NIC required).
+        /// False for the base-image build VM, which uses Lima's slirp NIC only
+        /// and therefore has no `networks:` key in its lima.yaml.
+        is_hardened_session: bool,
     },
     /// Start (boot) an existing Lima VM instance.
     Start {

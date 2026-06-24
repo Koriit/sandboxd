@@ -1316,6 +1316,12 @@ impl GatewayLimaManager {
                 // it is daemon infrastructure, not tracked by the Lima orphan
                 // reaper's per-operator marker scheme.
                 owner: "",
+                // The gateway VM is daemon infrastructure; it always runs as the
+                // daemon uid and goes through run_limactl_direct, bypassing the
+                // agent's socket_vmnet check. The field is set to true here to
+                // reflect that the gateway template includes a socket_vmnet NIC,
+                // though the value is not inspected by run_limactl_direct.
+                is_hardened_session: true,
             },
             GATEWAY_CREATE_TIMEOUT,
             "gateway: limactl create",

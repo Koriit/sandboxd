@@ -1155,6 +1155,7 @@ fn lima_op_to_broker_op(
             vm,
             yaml_path,
             owner,
+            is_hardened_session,
         } => {
             let lima_yaml = std::fs::read_to_string(yaml_path).map_err(|e| {
                 SandboxError::Lima(format!(
@@ -1175,6 +1176,7 @@ fn lima_op_to_broker_op(
                 lima_yaml,
                 owner: owner.to_string(),
                 qemu_wrapper: String::new(),
+                is_hardened_session,
             }
         }
         LimaOp::Start {

@@ -582,18 +582,39 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
         ))
     })?;
 
-    // On macOS the per-operator LIMA_HOME is `0700`, operator-owned. The
-    // `setfacl` tool does not exist on macOS (Linux POSIX ACLs are not a
-    // macOS primitive), and the OpenSSH StrictKeyfileMode hazard from the
-    // Linux named-user ACL propagating into group bits does not arise on
-    // the single-uid macOS dev path (no named-user ACL → no mask → plain
-    // 0600 `_config/user` key). The full per-operator ACL port is deferred
-    // to M21 (todo #236).
+    // macOS: cross-uid setup mirroring the Linux setfacl grant.
+    //
+    // macOS is cross-uid just like Linux: the daemon runs as its own uid
+    // (_sandboxd) while limactl runs as the operator uid.  `setfacl` is a
+    // Linux POSIX-ACL tool and does not exist on macOS.  Instead we use
+    // `chmod +a` (macOS NFSv4/Darwin ACL) to grant the operator read/write/
+    // traverse access to the LIMA_HOME directory.
+    //
+    // Two steps:
+    //
+    // 1. `chmod 0700` — daemon owns the dir, no group/other access.
+    //
+    // 2. `chmod +a "user:<username> allow list,search,add_file,
+    //     add_subdirectory,delete_child,readattr,writeattr,
+    //     readextattr,writeextattr,readsecurity"` — grant the operator ACE
+    //     on the directory itself ONLY.
+    //
+    //    CRITICAL — no `file_inherit` / `directory_inherit` in the ACE.
+    //    Inheritance would propagate into every child, including
+    //    `_config/user` (Lima's SSH private key).  OpenSSH StrictKeyfileMode
+    //    calls stat(2) and rejects any key with a non-empty ACL (the `+` bit
+    //    in `ls -le` output) whose effective mode & 077 ≠ 0.  Without
+    //    inheritance the SSH key is a plain 0600 file with no ACL.
+    //    The operator runs limactl via the helper post-setresuid, so it owns
+    //    every file it creates and accesses them via owner bits — no
+    //    propagation needed.
+    //
+    // `chmod +a` on macOS requires a username, not a numeric uid (the kernel
+    // resolves it to a UUID via Directory Services; a bare numeric uid fails
+    // "Unable to translate to a UUID").  We resolve op_uid → name via the
+    // `nix` crate (NSS lookup, same as the kernel would do).
     #[cfg(target_os = "macos")]
     {
-        // chmod 0700 so only the operator (and root) can enter the dir.
-        // `set_permissions` requires a `Permissions` derived from the target
-        // mode; use `std::os::unix::fs::PermissionsExt` for the raw mode.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&lima_home, std::fs::Permissions::from_mode(0o700)).map_err(
             |e| {
@@ -603,10 +624,44 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
                 ))
             },
         )?;
+
+        // Resolve op_uid to a username for chmod +a.
+        let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(op_uid))
+            .map_err(|e| {
+                SandboxError::Internal(format!(
+                    "failed to look up username for uid {op_uid}: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                SandboxError::Internal(format!("no passwd entry for uid {op_uid}"))
+            })?
+            .name;
+
+        // Grant the operator ACE on the directory. No file_inherit or
+        // directory_inherit — ACE must not propagate to children so the SSH
+        // key stays a plain 0600 file.
+        let ace = format!(
+            "user:{username} allow \
+             list,search,add_file,add_subdirectory,delete_child,\
+             readattr,writeattr,readextattr,writeextattr,readsecurity"
+        );
+        let output = run_with_timeout(
+            Command::new("chmod").arg("+a").arg(&ace).arg(&lima_home),
+            std::time::Duration::from_secs(10),
+            "chmod +a",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Internal(format!(
+                "chmod +a on {} failed: {stderr}",
+                lima_home.display()
+            )));
+        }
+
         info!(
             op_uid,
             path = %lima_home.display(),
-            "per-operator LIMA_HOME provisioned (macOS, no setfacl)"
+            "per-operator LIMA_HOME provisioned (macOS, chmod +a)"
         );
         return Ok(lima_home);
     }
@@ -718,6 +773,10 @@ pub enum LimaOp<'a> {
         vm: &'a str,
         yaml_path: &'a std::path::Path,
         owner: &'a str,
+        /// True when creating a real session VM (which must have a socket_vmnet
+        /// NIC). False for the transient base-image build VM, which uses
+        /// Lima's slirp NIC only and therefore has no `networks:` key.
+        is_hardened_session: bool,
     },
     /// `sandbox-lima-helper start --vm <vm> --qemu-wrapper <path>
     ///   --hardened <0|1> --memory-mb <n> --cpus <n> --start-timeout-s <n>
@@ -935,6 +994,7 @@ impl LimaExecutor for SetuidHelperExecutor {
                 vm,
                 yaml_path,
                 owner,
+                is_hardened_session: _,
             } => {
                 cmd.arg("create")
                     .arg("--op-uid")
@@ -1982,6 +2042,7 @@ impl LimaManager {
                 vm: &vm_name,
                 yaml_path: &template_path,
                 owner: &self.owner_pool,
+                is_hardened_session: true,
             },
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create",
@@ -2035,6 +2096,7 @@ impl LimaManager {
                 vm: &vm_name,
                 yaml_path: &staged,
                 owner: &self.owner_pool,
+                is_hardened_session: true,
             },
             CREATE_VM_TIMEOUT,
             "sandbox-lima-helper create (custom template)",
@@ -2686,6 +2748,9 @@ impl LimaManager {
                 vm: &self.base_vm_name,
                 yaml_path: &template_path,
                 owner: &self.owner_pool,
+                // The base-image build VM uses Lima's slirp NIC only — there is no
+                // socket_vmnet NIC, so the agent must not require a networks: entry.
+                is_hardened_session: false,
             },
             BASE_CREATE_TIMEOUT,
             "sandbox-lima-helper create (base image)",
@@ -6003,8 +6068,9 @@ mod tests {
                 lima_home.display()
             ))
         })?;
-        // On macOS setfacl does not exist; mirror the production path's macOS
-        // branch (chmod 0700 only, no setfacl).
+        // macOS: mirror the production path — chmod 0700 then chmod +a to
+        // grant the operator ACE on the directory only (no inheritance).
+        // See ensure_operator_lima_home for the full rationale.
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -6016,6 +6082,35 @@ mod tests {
                     ))
                 },
             )?;
+
+            let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(op_uid))
+                .map_err(|e| {
+                    SandboxError::Internal(format!(
+                        "failed to look up username for uid {op_uid}: {e}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    SandboxError::Internal(format!("no passwd entry for uid {op_uid}"))
+                })?
+                .name;
+
+            let ace = format!(
+                "user:{username} allow \
+                 list,search,add_file,add_subdirectory,delete_child,\
+                 readattr,writeattr,readextattr,writeextattr,readsecurity"
+            );
+            let output = run_with_timeout(
+                Command::new("chmod").arg("+a").arg(&ace).arg(&lima_home),
+                std::time::Duration::from_secs(10),
+                "chmod +a",
+            )?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(SandboxError::Internal(format!(
+                    "chmod +a on {} failed: {stderr}",
+                    lima_home.display()
+                )));
+            }
             return Ok(lima_home);
         }
         #[cfg(not(target_os = "macos"))]
@@ -6066,8 +6161,8 @@ mod tests {
             .expect("second ensure call must succeed (idempotent)");
     }
 
-    // ACL verification is Linux-only (setfacl + getfacl do not exist on macOS;
-    // the macOS production path uses chmod 0700 only — see D2/ensure_operator_lima_home).
+    // Linux ACL verification uses setfacl + getfacl.  macOS uses chmod +a;
+    // see ensure_operator_lima_home_macos_acl_* tests below.
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn ensure_operator_lima_home_acl_contains_user_entry() {
@@ -6150,6 +6245,119 @@ mod tests {
             "getfacl output must NOT contain a default named-user ACL for op_uid {op_uid} \
              — such an entry causes OpenSSH StrictKeyfileMode rejection of _config/user;\n\
              got:\n{acl}"
+        );
+    }
+
+    // macOS ACL verification: ensure_operator_lima_home_at applies a
+    // non-inheriting `allow` ACE for the operator on the directory, mirroring
+    // the Linux setfacl grant, without propagating to child files (which would
+    // trigger OpenSSH StrictKeyfileMode rejection of _config/user).
+
+    /// Parse `ls -led` output for a directory and return the raw ACL lines
+    /// (everything after the first line).  The first line is the stat line;
+    /// subsequent lines are ACE entries prefixed with a space and index.
+    #[cfg(target_os = "macos")]
+    fn lsled_acl_lines(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("ls")
+            .arg("-led")
+            .arg(dir.to_string_lossy().as_ref())
+            .output()
+            .expect("ls -led must be available");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        // Drop the first line (the stat summary); return the rest.
+        text.lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Parse `ls -le` output for a file and return the ACL lines.
+    #[cfg(target_os = "macos")]
+    fn lsle_acl_lines(file: &std::path::Path) -> String {
+        let out = std::process::Command::new("ls")
+            .arg("-le")
+            .arg(file.to_string_lossy().as_ref())
+            .output()
+            .expect("ls -le must be available");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// After provisioning, the LIMA_HOME directory must carry a macOS `allow`
+    /// ACE for the operator uid that grants traverse/read/write access.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_operator_lima_home_macos_acl_grants_operator_allow_ace() {
+        // Use the current uid as both daemon uid and operator uid so the test
+        // is self-contained (no cross-uid chmod needed).
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let current_uid = nix::unistd::Uid::current().as_raw();
+        let lima_home =
+            ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
+                .expect("ensure_operator_lima_home_at must succeed");
+
+        let acl = lsled_acl_lines(&lima_home);
+
+        // Resolve uid → username the same way the implementation does.
+        let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(current_uid))
+            .expect("nix lookup must not error")
+            .expect("current uid must have a passwd entry")
+            .name;
+
+        // The ACE must be an `allow` entry for the operator username.
+        assert!(
+            acl.contains(&format!("user:{username} allow")),
+            "ls -led ACL lines must contain an 'allow' ACE for user {username};\n\
+             got:\n{acl}"
+        );
+
+        // The ACE must NOT contain inheritance flags.  Inheritance would
+        // propagate into `_config/user` (Lima's SSH key), whose ACL presence
+        // triggers OpenSSH StrictKeyfileMode rejection.
+        assert!(
+            !acl.contains("file_inherit"),
+            "ls -led ACL lines must NOT contain 'file_inherit' — the ACE must \
+             apply to the directory only, not propagate to child files;\n\
+             got:\n{acl}"
+        );
+        assert!(
+            !acl.contains("directory_inherit"),
+            "ls -led ACL lines must NOT contain 'directory_inherit';\n\
+             got:\n{acl}"
+        );
+    }
+
+    /// A file created inside the provisioned LIMA_HOME must NOT inherit the
+    /// operator ACE — it must be a plain mode file with no ACL.
+    ///
+    /// This is the load-bearing correctness property: Lima's `_config/user`
+    /// SSH private key lives inside LIMA_HOME and must remain 0600 with no
+    /// ACL so OpenSSH StrictKeyfileMode does not reject it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_operator_lima_home_macos_child_file_has_no_inherited_ace() {
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let current_uid = nix::unistd::Uid::current().as_raw();
+        let lima_home =
+            ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
+                .expect("ensure_operator_lima_home_at must succeed");
+
+        // Create a child file to simulate what limactl would create.
+        let child = lima_home.join("_config_user_sim");
+        std::fs::write(&child, b"").expect("create child file");
+
+        let child_acl = lsle_acl_lines(&child);
+
+        // A plain file with no ACL has no lines after the stat line in
+        // `ls -le` output.
+        assert!(
+            child_acl.trim().is_empty(),
+            "child file must have no ACL (empty ls -le ACL lines) — the \
+             parent dir ACE must not propagate via inheritance;\n\
+             got:\n{child_acl}"
         );
     }
 

@@ -353,7 +353,18 @@ pub fn validate_backend(backend: &str) -> Result<(), String> {
 /// assertions are robust by construction.
 ///
 /// Returns `Err(String)` with a human-readable reason on any shape violation.
-pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<(), String> {
+///
+/// `require_socket_vmnet` controls whether a `networks:` key with exactly one
+/// socket_vmnet entry is required. Pass `true` for real session VMs (which MUST
+/// attach a socket_vmnet NIC for egress enforcement); pass `false` for the
+/// transient base-image build VM, which uses Lima's slirp NIC only and has no
+/// `networks:` key. All other shape checks (vmType, no singular `network` key,
+/// NIC structure) apply regardless of this flag.
+pub fn validate_lima_yaml_shape(
+    lima_yaml: &str,
+    expected_vm: &str,
+    require_socket_vmnet: bool,
+) -> Result<(), String> {
     use serde_yaml::Value;
 
     if lima_yaml.trim().is_empty() {
@@ -407,8 +418,9 @@ pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<()
     }
 
     // Check: no `network` key (singular) at the top level. Some Lima versions
-    // accept this form as an alias for `networks`; reject it so the check
-    // below on `networks` is the only code path.
+    // accept this form as an alias for `networks`; reject it unconditionally so
+    // the check below on `networks` is the only code path. This applies to both
+    // session VMs and base-image build VMs.
     if top.contains_key("network") {
         return Err(
             "lima.yaml must not contain a 'network' key; use 'networks' with a socket: entry"
@@ -416,8 +428,18 @@ pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<()
         );
     }
 
-    // Check: the `networks` sequence contains exactly one entry, that entry is
-    // a mapping with a `socket` key and no `mode` key.
+    // Check: the `networks` sequence contains exactly one entry with a valid
+    // socket_vmnet path.
+    //
+    // When `require_socket_vmnet` is true (real session VMs), a `networks:` key
+    // with exactly one socket_vmnet entry is mandatory — Lima on macOS uses this
+    // NIC as the VM's data-plane attachment to the gateway; its absence means
+    // the VM has no managed NIC and egress enforcement is void.
+    //
+    // When `require_socket_vmnet` is false (base-image build VM), the `networks:`
+    // key is absent by design: the build VM uses Lima's slirp NIC only during
+    // cloud-init provisioning and is never promoted to a session. In this case
+    // we skip the presence requirement but still validate the entry if it exists.
     //
     // Valid Lima 2.x form (block style):
     //   networks:
@@ -427,9 +449,47 @@ pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<()
     //   networks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}]
     //
     // All of these produce the same `Value::Sequence([Mapping({socket: ...})])`.
-    let networks_val = top.get("networks").ok_or_else(|| {
-        "lima.yaml must contain a 'networks' key with exactly one socket_vmnet entry".to_string()
-    })?;
+    let networks_val_opt = top.get("networks");
+
+    if require_socket_vmnet {
+        // Session VM: `networks:` is required.
+        let networks_val = networks_val_opt.ok_or_else(|| {
+            "lima.yaml must contain a 'networks' key with exactly one socket_vmnet entry"
+                .to_string()
+        })?;
+        validate_networks_entry(networks_val)?;
+    } else if let Some(networks_val) = networks_val_opt {
+        // Base-image build VM: `networks:` is absent by design.
+        // If it is unexpectedly present, validate it anyway — an invalid entry
+        // is still rejected so a malformed template cannot slip past unnoticed.
+        validate_networks_entry(networks_val)?;
+    }
+    // else: base-image build VM with no `networks:` key — correct, no check needed.
+
+    // Belt-and-suspenders: the expected VM name should appear somewhere in the
+    // raw YAML text. This is a coarse sanity check — the `vm` field in the
+    // BrokerOp is the authoritative name used for limactl's `--name` flag, but
+    // a daemon that sends a YAML for the wrong VM is at minimum mis-routing.
+    if !expected_vm.is_empty() && !lima_yaml.contains(expected_vm) {
+        return Err(format!(
+            "lima.yaml does not appear to reference the expected VM name {expected_vm:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Networks-entry validation (used inside validate_lima_yaml_shape)
+// ---------------------------------------------------------------------------
+
+/// Validate the `networks:` value from a parsed lima.yaml.
+///
+/// Enforces: exactly one entry; that entry is a mapping; it has a `socket` key
+/// and no `mode` key; exactly one key total; and the socket path passes
+/// `validate_socket_path`.
+fn validate_networks_entry(networks_val: &serde_yaml::Value) -> Result<(), String> {
+    use serde_yaml::Value;
 
     let networks_seq = match networks_val {
         Value::Sequence(s) => s,
@@ -498,16 +558,6 @@ pub fn validate_lima_yaml_shape(lima_yaml: &str, expected_vm: &str) -> Result<()
         .and_then(|v| v.as_str())
         .ok_or_else(|| "lima.yaml 'networks[0].socket' must be a string value".to_string())?;
     validate_socket_path(socket_val)?;
-
-    // Belt-and-suspenders: the expected VM name should appear somewhere in the
-    // raw YAML text. This is a coarse sanity check — the `vm` field in the
-    // BrokerOp is the authoritative name used for limactl's `--name` flag, but
-    // a daemon that sends a YAML for the wrong VM is at minimum mis-routing.
-    if !expected_vm.is_empty() && !lima_yaml.contains(expected_vm) {
-        return Err(format!(
-            "lima.yaml does not appear to reference the expected VM name {expected_vm:?}"
-        ));
-    }
 
     Ok(())
 }
@@ -940,7 +990,7 @@ networks:
   - socket: /var/run/sandbox/vmnet/slot-0.sock
 "#;
         assert!(
-            validate_lima_yaml_shape(yaml, "").is_ok(),
+            validate_lima_yaml_shape(yaml, "", true).is_ok(),
             "canonical block-style YAML with vmType: qemu must be accepted"
         );
     }
@@ -954,7 +1004,7 @@ networks:
         let yaml =
             "vmType: qemu\ncpus: 2\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}]\n";
         assert!(
-            validate_lima_yaml_shape(yaml, "").is_ok(),
+            validate_lima_yaml_shape(yaml, "", true).is_ok(),
             "flow-style single socket NIC with vmType: qemu must be accepted"
         );
     }
@@ -964,7 +1014,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_missing_vmtype() {
         let yaml = "networks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "absent vmType must be rejected — Lima defaults to VZ on macOS, \
@@ -976,7 +1026,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_vmtype_vz() {
         let yaml = "vmType: vz\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "vmType: vz must be rejected — VZ bypasses the gateway"
@@ -987,7 +1037,7 @@ networks:
     #[test]
     fn lima_yaml_accepts_vmtype_qemu_explicit() {
         let yaml = "vmType: qemu\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_ok(),
             "explicit vmType: qemu must be accepted; error: {:?}",
@@ -999,7 +1049,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_vmtype_non_qemu() {
         let yaml = "vmType: libkrun\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_err(),
             "vmType: libkrun must be rejected — only qemu is permitted"
@@ -1013,7 +1063,7 @@ networks:
         // Inline flow-mapping for the whole document — vmType: vz in braces.
         // The YAML parser normalises this to the same top-level mapping.
         let yaml = "{vmType: vz, networks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}]}\n";
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_err(),
             "flow-style vmType: vz in a flow-mapping document must be rejected"
@@ -1024,7 +1074,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_missing_networks() {
         let yaml = "vmType: qemu\ncpus: 2\nmemory: \"4GiB\"\ndisk: \"20GiB\"\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "YAML with no networks key must be rejected"
@@ -1035,7 +1085,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_multiple_socket_nics() {
         let yaml = "vmType: qemu\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n  - socket: /var/run/sandbox/vmnet/slot-1.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "YAML with multiple socket NICs must be rejected"
@@ -1050,7 +1100,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_multiple_socket_nics_flow_style() {
         let yaml = "vmType: qemu\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock}, {socket: /var/run/sandbox/vmnet/slot-1.sock}]\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "flow-style multiple socket NICs must be rejected"
@@ -1063,7 +1113,7 @@ networks:
     fn lima_yaml_rejects_nic_with_mode_key() {
         // Single NIC entry containing both socket and mode — extra key, rejected.
         let yaml = "vmType: qemu\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n    mode: shared\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "NIC entry with a mode: key must be rejected"
@@ -1078,7 +1128,7 @@ networks:
     fn lima_yaml_rejects_nic_mode_in_flow_style() {
         // Flow-style NIC mapping with both socket and mode.
         let yaml = "vmType: qemu\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock, mode: shared}]\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "flow-style {{socket: ..., mode: shared}} NIC must be rejected; \
@@ -1095,7 +1145,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_anchor_alias_extra_nic() {
         let yaml = "vmType: qemu\nnetworks:\n  - &nic\n    socket: /var/run/sandbox/vmnet/slot-0.sock\n  - *nic\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "anchor/alias that introduces a second NIC must be rejected; \
@@ -1114,7 +1164,7 @@ networks:
         // on the parsed structure, not the raw text.
         let yaml = "vmType: qemu\nnetworks:\n  - 'socket': /var/run/sandbox/vmnet/slot-0.sock\n";
         assert!(
-            validate_lima_yaml_shape(yaml, "").is_ok(),
+            validate_lima_yaml_shape(yaml, "", true).is_ok(),
             "quoted 'socket' key must be accepted — parser normalises to same key"
         );
     }
@@ -1126,7 +1176,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_quoted_vmtype_key() {
         let yaml = "'vmType': vz\nnetworks:\n  - socket: /slot-0.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "test-vm");
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
         assert!(
             result.is_err(),
             "quoted 'vmType' key must be rejected; \
@@ -1137,8 +1187,89 @@ networks:
     /// Empty YAML — must be rejected.
     #[test]
     fn lima_yaml_rejects_empty() {
-        let result = validate_lima_yaml_shape("", "test-vm");
+        let result = validate_lima_yaml_shape("", "test-vm", true);
         assert!(result.is_err(), "empty YAML must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // B2 fix: base-image-build YAML (networks-less) validation
+    //
+    // The base-image build VM uses Lima's slirp NIC only and deliberately
+    // has no `networks:` key. When `require_socket_vmnet` is false the check
+    // must not require a socket_vmnet entry; all other checks (vmType, singular
+    // `network` key, etc.) still apply to both session and base-build VMs.
+    // -----------------------------------------------------------------------
+
+    /// A hardened session create with a networks-less lima.yaml must still be
+    /// rejected — the socket_vmnet requirement is not gated on the base-build
+    /// exemption when `require_socket_vmnet` is true.
+    #[test]
+    fn lima_yaml_session_create_requires_networks_entry() {
+        let yaml = "vmType: \"qemu\"\ncpus: 4\nmemory: \"4GiB\"\ndisk: \"10GiB\"\n";
+        let result = validate_lima_yaml_shape(yaml, "test-vm", true);
+        assert!(
+            result.is_err(),
+            "session create (require_socket_vmnet=true) with networks-less YAML must be rejected"
+        );
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("networks"),
+            "rejection reason must mention 'networks'; got: {reason:?}"
+        );
+    }
+
+    /// A base-image-build create (require_socket_vmnet=false) with a
+    /// networks-less lima.yaml must pass the socket_vmnet check. This is the
+    /// B2 fix: the base-image build VM has no networks: key by design.
+    #[test]
+    fn lima_yaml_base_build_create_accepts_networks_less_yaml() {
+        let yaml = "vmType: \"qemu\"\ncpus: 4\nmemory: \"4GiB\"\ndisk: \"10GiB\"\n";
+        let result = validate_lima_yaml_shape(yaml, "", false);
+        assert!(
+            result.is_ok(),
+            "base-image-build create (require_socket_vmnet=false) must accept \
+             networks-less YAML; error: {:?}",
+            result.err()
+        );
+    }
+
+    /// A hardened session create with a valid socket_vmnet entry still passes.
+    /// This ensures the gating change does not inadvertently break the session
+    /// VM creation path.
+    #[test]
+    fn lima_yaml_session_create_with_socket_vmnet_passes() {
+        let yaml = "vmType: \"qemu\"\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
+        let result = validate_lima_yaml_shape(yaml, "", true);
+        assert!(
+            result.is_ok(),
+            "session create with valid socket_vmnet entry must pass; error: {:?}",
+            result.err()
+        );
+    }
+
+    /// A base-image-build create with a networks-less YAML still requires
+    /// vmType: qemu — the vmType check is unconditional.
+    #[test]
+    fn lima_yaml_base_build_still_requires_vmtype_qemu() {
+        let yaml = "cpus: 4\nmemory: \"4GiB\"\ndisk: \"10GiB\"\n";
+        let result = validate_lima_yaml_shape(yaml, "", false);
+        assert!(
+            result.is_err(),
+            "base-image-build create must still reject absent vmType"
+        );
+    }
+
+    /// A base-image-build create with vmType: vz must still be rejected — the
+    /// vmType check is unconditional regardless of require_socket_vmnet.
+    #[test]
+    fn lima_yaml_base_build_still_rejects_vmtype_vz() {
+        let yaml = "vmType: vz\ncpus: 4\nmemory: \"4GiB\"\n";
+        let result = validate_lima_yaml_shape(yaml, "", false);
+        assert!(
+            result.is_err(),
+            "base-image-build create must reject vmType: vz; \
+             vmType check is unconditional"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1276,7 +1407,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_out_of_prefix_socket_path() {
         let yaml = "cpus: 2\nnetworks:\n  - socket: /arbitrary/socket.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_err(),
             "socket path outside /var/run/sandbox/vmnet/ must be rejected by shape validation"
@@ -1287,7 +1418,7 @@ networks:
     fn lima_yaml_rejects_traversal_socket_path() {
         let yaml =
             "cpus: 2\nnetworks:\n  - socket: /var/run/sandbox/vmnet/../../../tmp/evil.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_err(),
             "socket path with '..' traversal must be rejected"
@@ -1297,7 +1428,7 @@ networks:
     #[test]
     fn lima_yaml_rejects_relative_socket_path() {
         let yaml = "cpus: 2\nnetworks:\n  - socket: relative/vmnet/slot-0.sock\n";
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_err(),
             "relative socket path must be rejected by shape validation"
@@ -1358,7 +1489,7 @@ provision:
     #!/bin/bash
     hostnamectl set-hostname sandbox-550e8400e29b
 "#;
-        let result = validate_lima_yaml_shape(yaml, "sandbox-550e8400e29b");
+        let result = validate_lima_yaml_shape(yaml, "sandbox-550e8400e29b", true);
         assert!(
             result.is_ok(),
             "canonical macOS template (slot 0) must pass shape validation; error: {:?}",
@@ -1388,7 +1519,7 @@ user:
   name: "sandbox"
   home: "/home/sandbox"
 "#;
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_ok(),
             "macOS template with slot 3 must pass shape validation; error: {:?}",
@@ -1427,7 +1558,7 @@ user:
   name: "sandbox"
   home: "/home/sandbox"
 "#;
-        let result = validate_lima_yaml_shape(yaml, "");
+        let result = validate_lima_yaml_shape(yaml, "", true);
         assert!(
             result.is_ok(),
             "macOS template with 9p shared workspace must pass shape validation; error: {:?}",

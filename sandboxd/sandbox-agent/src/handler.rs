@@ -190,7 +190,8 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
             lima_yaml,
             owner,
             qemu_wrapper,
-        } => handle_create(ctx, vm, lima_yaml, owner, qemu_wrapper).await,
+            is_hardened_session,
+        } => handle_create(ctx, vm, lima_yaml, owner, qemu_wrapper, is_hardened_session).await,
         BrokerOp::Start {
             op_uid: _,
             vm,
@@ -403,6 +404,7 @@ async fn handle_create(
     lima_yaml: String,
     owner: String,
     qemu_wrapper: String,
+    is_hardened_session: bool,
 ) -> BrokerResult {
     // Validate all fields before any filesystem access.
     if let Err(reason) = validation::validate_vm_name(&vm) {
@@ -422,7 +424,9 @@ async fn handle_create(
             return BrokerResult::Rejected { reason };
         }
     }
-    if let Err(reason) = validation::validate_lima_yaml_shape(&lima_yaml, &vm) {
+    if let Err(reason) =
+        validation::validate_lima_yaml_shape(&lima_yaml, &vm, is_hardened_session)
+    {
         return BrokerResult::Rejected { reason };
     }
 
@@ -551,12 +555,25 @@ async fn handle_start(
     let memory_mb_str = memory_mb.to_string();
     let cpus_str = cpus.to_string();
 
+    // Tell the qemu-wrapper where to write the restrict=on marker after it
+    // rewrites the management NIC. The broker-mediated RestrictOnVerify reads
+    // this file as fallback evidence when QMP query-netdev is unavailable
+    // (e.g. QEMU < 7.2, which lacks the command). Mirrors the daemon-direct
+    // path in broker.rs. Only set when a wrapper is present (the gateway
+    // instance passes an empty wrapper and must NOT have its management NIC
+    // restricted); the wrapper itself skips the marker write for unrestricted
+    // provisioning (base-image) builds.
+    let marker_path_owned = format!("{}/{}/sandboxd-restrict-marker", ctx.lima_home, vm);
+
     let mut extra_env: Vec<(&str, &str)> = vec![
         ("QEMU_SYSTEM_AARCH64", &qemu_wrapper),
         ("SANDBOX_QEMU_HARDENED", hardened_str),
         ("SANDBOX_QEMU_MEMORY_MB", &memory_mb_str),
         ("SANDBOX_QEMU_CPUS", &cpus_str),
     ];
+    if !qemu_wrapper.is_empty() {
+        extra_env.push(("SANDBOX_RESTRICT_MARKER", &marker_path_owned));
+    }
 
     // Bridge env vars are built from validated bridge data.
     let bridge_name_owned;
@@ -1067,6 +1084,17 @@ fn query_restrict_on_via_qmp(lima_home: &str, vm: &str) -> Result<Option<String>
     let netdevs = match netdev_resp.get("return").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => {
+            // If the response is a QMP error ({"error": {...}}), the command is
+            // not supported by this QEMU build. Treat as "can't determine via
+            // QMP" and fall back to the wrapper marker. Only a CommandNotFound
+            // error is expected here (QEMU ≤7.1 lacks query-netdev), but we
+            // apply the same Ok(None) treatment to any QMP error response: if
+            // QMP can't answer the question, the marker is the fallback source.
+            // A restrict=off finding (the hard Err below) requires QMP to
+            // successfully return a user netdev with restrict NOT on.
+            if netdev_resp.get("error").is_some() {
+                return Ok(None);
+            }
             return Err(format!(
                 "QMP query-netdev returned unexpected response: {netdev_resp}"
             ));
@@ -1492,6 +1520,7 @@ mod tests {
             lima_yaml: bad_yaml.to_string(),
             owner: "10.209.0.0/20".to_string(),
             qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+            is_hardened_session: true,
         };
         let result = dispatch_op(&ctx, op).await;
         assert!(
@@ -1513,6 +1542,7 @@ mod tests {
             lima_yaml: bad_yaml.to_string(),
             owner: "10.209.0.0/20".to_string(),
             qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+            is_hardened_session: true,
         };
         let result = dispatch_op(&ctx, op).await;
         assert!(
@@ -1538,6 +1568,7 @@ mod tests {
             lima_yaml: bad_yaml.to_string(),
             owner: "10.209.0.0/20".to_string(),
             qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+            is_hardened_session: true,
         };
         let result = dispatch_op(&ctx, op).await;
         assert!(
@@ -1562,6 +1593,7 @@ mod tests {
             lima_yaml: bad_yaml.to_string(),
             owner: "10.209.0.0/20".to_string(),
             qemu_wrapper: "/usr/local/libexec/sandboxd/qemu-wrapper".to_string(),
+            is_hardened_session: true,
         };
         let result = dispatch_op(&ctx, op).await;
         assert!(
@@ -1605,6 +1637,7 @@ mod tests {
             lima_yaml,
             owner: "10.1.0.0/29".to_string(),
             qemu_wrapper: String::new(), // empty — as sent by lima_op_to_broker_op
+            is_hardened_session: true,
         };
         let result = dispatch_op(&ctx, op).await;
         // The request must NOT be Rejected due to qemu_wrapper validation. Any
@@ -1617,6 +1650,71 @@ mod tests {
                 !reason.contains("qemu_wrapper"),
                 "Create with empty qemu_wrapper must not be rejected by qemu_wrapper validation; \
                  got Rejected {{ reason: {reason:?} }}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B2 fix: base-image-build YAML (networks-less) dispatch
+    // -----------------------------------------------------------------------
+
+    /// A hardened-session Create with a networks-less lima.yaml must still be
+    /// rejected — the socket_vmnet check is not gated when is_hardened_session
+    /// is true, so the base-build exemption cannot be used for real sessions.
+    #[tokio::test]
+    async fn dispatch_rejects_hardened_session_create_without_networks() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let yaml = "vmType: \"qemu\"\ncpus: 4\nmemory: \"4GiB\"\ndisk: \"10GiB\"\n";
+        let op = BrokerOp::Create {
+            op_uid: own_uid,
+            vm: "sandbox-test".to_string(),
+            lima_yaml: yaml.to_string(),
+            owner: "10.209.0.0/20".to_string(),
+            qemu_wrapper: String::new(),
+            is_hardened_session: true,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { ref reason } if reason.contains("networks")),
+            "hardened-session Create with networks-less YAML must be Rejected with \
+             a 'networks' reason; got: {result:?}"
+        );
+    }
+
+    /// A base-image-build Create (is_hardened_session=false) with a
+    /// networks-less lima.yaml must pass the socket_vmnet check. The validation
+    /// must not reject it — this is the B2 fix for the base-image build flow.
+    ///
+    /// The test exercises Create dispatch up to the point where `limactl create`
+    /// would be invoked; it cannot actually run limactl, so it expects either
+    /// Ok (limactl succeeded) or Failed (limactl not found / not runnable) — NOT
+    /// Rejected with a reason mentioning 'networks'. A Rejected{reason} that
+    /// mentions 'networks' means the exemption did not take effect.
+    #[tokio::test]
+    async fn dispatch_base_build_create_accepts_networks_less_yaml() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        // Minimal networks-less base-image YAML. vmType: qemu is still required.
+        let vm_name = "sandbox-base";
+        let yaml = format!(
+            "# vm: {vm_name}\nvmType: \"qemu\"\ncpus: 4\nmemory: \"4GiB\"\ndisk: \"10GiB\"\n"
+        );
+        let op = BrokerOp::Create {
+            op_uid: own_uid,
+            vm: vm_name.to_string(),
+            lima_yaml: yaml,
+            owner: "10.209.0.0/20".to_string(),
+            qemu_wrapper: String::new(),
+            is_hardened_session: false,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        // Must NOT be Rejected with a 'networks' reason — the exemption must apply.
+        if let BrokerResult::Rejected { ref reason } = result {
+            assert!(
+                !reason.contains("networks"),
+                "base-image-build Create with networks-less YAML must not be rejected \
+                 by the socket_vmnet check; got Rejected {{ reason: {reason:?} }}"
             );
         }
     }
@@ -1814,6 +1912,194 @@ mod tests {
         assert!(
             matches!(result, Ok(None)),
             "non-connectable QMP path must return Ok(None) (marker fallback): {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // QMP server harness — serves a single canned QMP exchange over a real
+    // Unix domain socket, then closes the connection.
+    //
+    // The server sends the QMP greeting, waits for qmp_capabilities, replies
+    // with `{"return":{}}`, waits for query-netdev, and replies with
+    // `netdev_response`. The function returns the path to the socket directory
+    // so the caller can point `query_restrict_on_via_qmp` at it.
+    // -----------------------------------------------------------------------
+
+    /// Spawn a background thread that listens on a Unix socket at
+    /// `{dir}/{vm}/qmp.sock`, handles exactly one QMP client exchange, and
+    /// replies to the `query-netdev` command with `netdev_response`. The
+    /// thread exits after serving one connection.
+    fn spawn_qmp_server(
+        vm_dir: &std::path::Path,
+        vm: &str,
+        netdev_response: &'static str,
+    ) -> std::path::PathBuf {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let sock_path = vm_dir.join(vm).join("qmp.sock");
+        std::fs::create_dir_all(vm_dir.join(vm)).unwrap();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            // Send QMP greeting.
+            let greeting = r#"{"QMP":{"version":{"qemu":{"micro":0,"minor":0,"major":7},"package":""},"capabilities":[]}}"#;
+            reader.get_mut().write_all(greeting.as_bytes()).unwrap();
+            reader.get_mut().write_all(b"\n").unwrap();
+            reader.get_mut().flush().unwrap();
+
+            // Read qmp_capabilities command (skip; we don't validate its content).
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+
+            // Reply to qmp_capabilities.
+            reader
+                .get_mut()
+                .write_all(b"{\"return\":{}}\n")
+                .unwrap();
+            reader.get_mut().flush().unwrap();
+
+            // Read query-netdev command (skip; we don't validate its content).
+            line.clear();
+            let _ = reader.read_line(&mut line);
+
+            // Reply to query-netdev with the canned response.
+            reader
+                .get_mut()
+                .write_all(netdev_response.as_bytes())
+                .unwrap();
+            reader.get_mut().write_all(b"\n").unwrap();
+            reader.get_mut().flush().unwrap();
+            // Connection closes when the stream is dropped — client reads EOF.
+        });
+
+        sock_path
+    }
+
+    /// A QMP `CommandNotFound` error response for `query-netdev` must cause
+    /// `query_restrict_on_via_qmp` to return `Ok(None)`, triggering the
+    /// marker-file fallback. This is the B4 fix: QEMU builds that lack
+    /// `query-netdev` must not hard-fail with `RestrictNotConfirmed`.
+    #[test]
+    fn qmp_command_not_found_returns_ok_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-abc123def456";
+
+        spawn_qmp_server(
+            dir.path(),
+            vm,
+            r#"{"error":{"class":"CommandNotFound","desc":"The command query-netdev has not been found"}}"#,
+        );
+
+        // Give the listener thread a moment to bind before connecting.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let result = query_restrict_on_via_qmp(&dir.path().to_string_lossy(), vm);
+        assert!(
+            matches!(result, Ok(None)),
+            "CommandNotFound QMP error must return Ok(None) (marker fallback), not Err: {result:?}"
+        );
+    }
+
+    /// A QMP `query-netdev` response that shows a user netdev with
+    /// `restrict=false` must cause `query_restrict_on_via_qmp` to return
+    /// `Err` — a hard `RestrictNotConfirmed`. The marker fallback must NOT
+    /// be consulted; a restrict=off finding from QMP is authoritative.
+    #[test]
+    fn qmp_user_netdev_restrict_false_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-abc123def456";
+
+        spawn_qmp_server(
+            dir.path(),
+            vm,
+            r#"{"return":[{"id":"net0","type":"user","props":{"restrict":false}}]}"#,
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let result = query_restrict_on_via_qmp(&dir.path().to_string_lossy(), vm);
+        assert!(
+            result.is_err(),
+            "user netdev with restrict=false must return Err (hard RestrictNotConfirmed, no marker fallback): {result:?}"
+        );
+    }
+
+    /// End-to-end: `CommandNotFound` from QMP + a marker file containing
+    /// `restrict=on` → `RestrictConfirmed`. This is the expected runtime path
+    /// for QEMU builds that lack `query-netdev`.
+    #[tokio::test]
+    async fn restrict_verify_qmp_command_not_found_plus_marker_returns_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-qmpfallback01";
+        let own_uid = unsafe { libc::getuid() };
+
+        spawn_qmp_server(
+            dir.path(),
+            vm,
+            r#"{"error":{"class":"CommandNotFound","desc":"The command query-netdev has not been found"}}"#,
+        );
+
+        // Write a valid restrict marker.
+        let marker_path = dir.path().join(vm).join(RESTRICT_MARKER_FILENAME);
+        std::fs::write(
+            &marker_path,
+            "user,hostfwd=tcp:127.0.0.1:12345-:22,restrict=on",
+        )
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let ctx = RunContext {
+            own_uid,
+            lima_home: dir.path().to_string_lossy().into_owned(),
+        };
+        let op = BrokerOp::RestrictOnVerify {
+            op_uid: own_uid,
+            vm: vm.to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::RestrictConfirmed { .. }),
+            "CommandNotFound + restrict=on marker must yield RestrictConfirmed: {result:?}"
+        );
+    }
+
+    /// End-to-end: `CommandNotFound` from QMP + no marker file →
+    /// `RestrictNotConfirmed`. The fallback must itself fail closed when there
+    /// is no evidence that restrict=on was injected.
+    #[tokio::test]
+    async fn restrict_verify_qmp_command_not_found_no_marker_returns_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = "sandbox-qmpfallback02";
+        let own_uid = unsafe { libc::getuid() };
+
+        spawn_qmp_server(
+            dir.path(),
+            vm,
+            r#"{"error":{"class":"CommandNotFound","desc":"The command query-netdev has not been found"}}"#,
+        );
+
+        // No marker file — vm dir was created by spawn_qmp_server (for the socket)
+        // but the marker itself is absent.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let ctx = RunContext {
+            own_uid,
+            lima_home: dir.path().to_string_lossy().into_owned(),
+        };
+        let op = BrokerOp::RestrictOnVerify {
+            op_uid: own_uid,
+            vm: vm.to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::RestrictNotConfirmed { .. }),
+            "CommandNotFound + no marker must yield RestrictNotConfirmed (fail-closed): {result:?}"
         );
     }
 
