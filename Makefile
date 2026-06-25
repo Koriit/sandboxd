@@ -1083,12 +1083,30 @@ sandboxd/target/debug/sandbox-agent-test:
 install-guest-prod: sandboxd/target/.dev-env-stamps/guest-prod.stamp
 	@true
 
+# On macOS the host cargo build produces a Darwin Mach-O sandbox-guest, which
+# cannot exec inside the linux/aarch64 full-backend session VM (status=203/EXEC,
+# "Exec format error"). The canonical path /usr/local/libexec/sandboxd/sandbox-guest
+# is consumed on macOS ONLY by the lima-helper copying it into the Linux VM
+# (resolve_guest_binary_path / SANDBOX_GUEST_HOST_PATH) and by the base-image
+# build hashing its bytes — the daemon never execs it on the host. So on macOS
+# we install the cross-compiled linux/aarch64 ELF (from build-guest-linux-aarch64,
+# the same binary lite-image bakes). On Linux the host release build is already
+# the right arch and is installed unchanged.
+ifeq ($(HOST_OS),Darwin)
+sandboxd/target/.dev-env-stamps/guest-prod.stamp: build-guest-linux-aarch64
+	@mkdir -p $(dir $@)
+	scripts/dev/canonical-binary.sh install \
+	  sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest \
+	  "$(GUEST_PROD_PATH)" 0755
+	@touch $@
+else
 sandboxd/target/.dev-env-stamps/guest-prod.stamp: sandboxd/target/release/sandbox-guest
 	@mkdir -p $(dir $@)
 	scripts/dev/canonical-binary.sh install \
 	  sandboxd/target/release/sandbox-guest \
 	  "$(GUEST_PROD_PATH)" 0755
 	@touch $@
+endif
 
 .PHONY: sandboxd/target/release/sandbox-guest
 sandboxd/target/release/sandbox-guest:
