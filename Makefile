@@ -5,7 +5,8 @@
 	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
 	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image \
 	stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test \
-	setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared
+	setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared \
+	codesign-test-bins
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -535,7 +536,7 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod install-agent-test setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image
+setup-dev-env: install-guest-prod install-agent-test setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -2120,3 +2121,21 @@ setup-darwin-sandbox-shared:
 	  chmod 0755 /tmp/sandbox-shared; \
 	  echo "$(GREEN)✓ created /tmp/sandbox-shared (0755)$(RESET)"; \
 	fi
+
+# codesign-test-bins — ad-hoc codesign all workspace test binaries on Darwin.
+#
+# Background: after a sleep/wake cycle on macOS, syspolicyd scans unsigned Mach-O
+# executables that cargo nextest spawns from sandboxd/target/debug/deps/. The scan
+# can deadlock the nextest process for several minutes (or indefinitely), causing
+# `make test` to stall. Ad-hoc codesigning (`codesign --sign -`) pre-registers the
+# binaries with the kernel's code-signing subsystem so syspolicyd skips the online
+# scan on subsequent executions from the same inode.
+#
+# NOTE: whether this fully eliminates the deadlock needs live verification after a
+# sleep/wake cycle (todo #294 / NEEDS_LIVE_E2E). The code change itself is bounded
+# and safe; effectiveness is a follow-on live-verify item.
+#
+# Only runs on Darwin; no-op on Linux (codesign is not available / not needed).
+.PHONY: codesign-test-bins
+codesign-test-bins:
+	@scripts/dev/codesign-test-bins.sh "$(GREEN)" "$(RESET)"
