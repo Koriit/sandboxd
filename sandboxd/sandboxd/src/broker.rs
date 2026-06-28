@@ -1873,10 +1873,10 @@ fn broker_result_to_output(
 
 /// Construct an `ExitStatus` from a numeric exit code.
 ///
-/// `std::process::ExitStatus` does not have a public constructor on macOS;
-/// we use `std::process::Command` output's status field via a workaround:
-/// spawn `true` (exit 0) or `false` (exit 1) and override the code via
-/// a type-system trick. Instead, we use the `ExitStatusExt` from nix.
+/// `std::process::ExitStatus` has no public constructor, so we synthesise the
+/// raw POSIX wait(2) status word directly: a normal exit of code N is encoded
+/// as `(N & 0xff) << 8` (POSIX `W_EXITCODE(N, 0)`).  `ExitStatusExt::from_raw`
+/// from `std::os::unix::process` wraps that integer into the opaque type.
 fn exit_status_from_code(code: i32) -> std::process::ExitStatus {
     // On Unix, ExitStatus wraps a raw wait(2) status. A normal exit of code N
     // is encoded as `(N & 0xff) << 8` in the raw wait status.

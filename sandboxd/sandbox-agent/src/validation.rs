@@ -652,6 +652,11 @@ pub fn validate_qemu_wrapper(qemu_wrapper: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Arbitrary daemon-uid used in test fixture paths.  The value `501` is the
+    /// default macOS UID for the first non-root user and has no special meaning
+    /// here — it is chosen only to keep fixture paths realistic.
+    const TEST_DAEMON_UID: u32 = 501;
+
     // -----------------------------------------------------------------------
     // own-uid gate
     // -----------------------------------------------------------------------
@@ -801,25 +806,25 @@ mod tests {
 
     #[test]
     fn lima_home_confinement_accepts_child_path() {
-        let lima_home = "/var/lib/sandboxd/501/1000/lima";
-        let path = "/var/lib/sandboxd/501/1000/lima/sandbox-abc/lima.yaml";
-        assert!(validate_lima_home_path(lima_home, path).is_ok());
+        let lima_home = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima");
+        let path = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima/sandbox-abc/lima.yaml");
+        assert!(validate_lima_home_path(&lima_home, &path).is_ok());
     }
 
     #[test]
     fn lima_home_confinement_accepts_trailing_slash_variant() {
-        let lima_home = "/var/lib/sandboxd/501/1000/lima/";
-        let path = "/var/lib/sandboxd/501/1000/lima/sandbox-abc/file";
-        assert!(validate_lima_home_path(lima_home, path).is_ok());
+        let lima_home = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima/");
+        let path = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima/sandbox-abc/file");
+        assert!(validate_lima_home_path(&lima_home, &path).is_ok());
     }
 
     #[test]
     fn lima_home_confinement_rejects_parent_escape() {
         // Path escapes LIMA_HOME by going to a sibling dir.
-        let lima_home = "/var/lib/sandboxd/501/1000/lima";
+        let lima_home = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima");
         let result = validate_lima_home_path(
-            lima_home,
-            "/var/lib/sandboxd/501/9999/lima/sandbox-abc/file",
+            &lima_home,
+            &format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/9999/lima/sandbox-abc/file"),
         );
         assert!(
             result.is_err(),
@@ -829,9 +834,11 @@ mod tests {
 
     #[test]
     fn lima_home_confinement_rejects_dotdot_escape() {
-        let lima_home = "/var/lib/sandboxd/501/1000/lima";
-        let result =
-            validate_lima_home_path(lima_home, "/var/lib/sandboxd/501/1000/lima/../other/file");
+        let lima_home = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima");
+        let result = validate_lima_home_path(
+            &lima_home,
+            &format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima/../other/file"),
+        );
         assert!(
             result.is_err(),
             "dotdot escape from LIMA_HOME must be rejected"
@@ -841,11 +848,14 @@ mod tests {
     #[test]
     fn lima_home_confinement_rejects_prefix_spoofing() {
         // A path that starts with the LIMA_HOME string but is actually a
-        // sibling directory (e.g. `/var/lib/sandboxd/501/1000/limactl`).
-        let lima_home = "/var/lib/sandboxd/501/1000/lima";
-        let result = validate_lima_home_path(lima_home, "/var/lib/sandboxd/501/1000/limactl/evil");
-        // The base is normalised to `/var/lib/sandboxd/501/1000/lima/`, so
-        // `limactl/evil` does not start with it — correct rejection.
+        // sibling directory (e.g. `…/<daemon_uid>/1000/limactl`).
+        let lima_home = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima");
+        let result = validate_lima_home_path(
+            &lima_home,
+            &format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/limactl/evil"),
+        );
+        // The base is normalised to `…/1000/lima/`, so `limactl/evil` does
+        // not start with it — correct rejection.
         assert!(result.is_err(), "prefix-spoof path must be rejected");
     }
 
@@ -1323,9 +1333,10 @@ networks:
     #[test]
     fn non_features_no_path_traversal() {
         // Traversal attempt: escape LIMA_HOME and write to a system path.
-        let lima_home = "/var/lib/sandboxd/501/1000/lima";
-        let traversal = "/var/lib/sandboxd/501/1000/lima/../../../etc/cron.d/evil";
-        let result = validate_lima_home_path(lima_home, traversal);
+        let lima_home = format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima");
+        let traversal =
+            format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/1000/lima/../../../etc/cron.d/evil");
+        let result = validate_lima_home_path(&lima_home, &traversal);
         assert!(
             result.is_err(),
             "dotdot traversal must be rejected, not resolved to /etc/cron.d/evil"

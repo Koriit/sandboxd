@@ -287,11 +287,11 @@ pub fn setup_macos_gateway(
     // exec`. The `write_file_to_gateway_container` helper now creates the
     // parent directory inline, so no separate mkdir step is needed.
     //
-    // Note: dynamic LDS listener updates (the Linux path rewrites the
-    // bind-mounted host file via `AtomicListenerWriter` on every policy
-    // change) are not yet wired on macOS. The initial deny-all listener
-    // unblocks Envoy at startup; live policy-driven listener replacement
-    // over the forwarded socket remains future work.
+    // The initial deny-all listener unblocks Envoy at startup. Subsequent
+    // policy-driven listener replacements are distributed via
+    // `PolicyDistributor::distribute` using `write_listener_into_container`
+    // over the forwarded Docker socket — the same path as the Linux
+    // `AtomicListenerWriter` but tunnelled through the gateway-VM socket.
     {
         use crate::policy::{LISTENER_FILE_IN_CONTAINER, PolicyCompiler};
         let listener = PolicyCompiler::compile_initial_envoy_listener();
@@ -825,7 +825,15 @@ fn write_file_to_gateway_container(
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string());
-    let sh_cmd = format!("mkdir -p {parent} && cat > {container_path}");
+    debug_assert!(
+        !parent.contains('\''),
+        "write_file_to_gateway_container: parent path contains single-quote: {parent}"
+    );
+    debug_assert!(
+        !container_path.contains('\''),
+        "write_file_to_gateway_container: container_path contains single-quote: {container_path}"
+    );
+    let sh_cmd = format!("mkdir -p '{parent}' && cat > '{container_path}'");
 
     let mut child = gateway_docker_cmd(gateway_docker_socket)
         .args(["exec", "-i", container_name, "sh", "-c", &sh_cmd])

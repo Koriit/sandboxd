@@ -1059,13 +1059,16 @@ impl GatewayLimaManager {
         let load_result = {
             use std::io;
             use std::process::Stdio;
-            let mut child = match Command::new("docker")
-                .args(["-H", &socket_str, "load"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
+            let spawn_result = {
+                let mut cmd = Command::new("docker");
+                apply_docker_env(&mut cmd);
+                cmd.args(["-H", &socket_str, "load"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            };
+            let mut child = match spawn_result {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(error = %e, "failed to spawn docker load for gateway image");
@@ -1178,36 +1181,45 @@ impl GatewayLimaManager {
             tag = %image_tag,
             "loading lite image into gateway VM from tarball"
         );
-        let tarball_content = std::fs::read(&tarball).map_err(|e| {
-            SandboxError::Internal(format!(
-                "failed to read lite image tarball {}: {e}",
-                tarball.display()
-            ))
-        })?;
-
         let load_result = {
-            use std::io::Write;
+            use std::io;
             use std::process::Stdio;
-            let mut child = Command::new("docker")
-                .args(["-H", &socket_str, "load"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| {
-                    SandboxError::Internal(format!(
-                        "failed to spawn docker load for lite image: {e}"
-                    ))
-                })?;
-            if let Some(ref mut stdin) = child.stdin {
-                if let Err(e) = stdin.write_all(&tarball_content) {
-                    let _ = child.kill();
-                    return Err(SandboxError::Internal(format!(
-                        "failed to write lite tarball to docker load stdin: {e}"
-                    )));
-                }
+            let mut child = {
+                let mut cmd = Command::new("docker");
+                apply_docker_env(&mut cmd);
+                cmd.args(["-H", &socket_str, "load"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| {
+                        SandboxError::Internal(format!(
+                            "failed to spawn docker load for lite image: {e}"
+                        ))
+                    })?
+            };
+            // Take the stdin handle so we own it and can drop it to signal EOF.
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                let _ = child.kill();
+                SandboxError::Internal(
+                    "docker load (lite): failed to take stdin handle".to_string(),
+                )
+            })?;
+            let mut file = std::fs::File::open(&tarball).map_err(|e| {
+                let _ = child.kill();
+                SandboxError::Internal(format!(
+                    "failed to open lite image tarball {}: {e}",
+                    tarball.display()
+                ))
+            })?;
+            if let Err(e) = io::copy(&mut file, &mut stdin) {
+                let _ = child.kill();
+                return Err(SandboxError::Internal(format!(
+                    "failed to stream lite tarball to docker load stdin: {e}"
+                )));
             }
-            child.stdin.take(); // close stdin so docker load sees EOF
+            // Drop stdin to close the pipe and signal EOF to docker load.
+            drop(stdin);
             child.wait_with_output().map_err(|e| {
                 SandboxError::Internal(format!("docker load wait failed for lite image: {e}"))
             })?

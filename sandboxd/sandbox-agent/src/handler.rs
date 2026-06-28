@@ -1402,10 +1402,15 @@ mod tests {
     use super::*;
     use crate::protocol::BrokerOp;
 
+    /// Arbitrary daemon-uid used in test fixture paths.  The value `501` is the
+    /// default macOS UID for the first non-root user and has no special meaning
+    /// here — it is chosen only to keep fixture paths realistic.
+    const TEST_DAEMON_UID: u32 = 501;
+
     fn ctx(own_uid: u32) -> RunContext {
         RunContext {
             own_uid,
-            lima_home: format!("/var/lib/sandboxd/501/{own_uid}/lima"),
+            lima_home: format!("/var/lib/sandboxd/{TEST_DAEMON_UID}/{own_uid}/lima"),
             broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         }
     }
