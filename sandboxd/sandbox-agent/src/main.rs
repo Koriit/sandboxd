@@ -459,13 +459,42 @@ mod imp {
     ///   - Fall back to the original single-connection behaviour: reunite the
     ///     control connection, run the byte-pump, and exit after it completes.
     ///     The agent reconnects for the next op as before.
+    ///
+    /// # Heartbeat liveness during long ops
+    ///
+    /// A one-shot control-plane op (e.g. the base-image build routed through a
+    /// `limactl start`) can run for minutes. The daemon's broker drops a control
+    /// connection that produces no traffic within its heartbeat timeout (60 s).
+    /// If `dispatch_op` were awaited inline inside the `select!` arm, the
+    /// heartbeat-interval arm would never fire for the op's full duration and the
+    /// daemon would declare the agent dead mid-build.
+    ///
+    /// To keep the connection alive, the op is dispatched on a **spawned task**;
+    /// the `select!` loop keeps running throughout, so the agent continues both
+    /// (a) sending periodic `PING` heartbeats — which is what resets the daemon's
+    /// liveness timer — and (b) reading from the daemon (draining `PONG`s and
+    /// answering any daemon→agent `PING` with `PONG`). The op task writes its
+    /// `BrokerResponse` when it completes.
+    ///
+    /// The control-connection write half is shared between the `select!` loop and
+    /// the spawned op task via `Arc<Mutex<…>>`. Every write acquires the lock for
+    /// the duration of a single complete frame, so heartbeat, PONG, and response
+    /// frames never interleave on the wire. The daemon serializes control-plane
+    /// ops (one request in flight, response awaited before the next is sent — see
+    /// the protocol doc-comment), so at most one op task runs at a time and op
+    /// responses cannot be reordered.
     async fn run_protocol_loop(stream: tokio::net::UnixStream, own_uid: u32, run_ctx: &RunContext) {
+        use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::Mutex;
 
         let socket_path = run_ctx.broker_socket.clone();
         let (reader_half, writer_half) = stream.into_split();
         let mut buf_reader = BufReader::new(reader_half);
-        let mut writer = writer_half;
+        // Shared write half: the select! loop (heartbeat + PONG) and any spawned
+        // one-shot op task all write through this single lock so frames are never
+        // interleaved mid-write.
+        let writer = Arc::new(Mutex::new(writer_half));
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat_interval.tick().await; // consume the immediate first tick
 
@@ -474,9 +503,12 @@ mod imp {
             line.clear();
 
             tokio::select! {
-                // Idle heartbeat (sent when no op is in flight).
+                // Periodic heartbeat. Sent unconditionally on every tick — even
+                // while a one-shot op runs on a spawned task — because the agent's
+                // unprompted PING is what resets the daemon's liveness timer.
                 _ = heartbeat_interval.tick() => {
-                    if let Err(e) = writer.write_all(HEARTBEAT_FRAME).await {
+                    let mut w = writer.lock().await;
+                    if let Err(e) = w.write_all(HEARTBEAT_FRAME).await {
                         warn!(uid = own_uid, error = %e, "heartbeat write failed; closing connection");
                         return;
                     }
@@ -505,7 +537,8 @@ mod imp {
 
                     // Plain-text PING from the daemon.
                     if trimmed == "PING" {
-                        if let Err(e) = writer.write_all(PONG_FRAME).await {
+                        let mut w = writer.lock().await;
+                        if let Err(e) = w.write_all(PONG_FRAME).await {
                             warn!(uid = own_uid, error = %e, "PONG write failed; closing connection");
                             return;
                         }
@@ -540,11 +573,14 @@ mod imp {
                                         return;
                                     }
                                 };
-                                if writer.write_all(response_json.as_bytes()).await.is_err()
-                                    || writer.write_all(b"\n").await.is_err()
                                 {
-                                    warn!(uid = own_uid, "StreamReady write failed; closing connection");
-                                    return;
+                                    let mut w = writer.lock().await;
+                                    if w.write_all(response_json.as_bytes()).await.is_err()
+                                        || w.write_all(b"\n").await.is_err()
+                                    {
+                                        warn!(uid = own_uid, "StreamReady write failed; closing connection");
+                                        return;
+                                    }
                                 }
 
                                 // Spawn a task to open the stream connection and pump bytes.
@@ -571,7 +607,20 @@ mod imp {
                             None => {
                                 // Legacy path: consume the control connection for the byte-pump.
                                 // The agent will reconnect after the stream ends.
-                                let stream = match buf_reader.into_inner().reunite(writer) {
+                                //
+                                // Recover the owned write half from the shared Arc/Mutex so it
+                                // can be reunited with the reader half. The legacy GuestSocat op
+                                // consumes the connection; no spawned op task or heartbeat write
+                                // is in flight against this Arc on this path (the daemon sends one
+                                // op at a time), so the Arc holds the single strong reference here.
+                                let writer_half = match Arc::try_unwrap(writer) {
+                                    Ok(m) => m.into_inner(),
+                                    Err(_) => {
+                                        warn!(uid = own_uid, "writer still shared; cannot take control connection for legacy GuestSocat; closing");
+                                        return;
+                                    }
+                                };
+                                let stream = match buf_reader.into_inner().reunite(writer_half) {
                                     Ok(s) => s,
                                     Err(_) => {
                                         warn!(uid = own_uid, "failed to reunite stream for legacy GuestSocat; closing connection");
@@ -584,24 +633,36 @@ mod imp {
                             }
                         }
                     } else {
-                        // One-shot op: dispatch and write the response.
-                        let result = handler::dispatch_op(run_ctx, request.op).await;
-                        let response = BrokerResponse { request_id, result };
-                        let response_json = match serde_json::to_string(&response) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                warn!(uid = own_uid, error = %e, "failed to serialize BrokerResponse; closing connection");
+                        // One-shot op: dispatch on a spawned task so the select! loop keeps
+                        // sending heartbeats (and answering daemon PINGs) for the op's full
+                        // duration. The task writes the BrokerResponse under the shared writer
+                        // lock when dispatch completes.
+                        let run_ctx_clone = RunContext {
+                            own_uid: run_ctx.own_uid,
+                            lima_home: run_ctx.lima_home.clone(),
+                            broker_socket: run_ctx.broker_socket.clone(),
+                        };
+                        let writer_for_op = Arc::clone(&writer);
+                        let op = request.op;
+                        tokio::spawn(async move {
+                            let result = handler::dispatch_op(&run_ctx_clone, op).await;
+                            let response = BrokerResponse { request_id, result };
+                            let response_json = match serde_json::to_string(&response) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    warn!(uid = own_uid, error = %e, "failed to serialize BrokerResponse; dropping");
+                                    return;
+                                }
+                            };
+                            let mut w = writer_for_op.lock().await;
+                            if let Err(e) = w.write_all(response_json.as_bytes()).await {
+                                warn!(uid = own_uid, error = %e, "response write failed");
                                 return;
                             }
-                        };
-                        if let Err(e) = writer.write_all(response_json.as_bytes()).await {
-                            warn!(uid = own_uid, error = %e, "response write failed; closing connection");
-                            return;
-                        }
-                        if let Err(e) = writer.write_all(b"\n").await {
-                            warn!(uid = own_uid, error = %e, "response newline write failed; closing connection");
-                            return;
-                        }
+                            if let Err(e) = w.write_all(b"\n").await {
+                                warn!(uid = own_uid, error = %e, "response newline write failed");
+                            }
+                        });
                     }
                 }
             }

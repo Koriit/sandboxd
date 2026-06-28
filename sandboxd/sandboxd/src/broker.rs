@@ -3972,6 +3972,178 @@ mod tests {
         // each #[tokio::test] sets its own override before spawning listeners).
     }
 
+    /// Regression guard: a fake agent that keeps heart-beating while a one-shot
+    /// op runs longer than the heartbeat timeout is NOT dropped, and the op's
+    /// response is still delivered after it completes.
+    ///
+    /// This proves the agent-side fix for the heartbeat-starvation bug: the
+    /// agent must continue sending `PING` frames (and stay registered at the
+    /// broker) while a long synchronous control-plane op (e.g. the multi-minute
+    /// base-image build) is in flight, then deliver the `BrokerResponse` when it
+    /// finishes. Before the fix, the agent dispatched the op inline in its
+    /// `select!` loop, starving the heartbeat; the daemon hit
+    /// `process_agent_line`'s `Err(_elapsed)` arm ("no heartbeat received within
+    /// timeout; dropping dead agent") and `send_op` failed with "dropped before
+    /// responding".
+    ///
+    /// The test shortens the daemon's heartbeat timeout to 200 ms via the
+    /// `test_set_heartbeat_ms` seam, then runs a fake agent whose op "takes"
+    /// ~1 s (5× the timeout) while emitting a `PING` every 50 ms throughout —
+    /// exactly the behaviour the fixed `run_protocol_loop` produces. It asserts
+    /// (a) the agent stays registered for the whole op, and (b) `send_op`
+    /// resolves with the correct `Ok` result afterward.
+    #[cfg(feature = "test-env-override")]
+    #[tokio::test]
+    async fn integration_heartbeat_during_long_op_keeps_agent_alive() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest, BrokerResponse, BrokerResult};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("integration_heartbeat_long_op.sock");
+
+        let own_uid = unsafe { libc::getuid() };
+        let primary_gid = uid_to_primary_gid(own_uid).unwrap();
+        let primary_group = gid_to_group_name(primary_gid).unwrap();
+
+        // Shorten the daemon heartbeat timeout for this thread only. The op the
+        // fake agent runs below takes ~1 s — 5× this window — so without the
+        // agent's interleaved PINGs the daemon would drop the connection well
+        // before the response arrives.
+        let heartbeat_ms = 200;
+        test_set_heartbeat_ms(heartbeat_ms);
+
+        unsafe {
+            std::env::set_var(TEST_SANDBOX_GROUP_ENV, &primary_group);
+            std::env::set_var(TEST_BROKER_SOCKET_ENV, &socket_path);
+        }
+
+        let listener = bind_broker_socket(&socket_path).unwrap();
+        let registry = AgentRegistry::new();
+        let reg_for_listener = registry.clone();
+
+        tokio::spawn(run_broker_listener(
+            listener,
+            reg_for_listener,
+            PendingStreamRegistry::new(),
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fake agent: connect and check in.
+        let agent_stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("agent connect");
+        let (agent_reader, agent_writer) = agent_stream.into_split();
+        let mut agent_buf = BufReader::new(agent_reader);
+        let agent_writer = std::sync::Arc::new(tokio::sync::Mutex::new(agent_writer));
+        {
+            let mut w = agent_writer.lock().await;
+            w.write_all(b"CHECKIN\n").await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            registry.is_registered(own_uid).await,
+            "uid must be registered after check-in"
+        );
+
+        // Daemon side: route a one-shot op. `send_op` resolves only once the
+        // fake agent delivers the BrokerResponse below (~1 s from now).
+        let registry_clone = registry.clone();
+        let request = BrokerRequest {
+            request_id: 314,
+            op: BrokerOp::ListJson { op_uid: own_uid },
+        };
+        let daemon_task =
+            tokio::spawn(async move { registry_clone.send_op(own_uid, request).await });
+
+        // Fake agent: read the request off the control connection.
+        let mut agent_line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), agent_buf.read_line(&mut agent_line))
+            .await
+            .expect("agent request timeout")
+            .expect("agent request read");
+        let parsed_req: BrokerRequest =
+            serde_json::from_str(agent_line.trim()).expect("valid BrokerRequest from daemon");
+        assert_eq!(parsed_req.request_id, 314);
+
+        // Heartbeat sender: emit a PING every 50 ms — the FIXED agent behaviour
+        // (heartbeats keep flowing while the op task runs). Shares the writer via
+        // the same Arc<Mutex<...>> the fixed run_protocol_loop uses, so the PINGs
+        // and the eventual response never interleave on the wire.
+        let hb_writer = std::sync::Arc::clone(&agent_writer);
+        let heartbeat_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            interval.tick().await; // consume immediate tick
+            loop {
+                interval.tick().await;
+                let mut w = hb_writer.lock().await;
+                if w.write_all(b"PING\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Reader-drain: the daemon replies PONG to every agent PING; drain those
+        // so they don't pile up in the socket buffer (mirrors the fixed agent's
+        // read arm discarding PONGs while an op runs).
+        let drain_task = tokio::spawn(async move {
+            let mut junk = String::new();
+            loop {
+                junk.clear();
+                match agent_buf.read_line(&mut junk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {} // discard PONG frames
+                }
+            }
+        });
+
+        // Simulate a long op: sleep 1 s (5× the 200 ms heartbeat timeout).
+        let op_duration = Duration::from_millis(heartbeat_ms * 5);
+        tokio::time::sleep(op_duration).await;
+
+        // The agent must STILL be registered — the interleaved PINGs kept the
+        // daemon's liveness timer reset throughout the long op.
+        assert!(
+            registry.is_registered(own_uid).await,
+            "agent must remain registered while a long op runs WITH heartbeats; \
+             a drop here means the heartbeat-starvation regression returned"
+        );
+
+        // Stop the heartbeat sender, then deliver the op response under the lock.
+        heartbeat_task.abort();
+        let response = BrokerResponse {
+            request_id: 314,
+            result: BrokerResult::Ok {
+                stdout: "[]".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        };
+        let response_json = serde_json::to_string(&response).unwrap();
+        {
+            let mut w = agent_writer.lock().await;
+            w.write_all(response_json.as_bytes()).await.unwrap();
+            w.write_all(b"\n").await.unwrap();
+        }
+
+        // The daemon's send_op must resolve with the delivered result.
+        let result = tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("daemon task timeout")
+            .expect("daemon task join")
+            .expect("send_op must succeed — agent stayed alive through the long op");
+        assert!(
+            matches!(result, BrokerResult::Ok { .. }),
+            "expected Ok result delivered after the long op; got {result:?}"
+        );
+
+        drain_task.abort();
+        unsafe {
+            std::env::remove_var(TEST_SANDBOX_GROUP_ENV);
+            std::env::remove_var(TEST_BROKER_SOCKET_ENV);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Eviction severs GuestSocat stream; new connection works
     // -----------------------------------------------------------------------
