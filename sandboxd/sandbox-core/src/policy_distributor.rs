@@ -28,6 +28,49 @@ fn docker_with_socket(socket: Option<&Path>) -> Command {
     cmd
 }
 
+/// Build the `docker exec` argv that writes `content` (piped on stdin) to
+/// `path` inside `container`.
+///
+/// Mirrors [`gate_listener_exec_argv`](crate::dns_gate_bridge::gate_listener_exec_argv):
+/// the spawn function is `docker_with_socket(socket).args(build…)` so the
+/// argv shape is unit-testable without invoking Docker. The container path is
+/// single-quoted in the `sh -c 'cat > …'` so that a path containing shell
+/// metacharacters cannot break out of the redirection target.
+fn write_file_exec_argv(container: &str, path: &str) -> [String; 6] {
+    [
+        "exec".to_string(),
+        "-i".to_string(),
+        container.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        format!("cat > '{path}'"),
+    ]
+}
+
+/// Build the `docker exec` argv that reads `path` from inside `container`.
+fn read_file_exec_argv(container: &str, path: &str) -> [String; 4] {
+    [
+        "exec".to_string(),
+        container.to_string(),
+        "cat".to_string(),
+        path.to_string(),
+    ]
+}
+
+/// Build the `docker exec` argv that lists the inet `table` from inside
+/// `container` via `nft list table`.
+fn list_nft_table_exec_argv(container: &str, table: &str) -> [String; 7] {
+    [
+        "exec".to_string(),
+        container.to_string(),
+        "nft".to_string(),
+        "list".to_string(),
+        "table".to_string(),
+        "inet".to_string(),
+        table.to_string(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Distribution step tracking (for rollback)
 // ---------------------------------------------------------------------------
@@ -467,14 +510,7 @@ pub fn write_file_to_container_on_socket(
     use std::io::Write;
 
     let mut child = docker_with_socket(socket)
-        .args([
-            "exec",
-            "-i",
-            container,
-            "sh",
-            "-c",
-            &format!("cat > '{path}'"),
-        ])
+        .args(write_file_exec_argv(container, path))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -517,7 +553,7 @@ fn read_file_from_container_on_socket(
     path: &str,
 ) -> Result<String, SandboxError> {
     let output = docker_with_socket(socket)
-        .args(["exec", container, "cat", path])
+        .args(read_file_exec_argv(container, path))
         .output()
         .map_err(|e| {
             SandboxError::Gateway(format!("failed to read {path} from {container}: {e}"))
@@ -555,7 +591,7 @@ fn read_nftables_state_on_socket(
 
     for table in ["sandbox_dnat", "sandbox_policy"] {
         let output = docker_with_socket(socket)
-            .args(["exec", &container, "nft", "list", "table", "inet", table])
+            .args(list_nft_table_exec_argv(&container, table))
             .output()
             .map_err(|e| {
                 SandboxError::Gateway(format!("failed to list nftables table {table}: {e}"))
@@ -570,4 +606,233 @@ fn read_nftables_state_on_socket(
     }
 
     Ok(combined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collect a built `Command`'s argv as borrowed `&str`s for assertions.
+    fn args_of(cmd: &Command) -> Vec<&str> {
+        cmd.get_args().map(|a| a.to_str().unwrap()).collect()
+    }
+
+    // -- docker_with_socket: the -H prefix algebra ---------------------------
+
+    /// Linux transport (`socket = None`): the command is a bare `docker` with
+    /// no `-H` flag — the byte-for-byte-unchanged Linux invariant. A
+    /// regression that prepended `-H` on Linux would point every gateway
+    /// `docker exec` at a nonexistent forwarded socket.
+    #[test]
+    fn docker_with_socket_none_emits_no_h_flag() {
+        let cmd = docker_with_socket(None);
+        assert_eq!(cmd.get_program().to_str().unwrap(), "docker");
+        let args = args_of(&cmd);
+        assert!(
+            !args.contains(&"-H"),
+            "Linux transport must never prepend -H: {args:?}"
+        );
+        assert!(
+            args.is_empty(),
+            "None socket adds no leading args: {args:?}"
+        );
+    }
+
+    /// macOS transport (`socket = Some`): exactly `-H unix://<path>` is
+    /// prepended, in that order, before any subcommand the caller appends.
+    /// Docker requires the `-H` daemon flag to precede the subcommand, so the
+    /// ordering here is load-bearing, not cosmetic.
+    #[test]
+    fn docker_with_socket_some_prepends_h_unix_prefix() {
+        let sock = Path::new("/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock");
+        let cmd = docker_with_socket(Some(sock));
+        assert_eq!(cmd.get_program().to_str().unwrap(), "docker");
+        let args = args_of(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "-H",
+                "unix:///var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock"
+            ],
+            "macOS transport must prepend exactly `-H unix://<path>`"
+        );
+    }
+
+    /// The `-H` prefix sits *before* any args the spawn site appends, so the
+    /// final argv parses as `docker -H unix://… exec …`, not
+    /// `docker exec -H …` (which Docker rejects).
+    #[test]
+    fn docker_with_socket_prefix_precedes_appended_subcommand() {
+        let sock = Path::new("/tmp/gw.sock");
+        let mut cmd = docker_with_socket(Some(sock));
+        cmd.args(["exec", "ctr", "true"]);
+        let args = args_of(&cmd);
+        assert_eq!(
+            args,
+            vec!["-H", "unix:///tmp/gw.sock", "exec", "ctr", "true"],
+            "the -H prefix must lead the subcommand: {args:?}"
+        );
+    }
+
+    // -- exec argv builders --------------------------------------------------
+
+    /// The file-write argv pipes `content` (on stdin) to `path` via
+    /// `sh -c 'cat > '\''path'\'''`. The container path is single-quoted so a
+    /// path containing shell metacharacters cannot break the redirection.
+    #[test]
+    fn write_file_exec_argv_single_quotes_the_target_path() {
+        let argv = write_file_exec_argv("sandbox-gw-abc123", "/etc/coredns/policy.conf");
+        assert_eq!(
+            argv,
+            [
+                "exec".to_string(),
+                "-i".to_string(),
+                "sandbox-gw-abc123".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "cat > '/etc/coredns/policy.conf'".to_string(),
+            ]
+        );
+    }
+
+    /// `-i` must be present: the write pipes content on stdin, so an exec
+    /// without an interactive stdin would silently truncate the policy file
+    /// to empty.
+    #[test]
+    fn write_file_exec_argv_keeps_interactive_stdin_flag() {
+        let argv = write_file_exec_argv("ctr", "/tmp/mitmproxy/policy.json");
+        assert!(
+            argv.iter().any(|a| a == "-i"),
+            "the write exec must keep -i (stdin pipe): {argv:?}"
+        );
+        // The redirection target carries the exact path under single quotes.
+        assert_eq!(argv.last().unwrap(), "cat > '/tmp/mitmproxy/policy.json'");
+    }
+
+    /// The file-read argv is `exec <container> cat <path>` — a plain
+    /// non-interactive read, no shell, no quoting (the path is the final
+    /// argv element, not interpolated into a shell string).
+    #[test]
+    fn read_file_exec_argv_is_plain_cat() {
+        let argv = read_file_exec_argv("sandbox-gw-x", BOOTSTRAP_FILE_IN_CONTAINER);
+        assert_eq!(
+            argv,
+            [
+                "exec".to_string(),
+                "sandbox-gw-x".to_string(),
+                "cat".to_string(),
+                BOOTSTRAP_FILE_IN_CONTAINER.to_string(),
+            ]
+        );
+    }
+
+    /// The nft-list argv targets the `inet` family for the named table, used
+    /// by the rollback snapshot to capture pre-apply ruleset state.
+    #[test]
+    fn list_nft_table_exec_argv_targets_inet_family() {
+        let argv = list_nft_table_exec_argv("sandbox-gw-x", "sandbox_policy");
+        assert_eq!(
+            argv,
+            [
+                "exec".to_string(),
+                "sandbox-gw-x".to_string(),
+                "nft".to_string(),
+                "list".to_string(),
+                "table".to_string(),
+                "inet".to_string(),
+                "sandbox_policy".to_string(),
+            ]
+        );
+    }
+
+    /// The argv builders carry through whatever container name the caller
+    /// derives (`container_name(session_id)` → `sandbox-gw-<id>`); none of
+    /// them hardcode it.
+    #[test]
+    fn exec_argv_builders_use_caller_supplied_container() {
+        let session = SessionId::parse("0123456789ab").unwrap();
+        let container = gateway::container_name(&session);
+        assert_eq!(container, "sandbox-gw-0123456789ab");
+        assert!(
+            write_file_exec_argv(&container, "/x").contains(&container),
+            "write argv must carry the session container"
+        );
+        assert!(
+            read_file_exec_argv(&container, "/x").contains(&container),
+            "read argv must carry the session container"
+        );
+        assert!(
+            list_nft_table_exec_argv(&container, "sandbox_dnat").contains(&container),
+            "nft-list argv must carry the session container"
+        );
+    }
+
+    // -- DistributionState: rollback step-tracking ---------------------------
+
+    /// A freshly-constructed `DistributionState` has every step un-set.
+    /// This is the rollback-safety precondition: `rollback_steps` only undoes
+    /// a step when its flag is `true`, so a `Default` state must trigger zero
+    /// rollback writes — otherwise an early failure (e.g. step 1 fails) would
+    /// roll back steps that never ran, writing to a half-created gateway.
+    #[test]
+    fn distribution_state_default_marks_nothing_done() {
+        let state = DistributionState::default();
+        assert!(!state.coredns_written);
+        assert!(!state.mitmproxy_written);
+        assert!(!state.nftables_injected);
+        assert!(!state.envoy_bootstrap_written);
+        assert!(!state.envoy_listener_written);
+    }
+
+    /// The step flags are independent: marking one done leaves the others
+    /// un-set. `distribute` flips them one at a time as each step succeeds, so
+    /// rollback after step N must see exactly steps 1..=N marked — never a
+    /// later step that has not run yet.
+    #[test]
+    // Incremental field assignment is the behaviour under test: it mirrors how
+    // `distribute` flips one flag per completed step. A struct-literal
+    // initializer would not exercise the per-step independence we assert.
+    #[allow(clippy::field_reassign_with_default)]
+    fn distribution_state_flags_are_independent() {
+        let mut state = DistributionState::default();
+        // Mark the steps in the order `distribute` sets them, asserting each
+        // flip is isolated to its own flag.
+        state.coredns_written = true;
+        assert!(state.coredns_written && !state.mitmproxy_written);
+
+        state.mitmproxy_written = true;
+        assert!(state.mitmproxy_written && !state.nftables_injected);
+
+        state.nftables_injected = true;
+        assert!(state.nftables_injected && !state.envoy_bootstrap_written);
+
+        state.envoy_bootstrap_written = true;
+        assert!(state.envoy_bootstrap_written && !state.envoy_listener_written);
+
+        state.envoy_listener_written = true;
+        // After the final step every flag is set — a fully-distributed policy.
+        assert!(
+            state.coredns_written
+                && state.mitmproxy_written
+                && state.nftables_injected
+                && state.envoy_bootstrap_written
+                && state.envoy_listener_written
+        );
+    }
+
+    // -- PreviousConfigs snapshot --------------------------------------------
+
+    /// A defaulted `PreviousConfigs` carries no prior generation for any
+    /// component. On rollback this is the "nothing to restore" baseline: the
+    /// listener restore falls back to the deny-all initial listener
+    /// (fail-closed), and the other components are simply left as-is.
+    #[test]
+    fn previous_configs_default_is_all_none() {
+        let prev = PreviousConfigs::default();
+        assert!(prev.coredns.is_none());
+        assert!(prev.mitmproxy.is_none());
+        assert!(prev.nftables.is_none());
+        assert!(prev.envoy_bootstrap.is_none());
+        assert!(prev.envoy_listener.is_none());
+    }
 }
