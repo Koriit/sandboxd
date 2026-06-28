@@ -6079,14 +6079,38 @@ mod tests {
                 },
             )?;
 
-            let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(op_uid))
+            // Resolve op_uid → username for the chmod +a ACE.  Production
+            // `ensure_operator_lima_home` hard-fails on an unresolvable uid
+            // because the operator is always a real logged-in user.  This
+            // test helper, however, is exercised by the registry tests with
+            // synthetic uids (1000, 1001) that intentionally have no passwd
+            // entry on macOS (user uids start at 501).  Those tests only care
+            // about per-operator path isolation, not the ACL — the ACL itself
+            // is covered by the `ensure_operator_lima_home_macos_*` tests,
+            // which always pass `Uid::current()`.  So when the uid does not
+            // resolve, fall back to the current user's name: the tempdir is
+            // owned by the test runner and a uid with no Directory Services
+            // UUID cannot be named in a `chmod +a` ACE anyway.
+            let username = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(op_uid))
                 .map_err(|e| {
                     SandboxError::Internal(format!(
                         "failed to look up username for uid {op_uid}: {e}"
                     ))
-                })?
-                .ok_or_else(|| SandboxError::Internal(format!("no passwd entry for uid {op_uid}")))?
-                .name;
+                })? {
+                Some(user) => user.name,
+                None => {
+                    nix::unistd::User::from_uid(nix::unistd::Uid::current())
+                        .map_err(|e| {
+                            SandboxError::Internal(format!(
+                                "failed to look up current username: {e}"
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            SandboxError::Internal("no passwd entry for current uid".to_string())
+                        })?
+                        .name
+                }
+            };
 
             let ace = format!(
                 "user:{username} allow \
