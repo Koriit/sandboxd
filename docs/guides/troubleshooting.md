@@ -7,6 +7,40 @@ Common issues and solutions for sandboxd operators. Each section lists the sympt
 
 If you are just getting started, check [Installation](/sandboxd/start/installation/) for setup-time errors. For command reference, see the [CLI reference](/sandboxd/reference/cli/).
 
+## On macOS, read this first
+
+Most recipes below are written for the Linux substrate and reference Linux-only mechanics — `/dev/kvm`, the `kvm` group, `systemctl --user` / `sandbox.slice`, `journalctl -u sandboxd`, and `docker exec sandbox-gw-<id>` against the host Docker daemon. On Apple-Silicon macOS the substrate differs, so translate as follows:
+
+- **No `/dev/kvm`, no `kvm` group.** VMs are HVF-accelerated. A "KVM not available" or missing-`/dev/kvm` symptom does not apply — there is nothing to fix. `sandbox doctor` does not check `/dev/kvm` on macOS.
+- **Daemon runs under launchd, not systemd.** Replace `systemctl`/`journalctl` with `launchctl` and `log show`:
+  ```bash
+  # Is the daemon loaded and running?
+  sudo launchctl print system/io.sandboxd.daemon
+
+  # Daemon structured logs (in-process rotating appender):
+  sudo tail -f /var/log/sandbox/sandboxd.log
+  # Pre-tracing-init messages and panics land in the launchd capture files:
+  sudo tail -f /var/log/sandbox/launchd.stderr.log
+
+  # Restart the daemon:
+  sudo launchctl bootout system/io.sandboxd.daemon
+  sudo launchctl bootstrap system /Library/LaunchDaemons/io.sandboxd.daemon.plist
+  ```
+- **The gateway runs inside a Lima VM, not on the host Docker daemon.** There is no host Docker on macOS. Gateway containers live inside the persistent `sandboxd-gateway` Lima VM and are reached over the forwarded Docker socket. To run the `docker exec sandbox-gw-<id> …` recipes below, target that socket (the daemon runs as `_sandboxd`, which owns it):
+  ```bash
+  SANDBOX_UID=$(id -u _sandboxd)
+  GW_SOCK="/var/lib/sandboxd/${SANDBOX_UID}/lima/sandboxd-gateway/gateway-docker.sock"
+  sudo -u _sandboxd docker -H "unix://${GW_SOCK}" ps
+  sudo -u _sandboxd docker -H "unix://${GW_SOCK}" exec sandbox-gw-<id> nft list ruleset
+  ```
+- **socket_vmnet pool health.** When sessions fail to get network connectivity, check the pool daemons (one launchd job per slot) and their logs:
+  ```bash
+  sudo launchctl print system/io.sandboxd.vmnet.0    # repeat per slot
+  sudo tail -f /var/log/sandbox/vmnet-0.stderr.log
+  ```
+- **No host TAP / host Docker bridge.** The "TAP device missing" and "Docker bridge missing" recipes do not apply as written — macOS uses `socket_vmnet` segments and a macvlan network inside the gateway VM. Confirm a session's slot with `sandbox describe <id>` (its `vmnet_slot`) and inspect the macvlan network via the gateway-VM Docker socket shown above.
+- **`sandbox health`, `sandbox logs`, `sandbox events`, and `sandbox doctor` are backend-agnostic** — prefer them over raw `docker`/`launchctl` plumbing; they already target the right substrate on both platforms.
+
 ## Which layer denied my request?
 
 Before diving into component-specific symptoms below, check the unified event stream — every policy-enforcing layer (CoreDNS, nft-deny-logger and nft-allow-logger, Envoy, mitmproxy) writes a per-decision event there, and sandboxd exposes the whole stream through `sandbox events`.
@@ -35,7 +69,9 @@ How to read the result:
 
 ## VM won't boot
 
-### KVM permissions
+### KVM permissions (Linux only)
+
+> This section is Linux-specific. On macOS there is no `/dev/kvm` and no `kvm` group — VMs are HVF-accelerated and need no such setup.
 
 **Symptom:** `limactl start: KVM not available -- is /dev/kvm accessible?`
 

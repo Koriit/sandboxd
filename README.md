@@ -25,6 +25,8 @@ CLI (sandbox) --> Unix socket --> Daemon (sandboxd) --> Lima/QEMU VMs
 - **Guest agent** runs inside each VM for command execution and file transfer.
 - **SQLite** session store tracks active sessions and their configuration.
 
+> The diagram above shows the Linux substrate (gateway container on the host's Docker, per-session host Docker bridge). On Apple-Silicon macOS the same components run inside a persistent gateway Lima VM reached over a forwarded Docker socket, and per-session VMs attach to `socket_vmnet` L2 segments instead of a host Docker bridge — see [Networking](docs/concepts/networking.md#macos-networking-topology).
+
 ## Crates
 
 | Crate | Purpose |
@@ -40,11 +42,22 @@ CLI (sandbox) --> Unix socket --> Daemon (sandboxd) --> Lima/QEMU VMs
 
 ## Prerequisites
 
-- Linux x86_64 with KVM access
+**Linux x86_64:**
+
+- KVM access
 - Docker 24.0+
 - Lima 2.1+
 - QEMU 8.0+ with OVMF
 - Rust 1.88+
+
+**Apple-Silicon macOS:**
+
+- macOS on Apple Silicon (arm64); Intel Macs are not supported
+- Lima, `socket_vmnet`, and QEMU (`brew install lima socket_vmnet qemu`)
+- Docker is provisioned *inside* the gateway VM by the installer — no host Docker Desktop is required
+- Rust 1.88+
+
+On macOS, sandboxd does not run the gateway directly on the host. The substrate is a persistent daemon-owned Lima VM (`sandboxd-gateway`) that hosts every session's gateway container, plus a pool of `socket_vmnet` daemons that provide each full-backend session VM its own isolated L2 segment. See [Networking](docs/concepts/networking.md#macos-networking-topology) for the topology.
 
 See `docs/` for detailed installation and configuration instructions.
 

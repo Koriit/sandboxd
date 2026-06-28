@@ -9,7 +9,7 @@ sandboxd runs coding agents inside real Linux virtual machines, one per session,
 
 Every session you create gives you:
 
-- A dedicated guest runtime — by default a QEMU/KVM virtual machine managed by Lima, optionally a Docker container via `--lite` / `--backend container` for fast ephemeral sessions; either way with its own filesystem and an in-guest agent.
+- A dedicated guest runtime — by default a QEMU virtual machine managed by Lima (KVM-accelerated on Linux, HVF-accelerated on Apple-Silicon macOS), optionally a Docker container via `--lite` / `--backend container` for fast ephemeral sessions; either way with its own filesystem and an in-guest agent.
 - A per-session Docker bridge network — no cross-session traffic path, no access to the host network.
 - A gateway container running five processes — Envoy, mitmproxy, CoreDNS, sandbox-nft-deny-logger, and sandbox-nft-allow-logger — that together mediate all outbound traffic.
 - A per-session CA that mitmproxy uses for TLS interception. The private key never leaves the gateway.
@@ -36,7 +36,7 @@ sandboxd fits best when you are:
 - Experimenting with agent tool use and want to inspect every outbound request.
 - Giving teammates or untrusted scripts a short-lived shell with a tight network allowlist.
 
-It is probably not what you want if you need sub-second start-up, macOS guests, or a hosted multi-tenant platform. Session create takes 2 to 5 minutes on first run and under a minute with the cached base image. Everything runs locally on your Linux host.
+It is probably not what you want if you need sub-second start-up, macOS or Windows *guests*, or a hosted multi-tenant platform. Guests are always Linux, regardless of host. Session create takes 2 to 5 minutes on first run and under a minute with the cached base image. Everything runs locally on your own machine — sandboxd hosts on Linux and on Apple-Silicon macOS.
 
 ## How it fits together
 

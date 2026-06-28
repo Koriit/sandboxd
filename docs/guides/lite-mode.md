@@ -100,6 +100,17 @@ Lima defaults (currently 4 GB / 2 CPUs) are unchanged — the percentage rule ap
 
 Pass `--memory` (in MB) and `--cpus` explicitly to override the defaults, on either backend. Fractional values for `--cpus` (e.g. `1.5`) are accepted only on the container backend; the Lima backend rejects them at session-create time because `limactl` requires integer CPU counts.
 
+### Resource defaults on macOS
+
+The `host × 0.8` rule above describes the Linux container backend, where the container runs directly on the host. On macOS the lite container does **not** run on the host — it runs inside the persistent gateway Lima VM (`sandboxd-gateway`), which is fixed at 2 vCPU / 2 GiB. Docker inside that VM cannot allocate more cores or memory than the VM has, so the daemon clamps the resolved `(memory, cpus)` pair to the VM's capacity:
+
+| Resource | macOS lite ceiling | macOS lite floor |
+|---|---|---|
+| `cpus` | 2 (the gateway VM's vCPU count) | 1.0 |
+| `memory_mb` | ~1536 MiB (VM RAM minus ~512 MiB reserved for the VM kernel, the per-session gateway container, and the in-VM Docker daemon) | 512 MiB |
+
+This clamp applies to **both** the `host × 0.8` defaults **and** any explicit `--memory` / `--cpus` you pass. On a 64 GB / 12-core Mac the `host × 0.8` default would resolve to ~51 GB / 9.6 CPU, but the macOS lite session is clamped to ~1.5 GiB / 2 vCPU regardless — and an explicit `--cpus 8` is likewise capped at 2. If you request a value above the ceiling the daemon silently clamps it rather than failing; without the clamp `docker create` inside the VM would reject the over-large request outright. For workloads that need more than ~1.5 GiB / 2 vCPU per session on macOS, use the Lima (full) backend, where the per-session VM is sized independently of the gateway VM.
+
 ## UID alignment
 
 The lite container runs as the host operator's uid:gid. When the host uid is not 1000, the daemon passes `--user <host-uid>:<host-gid>` to `docker run` so files written inside the container — into the workspace bind mount or back out via `sandbox cp` — land owned by the operator on the host.

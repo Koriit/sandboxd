@@ -29,6 +29,8 @@ Per-module filters work the usual `tracing` way: `crate=level`, comma-separated.
 
 ## systemd (user unit)
 
+> macOS operators: skip to [launchd (macOS)](#launchd-macos) below — the systemd unit here is Linux-only.
+
 Put this at `~/.config/systemd/user/sandboxd.service`:
 
 ```ini

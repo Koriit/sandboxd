@@ -348,7 +348,7 @@ sandbox VM (B+4) → macvlan slot segment → gateway container (B+3)
   → sandboxd-egress bridge → NAT → gateway VM eth0 → macOS host → internet
 ```
 
-The gateway VM's `eth0` is the one sanctioned use of SLIRP on macOS — it is the upstream uplink, not a guest-facing NIC. Because a compromised gateway component would otherwise have an unfiltered path to the internet via `eth0`, the daemon applies a baseline nftables policy on the gateway VM's `eth0` at startup: default-drop, with explicit allows only for conntrack-established responses and DNS egress. This is the macOS gateway VM's egress control; the sandbox VMs enforce via `restrict=on` on their management NIC (see below).
+The gateway VM's `eth0` is the one sanctioned use of SLIRP on macOS — it is the upstream uplink, not a guest-facing NIC. Because a compromised gateway component would otherwise have an unfiltered path to the internet via `eth0`, the daemon applies a baseline nftables policy on the gateway VM's `eth0` at startup: default-drop, with explicit allows only for conntrack-established/related responses, DNS (53), HTTPS (443), and HTTP (80). The HTTPS/HTTP allows are what let the in-VM Docker daemon pull gateway images and the policed traffic re-originated by the gateway containers exit; they are not a guest-reachable path (the sandbox VMs never reach `eth0` — see below). This is the macOS gateway VM's egress control; the sandbox VMs enforce via `restrict=on` on their management NIC (see below).
 
 ### The baseline `eth0` split: `restrict=on` vs. the baseline egress policy
 
@@ -356,7 +356,7 @@ The macOS topology has two kinds of `eth0` — sandbox VM management NIC and gat
 
 **Sandbox VM `eth0` — `restrict=on`.** Every sandbox VM runs under QEMU (HVF-accelerated on Apple Silicon) and must have its sole egress path be the socket_vmnet segment through the gateway. Lima's management NIC (`eth0`, QEMU user-mode SLIRP) reaches the internet by default and cannot be removed — but sandboxd wraps each sandbox VM launch with a narrow QEMU wrapper that rewrites the management netdev to `restrict=on` before QEMU sees it. `restrict=on` makes libslirp drop all guest-initiated external traffic while leaving the explicitly-configured SSH `hostfwd` working. With `restrict=on`, a root guest that deletes the gateway route and tries to use `eth0` for egress gets no connectivity — the slirp layer blocks it at the hypervisor, below any guest routing table. The socket_vmnet gateway segment is then the only remaining path, fully under the gateway container's nftables.
 
-**Gateway VM `eth0` — never `restrict=on`.** The gateway Lima instance's `eth0` is the sanctioned egress uplink for all policed traffic. Restricting it would block every session's upstream connections. It is bounded instead by the baseline nftables policy described above (default-drop on output; allow only established/related and DNS).
+**Gateway VM `eth0` — never `restrict=on`.** The gateway Lima instance's `eth0` is the sanctioned egress uplink for all policed traffic. Restricting it would block every session's upstream connections. It is bounded instead by the baseline nftables policy described above (default-drop on output; allow only established/related, DNS on 53, HTTPS on 443, and HTTP on 80).
 
 The daemon verifies `restrict=on` is in effect on each sandbox VM before marking the session `Running`. If the wrapper fails to inject it — or the verification does not confirm — the VM is torn down and the create operation fails rather than starting a session with an unrestricted management NIC.
 

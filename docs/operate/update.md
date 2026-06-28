@@ -3,9 +3,11 @@ title: Update sandboxd
 description: Operator walkthrough of `sandbox update` — pre-flight checks, the stateful upgrade flow, backup mechanics, lock semantics, and the rollback path.
 ---
 
-`sandbox update` applies an in-place upgrade of the sandboxd binaries, systemd unit, and configuration migrations. It is idempotent: re-running after an interrupted upgrade converges to the same end state without operator intervention. This page is the operator's reference for what the command does, what it leaves behind, and how to recover if something goes wrong.
+`sandbox update` applies an in-place upgrade of the sandboxd binaries, service definition, and configuration migrations. It is idempotent: re-running after an interrupted upgrade converges to the same end state without operator intervention. This page is the operator's reference for what the command does, what it leaves behind, and how to recover if something goes wrong.
 
 For the per-flag CLI reference, see [`sandbox update`](/sandboxd/reference/cli/#sandbox-update).
+
+> **Platform note.** The detailed flow below describes the **Linux** install (systemd unit, `setcap`, `/etc` config, host Docker gateway image). `sandbox update` is fully supported on **Apple-Silicon macOS**, where the same command drives a launchd service instead. See [On macOS](#on-macos) for the per-step substitutions; the pre-flight modes, lock semantics, backup-set/retention model, and `sandbox doctor` gating are identical on both platforms.
 
 ## Operator preconditions
 
@@ -88,6 +90,22 @@ Proceed? [y/N]:
 ```
 
 Lower-case `y` proceeds; anything else aborts (exit `0`). `--yes` skips the prompt.
+
+## On macOS
+
+`sandbox update` runs the same two-phase, lock-guarded, idempotent flow on Apple-Silicon macOS, but the Linux-specific steps are substituted for their launchd equivalents. The differences:
+
+- **Production-install detection** keys off the launchd daemon plist at `/Library/LaunchDaemons/io.sandboxd.daemon.plist` (plus the install-state file under `/var/lib/sandboxd/<_sandboxd-uid>/.install-state.json`), not a systemd unit. If the plist is absent the host is treated as a dev install and `sandbox update` refuses; dev installs upgrade by re-running `make setup-dev-env`.
+- **Daemon user is `_sandboxd`**, not `sandbox`; every `/var/lib/sandboxd/<uid>/…` path resolves against the `_sandboxd` uid (`id -u _sandboxd`).
+- **Stop / start use `launchctl`, not `systemctl`.** Stop is `launchctl bootout system/io.sandboxd.daemon`; start is `launchctl bootstrap system /Library/LaunchDaemons/io.sandboxd.daemon.plist` (`RunAtLoad` starts it immediately on bootstrap). There is no separate `daemon-reload` step — replacing the plist and re-bootstrapping is the macOS analog.
+- **No `setcap` step.** macOS does not use file capabilities, so the route-helper `setcap` step does not exist. There is no `sandbox-route-helper` or `sandbox-lima-helper` on macOS at all.
+- **No host `docker load`.** The gateway image lives inside the persistent `sandboxd-gateway` Lima VM, not the host Docker daemon, so there is no host gateway-image load step. As an added pre-flight, `sandbox update` refuses if the gateway Lima instance is unreachable (so the upgraded daemon's startup can proceed from a known-good gateway).
+- **Service config captured in the backup set.** Where Linux backs up `/etc/sandboxd/users.conf` and `/etc/qemu/bridge.conf`, macOS backs up the two launchd plists (`io.sandboxd.daemon.plist`, `io.sandboxd.agent.plist`).
+- **Binary set differs.** macOS captures and restores `sandboxd`, `sandbox`, `sandbox-agent`, `sandbox-guest`, and `cosign` — not the Linux route-helper/lima-helper pair.
+- **Per-operator agent restart.** After the binary swap, `sandbox update` kickstarts the per-operator LaunchAgent (`launchctl kickstart gui/<uid>/io.sandboxd.agent`) so the running agent picks up the new binary.
+- **Logs go to launchd locations.** Where the Linux failure-mode table points at `journalctl -u sandboxd`, on macOS consult the daemon's log at `/var/log/sandbox/sandboxd.log` and the launchd capture files at `/var/log/sandbox/launchd.stderr.log`, or `log show --predicate 'process == "sandboxd"'`.
+
+The macOS rollback recipe is documented alongside the Linux one — see [Rolling back on macOS](/sandboxd/guides/rollback/#rolling-back-on-macos).
 
 ## Backup mechanics
 

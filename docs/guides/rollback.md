@@ -3,6 +3,8 @@ title: Roll back a sandboxd upgrade
 description: Manual recipe for restoring binaries, /etc configuration, and sessions.db from a previous release's backup set after `sandbox update`.
 ---
 
+> **Platform note.** The recipe below is for the **Linux** install (systemd, `setcap`, `/etc` config, host Docker gateway image). On **macOS** the backup set, the service-control commands, and the restored file list all differ — skip to [Rolling back on macOS](#rolling-back-on-macos) for the Apple-Silicon variant.
+
 `sandbox update` keeps a versioned backup of every file it touched in `/var/lib/sandboxd/<sandbox-uid>/backups/<timestamp>-from-<v>-to-<v>/`. If a recent upgrade caused a regression — daemon refusing to start, sessions misbehaving, a network-policy bug — you can restore the previous release by running the manual recipe below.
 
 There is no automated `sandbox rollback` subcommand in this release. The rationale is documented at the bottom of this page; in short, the recipe gives operators every primitive they need to recover without committing the project to a UX choice for backup-set selection or DB-schema-downgrade.
@@ -111,6 +113,68 @@ sandbox doctor
 ```
 
 `sandbox doctor` is the load-bearing verification — every check should pass, `/version` reports the previous version, and any sessions in the restored DB are visible.
+
+## Rolling back on macOS
+
+The macOS backup set lives under the same `backups/` directory, but resolved against the `_sandboxd` daemon user's per-uid base dir (`/var/lib/sandboxd/<_sandboxd-uid>/backups/`). The macOS install has no systemd, no `setcap`, no `/etc/sandboxd/users.conf` or `/etc/qemu/bridge.conf`, and no host gateway image — so the recipe substitutes accordingly:
+
+- **What the set captures.** Binaries `sandboxd`, `sandbox`, `sandbox-agent`, `sandbox-guest`, and `cosign` (there is no `sandbox-route-helper` or `sandbox-lima-helper` on macOS — those are Linux-only setcap helpers), plus the two launchd plists `io.sandboxd.daemon.plist` and `io.sandboxd.agent.plist` (in place of the Linux `users.conf`/`bridge.conf`), plus `sessions.db` and its WAL companions.
+- **No `setcap` step.** macOS does not use file capabilities; skip the route-helper `setcap`.
+- **No host gateway-image reload.** The gateway image lives inside the persistent `sandboxd-gateway` Lima VM, not the host Docker daemon, so there is no host `docker load` gate. If the rolled-back daemon cannot reach the gateway VM, `sandbox doctor --verbose` reports it; bootstrap the gateway with `sudo launchctl bootstrap system /Library/LaunchDaemons/io.sandboxd.daemon.plist`.
+- **Service control is `launchctl`, not `systemctl`.** Stop with `sudo launchctl bootout system/io.sandboxd.daemon`; start with `sudo launchctl bootstrap system /Library/LaunchDaemons/io.sandboxd.daemon.plist`.
+
+```bash
+# 1. Pick the backup set (most-recent successful), resolved against _sandboxd's base dir.
+SANDBOX_UID=$(id -u _sandboxd)
+BACKUPS_ROOT="/var/lib/sandboxd/${SANDBOX_UID}/backups"
+BACKUP_DIR=$(sudo -u _sandboxd sh -c "ls -td ${BACKUPS_ROOT}/*/" \
+               | xargs -I{} sudo -u _sandboxd sh -c \
+                   'test "$(jq -r .completed_ok < "{}/manifest.json")" = "true" && echo "{}"' \
+               | head -1)
+[ -z "$BACKUP_DIR" ] && { echo "No completed_ok backup set under ${BACKUPS_ROOT}." >&2; exit 1; }
+echo "Rolling back from backup: $BACKUP_DIR"
+sudo -u _sandboxd cat "$BACKUP_DIR/manifest.json"
+
+# 2. Stop the daemon.
+sudo launchctl bootout system/io.sandboxd.daemon || true
+
+# 3. Restore binaries (root:wheel; no setcap on macOS).
+sudo install -m 0755 -o root -g wheel "$BACKUP_DIR/sandboxd.bak"      /usr/local/libexec/sandboxd/sandboxd
+sudo install -m 0755 -o root -g wheel "$BACKUP_DIR/sandbox.bak"       /usr/local/bin/sandbox
+sudo install -m 0755 -o root -g wheel "$BACKUP_DIR/sandbox-agent.bak" /usr/local/libexec/sandboxd/sandbox-agent
+sudo install -m 0755 -o root -g wheel "$BACKUP_DIR/sandbox-guest.bak" /usr/local/libexec/sandboxd/sandbox-guest
+sudo install -m 0755 -o root -g wheel "$BACKUP_DIR/cosign.bak"        /usr/local/libexec/sandboxd/cosign
+
+# 4. Restore the launchd plists (root:wheel 0644).
+sudo install -m 0644 -o root -g wheel "$BACKUP_DIR/io.sandboxd.daemon.plist.bak" /Library/LaunchDaemons/io.sandboxd.daemon.plist
+sudo install -m 0644 -o root -g wheel "$BACKUP_DIR/io.sandboxd.agent.plist.bak"  /Library/LaunchAgents/io.sandboxd.agent.plist
+
+# 5. Restore sessions.db + WAL companions (owned _sandboxd:_sandboxd, mode 0600).
+BASE_DIR="/var/lib/sandboxd/${SANDBOX_UID}"
+sudo install -m 0600 -o _sandboxd -g _sandboxd "$BACKUP_DIR/sessions.db.bak" "${BASE_DIR}/sessions.db"
+if [ -f "$BACKUP_DIR/sessions.db-wal.bak" ]; then
+    sudo install -m 0600 -o _sandboxd -g _sandboxd "$BACKUP_DIR/sessions.db-wal.bak" "${BASE_DIR}/sessions.db-wal"
+else
+    sudo rm -f "${BASE_DIR}/sessions.db-wal"
+fi
+if [ -f "$BACKUP_DIR/sessions.db-shm.bak" ]; then
+    sudo install -m 0600 -o _sandboxd -g _sandboxd "$BACKUP_DIR/sessions.db-shm.bak" "${BASE_DIR}/sessions.db-shm"
+else
+    sudo rm -f "${BASE_DIR}/sessions.db-shm"
+fi
+
+# 6. Remove a stale update lock, if any.
+sudo rm -f "${BASE_DIR}/.update.lock"
+
+# 7. Start the daemon (RunAtLoad starts it immediately on bootstrap).
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.sandboxd.daemon.plist
+sudo launchctl enable system/io.sandboxd.daemon
+
+# 8. Verify.
+sandbox doctor
+```
+
+The DB-schema-downgrade, no-partial-rollback, and lock-file caveats below apply identically on macOS; only the service-config-snapshot caveat differs (macOS captures the plists in the set, so they *are* snapshotted — unlike the Linux systemd unit).
 
 ## Caveats
 

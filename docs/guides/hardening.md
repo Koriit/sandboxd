@@ -23,7 +23,9 @@ Read the layers in order: an attacker has to defeat each one in turn to reach yo
 
 ## Layer 1 — QEMU wrapper
 
-QEMU runs through a wrapper at `~/.local/share/sandboxd/libexec/qemu-system-x86_64` (or `$XDG_DATA_HOME/sandboxd/libexec/` if you set that variable). The wrapper injects security flags and wraps the process in a systemd scope for resource limits.
+On Linux, QEMU runs through a wrapper at `~/.local/share/sandboxd/libexec/qemu-system-x86_64` (or `$XDG_DATA_HOME/sandboxd/libexec/` if you set that variable). The wrapper injects security flags and wraps the process in a systemd scope for resource limits.
+
+> **On macOS** the QEMU wrapper exists too, but it does a narrower, different job. It wraps `qemu-system-aarch64` (Apple Silicon), its load-bearing purpose is injecting `restrict=on` into the sandbox VM's management NIC (the egress-enforcement surface — see [Layer 3](#layer-3--network-isolation) and the [SLIRP section](#slirp-management-network)), and it is **fail-closed**: it aborts the launch rather than starting a VM with an unrestricted management NIC. It does **not** apply cgroup limits (cgroups are a Linux feature; macOS has no equivalent) and never attaches a bridge NIC (the gateway-facing NIC is a `socket_vmnet` segment). Treat the device-lockdown and cgroup subsections below as Linux-specific.
 
 ### Device lockdown
 
@@ -52,7 +54,9 @@ Only three virtio devices remain:
 
 Each absent device (USB, sound, VGA) removes a category of device-emulation bugs.
 
-### Cgroup resource limits
+### Cgroup resource limits (Linux only)
+
+> Cgroups are a Linux kernel feature; this subsection — including the `loginctl enable-linger` prerequisite — does not apply on macOS, where the QEMU wrapper applies no resource limits. Per-session sizing on macOS is bounded by the VM's own `--cpus`/`--memory` (full backend) and, for lite, by the gateway-VM clamp described in [Lite mode → Resource defaults on macOS](/sandboxd/guides/lite-mode/#resource-defaults-on-macos).
 
 When `SANDBOX_QEMU_MEMORY_MB` and `SANDBOX_QEMU_CPUS` are set and the user-systemd bus is reachable, the wrapper places QEMU in a transient `sandbox.slice` scope:
 
@@ -107,9 +111,11 @@ The gateway container ships with a tight capability set and a read-only root.
 
 - **Capability set:** `CAP_NET_ADMIN` only. Required for managing nftables inside the container's own netns. No host-level nftables touch.
 - **`--read-only` root:** container filesystem is immutable. Writable paths (logs, PID files) come from tmpfs mounts. CA certificate files are bind-mounted read-only from the host.
-- **No sudo on the host:** the entire daemon runs as a regular user. The only host privileges required are membership in the `docker` and `kvm` groups.
+- **No sudo on the host:** the entire daemon runs as a regular user. On Linux the only host privileges required are membership in the `docker` and `kvm` groups. On macOS the daemon runs as the dedicated `_sandboxd` system account under launchd, and there is no `kvm` group (VMs are HVF-accelerated) and no host Docker membership (Docker lives inside the gateway Lima VM).
 
-### Privileged helpers and the `SANDBOX_USERS_CONF` boundary
+> **On macOS the privileged-helper set below does not apply.** There is no setuid `qemu-bridge-helper` (no host bridge), no `sandbox-route-helper`, and no `sandbox-lima-helper` — those are Linux-only setcap/setuid helpers. macOS instead uses a per-operator agent launched by launchd that pivots Lima operations to the operator's uid without any file capability, the per-VM QEMU wrapper for `restrict=on` egress enforcement, and root-owned launchd daemons for the `socket_vmnet` pool. The `SANDBOX_USERS_CONF` privilege-boundary discussion below is Linux-specific (it guards the cap'd route helper, which does not exist on macOS).
+
+### Privileged helpers and the `SANDBOX_USERS_CONF` boundary (Linux)
 
 Three privileged helpers exist in the install footprint: `qemu-bridge-helper` (setuid root, ships with QEMU), `sandbox-route-helper` (cap'd `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`, lives at `/usr/local/libexec/sandboxd/sandbox-route-helper`), and `sandbox-lima-helper` (cap'd `cap_setuid+ep`, lives at `/usr/local/libexec/sandboxd/sandbox-lima-helper`). All three are invoked by the daemon, not by operators directly. `qemu-bridge-helper` cross-checks the caller's uid against its own ACL before attaching a TAP device; `sandbox-route-helper` enforces a **pair-membership check** against `/etc/sandboxd/users.conf` before any namespace mutation — both the calling process's uid (the daemon, via `getuid`) and the operator name passed in `--for-user` (which the daemon reads from `SO_PEERCRED` on its accepted Unix socket) must appear in the same pool's `allow_users`. A compromised daemon cannot invent operator names that are not already paired with its own runtime uid; a local user with `allow_users` access cannot drive the helper from outside the daemon because they cannot forge the `SO_PEERCRED`-derived `--for-user` argument the daemon supplies. Every allow/deny decision is recorded to a JSON-Lines audit log; see [Audit log](/sandboxd/start/installation/#audit-log) in the installation guide for the on-disk path, field set, and the deny-path-write-failure escalation contract.
 
@@ -258,7 +264,9 @@ The VM has two NICs. `eth1` is a TAP device on the per-session Docker bridge —
 
 **What it costs.** SLIRP runs in-process with QEMU, so any bug in its packet-handling code executes in the same address space as the hypervisor. That widens the QEMU attack surface compared to a plain TAP bridge, where the kernel does the forwarding. SLIRP is also slower than a TAP bridge and emulates some protocols (ICMP, raw sockets) only partially.
 
-**How the sandbox contains that.** SLIRP is confined to `eth0` and carries only Lima's SSH traffic — all outbound application traffic goes over `eth1` to the gateway. The guest adds a default route over `eth1` with a lower metric than SLIRP's, so internet-bound traffic prefers the gateway path; SSH and Lima management still ride SLIRP. The policy layer (DNS filtering, nftables, Envoy, mitmproxy) only applies to traffic that reaches the gateway — that is by construction true for the data plane, since SLIRP has no route to anything a user workload would use.
+**How the sandbox contains that (Linux).** SLIRP is confined to `eth0` and carries only Lima's SSH traffic — all outbound application traffic goes over `eth1` to the gateway. The guest adds a default route over `eth1` with a lower metric than SLIRP's, so internet-bound traffic prefers the gateway path; SSH and Lima management still ride SLIRP. The policy layer (DNS filtering, nftables, Envoy, mitmproxy) only applies to traffic that reaches the gateway — that is by construction true for the data plane, since SLIRP has no route to anything a user workload would use.
+
+**How the sandbox contains that (macOS).** On Apple-Silicon macOS the containment is stronger and does not rely on route metrics. Each sandbox VM's management NIC (`eth0`, still a mandatory Lima SLIRP netdev) is locked with QEMU `restrict=on`: a narrow per-VM QEMU wrapper rewrites Lima's management netdev to splice in `restrict=on` before QEMU sees the argv. `restrict=on` makes libslirp drop *all* guest-initiated external traffic at the hypervisor — below any guest routing table — while leaving the explicitly-configured SSH `hostfwd` working. A root guest that deletes the gateway route and tries to egress over `eth0` gets no connectivity. The daemon verifies `restrict=on` is in effect before marking the session `Running`; if the wrapper fails to inject it or verification does not confirm, the VM is torn down and create fails rather than starting a session with an unrestricted management NIC. The sandbox VM's data path is the `socket_vmnet` segment to the gateway — see [networking → The baseline `eth0` split](/sandboxd/concepts/networking/#the-baseline-eth0-split-restricton-vs-the-baseline-egress-policy).
 
 Removing SLIRP would require replacing Lima's SSH provisioning; it is not currently configurable.
 

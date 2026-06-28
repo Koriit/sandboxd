@@ -33,6 +33,8 @@ flowchart LR
 
 The diagram shows three traffic paths: the control path (CLI → daemon → guest agent for commands and files), the VM lifecycle path (daemon → Lima → QEMU VM), and the data path (VM → Docker bridge → gateway → internet).
 
+> **On macOS** the data path is built on a different substrate. There is no host `qemu-bridge-helper`, host TAP device, or per-session host Docker bridge. Each session VM attaches to an isolated `socket_vmnet` L2 segment, and the gateway container reaches it over a `macvlan(private)` child NIC inside the persistent gateway Lima VM; the gateway and all per-session Docker networks live inside that VM rather than on the host. `NetworkInfo` records a `vmnet_slot` (pool slot index, socket path, daemon label) instead of a TAP name. The enforcement components (Envoy, mitmproxy, CoreDNS, the nft-loggers, deny-by-default nftables) are identical — only the substrate underneath differs. See [Networking → macOS networking topology](/sandboxd/concepts/networking/#macos-networking-topology) for the full picture.
+
 ### sandboxd (daemon)
 
 The central process that manages the full sandbox lifecycle. It listens on a Unix socket for HTTP API requests and coordinates all other components.
@@ -41,7 +43,7 @@ Responsibilities:
 
 - Create, start, stop, and remove sessions.
 - Manage Lima VMs (create, start, stop, delete).
-- Set up and tear down per-session networking (Docker bridge, gateway container, bridge NIC via `qemu-bridge-helper`).
+- Set up and tear down per-session networking (Docker bridge, gateway container, and the VM's data NIC — attached via `qemu-bridge-helper` to a host bridge on Linux, or via a `socket_vmnet` segment on macOS).
 - Generate and inject per-session CA certificates.
 - Compile and distribute network policies to gateway components.
 - Relay command execution, file transfer, and git operations to the guest agent.
@@ -140,8 +142,8 @@ A session moves through these states:
 ### Create
 
 1. **Session record.** A new session is created in the SQLite database with state `Creating`.
-2. **CA + Networking.** The per-session CA certificate is generated. A per-session Docker bridge network is created (the bridge must exist before VM boot so `qemu-bridge-helper` can attach the NIC).
-3. **Lima VM.** A QEMU/KVM virtual machine is created and booted via `limactl`. An auto-generated Lima YAML template configures CPU, memory, disk, and firmware settings. The bridge NIC is attached at boot time via `qemu-bridge-helper` (no QMP hot-add). If `--template` is provided, the custom template is used instead.
+2. **CA + Networking.** The per-session CA certificate is generated, then per-session networking is brought up before VM boot. On Linux this is a per-session Docker bridge network on the host, which must exist before VM boot so `qemu-bridge-helper` can attach the NIC. On macOS a pool slot is claimed and a macvlan Docker network is created inside the gateway Lima VM, and the gateway container is started with deny-all nftables in place before the VM's `socket_vmnet` NIC comes up.
+3. **Lima VM.** A QEMU virtual machine is created and booted via `limactl` (KVM-accelerated on Linux, HVF on Apple-Silicon macOS). An auto-generated Lima YAML template configures CPU, memory, disk, and firmware settings. On Linux the data NIC is attached at boot time via `qemu-bridge-helper` (no QMP hot-add); on macOS the VM attaches to its claimed `socket_vmnet` segment and the management NIC is locked with `restrict=on`. If `--template` is provided, the custom template is used instead.
 4. **Guest agent.** The `sandbox-guest` binary is copied into the VM and started. The daemon verifies connectivity with a ping.
 5. **Gateway + Network config.** The gateway container is created on the Docker bridge. The VM's bridge NIC is configured with a static IP via the guest agent. The CA certificate is injected into the VM's trust store.
 6. **State transition.** Session state moves to `Running`.
@@ -152,8 +154,8 @@ A session moves through these states:
 ### Stop
 
 1. Cancel the DNS propagation loop.
-2. Stop the Lima VM (the TAP device, owned by QEMU, is destroyed automatically).
-3. Tear down networking (stop gateway container, remove Docker bridge). The subnet allocation and CA certificate are preserved.
+2. Stop the Lima VM. On Linux the TAP device, owned by QEMU, is destroyed automatically; on macOS the VM simply detaches from its `socket_vmnet` segment.
+3. Tear down networking (stop gateway container, remove the Docker bridge on Linux, or the macvlan network inside the gateway VM and release the pool slot on macOS). The subnet allocation and CA certificate are preserved.
 4. Session state moves to `Stopped`.
 
 ### Start (resume)
@@ -264,7 +266,7 @@ The daemon socket is shared by every operator on the host, but each session is o
 The daemon stores session metadata in a SQLite database at `<base-dir>/sessions.db`. The database contains:
 
 - Session records (ID, name, state, config, timestamps).
-- Network info per session (subnet, IPs, Docker network name, TAP name).
+- Network info per session (subnet, IPs, Docker network name, and the data-NIC handle — a TAP name on Linux, a `vmnet_slot` on macOS).
 
 Migrations are managed by the `refinery` crate and run automatically at daemon startup.
 

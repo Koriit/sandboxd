@@ -52,9 +52,9 @@ The signed installer lives at `https://Koriit.github.io/sandboxd/install.sh`. It
 curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh
 ```
 
-This walks 24 steps: prereq probe, sigstore-verified tarball download, binary install, `sandbox` system-user create, `setcap` on the route helper, `setuid` on `qemu-bridge-helper`, `docker load` of the gateway image, and `systemd` unit install. Every privileged step uses `sudo -k`. A re-run on an already-installed host detects each desired end-state and logs `action=skip`.
+**On Linux**, this walks a multi-step sequence: prereq probe, sigstore-verified tarball download, binary install, `sandbox` system-user create, `setcap` on the route helper, `setuid` on `qemu-bridge-helper`, `docker load` of the gateway image, and `systemd` unit install. Every privileged step uses `sudo -k`. A re-run on an already-installed host detects each desired end-state and logs `action=skip`.
 
-After install, finish the two follow-up steps the installer prints:
+After install on Linux, finish the two follow-up steps the installer prints:
 
 ```bash
 # 1. Activate sandbox-group membership in your current shell.
@@ -66,6 +66,17 @@ sudo systemctl enable --now sandboxd
 # 3. Verify the install.
 sandbox doctor
 ```
+
+**On macOS (Apple Silicon)**, the sequence is shorter (13 phases) and the named Linux steps do not apply — there is no `setcap`, no `setuid` on `qemu-bridge-helper`, and no `docker load` on the host (the gateway image is staged into the gateway VM, not the host Docker). Instead the macOS path creates the `_sandboxd` role account, installs the socket_vmnet pool launchd daemons, installs the per-operator LaunchAgent and the system LaunchDaemon, and bootstraps + enables the daemon under `launchctl`. Because the daemon plist is `RunAtLoad`, **the installer starts the daemon for you** — there is no manual start step. The only follow-up is activating group membership:
+
+```bash
+# The installer already added you to the _sandboxd group via dseditgroup
+# and started the daemon. Log out and back in so the new group membership
+# is present in your login session's socket credentials, then verify:
+sandbox doctor
+```
+
+`sandbox doctor` reports group membership immediately after install, but the socket's group-credential check requires a fresh login session — log out and back in before relying on CLI access.
 
 ### Variants
 

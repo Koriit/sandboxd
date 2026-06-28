@@ -3,19 +3,29 @@ title: Quickstart
 description: Install prerequisites, build sandboxd, and run your first policy-bounded session in about five minutes.
 ---
 
-This page takes you from a fresh Linux host to a running sandbox session you can shell into. You need about five minutes, plus the first-boot image download.
+This page takes you from a fresh host to a running sandbox session you can shell into. You need about five minutes, plus the first-boot image download. The walkthrough below builds from source on Linux; macOS operators should install via the signed installer (see the macOS note under Prerequisites) and then pick up at step 3.
 
 If you hit a snag, jump to [Troubleshooting](/sandboxd/guides/troubleshooting/) or the deeper [Installation guide](/sandboxd/start/installation/).
 
 ## Prerequisites
 
-You need a Linux x86_64 host with KVM, Docker, Lima, QEMU, and a Rust toolchain. Check them in one go:
+**Linux x86_64.** You need a host with KVM, Docker, Lima, QEMU, and a Rust toolchain. Check them in one go:
 
 ```bash
 ls /dev/kvm && docker info >/dev/null && limactl --version && rustc --version
 ```
 
 If any of those fail, stop here and follow [Installation](/sandboxd/start/installation/). The most common blockers are KVM group membership and Docker group membership — both require a logout after `usermod -aG`.
+
+**Apple-Silicon macOS.** There is no `/dev/kvm` on macOS (VMs are HVF-accelerated), and no host Docker is required — the gateway VM provisions its own. Install Lima and `socket_vmnet` first, then use the signed installer rather than the build-from-source path below:
+
+```bash
+brew install lima socket_vmnet
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | sh
+sandbox doctor   # verify the install
+```
+
+See [Installation](/sandboxd/start/installation/#macos) for the macOS specifics; once `sandbox doctor` is clean, continue at [step 3](#3-create-your-first-session) below.
 
 ## 1. Clone and build
 
