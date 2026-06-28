@@ -902,9 +902,11 @@ check_lima_installed_and_version() {
 check_socket_vmnet_running() {
     _slot_found=0
     _slot_broken=0
-    for _slot in 0 1 2 3 4 5 6 7; do
-        _label="io.sandboxd.vmnet.$_slot"
-        _sock="/var/run/sandbox/vmnet/slot-$_slot.sock"
+    _csr_slots="${DARWIN_VMNET_SLOTS:-8}"
+    _csr_i=0
+    while [ "$_csr_i" -lt "$_csr_slots" ]; do
+        _label="io.sandboxd.vmnet.$_csr_i"
+        _sock="/var/run/sandbox/vmnet/slot-$_csr_i.sock"
         if launchctl print "system/$_label" >/dev/null 2>&1; then
             _slot_found=$((_slot_found + 1))
             # Daemon is loaded; its socket must be present.
@@ -912,6 +914,7 @@ check_socket_vmnet_running() {
                 _slot_broken=$((_slot_broken + 1))
             fi
         fi
+        _csr_i=$((_csr_i + 1))
     done
 
     if [ "$_slot_found" -eq 0 ]; then
