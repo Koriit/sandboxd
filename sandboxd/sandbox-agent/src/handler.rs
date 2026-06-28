@@ -154,6 +154,9 @@ pub struct RunContext {
     /// `own_uid` and the daemon uid (from the broker socket path). Format:
     /// `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima`.
     pub lima_home: String,
+    /// Path to the broker socket. Used by the multiplexed GuestSocat path to
+    /// open a dedicated stream connection for each streaming op.
+    pub broker_socket: std::path::PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -424,8 +427,7 @@ async fn handle_create(
             return BrokerResult::Rejected { reason };
         }
     }
-    if let Err(reason) =
-        validation::validate_lima_yaml_shape(&lima_yaml, &vm, is_hardened_session)
+    if let Err(reason) = validation::validate_lima_yaml_shape(&lima_yaml, &vm, is_hardened_session)
     {
         return BrokerResult::Rejected { reason };
     }
@@ -1253,12 +1255,15 @@ async fn handle_restrict_on_verify(ctx: &RunContext, vm: String) -> BrokerResult
 
 /// Open the `GuestSocat` streaming op.
 ///
-/// After validation, writes `BrokerResult::StreamOpen` to the stream and then
-/// splices the stream bidirectionally to `limactl shell <vm> -- socat -
+/// Splices the stream bidirectionally to `limactl shell <vm> -- socat -
 /// TCP:127.0.0.1:5123`.
 ///
-/// This function does not return until the session ends (either the guest agent
-/// closes its side or the daemon closes the broker connection).
+/// When `write_stream_open` is `true` (legacy single-connection path), writes
+/// `BrokerResult::StreamOpen` to the stream before beginning the byte-pump.
+/// When `false` (multiplexed stream-connection path), the stream connection is
+/// a dedicated raw byte-pump channel; no framing header is written.
+///
+/// This function does not return until the session ends.
 ///
 /// The `own_uid` gate has already been checked by `dispatch_op` before this is
 /// called; re-checking it here is belt-and-suspenders.
@@ -1267,6 +1272,7 @@ pub async fn handle_guest_socat<S>(
     vm: String,
     op_uid: u32,
     request_id: u64,
+    write_stream_open: bool,
     mut stream: S,
 ) -> std::io::Result<()>
 where
@@ -1336,16 +1342,20 @@ where
     let child_stdin = child.stdin.take().unwrap();
     let child_stdout = child.stdout.take().unwrap();
 
-    // Send StreamOpen to the daemon before beginning raw byte-pump.
-    // Echo the caller's request_id so the daemon's request_id validation
-    // can verify the response matches the outstanding request.
-    let response = BrokerResponse {
-        request_id,
-        result: BrokerResult::StreamOpen,
-    };
-    let open_msg = serde_json::to_string(&response).unwrap_or_default();
-    stream.write_all(open_msg.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
+    // On the legacy single-connection path, send StreamOpen before the byte-pump
+    // so the daemon (which holds the read cursor on the same connection) can detect
+    // the transition from framed to raw mode.
+    // On the multiplexed stream-connection path, the stream is already a dedicated
+    // raw channel; no framing header is needed or expected.
+    if write_stream_open {
+        let response = BrokerResponse {
+            request_id,
+            result: BrokerResult::StreamOpen,
+        };
+        let open_msg = serde_json::to_string(&response).unwrap_or_default();
+        stream.write_all(open_msg.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+    }
 
     // After StreamOpen, the connection is a raw byte-pump. Split the broker
     // stream and the child stdio into two async copy tasks.
@@ -1396,6 +1406,7 @@ mod tests {
         RunContext {
             own_uid,
             lima_home: format!("/var/lib/sandboxd/501/{own_uid}/lima"),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         }
     }
 
@@ -1807,6 +1818,7 @@ mod tests {
         let ctx = RunContext {
             own_uid,
             lima_home: dir.path().to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         };
         let op = BrokerOp::RestrictOnVerify {
             op_uid: own_uid,
@@ -1834,6 +1846,7 @@ mod tests {
         let ctx = RunContext {
             own_uid,
             lima_home: dir.path().to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         };
         let op = BrokerOp::RestrictOnVerify {
             op_uid: own_uid,
@@ -1864,6 +1877,7 @@ mod tests {
         let ctx = RunContext {
             own_uid,
             lima_home: dir.path().to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         };
         let op = BrokerOp::RestrictOnVerify {
             op_uid: own_uid,
@@ -1957,10 +1971,7 @@ mod tests {
             let _ = reader.read_line(&mut line);
 
             // Reply to qmp_capabilities.
-            reader
-                .get_mut()
-                .write_all(b"{\"return\":{}}\n")
-                .unwrap();
+            reader.get_mut().write_all(b"{\"return\":{}}\n").unwrap();
             reader.get_mut().flush().unwrap();
 
             // Read query-netdev command (skip; we don't validate its content).
@@ -2057,6 +2068,7 @@ mod tests {
         let ctx = RunContext {
             own_uid,
             lima_home: dir.path().to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         };
         let op = BrokerOp::RestrictOnVerify {
             op_uid: own_uid,
@@ -2091,6 +2103,7 @@ mod tests {
         let ctx = RunContext {
             own_uid,
             lima_home: dir.path().to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         };
         let op = BrokerOp::RestrictOnVerify {
             op_uid: own_uid,
@@ -2118,6 +2131,7 @@ mod tests {
         let ctx = RunContext {
             own_uid,
             lima_home: dir.path().to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         };
         let op = BrokerOp::RestrictOnVerify {
             op_uid: own_uid,
@@ -2153,21 +2167,24 @@ mod tests {
         let ctx = RunContext {
             own_uid,
             lima_home: "/tmp/lima_test".to_string(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
         };
 
         // Use a duplex in-memory stream to capture what the handler writes.
         let (client, server) = tokio::io::duplex(4096);
 
-        // Spawn the handler; it will write StreamOpen then attempt limactl
-        // (which will fail since there's no real limactl), then close.
+        // Spawn the handler with write_stream_open=true (legacy path).
+        // It will write StreamOpen then attempt limactl (which will fail since
+        // there's no real limactl), then close.
         let vm = "sandbox-test".to_string();
         let op_uid = own_uid;
         let ctx_clone = RunContext {
             own_uid: ctx.own_uid,
             lima_home: ctx.lima_home.clone(),
+            broker_socket: ctx.broker_socket.clone(),
         };
         let handle = tokio::spawn(async move {
-            let _ = handle_guest_socat(&ctx_clone, vm, op_uid, 1, server).await;
+            let _ = handle_guest_socat(&ctx_clone, vm, op_uid, 1, true, server).await;
         });
 
         // Read the first line from the client end — must be a valid JSON

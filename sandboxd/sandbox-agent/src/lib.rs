@@ -16,7 +16,7 @@
 pub use protocol::{BridgePair, BrokerOp, BrokerRequest, BrokerResponse, BrokerResult};
 
 #[cfg(target_os = "macos")]
-pub use protocol::{RESTRICT_MARKER_FILENAME, RESTRICT_ON_MARKER};
+pub use protocol::{RESTRICT_MARKER_FILENAME, RESTRICT_ON_MARKER, STREAM_CONNECT_PREFIX};
 
 #[cfg(target_os = "macos")]
 mod protocol;

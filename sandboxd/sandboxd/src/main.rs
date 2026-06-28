@@ -13432,7 +13432,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     let lima_executor: Arc<dyn sandbox_core::lima::LimaExecutor> = {
         use broker::{
-            AgentBrokerExecutor, bind_broker_socket, broker_socket_path, run_broker_listener,
+            AgentBrokerExecutor, PendingStreamRegistry, bind_broker_socket, broker_socket_path,
+            run_broker_listener,
         };
 
         // Bind the broker socket. The path is `/var/run/sandbox/broker.sock`
@@ -13463,16 +13464,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         info!(path = %broker_path.display(), "agent-broker socket bound");
 
+        // Create the pending-stream registry for multiplexed GuestSocat connections.
+        let pending_streams = PendingStreamRegistry::new();
+
         // Spawn the broker listener. The on_admit sender notifies the
         // post-startup reconcile task on each fresh agent check-in.
         let reg_for_listener = agent_registry.clone();
+        let pending_for_listener = pending_streams.clone();
         tokio::spawn(run_broker_listener(
             broker_listener,
             reg_for_listener,
+            pending_for_listener,
             Some(on_admit_tx),
         ));
 
-        Arc::new(AgentBrokerExecutor::new(agent_registry.clone(), daemon_uid))
+        Arc::new(AgentBrokerExecutor::new(
+            agent_registry.clone(),
+            pending_streams,
+            daemon_uid,
+        ))
     };
 
     // Build the per-operator LimaManager registry. One LimaManager per

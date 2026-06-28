@@ -628,13 +628,9 @@ pub fn ensure_operator_lima_home(op_uid: u32) -> Result<PathBuf, SandboxError> {
         // Resolve op_uid to a username for chmod +a.
         let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(op_uid))
             .map_err(|e| {
-                SandboxError::Internal(format!(
-                    "failed to look up username for uid {op_uid}: {e}"
-                ))
+                SandboxError::Internal(format!("failed to look up username for uid {op_uid}: {e}"))
             })?
-            .ok_or_else(|| {
-                SandboxError::Internal(format!("no passwd entry for uid {op_uid}"))
-            })?
+            .ok_or_else(|| SandboxError::Internal(format!("no passwd entry for uid {op_uid}")))?
             .name;
 
         // Grant the operator ACE on the directory. No file_inherit or
@@ -6089,9 +6085,7 @@ mod tests {
                         "failed to look up username for uid {op_uid}: {e}"
                     ))
                 })?
-                .ok_or_else(|| {
-                    SandboxError::Internal(format!("no passwd entry for uid {op_uid}"))
-                })?
+                .ok_or_else(|| SandboxError::Internal(format!("no passwd entry for uid {op_uid}")))?
                 .name;
 
             let ace = format!(
@@ -6265,10 +6259,7 @@ mod tests {
             .expect("ls -led must be available");
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         // Drop the first line (the stat summary); return the rest.
-        text.lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n")
+        text.lines().skip(1).collect::<Vec<_>>().join("\n")
     }
 
     /// Parse `ls -le` output for a file and return the ACL lines.
@@ -6280,10 +6271,7 @@ mod tests {
             .output()
             .expect("ls -le must be available");
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n")
+        text.lines().skip(1).collect::<Vec<_>>().join("\n")
     }
 
     /// After provisioning, the LIMA_HOME directory must carry a macOS `allow`
@@ -6295,9 +6283,8 @@ mod tests {
         // is self-contained (no cross-uid chmod needed).
         let tmp = tempfile::TempDir::new().expect("create tempdir");
         let current_uid = nix::unistd::Uid::current().as_raw();
-        let lima_home =
-            ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
-                .expect("ensure_operator_lima_home_at must succeed");
+        let lima_home = ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
+            .expect("ensure_operator_lima_home_at must succeed");
 
         let acl = lsled_acl_lines(&lima_home);
 
@@ -6341,9 +6328,8 @@ mod tests {
     fn ensure_operator_lima_home_macos_child_file_has_no_inherited_ace() {
         let tmp = tempfile::TempDir::new().expect("create tempdir");
         let current_uid = nix::unistd::Uid::current().as_raw();
-        let lima_home =
-            ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
-                .expect("ensure_operator_lima_home_at must succeed");
+        let lima_home = ensure_operator_lima_home_at(tmp.path(), current_uid, current_uid)
+            .expect("ensure_operator_lima_home_at must succeed");
 
         // Create a child file to simulate what limactl would create.
         let child = lima_home.join("_config_user_sim");

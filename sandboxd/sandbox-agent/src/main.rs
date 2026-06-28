@@ -33,10 +33,14 @@
 //! The broker channel carries newline-delimited JSON frames:
 //! - **One-shot ops**: daemon writes `BrokerRequest\n`, agent processes and
 //!   writes `BrokerResponse\n`. Request/response is strictly sequential.
-//! - **GuestSocat**: daemon writes `BrokerRequest { op: GuestSocat }\n`,
-//!   agent writes `BrokerResponse { result: StreamOpen }\n`, then the
-//!   stream transitions to a raw byte-pump for the duration of the VM
-//!   SSH session (see `protocol` module for full framing documentation).
+//! - **GuestSocat (multiplexed)**: daemon writes `BrokerRequest { op:
+//!   GuestSocat { stream_token: Some(token) } }\n` on the **control**
+//!   connection. Agent replies `BrokerResponse { result: StreamReady }\n`
+//!   on the same control connection (which is NOT consumed), then opens a
+//!   **separate** stream connection and sends `STREAM_CONNECT:<token>\n`
+//!   before beginning the raw byte-pump. The daemon correlates the stream
+//!   connection to the pending op by token. Control connection stays alive
+//!   and can immediately serve the next op.
 //! - **Heartbeat**: daemon may send `PING\n` (plain text, not JSON) and
 //!   expects `PONG\n` in reply. This coexists with the op framing because
 //!   ops are sequential and heartbeats are sent between ops.
@@ -72,7 +76,7 @@ mod imp {
     use tracing::{info, warn};
 
     use crate::handler::{self, RunContext};
-    use crate::protocol::{BrokerOp, BrokerRequest, BrokerResponse};
+    use crate::protocol::{BrokerOp, BrokerRequest, BrokerResponse, BrokerResult};
 
     // ---------------------------------------------------------------------------
     // Constants
@@ -440,18 +444,27 @@ mod imp {
     }
 
     /// Drive the op-dispatch loop on an established, authenticated broker
-    /// connection.
+    /// control connection.
     ///
-    /// Reads lines from the daemon and dispatches ops or heartbeats. Exits
-    /// when the connection closes or on a read/write error.
+    /// Reads lines from the daemon and dispatches ops or heartbeats. The
+    /// control connection is never consumed — each `GuestSocat` op opens a
+    /// separate stream connection for the byte-pump (multiplexed protocol).
+    ///
+    /// For daemons that send a `GuestSocat` with `stream_token: Some(token)`:
+    ///   - Reply with `StreamReady { token }` on the control connection.
+    ///   - Spawn a task that opens a new connection and runs the byte-pump.
+    ///   - The control connection continues to serve subsequent ops.
+    ///
+    /// For daemons that send `GuestSocat` with `stream_token: None` (legacy):
+    ///   - Fall back to the original single-connection behaviour: reunite the
+    ///     control connection, run the byte-pump, and exit after it completes.
+    ///     The agent reconnects for the next op as before.
     async fn run_protocol_loop(stream: tokio::net::UnixStream, own_uid: u32, run_ctx: &RunContext) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+        let socket_path = run_ctx.broker_socket.clone();
         let (reader_half, writer_half) = stream.into_split();
         let mut buf_reader = BufReader::new(reader_half);
-        // Wrap writer in Arc<Mutex> so GuestSocat can take ownership.
-        // For non-streaming ops we write synchronously; for GuestSocat we
-        // pass the full stream (reader + writer) to the streaming handler.
         let mut writer = writer_half;
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat_interval.tick().await; // consume the immediate first tick
@@ -485,17 +498,12 @@ mod imp {
 
                     let trimmed = line.trim_end_matches(['\n', '\r']);
 
-                    // Heartbeat acknowledgement from the daemon (response to our
-                    // PING — the daemon also sends PONG; or the daemon may send
-                    // PONG in response to our idle PING).
+                    // Heartbeat acknowledgement from the daemon.
                     if trimmed == "PONG" {
-                        // Daemon acknowledged our heartbeat — nothing to do.
                         continue;
                     }
 
-                    // Plain-text PING from the daemon (daemon-initiated heartbeat
-                    // check — though the protocol primarily has the agent ping;
-                    // handle it defensively).
+                    // Plain-text PING from the daemon.
                     if trimmed == "PING" {
                         if let Err(e) = writer.write_all(PONG_FRAME).await {
                             warn!(uid = own_uid, error = %e, "PONG write failed; closing connection");
@@ -514,57 +522,153 @@ mod imp {
                     };
 
                     let request_id = request.request_id;
-                    let is_guest_socat = matches!(request.op, BrokerOp::GuestSocat { .. });
 
-                    if is_guest_socat {
-                        // GuestSocat: pass the full stream to the streaming handler.
-                        // We need to reunite the split reader/writer and pass the
-                        // whole stream to handle_guest_socat.
-                        //
-                        // Extract the op fields.
-                        let (op_uid, vm) = if let BrokerOp::GuestSocat { op_uid, vm } = request.op {
-                            (op_uid, vm)
-                        } else {
-                            unreachable!()
-                        };
+                    if let BrokerOp::GuestSocat { op_uid, vm, stream_token } = request.op {
+                        match stream_token {
+                            Some(token) => {
+                                // Multiplexed path: respond StreamReady on the control
+                                // connection, open a separate stream connection for the
+                                // byte-pump. The control connection stays alive.
+                                let response = BrokerResponse {
+                                    request_id,
+                                    result: BrokerResult::StreamReady { token: token.clone() },
+                                };
+                                let response_json = match serde_json::to_string(&response) {
+                                    Ok(j) => j,
+                                    Err(e) => {
+                                        warn!(uid = own_uid, error = %e, "failed to serialize StreamReady; closing connection");
+                                        return;
+                                    }
+                                };
+                                if writer.write_all(response_json.as_bytes()).await.is_err()
+                                    || writer.write_all(b"\n").await.is_err()
+                                {
+                                    warn!(uid = own_uid, "StreamReady write failed; closing connection");
+                                    return;
+                                }
 
-                        // Reunite the split stream for the bidirectional pump.
-                        let stream = match buf_reader.into_inner().reunite(writer) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                warn!(uid = own_uid, "failed to reunite stream for GuestSocat; closing connection");
+                                // Spawn a task to open the stream connection and pump bytes.
+                                let run_ctx_clone = RunContext {
+                                    own_uid: run_ctx.own_uid,
+                                    lima_home: run_ctx.lima_home.clone(),
+                                    broker_socket: run_ctx.broker_socket.clone(),
+                                };
+                                let socket_for_stream = socket_path.clone();
+                                tokio::spawn(async move {
+                                    run_stream_connection(
+                                        socket_for_stream,
+                                        run_ctx_clone,
+                                        vm,
+                                        op_uid,
+                                        request_id,
+                                        token,
+                                    )
+                                    .await;
+                                });
+                                // Control connection continues — do not exit.
+                                continue;
+                            }
+                            None => {
+                                // Legacy path: consume the control connection for the byte-pump.
+                                // The agent will reconnect after the stream ends.
+                                let stream = match buf_reader.into_inner().reunite(writer) {
+                                    Ok(s) => s,
+                                    Err(_) => {
+                                        warn!(uid = own_uid, "failed to reunite stream for legacy GuestSocat; closing connection");
+                                        return;
+                                    }
+                                };
+                                // Legacy path: write StreamOpen on the control connection before pumping.
+                                let _ = handler::handle_guest_socat(run_ctx, vm, op_uid, request_id, true, stream).await;
+                                return;
+                            }
+                        }
+                    } else {
+                        // One-shot op: dispatch and write the response.
+                        let result = handler::dispatch_op(run_ctx, request.op).await;
+                        let response = BrokerResponse { request_id, result };
+                        let response_json = match serde_json::to_string(&response) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                warn!(uid = own_uid, error = %e, "failed to serialize BrokerResponse; closing connection");
                                 return;
                             }
                         };
-
-                        // handle_guest_socat writes StreamOpen (or Rejected) and
-                        // then pumps raw bytes. The connection is consumed.
-                        let _ = handler::handle_guest_socat(run_ctx, vm, op_uid, request_id, stream).await;
-                        // After GuestSocat ends, the connection is done.
-                        return;
-                    }
-
-                    // One-shot op: dispatch and write the response.
-                    let result = handler::dispatch_op(run_ctx, request.op).await;
-                    let response = BrokerResponse { request_id, result };
-                    let response_json = match serde_json::to_string(&response) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            warn!(uid = own_uid, error = %e, "failed to serialize BrokerResponse; closing connection");
+                        if let Err(e) = writer.write_all(response_json.as_bytes()).await {
+                            warn!(uid = own_uid, error = %e, "response write failed; closing connection");
                             return;
                         }
-                    };
-                    if let Err(e) = writer.write_all(response_json.as_bytes()).await {
-                        warn!(uid = own_uid, error = %e, "response write failed; closing connection");
-                        return;
-                    }
-                    if let Err(e) = writer.write_all(b"\n").await {
-                        warn!(uid = own_uid, error = %e, "response newline write failed; closing connection");
-                        return;
+                        if let Err(e) = writer.write_all(b"\n").await {
+                            warn!(uid = own_uid, error = %e, "response newline write failed; closing connection");
+                            return;
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Open a dedicated stream connection to the broker for a `GuestSocat` op.
+    ///
+    /// The stream connection goes through the full authentication path (peer-cred,
+    /// group membership, and uid gate) independently of the control connection.
+    /// After authentication, the connection sends a `STREAM_CONNECT:<token>` frame
+    /// so the daemon can correlate this connection to the pending op.
+    ///
+    /// This function is spawned as a task by `run_protocol_loop` when the daemon
+    /// sends a `GuestSocat` with a `stream_token`. It runs concurrently with the
+    /// control connection's protocol loop.
+    async fn run_stream_connection(
+        socket_path: std::path::PathBuf,
+        run_ctx: RunContext,
+        vm: String,
+        op_uid: u32,
+        request_id: u64,
+        token: String,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+
+        info!(
+            uid = run_ctx.own_uid,
+            vm, "opening stream connection for GuestSocat"
+        );
+
+        let stream = match UnixStream::connect(&socket_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(uid = run_ctx.own_uid, error = %e, "stream connection connect failed");
+                return;
+            }
+        };
+
+        // Send STREAM_CONNECT:<token>\n. The broker recognises this prefix,
+        // authenticates the peer (peer-cred + group + uid — same gates as the
+        // control connection), and matches the token to the pending op.
+        let frame = format!("{}{}\n", crate::protocol::STREAM_CONNECT_PREFIX, token);
+        let (reader_half, mut writer_half) = stream.into_split();
+        if let Err(e) = writer_half.write_all(frame.as_bytes()).await {
+            warn!(uid = run_ctx.own_uid, error = %e, "STREAM_CONNECT frame write failed");
+            return;
+        }
+
+        // Reunite for the bidirectional byte-pump.
+        let stream = match reader_half.reunite(writer_half) {
+            Ok(s) => s,
+            Err(_) => {
+                warn!(
+                    uid = run_ctx.own_uid,
+                    "failed to reunite stream connection halves"
+                );
+                return;
+            }
+        };
+
+        // Run the byte-pump on the dedicated stream connection.
+        // write_stream_open=false: the stream connection is a raw byte-pump;
+        // the StreamReady acknowledgement already went on the control connection.
+        let _ = handler::handle_guest_socat(&run_ctx, vm, op_uid, request_id, false, stream).await;
+        info!(uid = run_ctx.own_uid, "stream connection GuestSocat ended");
     }
 
     // ---------------------------------------------------------------------------
@@ -621,7 +725,11 @@ mod imp {
 
         info!(uid = own_uid, daemon_uid, lima_home, "LIMA_HOME resolved");
 
-        let run_ctx = RunContext { own_uid, lima_home };
+        let run_ctx = RunContext {
+            own_uid,
+            lima_home,
+            broker_socket: broker_socket.clone(),
+        };
 
         // Build the tokio runtime and run the broker connection loop.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -757,6 +865,7 @@ mod imp {
             let run_ctx = RunContext {
                 own_uid,
                 lima_home: "/tmp/lima_test".to_string(),
+                broker_socket: std::path::PathBuf::from("/tmp/lima_test_broker.sock"),
             };
 
             // Create a duplex stream: `client` is the daemon side.
@@ -766,6 +875,7 @@ mod imp {
             let ctx_clone = RunContext {
                 own_uid: run_ctx.own_uid,
                 lima_home: run_ctx.lima_home.clone(),
+                broker_socket: run_ctx.broker_socket.clone(),
             };
             let loop_handle = tokio::spawn(async move {
                 // Wrap the duplex as a UnixStream-compatible stream. Since we
@@ -871,12 +981,14 @@ mod imp {
             let ctx = RunContext {
                 own_uid,
                 lima_home: dir.path().to_string_lossy().into_owned(),
+                broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
             };
 
             let (client, server) = tokio::io::duplex(4096);
             let ctx_clone = RunContext {
                 own_uid: ctx.own_uid,
                 lima_home: ctx.lima_home.clone(),
+                broker_socket: ctx.broker_socket.clone(),
             };
             let loop_handle = tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

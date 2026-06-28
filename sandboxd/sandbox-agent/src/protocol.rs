@@ -143,7 +143,20 @@ pub enum BrokerResult {
     },
     /// The `GuestSocat` streaming op is open. After this response the stream
     /// carries raw bytes; there are no further framed messages.
+    ///
+    /// Retained for wire-compatibility with agents that have not yet been
+    /// updated to the multiplexed protocol. The daemon no longer sends
+    /// `GuestSocat` on the control connection; updated agents respond with
+    /// [`StreamReady`] instead and open a separate stream connection.
     StreamOpen,
+    /// Multiplexed GuestSocat: the agent has acknowledged the op and will open
+    /// a separate stream connection carrying `STREAM_CONNECT:<token>\n`.
+    ///
+    /// The `token` is the correlation token the daemon embedded in the
+    /// `GuestSocat` request (see [`BrokerOp::GuestSocat::stream_token`]).
+    /// The agent echoes it back so the daemon can match the incoming stream
+    /// connection to this pending op. The control connection is not consumed.
+    StreamReady { token: String },
     /// The `RestrictOnVerify` check passed — `restrict=on` is confirmed on the
     /// management netdev for the named VM.
     RestrictConfirmed { vm: String, netdev_token: String },
@@ -249,11 +262,30 @@ pub enum BrokerOp {
     ReadOwnerMarker { op_uid: u32, vm: String },
     /// Open a long-lived bidirectional stream to the in-VM guest agent.
     ///
-    /// After the agent sends `BrokerResult::StreamOpen`, the stream transitions
-    /// to raw byte-pump mode (see module-level framing documentation). The
-    /// agent splices its end of the broker connection to
-    /// `limactl shell <vm> -- socat - TCP:127.0.0.1:5123`.
-    GuestSocat { op_uid: u32, vm: String },
+    /// Multiplexed protocol (updated agents):
+    ///   daemon → agent (control connection): `GuestSocat { ..., stream_token: Some("hex…") }`
+    ///   agent → daemon (control connection): `StreamReady { token: "hex…" }`
+    ///   agent → daemon (NEW connection):     `STREAM_CONNECT:<token>\n`, then raw byte-pump
+    ///
+    /// The control connection is never consumed. Each GuestSocat op gets its own
+    /// dedicated stream connection. The `stream_token` is a cryptographically
+    /// random single-use correlation handle; the daemon matches the incoming
+    /// stream connection to the pending op by token, then verifies the stream
+    /// connection's peer-cred independently (peer-cred + group + uid — full auth
+    /// chain, not pre-authorized by the control connection).
+    ///
+    /// Legacy fallback (agents that have not yet been updated):
+    ///   When `stream_token` is `None` the agent responds with `StreamOpen` and
+    ///   the original single-connection byte-pump runs on the control connection.
+    ///   The daemon detects this and falls back to the old handoff path.
+    GuestSocat {
+        op_uid: u32,
+        vm: String,
+        /// Correlation token for the multiplexed stream connection. `None` in
+        /// requests sent to legacy agents (pre-multiplexing protocol).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_token: Option<String>,
+    },
     /// Post-boot `restrict=on` verification.
     ///
     /// The agent reads the qemu-wrapper marker file at
@@ -301,6 +333,21 @@ impl BrokerOp {
         }
     }
 }
+
+/// Prefix of the stream-connection identification frame.
+///
+/// When an agent opens a dedicated stream connection for a `GuestSocat` op
+/// it sends this prefix immediately after the CHECKIN/auth phase, followed
+/// by the correlation token and a newline:
+///
+/// ```text
+/// STREAM_CONNECT:<hex-token>\n
+/// ```
+///
+/// The daemon matches the token to a pending `PendingStream` entry registered
+/// by the control-connection path, verifies the connection's peer-cred matches
+/// the expected operator uid, and then hands the raw stream to the caller.
+pub const STREAM_CONNECT_PREFIX: &str = "STREAM_CONNECT:";
 
 /// The name of the wrapper marker file written by the qemu-wrapper after it
 /// successfully injects `restrict=on` into the management netdev argv.
