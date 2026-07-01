@@ -3192,14 +3192,19 @@ mod tests {
         );
     }
 
-    /// `read_host_cpus_or_default` returns a positive count. We don't
-    /// pin the exact count because it varies across hosts, but it must
-    /// be at least 1.0 (single-core fallback floor doesn't apply on
-    /// standard nextest hosts).
+    /// `read_host_cpus_or_default` returns a count that reflects the real
+    /// host: at least 2.0 on any dev machine or CI runner (modern systems are
+    /// never single-core). The `>= 1.0` floor would pass even if the function
+    /// returned the single-core fallback constant; `>= 2.0` distinguishes a
+    /// real read from a stuck fallback.
     #[test]
     fn read_host_cpus_or_default_returns_positive_count() {
         let cpus = read_host_cpus_or_default();
-        assert!(cpus >= 1.0, "expected at least 1 CPU, got {cpus}");
+        assert!(
+            cpus >= 2.0,
+            "expected at least 2 CPUs on any dev or CI host, got {cpus}; \
+             if the function returned 1.0 the fallback may have fired"
+        );
     }
 
     /// `map_container_uid_gid` enforces the UID alignment contract:

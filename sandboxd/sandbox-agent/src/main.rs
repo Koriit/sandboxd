@@ -811,19 +811,32 @@ mod imp {
 
         /// Verify that a uid below 500 (the system-account floor) is not a
         /// member of the sandbox group. This test drives the `uid_in_group`
-        /// logic indirectly: uid 0 (root) should not be in `_sandboxd` on
-        /// any correctly-configured macOS host, so this is a safe assertion.
+        /// logic with both a negative and a positive control:
         ///
-        /// We cannot test actual membership without `_sandboxd` existing and
-        /// the test user being enrolled; the integration tests in the broker
-        /// module cover that path.
+        /// - **Negative:** uid 0 (root) must not be in `_sandboxd` on any
+        ///   correctly-configured macOS host.
+        /// - **Positive:** uid 0 IS always a member of `wheel` (gid 0) on
+        ///   macOS. If this assertion fails it means `uid_in_group` is broken
+        ///   or the membership logic is inverted — a passing negative assertion
+        ///   alone cannot distinguish "correctly excluded" from "group lookup
+        ///   always returns false."
+        ///
+        /// The positive control guarantees that a regression that inverts
+        /// `uid_in_group` would surface here, not silently pass.
         #[test]
         fn uid_zero_not_in_sandbox_group() {
-            // On a correctly configured host, uid 0 (root) is never a member
-            // of _sandboxd. If this fails it means _sandboxd is misconfigured.
-            // The test is intentionally conservative: if _sandboxd doesn't exist
-            // on this host, uid_in_group returns false (can't resolve group),
-            // which also passes.
+            // Positive control: root (uid 0) is a member of "wheel" on every
+            // macOS host. This confirms uid_in_group resolves membership
+            // correctly — if this fails, the function is broken.
+            assert!(
+                uid_in_group(0, "wheel"),
+                "uid 0 must be in 'wheel' on macOS — uid_in_group appears to be broken"
+            );
+
+            // Negative control: root is never in _sandboxd. If this fails it
+            // means _sandboxd is misconfigured (uid 0 enrolled) — investigate.
+            // Note: if _sandboxd doesn't exist on this host, group_name_to_gid
+            // returns None and uid_in_group returns false, which is also correct.
             let in_group = uid_in_group(0, "_sandboxd");
             assert!(
                 !in_group,

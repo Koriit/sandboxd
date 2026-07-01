@@ -1060,16 +1060,45 @@ mod tests {
     }
 
     /// `provision_mitmproxy_ca(None)` is a no-op: when no CA dir is supplied
-    /// the helper returns `Ok(())` without touching the socket. The socket
-    /// path is bogus on purpose — reaching it would error, proving the
-    /// `None` branch short-circuits before any `docker exec`.
+    /// the helper returns `Ok(())` without touching the socket.
+    ///
+    /// The socket path is bogus on purpose. Any code path that reaches socket
+    /// I/O (the `write_file_to_gateway_container` call inside the `Some` branch)
+    /// would error and propagate via `?`, making the test fail — so an `Ok`
+    /// result proves the `None` branch short-circuited before any `docker exec`.
+    /// See `provision_mitmproxy_ca_with_complete_ca_reaches_socket` below for
+    /// the complementary assertion that the `Some`+complete-CA path DOES reach
+    /// the socket.
     #[cfg(target_os = "macos")]
     #[test]
     fn provision_mitmproxy_ca_none_is_noop() {
         let bogus_sock = std::path::Path::new("/nonexistent/gateway-docker.sock");
+        // unwrap() rather than is_ok(): if it errors, the message surfaces the cause.
+        provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", None)
+            .expect("provision_mitmproxy_ca(None) must be a no-op Ok");
+    }
+
+    /// `provision_mitmproxy_ca` with a complete CA dir DOES reach the socket:
+    /// a bogus socket path errors after the host-file reads succeed, proving
+    /// the `None` test above is a genuine short-circuit check (not "always Ok").
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provision_mitmproxy_ca_with_complete_ca_reaches_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write both files that `mitmproxy_ca_writes` requires.
+        std::fs::write(dir.path().join("mitmproxy-ca.pem"), "fake-key").unwrap();
+        std::fs::write(dir.path().join("mitmproxy-ca-cert.pem"), "fake-cert").unwrap();
+        let bogus_sock = std::path::Path::new("/nonexistent/gateway-docker.sock");
+        // Host-file reads succeed; socket I/O is attempted and must fail.
+        let result = provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", Some(dir.path()));
         assert!(
-            provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", None).is_ok(),
-            "provision_mitmproxy_ca(None) must be a no-op Ok"
+            result.is_err(),
+            "provision_mitmproxy_ca with a complete CA dir must error on a bogus socket"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("sandbox-gw-x"),
+            "error must name the container; got: {msg}"
         );
     }
 
@@ -1209,21 +1238,6 @@ mod tests {
             info.vmnet_slot.is_none(),
             "old rows without vmnet_slot must deserialize with None"
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_forwarding_check_returns_ok_on_dev_machine() {
-        // Verify check_host_ip_forwarding_disabled() compiles and runs without
-        // panic. On a correctly-configured macOS dev machine both sysctls should
-        // be 0 (off), so the function returns Ok. If this fails with Err, the
-        // host has IP forwarding enabled — investigate VPN/Docker Desktop.
-        //
-        // The test does NOT use the result for a hard assertion so it stays green
-        // in CI environments where forwarding may legitimately differ. The purpose
-        // here is smoke-test: the function runs, uses the correct sysctl keys, and
-        // does not panic.
-        let _ = check_host_ip_forwarding_disabled();
     }
 
     #[cfg(target_os = "macos")]

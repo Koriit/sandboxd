@@ -857,6 +857,12 @@ mod tests {
         // The base is normalised to `…/1000/lima/`, so `limactl/evil` does
         // not start with it — correct rejection.
         assert!(result.is_err(), "prefix-spoof path must be rejected");
+        // The error must name the rejected path so the caller can diagnose it.
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("limactl/evil"),
+            "error must identify the rejected path; got: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -873,24 +879,48 @@ mod tests {
 
     #[test]
     fn range_rejects_below_min() {
-        // Must reject, not clamp to min.
+        // Must reject, not clamp to min; error must name the field and the
+        // rejected value so the caller can produce a useful diagnostic.
         let result = validate_range("--cpus", 0, 1, 64);
+        let msg = result.expect_err("value below min must be rejected, not clamped to 1");
         assert!(
-            result.is_err(),
-            "value below min must be rejected, not clamped to 1"
+            msg.contains("--cpus"),
+            "error must name the field; got: {msg}"
         );
-        assert!(validate_range("--memory-mb", 255, 256, 262144).is_err());
+        assert!(
+            msg.contains('0'),
+            "error must identify the rejected value; got: {msg}"
+        );
+
+        let mem_err = validate_range("--memory-mb", 255, 256, 262144)
+            .expect_err("255 MB is below the 256 MB floor");
+        assert!(
+            mem_err.contains("--memory-mb"),
+            "error must name the field; got: {mem_err}"
+        );
     }
 
     #[test]
     fn range_rejects_above_max() {
-        // Must reject, not clamp to max.
+        // Must reject, not clamp to max; error must name the field and the
+        // rejected value so the caller can produce a useful diagnostic.
         let result = validate_range("--cpus", 65, 1, 64);
+        let msg = result.expect_err("value above max must be rejected, not clamped to 64");
         assert!(
-            result.is_err(),
-            "value above max must be rejected, not clamped to 64"
+            msg.contains("--cpus"),
+            "error must name the field; got: {msg}"
         );
-        assert!(validate_range("--memory-mb", 262145, 256, 262144).is_err());
+        assert!(
+            msg.contains("65"),
+            "error must identify the rejected value; got: {msg}"
+        );
+
+        let mem_err = validate_range("--memory-mb", 262145, 256, 262144)
+            .expect_err("262145 MB exceeds the ceiling");
+        assert!(
+            mem_err.contains("--memory-mb"),
+            "error must name the field; got: {mem_err}"
+        );
     }
 
     // -----------------------------------------------------------------------
