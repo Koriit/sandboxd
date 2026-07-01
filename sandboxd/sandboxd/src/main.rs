@@ -7132,7 +7132,7 @@ async fn start_session(
     (StatusCode::OK, Json(dto)).into_response()
 }
 
-/// Query parameters accepted by `DELETE /sessions/{id}` (stop).
+/// Query parameters accepted by `POST /sessions/{id}/stop` (e.g. `?force=true`).
 #[derive(Debug, serde::Deserialize, Default)]
 struct StopParams {
     /// When true, bypass the workspace-lock conflict check and proceed
