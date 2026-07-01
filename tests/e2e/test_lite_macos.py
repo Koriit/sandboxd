@@ -43,6 +43,8 @@ from typing import Optional
 
 import pytest
 
+from conftest import PLATFORM, _SANDBOX_TEST_UID
+
 # ---------------------------------------------------------------------------
 # Platform guard: skip entire file on Linux.
 # These tests target the macOS lite path and require the gateway Lima VM.
@@ -135,6 +137,104 @@ def _wait_for_running(session_name: str, timeout: int = 60) -> None:
 
 def _session_exists(session_name: str) -> bool:
     result = _sandbox("inspect", session_name, check=False)
+    return result.returncode == 0
+
+
+def _daemon_log_path(sandbox_daemon: dict) -> Path:
+    """Return the path to the e2e daemon's tracing log on macOS.
+
+    On macOS the harness launches the daemon with
+    ``--log-file <base_dir>/sandboxd.log`` (see conftest's
+    ``_macos_argv_extras``); all ``tracing`` output — including the
+    ``warn!`` TCC-asymmetry line emitted during lite ``shared:`` create —
+    lands there, NOT on the daemon's stdout/stderr. (The ``_stdout_log`` /
+    ``_stderr_log`` files in ``sandbox_daemon`` only capture the pre-tracing
+    ``eprintln!`` fallback path, so they do not contain the warning.)
+    """
+    return Path(sandbox_daemon["base_dir"]) / "sandboxd.log"
+
+
+def _read_daemon_log(sandbox_daemon: dict) -> str:
+    """Read the daemon tracing log, routing through the daemon test user.
+
+    The daemon writes ``sandboxd.log`` as ``PLATFORM.daemon_test_user`` under
+    its per-uid base dir; depending on the daemon's umask the file may not be
+    group-readable by the operator. Read it via ``sudo -n -u <daemon_test_user>
+    cat`` (pre-authorized NOPASSWD by ``make setup-dev-env``) so the read
+    succeeds regardless of the file's group bits — the same cross-user read
+    pattern ``test_golden_image._meta_read_text`` uses for daemon-owned files.
+
+    Returns "" if the log does not exist yet (never-written).
+    """
+    log_path = _daemon_log_path(sandbox_daemon)
+    result = subprocess.run(
+        ["sudo", "-n", "-u", PLATFORM.daemon_test_user, "cat", str(log_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        # Missing file is expected before the daemon first writes; any other
+        # failure (e.g. sudo mis-scoped) surfaces as empty text and the caller
+        # asserts on the missing warning with a diagnostic dump.
+        return ""
+    return result.stdout
+
+
+def _gateway_vm_sees_path(host_path: str) -> bool:
+    """Return True if the daemon's gateway VM sees ``host_path`` via 9p.
+
+    On macOS lite the sandbox container's Docker runs *inside* the daemon's
+    ``sandboxd-gateway`` Lima VM, so a ``shared:`` bind source is resolved
+    against the VM filesystem — specifically the read-write 9p mount of the
+    lite shared root (``/tmp/sandbox-shared``) that ``generate_gateway_template``
+    injects as a ``mounts:`` stanza (identity mount: host ``/tmp/sandbox-shared``
+    → VM ``/tmp/sandbox-shared``). A host path created under that root is only
+    visible in the VM when QEMU's virtfs 9p export is bound to the *current*
+    host inode.
+
+    There is a real macOS hazard here: macOS clears ``/private/tmp`` (``/tmp``
+    is a symlink to it) on reboot and periodically, so if the gateway VM
+    out-lived a ``/tmp/sandbox-shared`` recreation, QEMU holds a handle to the
+    now-deleted boot-time inode and the 9p mount is *stale* — host-side changes
+    (and even the directory's contents) are invisible in the VM, and a
+    ``docker create --mount src=<under-root>`` fails with
+    ``bind source path does not exist``. A gateway-VM restart rebinds the
+    export to the live inode. This probe distinguishes a live export (test can
+    proceed) from a stale one (test skips with a precise reason).
+
+    The gateway VM lives under the *daemon's* own LIMA_HOME
+    (``/var/lib/sandboxd/<daemon_uid>/<daemon_uid>/lima``), owned 0600/0700 by
+    the daemon test user — the operator (this test process) cannot ``limactl
+    shell`` it directly. We therefore reach it via ``sudo -n -u
+    <daemon_test_user>`` (pre-authorized NOPASSWD by ``make setup-dev-env``),
+    with ``LIMA_HOME`` and ``HOME`` set to the daemon's paths — the exact
+    invocation the daemon itself uses for every gateway-VM control operation.
+    """
+    daemon_uid = _SANDBOX_TEST_UID
+    daemon_home = f"/var/lib/sandboxd/{daemon_uid}"
+    lima_home = f"/var/lib/sandboxd/{daemon_uid}/{daemon_uid}/lima"
+    result = subprocess.run(
+        [
+            "sudo",
+            "-n",
+            "-u",
+            PLATFORM.daemon_test_user,
+            "env",
+            f"LIMA_HOME={lima_home}",
+            f"HOME={daemon_home}",
+            "limactl",
+            "shell",
+            "sandboxd-gateway",
+            "--",
+            "test",
+            "-d",
+            host_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     return result.returncode == 0
 
 
@@ -516,6 +616,185 @@ class TestLiteMacosPoolAccounting:
                 _sandbox("rm", name, check=False)
 
 
+class TestLiteMacosWorkspaceSetup:
+    """Repo-clone and boot-command create-time setup for the lite macOS path.
+
+    Both ``--repo`` and ``--boot-cmd`` run inside the sandbox container via
+    the backend-agnostic ``GuestConnector`` after the runtime starts. On the
+    lite macOS path that connector reaches the container through the gateway
+    VM's forwarded Docker socket (``docker exec … socat``), so these tests
+    prove the setup steps run over the forwarded-socket transport.
+    """
+
+    def test_repo_clone_on_lite_macos(self, tmp_path):
+        """``--repo`` clones a git repository into the lite container workspace.
+
+        Mirrors the Linux/cross-backend ``test_workspace.py::test_clone_repo``:
+        create with ``--repo <url>`` plus a policy that admits the clone host,
+        then assert the tree landed with a ``.git`` directory and a working
+        ``git log``. The daemon hard-codes the clone destination to
+        ``/home/sandbox/workspace/`` (see the container create handler in
+        ``sandboxd/src/main.rs``), so we assert there directly rather than via
+        ``guest_home(backend)``.
+
+        The clone runs *during* create, so its source must already exist
+        before create — an in-container ``file://`` path is not available at
+        that point. We therefore clone the same public repo the Linux test
+        uses (``octocat/Hello-World``) and gate it on an allow policy for the
+        clone host (``github.com:443``). The lite egress-*allow* direction is
+        already proven independently by
+        ``test_allowed_domain_egress_on_lite_macos``, so a clone failure here
+        points at the repo-clone dispatch, not the allow path.
+        """
+        name = f"e2e-lite-clone-{int(time.time())}"
+        policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": "github.com",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "transport",
+                }
+            ],
+        }
+        policy_path = tmp_path / "allow-github.json"
+        policy_path.write_text(json.dumps(policy))
+
+        created = False
+        try:
+            result = _sandbox(
+                "create",
+                "--lite",
+                "--name",
+                name,
+                "--policy",
+                str(policy_path),
+                "--repo",
+                "https://github.com/octocat/Hello-World.git",
+                capture=True,
+            )
+            assert result.returncode == 0, (
+                "sandbox create --lite --repo failed — the clone runs during "
+                "create, so a non-zero exit means the guest `git clone` (over "
+                "the forwarded Docker socket) or its egress-allow policy "
+                f"regressed.\nstdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+            )
+            created = True
+            _wait_for_running(name)
+
+            # The daemon clones into /home/sandbox/workspace/. Assert .git
+            # landed there (the definitive "clone happened" signal).
+            git_dir = _sandbox(
+                "exec",
+                name,
+                "--",
+                "test",
+                "-d",
+                "/home/sandbox/workspace/.git",
+                check=False,
+            )
+            assert git_dir.returncode == 0, (
+                "Expected /home/sandbox/workspace/.git to exist after "
+                f"--repo clone, but `test -d` returned {git_dir.returncode}.\n"
+                f"stdout: {git_dir.stdout!r}\nstderr: {git_dir.stderr!r}"
+            )
+
+            # And it must be a valid repo with at least one commit — mirrors
+            # the `git log --oneline -1` assertion in the Linux test.
+            git_log = _sandbox(
+                "exec",
+                name,
+                "--",
+                "git",
+                "-C",
+                "/home/sandbox/workspace/",
+                "log",
+                "--oneline",
+                "-1",
+                check=False,
+            )
+            assert git_log.returncode == 0, (
+                "git log in the cloned workspace failed (clone incomplete or "
+                f"not a repo).\nstdout: {git_log.stdout!r}\n"
+                f"stderr: {git_log.stderr!r}"
+            )
+        finally:
+            if created and _session_exists(name):
+                _sandbox("stop", name, check=False)
+                _sandbox("rm", name, check=False)
+
+    def test_boot_cmd_on_lite_macos(self, tmp_path):
+        """``--boot-cmd`` runs a command inside the lite container at create.
+
+        The daemon executes ``bash -c <cmd>`` in the container via the
+        ``GuestConnector`` right after the runtime starts (see the ``--boot-cmd``
+        block in the container create handler in ``sandboxd/src/main.rs``). A
+        non-zero boot-command exit marks the whole session ``Error`` and aborts
+        create, so create succeeding *is* the primary contract; we additionally
+        assert an observable side effect — the boot command writes a sentinel
+        file — which a follow-up ``sandbox exec`` reads back.
+
+        There is no dedicated Linux e2e boot-cmd test to mirror line-for-line
+        (the workspace suite documents boot-cmd in its module docstring but the
+        behaviour is pinned by the Rust integration tests, e.g.
+        ``integration_create_session_container``, which set ``boot_cmd``). This
+        mirrors that integration coverage at the e2e/CLI surface using the
+        confirmed ``--boot-cmd`` flag (``boot_cmd`` in
+        ``sandbox-cli/src/main.rs``, kebab-cased by clap).
+        """
+        sentinel = "/home/sandbox/boot-cmd-ran.txt"
+        marker = f"boot-cmd-ran-{int(time.time())}"
+        name = f"e2e-lite-boot-{int(time.time())}"
+
+        created = False
+        try:
+            result = _sandbox(
+                "create",
+                "--lite",
+                "--name",
+                name,
+                "--boot-cmd",
+                f"echo -n '{marker}' > {sentinel}",
+                capture=True,
+            )
+            assert result.returncode == 0, (
+                "sandbox create --lite --boot-cmd failed — an explicit "
+                "boot-cmd that exits non-zero marks the session Error and "
+                "aborts create, so a non-zero create exit means the boot "
+                "command did not run (or failed) inside the container.\n"
+                f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+            )
+            created = True
+            _wait_for_running(name)
+
+            # Observable side effect: the sentinel the boot command wrote must
+            # be present with the exact marker contents. This fails if the
+            # boot command silently no-op'd (never ran) even though create
+            # returned 0.
+            cat = _sandbox(
+                "exec",
+                name,
+                "--",
+                "cat",
+                sentinel,
+                check=False,
+            )
+            assert cat.returncode == 0, (
+                f"Expected the boot-cmd sentinel {sentinel} to exist, but "
+                f"`cat` returned {cat.returncode} (boot command did not run).\n"
+                f"stdout: {cat.stdout!r}\nstderr: {cat.stderr!r}"
+            )
+            assert marker in cat.stdout, (
+                "Boot-cmd sentinel exists but its contents do not match — "
+                f"expected {marker!r} in the file.\nstdout: {cat.stdout!r}"
+            )
+        finally:
+            if created and _session_exists(name):
+                _sandbox("stop", name, check=False)
+                _sandbox("rm", name, check=False)
+
+
 class TestLiteMacosWorkspace:
     """Workspace mode tests for the macOS lite path."""
 
@@ -592,25 +871,89 @@ class TestLiteMacosWorkspace:
                 _sandbox("stop", name, check=False)
                 _sandbox("rm", name, check=False)
 
-    def test_shared_workspace_tcc_warning(self, tmp_path):
-        """``shared:`` workspace on lite emits a TCC-asymmetry warning.
+    def test_shared_workspace_tcc_warning(self, sandbox_daemon, tmp_path):
+        """``shared:`` workspace on lite emits a TCC-asymmetry warning AND is
+        accepted when the source is under the configured shared root.
 
-        The gateway VM reads the shared path as ``_sandboxd``, not the
-        operator. The daemon must emit a warning at create time.
+        On macOS lite the sandbox container's Docker runs *inside* the daemon's
+        ``sandboxd-gateway`` Lima VM, so a ``shared:`` bind source resolves
+        against the VM filesystem — specifically the read-write 9p mount of the
+        lite shared root (default ``/tmp/sandbox-shared``, see
+        ``sandbox-core/src/lite_macos.rs`` and the ``mounts:`` stanza
+        ``generate_gateway_template`` injects in ``gateway_lima.rs``). The mount
+        is an identity mount: host ``/tmp/sandbox-shared/<x>`` is visible in the
+        VM at the same absolute path. So the source must (a) live under
+        ``/tmp/sandbox-shared`` on the HOST — validated by ``validate_shared_path``
+        in the create handler — and (b) be surfaced to the VM by a *live* 9p
+        export.
 
-        This test only verifies the path is accepted (not rejected) when the
-        source is under the configured ``lite_shared_root``. The TCC warning
-        is observable in the daemon log, not in the CLI output; we assert
-        the session reaches Running.
+        The gateway VM reads the shared path as ``_sandboxd`` (the gateway VM
+        user), not the operator, so the daemon warns operators about the TCC
+        asymmetry at create time. For a source *under* the configured shared
+        root the daemon logs an informational ``warn!`` and proceeds — it does
+        NOT reject the path (rejection is reserved for sources outside the root).
 
-        Note: requires ``SANDBOX_LITE_SHARED_ROOT`` set to ``tmp_path`` or
-        the default ``/tmp/sandbox-shared`` to be accessible.
+        This test asserts BOTH halves of that contract:
+
+        1. ``sandbox create`` returns 0 (accepted), and the session reaches
+           Running; and
+        2. the daemon tracing log contains the TCC-asymmetry warning line the
+           create handler emits.
+
+        The warning goes to the daemon tracing log, not the CLI output, so we
+        read ``<base_dir>/sandboxd.log`` (via the daemon test user). Because we
+        assert on ``returncode == 0`` explicitly, this test can no longer pass
+        silently when create fails — a create failure fails the first
+        assertion, and a missing warning fails the second.
+
+        The distinctive substring asserted is a stable, em-dash-free slice of
+        the source ``warn!`` message in ``sandboxd/src/main.rs``:
+        "access runs as _sandboxd (gateway VM user)".
+
+        Live-export guard: macOS clears ``/private/tmp`` (``/tmp`` symlinks to
+        it) on reboot / periodically, so if the daemon's gateway VM out-lived a
+        ``/tmp/sandbox-shared`` recreation, QEMU's virtfs 9p export is bound to
+        a now-deleted inode and host-created sources are invisible in the VM —
+        ``docker create --mount src=<under-root>`` then fails with
+        ``bind source path does not exist``. That is an environment/VM-lifecycle
+        state (fixed by restarting the gateway VM), NOT a product regression, so
+        we probe the export first and ``skip`` with a precise reason when it is
+        stale rather than fail spuriously. When the export is live the strong
+        assertions above still hold and a genuine create/warning regression
+        fails loudly.
         """
-        # Use /tmp/sandbox-shared as the shared root (default).
+        # The source must live under the configured lite shared root
+        # (default /tmp/sandbox-shared) or the daemon rejects it before the
+        # informational warning path — so this is a hard prerequisite, not an
+        # environment-dependent maybe. `make setup-dev-env` establishes this
+        # root (0755) before the gateway VM is provisioned.
         shared_root = "/tmp/sandbox-shared"
         os.makedirs(shared_root, exist_ok=True)
         workspace = os.path.join(shared_root, f"test-{int(time.time())}")
         os.makedirs(workspace, exist_ok=True)
+
+        # Verify the daemon's gateway VM actually sees the source via its 9p
+        # mount. If the export is stale (see the live-export guard note in the
+        # docstring), skip with a precise, actionable reason — the source is
+        # correctly provisioned on the host but the VM cannot resolve the bind.
+        if not _gateway_vm_sees_path(workspace):
+            pytest.skip(
+                "lite shared: source is provisioned on the host under "
+                f"{shared_root} but the gateway VM's 9p export cannot see it "
+                f"({workspace!r} is absent inside the VM). This is a stale QEMU "
+                "virtfs export: macOS cleared /private/tmp (/tmp -> /private/tmp) "
+                "after the daemon's sandboxd-gateway VM booted, so QEMU holds a "
+                "handle to the deleted boot-time /tmp/sandbox-shared inode. "
+                "docker-create in the VM would fail with 'bind source path does "
+                "not exist'. Fix: restart the gateway VM (it rebinds the export "
+                "to the live inode) — e.g. re-run make setup-dev-env after "
+                "ensuring /tmp/sandbox-shared exists, then bounce the daemon so "
+                "ensure_ready() restarts sandboxd-gateway."
+            )
+
+        # Distinctive, stable slice of the TCC ``warn!`` message emitted by the
+        # container create handler for lite shared: sessions under the root.
+        tcc_warning_needle = "access runs as _sandboxd (gateway VM user)"
 
         name = f"e2e-lite-shared-{int(time.time())}"
         try:
@@ -623,13 +966,30 @@ class TestLiteMacosWorkspace:
                 f"shared:{workspace}",
                 check=False,
             )
-            # Accept either success (session created) or failure with a
-            # descriptive error. We do not assert success because the shared
-            # root may not be configured in the test environment.
-            if result.returncode == 0:
-                _wait_for_running(name, timeout=60)
-                info = _inspect_one(name)
-                assert info["state"] == "running"
+            assert result.returncode == 0, (
+                "sandbox create --lite --workspace shared:<under-root> must be "
+                "ACCEPTED (the source is under the configured shared root and "
+                "the gateway VM's 9p export sees it), but create failed with "
+                f"exit {result.returncode}.\n"
+                f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+            )
+            _wait_for_running(name, timeout=60)
+            info = _inspect_one(name)
+            assert info["state"] == "running", (
+                f"Expected running after accepted shared: create, got "
+                f"{info['state']!r}"
+            )
+
+            # The TCC-asymmetry warning must have been logged during create.
+            log_text = _read_daemon_log(sandbox_daemon)
+            assert tcc_warning_needle in log_text, (
+                "Expected the lite shared: TCC-asymmetry warning "
+                f"({tcc_warning_needle!r}) in the daemon log at "
+                f"{_daemon_log_path(sandbox_daemon)}, but it was absent. "
+                "The create handler must warn that lite shared: access runs "
+                "as _sandboxd, not the operator.\n"
+                f"(daemon log length: {len(log_text)} bytes)"
+            )
         finally:
             if _session_exists(name):
                 _sandbox("stop", name, check=False)
