@@ -3700,6 +3700,35 @@ provision:
   script: |
     #!/bin/bash
     set -eux -o pipefail
+    echo "[sandbox-provision] step=wait-online start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # systemd-networkd-wait-online drop-in: pass --any so the service
+    # reports online as soon as at least one interface is configured,
+    # rather than waiting for ALL interfaces. On macOS sandbox VMs the
+    # lima0 (socket_vmnet) interface is configured statically by the
+    # net-vmnet step above, but if the socket_vmnet segment is not yet
+    # bridged (e.g. during the very first create before the gateway
+    # container is fully up), networkd may briefly mark lima0 as
+    # "configuring" and wait-online blocks indefinitely — exceeding the
+    # 300 s START_VM_TIMEOUT and causing `create` to roll back with a
+    # confusing timeout. The --any flag makes eth0 (the SLIRP management
+    # NIC, always up) sufficient to satisfy the wait. Note: netplan
+    # `optional: true` on lima0 was intended to exempt it from the wait,
+    # but that only affects networkd's per-link RequiredForOnline state;
+    # the service-level --any override is the reliable guard.
+    # NEEDS_LIVE_E2E: effectiveness against the dead-segment hang
+    # requires a live macOS full-backend test (tracked as #249).
+    mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
+    cat > /etc/systemd/system/systemd-networkd-wait-online.service.d/sandbox-any.conf <<'DROPIN_EOF'
+    [Service]
+    ExecStart=
+    ExecStart=/lib/systemd/systemd-networkd-wait-online --any
+    DROPIN_EOF
+    systemctl daemon-reload
+    echo "[sandbox-provision] step=wait-online done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
     echo "[sandbox-provision] step=apt-config start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
     cat > /etc/apt/apt.conf.d/99sandbox <<'APTEOF'
@@ -7374,6 +7403,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// macOS template must include the systemd-networkd-wait-online --any drop-in.
+    ///
+    /// The drop-in prevents `systemd-networkd-wait-online` from blocking boot
+    /// on the socket_vmnet (lima0) interface when the gateway segment is not yet
+    /// bridged. Without it, first boot can exceed START_VM_TIMEOUT (300 s) and
+    /// `create` rolls back with a confusing timeout.
+    #[test]
+    fn macos_template_has_wait_online_any_dropin() {
+        let mgr = macos_mgr();
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig::default();
+        let template = mgr.generate_template(&id, &config, None, Some(0));
+        assert!(
+            template.contains("step=wait-online"),
+            "macOS template must include the wait-online provision step"
+        );
+        assert!(
+            template.contains("systemd-networkd-wait-online.service.d"),
+            "macOS template must install a systemd-networkd-wait-online drop-in directory"
+        );
+        assert!(
+            template.contains("--any"),
+            "macOS template wait-online drop-in must pass --any to avoid blocking on all interfaces"
+        );
+        assert!(
+            template.contains("sandbox-any.conf"),
+            "macOS template must install the sandbox-any.conf drop-in file"
+        );
     }
 
     // -- verify_restrict_on negative tests -----------------------------------
