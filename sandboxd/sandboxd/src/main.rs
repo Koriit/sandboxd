@@ -12763,13 +12763,117 @@ async fn gateway_monitor(state: Arc<AppState>) {
 /// paths, including early returns and async cancellation (tokio drop). Defined
 /// at module scope so the `Drop` impl's `fn drop` is not mistaken for an
 /// enclosing function by the `update_state_reconcile` allow-list scanner.
-#[cfg(target_os = "macos")]
+///
+/// Not `#[cfg]`-gated: the guard carries no macOS-only types and staying
+/// platform-independent lets the release-on-all-paths behaviour be unit-tested
+/// on any host.
 struct GatewayRecoveringGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
-#[cfg(target_os = "macos")]
+impl GatewayRecoveringGuard {
+    /// Set the latch and return the guard whose `Drop` clears it. Ties the
+    /// set-on-entry / clear-on-exit pair together at one call site so the two
+    /// halves of the latch lifecycle cannot drift.
+    fn engage(latch: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        latch.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(std::sync::Arc::clone(latch))
+    }
+}
+
 impl Drop for GatewayRecoveringGuard {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Select the sessions that a gateway-Lima recovery must re-create.
+///
+/// Pure filter over an unfiltered session snapshot: a session qualifies iff it
+/// is `Running` **and** backed by Lima. Extracted from `recover_gateway_lima`
+/// so the selection contract (which rows recovery touches) is unit-testable
+/// without a store, a daemon, or a running gateway.
+fn sessions_to_recover(all: Vec<sandbox_core::Session>) -> Vec<sandbox_core::Session> {
+    use sandbox_core::{BackendKind, SessionState};
+    all.into_iter()
+        .filter(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima)
+        .collect()
+}
+
+/// Drive at most `max_concurrent` per-session recovery tasks concurrently,
+/// preserving the exact fill/drain control flow of `recover_gateway_lima`.
+///
+/// This is the bounded-fill concurrency loop lifted out of the orchestrator
+/// with its two effectful edges injected so they can be faked in tests:
+///
+/// - `prepare(session) -> Option<Future>`: async per-session preparation. It
+///   performs the "tag Recovering / fetch network info / build inputs" work and
+///   returns `Some(fut)` to enqueue an in-flight recovery task, or `None` to
+///   skip this session without spawning (the production "no network info →
+///   mark Error, continue" path). Returning `None` is the seam's equivalent of
+///   the original `continue` inside the fill loop.
+/// - `on_complete(outcome)`: async handler run for each task that finishes
+///   normally (the drain-side "remove map entry / mark Error" work).
+/// - `on_join_error(err)`: handler for a `JoinSet` join error (the spawned
+///   async task itself panicked). Mirrors the original's log-and-continue arm.
+///
+/// The loop invariants preserved verbatim from the original:
+///   * never more than `max_concurrent` tasks in flight (the fill `while` gate);
+///   * every session is offered to `prepare` exactly once, in order;
+///   * one task's outcome never aborts the others (drain handles each in turn);
+///   * the loop exits only once the input is exhausted **and** no task remains.
+///
+/// Generic and platform-independent so the cap, ordering, and partial-failure
+/// isolation can be asserted hermetically with an injected fake.
+async fn run_bounded_recovery<S, PrepFut, TaskFut, R, CompleteFut>(
+    sessions: Vec<S>,
+    max_concurrent: usize,
+    mut prepare: impl FnMut(S) -> PrepFut,
+    mut on_complete: impl FnMut(R) -> CompleteFut,
+    mut on_join_error: impl FnMut(tokio::task::JoinError),
+) where
+    PrepFut: std::future::Future<Output = Option<TaskFut>>,
+    TaskFut: std::future::Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+    CompleteFut: std::future::Future<Output = ()>,
+{
+    let mut join_set: tokio::task::JoinSet<R> = tokio::task::JoinSet::new();
+    let mut session_iter = sessions.into_iter().peekable();
+
+    loop {
+        // Fill the JoinSet up to the concurrency cap.
+        while join_set.len() < max_concurrent {
+            let session = match session_iter.next() {
+                Some(s) => s,
+                None => break,
+            };
+            match prepare(session).await {
+                Some(fut) => {
+                    join_set.spawn(fut);
+                }
+                // Skipped session (e.g. missing network info): no task spawned,
+                // just move on to the next candidate.
+                None => continue,
+            }
+        }
+
+        // Wait for any in-flight task to complete.
+        match join_set.join_next().await {
+            Some(Ok(outcome)) => {
+                on_complete(outcome).await;
+            }
+            Some(Err(e)) => {
+                on_join_error(e);
+                if session_iter.peek().is_none() && join_set.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            None => break, // JoinSet empty and no more sessions.
+        }
+
+        // Exit when all sessions have been processed.
+        if session_iter.peek().is_none() && join_set.is_empty() {
+            break;
+        }
     }
 }
 
@@ -12817,23 +12921,18 @@ impl Drop for GatewayRecoveringGuard {
 /// operators' agents.
 #[cfg(target_os = "macos")]
 async fn recover_gateway_lima(state: &Arc<AppState>) {
-    use sandbox_core::{BackendKind, SessionState};
-    use std::sync::atomic::Ordering;
+    use sandbox_core::SessionState;
 
     // Set the recovering latch. The GatewayRecoveringGuard (module-level)
     // clears it on drop so all return paths — including early returns and
     // async cancellation — release the latch.
-    state.gateway_recovering.store(true, Ordering::SeqCst);
-    let _guard = GatewayRecoveringGuard(Arc::clone(&state.gateway_recovering));
+    let _guard = GatewayRecoveringGuard::engage(&state.gateway_recovering);
 
     info!("gateway Lima recovery: starting full instance recovery");
 
     // Snapshot all Running Lima sessions up front.
     let sessions: Vec<sandbox_core::Session> = match state.store.list_sessions_unfiltered() {
-        Ok(s) => s
-            .into_iter()
-            .filter(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima)
-            .collect(),
+        Ok(s) => sessions_to_recover(s),
         Err(e) => {
             error!(error = %e, "gateway Lima recovery: failed to list sessions");
             return;
@@ -12891,193 +12990,189 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
 
     // Process sessions with bounded concurrency (~8 at a time) so the
     // gateway Docker daemon is not flooded. One session failure must not
-    // abort the others.
-    let mut join_set: tokio::task::JoinSet<(sandbox_core::SessionId, String, Result<(), String>)> =
-        tokio::task::JoinSet::new();
+    // abort the others. The fill/drain loop itself lives in
+    // `run_bounded_recovery`; the two effectful edges are injected below.
     let max_concurrent: usize = 8;
 
-    let mut session_iter = sessions.into_iter().peekable();
-
-    loop {
-        // Fill the JoinSet up to the concurrency cap.
-        while join_set.len() < max_concurrent {
-            let session = match session_iter.next() {
-                Some(s) => s,
-                None => break,
-            };
-
-            // Tag Recovering.
-            {
-                let mut map = state.networking_status.lock().await;
-                map.insert(session.id, NetworkingStatus::Recovering);
-            }
-
-            let network_info = match state.store.get_network_info_unfiltered(&session.id) {
-                Ok(Some(info)) => info,
-                Ok(None) => {
-                    warn!(
-                        session_id = %session.id,
-                        "gateway Lima recovery: no network info for session; marking Error"
-                    );
-                    let _ = state
-                        .store
-                        .update_state_reconcile(&session.id, SessionState::Error);
-                    {
-                        let mut map = state.networking_status.lock().await;
-                        map.remove(&session.id);
-                    }
-                    continue;
+    run_bounded_recovery(
+        sessions,
+        max_concurrent,
+        // prepare(session) -> Option<task future>. Returns None to skip a
+        // session without spawning (the "no network info → mark Error" path).
+        //
+        // The closure is `FnMut` (re-invoked per session), so it must not
+        // consume the shared inputs: re-borrow the owned ones here and
+        // `async move` the returned future, which then owns only the moved
+        // references plus the moved `session`. (`state` is already a
+        // `&Arc<AppState>` — Copy — so it needs no re-borrow.)
+        |session| {
+            let mgr = &mgr;
+            let image_tag = &image_tag;
+            let pool = &pool;
+            async move {
+                // Tag Recovering.
+                {
+                    let mut map = state.networking_status.lock().await;
+                    map.insert(session.id, NetworkingStatus::Recovering);
                 }
-                Err(e) => {
-                    warn!(
-                        session_id = %session.id,
-                        error = %e,
-                        "gateway Lima recovery: failed to get network info; marking Error"
-                    );
-                    let _ = state
-                        .store
-                        .update_state_reconcile(&session.id, SessionState::Error);
-                    {
-                        let mut map = state.networking_status.lock().await;
-                        map.remove(&session.id);
+
+                let network_info = match state.store.get_network_info_unfiltered(&session.id) {
+                    Ok(Some(info)) => info,
+                    Ok(None) => {
+                        warn!(
+                            session_id = %session.id,
+                            "gateway Lima recovery: no network info for session; marking Error"
+                        );
+                        let _ = state
+                            .store
+                            .update_state_reconcile(&session.id, SessionState::Error);
+                        {
+                            let mut map = state.networking_status.lock().await;
+                            map.remove(&session.id);
+                        }
+                        return None;
                     }
-                    continue;
-                }
-            };
+                    Err(e) => {
+                        warn!(
+                            session_id = %session.id,
+                            error = %e,
+                            "gateway Lima recovery: failed to get network info; marking Error"
+                        );
+                        let _ = state
+                            .store
+                            .update_state_reconcile(&session.id, SessionState::Error);
+                        {
+                            let mut map = state.networking_status.lock().await;
+                            map.remove(&session.id);
+                        }
+                        return None;
+                    }
+                };
 
-            let sock = mgr.gateway_docker_socket().to_path_buf();
-            let nic_name = {
-                let slot_idx = network_info
-                    .vmnet_slot
-                    .as_ref()
-                    .map(|s| s.index)
-                    .unwrap_or(0u16);
-                mgr.nic_map()
-                    .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
-                    .unwrap_or_else(|| format!("lima{slot_idx}"))
-            };
-            let tag = image_tag.clone();
-            let pool_str = pool.clone();
-            let ni = network_info.clone();
-            let sid = session.id;
-            let owner = session.owner_username.clone();
+                let sock = mgr.gateway_docker_socket().to_path_buf();
+                let nic_name = {
+                    let slot_idx = network_info
+                        .vmnet_slot
+                        .as_ref()
+                        .map(|s| s.index)
+                        .unwrap_or(0u16);
+                    mgr.nic_map()
+                        .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
+                        .unwrap_or_else(|| format!("lima{slot_idx}"))
+                };
+                let tag = image_tag.clone();
+                let pool_str = pool.clone();
+                let ni = network_info.clone();
+                let sid = session.id;
+                let owner = session.owner_username.clone();
 
-            // Determine initial DNS policy — fail-closed.
-            let has_policy = {
-                let policies = state.session_policies.lock().await;
-                policies.contains_key(&session.id)
-            };
-            let init_dns_owned = if !has_policy {
-                Some(sandbox_core::CoreDnsConfig::empty_policy_file_content())
-            } else {
-                None
-            };
-
-            // Reuse-or-regen the per-session mitmproxy CA so the recovered
-            // gateway signs intercepted HTTPS with the key the sandbox VM
-            // already trusts. Passing `None` would let mitmproxy self-generate
-            // a throwaway CA, breaking HTTPS interception for allowed flows
-            // after a daemon-restart recovery.
-            let ca_dir = {
-                let dir = CaManager::ca_dir(&state.base_dir, &session.id);
-                if dir.join("cert.pem").exists() {
-                    dir
+                // Determine initial DNS policy — fail-closed.
+                let has_policy = {
+                    let policies = state.session_policies.lock().await;
+                    policies.contains_key(&session.id)
+                };
+                let init_dns_owned = if !has_policy {
+                    Some(sandbox_core::CoreDnsConfig::empty_policy_file_content())
                 } else {
-                    match CaManager::generate_session_ca(&state.base_dir, &session.id) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!(
-                                session_id = %session.id,
-                                error = %e,
-                                "gateway Lima recovery: failed to ensure CA; proceeding \
-                                 without CA (HTTPS interception may break)"
-                            );
-                            CaManager::ca_dir(&state.base_dir, &session.id)
+                    None
+                };
+
+                // Reuse-or-regen the per-session mitmproxy CA so the recovered
+                // gateway signs intercepted HTTPS with the key the sandbox VM
+                // already trusts. Passing `None` would let mitmproxy self-generate
+                // a throwaway CA, breaking HTTPS interception for allowed flows
+                // after a daemon-restart recovery.
+                let ca_dir = {
+                    let dir = CaManager::ca_dir(&state.base_dir, &session.id);
+                    if dir.join("cert.pem").exists() {
+                        dir
+                    } else {
+                        match CaManager::generate_session_ca(&state.base_dir, &session.id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway Lima recovery: failed to ensure CA; proceeding \
+                                     without CA (HTTPS interception may break)"
+                                );
+                                CaManager::ca_dir(&state.base_dir, &session.id)
+                            }
                         }
                     }
-                }
-            };
-
-            join_set.spawn(async move {
-                let join_result = tokio::task::spawn_blocking(move || {
-                    let result = (|| -> Result<(), sandbox_core::error::SandboxError> {
-                        sandbox_core::teardown_macos_gateway(&sid, &sock)?;
-                        let ca_opt = if ca_dir.join("cert.pem").exists() {
-                            Some(ca_dir.as_path())
-                        } else {
-                            None
-                        };
-                        sandbox_core::setup_macos_gateway(
-                            &sid,
-                            &ni,
-                            &nic_name,
-                            &sock,
-                            &tag,
-                            ca_opt,
-                            init_dns_owned.as_deref(),
-                            Some(&pool_str),
-                        )
-                    })();
-                    result.map_err(|e| e.to_string())
-                })
-                .await;
-                let result = match join_result {
-                    Ok(r) => r,
-                    Err(e) => Err(format!("spawn_blocking panicked: {e}")),
                 };
-                (sid, owner, result)
-            });
-        }
 
-        // Wait for any in-flight task to complete.
-        let (sid, owner, result) = match join_set.join_next().await {
-            Some(Ok(triple)) => triple,
-            Some(Err(e)) => {
-                error!(error = %e, "gateway Lima recovery: JoinSet join error");
-                if session_iter.peek().is_none() && join_set.is_empty() {
-                    break;
-                }
-                continue;
+                Some(async move {
+                    let join_result = tokio::task::spawn_blocking(move || {
+                        let result = (|| -> Result<(), sandbox_core::error::SandboxError> {
+                            sandbox_core::teardown_macos_gateway(&sid, &sock)?;
+                            let ca_opt = if ca_dir.join("cert.pem").exists() {
+                                Some(ca_dir.as_path())
+                            } else {
+                                None
+                            };
+                            sandbox_core::setup_macos_gateway(
+                                &sid,
+                                &ni,
+                                &nic_name,
+                                &sock,
+                                &tag,
+                                ca_opt,
+                                init_dns_owned.as_deref(),
+                                Some(&pool_str),
+                            )
+                        })();
+                        result.map_err(|e| e.to_string())
+                    })
+                    .await;
+                    let result = match join_result {
+                        Ok(r) => r,
+                        Err(e) => Err(format!("spawn_blocking panicked: {e}")),
+                    };
+                    (sid, owner, result)
+                })
             }
-            None => break, // JoinSet empty and no more sessions.
-        };
-
-        match result {
-            Ok(()) => {
-                info!(
-                    session_id = %sid,
-                    "gateway Lima recovery: session gateway recovered"
-                );
-                // Remove map entry → Healthy.
-                {
-                    let mut map = state.networking_status.lock().await;
-                    map.remove(&sid);
+        },
+        // on_complete(outcome) — drain-side handling of one finished task.
+        |(sid, owner, result): (sandbox_core::SessionId, String, Result<(), String>)| async move {
+            match result {
+                Ok(()) => {
+                    info!(
+                        session_id = %sid,
+                        "gateway Lima recovery: session gateway recovered"
+                    );
+                    // Remove map entry → Healthy.
+                    {
+                        let mut map = state.networking_status.lock().await;
+                        map.remove(&sid);
+                    }
+                    spawn_session_ingestor(&sid, state).await;
+                    reapply_session_policy(&sid, &owner, state).await;
                 }
-                spawn_session_ingestor(&sid, state).await;
-                reapply_session_policy(&sid, &owner, state).await;
-            }
-            Err(e) => {
-                error!(
-                    session_id = %sid,
-                    error = %e,
-                    "gateway Lima recovery: failed to recover session gateway; marking Error"
-                );
-                let _ = state
-                    .store
-                    .update_state_reconcile(&sid, SessionState::Error);
-                // Remove map entry (session is now Error, not Running).
-                {
-                    let mut map = state.networking_status.lock().await;
-                    map.remove(&sid);
+                Err(e) => {
+                    error!(
+                        session_id = %sid,
+                        error = %e,
+                        "gateway Lima recovery: failed to recover session gateway; marking Error"
+                    );
+                    let _ = state
+                        .store
+                        .update_state_reconcile(&sid, SessionState::Error);
+                    // Remove map entry (session is now Error, not Running).
+                    {
+                        let mut map = state.networking_status.lock().await;
+                        map.remove(&sid);
+                    }
                 }
             }
-        }
-
-        // Exit when all sessions have been processed.
-        if session_iter.peek().is_none() && join_set.is_empty() {
-            break;
-        }
-    }
+        },
+        // on_join_error — a spawned recovery task itself panicked. Log and
+        // continue; `run_bounded_recovery` handles the loop-exit accounting.
+        |e| {
+            error!(error = %e, "gateway Lima recovery: JoinSet join error");
+        },
+    )
+    .await;
 
     info!("gateway Lima recovery: complete");
     // _guard is dropped here, clearing gateway_recovering.
@@ -17634,6 +17729,423 @@ mod tests {
                     "no_cache must bypass the base-image path entirely"
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gateway-Lima recovery orchestrator seams.
+    //
+    // These exercise the pure/orchestration pieces lifted out of
+    // `recover_gateway_lima` — the session-filter predicate, the
+    // bounded-fill concurrency loop, and the latch guard — with no daemon,
+    // no Lima, no Docker, and no wall-clock races. The effectful per-session
+    // recovery action is injected as a fake so the tests can assert the
+    // concurrency cap, partial-failure isolation, and guard lifecycle in
+    // isolation. The real `restart_instance_for_recovery` is separately
+    // integration-covered and is not re-tested here.
+    // -----------------------------------------------------------------------
+    mod recovery_seams {
+        use super::*;
+        use sandbox_core::{BackendKind, Session, SessionState};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// Build a session with an explicit state + backend for the filter tests.
+        fn session_with(state: SessionState, backend: BackendKind) -> Session {
+            let mut s = Session::new(Some("recovery-seam".into()));
+            s.state = state;
+            s.backend = backend;
+            s
+        }
+
+        // ---- sessions_to_recover (pure filter) --------------------------
+
+        #[test]
+        fn filter_selects_only_running_lima_sessions() {
+            let running_lima = session_with(SessionState::Running, BackendKind::Lima);
+            let want = running_lima.id;
+
+            let all = vec![
+                session_with(SessionState::Creating, BackendKind::Lima),
+                running_lima,
+                session_with(SessionState::Stopped, BackendKind::Lima),
+                session_with(SessionState::Running, BackendKind::Container),
+                session_with(SessionState::Error, BackendKind::Lima),
+            ];
+
+            let selected = sessions_to_recover(all);
+            assert_eq!(
+                selected.len(),
+                1,
+                "only the single Running+Lima session qualifies"
+            );
+            assert_eq!(
+                selected[0].id, want,
+                "the selected session must be the Running Lima one"
+            );
+        }
+
+        #[test]
+        fn filter_excludes_non_lima_backend() {
+            // A Running container session must never be swept into a
+            // gateway-Lima recovery — the container backend has no gateway
+            // Lima instance to re-create through.
+            let all = vec![session_with(SessionState::Running, BackendKind::Container)];
+            assert!(
+                sessions_to_recover(all).is_empty(),
+                "Running Container sessions are not gateway-Lima recovery candidates"
+            );
+        }
+
+        #[test]
+        fn filter_excludes_non_running_states() {
+            for state in [
+                SessionState::Creating,
+                SessionState::Stopped,
+                SessionState::Error,
+            ] {
+                let all = vec![session_with(state, BackendKind::Lima)];
+                assert!(
+                    sessions_to_recover(all).is_empty(),
+                    "a {state:?} Lima session must not be recovered"
+                );
+            }
+        }
+
+        #[test]
+        fn filter_empty_input_is_empty() {
+            assert!(sessions_to_recover(Vec::new()).is_empty());
+        }
+
+        // ---- run_bounded_recovery (concurrency-cap loop) ----------------
+
+        /// Never more than `max_concurrent` recovery tasks are in flight at
+        /// once, and with more sessions than the cap the loop actually fills
+        /// up to the cap (proving the bound is a real ceiling, not an
+        /// accidental serialization). Also proves every session is attempted.
+        #[tokio::test]
+        async fn bounded_loop_respects_concurrency_cap() {
+            const CAP: usize = 8;
+            const N: usize = 25;
+
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+            let attempted = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+
+            let sessions: Vec<usize> = (0..N).collect();
+
+            run_bounded_recovery(
+                sessions,
+                CAP,
+                |i| {
+                    let in_flight = Arc::clone(&in_flight);
+                    let max_seen = Arc::clone(&max_seen);
+                    let attempted = Arc::clone(&attempted);
+                    async move {
+                        attempted.fetch_add(1, Ordering::SeqCst);
+                        Some(async move {
+                            // Enter: bump the live counter and record the peak.
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_seen.fetch_max(now, Ordering::SeqCst);
+                            // Yield several times so the driver gets a chance
+                            // to fill the JoinSet up to the cap while this task
+                            // is still "in flight" — deterministic interleaving
+                            // on the single-threaded test runtime, no sleeps.
+                            for _ in 0..4 {
+                                tokio::task::yield_now().await;
+                            }
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+                            i
+                        })
+                    }
+                },
+                |_i: usize| {
+                    let completed = Arc::clone(&completed);
+                    async move {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                |_e| panic!("no task should panic in this test"),
+            )
+            .await;
+
+            let peak = max_seen.load(Ordering::SeqCst);
+            assert!(
+                peak <= CAP,
+                "in-flight tasks ({peak}) must never exceed the cap ({CAP})"
+            );
+            assert_eq!(
+                peak, CAP,
+                "with N ({N}) > cap ({CAP}), the loop must fill up to the cap"
+            );
+            assert_eq!(
+                attempted.load(Ordering::SeqCst),
+                N,
+                "every session must be offered to prepare exactly once"
+            );
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                N,
+                "every spawned task's outcome must be drained via on_complete"
+            );
+            assert_eq!(
+                in_flight.load(Ordering::SeqCst),
+                0,
+                "no task may remain in flight after the loop returns"
+            );
+        }
+
+        /// One task failing must not abort the others: every session still
+        /// runs, and the aggregate reflects each per-session outcome.
+        #[tokio::test]
+        async fn bounded_loop_isolates_partial_failure() {
+            const CAP: usize = 8;
+            const N: usize = 20;
+
+            // Sessions with index % 3 == 0 "fail"; the rest "succeed".
+            let sessions: Vec<usize> = (0..N).collect();
+            let outcomes = Arc::new(std::sync::Mutex::new(Vec::<(usize, bool)>::new()));
+
+            run_bounded_recovery(
+                sessions,
+                CAP,
+                |i| async move {
+                    Some(async move {
+                        let ok = i % 3 != 0;
+                        (i, if ok { Ok(()) } else { Err(format!("boom-{i}")) })
+                    })
+                },
+                |(i, res): (usize, Result<(), String>)| {
+                    let outcomes = Arc::clone(&outcomes);
+                    async move {
+                        outcomes.lock().unwrap().push((i, res.is_ok()));
+                    }
+                },
+                |_e| panic!("no task should panic in this test"),
+            )
+            .await;
+
+            let mut got = outcomes.lock().unwrap().clone();
+            got.sort_by_key(|(i, _)| *i);
+
+            assert_eq!(
+                got.len(),
+                N,
+                "every session must be drained despite failures"
+            );
+            for (i, ok) in got {
+                let expected_ok = i % 3 != 0;
+                assert_eq!(
+                    ok, expected_ok,
+                    "session {i}: on_complete must see its own per-session outcome"
+                );
+            }
+        }
+
+        /// A `prepare` that returns `None` skips the session without spawning
+        /// (the production "no network info → mark Error, continue" path). The
+        /// loop must still drain the spawned ones and terminate — even when
+        /// every session is skipped (empty JoinSet must not hang).
+        #[tokio::test]
+        async fn bounded_loop_handles_skipped_sessions() {
+            const CAP: usize = 8;
+            const N: usize = 10;
+
+            let prepared = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+
+            // Even indices spawn a task; odd indices are skipped (None).
+            let sessions: Vec<usize> = (0..N).collect();
+            let expected_spawned = (0..N).filter(|i| i % 2 == 0).count();
+
+            run_bounded_recovery(
+                sessions,
+                CAP,
+                |i| {
+                    let prepared = Arc::clone(&prepared);
+                    async move {
+                        prepared.fetch_add(1, Ordering::SeqCst);
+                        if i % 2 == 0 {
+                            Some(async move { i })
+                        } else {
+                            None
+                        }
+                    }
+                },
+                |_i: usize| {
+                    let completed = Arc::clone(&completed);
+                    async move {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                |_e| panic!("no task should panic in this test"),
+            )
+            .await;
+
+            assert_eq!(
+                prepared.load(Ordering::SeqCst),
+                N,
+                "prepare must be offered every session, including skipped ones"
+            );
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                expected_spawned,
+                "only spawned (non-skipped) sessions reach on_complete"
+            );
+        }
+
+        /// All sessions skipped: the loop must terminate (empty JoinSet →
+        /// join_next returns None immediately, not a hang).
+        #[tokio::test]
+        async fn bounded_loop_all_skipped_terminates() {
+            let sessions: Vec<usize> = (0..5).collect();
+            let completed = Arc::new(AtomicUsize::new(0));
+
+            run_bounded_recovery(
+                sessions,
+                8,
+                |_i| async move { None::<std::future::Ready<()>> },
+                |_i: ()| {
+                    let completed = Arc::clone(&completed);
+                    async move {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                |_e| panic!("no task should panic in this test"),
+            )
+            .await;
+
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                0,
+                "no task spawned means on_complete never fires; loop still returns"
+            );
+        }
+
+        /// Empty input set: the loop returns immediately without spawning or
+        /// draining anything.
+        #[tokio::test]
+        async fn bounded_loop_empty_input_terminates() {
+            let sessions: Vec<usize> = Vec::new();
+            let prepared = Arc::new(AtomicUsize::new(0));
+
+            run_bounded_recovery(
+                sessions,
+                8,
+                |_i| {
+                    let prepared = Arc::clone(&prepared);
+                    async move {
+                        prepared.fetch_add(1, Ordering::SeqCst);
+                        Some(async move {})
+                    }
+                },
+                |_i: ()| async move {},
+                |_e| panic!("no task should panic in this test"),
+            )
+            .await;
+
+            assert_eq!(
+                prepared.load(Ordering::SeqCst),
+                0,
+                "empty input must never invoke prepare"
+            );
+        }
+
+        // ---- GatewayRecoveringGuard (latch release on all paths) --------
+
+        #[test]
+        fn guard_sets_latch_on_engage_and_clears_on_drop() {
+            let latch = Arc::new(AtomicBool::new(false));
+            {
+                let _g = GatewayRecoveringGuard::engage(&latch);
+                assert!(
+                    latch.load(Ordering::SeqCst),
+                    "engage() must set the recovering latch"
+                );
+            }
+            assert!(
+                !latch.load(Ordering::SeqCst),
+                "the latch must be cleared when the guard is dropped"
+            );
+        }
+
+        #[test]
+        fn guard_clears_latch_on_early_return_path() {
+            // Model an early `return` inside the guarded scope: the guard is
+            // held by a function that returns before reaching its natural end.
+            let latch = Arc::new(AtomicBool::new(false));
+
+            fn early_return(latch: &Arc<AtomicBool>, bail: bool) {
+                let _g = GatewayRecoveringGuard::engage(latch);
+                if bail {
+                    return; // guard drops here
+                }
+                // (unreached in this test)
+            }
+
+            early_return(&latch, true);
+            assert!(
+                !latch.load(Ordering::SeqCst),
+                "latch must be released even when the guarded scope returns early"
+            );
+        }
+
+        #[test]
+        fn guard_clears_latch_on_panic_unwind() {
+            // The latch must not stay stuck if the guarded scope panics — Drop
+            // runs during unwind. Proves the release-on-all-paths property for
+            // the panic path.
+            let latch = Arc::new(AtomicBool::new(false));
+            let latch_for_closure = Arc::clone(&latch);
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = GatewayRecoveringGuard::engage(&latch_for_closure);
+                panic!("boom");
+            }));
+
+            assert!(result.is_err(), "the guarded closure must have panicked");
+            assert!(
+                !latch.load(Ordering::SeqCst),
+                "latch must be released on the panic-unwind path"
+            );
+        }
+
+        /// End-to-end over the two seams together: engage the guard, drive a
+        /// mixed success/failure bounded run to completion, then confirm the
+        /// latch is clear once the guard drops — the composed success/partial
+        /// path leaves no stuck latch.
+        #[tokio::test]
+        async fn guard_released_after_bounded_run_completes() {
+            let latch = Arc::new(AtomicBool::new(false));
+
+            {
+                let _guard = GatewayRecoveringGuard::engage(&latch);
+                assert!(latch.load(Ordering::SeqCst), "latch set during recovery");
+
+                let sessions: Vec<usize> = (0..12).collect();
+                run_bounded_recovery(
+                    sessions,
+                    8,
+                    |i| async move {
+                        Some(async move {
+                            if i % 4 == 0 {
+                                Err(())
+                            } else {
+                                Ok(())
+                            }
+                        })
+                    },
+                    |_r: Result<(), ()>| async move {},
+                    |_e| panic!("no task should panic in this test"),
+                )
+                .await;
+            } // guard drops here
+
+            assert!(
+                !latch.load(Ordering::SeqCst),
+                "latch must be clear after the recovery scope (guard) ends"
+            );
         }
     }
 }
