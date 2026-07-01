@@ -598,6 +598,20 @@ pub fn build_macos_gateway_docker_args(
         "net.ipv4.ip_forward=1".to_string(),
         "--sysctl".to_string(),
         "net.ipv6.conf.all.forwarding=0".to_string(),
+        // CoreDNS upstream forwarder. On macOS the gateway container runs
+        // inside the gateway Lima VM, where Docker's embedded DNS at
+        // 127.0.0.11 (the Linux default the entrypoint bakes in) is a dead
+        // end: its own upstream, the VM's 127.0.0.53 systemd-resolved stub,
+        // does not answer, so an allowed domain SERVFAILs on the forward even
+        // though the DNS policy admits it. The VM reaches public resolvers
+        // directly over eth0 (port 53 is permitted by the gateway-VM egress
+        // firewall), so point CoreDNS there. Multiple resolvers give
+        // failover; the entrypoint renders them into the `forward .` line.
+        // This never weakens deny — a denied domain is answered NXDOMAIN
+        // before the forward runs — and does not touch the Linux path, which
+        // keeps the 127.0.0.11 default.
+        "--env".to_string(),
+        "SANDBOX_COREDNS_UPSTREAM=8.8.8.8 8.8.4.4 1.1.1.1".to_string(),
         "--restart".to_string(),
         "unless-stopped".to_string(),
         "--label".to_string(),
@@ -1376,6 +1390,48 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.contains("docker.sock")),
             "gateway run args must not reference docker.sock in any arg; got: {args:?}"
+        );
+    }
+
+    /// macOS gateway containers must set `SANDBOX_COREDNS_UPSTREAM` to
+    /// reachable public resolvers. Inside the gateway Lima VM, CoreDNS's
+    /// baked-in default upstream (Docker's embedded DNS at 127.0.0.11) is a
+    /// dead end — its own upstream, the VM's 127.0.0.53 systemd-resolved stub,
+    /// does not answer — so an allowed domain SERVFAILs on the forward even
+    /// though the policy admits it. The env var overrides the forwarder to
+    /// public resolvers the VM reaches directly over eth0, which is what
+    /// makes egress *allow* actually resolve on macOS. Deny is unaffected (a
+    /// denied domain is NXDOMAIN'd before the forward runs), and the Linux
+    /// path is untouched (it never uses this builder and keeps 127.0.0.11).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_gateway_sets_coredns_upstream_to_public_resolvers() {
+        let id = SessionId::parse("aabbccddeeff").unwrap();
+        let args = build_macos_gateway_docker_args(&id, "sandbox-gateway:test", None);
+
+        // `--env` must be immediately followed by the SANDBOX_COREDNS_UPSTREAM
+        // assignment; docker requires the KEY=VALUE to follow the flag.
+        let env_pos = args
+            .iter()
+            .position(|a| a == "--env")
+            .unwrap_or_else(|| panic!("gateway run args must carry an --env flag; got: {args:?}"));
+        let env_val = &args[env_pos + 1];
+        assert!(
+            env_val.starts_with("SANDBOX_COREDNS_UPSTREAM="),
+            "the --env value must set SANDBOX_COREDNS_UPSTREAM; got {env_val:?}"
+        );
+        // Must NOT be the dead-end in-VM Docker embedded resolver — that is
+        // exactly the value that SERVFAILs allowed domains on macOS.
+        assert!(
+            !env_val.contains("127.0.0.11"),
+            "macOS CoreDNS upstream must not be the dead-end 127.0.0.11 \
+             embedded resolver; got {env_val:?}"
+        );
+        // Must point at a public resolver the VM can reach directly.
+        assert!(
+            env_val.contains("8.8.8.8") || env_val.contains("1.1.1.1"),
+            "macOS CoreDNS upstream must be a reachable public resolver; \
+             got {env_val:?}"
         );
     }
 

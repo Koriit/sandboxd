@@ -286,9 +286,30 @@ if [[ ! -f "$COREDNS_POLICY_FILE" ]]; then
     printf '# Default deny-all — sandboxd writes the real policy after gateway starts\n' > "$COREDNS_POLICY_FILE"
 fi
 
+# Render the Corefile with the effective upstream forwarder.
+#
+# The baked-in template forwards to Docker's embedded DNS at 127.0.0.11,
+# which is correct on Linux (gateway container on the host's Docker). On
+# macOS the gateway container runs inside the gateway Lima VM, where
+# 127.0.0.11's own upstream (the VM's 127.0.0.53 systemd-resolved stub) is a
+# dead end, so an allowed domain SERVFAILs on the forward even though the
+# policy admits it. The macOS create path sets SANDBOX_COREDNS_UPSTREAM to
+# public resolvers reachable directly over the VM's eth0.
+#
+# We substitute the `forward .` upstream(s) rather than using CoreDNS's
+# `{$VAR}` Corefile syntax: `{$VAR}` interpolates as a single token, so a
+# space-separated list would be parsed as one bogus hostname. A rendered
+# line lets the macOS path pass multiple resolvers for failover. The default
+# is 127.0.0.11, keeping the Linux behaviour byte-for-byte unchanged.
+COREDNS_UPSTREAM="${SANDBOX_COREDNS_UPSTREAM:-127.0.0.11}"
+RENDERED_COREFILE=/etc/coredns/Corefile
+sed -E "s|^([[:space:]]*)forward \. .*|\1forward . ${COREDNS_UPSTREAM}|" \
+    /opt/coredns/Corefile > "${RENDERED_COREFILE}"
+log "Rendered Corefile with upstream forwarder: ${COREDNS_UPSTREAM}"
+
 log "Starting CoreDNS..."
 coredns \
-    -conf /opt/coredns/Corefile \
+    -conf "${RENDERED_COREFILE}" \
     >>"${LOG_DIR}/coredns.log" 2>&1 &
 COREDNS_PID=$!
 log "CoreDNS started (PID=${COREDNS_PID})"

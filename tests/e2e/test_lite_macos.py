@@ -298,6 +298,18 @@ class TestLiteMacosCreate:
         )
 
 
+# curl exit codes that all mean "egress was blocked" on the lite path:
+#   6  — could not resolve host (CoreDNS answered NXDOMAIN for a denied domain)
+#   7  — failed to connect (route/nft refused the connection)
+#   28 — operation timed out (packets dropped, no response within --max-time)
+#   35 — TLS handshake failure (connection reached but was RST'd mid-handshake)
+#   56 — failure receiving network data (connection RST after connect)
+# A denied domain never resolves (NXDOMAIN) so 6 is the common case, but the
+# block can also surface as any of the connect/timeout/reset signatures; we
+# accept the whole set so the assertion is robust to which layer trips.
+_BLOCK_CURL_EXITS = {6, 7, 28, 35, 56}
+
+
 class TestLiteMacosEgressInterception:
     """Verify egress is gated through the gateway pipeline."""
 
@@ -305,8 +317,14 @@ class TestLiteMacosEgressInterception:
         """Traffic to a denied host must be blocked.
 
         The default policy denies all egress. A ``curl`` to an arbitrary
-        external host from inside the sandbox container must time out or
-        be refused within a few seconds.
+        external host from inside the sandbox container must fail with a
+        block signature (could-not-resolve / refused / timeout / reset).
+
+        We assert on the curl exit code rather than a ``query_denied`` event
+        in the CoreDNS log: enforcement is what matters and it fires via the
+        NXDOMAIN-before-forward path, but the JSONL event capture proved
+        unreliable to assert on (the event stream is a best-effort
+        observability sink, not the enforcement mechanism).
         """
         result = _sandbox(
             "exec",
@@ -314,18 +332,136 @@ class TestLiteMacosEgressInterception:
             "--",
             "curl",
             "--max-time",
-            "5",
+            "8",
             "--silent",
             "--show-error",
             "http://example.com",
             check=False,
         )
-        # Curl exits non-zero when blocked: exit 28 (timeout) or exit 7 (refused).
-        # Any non-zero exit confirms egress is gated.
-        assert result.returncode != 0, (
-            "Expected curl to fail (egress blocked) but it succeeded.\n"
-            f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+        assert result.returncode in _BLOCK_CURL_EXITS, (
+            "Expected curl to fail with a block signature "
+            f"(exit in {sorted(_BLOCK_CURL_EXITS)}) but got exit "
+            f"{result.returncode}.\nstdout: {result.stdout!r}\n"
+            f"stderr: {result.stderr!r}"
         )
+
+    def test_allowed_domain_egress_on_lite_macos(self, tmp_path):
+        """An ALLOWED domain must resolve AND reach its target on lite macOS.
+
+        This is the egress-*allow* half of the network-control promise on the
+        lite path — the direction that regressed because the gateway VM's
+        CoreDNS forwarded to Docker's embedded DNS at 127.0.0.11, whose own
+        upstream (the VM's 127.0.0.53 systemd-resolved stub) is a dead end, so
+        an allowed domain SERVFAILed on the forward even though the policy
+        admitted it. With the upstream forwarder pointed at reachable public
+        resolvers, an allowed domain resolves and its egress opens; a
+        non-allowed host still blocks (fail-closed intact).
+
+        Policy: allow example.com:80/tcp at level=transport — the exact shape
+        that is green on Linux (``test_policy.py::test_level1_transport_tcp``).
+        """
+        name = f"e2e-lite-allow-{int(time.time())}"
+        policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                }
+            ],
+        }
+        policy_path = tmp_path / "allow-example.json"
+        policy_path.write_text(json.dumps(policy))
+
+        created = False
+        try:
+            result = _sandbox(
+                "create",
+                "--lite",
+                "--name",
+                name,
+                "--policy",
+                str(policy_path),
+                capture=True,
+            )
+            assert result.returncode == 0, (
+                f"sandbox create --lite --policy failed:\n{result.stderr}"
+            )
+            created = True
+            _wait_for_running(name)
+
+            # The gate allow-list propagates asynchronously: after the policy
+            # is applied, the first few queries for the allowed domain can
+            # still miss until CoreDNS has the domain and the gate has admitted
+            # the resolved IPs. This is a real (separate) propagation-timing
+            # effect independent of the upstream-forwarder fix, so poll the
+            # first nslookup for up to ~30s before asserting.
+            nslookup = None
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                nslookup = _sandbox(
+                    "exec", name, "--", "nslookup", "example.com", check=False
+                )
+                if nslookup.returncode == 0:
+                    break
+                time.sleep(3)
+            assert nslookup is not None and nslookup.returncode == 0, (
+                "Allowed domain example.com failed to resolve within 30s "
+                "(egress-allow broken).\n"
+                f"exit: {nslookup.returncode if nslookup else 'n/a'}\n"
+                f"stdout: {nslookup.stdout if nslookup else ''!r}\n"
+                f"stderr: {nslookup.stderr if nslookup else ''!r}"
+            )
+
+            # ALLOW: curl to the allowed domain must succeed (TCP passthrough).
+            curl_allowed = _sandbox(
+                "exec",
+                name,
+                "--",
+                "curl",
+                "--max-time",
+                "30",
+                "--silent",
+                "--show-error",
+                "http://example.com",
+                check=False,
+            )
+            assert curl_allowed.returncode == 0, (
+                "curl to the ALLOWED example.com must succeed (exit 0).\n"
+                f"exit: {curl_allowed.returncode}\n"
+                f"stdout: {curl_allowed.stdout!r}\nstderr: {curl_allowed.stderr!r}"
+            )
+            assert "Example Domain" in curl_allowed.stdout, (
+                "Response body from the allowed example.com must contain "
+                f"'Example Domain'.\nstdout: {curl_allowed.stdout!r}"
+            )
+
+            # DENY (fail-closed still holds): a NON-allowed host must be
+            # blocked even though a sibling domain is allowed.
+            curl_denied = _sandbox(
+                "exec",
+                name,
+                "--",
+                "curl",
+                "--max-time",
+                "8",
+                "--silent",
+                "--show-error",
+                "http://blocked-example-xyz.com",
+                check=False,
+            )
+            assert curl_denied.returncode in _BLOCK_CURL_EXITS, (
+                "A non-allowed host must stay blocked (fail-closed) even with "
+                "an allow rule for a sibling domain. Expected curl exit in "
+                f"{sorted(_BLOCK_CURL_EXITS)} but got {curl_denied.returncode}.\n"
+                f"stdout: {curl_denied.stdout!r}\nstderr: {curl_denied.stderr!r}"
+            )
+        finally:
+            if created and _session_exists(name):
+                _sandbox("stop", name, check=False)
+                _sandbox("rm", name, check=False)
 
     def test_ssh_access_works_over_forwarded_socket(self, lite_session):
         """SSH into the lite session must work without a login-session agent.

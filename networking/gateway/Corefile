@@ -28,17 +28,24 @@
         gate_socket /var/log/gateway/events/dns-gate.sock
         reload 1s
     }
-    # Forward to Docker's embedded DNS at 127.0.0.11. This sidesteps
-    # reachability flakiness we saw forwarding to public resolvers
-    # (8.8.8.8 / 8.8.4.4) from the gateway container — the gateway
-    # sits on a per-session Docker bridge that the host's `docker0`
-    # ip-forwards through SLIRP/QEMU when sandboxd itself runs inside
-    # a Lima VM, and that path occasionally drops responses for
-    # unrelated downstream sessions, surfacing as transient SERVFAIL
-    # for an allowed domain. 127.0.0.11 is Docker's container-local
-    # embedded resolver — it always lives on the same network
-    # namespace as the gateway, has zero hops, and proxies to the
-    # host's real upstream via dockerd's own resolver code.
+    # Upstream forwarder. The default is Docker's container-local embedded
+    # DNS at 127.0.0.11: on Linux the gateway container runs on the host's
+    # Docker, where 127.0.0.11 sidesteps the public-resolver reachability
+    # flakiness seen forwarding through the host `docker0` → SLIRP/QEMU path
+    # (transient SERVFAIL for an allowed domain); it lives in the same netns,
+    # has zero hops, and proxies to the host's real upstream via dockerd's
+    # own resolver code.
+    #
+    # This line is rendered by entrypoint.sh from SANDBOX_COREDNS_UPSTREAM
+    # (default `127.0.0.11`, so the Linux behaviour is byte-for-byte
+    # unchanged). On macOS the gateway container runs *inside* the gateway
+    # Lima VM, where Docker's embedded 127.0.0.11 forwarder is a dead end —
+    # its own upstream (the VM's 127.0.0.53 systemd-resolved stub) does not
+    # answer — so an allowed domain SERVFAILs even though the policy admits
+    # it. There the macOS create path sets SANDBOX_COREDNS_UPSTREAM to public
+    # resolvers, which the VM reaches directly over eth0 (port 53 is allowed
+    # by the gateway-VM egress firewall). Deny is unaffected either way: a
+    # denied domain is answered NXDOMAIN before this forward runs.
     forward . 127.0.0.11
     log
     health :8180
