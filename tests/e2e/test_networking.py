@@ -36,6 +36,7 @@ import pytest
 
 from conftest import (
     LIMA_VM_HOME,
+    PLATFORM,
     capture_lima_logs,
     cleanup_policy_file,
     gateway_container_name,
@@ -1503,11 +1504,11 @@ def _daemon_lima_home() -> str:
     """Return the daemon uid's LIMA_HOME for the e2e harness.
 
     The sandboxd-gateway instance lives here, under the daemon-uid's
-    per-uid Lima registry: /var/lib/sandboxd/<sandbox-test-uid>/lima/.
+    per-uid Lima registry: /var/lib/sandboxd/<daemon-test-uid>/lima/.
     """
     import pwd as _pwd
-    sandbox_test_uid = _pwd.getpwnam("sandbox-test").pw_uid
-    return f"/var/lib/sandboxd/{sandbox_test_uid}/lima"
+    daemon_test_uid = _pwd.getpwnam(PLATFORM.daemon_test_user).pw_uid
+    return f"/var/lib/sandboxd/{daemon_test_uid}/lima"
 
 
 def _gateway_docker_socket() -> str:
@@ -1523,14 +1524,14 @@ def _gateway_docker_socket() -> str:
 def _gateway_lima_force_stop() -> subprocess.CompletedProcess:
     """Force-stop the sandboxd-gateway Lima instance out-of-band.
 
-    The gateway belongs to the daemon user (sandbox-test). We run
-    ``limactl stop --force sandboxd-gateway`` as ``sandbox-test`` via the
+    The gateway belongs to the daemon user (PLATFORM.daemon_test_user). We run
+    ``limactl stop --force sandboxd-gateway`` as the daemon test user via the
     NOPASSWD sudoers fragment installed by ``make setup-dev-env``.
     """
     lima_home = _daemon_lima_home()
     return subprocess.run(
         [
-            "sudo", "-n", "-u", "sandbox-test",
+            "sudo", "-n", "-u", PLATFORM.daemon_test_user,
             "env", f"LIMA_HOME={lima_home}",
             "limactl", "stop", "--force", "sandboxd-gateway", "--tty=false",
         ],
@@ -1542,13 +1543,13 @@ def _gateway_lima_state() -> str:
     """Return the sandboxd-gateway Lima instance state string.
 
     Returns ``"Running"``, ``"Stopped"``, or ``"None"`` (absent) by
-    parsing ``limactl list --json`` output. Runs as ``sandbox-test`` (the
-    daemon uid) so it reads the correct LIMA_HOME.
+    parsing ``limactl list --json`` output. Runs as the daemon test user
+    (PLATFORM.daemon_test_user) so it reads the correct LIMA_HOME.
     """
     lima_home = _daemon_lima_home()
     result = subprocess.run(
         [
-            "sudo", "-n", "-u", "sandbox-test",
+            "sudo", "-n", "-u", PLATFORM.daemon_test_user,
             "env", f"LIMA_HOME={lima_home}",
             "limactl", "list", "--json", "--tty=false",
         ],
@@ -1907,7 +1908,7 @@ def test_macos_slot_reclaimed_after_vm_death(sandbox_cli, sandbox_binaries, sand
         #    We match on the session ID as a substring of the qemu argv.
         kill_result = subprocess.run(
             [
-                "sudo", "-n", "-u", "sandbox-test",
+                "sudo", "-n", "-u", PLATFORM.daemon_test_user,
                 "pkill", "-f", session_id_dead,
             ],
             capture_output=True, text=True, timeout=30,
