@@ -385,10 +385,28 @@ class TestLiteMacosWorkspace:
 
     @pytest.mark.skip(
         reason=(
-            "macOS lite local: workspace deferred — host rsync is Apple "
-            "openrsync (no --mkpath, rsync>=3.2.3 only) and local: guest_path "
-            "semantics need finalizing; tracked for the macOS-lite-usability "
-            "follow-up"
+            "macOS lite local: workspace blocked by a host-path-echo × "
+            "read-only-rootfs interaction, NOT the earlier openrsync/--mkpath "
+            "or guest_path-semantics concerns. Both of those are now resolved: "
+            "guest_path is host-path-echo per the local: default in session.rs "
+            "(decided; the pushed tree lands at the echoed absolute HOST path, "
+            "not /home/sandbox/workspace), and the create path already drops "
+            "--mkpath and pre-creates the guest dir via `docker exec mkdir -p` "
+            "over the forwarded socket (Apple openrsync has no --mkpath). "
+            "The live blocker: on macOS, pytest tmp_path (and any real host "
+            "workspace under /private/var/folders/... or /tmp -> /private/tmp) "
+            "canonicalises under /private, so host-path-echo makes the guest "
+            "path start with /private — and the lite container's root fs has "
+            "/private on a read-only mount, so `mkdir -p /private/...` fails at "
+            "the first component: verbatim `mkdir: cannot create directory "
+            "'/private': Read-only file system` (docker exec mkdir exit 1), and "
+            "`sandbox create` aborts before rsync runs. The test body below is "
+            "already correct for host-path-echo (asserts hello.txt at the "
+            "echoed host path) and will pass once the product decides how "
+            "host-path-echo should handle guest roots the lite container cannot "
+            "materialise (e.g. remap /private-prefixed paths, or make the "
+            "container root writable at that mount). Coverage carry-forward for "
+            "the macOS-lite-usability follow-up."
         )
     )
     def test_local_workspace_mode(self, tmp_path):
@@ -396,10 +414,26 @@ class TestLiteMacosWorkspace:
 
         ``local:`` is platform-independent — rsync flows over the guest
         transport (docker exec … socat) which is forwarded-socket-aware.
+        On macOS lite the daemon spawns the host ``rsync`` (Apple openrsync,
+        which has no ``--mkpath``), so the create path pre-creates the guest
+        destination directory over the forwarded socket and drops ``--mkpath``.
+
+        Host-path-echo (per the ``local:`` default in ``session.rs``): a
+        ``local:<host>`` workspace with no explicit guest path resolves the
+        guest path to the echoed absolute HOST path, so the pushed tree lands
+        inside the guest at the SAME absolute path as on the host — NOT at
+        ``/home/sandbox/workspace``.
         """
         workspace = tmp_path / "project"
         workspace.mkdir()
         (workspace / "hello.txt").write_text("hello-lite-local")
+
+        # The CLI passes the host-path string through verbatim (only `~`
+        # expansion, never symlink canonicalization), and the daemon echoes
+        # it as the guest path. So the file lands inside the guest at exactly
+        # `<workspace>/hello.txt` — the identical absolute path string used on
+        # the host side of `local:<host>`.
+        guest_file = f"{workspace}/hello.txt"
 
         name = f"e2e-lite-local-{int(time.time())}"
         try:
@@ -413,10 +447,9 @@ class TestLiteMacosWorkspace:
             )
             _wait_for_running(name)
 
-            # The rsync snapshot should have placed hello.txt in the session home.
-            result = _sandbox(
-                "exec", name, "--", "cat", "/home/sandbox/workspace/hello.txt"
-            )
+            # The rsync snapshot should have placed hello.txt at the echoed
+            # host path inside the guest.
+            result = _sandbox("exec", name, "--", "cat", guest_file)
             assert "hello-lite-local" in result.stdout
         finally:
             if _session_exists(name):
