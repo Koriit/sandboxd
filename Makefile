@@ -54,6 +54,19 @@ test:
 	@# tests) compile only under test-integration's features but are then skipped
 	@# by its `integration_*`-only profile — so they would run in neither target.
 	@# These are hermetic unit tests (env-var seam resolution); no Docker/Lima.
+ifeq ($(HOST_OS),Darwin)
+	@# macOS-only: build (without running) + ad-hoc codesign the just-built test
+	@# binaries BEFORE nextest enumerates them. On macOS 26.x a degraded syspolicyd
+	@# makes each freshly-linked (unsigned) Mach-O hang at _dyld_start on first exec
+	@# while trustd runs an online notarization scan; nextest's per-binary
+	@# `--list` enumeration then stalls (~24s each, or indefinitely). Ad-hoc signing
+	@# (`codesign --sign -`) pre-registers each inode so syspolicyd skips the scan,
+	@# and the subsequent `cargo nextest run` finds them already built + signed and
+	@# execs them instantly. The script builds with the identical feature flags used
+	@# below, so nextest's incremental check is a no-op rebuild. No-op on Linux (this
+	@# block is `ifeq`-gated to Darwin); the Linux `test` path is unchanged.
+	@scripts/dev/codesign-test-bins.sh "$(GREEN)" "$(RESET)"
+endif
 	@if [ -t 1 ] && [ -z "$${CI:-}" ] && [ -z "$${NO_COLOR:-}" ]; then \
 	  cd sandboxd && cargo nextest run --workspace --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override; \
 	else \
