@@ -16,6 +16,10 @@ pub mod events;
 pub mod gateway;
 #[cfg(target_os = "macos")]
 pub mod gateway_lima;
+/// Gateway Lima crash-recovery orchestrator and its building blocks (latch
+/// guard, session filter, bounded-concurrency loop). Platform-neutral so the
+/// state-machine behaviours can be covered by hermetic unit tests on any host.
+pub mod gateway_recovery;
 pub mod guest;
 pub mod lds_ack;
 pub mod lima;
@@ -114,6 +118,10 @@ pub use gateway_lima::{
     count_reachable_slot_sockets, count_vmnet_plists, decide_pool_resize,
     discover_nics_from_ip_json, generate_gateway_eth0_nft_policy, generate_gateway_template,
     observe_vmnet_daemon_set,
+};
+pub use gateway_recovery::{
+    GatewayRecoveringGuard, GatewayRecoveryDeps, run_bounded_recovery, run_gateway_recovery,
+    sessions_to_recover,
 };
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,
