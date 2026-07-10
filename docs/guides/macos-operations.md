@@ -39,6 +39,36 @@ reservation isolating them.
 | Docker daemon | Inside gateway VM only | Host Docker / Desktop / OrbStack |
 | `networks.yaml` | Never written | Managed by Lima/Colima |
 
+## Resizing the session pool (`max_macos_sessions`)
+
+`max_macos_sessions` (env `SANDBOX_MAX_MACOS_SESSIONS`, default 8, range
+1–32) caps how many full-backend sessions run concurrently: it fixes the size
+of the `socket_vmnet` pool and the number of NICs the gateway VM is created
+with. Because Lima fixes a VM's NIC set at creation and the pool daemons are
+root-owned, a changed value is picked up at daemon startup — and applied only
+when it can be applied without disrupting live sessions.
+
+**Changing the value while sessions are running is safe.** When sandboxd
+starts and finds `max_macos_sessions` no longer matches the gateway's actual
+NIC count while one or more full-backend sessions are still `Running`, it does
+not rebuild or resize the pool. It keeps the currently-discovered set of vmnet
+slots and their launchd daemons, logs a warning, and continues serving the
+running sessions with the existing pool. This holds in both directions,
+including when the new limit is set *below* the number of sessions currently
+live — running sessions are never torn down to satisfy a lowered limit. The
+resize is deferred, not rejected.
+
+**Applying a deferred change.** Stop all full-backend sessions, then restart
+sandboxd; with nothing running, startup rebuilds the gateway to the new NIC
+count. A resize also requires the root-owned vmnet daemon set to match the new
+size; if it does not, startup logs that requirement and again keeps the
+current pool rather than rebuilding. Re-provision the daemon set with the
+privileged setup step and restart sandboxd once more:
+
+```
+make setup-dev-env DARWIN_VMNET_SLOTS=<n>
+```
+
 ## Disk usage and APFS accounting
 
 sandboxd stores sandbox VM disk images under the daemon's LIMA_HOME. On APFS
