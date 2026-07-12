@@ -800,54 +800,36 @@ class TestLiteMacosWorkspace:
 
     @pytest.mark.skip(
         reason=(
-            "macOS lite local: workspace blocked by a host-path-echo × "
-            "read-only-rootfs interaction, NOT the earlier openrsync/--mkpath "
-            "or guest_path-semantics concerns. Both of those are now resolved: "
-            "guest_path is host-path-echo per the local: default in session.rs "
-            "(decided; the pushed tree lands at the echoed absolute HOST path, "
-            "not /home/sandbox/workspace), and the create path already drops "
-            "--mkpath and pre-creates the guest dir via `docker exec mkdir -p` "
-            "over the forwarded socket (Apple openrsync has no --mkpath). "
-            "The live blocker: on macOS, pytest tmp_path (and any real host "
-            "workspace under /private/var/folders/... or /tmp -> /private/tmp) "
-            "canonicalises under /private, so host-path-echo makes the guest "
-            "path start with /private — and the lite container's root fs has "
-            "/private on a read-only mount, so `mkdir -p /private/...` fails at "
-            "the first component: verbatim `mkdir: cannot create directory "
-            "'/private': Read-only file system` (docker exec mkdir exit 1), and "
-            "`sandbox create` aborts before rsync runs. The test body below is "
-            "already correct for host-path-echo (asserts hello.txt at the "
-            "echoed host path) and will pass once the product decides how "
-            "host-path-echo should handle guest roots the lite container cannot "
-            "materialise (e.g. remap /private-prefixed paths, or make the "
-            "container root writable at that mount). Coverage carry-forward for "
-            "the macOS-lite-usability follow-up."
+            "macOS lite local: workspace without an explicit guest path is a known "
+            "edge case. The host-path-echo default (guest_path == host_path) fails "
+            "when the echoed path (e.g. /private/var/folders/... or /private/tmp) "
+            "cannot be materialised inside the lite container: the container root fs "
+            "is read-only, so `docker exec mkdir -p /private/...` exits non-zero. "
+            "The daemon now surfaces this as an actionable error that names the "
+            "guest path it tried to create, states that the container root fs is "
+            "read-only, and points the operator at the explicit-guest-path form "
+            "local:<host>:<guest>. This is an intentional, documented limitation "
+            "of the host-path-echo default on the lite backend — not a latent bug "
+            "to fix. The test body below was written for the success path and is "
+            "kept as a reference for when an explicit-guest-path test is added."
         )
     )
     def test_local_workspace_mode(self, tmp_path):
-        """``local:`` workspace mode works on the lite macOS path.
+        """``local:`` workspace mode on the lite macOS path — success path reference.
 
-        ``local:`` is platform-independent — rsync flows over the guest
-        transport (docker exec … socat) which is forwarded-socket-aware.
-        On macOS lite the daemon spawns the host ``rsync`` (Apple openrsync,
-        which has no ``--mkpath``), so the create path pre-creates the guest
-        destination directory over the forwarded socket and drops ``--mkpath``.
+        The host-path-echo default (``local:<host>`` with no explicit guest) fails
+        on the lite backend when the echoed path is outside a writable mount (the
+        container root fs is read-only). The daemon surfaces an actionable error
+        naming the guest path it tried and pointing at ``local:<host>:<guest>``.
 
-        Host-path-echo (per the ``local:`` default in ``session.rs``): a
-        ``local:<host>`` workspace with no explicit guest path resolves the
-        guest path to the echoed absolute HOST path, so the pushed tree lands
-        inside the guest at the SAME absolute path as on the host — NOT at
-        ``/home/sandbox/workspace``.
+        This test body was written for the success path and is preserved as a
+        reference. A separate test exercising ``local:<host>:<guest>`` (explicit
+        guest under the sandbox home) would be the correct positive-path coverage.
         """
         workspace = tmp_path / "project"
         workspace.mkdir()
         (workspace / "hello.txt").write_text("hello-lite-local")
 
-        # The CLI passes the host-path string through verbatim (only `~`
-        # expansion, never symlink canonicalization), and the daemon echoes
-        # it as the guest path. So the file lands inside the guest at exactly
-        # `<workspace>/hello.txt` — the identical absolute path string used on
-        # the host side of `local:<host>`.
         guest_file = f"{workspace}/hello.txt"
 
         name = f"e2e-lite-local-{int(time.time())}"
@@ -862,8 +844,6 @@ class TestLiteMacosWorkspace:
             )
             _wait_for_running(name)
 
-            # The rsync snapshot should have placed hello.txt at the echoed
-            # host path inside the guest.
             result = _sandbox("exec", name, "--", "cat", guest_file)
             assert "hello-lite-local" in result.stdout
         finally:

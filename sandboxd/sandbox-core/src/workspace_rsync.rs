@@ -506,7 +506,12 @@ async fn premkdir_guest_dir_via_socket(
         .unwrap_or_else(|| "signal".to_string());
     let stderr_text = String::from_utf8_lossy(&output.stderr);
     Err(SandboxError::Internal(format!(
-        "failed to create guest workspace dir {guest_path} (docker exec mkdir exit {code}): {stderr_text}"
+        "cannot create local: workspace directory '{guest_path}' inside the sandbox \
+         container (docker exec mkdir -p exited {code}: {stderr_text}). \
+         The sandbox container root filesystem is read-only, so a path outside a \
+         writable mount cannot be created there. To place the workspace in a writable \
+         location, pass an explicit guest path: \
+         local:<host-path>:<guest-path> (e.g. /home/sandbox/workspace as the guest path)."
     )))
 }
 
