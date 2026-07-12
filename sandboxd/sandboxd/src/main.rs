@@ -4845,7 +4845,25 @@ async fn create_session_macos_lima(
         }
     }
 
-    // Step 13: mark Running.
+    // Step 13: inject per-session CA certificate into the VM trust store.
+    // The guest agent is up (step 12 passed) and the gateway is already
+    // provisioned with the CA (steps 5-9 above). Inject it into the guest
+    // so that HTTPS traffic intercepted by mitmproxy verifies cleanly
+    // inside the VM. Mirrors the call in `restore_session_networking` at
+    // step 4, which runs this same injection on the start/stop→start path.
+    if let Err(e) = inject_ca_into_vm(&state.guest, &session_id, &ca_dir).await {
+        state.vm_ip_map.unbind(
+            network_info
+                .vm_ip
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+        );
+        state.event_bus.unregister_session(&session_id);
+        rollback(true).await;
+        return error_response(e).into_response();
+    }
+
+    // Step 14: mark Running.
     if let Err(e) = state
         .store
         .update_state(&session_id, &operator.name, SessionState::Running)
