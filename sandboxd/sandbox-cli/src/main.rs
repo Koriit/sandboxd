@@ -11336,6 +11336,42 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // `sandbox ps` / `sandbox ls` — connection-failure exit-code contract.
+    //
+    // `ps` goes through the generic `send_request` → `handle_response`
+    // pipeline in `main`. A daemon-connection failure must propagate as
+    // `Err` so the caller can map it to a non-zero process exit. The tests
+    // below pin that contract at the `send_request` seam — the shared
+    // helper used by both `ps` and `ls` — without requiring a live daemon.
+    // -----------------------------------------------------------------------
+
+    /// `sandbox ps` / `sandbox ls` must surface a daemon-connection failure
+    /// as `Err` so `main` can call `process::exit(1)`. Simulates the failure
+    /// by pointing `send_request` at a socket path that does not exist.
+    #[tokio::test]
+    async fn ps_daemon_connection_failure_returns_err() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/sessions")
+            .body(String::new())
+            .expect("failed to build sessions request");
+
+        let result = send_request("/tmp/sandboxd-no-daemon-ps-test.sock", req).await;
+
+        assert!(
+            result.is_err(),
+            "daemon-unreachable must return Err so main propagates process::exit(1)"
+        );
+        let msg = result.unwrap_err();
+        // The error message must name the socket path and the cause so the
+        // operator sees actionable output on stderr.
+        assert!(
+            msg.contains("Cannot connect"),
+            "error message must describe the connection failure; got: {msg}"
+        );
+    }
+
     fn main_tests_home_mutex() -> &'static std::sync::Mutex<()> {
         static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         M.get_or_init(|| std::sync::Mutex::new(()))
