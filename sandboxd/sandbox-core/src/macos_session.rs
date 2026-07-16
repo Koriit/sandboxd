@@ -798,14 +798,17 @@ pub fn check_host_ip_forwarding_disabled() -> Result<(), SandboxError> {
 
     if v4 != "0" {
         return Err(SandboxError::Internal(format!(
-            "host IP forwarding (net.inet.ip.forwarding={v4}) must be 0 for egress control. \
-             Check VPN clients or Docker Desktop. sandboxd refuses to start with forwarding enabled."
+            "host IP forwarding (net.inet.ip.forwarding={v4}) must be 0 for egress control — \
+             sandboxd refuses to start with forwarding enabled. \
+             Internet Sharing and sleep/wake cycles can re-enable it. \
+             Reset with: sudo sysctl -w net.inet.ip.forwarding=0"
         )));
     }
     if v6 != "0" {
         return Err(SandboxError::Internal(format!(
-            "host IPv6 forwarding (net.inet6.ip6.forwarding={v6}) must be 0. \
-             sandboxd refuses to start with IPv6 forwarding enabled."
+            "host IPv6 forwarding (net.inet6.ip6.forwarding={v6}) must be 0 for egress control — \
+             sandboxd refuses to start with IPv6 forwarding enabled. \
+             Reset with: sudo sysctl -w net.inet6.ip6.forwarding=0"
         )));
     }
     Ok(())

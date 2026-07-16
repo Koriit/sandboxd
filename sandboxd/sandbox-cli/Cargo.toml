@@ -28,6 +28,11 @@ clap = { workspace = true, features = ["env"] }
 # reexports — the daemon side already pulls this crate in with the
 # same minimal feature set.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# `libc::getgrouplist` is called directly on macOS (Apple targets) to
+# implement the C25 doctor row: nix 0.29 does not expose getgrouplist on
+# Apple platforms. Also used for `libc::getuid` and the passwd/group
+# resolver helpers that mirror broker.rs::uid_in_sandbox_group.
+libc = "0.2"
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

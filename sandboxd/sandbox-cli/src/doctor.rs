@@ -29,7 +29,11 @@
 //!   instance), C19 (vmnet pool slots), C20 (gateway image inside the
 //!   gateway Lima instance — distinct from the Linux host-docker C7),
 //!   C21 (lima version), C22 (operator agent checked in), C23 (TCC
-//!   workspace access — informational).
+//!   workspace access — informational), C24 (host IP forwarding disabled —
+//!   `net.inet.ip.forwarding=0` required for egress control; the daemon
+//!   refuses to start when non-zero), C25 (current user in `_sandboxd`
+//!   group — mirrors the Linux C4 check using direct `libc::getgrouplist`
+//!   since nix 0.29 lacks it on Apple targets).
 //!
 //! The output format is load-bearing for the integration tests:
 //! message tokens, glyphs, indentation, and the summary-line wording
@@ -458,6 +462,12 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
                 check_tcc_workspace_access(diag.as_ref().as_ref(), socket_reachable)
             });
         }
+        // C24 — host IP forwarding disabled. Host-side sysctl read; no
+        // daemon dependency. Runs even when the daemon is not yet up.
+        set.spawn_blocking(check_ip_forwarding);
+        // C25 — operator in '_sandboxd' group. Host-side getgrouplist
+        // probe; no daemon dependency. Mirrors the Linux C4 check.
+        set.spawn_blocking(check_group_membership_macos);
     }
 
     // Drain the JoinSet; a panicking task surfaces as a `JoinError`
@@ -1716,6 +1726,262 @@ fn check_tcc_workspace_access(
                     .to_string(),
             ),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Individual checks — C24 (IP forwarding disabled, macOS-only)
+// ---------------------------------------------------------------------------
+
+/// Pure verdict helper for C24 — testable without spawning sysctl.
+///
+/// `v4` is the raw string value of `net.inet.ip.forwarding` (e.g. `"0"` or
+/// `"1"`); `v6` the same for `net.inet6.ip6.forwarding`. Both are already
+/// treated defensively by the caller: an absent or empty key is passed as
+/// `"0"` (off), matching the daemon's `check_host_ip_forwarding_disabled`
+/// contract.
+#[cfg(target_os = "macos")]
+pub(crate) fn forwarding_verdict(v4: &str, v6: &str) -> CheckOutcome {
+    if v4 != "0" {
+        CheckOutcome::Fail {
+            detail: format!("net.inet.ip.forwarding={v4} (must be 0)"),
+            hint: Some(
+                "sudo sysctl -w net.inet.ip.forwarding=0\n    \
+                 (Internet Sharing and sleep/wake can re-enable forwarding)"
+                    .to_string(),
+            ),
+        }
+    } else if v6 != "0" {
+        CheckOutcome::Fail {
+            detail: format!("net.inet6.ip6.forwarding={v6} (must be 0)"),
+            hint: Some("sudo sysctl -w net.inet6.ip6.forwarding=0".to_string()),
+        }
+    } else {
+        CheckOutcome::Pass {
+            detail: "net.inet.ip.forwarding=0, net.inet6.ip6.forwarding=0".to_string(),
+        }
+    }
+}
+
+/// Read a sysctl value by key via `/usr/sbin/sysctl -n`.
+///
+/// Returns the trimmed stdout string. An absent or empty key returns `"0"`
+/// defensively — identical to the daemon's `check_host_ip_forwarding_disabled`
+/// behaviour: a missing forwarding knob cannot be enabled.
+#[cfg(target_os = "macos")]
+fn read_forwarding_sysctl(key: &str) -> String {
+    std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0".to_string())
+}
+
+/// C24 — host IP forwarding must be 0 on both IPv4 and IPv6.
+///
+/// When `net.inet.ip.forwarding=1` the daemon refuses to start: host
+/// forwarding could route guest traffic around the gateway, voiding the
+/// egress guarantee. Internet Sharing and sleep/wake cycles can silently
+/// flip this knob. This row surfaces the current value so operators see
+/// the problem before puzzling over an opaque daemon-startup failure.
+///
+/// Host-side only; does not require a running daemon.
+#[cfg(target_os = "macos")]
+fn check_ip_forwarding() -> CheckRow {
+    let v4 = read_forwarding_sysctl("net.inet.ip.forwarding");
+    let v6 = read_forwarding_sysctl("net.inet6.ip6.forwarding");
+    CheckRow {
+        id: "C24",
+        name: "IP forwarding disabled",
+        outcome: forwarding_verdict(&v4, &v6),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Individual checks — C25 (operator group membership, macOS-only)
+// ---------------------------------------------------------------------------
+
+/// Outcome of checking whether the current user is a member of the
+/// `_sandboxd` group on macOS. Three states, mirroring the Linux
+/// `GroupMembership` enum for C4:
+///
+/// - `GroupAbsent` — `_sandboxd` group not found on the host (dev mode or
+///   not yet installed).
+/// - `Member` — operator's uid is in the `_sandboxd` group.
+/// - `NotMember` — group exists but the operator is not in it.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MacGroupMembership {
+    GroupAbsent,
+    Member { user: String },
+    NotMember { user: String },
+}
+
+/// C25 — current user is in the `_sandboxd` group.
+///
+/// On macOS, the daemon (`_sandboxd`) gates operator enrollment at the
+/// broker via `getgrouplist(3)` against the `_sandboxd` group. This row
+/// checks the same gate from the CLI side so operators see their
+/// enrolment status without waiting for a session create to fail.
+///
+/// Uses `libc::getgrouplist` directly because nix 0.29 does not expose
+/// `getgrouplist` on Apple targets. Mirrors `broker.rs:uid_in_sandbox_group`.
+///
+/// Host-side only; does not require a running daemon.
+#[cfg(target_os = "macos")]
+pub(crate) fn check_group_membership_macos() -> CheckRow {
+    check_group_membership_macos_with(resolve_macos_group_membership)
+}
+
+/// Pure inner of [`check_group_membership_macos`], parameterised over the
+/// membership resolver so unit tests can drive every verdict path without
+/// touching the real directory service.
+#[cfg(target_os = "macos")]
+pub(crate) fn check_group_membership_macos_with<R>(resolver: R) -> CheckRow
+where
+    R: FnOnce() -> Result<MacGroupMembership, String>,
+{
+    const GROUP: &str = "_sandboxd";
+    match resolver() {
+        Ok(MacGroupMembership::GroupAbsent) => CheckRow {
+            id: "C25",
+            name: "current user in '_sandboxd' group",
+            outcome: CheckOutcome::Skip {
+                detail: format!("no '{GROUP}' group; dev mode or not installed"),
+                hint: None,
+            },
+        },
+        Ok(MacGroupMembership::Member { user }) => CheckRow {
+            id: "C25",
+            name: "current user in '_sandboxd' group",
+            outcome: CheckOutcome::Pass {
+                detail: format!("{user} \u{2208} {GROUP}"),
+            },
+        },
+        Ok(MacGroupMembership::NotMember { user }) => CheckRow {
+            id: "C25",
+            name: "current user in '_sandboxd' group",
+            outcome: CheckOutcome::Fail {
+                detail: format!("{user} is not in the '{GROUP}' group"),
+                hint: Some(format!(
+                    "sudo dseditgroup -o edit -a $USER -t user {GROUP}; log out and back in"
+                )),
+            },
+        },
+        Err(e) => CheckRow {
+            id: "C25",
+            name: "current user in '_sandboxd' group",
+            outcome: CheckOutcome::Fail {
+                detail: format!("group lookup failed: {e}"),
+                hint: Some(format!(
+                    "sudo dseditgroup -o edit -a $USER -t user {GROUP}; log out and back in"
+                )),
+            },
+        },
+    }
+}
+
+/// Production resolver for C25.
+///
+/// Checks whether the current user's uid is a member of the `_sandboxd`
+/// group using `getgrouplist(3)` via libc — the same call and the same
+/// group the broker gate in `broker.rs` enforces at check-in time.
+///
+/// Returns:
+/// - `Ok(GroupAbsent)` when `_sandboxd` is not found on the host.
+/// - `Ok(Member { user })` / `Ok(NotMember { user })` on a successful lookup.
+/// - `Err(reason)` on any uid/group resolution failure other than group-absent.
+#[cfg(target_os = "macos")]
+fn resolve_macos_group_membership() -> Result<MacGroupMembership, String> {
+    use std::ffi::CString;
+
+    let uid = unsafe { libc::getuid() };
+
+    // Step 1: resolve the username for getgrouplist (mirrors broker.rs).
+    let bufsize = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let bufsize = if bufsize <= 0 { 1024 } else { bufsize as usize };
+    let mut buf = vec![0i8; bufsize];
+    let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), bufsize, &mut result_ptr) };
+    if rc != 0 || result_ptr.is_null() {
+        return Err(format!("getpwuid_r uid={uid}: rc={rc}"));
+    }
+    let name_ptr = unsafe { (*result_ptr).pw_name };
+    if name_ptr.is_null() {
+        return Err(format!("getpwuid_r uid={uid}: pw_name is null"));
+    }
+    let username = unsafe { std::ffi::CStr::from_ptr(name_ptr) }
+        .to_str()
+        .map_err(|e| format!("pw_name is invalid UTF-8: {e}"))?
+        .to_string();
+    let primary_gid = unsafe { (*result_ptr).pw_gid };
+
+    // Step 2: resolve the gid of the _sandboxd group (absent → GroupAbsent).
+    let group_name_c = CString::new("_sandboxd").map_err(|e| format!("CString: {e}"))?;
+    let gr_bufsize = unsafe { libc::sysconf(libc::_SC_GETGR_R_SIZE_MAX) };
+    let gr_bufsize = if gr_bufsize <= 0 {
+        1024
+    } else {
+        gr_bufsize as usize
+    };
+    let mut gr_buf = vec![0i8; gr_bufsize];
+    let mut grp = unsafe { std::mem::zeroed::<libc::group>() };
+    let mut grp_result: *mut libc::group = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getgrnam_r(
+            group_name_c.as_ptr(),
+            &mut grp,
+            gr_buf.as_mut_ptr(),
+            gr_bufsize,
+            &mut grp_result,
+        )
+    };
+    if rc != 0 || grp_result.is_null() {
+        // Group not found — dev mode or not yet installed.
+        return Ok(MacGroupMembership::GroupAbsent);
+    }
+    let target_gid = unsafe { (*grp_result).gr_gid };
+
+    // Step 3: call getgrouplist with a growable buffer.
+    // On macOS, getgrouplist takes int (i32) for the primary gid and
+    // int[] for the groups buffer. Mirrors broker.rs:uid_in_sandbox_group.
+    let name_c = CString::new(username.as_bytes()).map_err(|e| format!("CString: {e}"))?;
+    let mut ngroups: libc::c_int = 64;
+    loop {
+        let mut groups: Vec<libc::c_int> = vec![0; ngroups as usize];
+        // SAFETY: name_c is a valid NUL-terminated C string; groups is a
+        // properly-sized mutable buffer; primary_gid is the user's real gid
+        // from the directory service.
+        let ret = unsafe {
+            libc::getgrouplist(
+                name_c.as_ptr(),
+                primary_gid as libc::c_int,
+                groups.as_mut_ptr(),
+                &mut ngroups,
+            )
+        };
+        if ret == -1 {
+            if (ngroups as usize) > groups.len() && ngroups < 65536 {
+                // Buffer too small; ngroups holds the required count.
+                continue;
+            }
+            return Err(format!(
+                "getgrouplist overflow for uid={uid} (ngroups={ngroups})"
+            ));
+        }
+        // ret >= 0: groups[0..ngroups] is the complete list.
+        let is_member = groups
+            .iter()
+            .take(ngroups as usize)
+            .any(|&g| g as libc::gid_t == target_gid);
+        return Ok(if is_member {
+            MacGroupMembership::Member { user: username }
+        } else {
+            MacGroupMembership::NotMember { user: username }
+        });
     }
 }
 
@@ -3457,7 +3723,9 @@ mod tests {
                 !ids.contains("C9"),
                 "C9 (route-helper caps) must be absent on macOS"
             );
-            for id in ["C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23"] {
+            for id in [
+                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C24", "C25",
+            ] {
                 assert!(ids.contains(id), "{id} must be present on macOS");
             }
         }
@@ -3469,7 +3737,9 @@ mod tests {
                 ids.contains("C9"),
                 "C9 (route-helper caps) must be present on Linux"
             );
-            for id in ["C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23"] {
+            for id in [
+                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C24", "C25",
+            ] {
                 assert!(!ids.contains(id), "{id} must be absent on Linux");
             }
         }
@@ -3657,6 +3927,180 @@ mod tests {
         match check_tcc_workspace_access(Some(&d), true).outcome {
             CheckOutcome::Skip { .. } => {}
             other => panic!("TCC row must be an informational Skip, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // C24 — forwarding_verdict (pure helper, hermetic)
+    // -----------------------------------------------------------------
+
+    /// Both sysctls are "0" → Pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn forwarding_verdict_pass_when_both_zero() {
+        match forwarding_verdict("0", "0") {
+            CheckOutcome::Pass { detail } => {
+                assert!(
+                    detail.contains("net.inet.ip.forwarding=0"),
+                    "pass detail must name the IPv4 key; got: {detail}"
+                );
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    /// IPv4 forwarding is 1 → Fail with the sysctl remediation hint.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn forwarding_verdict_fail_when_v4_nonzero_carries_sysctl_hint() {
+        match forwarding_verdict("1", "0") {
+            CheckOutcome::Fail { detail, hint } => {
+                assert!(
+                    detail.contains("net.inet.ip.forwarding=1"),
+                    "fail detail must name the key + value; got: {detail}"
+                );
+                let h = hint.expect("IPv4 Fail must carry a remediation hint");
+                assert!(
+                    h.contains("sysctl -w net.inet.ip.forwarding=0"),
+                    "hint must include the reset command; got: {h}"
+                );
+                assert!(
+                    h.contains("Internet Sharing") || h.contains("sleep"),
+                    "hint must note what re-enables forwarding; got: {h}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// IPv6 forwarding is 1 (IPv4 already 0) → Fail with the IPv6 hint.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn forwarding_verdict_fail_when_v6_nonzero_carries_sysctl_hint() {
+        match forwarding_verdict("0", "1") {
+            CheckOutcome::Fail { detail, hint } => {
+                assert!(
+                    detail.contains("net.inet6.ip6.forwarding=1"),
+                    "fail detail must name the IPv6 key; got: {detail}"
+                );
+                let h = hint.expect("IPv6 Fail must carry a remediation hint");
+                assert!(
+                    h.contains("sysctl -w net.inet6.ip6.forwarding=0"),
+                    "hint must include the IPv6 reset command; got: {h}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// The row struct has the correct id and name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c24_row_has_correct_id_and_name() {
+        // Use the verdict helper rather than spawning sysctl — host-value
+        // doesn't matter for the metadata check.
+        let outcome = forwarding_verdict("0", "0");
+        let row = CheckRow {
+            id: "C24",
+            name: "IP forwarding disabled",
+            outcome,
+        };
+        assert_eq!(row.id, "C24");
+        assert_eq!(row.name, "IP forwarding disabled");
+    }
+
+    // -----------------------------------------------------------------
+    // C25 — check_group_membership_macos_with (pure helper, hermetic)
+    // -----------------------------------------------------------------
+
+    /// _sandboxd group absent → Skip with dev-mode annotation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_check_skips_when_group_absent() {
+        let row = check_group_membership_macos_with(|| Ok(MacGroupMembership::GroupAbsent));
+        assert_eq!(row.id, "C25");
+        match row.outcome {
+            CheckOutcome::Skip { detail, hint } => {
+                assert!(
+                    detail.contains("_sandboxd"),
+                    "skip detail must name the group; got: {detail}"
+                );
+                assert!(hint.is_none(), "absent-group skip must carry no hint");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    /// Operator is in _sandboxd → Pass with `user ∈ _sandboxd` form.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_check_passes_when_member() {
+        let row = check_group_membership_macos_with(|| {
+            Ok(MacGroupMembership::Member {
+                user: "alice".to_string(),
+            })
+        });
+        assert_eq!(row.id, "C25");
+        match row.outcome {
+            CheckOutcome::Pass { detail } => {
+                assert!(
+                    detail.contains("alice"),
+                    "pass detail must name the user; got: {detail}"
+                );
+                assert!(
+                    detail.contains("_sandboxd"),
+                    "pass detail must name the group; got: {detail}"
+                );
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    /// _sandboxd group exists but operator not in it → Fail with dseditgroup hint.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_check_fails_when_not_member_with_dseditgroup_hint() {
+        let row = check_group_membership_macos_with(|| {
+            Ok(MacGroupMembership::NotMember {
+                user: "alice".to_string(),
+            })
+        });
+        assert_eq!(row.id, "C25");
+        match row.outcome {
+            CheckOutcome::Fail { detail, hint } => {
+                assert!(
+                    detail.contains("alice"),
+                    "fail detail must name the user; got: {detail}"
+                );
+                let h = hint.expect("not-member must carry a hint");
+                assert!(
+                    h.contains("dseditgroup"),
+                    "fail hint must instruct dseditgroup; got: {h}"
+                );
+                assert!(
+                    h.contains("_sandboxd"),
+                    "fail hint must name the group; got: {h}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// Resolver error → Fail (lookup failure surfaced, not silently swallowed).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_check_fails_on_lookup_error() {
+        let row =
+            check_group_membership_macos_with(|| Err("getpwuid_r: no such process".to_string()));
+        assert_eq!(row.id, "C25");
+        match row.outcome {
+            CheckOutcome::Fail { detail, .. } => {
+                assert!(
+                    detail.contains("group lookup failed"),
+                    "error must surface as lookup-failed detail; got: {detail}"
+                );
+            }
+            other => panic!("expected Fail on lookup error, got {other:?}"),
         }
     }
 }
