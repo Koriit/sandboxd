@@ -7,7 +7,7 @@
 //! ## Self-contained seams
 //!
 //! The `spawn_and_wait` helper redirects every production path the macOS
-//! startup binds or creates before the IP-forwarding check, so the test
+//! startup binds or creates before the socket_vmnet check, so the test
 //! runs as the current user without root or `_sandboxd` membership:
 //!
 //! | Production path | Override | Notes |
@@ -18,7 +18,7 @@
 //! | `/etc/sandboxd/users.conf` | `SANDBOX_USERS_CONF` → tempdir | Well-established test seam |
 //! | `/etc/sandboxd/bridge.conf` | absent is OK (returns `Ok(())`) | No override needed |
 //!
-//! The startup sequence between broker bind and IP-forwarding check
+//! The startup sequence between broker bind and the socket_vmnet check
 //! (`LimaManagerRegistry::new` + some pure in-memory construction) has no
 //! additional production filesystem access. `guest_agent_path()` is called
 //! *after* the macOS startup block, so the early-exit tests never reach it.
@@ -33,17 +33,11 @@
 //! the `target/debug/` sibling fallback in `guest_agent_path()`. Without this,
 //! tests that continue past the broker bind (e.g. anything that reaches step 3+)
 //! would fail because `/usr/local/libexec/sandboxd/sandbox-guest` does not exist
-//! in a dev environment. For the early-exit tests (forwarding ON, socket_vmnet
-//! absent) this is not strictly required since the daemon exits before reaching
+//! in a dev environment. For the early-exit tests (socket_vmnet absent) this is
+//! not strictly required since the daemon exits before reaching
 //! `guest_agent_path()`, but the canonical invocation always passes these features.
 //!
 //! ## What is tested here
-//!
-//! ### `integration_macos_daemon_startup_refuses_when_ip_forwarding_on`
-//! Verifies the daemon refuses to start when host IP forwarding is enabled.
-//! Gates on the current host state — skips automatically when forwarding is
-//! off. Enable forwarding first (`sudo sysctl -w net.inet.ip.forwarding=1`),
-//! then re-run. See the test body for the exact command.
 //!
 //! ### `integration_macos_daemon_startup_refuses_when_socket_vmnet_absent`
 //! Verifies the daemon fails fast when socket_vmnet is absent from the staged
@@ -188,74 +182,6 @@ mod macos_startup_tests {
             let _ = stderr.read_to_string(&mut stderr_output);
         }
         (stderr_output, exit_code)
-    }
-
-    /// Test that the daemon refuses to start when host IP forwarding is on.
-    ///
-    /// The daemon's macOS startup block asserts `net.inet.ip.forwarding == 0`
-    /// as step 2f — the first check inside the macOS-specific startup sequence.
-    /// If forwarding is on, the daemon refuses immediately with a hard error.
-    ///
-    /// ## Startup sequence: what fires before the forwarding check
-    ///
-    /// The ordering is:
-    ///
-    /// 1. `users.conf` parse + allocation pool (fixture provided in tempdir)
-    /// 2. `SessionStore::new` (SQLite in tempdir)
-    /// 3. macOS broker bind (redirected to tempdir via `SANDBOX_BROKER_SOCKET`)
-    /// 4. `LimaManagerRegistry::new` (pure in-memory)
-    /// 5. **[macOS startup block]** → **IP-forwarding check** (step 2f)
-    ///    → hard refuse with "host IP forwarding ... must be 0" error
-    ///
-    /// With all seams set, steps 1-4 succeed as the current user, and the
-    /// forwarding check fires as expected.
-    ///
-    /// ## How to run live
-    ///
-    /// ```sh
-    /// # Enable forwarding (requires root):
-    /// sudo sysctl -w net.inet.ip.forwarding=1
-    ///
-    /// # Run the test (from the workspace root):
-    /// cd sandboxd && cargo nextest run --profile integration \
-    ///   --features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override \
-    ///   -E 'test(integration_macos_daemon_startup_refuses_when_ip_forwarding_on)'
-    ///
-    /// # Restore (required — always restore after the test):
-    /// sudo sysctl -w net.inet.ip.forwarding=0
-    /// ```
-    ///
-    /// The test auto-skips when forwarding is already off, so it is safe to
-    /// include in the integration suite without the sudo flip.
-    #[test]
-    fn integration_macos_daemon_startup_refuses_when_ip_forwarding_on() {
-        // Check current forwarding state. Skip if forwarding is off (normal state).
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "net.inet.ip.forwarding"])
-            .output()
-            .expect("sysctl must be available on macOS");
-        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-
-        if v != "1" {
-            println!(
-                "SKIP: net.inet.ip.forwarding={v} (off). \
-                 To run this live test: sudo sysctl -w net.inet.ip.forwarding=1, \
-                 run the test, then sudo sysctl -w net.inet.ip.forwarding=0."
-            );
-            return;
-        }
-
-        // Host IP forwarding is ON. The daemon must refuse to start.
-        let (stderr, code) = spawn_and_wait(&[], 10);
-
-        assert_ne!(
-            code, 0,
-            "daemon must exit non-zero when host IP forwarding is on; stderr: {stderr}"
-        );
-        assert!(
-            stderr.contains("forwarding") || stderr.contains("net.inet.ip.forwarding"),
-            "error message must mention forwarding; got: {stderr}"
-        );
     }
 
     /// Test that the daemon refuses to start when socket_vmnet is absent.

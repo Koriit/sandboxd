@@ -373,8 +373,6 @@ The `sandboxd-gateway` VM's `eth0` is also **never** `restrict=on` for the same 
 
 Slots are not sticky across stop/start. The gateway-before-VM ordering is maintained on every path — the gateway container must be healthy with deny-all and DNAT in place before the sandbox VM's socket_vmnet NIC is brought up, so the VM's very first egress is already intercepted.
 
-The daemon asserts `net.inet.ip.forwarding == 0` on the macOS host at startup and surfaces a hard error if IP forwarding is enabled. An IP-forwarding host could route a guest's on-link `B+1` traffic off-segment via the host's own vmnet bridge, bypassing the gateway nftables entirely. `sandbox doctor` checks both `net.inet.ip.forwarding` and `net.inet6.ip6.forwarding`.
-
 ## Related reading
 
 - [Policy model](/sandboxd/concepts/policy-model/) — how assurance levels map onto the components above.

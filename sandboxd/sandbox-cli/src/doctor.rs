@@ -29,9 +29,7 @@
 //!   instance), C19 (vmnet pool slots), C20 (gateway image inside the
 //!   gateway Lima instance — distinct from the Linux host-docker C7),
 //!   C21 (lima version), C22 (operator agent checked in), C23 (TCC
-//!   workspace access — informational), C24 (host IP forwarding disabled —
-//!   `net.inet.ip.forwarding=0` required for egress control; the daemon
-//!   refuses to start when non-zero), C25 (current user in `_sandboxd`
+//!   workspace access — informational), C25 (current user in `_sandboxd`
 //!   group — mirrors the Linux C4 check using direct `libc::getgrouplist`
 //!   since nix 0.29 lacks it on Apple targets).
 //!
@@ -462,9 +460,6 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
                 check_tcc_workspace_access(diag.as_ref().as_ref(), socket_reachable)
             });
         }
-        // C24 — host IP forwarding disabled. Host-side sysctl read; no
-        // daemon dependency. Runs even when the daemon is not yet up.
-        set.spawn_blocking(check_ip_forwarding);
         // C25 — operator in '_sandboxd' group. Host-side getgrouplist
         // probe; no daemon dependency. Mirrors the Linux C4 check.
         set.spawn_blocking(check_group_membership_macos);
@@ -1726,76 +1721,6 @@ fn check_tcc_workspace_access(
                     .to_string(),
             ),
         },
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Individual checks — C24 (IP forwarding disabled, macOS-only)
-// ---------------------------------------------------------------------------
-
-/// Pure verdict helper for C24 — testable without spawning sysctl.
-///
-/// `v4` is the raw string value of `net.inet.ip.forwarding` (e.g. `"0"` or
-/// `"1"`); `v6` the same for `net.inet6.ip6.forwarding`. Both are already
-/// treated defensively by the caller: an absent or empty key is passed as
-/// `"0"` (off), matching the daemon's `check_host_ip_forwarding_disabled`
-/// contract.
-#[cfg(target_os = "macos")]
-pub(crate) fn forwarding_verdict(v4: &str, v6: &str) -> CheckOutcome {
-    if v4 != "0" {
-        CheckOutcome::Fail {
-            detail: format!("net.inet.ip.forwarding={v4} (must be 0)"),
-            hint: Some(
-                "sudo sysctl -w net.inet.ip.forwarding=0\n    \
-                 (Internet Sharing and sleep/wake can re-enable forwarding)"
-                    .to_string(),
-            ),
-        }
-    } else if v6 != "0" {
-        CheckOutcome::Fail {
-            detail: format!("net.inet6.ip6.forwarding={v6} (must be 0)"),
-            hint: Some("sudo sysctl -w net.inet6.ip6.forwarding=0".to_string()),
-        }
-    } else {
-        CheckOutcome::Pass {
-            detail: "net.inet.ip.forwarding=0, net.inet6.ip6.forwarding=0".to_string(),
-        }
-    }
-}
-
-/// Read a sysctl value by key via `/usr/sbin/sysctl -n`.
-///
-/// Returns the trimmed stdout string. An absent or empty key returns `"0"`
-/// defensively — identical to the daemon's `check_host_ip_forwarding_disabled`
-/// behaviour: a missing forwarding knob cannot be enabled.
-#[cfg(target_os = "macos")]
-fn read_forwarding_sysctl(key: &str) -> String {
-    std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", key])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "0".to_string())
-}
-
-/// C24 — host IP forwarding must be 0 on both IPv4 and IPv6.
-///
-/// When `net.inet.ip.forwarding=1` the daemon refuses to start: host
-/// forwarding could route guest traffic around the gateway, voiding the
-/// egress guarantee. Internet Sharing and sleep/wake cycles can silently
-/// flip this knob. This row surfaces the current value so operators see
-/// the problem before puzzling over an opaque daemon-startup failure.
-///
-/// Host-side only; does not require a running daemon.
-#[cfg(target_os = "macos")]
-fn check_ip_forwarding() -> CheckRow {
-    let v4 = read_forwarding_sysctl("net.inet.ip.forwarding");
-    let v6 = read_forwarding_sysctl("net.inet6.ip6.forwarding");
-    CheckRow {
-        id: "C24",
-        name: "IP forwarding disabled",
-        outcome: forwarding_verdict(&v4, &v6),
     }
 }
 
@@ -3724,10 +3649,14 @@ mod tests {
                 "C9 (route-helper caps) must be absent on macOS"
             );
             for id in [
-                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C24", "C25",
+                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C25",
             ] {
                 assert!(ids.contains(id), "{id} must be present on macOS");
             }
+            assert!(
+                !ids.contains("C24"),
+                "C24 (IP forwarding) must be absent — check removed"
+            );
         }
 
         #[cfg(target_os = "linux")]
@@ -3738,7 +3667,7 @@ mod tests {
                 "C9 (route-helper caps) must be present on Linux"
             );
             for id in [
-                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C24", "C25",
+                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C25",
             ] {
                 assert!(!ids.contains(id), "{id} must be absent on Linux");
             }
@@ -3928,85 +3857,6 @@ mod tests {
             CheckOutcome::Skip { .. } => {}
             other => panic!("TCC row must be an informational Skip, got {other:?}"),
         }
-    }
-
-    // -----------------------------------------------------------------
-    // C24 — forwarding_verdict (pure helper, hermetic)
-    // -----------------------------------------------------------------
-
-    /// Both sysctls are "0" → Pass.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn forwarding_verdict_pass_when_both_zero() {
-        match forwarding_verdict("0", "0") {
-            CheckOutcome::Pass { detail } => {
-                assert!(
-                    detail.contains("net.inet.ip.forwarding=0"),
-                    "pass detail must name the IPv4 key; got: {detail}"
-                );
-            }
-            other => panic!("expected Pass, got {other:?}"),
-        }
-    }
-
-    /// IPv4 forwarding is 1 → Fail with the sysctl remediation hint.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn forwarding_verdict_fail_when_v4_nonzero_carries_sysctl_hint() {
-        match forwarding_verdict("1", "0") {
-            CheckOutcome::Fail { detail, hint } => {
-                assert!(
-                    detail.contains("net.inet.ip.forwarding=1"),
-                    "fail detail must name the key + value; got: {detail}"
-                );
-                let h = hint.expect("IPv4 Fail must carry a remediation hint");
-                assert!(
-                    h.contains("sysctl -w net.inet.ip.forwarding=0"),
-                    "hint must include the reset command; got: {h}"
-                );
-                assert!(
-                    h.contains("Internet Sharing") || h.contains("sleep"),
-                    "hint must note what re-enables forwarding; got: {h}"
-                );
-            }
-            other => panic!("expected Fail, got {other:?}"),
-        }
-    }
-
-    /// IPv6 forwarding is 1 (IPv4 already 0) → Fail with the IPv6 hint.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn forwarding_verdict_fail_when_v6_nonzero_carries_sysctl_hint() {
-        match forwarding_verdict("0", "1") {
-            CheckOutcome::Fail { detail, hint } => {
-                assert!(
-                    detail.contains("net.inet6.ip6.forwarding=1"),
-                    "fail detail must name the IPv6 key; got: {detail}"
-                );
-                let h = hint.expect("IPv6 Fail must carry a remediation hint");
-                assert!(
-                    h.contains("sysctl -w net.inet6.ip6.forwarding=0"),
-                    "hint must include the IPv6 reset command; got: {h}"
-                );
-            }
-            other => panic!("expected Fail, got {other:?}"),
-        }
-    }
-
-    /// The row struct has the correct id and name.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn c24_row_has_correct_id_and_name() {
-        // Use the verdict helper rather than spawning sysctl — host-value
-        // doesn't matter for the metadata check.
-        let outcome = forwarding_verdict("0", "0");
-        let row = CheckRow {
-            id: "C24",
-            name: "IP forwarding disabled",
-            outcome,
-        };
-        assert_eq!(row.id, "C24");
-        assert_eq!(row.name, "IP forwarding disabled");
     }
 
     // -----------------------------------------------------------------

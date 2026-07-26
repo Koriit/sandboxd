@@ -4303,35 +4303,7 @@ async fn create_session_macos_lima(
     state: Arc<AppState>,
 ) -> axum::response::Response {
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
-    use sandbox_core::macos_session::{
-        check_host_ip_forwarding_disabled, setup_macos_gateway, teardown_macos_gateway,
-    };
-
-    // Defense-in-depth (#244): re-check host IP forwarding before creating a
-    // session. A VPN client or Docker Desktop can enable forwarding at runtime,
-    // after the daemon started with forwarding off. If forwarding is now on,
-    // the egress guarantee cannot be upheld — refuse the create with a hard
-    // error so the operator knows immediately.
-    {
-        match tokio::task::spawn_blocking(check_host_ip_forwarding_disabled).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(e).into_response();
-            }
-            Err(e) => {
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "IP-forwarding check task panicked: {e}"
-                )))
-                .into_response();
-            }
-        }
-    }
+    use sandbox_core::macos_session::{setup_macos_gateway, teardown_macos_gateway};
 
     // Step 1: generate the per-session CA certificate.
     let ca_dir = {
@@ -13361,7 +13333,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc<sandbox_core::network::VmnetPool>,
         Arc<sandbox_core::GatewayLimaManager>,
     ) = {
-        use sandbox_core::macos_session::check_host_ip_forwarding_disabled;
         use sandbox_core::network::{
             STAGED_SOCKET_VMNET_PATH, VMNET_SOCKET_DIR, VmnetPool, assert_root_exec_ancestry,
             vmnet_slot_socket_path,
@@ -13375,32 +13346,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Step 2: Prerequisite checks (fail fast with actionable errors)
         // ---------------------------------------------------------------------------
         //
-        // 2a: IP-forwarding HARD assert — refuse to start if forwarding is on.
-        //     A host with forwarding enabled can route guest on-link B+1 traffic
-        //     off-segment via the vmnet bridge, voiding the egress guarantee.
+        // NOTE(#80): Host IP forwarding is no longer gated here. A root sandbox
+        // guest can bypass the gateway by routing via the host bridge when the
+        // host has IP forwarding + NAT (e.g. Internet Sharing) enabled. This is a
+        // known open issue; the structural fix is deferred and tracked in #80.
         info!("macOS startup: step 2 — prerequisite checks");
-        {
-            let check = tokio::task::spawn_blocking(check_host_ip_forwarding_disabled).await;
-            match check {
-                Ok(Ok(())) => {
-                    info!("macOS startup 2f: host IP forwarding is off");
-                }
-                Ok(Err(e)) => {
-                    error!(
-                        error = %e,
-                        "macOS startup: host IP forwarding is ON — egress guarantee cannot be upheld; \
-                         daemon refuses to start. Disable forwarding in VPN software / Docker Desktop."
-                    );
-                    eprintln!("sandboxd: {e}");
-                    return Err(e.into());
-                }
-                Err(e) => {
-                    let msg = format!("IP-forwarding check task panicked: {e}");
-                    error!("{msg}");
-                    return Err(sandbox_core::error::SandboxError::Internal(msg).into());
-                }
-            }
-        }
 
         // 2a: socket_vmnet binary ancestry + ownership assertion.
         //     /Library/sandboxd/socket_vmnet must be root-owned with no

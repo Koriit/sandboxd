@@ -4,41 +4,6 @@ This guide covers macOS-specific operational topics: coexistence with other
 Lima-based tools, disk usage and APFS accounting, and DNS resolver behavior
 across host network changes.
 
-## Host IP forwarding must be disabled
-
-sandboxd requires `net.inet.ip.forwarding=0` on the host before it will start.
-This is an egress-safety gate: when host IP forwarding is enabled, the macOS
-vmnet bridge can route guest traffic off the sandbox network segment, bypassing
-the gateway and voiding the egress enforcement guarantee.
-
-If the daemon refuses to start with a message like:
-
-```
-host IP forwarding (net.inet.ip.forwarding=1) must be 0 for egress control
-```
-
-reset it with:
-
-```sh
-sudo sysctl -w net.inet.ip.forwarding=0
-```
-
-**What enables host IP forwarding.** Two common sources:
-
-- **Internet Sharing.** Enabling Internet Sharing in System Settings flips
-  `net.inet.ip.forwarding=1`. Turn Internet Sharing off and run the reset command
-  above before starting sandboxd.
-- **Sleep/wake cycles.** On some macOS versions, returning from sleep can
-  re-enable forwarding if Internet Sharing was ever active. If the daemon refuses
-  to start after a sleep/wake, run the reset command.
-
-The reset reverts immediately and does not require a reboot. The value is not
-persisted across reboots unless Internet Sharing is left enabled in System Settings.
-
-`sandbox doctor` surfaces this as check **C24 — IP forwarding disabled** and
-shows the current sysctl value so you can confirm the state without running the
-reset blindly.
-
 ## Coexistence with existing Lima and Colima setups
 
 sandboxd uses Lima internally but is completely isolated from any Lima or
