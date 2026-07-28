@@ -32,12 +32,19 @@ use std::path::{Path, PathBuf};
 pub const LITE_SHARED_ROOT_ENV: &str = "SANDBOX_LITE_SHARED_ROOT";
 
 /// Default path exposed to the gateway Lima VM via Lima's 9p `mounts:` stanza.
-/// Chosen as `/tmp/sandbox-shared` — a writable, world-accessible directory
-/// that is outside TCC-protected folders (Desktop, Documents, Downloads) and
-/// does not require operator consent for `_sandboxd` to read. Operators whose
-/// workspaces live elsewhere must either (a) move the workspace under this
-/// root, (b) set `SANDBOX_LITE_SHARED_ROOT` to a parent of their workspace,
-/// or (c) use `local:` / `clone:` instead of `shared:`.
+/// Chosen as `/tmp/sandbox-shared` because the principal that reads the host
+/// side of this mount is the **daemon user** (`_sandboxd`, which owns the
+/// gateway VM), not the operator — and `/tmp` is world-traversable, so that
+/// read succeeds. An operator's home directory is not: it is owned by the
+/// operator with mode 0750 and `_sandboxd` is outside its group, so the daemon
+/// user cannot even traverse into a workspace there. (TCC adds a second gate
+/// on top of that for Desktop / Documents / Downloads, but the ownership and
+/// mode bits are what rule out home-directory paths in general.) Operators
+/// whose workspaces live elsewhere must either (a) stage the content under
+/// this root, (b) set `SANDBOX_LITE_SHARED_ROOT` to a parent of their
+/// workspace that `_sandboxd` can traverse, or (c) use `clone:` / `--repo`,
+/// the operator-uid transfer commands (`sandbox sync`, `sandbox cp`), or the
+/// full backend instead of lite `shared:`.
 ///
 /// The in-VM mountpoint mirrors this path verbatim (no remapping): a host
 /// file at `<root>/project/foo.txt` is visible inside the gateway VM at
@@ -171,6 +178,14 @@ pub enum SharedPathError {
 }
 
 impl std::fmt::Display for SharedPathError {
+    /// The `OutsideRoot` rendering is the operator-facing explanation for this
+    /// refusal, so it names the real cause and the alternatives rather than
+    /// only restating the rule. The cause is Unix ownership, not TCC: the
+    /// gateway VM belongs to the daemon user, so the daemon user is the one
+    /// reading the host side of the mount, and an operator-owned home
+    /// directory is not traversable by it. Callers surface this verbatim (see
+    /// the lite `shared:` validation in the daemon's macOS create path) — keep
+    /// it self-contained.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SharedPathError::OutsideRoot {
@@ -178,10 +193,23 @@ impl std::fmt::Display for SharedPathError {
                 shared_root,
             } => write!(
                 f,
-                "lite shared: path {} is outside the configured shared root {} — \
-                 move the workspace under the root or set SANDBOX_LITE_SHARED_ROOT",
-                host_path.display(),
-                shared_root.display()
+                "lite shared: path {host} is outside the configured shared root {root}. \
+                 On the lite backend the sandbox container runs inside a gateway VM owned \
+                 by the sandboxd daemon user (`_sandboxd`), and that user — not you — reads \
+                 the host side of the mount; it cannot traverse your home directory (owned \
+                 by you, mode 0750, with `_sandboxd` outside its group), so only paths under \
+                 the shared root are mountable. What works instead: \
+                 (a) clone:<repo-url> or --repo for a git-backed project — the clone runs \
+                 inside the guest and never reads the host filesystem; \
+                 (b) `sandbox sync` / `sandbox cp` (and `sandbox workspace push|pull` on a \
+                 local: workspace), which run as your own uid over the daemon-mediated SSH \
+                 proxy and can therefore read what `_sandboxd` cannot; \
+                 (c) stage the content under {root} and point shared: there (the root itself \
+                 is overridable via SANDBOX_LITE_SHARED_ROOT); or \
+                 (d) use the full backend (drop --lite), whose per-session VM mounts the host \
+                 directory as your own uid and so accepts any path.",
+                host = host_path.display(),
+                root = shared_root.display()
             ),
         }
     }
@@ -403,6 +431,42 @@ mod tests {
             result.is_err(),
             "sibling directory with matching prefix must be rejected"
         );
+    }
+
+    /// The refusal an operator actually sees must name the real cause — the
+    /// gateway VM's daemon user reads the host side of the mount and cannot
+    /// traverse an operator-owned home directory — and then point at the paths
+    /// that do work. Pinned here because an earlier version of this message
+    /// attributed the refusal to macOS TCC, which sent operators chasing
+    /// privacy consent for a Unix-permissions problem.
+    #[test]
+    fn outside_root_error_names_cause_and_alternatives() {
+        let err = validate_shared_path(
+            Path::new("/Users/alice/Project"),
+            Path::new("/tmp/sandbox-shared"),
+        )
+        .expect_err("home-directory path must be rejected");
+        let msg = err.to_string();
+
+        // Both paths are named so the operator can see what was compared.
+        assert!(msg.contains("/Users/alice/Project"), "got: {msg}");
+        assert!(msg.contains("/tmp/sandbox-shared"), "got: {msg}");
+
+        // Cause: the daemon user does the read, and ownership/mode — not
+        // privacy consent — is what denies it.
+        assert!(msg.contains("_sandboxd"), "got: {msg}");
+        assert!(msg.contains("home directory"), "got: {msg}");
+        assert!(
+            !msg.contains("TCC"),
+            "TCC is at most secondary here; the message must not blame it: {msg}"
+        );
+
+        // Alternatives: guest-side clone, operator-uid transfer commands, the
+        // shared-root staging path (with its env override), and the full backend.
+        assert!(msg.contains("clone:"), "got: {msg}");
+        assert!(msg.contains("sandbox sync"), "got: {msg}");
+        assert!(msg.contains(LITE_SHARED_ROOT_ENV), "got: {msg}");
+        assert!(msg.contains("full backend"), "got: {msg}");
     }
 
     #[test]

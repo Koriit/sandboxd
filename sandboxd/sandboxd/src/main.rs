@@ -4918,7 +4918,7 @@ async fn create_session_macos_lite(
     use sandbox_core::backend::inspect_container_pid_via_socket;
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
     use sandbox_core::lite_macos::{
-        SharedPathError, build_in_vm_route_helper_argv, lite_shared_root, validate_shared_path,
+        build_in_vm_route_helper_argv, lite_shared_root, validate_shared_path,
     };
     use sandbox_core::macos_session::setup_macos_lite_gateway;
 
@@ -5069,30 +5069,22 @@ async fn create_session_macos_lite(
             // the 9p stanza added to the gateway template.
             let shared_root = lite_shared_root();
             let hp = std::path::PathBuf::from(host_path);
-            if let Err(SharedPathError::OutsideRoot { .. }) =
-                validate_shared_path(&hp, &shared_root)
-            {
-                // Warn operators about the TCC asymmetry: _sandboxd does the read.
+            if let Err(e) = validate_shared_path(&hp, &shared_root) {
+                // The gateway VM belongs to the daemon user, so the daemon
+                // user — not the operator — reads the host side of the 9p
+                // mount, and it cannot traverse an operator-owned home
+                // directory. `SharedPathError`'s Display carries that
+                // explanation plus the alternatives that do work; the log line
+                // stays short and structured.
                 warn!(
                     session_id = %session_id,
                     host_path = %hp.display(),
                     shared_root = %shared_root.display(),
-                    "lite shared: path outside configured shared root — \
-                     move workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
-                     Note: lite shared: is read by _sandboxd (the gateway VM user), \
-                     not the operator; TCC consent from the operator does not apply."
+                    "lite shared: path outside the configured shared root — the gateway \
+                     VM's daemon user cannot read operator-owned paths"
                 );
                 early_lite_cleanup_and_return!(
-                    error_response(SandboxError::InvalidArgument(format!(
-                        "lite shared: path {} is outside the configured shared root {} — \
-                         move the workspace under the root or set SANDBOX_LITE_SHARED_ROOT. \
-                         Note: lite shared: access runs as _sandboxd (not the operator); \
-                         sources in TCC-protected directories (Desktop, Documents, Downloads) \
-                         are not readable.",
-                        hp.display(),
-                        shared_root.display()
-                    ),))
-                    .into_response()
+                    error_response(SandboxError::InvalidArgument(e.to_string())).into_response()
                 );
             }
             // Emit a warning about the _sandboxd TCC asymmetry for all

@@ -57,33 +57,36 @@ In other words: lite changes the substrate underneath the guest, not the contrac
 
 On macOS, the lite and Lima backends expose `shared:` workspaces through different access paths, and that difference affects which directories you can use.
 
-**Lima backend.** The VM mounts the host directory directly via a 9p stanza that Lima provisions on behalf of the operator. Access to the host filesystem runs as the operator's uid, so macOS TCC (Transparency, Consent, and Control) grants the operator has given to other apps cover the mount.
+**Lima backend.** The VM mounts the host directory directly via a 9p stanza that Lima provisions on behalf of the operator. Access to the host filesystem runs as the operator's uid, so any path the operator can read works — including paths under the operator's home directory. macOS TCC (Transparency, Consent, and Control) is the only additional gate, and the grants the operator has given cover the mount.
 
-**Lite backend.** Sandbox containers run inside a persistent gateway Lima VM (`sandboxd-gateway`) that the daemon owns. The host directory reaches the sandbox container via a double-hop: the host 9p-mounts the shared root into the gateway VM as the `_sandboxd` daemon user, and the gateway VM bind-mounts that path into the sandbox container. Because the access runs as `_sandboxd` — not as the operator — the TCC grants the operator has accumulated for other apps do not transfer. A directory that the operator's own processes can read freely may be inaccessible when the same path is accessed via the `_sandboxd` gateway user.
+**Lite backend.** Sandbox containers run inside a persistent gateway Lima VM (`sandboxd-gateway`) that the daemon owns. The host directory reaches the sandbox container via a double-hop: the host 9p-mounts the shared root into the gateway VM as the `_sandboxd` daemon user, and the gateway VM bind-mounts that path into the sandbox container. Because the host-side read runs as `_sandboxd` — not as the operator — ordinary Unix ownership decides what is reachable, and a home directory is not: `/Users/<you>` is owned by you with mode 0750, and `_sandboxd` is not in its group, so the daemon user cannot even traverse into it. A directory that your own processes read freely is simply unreadable over this path.
 
 ### What this means in practice
 
-macOS TCC protects several common directories: Desktop, Documents, Downloads, and the `~/Library` subtree. If your `shared:` path sits inside one of those locations, `_sandboxd` will not have the necessary TCC consent and the mount will fail or appear empty.
+The load-bearing constraint is ownership, not privacy consent: **nothing under your home directory is reachable by `_sandboxd`**, whether or not it sits in a TCC-protected location. TCC (Desktop, Documents, Downloads, `~/Library`) is a second gate layered on top, and it only becomes relevant once the ownership gate is passed.
 
-The default lite shared root is `/tmp/sandbox-shared`, which is outside the TCC-protected tree and accessible to `_sandboxd` without any consent dialog. Per-session `shared:` paths must be under this root.
+The default lite shared root is `/tmp/sandbox-shared`, which `_sandboxd` can traverse because `/tmp` is world-traversable. Per-session `shared:` paths must be under this root, and the daemon rejects anything outside it at `sandbox create` time.
 
 ```bash
-# Works — /tmp/sandbox-shared is outside TCC-protected directories.
+# Works — /tmp is world-traversable, so _sandboxd can read the shared root.
 sandbox create --lite --name dev \
     --workspace "shared:/tmp/sandbox-shared/myproject"
 
-# Fails on macOS lite — Documents is TCC-protected and _sandboxd lacks consent.
+# Rejected at create time on macOS lite — _sandboxd cannot traverse $HOME.
 sandbox create --lite --name dev \
-    --workspace "shared:$HOME/Documents/myproject"
+    --workspace "shared:$HOME/Projects/myproject"
 ```
 
-If your workspace lives outside `/tmp/sandbox-shared`, you have three options:
+If your workspace lives outside `/tmp/sandbox-shared`, you have these options:
 
-1. **Move or symlink the workspace under `/tmp/sandbox-shared`.** This is the simplest fix for a single project.
-2. **Set `SANDBOX_LITE_SHARED_ROOT` to a parent of your workspace.** The daemon picks up this environment variable at startup and uses it as the 9p-mounted root instead of the default. Point it at a directory that is outside TCC-protected locations and that contains all the `shared:` paths you intend to use.
-3. **Use `local:` or `clone:` instead of `shared:`.** These modes transfer files over the daemon's control channel using the operator's uid, so TCC consent follows normally. They do not provide live bidirectional visibility, but for workloads where the agent reads the workspace once at session creation and you sync results back explicitly, they are a cleaner fit.
+1. **Stage the project under `/tmp/sandbox-shared`.** The simplest fix for a single project. A symlink is not enough — the shared root is 9p-mounted into the gateway VM, so the content itself must live under it.
+2. **Set `SANDBOX_LITE_SHARED_ROOT` to a different root.** The daemon picks up this environment variable at startup and uses it as the 9p-mounted root instead of the default. It must be a directory `_sandboxd` can actually traverse — pointing it at a parent inside your home directory passes the daemon's path check but still fails at mount time.
+3. **Use `clone:` or `--repo` instead of `shared:`.** The clone runs inside the guest and never touches the host filesystem, so no host-side access identity is involved at all. This is the cleanest fit for a git-backed project.
+4. **Move files explicitly with `sandbox sync` or `sandbox cp`.** These run on the CLI side as your own uid, over the daemon-mediated SSH proxy, so they read paths `_sandboxd` cannot. The same applies to `sandbox workspace push` / `pull` on a `local:` workspace. You give up live bidirectional visibility, but for workloads where the agent reads the workspace once and you sync results back explicitly, this is a clean fit.
 
-> On Lima sessions (full backend) there is no `_sandboxd` intermediary — the VM mounts the host directory on behalf of the operator, so TCC consent is symmetric and this restriction does not apply.
+> **`local:` carries the same host-side constraint on macOS lite.** The create-time `local:` push is run by the daemon (there is no setuid pivot to the operator on macOS), so its host source must be readable by `_sandboxd` just like a `shared:` source. The operator-driven `sandbox workspace push` / `pull` and `sandbox sync` are the parts that run as your uid.
+
+> On Lima sessions (full backend) there is no `_sandboxd` intermediary — the VM mounts the host directory on behalf of the operator, so `shared:` accepts any path you can read and this restriction does not apply.
 
 ## Resource defaults
 
