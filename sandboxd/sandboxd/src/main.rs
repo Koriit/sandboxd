@@ -5087,14 +5087,17 @@ async fn create_session_macos_lite(
                     error_response(SandboxError::InvalidArgument(e.to_string())).into_response()
                 );
             }
-            // Emit a warning about the _sandboxd TCC asymmetry for all
-            // lite shared: sessions so operators are informed.
-            warn!(
+            // Record who reads the host side of the mount. This fires only
+            // after the path cleared the shared-root check above, so the
+            // source is already somewhere the daemon user can traverse —
+            // there is nothing for the operator to act on here, and naming
+            // TCC-protected directories at this point would be misleading
+            // (a path under the shared root is not in one).
+            debug!(
                 session_id = %session_id,
                 host_path = %hp.display(),
-                "lite shared: workspace — access runs as _sandboxd (gateway VM user), \
-                 not the operator. Ensure the source is readable by _sandboxd and \
-                 outside TCC-protected directories (Desktop, Documents, Downloads)."
+                "lite shared: workspace — host-side access runs as the sandboxd \
+                 daemon user (gateway VM owner), not the operator"
             );
             Some(sandbox_core::backend::WorkspaceBind {
                 host_path: hp,
