@@ -802,6 +802,10 @@ mod tests {
         // held by a function that returns before reaching its natural end.
         let latch = Arc::new(AtomicBool::new(false));
 
+        // The explicit `return` is the subject of the test, not an oversight:
+        // collapsing it into the surrounding control flow would remove the
+        // early-exit path whose drop behavior this exercises.
+        #[allow(clippy::needless_return)]
         fn early_return(latch: &Arc<AtomicBool>, bail: bool) {
             let _g = GatewayRecoveringGuard::engage(latch);
             if bail {
