@@ -117,6 +117,29 @@ The cross-user matrix boots real VMs and runs ~1.5–2h on the 8 GB host. Launch
 
 Do **not** blanket `docker system prune -a` mid-session — it evicts the tagged `gateway` / `lite` images and forces slow rebuilds.
 
+### `target/` bloat stalls exec on macOS (distinct from ENOSPC)
+
+A `target/` dir that has grown without a `cargo clean` for a long time
+stops binaries from *starting*, independently of free disk space. The
+symptom is a freshly-built binary hanging at `_dyld_start`, which hangs
+`make test` with no useful output. Sessions have hit ~150 GB / ~1.4 M
+files with `target/debug/deps` at the 65535 hard-link cap.
+
+This is **not** covered by the `make test` self-signing step — signing
+and this are separate failures that present almost identically, so
+having handled one does not rule out the other.
+
+**Diagnose before treating.** Copy the built binary to `/tmp` and run it
+from there. If it starts fine outside `target/`, the tree is the
+problem. Do **not** `pkill -9 amfid` / `syspolicyd` chasing a suspected
+code-signing stall — those are system daemons, killing them destabilizes
+the host, and they are usually not the cause.
+
+**Fix:** `cargo clean` (in `sandboxd/`), then rebuild. Worth doing
+periodically on a long-lived dev host rather than waiting for the hang —
+`du -sh sandboxd/target` climbing into the tens of GB is the early
+signal.
+
 ## Rust workspace
 
 Working directory for cargo commands: `sandboxd/`
