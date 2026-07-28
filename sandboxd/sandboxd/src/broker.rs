@@ -1356,32 +1356,59 @@ async fn drive_agent_connection_outer(
                             }
 
                             // Read StreamReady (or Rejected) from the agent.
-                            // Set a short timeout: the agent should respond immediately.
-                            let read_result = tokio::time::timeout(
-                                heartbeat,
-                                buf_reader.read_line(&mut line),
-                            )
-                            .await;
+                            //
+                            // The agent's heartbeat runs on its own timer and is
+                            // written unconditionally, so a `PING` can arrive in
+                            // the window between the request above and the reply.
+                            // Absorb control frames and keep waiting rather than
+                            // feeding them to the response parser.
+                            //
+                            // The budget is an absolute deadline computed once,
+                            // not a per-read timeout: a chatty or hostile agent
+                            // must not be able to extend the wait indefinitely by
+                            // emitting frames. Total time spent here is bounded by
+                            // `heartbeat` regardless of how many frames arrive.
+                            let deadline = tokio::time::Instant::now() + heartbeat;
+                            let response: BrokerResponse = loop {
+                                line.clear();
+                                let read_result = tokio::time::timeout_at(
+                                    deadline,
+                                    buf_reader.read_line(&mut line),
+                                )
+                                .await;
 
-                            match read_result {
-                                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => {
-                                    warn!(uid, "no StreamReady from agent; closing connection");
-                                    let _ = ack_tx.send(Err("no StreamReady received from agent".to_string()));
-                                    break 'outer;
+                                match read_result {
+                                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => {
+                                        warn!(uid, "no StreamReady from agent; closing connection");
+                                        let _ = ack_tx.send(Err("no StreamReady received from agent".to_string()));
+                                        break 'outer;
+                                    }
+                                    Ok(Ok(_)) => {}
                                 }
-                                Ok(Ok(_)) => {}
-                            }
 
-                            let trimmed = line.trim_end_matches(['\n', '\r']);
-                            let response: BrokerResponse =
-                                match serde_json::from_str(trimmed) {
-                                    Ok(r) => r,
-                                    Err(e) => {
+                                let trimmed = line.trim_end_matches(['\n', '\r']);
+                                match classify_agent_frame(trimmed) {
+                                    AgentFrame::Ping => {
+                                        if let Err(e) = writer.write_all(b"PONG\n").await {
+                                            warn!(uid, error = %e, "failed to write PONG while awaiting StreamReady; closing");
+                                            let _ = ack_tx.send(Err("write error on control connection".to_string()));
+                                            break 'outer;
+                                        }
+                                    }
+                                    AgentFrame::Pong | AgentFrame::CheckIn => {}
+                                    AgentFrame::Unknown => {
+                                        if !trimmed.is_empty() {
+                                            warn!(uid, frame = %trimmed, "unexpected frame while awaiting StreamReady; ignoring");
+                                        }
+                                    }
+                                    AgentFrame::Response(response) => break response,
+                                    AgentFrame::MalformedResponse(e) => {
                                         warn!(uid, error = %e, "failed to parse GuestSocat response; closing");
                                         let _ = ack_tx.send(Err(format!("parse error: {e}")));
                                         break 'outer;
                                     }
-                                };
+                                }
+                            };
 
                             match response.result {
                                 BrokerResult::StreamReady { .. } => {
@@ -1458,6 +1485,45 @@ async fn drive_agent_connection_outer(
     info!(uid, "agent connection task exited");
 }
 
+/// A framed line from the agent, classified by kind.
+///
+/// The agent multiplexes two independent sources onto the control
+/// connection: replies to daemon-initiated requests, and unprompted `PING`
+/// heartbeats driven by its own timer (see `HEARTBEAT_INTERVAL` in
+/// `sandbox-agent`). A heartbeat can therefore land at *any* point,
+/// including between a request being written and its reply arriving.
+///
+/// Every read of the control connection classifies through this one
+/// function so no reader can mistake a control frame for a response.
+enum AgentFrame {
+    /// `CHECKIN` — the agent announcing itself.
+    CheckIn,
+    /// `PING` — heartbeat; the daemon owes a `PONG` in reply.
+    Ping,
+    /// `PONG` — reply to a daemon-sent ping; nothing further to do.
+    Pong,
+    /// A well-formed JSON [`BrokerResponse`].
+    Response(BrokerResponse),
+    /// A line that looked like JSON but did not parse as a [`BrokerResponse`].
+    MalformedResponse(serde_json::Error),
+    /// Anything else, including an empty line.
+    Unknown,
+}
+
+/// Classify one trimmed line read from the agent.
+fn classify_agent_frame(trimmed: &str) -> AgentFrame {
+    match trimmed {
+        "CHECKIN" => AgentFrame::CheckIn,
+        "PING" => AgentFrame::Ping,
+        "PONG" => AgentFrame::Pong,
+        other if other.starts_with('{') => match serde_json::from_str::<BrokerResponse>(other) {
+            Ok(response) => AgentFrame::Response(response),
+            Err(e) => AgentFrame::MalformedResponse(e),
+        },
+        _ => AgentFrame::Unknown,
+    }
+}
+
 /// Process a line read from the agent on the broker connection.
 ///
 /// Returns `true` to continue the outer loop, `false` to break.
@@ -1483,53 +1549,50 @@ async fn process_agent_line(
         }
         Ok(Ok(_)) => {
             let trimmed = line.trim_end_matches(['\n', '\r']);
-            match trimmed {
-                "CHECKIN" => {
+            match classify_agent_frame(trimmed) {
+                AgentFrame::CheckIn => {
                     info!(uid, "agent check-in frame received");
                     true
                 }
-                "PING" => {
+                AgentFrame::Ping => {
                     if let Err(e) = writer.write_all(b"PONG\n").await {
                         warn!(uid, error = %e, "failed to write PONG; dropping connection");
                         return false;
                     }
                     true
                 }
-                "PONG" => true,
-                other if !other.is_empty() && other.starts_with('{') => {
-                    match serde_json::from_str::<BrokerResponse>(other) {
-                        Ok(response) => {
-                            if let Some((expected_id, reply_tx)) = outstanding.take() {
-                                if response.request_id != expected_id {
-                                    warn!(
-                                        uid,
-                                        expected = expected_id,
-                                        got = response.request_id,
-                                        "BrokerResponse request_id mismatch; \
-                                         closing connection (agent protocol error)"
-                                    );
-                                    // Drop reply_tx without sending — the caller
-                                    // gets a RecvError mapped to "agent dropped".
-                                    return false;
-                                }
-                                let _ = reply_tx.send(response.result);
-                            } else {
-                                warn!(
-                                    uid,
-                                    request_id = response.request_id,
-                                    "received unsolicited BrokerResponse; ignoring"
-                                );
-                            }
+                AgentFrame::Pong => true,
+                AgentFrame::Response(response) => {
+                    if let Some((expected_id, reply_tx)) = outstanding.take() {
+                        if response.request_id != expected_id {
+                            warn!(
+                                uid,
+                                expected = expected_id,
+                                got = response.request_id,
+                                "BrokerResponse request_id mismatch; \
+                                 closing connection (agent protocol error)"
+                            );
+                            // Drop reply_tx without sending — the caller
+                            // gets a RecvError mapped to "agent dropped".
+                            return false;
                         }
-                        Err(e) => {
-                            warn!(uid, error = %e, frame = %other, "failed to parse BrokerResponse");
-                        }
+                        let _ = reply_tx.send(response.result);
+                    } else {
+                        warn!(
+                            uid,
+                            request_id = response.request_id,
+                            "received unsolicited BrokerResponse; ignoring"
+                        );
                     }
                     true
                 }
-                other => {
-                    if !other.is_empty() {
-                        warn!(uid, frame = %other, "unexpected frame on broker channel; ignoring");
+                AgentFrame::MalformedResponse(e) => {
+                    warn!(uid, error = %e, frame = %trimmed, "failed to parse BrokerResponse");
+                    true
+                }
+                AgentFrame::Unknown => {
+                    if !trimmed.is_empty() {
+                        warn!(uid, frame = %trimmed, "unexpected frame on broker channel; ignoring");
                     }
                     true
                 }
@@ -2507,6 +2570,211 @@ mod tests {
         assert!(
             msg.contains("not running"),
             "error message must mention 'not running'; got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Heartbeat frames arriving inside the StreamReady window
+    // -----------------------------------------------------------------------
+
+    /// Wire a control connection straight to `drive_agent_connection_outer`
+    /// over a socketpair, bypassing the listener.
+    ///
+    /// The line handling under test lives entirely in the connection task, so
+    /// nothing here needs a filesystem socket, peer-cred auth, or group
+    /// enrollment — which keeps these tests hermetic and off the
+    /// `test-env-override` feature that the listener-driven tests require.
+    ///
+    /// Returns the agent's end of the control connection plus the two
+    /// registries the daemon side is wired to.
+    async fn spawn_control_connection(
+        uid: u32,
+        heartbeat: Duration,
+    ) -> (tokio::net::UnixStream, AgentRegistry, PendingStreamRegistry) {
+        let (daemon_side, agent_side) = tokio::net::UnixStream::pair().unwrap();
+        let registry = AgentRegistry::new();
+        let pending_streams = PendingStreamRegistry::new();
+        let (generation, evict_rx, req_rx) = registry.register(uid).await;
+        tokio::spawn(drive_agent_connection_outer(
+            uid,
+            generation,
+            daemon_side,
+            evict_rx,
+            req_rx,
+            registry.clone(),
+            heartbeat,
+        ));
+        (agent_side, registry, pending_streams)
+    }
+
+    /// A heartbeat `PING` landing between the `GuestSocat` request and the
+    /// agent's `StreamReady` must be absorbed, not parsed as the response.
+    ///
+    /// The agent writes `PING` on a fixed 10 s timer regardless of whether an
+    /// op is in flight, so this window is hit in ordinary operation. Feeding
+    /// that frame to the `BrokerResponse` parser fails, and treating the
+    /// failure as a protocol error tears down the operator's whole control
+    /// connection — surfacing as an unexplained agent disconnect.
+    #[tokio::test]
+    async fn ping_inside_stream_ready_window_does_not_drop_control() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest, BrokerResponse, BrokerResult};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const UID: u32 = 4242;
+
+        let (agent_side, registry, pending_streams) =
+            spawn_control_connection(UID, Duration::from_secs(10)).await;
+        let (agent_read, mut agent_write) = agent_side.into_split();
+        let mut agent_read = BufReader::new(agent_read);
+
+        // Daemon side: request a multiplexed GuestSocat stream.
+        let reg = registry.clone();
+        let pend = pending_streams.clone();
+        let daemon_task = tokio::spawn(async move {
+            let request = BrokerRequest {
+                request_id: 7,
+                op: BrokerOp::GuestSocat {
+                    op_uid: UID,
+                    vm: "sandbox-test".to_string(),
+                    stream_token: None,
+                },
+            };
+            reg.take_stream_for_guest_socat(UID, request, &pend).await
+        });
+
+        // Agent side: read the request and recover the correlation token.
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), agent_read.read_line(&mut line))
+            .await
+            .expect("GuestSocat request must reach the agent")
+            .expect("control connection must be readable");
+        let request: BrokerRequest = serde_json::from_str(line.trim()).unwrap();
+        let token = match &request.op {
+            BrokerOp::GuestSocat {
+                stream_token: Some(t),
+                ..
+            } => t.clone(),
+            other => panic!("expected a token-bearing GuestSocat request, got {other:?}"),
+        };
+
+        // The heartbeat tick fires here — the window this test exists for.
+        agent_write.write_all(b"PING\n").await.unwrap();
+
+        // ...immediately followed by the real, well-formed response.
+        let ready = BrokerResponse {
+            request_id: request.request_id,
+            result: BrokerResult::StreamReady {
+                token: token.clone(),
+            },
+        };
+        let encoded = serde_json::to_string(&ready).unwrap();
+        agent_write.write_all(encoded.as_bytes()).await.unwrap();
+        agent_write.write_all(b"\n").await.unwrap();
+
+        // Stand in for the agent's dedicated stream connection. With no
+        // listener in play the test claims the token directly, which is what
+        // the listener's `STREAM_CONNECT` handler does once auth passes.
+        let (stream_daemon_end, _stream_agent_end) = tokio::net::UnixStream::pair().unwrap();
+        let stream_tx = pending_streams
+            .claim(&token, UID)
+            .await
+            .expect("the pending stream entry is registered before the request is sent");
+        assert!(
+            stream_tx.send(Box::new(stream_daemon_end)).is_ok(),
+            "the daemon must still be awaiting the stream"
+        );
+
+        // The stream must be delivered to the caller...
+        let delivered = tokio::time::timeout(Duration::from_secs(10), daemon_task)
+            .await
+            .expect("take_stream_for_guest_socat must not hang")
+            .expect("the daemon task must not panic");
+        if let Err(e) = delivered {
+            panic!("GuestSocat stream must be delivered despite the in-window PING; got: {e}");
+        }
+
+        // ...the in-window PING must have been answered...
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(5), agent_read.read_line(&mut line))
+            .await
+            .expect("a PONG must follow the in-window PING")
+            .expect("control connection must be readable");
+        assert_eq!(
+            line.trim(),
+            "PONG",
+            "the daemon owes a PONG for a PING received in the StreamReady window"
+        );
+
+        // ...and the control connection must still be registered.
+        assert!(
+            registry.is_registered(UID).await,
+            "an in-window heartbeat must not tear down the operator's control connection"
+        );
+    }
+
+    /// Absorbing control frames must not let an agent stall the wait forever.
+    ///
+    /// The budget for `StreamReady` is a single absolute deadline, so an agent
+    /// that streams `PING`s and never answers still hits it. A per-read
+    /// timeout would be restarted by every frame and never expire.
+    #[tokio::test]
+    async fn endless_pings_cannot_extend_the_stream_ready_wait() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const UID: u32 = 4243;
+        const BUDGET: Duration = Duration::from_millis(300);
+
+        let (agent_side, registry, pending_streams) = spawn_control_connection(UID, BUDGET).await;
+        let (agent_read, mut agent_write) = agent_side.into_split();
+        let mut agent_read = BufReader::new(agent_read);
+
+        let reg = registry.clone();
+        let pend = pending_streams.clone();
+        let daemon_task = tokio::spawn(async move {
+            let request = BrokerRequest {
+                request_id: 11,
+                op: BrokerOp::GuestSocat {
+                    op_uid: UID,
+                    vm: "sandbox-test".to_string(),
+                    stream_token: None,
+                },
+            };
+            reg.take_stream_for_guest_socat(UID, request, &pend).await
+        });
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), agent_read.read_line(&mut line))
+            .await
+            .expect("GuestSocat request must reach the agent")
+            .expect("control connection must be readable");
+
+        // Heartbeat far faster than the budget, and never a response. Drop the
+        // writer once the daemon hangs up so the task finishes.
+        tokio::spawn(async move {
+            loop {
+                if agent_write.write_all(b"PING\n").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("the StreamReady wait must be bounded by the deadline, not per-read")
+            .expect("the daemon task must not panic");
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "an agent that never answers must not yield a stream"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the wait must end near the {BUDGET:?} budget, not be extended by each PING; \
+             took {elapsed:?}"
         );
     }
 
