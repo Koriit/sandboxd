@@ -28,17 +28,17 @@ and assumes **no** prior knowledge of this codebase.
   — each phase links back to the design sections it implements.
 - **[§5](#5-deltas-corrections-and-related-issues)** records accepted security
   deltas and the corrections issue #82 itself needs.
-- **[Open questions](#open-questions)** now holds a single empirical question that
-  phase 0 answers in 30 seconds, plus a trail of the decisions already made and where
-  each one lives. Do not re-litigate the settled ones; do not guess the open one.
+- **[Open questions](#open-questions)** is now **empty** — every design question has
+  been closed. What it holds is a trail of the decisions made and where each one lives,
+  so you can find the reasoning without re-litigating it.
 
 Every claim cites a `file:line` in this repository. Line numbers are against `master`
 @ `7e5fa0c`. Where a line may have moved, the code is quoted inline so you can
 recognise it.
 
-**Claims marked ⚠️ UNVERIFIED are exactly that.** They are flagged at the point of
-use, each with a check you can run in under a minute. Do not build on one without
-running its check first.
+**One claim is still marked ⚠️ UNVERIFIED** (§2.7, `cidata.iso` regeneration). It is
+flagged at its point of use with a check you can run in under a minute. Do not build on
+it without running that check.
 
 ---
 
@@ -350,13 +350,12 @@ form appears in one test helper and is wrong — see phase 6.
 
 ### What "unverified" means here
 
-Two claims this design leans on were reasoned from Lima's source and templates but
-**not observed**. Both are cheap to check, and both are pre-checks in §3.1:
+**One** claim this design leans on is still reasoned from Lima's source rather than
+observed: that `cidata.iso` regenerates on **every** VM start, not only the first. It is
+flagged ⚠️ at its point of use (§2.7) and pre-check B in §3.1 settles it in 30 seconds.
 
-1. Lima honours a per-entry `interface:` key for `socket:` networks.
-2. `cidata.iso` regenerates on **every** VM start, not only the first.
-
-They are flagged ⚠️ at each point of use.
+Its sibling — whether Lima honours a per-entry `interface:` key on `socket:` networks —
+**has been verified** and is no longer an assumption; see §1.4 fix 1 for the evidence.
 
 ---
 
@@ -537,23 +536,67 @@ That matters because the NIC name selects the **macvlan parent**, i.e. which L2 
 the session lands on (`macos_session.rs:158-165`), and it is persisted as
 `NetworkInfo.bridge_name` (`main.rs:4373`) — so a wrong name is durable, not transient.
 
-#### Fix 1 — pin identity with Lima's per-entry `interface:` key
+#### Fix 1 — pin identity with Lima's per-entry `interface:` key ✅ CONFIRMED
 
 ```yaml
 networks:
-  - socket: /var/run/sandbox/vmnet/slot-4.sock
-    interface: lima4
+  - socket: /var/run/sandbox/vmnet/slot-6.sock
+    interface: lima6
+  - socket: /var/run/sandbox/vmnet/slot-7.sock
+    interface: lima7
 ```
 
-⚠️ **UNVERIFIED for `socket:` networks.** The `interface:` field is documented under a
-`- lima: shared` example (`default.yaml:470-471`). The evidence that it applies to
-`socket:` entries is structural, not observed: Lima's network-config template renders
-`{{$nw.Interface}}` while iterating *all* networks with no kind-specific branch, and
-Lima carries a uniqueness-validation message that indexes the field generically across
-the whole list (`field '%s.interface' value %#q has already been used by field
-'networks[%d].interface'`). **Run pre-check A (§3.1) before relying on this.** If it
-fails, fixes 2–4 still apply and you need an explicit slot→NIC translation layer
-instead — more code, no more risk, but decide it before writing template code.
+**Verified empirically** on Lima 2.1.2 / socket_vmnet 1.2.2, unelevated as an ordinary
+operator uid in a throwaway LIMA_HOME.
+
+**Baseline** — one network on `slot-6.sock` with **no** `interface:` key. The guest
+reports the positional name, reproducing the hazard exactly:
+
+```
+3: lima0: ... link/ether 52:55:55:ec:c3:59
+```
+
+**Test** — two networks pinned non-positionally, using the YAML above:
+
+```
+3: lima6: ... link/ether 52:55:55:fc:23:77
+4: lima7: ... link/ether 52:55:55:f3:cb:4b
+```
+
+`limactl validate` returns OK with no warning; the key survives into the effective
+`lima.yaml` and into cloud-init's netplan as `set-name:`, keyed by MAC.
+
+**It is a real binding, not a relabel.** This matters — "the name sticks" alone would not
+have been sufficient evidence, because a name that stuck while pointing at the wrong
+socket is precisely the failure this fix exists to prevent. Lima dials each socket itself
+and hands QEMU the fd, so correlating fds via `lsof` gives an end-to-end chain, and it
+agrees at every hop:
+
+| fd | QEMU netdev | MAC | guest name | peer socket |
+|---|---|---|---|---|
+| 3 | `net1` | `52:55:55:fc:23:77` | `lima6` | `slot-6.sock` |
+| 4 | `net2` | `52:55:55:f3:cb:4b` | `lima7` | `slot-7.sock` |
+
+So an offset range behaves exactly like a contiguous one from slot 0, and the slot→NIC
+translation layer that would otherwise have been needed is **not** required.
+
+#### Fix 1a — the generator must now guard the invariant itself
+
+The confirmation comes with an obligation. **Lima honours whatever name you ask for and
+never warns about a non-positional one** — `limactl validate` passed on names that do not
+match array position, and it would equally pass on `interface: lima2` sitting on
+`slot-7.sock`.
+
+That means the `lima<N>` ⇔ slot N correspondence stops being something Lima enforces and
+becomes **the generator's responsibility**. Left implicit, it is exactly the same species
+of accident as the reaper exclusion in §2.6: a property that currently holds, that
+nothing checks, and whose violation is silent and routes traffic onto the wrong L2
+segment.
+
+**Requirement:** `generate_gateway_template` must emit
+`interface == format!("lima{slot}")` for **every** entry, and a unit test must assert it
+for every emitted entry rather than spot-checking one. Replace the accidental invariant
+with a deliberate one.
 
 #### Fix 2 — key the NIC parser by suffix, not position
 
@@ -576,6 +619,12 @@ let slot_to_iface: HashMap<u16, String> = lima_nics
 With NICs `lima4..lima7` present this yields `slot 0 → lima4`. Key by the parsed suffix
 `n` instead. One line — but it changes `NicMap`'s meaning for the contiguous case too,
 so the tests at `gateway_lima.rs:2502-2543` change with it.
+
+**This fix stands on its own terms and is not contingent on fix 1.** Now that pinning is
+confirmed, threading the slot explicitly through the parser is no longer a *fallback* for
+a missing Lima feature — it is simply correct. The parser claims to build a slot→interface
+map and instead builds a position→interface map; those coincide only while the range is
+contiguous and zero-based. Fix it because it is wrong, not because something else failed.
 
 #### Fix 3 — take an explicit slot set in template generation
 
@@ -1018,6 +1067,40 @@ already required by this design, so the future work is policy, not plumbing.
 
 ---
 
+### 2.8 Constraint: LIMA_HOME path depth (`UNIX_PATH_MAX = 104`)
+
+**Lima instances cannot live at an arbitrarily deep path.** Lima creates a Unix domain
+socket at `<instance-dir>/ssh.sock`, and a Unix socket address is bounded by
+`UNIX_PATH_MAX`, which on macOS is **104 bytes** including the terminator. Exceed it and
+the VM fails to start.
+
+Discovered the hard way while verifying §1.4 fix 1: a throwaway LIMA_HOME under a deep
+scratchpad directory produced a 117-character socket path and failed. **A symlink does
+not help — Lima resolves it** before binding, so shortening the path you type does not
+shorten the path that gets bound.
+
+This bears directly on this design, because per-operator instances live at
+`{state_root}/{daemon_uid}/{op_uid}/lima/<instance>/` and §2.6 *lengthened* the instance
+name to `sandboxd-gateway-<operator_uid>`. The arithmetic for the real shape:
+
+| Path | Length | Headroom |
+|---|---|---|
+| `/var/lib/sandboxd/309/501/lima/sandboxd-gateway-501/ssh.sock` | 60 | 44 |
+| `/var/lib/sandboxd/309/501/lima/sandbox-a1b2c3d4e5f6/ssh.sock` (a session VM) | 60 | 44 |
+| `/var/lib/sandboxd/12345/98765/lima/sandboxd-gateway-98765/ssh.sock` (5-digit uids) | 66 | 38 |
+
+**Headroom is comfortable today — roughly 40 characters — and the §2.6 naming decision
+does not threaten it.** A gateway instance name is the same length as a session VM name,
+so nothing regressed.
+
+**But it is finite, and three things consume it:** a longer `{state_root}`, another level
+of nesting under it, and a longer instance-name scheme. Do not add any of them without
+recomputing against 104. In particular, do not "temporarily" relocate a LIMA_HOME into a
+scratchpad or temp directory to test something — that is exactly what failed here, and
+the error does not name path length as the cause.
+
+---
+
 ## 3. The egress validation gate
 
 **The question:** *is egress still enforced when the gateway VM is owned by the operator
@@ -1064,47 +1147,25 @@ export LIMA_HOME=/var/lib/sandboxd/<daemon_uid>/${OP_UID}/lima
 export GW=egress-gate-${OP_UID}      # throwaway VM name — never `sandboxd-gateway`
 ```
 
-### 3.1 Pre-checks — run these first
+### 3.1 Pre-checks
 
-Both take about 30 seconds. **Either can invalidate §1.** Do not proceed to 3.4 without
-them.
+Two were originally scoped here. **A is already answered** — its result is folded into
+§1.4 and shaped phase 1, so there is nothing to run. **B is still outstanding**, takes
+about 30 seconds, and should be done before §3.4 so its answer is on record while the VM
+lifecycle is being exercised anyway.
 
-#### Pre-check A — does `interface:` work for `socket:` networks?
+#### Pre-check A — ✅ ALREADY ANSWERED, do not re-run
 
-Settles the ⚠️ in §1.4 fix 1.
+**`interface:` works on `socket:` networks.** Verified on Lima 2.1.2 / socket_vmnet
+1.2.2, unelevated, in a throwaway LIMA_HOME. The full result — baseline, pinned test, and
+the `lsof` fd-correlation chain proving it binds rather than merely relabels — is in
+§1.4 fix 1.
 
-```bash
-cat > /tmp/iface-probe.yaml <<'YAML'
-vmType: "qemu"
-images:
-  - location: "<UBUNTU_NOBLE_ARM64_URL — copy the value from gateway_lima.rs>"
-    arch: aarch64
-cpus: 2
-memory: "2GiB"
-networks:
-  - socket: /var/run/sandbox/vmnet/slot-4.sock
-    interface: lima4
-containerd:
-  system: false
-  user: false
-YAML
+Nothing to run here. Two things it produced that phase 1 must carry:
 
-limactl create --name=iface-probe --tty=false /tmp/iface-probe.yaml
-limactl start iface-probe
-limactl shell iface-probe -- ip -json link show \
-  | python3 -c 'import json,sys; print([e["ifname"] for e in json.load(sys.stdin)])'
-```
-
-- **Success:** the list contains `lima4`.
-- **Failure signature:** the list contains `lima0` instead — `interface:` is not
-  honoured for `socket:` entries.
-- **If it fails:** §1.4 fix 1 is out. Record the decision, replace it with an explicit
-  slot→NIC translation layer in phase 1, and continue with the gate — this does not
-  block the egress question.
-
-```bash
-limactl stop --force iface-probe && limactl delete iface-probe
-```
+- §1.4 **fix 1a** — the generator must assert `interface == format!("lima{slot}")`
+  itself, because Lima validates neither the correspondence nor anything about it.
+- §2.8 — the `UNIX_PATH_MAX` path-depth constraint, found while setting this up.
 
 #### Pre-check B — does `cidata.iso` regenerate on every start?
 
@@ -1589,8 +1650,9 @@ this phase's exit** — see
 
 **Part A — runnable immediately (no #85 dependency).**
 
-- [ ] Pre-check A (§3.1) run; result recorded as "`interface:` honoured for `socket:`
-      networks: yes/no". If no, phase 1's scope is updated before it starts.
+- [x] ~~Pre-check A~~ — **done.** `interface:` is honoured on `socket:` networks
+      (§1.4 fix 1). Phase 1 takes the pinning path; no translation layer needed, and
+      fix 1a plus the §2.8 path constraint come with it.
 - [ ] Pre-check B (§3.1) run; result recorded.
 - [ ] Host `net.inet.ip.forwarding` recorded (not gated on, §3.2).
 - [ ] Single-VM gate: assertions 1–4 (§3.6) all pass, **in that order**, with §3.5's
@@ -1626,8 +1688,8 @@ A is a meaningful intermediate result even while Part B waits on #85.
 **Goal.** More than one `VmnetPool`, each owning a disjoint contiguous slot range, with
 slot identity no longer positional.
 
-**Depends on.** Phase 0 green, and pre-check A's answer (which selects fix 1 vs. a
-translation layer).
+**Depends on.** Phase 0 green. (Pre-check A is already answered — the `interface:`
+pinning path is confirmed available, so no slot→NIC translation layer is needed.)
 
 **Implements.** §1.2, §1.3, §1.4, §1.5, §2.2.
 
@@ -1638,7 +1700,7 @@ translation layer).
 | `sandbox-core/src/network.rs:1090-1421` | `VmnetPool` unchanged in shape; range-scoped `claim_lima_slot` scan (`:1171`), quota-scoped cap checks (`:1161`, `:1208`), range-aware `restore_from_infos` (`:1320`), operator dimension on `claimed_slot_sessions` (`:1406`) |
 | new | uid-keyed `VmnetPoolRegistry`, modelled on `LimaManagerRegistry` (`lima.rs:1245-1280`) |
 | `sandbox-core/src/gateway_lima.rs:282-316` | `discover_nics_from_ip_json` — key by parsed suffix, not `enumerate()` position |
-| `sandbox-core/src/gateway_lima.rs:334-381` | `generate_gateway_template` — take a slot set; emit `interface:` per entry (or the translation layer) |
+| `sandbox-core/src/gateway_lima.rs:334-381` | `generate_gateway_template` — take a slot set; emit `interface: lima<slot>` per entry, and **guard the correspondence in the generator** (§1.4 fix 1a) — Lima does not check it |
 | `sandbox-core/src/gateway_lima.rs:1286` | `create_instance` — derive the slot set from the pool **at call time** |
 | `sandboxd/src/main.rs:4362-4370`, `:9884-9896`, `:12811-12820` | replace `unwrap_or_else(\|\| format!("lima{}", …))` with a hard error |
 | `sandboxd/src/main.rs:13403-13440` | `SANDBOX_MAX_MACOS_SESSIONS` parse — add the per-operator quota dimension |
@@ -1658,6 +1720,13 @@ translation layer).
 - [ ] A unit test proves `generate_gateway_template(&[4,5,6,7])` emits exactly four
       `socket:` entries naming `slot-4..slot-7`, with matching netplan and IPv6-disable
       lines.
+- [ ] A unit test proves that for **every** emitted network entry,
+      `interface == format!("lima{slot}")` — iterate the entries, do not spot-check one.
+      Lima honours whatever name it is given and never warns about a mismatched one
+      (§1.4 fix 1a), so this invariant is the generator's to enforce.
+- [ ] The resulting instance socket path stays under `UNIX_PATH_MAX` (§2.8). Nothing in
+      this phase should lengthen it, but confirm rather than assume if the state-root
+      layout or instance naming is touched.
 - [ ] A unit test proves a missing NIC-map entry returns `Err`, not a `limaN` guess, at
       all three sites.
 - [ ] Two pools with disjoint ranges never hand out the same slot index, and a pool
@@ -2009,15 +2078,18 @@ Two counterweights, for honesty: `gateway_recovery.rs` is far cheaper than #82 s
 
 ## Open questions
 
-**One question remains open, and it is deliberately open rather than undecided.** It
-cannot be settled by discussion — it is an empirical fact about Lima's behaviour, and
-phase 0's first action answers it in about 30 seconds.
+**None. Every open question has been closed.** The design is decided end to end; what
+remains is execution, and phase 0 is the first thing to run.
 
-1. **Does `interface:` pinning work for `socket:` networks?** (§1.4 fix 1, answered by
-   pre-check A in §3.1.) The evidence in §1.4 is structural and converging, not observed.
-   A negative answer changes *how* phase 1 pins slot identity — an explicit slot→NIC
-   translation layer instead of the `interface:` key — but not the design's direction.
-   **Answered by phase 0; do not guess it, run the check.**
+Two caveats, so "no open questions" is not read as "nothing left to find out":
+
+- **One assumption is still unverified** — that `cidata.iso` regenerates on every VM
+  start (§2.7). It is not an open *question* in the sense of an undecided design choice;
+  it is a fact about Lima that pre-check B checks in 30 seconds. A negative answer costs
+  bounce-to-resize, which this version does not build anyway.
+- **The gate itself can still change the answer.** Phase 0 exists precisely because the
+  egress question is unproven. A red gate routes to §3.8 — and outcome (c) reopens the
+  whole decision, not merely a question within it.
 
 ### Previously open, now decided
 
@@ -2031,6 +2103,7 @@ named, not here.
 | Gate harness form and lifetime | **A throwaway shell script**, executed once in phase 0 and **deleted at that phase's exit**; phase 6's retargeted e2e suite owns ongoing regression coverage, and a parallel bespoke harness would be a second system that can disagree with it | §3 *Form and lifetime*; phase 0 files + exit |
 | Per-operator gateway VM naming | **`sandboxd-gateway-<operator_uid>`** — keeps the greppable prefix, encodes the owner, structurally cannot match the `sandbox-<12hex>` session grammar; paired with an **explicit** reaper exclusion rather than reliance on the parse failing | §2.6; phase 2 files + criteria |
 | Which second uid plays "operator B" | **Fix issue #85 first**, then a dedicated test-operator account in the proper group; adding another member to Apple's reserved gid 60 was rejected as making #85 worse | §3.7; [Before you start](#before-you-start); phase 0 Part B |
+| Does `interface:` pinning work on `socket:` networks | **Yes — verified**, and it is a real fd-level binding rather than a relabel. Brings two obligations with it: the generator must guard the `lima<slot>` correspondence itself (Lima does not), and `UNIX_PATH_MAX` bounds how deep a LIMA_HOME may sit | §1.4 fix 1 + fix 1a; §2.8; phase 1 criteria |
 
 ---
 
