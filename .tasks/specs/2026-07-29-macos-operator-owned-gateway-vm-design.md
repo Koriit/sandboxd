@@ -28,8 +28,9 @@ and assumes **no** prior knowledge of this codebase.
   — each phase links back to the design sections it implements.
 - **[§5](#5-deltas-corrections-and-related-issues)** records accepted security
   deltas and the corrections issue #82 itself needs.
-- **[Open questions](#open-questions)** are genuinely undecided. Do not invent
-  answers; raise them.
+- **[Open questions](#open-questions)** now holds a single empirical question that
+  phase 0 answers in 30 seconds, plus a trail of the decisions already made and where
+  each one lives. Do not re-litigate the settled ones; do not guess the open one.
 
 Every claim cites a `file:line` in this repository. Line numbers are against `master`
 @ `7e5fa0c`. Where a line may have moved, the code is quoted inline so you can
@@ -321,6 +322,20 @@ If the account is missing, run `scripts/install.sh` first. If the installed plis
 account first, regenerate the plists, then **reboot or explicitly reload the jobs**
 rather than trusting the green exit.
 
+**This warning has a resolution path — it is not a permanent dead end.** Repairing the
+host per issue #85 (create the real `_sandboxd` account, regenerate the vmnet plists
+correctly, reload) is what makes `make setup-dev-env` safe to run again. Do that rather
+than working around it.
+
+**That repair is also a prerequisite for part of phase 0.** The second-operator isolation
+probe (§3.7) needs a purpose-made test-operator account in the **correct** group. Adding
+another member to Apple's reserved `_sandbox` (gid 60) was considered and **rejected** —
+it deepens exactly the problem #85 describes. Fix #85, then create a dedicated
+test-operator account in the proper group.
+
+**The single-operator half of the gate does not need any of this** and can proceed on the
+host as it stands.
+
 ### Gateway VM state
 
 The gateway VM is often stopped; egress work needs it running:
@@ -384,7 +399,7 @@ here rather than documented away.
 
 | Phase | Goal | Gated on |
 |---|---|---|
-| **0** | Pre-checks + egress validation gate | — |
+| **0** | Pre-checks + egress validation gate | single-operator half: nothing. **Second-operator isolation probe: issue #85 fixed first** |
 | **1** | Per-operator slot partitioning | 0 green |
 | **2** | Per-operator gateway VM ownership | 1 |
 | **3** | Docker broker ops + brokered streams | 2 |
@@ -705,16 +720,23 @@ trusted party in the model. **This holds even if the permissions were different.
 independently fragile as a source of truth too: `lima.yaml` is Lima's file with Lima's
 schema, not sandboxd's.
 
-**Decision: the daemon assigns the range and persists it itself.** Two candidate
-locations, both daemon-owned and both requiring no permission change:
+**Decision: the daemon assigns the range and persists it in `sessions.db`, via a
+refinery migration.** An operator-scoped table, added as a new `V<NNN>__<name>.sql` in
+`sandbox-core/migrations/`.
 
-- `sessions.db` — follow `CLAUDE.md` § On-disk compatibility: a new
-  `V<NNN>__<name>.sql` in `sandbox-core/migrations/` for a column, or `Option<T>` +
-  `#[serde(default)]` for a JSON blob field.
-- A daemon-written file under `{state_root}/{daemon_uid}/{op_uid}/`, which is
-  `drwxr-xr-x` daemon-owned.
+Follow the on-disk compatibility discipline in `CLAUDE.md`:
 
-**The choice is open** — see [Open questions](#open-questions).
+- Migrations are **forward-only**; `SessionStore::new` runs every pending one at open.
+- Never drop a column without verifying no older daemon needs it.
+- Any new JSON blob field is `Option<T>` + `#[serde(default)]`, so a record written by a
+  newer daemon still deserializes after a rollback.
+
+The alternative considered was a daemon-written file under
+`{state_root}/{daemon_uid}/{op_uid}/` (also daemon-owned `drwxr-xr-x`, also needing no
+permission change). It was **rejected**: `sessions.db` is the mechanism the project
+already uses for persistent state, with an established schema-evolution and rollback
+story, whereas a bespoke file would need its own atomic-write and corruption-recovery
+handling — and would put persistent state in two places.
 
 **Documentation correction.** `CLAUDE.md` states the per-operator LIMA_HOME is "owned by
 the operator uid". It is **daemon-owned with a single non-inheriting operator ACE**. The
@@ -915,8 +937,25 @@ per-operator naming scheme happens to parse, the reaper classifies it `Reap` and
 enumerates the daemon's own uid as an "operator uid", because the gateway's LIMA_HOME is
 `{state_root}/{daemon_uid}/{daemon_uid}/lima`.
 
-**Add an explicit exclusion.** Do not rely on a name-shape accident. The naming scheme
-itself is undecided — see [Open questions](#open-questions).
+**Naming decision: `sandboxd-gateway-<operator_uid>`.** It keeps the existing
+`sandboxd-gateway` prefix, so the VM stays greppable and instantly recognisable in
+`limactl list` output and in logs; it encodes the owner; and it **structurally cannot
+match** the session grammar, which requires the `sandbox-` prefix followed by a parseable
+12-hex session id.
+
+**Pair it with an explicit reaper exclusion.** Do **not** rely on the parse failing —
+that reliance is precisely the accident that makes today's arrangement a landmine, and a
+future change to either the session-id grammar or the gateway naming scheme would arm it
+silently. `decide_lima_vm` (`lima.rs:350`) must recognise and skip gateway instances by
+name prefix, deliberately.
+
+**Consequence for daemon-side data structures.** The instance name alone is no longer
+unique in the way daemon-side code may assume: two operators' gateway VMs have distinct
+names, but they live in **different LIMA_HOMEs**, and a name is only meaningful together
+with the LIMA_HOME it resolves in. Any daemon-side map keyed on instance name must
+therefore be keyed by **(operator uid, name)** — or simply by operator uid, since each
+operator has exactly one gateway VM. Audit for name-keyed lookups when implementing
+phase 2.
 
 ### 2.7 Bounce-to-resize: available, deliberately unbuilt
 
@@ -988,8 +1027,34 @@ instead of the daemon?*
 real sessions, **no** session store, **no** `shared:` mounts. Stand the topology up by
 hand as an operator uid, assert, tear down.
 
-**Not wired into the pytest e2e suite.** It is a decision instrument with a different
-lifetime and audience from the regression suite. The suite's own retarget is phase 6.
+### Form and lifetime: a throwaway shell script
+
+**The gate is a one-off shell script that answers one question and is then deleted.** It
+is not a regression harness, it is not wired into the pytest suite, and it is not
+maintained.
+
+The reasoning: **phase 6 retargets the real e2e suite and runs continuously**, so
+regression coverage during the migration already has an owner. Building a parallel
+bespoke harness would mean maintaining two systems that can disagree about what "egress
+is enforced" means — and when they disagree, you have to work out which one is wrong
+before you can act on either.
+
+So:
+
+- Section 3 is a procedure **executed once, during phase 0**. Its findings are recorded
+  in this spec and on issue #82 — the *findings* are the durable artifact, not the code.
+- The script **may be committed during phase 0** for reproducibility while the question
+  is live. **Deleting it is part of phase 0's exit.** Nobody should inherit it as a
+  maintenance burden.
+- Step 6 copies the nft ruleset out of `generate_dnat_ruleset` (`gateway.rs:1616`) as
+  literal text. **In any durable artifact that copy would be a drift hazard** — the
+  generator is the source of truth and a hand-maintained duplicate silently rots. It is
+  acceptable here **only** because the script's lifetime is measured in days. That
+  trade-off is exactly why it must not be kept: the moment it outlives the question, the
+  copy becomes a liability.
+
+Ongoing egress regression coverage is phase 6's job, against the retargeted e2e suite —
+not this script's.
 
 Set these once; every command below uses them:
 
@@ -1196,8 +1261,8 @@ done
 **Step 6 — inject the nft ruleset and seed the policy artifacts.**
 
 Do **not** hand-write the rules. `generate_dnat_ruleset(vm_subnet, gateway_ip)` is
-`pub` at `gateway.rs:1616` and produces the exact ruleset; a Rust harness calls it
-directly (a strong argument for the Rust option in §3.10). Its output for
+`pub` at `gateway.rs:1616` and produces the exact ruleset — render it once and paste the
+result into the script, rather than paraphrasing it. Its output for
 `vm_subnet=10.211.0.0/28`, `gateway_ip=10.211.0.2`:
 
 ```
@@ -1436,13 +1501,21 @@ demonstrated. The in-tree precedent for the mechanism is
 inter-slot L2 isolation for the singleton case; the gate extends it to two
 independently-owned VMs.
 
-⚠️ **Environment dependency:** this needs a second uid enrolled in the vmnet socket group
-and able to run `limactl`. See [Open questions](#open-questions) — on the reference host
-the obvious candidates are entangled with issue #85.
+⚠️ **Prerequisite: issue #85 must be fixed first.** This probe needs a second uid enrolled
+in the vmnet socket group and able to run `limactl`, and the reference host cannot supply
+one honestly today: its plists are pre-rename, the real `_sandboxd` account does not
+exist, and the existing candidates are enrolled in Apple's reserved `_sandbox` (gid 60).
+
+The decided path is **repair, not workaround**: fix #85 (create `_sandboxd`, regenerate
+the plists correctly, reload), then create a **dedicated test-operator account** in the
+proper group. Adding another member to gid 60 was rejected — it makes #85 worse.
+
+**Sequencing consequence:** §3.1–§3.6 (the single-operator gate) can run before #85 is
+fixed; this section cannot. Phase 0's acceptance criteria are split accordingly.
 
 ### 3.8 Failure discrimination — a red run must say which
 
-The gate is worthless if a red result cannot be attributed. Structure the harness so its
+The gate is worthless if a red result cannot be attributed. Structure the script so its
 output names one of these three:
 
 | Outcome | Signature | Effect on the decision |
@@ -1466,22 +1539,12 @@ limactl shell "$GW" -- docker network rm gate-session sandboxd-egress || true
 limactl stop --force "$GW" && limactl delete "$GW"
 ```
 
-The gate must be re-runnable: teardown is idempotent and **must not touch
-`sandboxd-gateway` or any real instance**.
+Teardown is idempotent, so a failed run can be cleaned up and the procedure repeated
+while the question is still live. It **must not touch `sandboxd-gateway` or any real
+instance**.
 
-### 3.10 Harness form — open
-
-Three candidates; **the choice is open** (see [Open questions](#open-questions)).
-Decision inputs:
-
-| Option | For | Against |
-|---|---|---|
-| **Shell under `tests/`** | lowest ceremony; matches what the work actually is | must hand-render the nft ruleset and the Envoy/CoreDNS artifacts, and keep them in sync with `gateway.rs` by hand |
-| **Python outside the pytest suite** | reuses assertion idioms and `_BLOCK_CURL_EXITS` without inheriting conftest's daemon/host-Docker assumptions | same rendering-drift problem as shell |
-| **Rust `integration_*` test** | calls `generate_dnat_ruleset` (`gateway.rs:1616`) and `generate_gateway_template` (`gateway_lima.rs:334`) **directly**, so the rules cannot drift; reuses `DirectLimaExecutor` and `build_test_manager` (`sandbox-core/tests/integration_gateway_lima.rs:45, 123`) and the shipped `sandbox-core/src/test_support/direct_executor.rs`; gets the `integration` nextest profile for free | heaviest to iterate on; the two-uid case in §3.7 is awkward inside one test process |
-
-The rendering-drift argument is strong: step 6's ruleset and the policy artifacts are
-generated code today, and a hand-maintained copy in a shell script will silently rot.
+When the question is answered, **delete the script** (see
+[Form and lifetime](#form-and-lifetime-a-throwaway-shell-script)).
 
 ---
 
@@ -1504,14 +1567,27 @@ otherwise phases 1–4 look like no progress at all.
 **Goal.** Answer whether egress remains enforced when the gateway VM is operator-owned,
 before committing to the migration.
 
-**Depends on.** Nothing. Requires the environment in
-[Before you start](#before-you-start).
+**Depends on.**
+
+- **Single-operator gate (§3.1–§3.6):** nothing beyond the environment in
+  [Before you start](#before-you-start). It can run on the host as it stands.
+- **Second-operator isolation probe (§3.7): issue #85 must be fixed first** — create the
+  real `_sandboxd` account, regenerate the vmnet plists correctly, then add a dedicated
+  test-operator account to the proper group. This is a prerequisite, not a related
+  concern.
+
+Phase 0 is therefore **partially runnable immediately**; do not read it as fully blocked.
 
 **Implements.** §3.
 
-**Files.** New harness only (location open, §3.10). **No production code changes.**
+**Files.** One throwaway shell script. **No production code changes.** The script may be
+committed for reproducibility while the question is live, and **deleting it is part of
+this phase's exit** — see
+[Form and lifetime](#form-and-lifetime-a-throwaway-shell-script).
 
 **Acceptance criteria.**
+
+**Part A — runnable immediately (no #85 dependency).**
 
 - [ ] Pre-check A (§3.1) run; result recorded as "`interface:` honoured for `socket:`
       networks: yes/no". If no, phase 1's scope is updated before it starts.
@@ -1519,14 +1595,29 @@ before committing to the migration.
 - [ ] Host `net.inet.ip.forwarding` recorded (not gated on, §3.2).
 - [ ] Single-VM gate: assertions 1–4 (§3.6) all pass, **in that order**, with §3.5's
       route verified before assertion 1 runs.
-- [ ] Second-operator probe (§3.7): all three assertions pass.
-- [ ] The harness is re-runnable — a second consecutive run passes with no manual
-      cleanup — and its teardown touches no real instance.
 - [ ] A deliberately broken run (skip §3.5) produces a **red** result, not a green one.
       *Test your test.*
 - [ ] Any red result names outcome (a), (b) or (c) per §3.8.
+- [ ] Teardown leaves no residue and touches no real instance.
 
-**Exit.** Green → phase 1 starts. Red → route per §3.8; only (c) kills the decision.
+**Part B — gated on issue #85 being fixed.**
+
+- [ ] `_sandboxd` account exists, vmnet plists regenerated correctly and reloaded, and a
+      **dedicated test-operator account** exists in the proper group (not gid 60).
+- [ ] Second-operator isolation probe (§3.7): all three assertions pass — in particular
+      that neither VM can see the other's segment.
+
+**Exit (both parts).**
+
+- [ ] Findings recorded in this spec and on issue #82. The findings are the durable
+      artifact.
+- [ ] **The gate script is deleted.** It is not carried into phase 1 and not inherited by
+      anyone (see [Form and lifetime](#form-and-lifetime-a-throwaway-shell-script)).
+
+Green → phase 1 starts. Red → route per §3.8; only (c) kills the decision.
+
+Part A alone is enough to detect outcome (c) — the decision-killing one — so a green Part
+A is a meaningful intermediate result even while Part B waits on #85.
 
 ---
 
@@ -1554,7 +1645,7 @@ translation layer).
 | `sandboxd/src/error.rs:57-79` | new `SandboxError` variant → `429` (per-operator exhaustion) + new arm in `error_response`; **reuse** existing `Conflict → 409` (`:69`) for range-unavailable |
 | `sandbox-core/src/network.rs:1161-1176`, `:1208-1213` | rewrite the exhaustion message (§2.2 condition 1) |
 | range-claim path (new) | first-claim-wins; `Conflict` with pool size + holder + remediation when no disjoint range is available (§1.3, §2.2 condition 2) |
-| persistence | range record — `sessions.db` migration **or** `{state_root}/{daemon_uid}/{op_uid}/` file (**open**, §2.1) |
+| `sandbox-core/migrations/V<NNN>__<name>.sql` (new) | operator-scoped range table in `sessions.db`; forward-only, `#[serde(default)]` on any new blob field for rollback safety (§2.1) |
 | `sandbox-core/src/gateway_lima.rs:2502-2543` | NicMap tests follow the re-keying |
 
 **Acceptance criteria.**
@@ -1611,8 +1702,9 @@ the broker.
 | `sandbox-core/src/gateway_lima.rs:771-2272` | `GatewayLimaManager` takes an `op_uid`; the six executor calls (`:1245, 1323, 1362, 1931, 2122, 2164`) pass the operator uid |
 | new | `GatewayLimaManagerRegistry`, modelled on `LimaManagerRegistry` (`lima.rs:1245-1280`) |
 | `sandbox-core/src/gateway_lima.rs:672` | `apply_limactl_env` — operator LIMA_HOME |
-| `sandbox-core/src/gateway_lima.rs:84` + 14 use sites | per-operator instance naming; **must fail `parse_session_id_from_name` (`lima.rs:4202`)** |
-| `sandbox-core/src/lima.rs:350` (`decide_lima_vm`) | **explicit** gateway exclusion, not a name-shape accident |
+| `sandbox-core/src/gateway_lima.rs:84` + 14 use sites | instance name becomes `sandboxd-gateway-<operator_uid>` (§2.6) |
+| `sandbox-core/src/lima.rs:350` (`decide_lima_vm`) | **explicit** gateway exclusion by name prefix, not reliance on the session-id parse failing |
+| daemon-side name-keyed maps | re-key by operator uid — an instance name is only meaningful with its LIMA_HOME (§2.6) |
 | `sandboxd/src/main.rs:1339`, `:1349`, `:1373` | `AppState` — pool, manager and recovery latch become uid-keyed |
 | `sandbox-core/src/gateway_recovery.rs:247-250` | operator scope + per-operator latch |
 | `sandboxd/src/main.rs:12766`, `:12910` | `recover_gateway_lima` / `gateway_lima_monitor` — per-operator |
@@ -1640,9 +1732,15 @@ the broker.
 - [ ] Killing an operator's agent mid-`limactl start` leaves recoverable state: the VM
       either exists and is usable, or is absent and re-creatable. No stranded half-state
       (§2.5).
+- [ ] The gateway VM is named `sandboxd-gateway-<operator_uid>`, and a **deliberate**
+      reaper exclusion (not the session-id parse failing) is what protects it. Assert by
+      changing the exclusion and watching the reap test fail.
 - [ ] `cargo nextest run --workspace --profile integration` passes (Docker required).
-- [ ] The §3 gate, re-run against a VM created in this new shape, still passes all four
-      assertions.
+- [ ] Egress enforcement is re-verified on the new shape. **The §3 gate script no longer
+      exists** — it was deleted at the end of phase 0 — so this is covered by the
+      retargeted e2e tests (phase 6), which is why phase 6 runs continuously rather than
+      at the end. If phase 6's macOS egress coverage is not yet in place when phase 2
+      lands, that is the thing to build; do not resurrect the throwaway script.
 
 ---
 
@@ -1905,41 +2003,34 @@ Two counterweights, for honesty: `gateway_recovery.rs` is far cheaper than #82 s
 |---|---|
 | **#83** — gateway-VM recovery skips container-backend sessions (`gateway_recovery.rs:77-82`) | **Blocks bounce-to-resize** (§2.7). Bouncing an operator's VM kills their lite sessions and those are never recovered — containers are `--restart no` (`container.rs:853-854`). |
 | **#84** — `linux_only` declared and enforced but applied to zero tests | **Phase 6 depends on it.** `make test-e2e-macos SCOPE=full` currently collects the whole Linux-authored matrix on macOS. Close it first. |
-| **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **Actively dangerous, and directly in phase 0's path.** See [Before you start](#before-you-start). The failure is deferred to the next boot and takes the whole vmnet pool down. |
+| **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **A prerequisite, not merely related.** The second-operator isolation probe (§3.7) cannot run until it is fixed, because the host has no honest second operator to offer: pre-rename plists, no real `_sandboxd` account, and the existing candidates enrolled in Apple's reserved gid 60 (adding another there was rejected — it deepens the same problem). Fixing it is also what makes `make setup-dev-env` safe again. **The single-operator gate does not depend on it.** See [Before you start](#before-you-start). |
 
 ---
 
 ## Open questions
 
-Do not invent answers to these. Raise them.
+**One question remains open, and it is deliberately open rather than undecided.** It
+cannot be settled by discussion — it is an empirical fact about Lima's behaviour, and
+phase 0's first action answers it in about 30 seconds.
 
-*Previously open, now decided: the quota model. Resolved 2026-07-30 as first-claim-wins
-with an explicit 409 for a second operator — the decision lives in §1.3, its error
-shapes in §2.2, and its acceptance criteria in phases 1 and 2.*
+1. **Does `interface:` pinning work for `socket:` networks?** (§1.4 fix 1, answered by
+   pre-check A in §3.1.) The evidence in §1.4 is structural and converging, not observed.
+   A negative answer changes *how* phase 1 pins slot identity — an explicit slot→NIC
+   translation layer instead of the `interface:` key — but not the design's direction.
+   **Answered by phase 0; do not guess it, run the check.**
 
-1. **Range persistence location** (§2.1) — `sessions.db` (refinery migration or
-   `Option<T>` + `#[serde(default)]` blob field) versus a daemon-written file under
-   `{state_root}/{daemon_uid}/{op_uid}/`. Both are daemon-owned and both satisfy the
-   trust requirement; the trade is schema-evolution cost versus a second persistence
-   mechanism. **Blocks phase 1.**
-2. **Gate harness language and location** (§3.10) — shell under `tests/`, Python outside
-   the pytest suite, or a Rust `integration_*` test. The rendering-drift argument favours
-   Rust. **Blocks phase 0.**
-3. **Does `interface:` pinning work for `socket:` networks?** (§1.4, pre-check A) — the
-   highest-value pre-check. Evidence is structural and converging, not observed. A
-   negative answer changes phase 1's approach but not the design's direction.
-   **Answered by phase 0.**
-4. **Per-operator gateway VM naming scheme** (§2.6) — undecided, and a correctness
-   constraint rather than a cosmetic one: whatever is chosen must provably fail
-   `parse_session_id_from_name` (`lima.rs:4202`) **and** carry an explicit reaper
-   exclusion, so the VM does not survive only by name-shape accident as it does today.
-   **Blocks phase 2.**
-5. **Which second uid plays "operator B" in the gate's second-operator probe** (§3.7) —
-   it must be enrolled in the vmnet socket group and able to run `limactl`. On the
-   reference host the candidate uids qualify against the *currently installed* plists,
-   but those plists are stale and issue #85 means the obvious remediation takes the pool
-   down. Settle the gate's environment prerequisites before writing it.
-   **Blocks phase 0.**
+### Previously open, now decided
+
+Kept as a trail so the reasoning stays traceable. Each decision lives in the section
+named, not here.
+
+| Question | Resolution | Where it lives |
+|---|---|---|
+| Quota model — what happens when a second operator arrives | **First-claim-wins**; the first operator claims the whole pool, multi-operator is opt-in via explicit quota config, and a second operator with no quota is refused | §1.3; error shapes §2.2; criteria phases 1–2 |
+| Range persistence location | **`sessions.db` via a refinery migration** — an operator-scoped table under `sandbox-core/migrations/`; a bespoke file was rejected (it would need its own atomic-write and corruption-recovery story and would split persistent state across two places) | §2.1; migration row in phase 1 |
+| Gate harness form and lifetime | **A throwaway shell script**, executed once in phase 0 and **deleted at that phase's exit**; phase 6's retargeted e2e suite owns ongoing regression coverage, and a parallel bespoke harness would be a second system that can disagree with it | §3 *Form and lifetime*; phase 0 files + exit |
+| Per-operator gateway VM naming | **`sandboxd-gateway-<operator_uid>`** — keeps the greppable prefix, encodes the owner, structurally cannot match the `sandbox-<12hex>` session grammar; paired with an **explicit** reaper exclusion rather than reliance on the parse failing | §2.6; phase 2 files + criteria |
+| Which second uid plays "operator B" | **Fix issue #85 first**, then a dedicated test-operator account in the proper group; adding another member to Apple's reserved gid 60 was rejected as making #85 worse | §3.7; [Before you start](#before-you-start); phase 0 Part B |
 
 ---
 
