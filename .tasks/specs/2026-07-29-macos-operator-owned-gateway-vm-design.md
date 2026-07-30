@@ -470,18 +470,33 @@ sockets are already reachable by every enrolled operator via the socket group.
 - Claimed at **VM creation**, released on **VM deletion**.
 - **Persisted daemon-side.** §2.1 gives two reasons; the second is decisive.
 
-**Quota defaults to the entire pool.** A single-operator host must behave exactly as it
-does today — same 8 concurrent sessions, same slot indices, same segments. Without that
-default, partitioning is a straight concurrency regression: 8 slots across 2 operators
-caps each at 4; across 4 operators, at 2. **Multi-operator partitioning is opt-in via
-explicit configuration**, never an automatic division by the number of enrolled
-operators.
+**Quota defaults to the entire pool, and the first operator to create a gateway VM
+claims all of it.** This is first-claim-wins, and the reason for it is the
+single-operator host: it must behave **exactly** as it does today — same 8 concurrent
+sessions, same slot indices, same segments. Without that default, partitioning is a
+straight concurrency regression: 8 slots across 2 operators caps each at 4; across 4
+operators, at 2.
 
-This is the one place where the default and the disjointness requirement of §1.2
-collide: if operator A holds the whole range and operator B then requests a VM on a
-host with no explicit quota config, both cannot be satisfied. Whether B's create is
-refused with an actionable message or the pool auto-divides (silently halving A) is
-**not settled** — see [Open questions](#open-questions).
+**Multi-operator is opt-in via explicit quota configuration.** In this version there is
+**no automatic rebalancing, no lazy claiming, and no bouncing of an existing operator's
+VM to make room.** (Bounce-driven rebalancing is a plausible future enhancement and is
+explicitly out of scope — §2.7.)
+
+The concrete shape of that quota configuration — which file, which field — is left to
+phase 1 as an implementation detail. Two constraints on it: config files are JSON per
+project convention, and `SANDBOX_MAX_MACOS_SESSIONS` has exactly one parse site today
+(`main.rs:13403-13440`), so the per-operator dimension should land there rather than
+growing a second ingestion path.
+
+**A second operator requesting a gateway VM when no disjoint range is available fails
+explicitly.** This is a *configuration conflict*, not a capacity ceiling; §2.2 gives the
+two distinct error shapes and why they must not be conflated. The error must state:
+
+- how many slots the pool has;
+- that they are already claimed — and by which operator, if the daemon can name it;
+- the remediation: **configure a per-operator quota and recreate the existing VM.**
+
+Someone hitting this must not have to read the source to understand what happened.
 
 Growing the pool toward the 32 the `/24` allows is **one-time privileged installer
 work**, not daemon work. The daemon explicitly refuses to regenerate root-owned
@@ -707,7 +722,23 @@ practical guidance it supports (run test-side `limactl` as the operator, never a
 daemon user) is correct; the mechanism differs, and the difference is exactly what makes
 reason 1 true.
 
-### 2.2 Exhaustion becomes a per-operator condition
+### 2.2 Exhaustion and range conflict — two distinct failures
+
+Partitioning produces **two** client-visible failures that are easy to conflate and
+must not be. They have different causes, different remediations, and different status
+codes.
+
+| # | Condition | Cause | Status | Variant |
+|---|---|---|---|---|
+| 1 | **Per-operator session exhaustion** | the operator *has* a range, but every slot in it is in use | **429 Too Many Requests** | **new** `SandboxError` variant |
+| 2 | **No range available for a new operator** | first-claim-wins (§1.3): the pool is already claimed and no quota config carves out a share | **409 Conflict** | existing `SandboxError::Conflict` |
+
+Condition 1 is a capacity ceiling — wait, or stop a session. Condition 2 is a
+configuration conflict — no amount of waiting fixes it; an administrator must act.
+Returning the same code for both would tell the operator to retry when retrying can
+never work.
+
+#### Condition 1 — per-operator session exhaustion (the existing path, re-shaped)
 
 Three sites build the same error. `claim_lima_slot`'s count cap
 (`network.rs:1161-1166`):
@@ -735,17 +766,33 @@ SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
 Two changes:
 
 1. **Status class → 429.** Capacity exhaustion is a client-visible quota condition, not
-   a server fault, and under partitioning it stops being rare. `429 Too Many Requests`
-   needs a **new `SandboxError` variant** plus an arm in `error_response`.
-   (`SandboxError::Conflict(msg) → 409` already exists at `error.rs:69` and passes its
-   message through verbatim, so a 409 would need no new variant — but 429 is the precise
-   shape and this design takes it.)
+   a server fault, and under partitioning it stops being rare: 8 slots across 2
+   operators means an operator hits it at 4 sessions, across 4 operators at 2.
+   `429 Too Many Requests` needs a **new `SandboxError` variant** plus an arm in
+   `error_response`.
 2. **Rewrite the remediation text.** "set max_macos_sessions in config and restart
    sandboxd" becomes actively misleading once the binding constraint is the operator's
    *share*: raising the host total does not help, and the host total cannot exceed 32
    regardless. The message must distinguish "your share is full" from "the host is
    full", and for the latter point at the privileged pool-regeneration step rather than
    a config edit.
+
+#### Condition 2 — no range available for a new operator (new path)
+
+Raised when an operator without a range requests a gateway VM and first-claim-wins
+(§1.3) has already handed the pool out. **Reuse `SandboxError::Conflict`** — it maps to
+`409` at `error.rs:69` and, like `Network`, passes its message through verbatim, so this
+condition costs no new variant:
+
+```rust
+SandboxError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+```
+
+The message carries the three facts from §1.3 — pool size, that it is already claimed
+(naming the holding operator when the daemon can resolve it), and the remediation
+(configure a per-operator quota, then recreate the existing VM). Do **not** reuse
+condition 1's text: "max concurrent sessions reached" is wrong here, because the
+requester holds no sessions at all.
 
 ### 2.3 Bootstrap gains a login dependency
 
@@ -912,6 +959,23 @@ pub fn sessions_to_recover(all: Vec<Session>) -> Vec<Session> {
 and sandbox containers are created `--restart no` (`backend/container.rs:853-854`), so
 they do not return when the VM's Docker daemon restarts. Until #83 lands, resizing a
 range means restarting the daemon and re-deriving ranges from persisted state.
+
+#### Future enhancement, explicitly out of scope: bounce-driven rebalancing
+
+The mechanism above is exactly what a **rebalancing** policy would need — shrink
+operator A's range by bouncing A's VM so a newly-arriving operator B can be given a
+disjoint share, instead of refusing B under first-claim-wins (§1.3).
+
+**This version deliberately does not do that, and the omission is a decision rather
+than an oversight.** It is gated on issue #83: bouncing an operator's VM kills that
+operator's lite sessions, and container-backend sessions are not recovered today. Until
+that holds, automatic rebalancing would silently destroy running work belonging to an
+operator who did nothing but be first. Refusing B with an actionable 409 (§2.2 condition
+2) is the honest behaviour in the meantime.
+
+Revisit once #83 lands. The pieces it would need — persisted ranges (§2.1), a slot set
+derived at call time (§1.4 fix 3), and self-correcting provision scripts — are all
+already required by this design, so the future work is policy, not plumbing.
 
 ---
 
@@ -1487,8 +1551,9 @@ translation layer).
 | `sandbox-core/src/gateway_lima.rs:1286` | `create_instance` — derive the slot set from the pool **at call time** |
 | `sandboxd/src/main.rs:4362-4370`, `:9884-9896`, `:12811-12820` | replace `unwrap_or_else(\|\| format!("lima{}", …))` with a hard error |
 | `sandboxd/src/main.rs:13403-13440` | `SANDBOX_MAX_MACOS_SESSIONS` parse — add the per-operator quota dimension |
-| `sandboxd/src/error.rs:57-79` | new `SandboxError` variant → `429`; new arm in `error_response` |
-| `sandbox-core/src/network.rs:1161-1176`, `:1208-1213` | rewrite the exhaustion message (§2.2) |
+| `sandboxd/src/error.rs:57-79` | new `SandboxError` variant → `429` (per-operator exhaustion) + new arm in `error_response`; **reuse** existing `Conflict → 409` (`:69`) for range-unavailable |
+| `sandbox-core/src/network.rs:1161-1176`, `:1208-1213` | rewrite the exhaustion message (§2.2 condition 1) |
+| range-claim path (new) | first-claim-wins; `Conflict` with pool size + holder + remediation when no disjoint range is available (§1.3, §2.2 condition 2) |
 | persistence | range record — `sessions.db` migration **or** `{state_root}/{daemon_uid}/{op_uid}/` file (**open**, §2.1) |
 | `sandbox-core/src/gateway_lima.rs:2502-2543` | NicMap tests follow the re-keying |
 
@@ -1507,8 +1572,18 @@ translation layer).
 - [ ] Two pools with disjoint ranges never hand out the same slot index, and a pool
       cannot hand out an index outside its range — **including via
       `restore_from_infos`**.
-- [ ] Exhaustion returns **429** with a message distinguishing "your share" from "the
-      host". Assert the status code, not just the string.
+- [ ] **Per-operator exhaustion returns 429** with a message distinguishing "your share"
+      from "the host". Assert the status code, not just the string.
+- [ ] **Range-unavailable returns 409** — claiming a range for a second operator when
+      none is available yields `Conflict`, and the message names the pool size, that it
+      is already claimed, and the remediation (§1.3). Assert the status code and that
+      the text is **not** condition 1's "max concurrent sessions reached". *Assert this
+      at the range-claim level: phase 1 has no per-operator gateway VM to create yet, so
+      the end-to-end refusal on VM creation is phase 2's criterion.*
+- [ ] The two conditions are distinguishable by status code alone — a client can tell
+      "wait or stop a session" from "an administrator must act" without parsing prose.
+- [ ] **First-claim-wins holds**: the first operator to create a gateway VM is given the
+      whole pool; nothing rebalances it afterwards, and no existing VM is bounced.
 - [ ] **Single-operator behaviour is unchanged**: with default config, one operator still
       gets 8 concurrent sessions and slot indices still start at 0. This is the
       regression that matters most.
@@ -1549,8 +1624,12 @@ the broker.
 
 **Acceptance criteria.**
 
-- [ ] Two operators each get their own gateway VM, in their own LIMA_HOME, with disjoint
-      slot ranges.
+- [ ] **With per-operator quotas configured**, two operators each get their own gateway
+      VM, in their own LIMA_HOME, with disjoint slot ranges.
+- [ ] **With default config** (no quotas), the second operator's gateway-VM create is
+      refused with the **409** of §2.2 condition 2 — first-claim-wins is in force, and
+      operator A's VM is neither bounced nor resized. Assert this explicitly; it is the
+      behaviour a multi-operator host hits first.
 - [ ] `limactl list` as operator A does not show operator B's gateway VM.
 - [ ] With the orphan reaper enabled and a gateway VM running, a full reap cycle **does
       not delete it** — assert explicitly; this is the §2.6 landmine.
@@ -1834,6 +1913,10 @@ Two counterweights, for honesty: `gateway_recovery.rs` is far cheaper than #82 s
 
 Do not invent answers to these. Raise them.
 
+*Previously open, now decided: the quota model. Resolved 2026-07-30 as first-claim-wins
+with an explicit 409 for a second operator — the decision lives in §1.3, its error
+shapes in §2.2, and its acceptance criteria in phases 1 and 2.*
+
 1. **Range persistence location** (§2.1) — `sessions.db` (refinery migration or
    `Option<T>` + `#[serde(default)]` blob field) versus a daemon-written file under
    `{state_root}/{daemon_uid}/{op_uid}/`. Both are daemon-owned and both satisfy the
@@ -1842,24 +1925,16 @@ Do not invent answers to these. Raise them.
 2. **Gate harness language and location** (§3.10) — shell under `tests/`, Python outside
    the pytest suite, or a Rust `integration_*` test. The rendering-drift argument favours
    Rust. **Blocks phase 0.**
-3. **Quota default value and configuration surface** (§1.3) — "entire pool" is settled as
-   the default; the config shape expressing a non-default per-operator quota is not.
-   Config files are JSON per project convention; `SANDBOX_MAX_MACOS_SESSIONS` has one
-   parse site (`main.rs:13403-13440`). **Sub-question, and the sharper one: what happens
-   when a second operator requests a VM on a host with no explicit quota config** —
-   refuse with an actionable message, or auto-divide and silently halve the first
-   operator's concurrency? The default and the disjointness requirement cannot both hold.
-   **Blocks phase 1.**
-4. **Does `interface:` pinning work for `socket:` networks?** (§1.4, pre-check A) — the
+3. **Does `interface:` pinning work for `socket:` networks?** (§1.4, pre-check A) — the
    highest-value pre-check. Evidence is structural and converging, not observed. A
    negative answer changes phase 1's approach but not the design's direction.
    **Answered by phase 0.**
-5. **Per-operator gateway VM naming scheme** (§2.6) — undecided, and a correctness
+4. **Per-operator gateway VM naming scheme** (§2.6) — undecided, and a correctness
    constraint rather than a cosmetic one: whatever is chosen must provably fail
    `parse_session_id_from_name` (`lima.rs:4202`) **and** carry an explicit reaper
    exclusion, so the VM does not survive only by name-shape accident as it does today.
    **Blocks phase 2.**
-6. **Which second uid plays "operator B" in the gate's second-operator probe** (§3.7) —
+5. **Which second uid plays "operator B" in the gate's second-operator probe** (§3.7) —
    it must be enrolled in the vmnet socket group and able to run `limactl`. On the
    reference host the candidate uids qualify against the *currently installed* plists,
    but those plists are stale and issue #85 means the obvious remediation takes the pool
