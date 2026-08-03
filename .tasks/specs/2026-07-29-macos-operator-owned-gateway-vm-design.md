@@ -28,6 +28,9 @@ and assumes **no** prior knowledge of this codebase.
   — each phase links back to the design sections it implements.
 - **[§5](#5-deltas-corrections-and-related-issues)** records accepted security
   deltas and the corrections issue #82 itself needs.
+- **⚠️ §1.6 documents an active, exploitable defect on `master` that has no tracker
+  issue** — this spec is its only record. If you read nothing else, read that. Its fix is
+  independently shippable ahead of the rest of this design.
 - **[Open questions](#open-questions)** holds five undecided items, each tagged with the
   phase it blocks, plus a trail of the decisions already made and where each lives. **Do
   not start a phase whose blocking question is open.**
@@ -578,11 +581,19 @@ placeholder-write invariant that lets a partial-create rollback always free its 
 segments and distinct `/29`s regardless of who consumes them. That removes the
 *addressing collision* described in [Decision and sequencing](#decision-and-sequencing).
 
-**It does not remove the exposure.** Every enrolled operator can open every slot socket
-today, so the pool assignment described above is **daemon-side bookkeeping, not an access
-control**. An earlier draft of this spec filed that fact as a cost saving ("no privileged
-work needed — the sockets are already reachable by every enrolled operator"). That is
-backwards: it stated the vulnerability and counted it as a benefit. §1.6 is the fix.
+**It does not remove the exposure, and the exposure is a live defect.** Every enrolled
+operator can open every slot socket on `master` today, so the pool assignment described
+above is **daemon-side bookkeeping, not an access control**. On a host with two or more
+enrolled operators that is exploitable now, and the consequence is that one operator can
+void another's egress policy.
+
+An earlier draft of this spec filed that fact as a cost saving — "no privileged work
+needed, the sockets are already reachable by every enrolled operator". That is backwards:
+it stated the vulnerability and counted it as a benefit.
+
+**§1.6 carries the full defect record** — mechanism, impact, fix and test. **It is not
+filed as a tracker issue, so that section is the only record**, and its fix is
+independently shippable ahead of the rest of this design.
 
 ### 1.3 Range assignment, lifetime and quota
 
@@ -940,7 +951,31 @@ sibling defect" four lines after arguing against precisely that error. It is not
 
 ### 1.6 Per-operator socket groups — what makes the partition real
 
-**The problem.** `generate_vmnet_plist` (`network.rs:999`) hardcodes one group for every
+> ### ⚠️ ACTIVE DEFECT ON `master` — and this document is its only record
+>
+> **There is no tracker issue for this.** It was found during the review of this design
+> and deliberately recorded here rather than filed, so §1.6 has to carry the whole
+> analysis: the mechanism, the impact, the fix, and how to test it.
+>
+> **Status: exploitable today**, on any host with two or more enrolled operators, against
+> `master`. It is **not** introduced by this design — see *Provenance* below. If you are
+> reading this after the migration landed, do not conclude the operator-owned VM work
+> caused it.
+>
+> **Impact:** an operator can place themselves on another operator's isolated L2 segment
+> and become the next hop for that operator's sandbox traffic. **The victim's egress
+> policy is void** — traffic leaves through the attacker's unfiltered uplink instead of
+> the victim's gateway container, and their TLS is terminated by the attacker. Nothing in
+> the victim's session, in the daemon, or in the deny-event stream reflects it. That is a
+> direct failure of the project's stated core promise.
+>
+> **The fix in this section is independently shippable.** Per-operator socket groups plus
+> enrollment-time range assignment depend on **nothing else** in this design — not on
+> ownership, not on the brokered control plane, not on the gate. They can land ahead of
+> the rest of the migration as a standalone fix, and on a multi-operator host they
+> probably should. Everything else here is sequencing; this part is not.
+
+**The mechanism.** `generate_vmnet_plist` (`network.rs:999`) hardcodes one group for every
 slot (`network.rs:1027`):
 
 ```
@@ -958,20 +993,23 @@ The canonical macOS spec confirms there is no second gate: the slot sockets have
 application-layer check, because `socket_vmnet` is a byte pump — the group bit plus the
 `0750` directory traversal **is** the control.
 
-**The attack.** Host with operators A and B; the daemon has assigned `{0..3}` to A and
-`{4..7}` to B; B is running a session on slot 5, so B's VM sits at `10.209.128.44` with
-its default route at B's gateway container `10.209.128.43`.
+**Why that is sufficient to break isolation.** A slot socket is the *entire* admission
+control for its L2 segment. Anything that can `connect(2)` to `slot-N.sock` becomes a
+peer on segment N — a `socket_vmnet` client is just a process speaking a framing protocol,
+so this needs neither a VM nor sandboxd's cooperation. The victim's sandbox VM and its
+gateway container are both addressable on that segment, and the sandbox VM's default route
+points at the gateway container's IP; ordinary L2 address-resolution behaviour is enough
+for a same-segment peer to be believed as that next hop.
 
-A never touches sandboxd. A writes one line of YAML in a private LIMA_HOME —
-`networks: [{socket: /var/run/sandbox/vmnet/slot-5.sock}]` — and starts it. The kernel DAC
-check passes, because A is in `_sandboxd`. A now has an L2 NIC on B's segment, ARP-spoofs
-`10.209.128.43`, becomes B's next hop, and forwards B's traffic out A's own unfiltered
-uplink. **B's egress policy is void and B's TLS is terminated by A**, with nothing in B's
-session, the daemon, or the deny-event stream showing it. A does not even need a VM — any
-process A controls can speak the socket.
+**The consequence, stated without softening:** the victim's traffic can be made to leave
+through the attacker's uplink instead of the victim's gateway container. **The victim's
+egress policy is void, and their TLS is terminated by the attacker.** The victim's
+session, the daemon, and the deny-event stream all continue to look normal, because no
+traffic reaches the enforcement point that would have logged it.
 
-**This is pre-existing, not introduced here.** Operator A can do this today. Two things
-change, and they are why the design must address it rather than inherit it:
+**Provenance — pre-existing, not introduced by this design.** An operator can do this on
+`master` today. Nothing about the operator-owned VM work creates it. Two things change,
+which is why this design must fix it rather than inherit it:
 
 1. **The design claimed to close it.** §5.1's gateway-axis improvement was stated as
    "true with slot partitioning in place". Partitioning the daemon's ledger does not
@@ -1015,6 +1053,28 @@ state inside a daemon process.
 own** slots and misconfigure it. That is inherent to operator ownership and is accepted —
 the boundary this restores is *between* operators, not between an operator and their own
 sessions.
+
+#### Why no existing test catches this, and how to test the fix
+
+**Nothing in the suite can detect it, and the obvious test shape cannot either.** The
+isolation checks that exist — including §3.7's original cross-VM reachability probe —
+stand up two VMs whose configurations were both written by the harness, each given NICs
+only on its own slots, and then confirm they cannot reach each other. Of course they
+cannot: neither was configured to try. **Those assertions measure the daemon's
+configuration, not the boundary**, so they pass whether or not the boundary exists.
+
+`integration_vmnet_inter_slot_l2_isolation` (`network.rs:3021`) has the same shape — it
+establishes that *distinct slots* are distinct segments, which is true and is not the
+question. The question is who may attach to a given slot.
+
+**The test that does detect it is §3.6 assertion 5**, added for exactly this reason: a VM
+configured by its *own owner* to name a slot it was not assigned. That is the only shape
+that exercises the DAC check rather than the bookkeeping.
+
+**To verify a fix:** run assertion 5 as a second operator against a slot belonging to the
+first. It succeeds today — that success *is* the reproduction — and must fail at connect
+once per-operator groups land. §3.8 outcome (d) exists to catch the case where it still
+succeeds afterwards, which would mean the mechanism was applied incompletely.
 
 ---
 
@@ -2649,6 +2709,10 @@ delta runs the **other way**: worse than today, not better.
 An earlier draft attributed the improvement to partitioning as such. Partitioning the
 ledger does not partition the kernel's access control; §1.6 does.
 
+**Until §1.6 ships, the gateway axis is not merely unimproved — it is a live defect**
+(§1.6, §5.4). Do not record a gateway-axis improvement in any external document before
+that lands.
+
 **New delta — the operator uid becomes a path into the enforcement plane.**
 
 This is the largest single change in the document's threat picture and it was previously
@@ -2762,7 +2826,24 @@ against these figures **after** the gate, when phase 3's shape is actually decid
 Two counterweights, for honesty: `gateway_recovery.rs` is far cheaper than #82 suggests
 (correction 6), and the `op_uid` routing change in §1.1 is free.
 
-### 5.4 Related issues
+### 5.4 Related issues, and one that is not an issue
+
+**⚠️ Read this first: the most serious defect this design touches has no tracker entry.**
+
+Cross-operator slot access (§1.6) is an **active, exploitable defect on `master`** with no
+GitHub issue. It was found reviewing this design and deliberately recorded in the spec
+instead. It is therefore absent from every issue list, triage board and search anyone
+would normally use to find it — **which is exactly why it is repeated here**.
+
+| | |
+|---|---|
+| **What** | Every slot plist hardcodes one socket group (`network.rs:1027`) and enrollment adds every operator to it (`scripts/install.sh:2679`), so any enrolled operator can attach to any operator's vmnet slot socket. |
+| **Impact** | The victim's egress policy is void: their traffic can be diverted through the attacker's unfiltered uplink and their TLS terminated, with the daemon and the deny-event stream showing nothing. |
+| **Applies to** | Any host with **two or more enrolled operators**. Single-operator hosts are unaffected in practice. |
+| **Introduced by** | Nothing here — it **predates** this design. |
+| **Fix** | §1.6. **Independently shippable**; depends on no other part of this design. |
+| **Test** | §3.6 assertion 5 (hostile VM). No existing test can detect it — see §1.6. |
+| **Record** | §1.6 is the only one. If this design is abandoned, the defect and its analysis must be carried somewhere else before this document is. |
 
 | Issue | Bearing |
 |---|---|
