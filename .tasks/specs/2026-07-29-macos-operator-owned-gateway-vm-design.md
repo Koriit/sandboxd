@@ -1544,30 +1544,36 @@ So:
 - The script **may be committed during phase 0** for reproducibility while the question
   is live. **Deleting it is part of phase 0's exit.** Nobody should inherit it as a
   maintenance burden.
-- Step 6 copies the nft ruleset out of `generate_dnat_ruleset` (`gateway.rs:1616`) as
-  literal text. **In any durable artifact that copy would be a drift hazard** — the
-  generator is the source of truth and a hand-maintained duplicate silently rots. It is
-  acceptable here **only** because the script's lifetime is measured in days. That
-  trade-off is exactly why it must not be kept: the moment it outlives the question, the
-  copy becomes a liability.
+- **The script hand-writes everything it needs** — the Lima YAML and the nft rulesets are
+  literal text in the script, copied from the generators once. **In any durable artifact
+  those copies would be drift hazards**; they are acceptable here *only* because the
+  script's lifetime is measured in days, which is exactly why it must not be kept.
 
-Ongoing egress regression coverage is phase 6's job, against the retargeted e2e suite —
-not this script's.
+Ongoing egress regression coverage is phase 6's job — specifically its durable
+bypass-resistance test — not this script's.
 
 Set these once; every command below uses them:
 
 ```bash
 export OP_UID=$(id -u)
-export LIMA_HOME=/var/lib/sandboxd/<daemon_uid>/${OP_UID}/lima
+export LIMA_HOME=/var/lib/sandboxd/<daemon_uid>/${OP_UID}/lima   # resolve per Before you start
 export GW=egress-gate-${OP_UID}      # throwaway VM name — never `sandboxd-gateway`
 ```
+
+⚠️ **Resolve `<daemon_uid>` deliberately** — see [Before you start](#before-you-start).
+Creating this VM under the e2e harness daemon's uid puts it in a tree that
+`conftest.py:1049-1062` sweeps destructively.
 
 ### 3.1 Pre-checks
 
 Two were originally scoped here. **A is already answered** — its result is folded into
-§1.4 and shaped phase 1, so there is nothing to run. **B is still outstanding**, takes
-about 30 seconds, and should be done before §3.4 so its answer is on record while the VM
-lifecycle is being exercised anyway.
+§1.4 and shaped phase 1, though note its two limits there (bare `limactl`, not the broker
+path; Lima 2.1.2, not the declared 1.2.0 floor). **B is still outstanding**, takes about
+30 seconds, and should be done before §3.4.
+
+**Pre-check C (§2.9) also belongs here** — does an operator's VM survive logout? Create a
+VM, log the operator out, log back in, observe whether QEMU survived and whether the agent
+re-registers. It decides whether §2.4 and one §5.1 delta describe a real state.
 
 #### Pre-check A — ✅ ALREADY ANSWERED, do not re-run
 
@@ -1576,10 +1582,11 @@ lifecycle is being exercised anyway.
 the `lsof` fd-correlation chain proving it binds rather than merely relabels — is in
 §1.4 fix 1.
 
-Nothing to run here. Two things it produced that phase 1 must carry:
+Nothing to run here. Three things it produced that later phases must carry:
 
-- §1.4 **fix 1a** — the generator must assert `interface == format!("lima{slot}")`
-  itself, because Lima validates neither the correspondence nor anything about it.
+- §1.4 **fix 1a** — the generator must assert `interface == format!("lima{slot}")` itself,
+  because Lima validates neither the correspondence nor anything about it.
+- §1.1a — the **agent** must assert the same thing, and today rejects the key outright.
 - §2.8 — the `UNIX_PATH_MAX` path-depth constraint, found while setting this up.
 
 #### Pre-check B — does `cidata.iso` regenerate on every start?
@@ -1597,27 +1604,37 @@ stat -f %m "$LIMA_HOME/$INST/cidata.iso"       # compare
 - **If unchanged:** bounce-to-resize (§2.7) is not viable as described; a NIC-set change
   would need instance recreation. Record it; it does not block the gate.
 
-### 3.2 Not a precondition: `net.inet.ip.forwarding`
+### 3.2 Host IP forwarding — record it, and know what it means
 
-The macOS daemon refuses to start when host IP forwarding is enabled. **Do not make that
-a gate precondition.** There is a separate ticket to remove the requirement, and holding
-the gate to a condition intended to disappear would encode a dependency this design does
-not want.
+⚠️ **An earlier draft of this section had the premise backwards.** It said the daemon
+refuses to start when host IP forwarding is enabled and that a ticket existed to remove
+that requirement. **The requirement was already removed**, and the ticket tracks the
+*unfixed bypass the check used to paper over*:
 
-Record it, do not gate on it:
+> `NOTE(#80): Host IP forwarding is no longer gated here. A root sandbox guest can bypass
+> the gateway by routing via the host bridge when the host has IP forwarding + NAT (e.g.
+> Internet Sharing) enabled. This is a known open issue; the structural fix is deferred
+> and tracked in #80.`
+>
+> — `sandboxd/src/main.rs:13344-13347`, repeated at `sandbox-core/src/macos_session.rs:744-748`
+
+So: **host IP forwarding is a live, unfixed egress bypass (#80)** for the **full**
+backend, where sessions sit on a host-visible segment. It is out of scope for this gate,
+which builds a lite-shaped topology with no host bridge in the path.
+
+Record the values as interpretive context; do not gate on them:
 
 ```bash
-sysctl net.inet.ip.forwarding net.inet6.ip6.forwarding   # log the values
+sysctl net.inet.ip.forwarding net.inet6.ip6.forwarding
 ```
 
-Report them alongside the result as interpretive context. No hard fail, no design
-weight.
+Carry the correct model into phase 4: this is a known hole, not a retired concern.
 
 ### 3.3 What the gate builds
 
 The topology mirrors the **lite** shape (an in-VM Docker bridge), not the full-backend
 macvlan shape — lite sessions consume no vmnet NIC, and the question is about the VM's
-ownership, not about macvlan.
+ownership.
 
 ```
   operator-owned Lima VM ($GW)
@@ -1634,7 +1651,12 @@ ownership, not about macvlan.
 ```
 
 The probe container stands in for a sandbox container. Its default route must point at
-`.2`, not at `.1` — see 3.5, which is the step everything hinges on.
+`.2`, not at `.1` — see §3.5, the step everything hinges on.
+
+**Note for §3.7:** the second-operator probe additionally needs each VM attached to its own
+vmnet slots with **endpoints actually addressed on the `/29`s**, because that is where
+cross-operator isolation lives. The bridge topology above proves egress; it says nothing
+about slots.
 
 ### 3.4 Stand-up
 
@@ -1646,20 +1668,43 @@ export SLOT_SOCK=/var/run/sandbox/vmnet/slot-${SLOT}.sock
 test -S "$SLOT_SOCK" && echo "slot socket present"
 ```
 
-The single-VM case does not strictly need a vmnet NIC (the probe's egress rides the VM's
-slirp `eth0` via the gateway container). The **second-operator probe (3.7) does** —
-distinct segments are the whole point there. Attach one anyway so both paths are the
-same shape.
+**Step 1 — hand-write the Lima YAML, then create and start the VM as the operator.**
 
-**Step 1 — create and start the VM as the operator.**
+⚠️ **Do not try to render this with `generate_gateway_template`.** An earlier draft said
+to, and it cannot work: that function takes `max_slots: u16` rather than a slot set, and
+unconditionally interpolates the 9p stanza (`gateway_lima.rs:349-350`) — both of which are
+phase 1 changes, while this phase forbids production code changes. It is also a
+`#[cfg(target_os = "macos")]` library function with no binary that prints YAML, so a shell
+script cannot call it at all. That instruction was a fossil from when this harness was
+going to be Rust.
 
-Render the template with `generate_gateway_template` using an explicit slot set and
-**the 9p `mounts_stanza` dropped** — the gate does not exercise workspaces, and the
-stanza (`lite_macos.rs:110-115`, interpolated at `gateway_lima.rs:409-415`) would
-require the shared root to exist.
+**Write the YAML literally in the script.** It is a throwaway; a hand-written copy is
+acceptable here and nowhere else. Mirror the real template's load-bearing parts — `vmType:
+"qemu"`, the Ubuntu image, `cpus`/`memory`, one `socket:` entry with its matching
+`interface:`, no `mounts:` stanza — and keep the instance name out of the
+`sandbox-<12hex>` shape.
 
 ```bash
-limactl create --name="$GW" --tty=false /tmp/gate-template.yaml
+cat > /tmp/${GW}.yaml <<YAML
+vmType: "qemu"
+images:
+  - location: "<UBUNTU_NOBLE_ARM64_URL — copy from gateway_lima.rs>"
+    arch: aarch64
+cpus: 2
+memory: "2GiB"
+disk: "20GiB"
+networks:
+  - socket: "${SLOT_SOCK}"
+    interface: "lima${SLOT}"
+portForwards:
+  - guestSocket: "/var/run/docker.sock"
+    hostSocket: "{{.Dir}}/gateway-docker.sock"
+containerd:
+  system: false
+  user: false
+YAML
+
+limactl create --name="$GW" --tty=false /tmp/${GW}.yaml
 limactl start "$GW"
 limactl shell "$GW" -- docker info >/dev/null && echo "docker up"
 ```
@@ -1668,12 +1713,34 @@ limactl shell "$GW" -- docker info >/dev/null && echo "docker up"
   `limactl start` fails on the socket, re-check the socket group
   ([Before you start](#before-you-start)).
 
-**Step 2 — create the two bridges.**
+**Step 2 — get the gateway image into the VM.**
+
+⚠️ **There is no registry, and the VM is brand new.** An earlier draft ended step 3 with
+`sandbox-gateway:<version>` and never said where the image comes from — `docker run` would
+fail with image-not-found.
+
+Production loads a staged tarball: `GATEWAY_IMAGE_TARBALL_FILENAME = "gateway-image.tar"`
+(`gateway_lima.rs:179`), copied in and piped to `docker load` by
+`load_gateway_image_if_needed` (`gateway_lima.rs:957-1121`). The `make` staging targets
+are keyed to the **daemon's** LIMA_HOME and the `sandboxd-gateway` instance name, so they
+do not help here. Do it by hand:
+
+```bash
+make gateway-image                          # build it if you have not
+docker save sandbox-gateway:<version> -o /tmp/gateway-image.tar
+limactl copy /tmp/gateway-image.tar "$GW":/tmp/gateway-image.tar
+limactl shell "$GW" -- docker load -i /tmp/gateway-image.tar
+limactl shell "$GW" -- docker image inspect sandbox-gateway:<version> >/dev/null
+```
+
+Resolve `<version>` from the workspace version in `sandboxd/Cargo.toml`
+(`[workspace.package].version`), which is what drives the runtime image tags.
+
+**Step 3 — create the two bridges.**
 
 ```bash
 limactl shell "$GW" -- docker network create sandboxd-egress || true   # name: gateway_lima.rs:89
 
-# Derive a /28 that does not collide with anything already on the VM:
 limactl shell "$GW" -- docker network ls --format '{{.Name}}' \
   | xargs -I{} limactl shell "$GW" -- docker network inspect {} \
       --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'
@@ -1684,9 +1751,36 @@ limactl shell "$GW" -- docker network create --subnet "$SESSION_NET" gate-sessio
 
 With `10.211.0.0/28`: `.1` is the bridge, `.2` the gateway container, `.3` the probe.
 
-**Step 3 — run the gateway container on the uplink bridge.**
+**Steps 4–10 — mirror the production order exactly.**
 
-Mirror `build_macos_gateway_docker_args` (`macos_session.rs:567-640`):
+⚠️ **The order matters and an earlier draft had it wrong**, waiting for health *before*
+seeding the artifacts Envoy blocks on. `entrypoint.sh:184-190` blocks Envoy on **both**
+the bootstrap and the listener file, with `ENVOY_CONFIG_WAIT_TIMEOUT` defaulting to 30 s
+(`entrypoint.sh:47`) — so the container's own wait expires long before a 120 s health poll
+gives up, and the health check can never pass first. That deadlock is not any of §3.8's
+outcomes; it would have been misattributed.
+
+The production sequence for the lite shape is `setup_macos_lite_gateway`
+(`macos_session.rs:439-544`). Follow it:
+
+| Step | Action | Production reference |
+|---|---|---|
+| 4 | `docker run` the gateway container on `sandboxd-egress` | `macos_session.rs:439` |
+| 5 | **provision the mitmproxy CA** | `provision_mitmproxy_ca`, `:460` |
+| 6 | **write the Envoy static bootstrap** to `/etc/envoy/envoy-bootstrap.yaml` | `PolicyCompiler::compile_envoy_bootstrap`, `:465`; path const `policy.rs:569` |
+| 7 | **write the deny-all Envoy listener** to `/etc/envoy/listeners/listener.yaml` | `:480`; path const `policy.rs:584` |
+| 8 | **write the CoreDNS policy** to `/etc/coredns/policy.conf` | `policy_distributor.rs:151` |
+| 9 | attach the second NIC at `.2` | `docker network connect`, `:523` |
+| 10 | **inject the deny-all base ruleset** | `gm.inject_deny_all`, `:543`; generator `gateway.rs:1554` |
+| 11 | wait for health | `gm.wait_for_components`, `:544` |
+| 12 | inject the DNAT ruleset | `inject_dnat`; generator `gateway.rs:1616` |
+
+**Four artifacts, not two.** An earlier draft listed only the listener and the CoreDNS
+policy. The **Envoy bootstrap** is a third and is what the container actually blocks on;
+the **mitmproxy CA** is a fourth, and while assertion 2 uses plain HTTP, `mitmdump` must be
+running for `/healthcheck.sh` to pass, so a missing CA fails the health wait opaquely.
+
+Step 4's flags mirror `build_macos_gateway_docker_args` (`macos_session.rs:567-640`):
 
 ```bash
 limactl shell "$GW" -- docker run -d --name gw \
@@ -1707,21 +1801,17 @@ limactl shell "$GW" -- docker run -d --name gw \
 
 **`SANDBOX_COREDNS_UPSTREAM` is macOS-specific and load-bearing. Omitting it produces a
 false red on the allow half.** The entrypoint's baked Linux default is `127.0.0.11`
-(`networking/gateway/entrypoint.sh:304`), which is a dead end inside the VM: its own
-upstream — the VM's `127.0.0.53` systemd-resolved stub — does not answer, so an allowed
-domain **SERVFAILs on the forward even though DNS policy admits it**. The rationale is
-spelled out in the code at `macos_session.rs:610-611`.
+(`networking/gateway/entrypoint.sh:304`), a dead end inside the VM: its own upstream — the
+VM's `127.0.0.53` stub — does not answer, so an allowed domain **SERVFAILs on the forward
+even though DNS policy admits it**. Rationale in code at `macos_session.rs:599-610`.
 
-**Step 4 — attach the gateway container's second NIC at `.2`.**
+Step 9:
 
 ```bash
 limactl shell "$GW" -- docker network connect --ip 10.211.0.2 gate-session gw
 ```
 
-**Step 5 — wait for the pipeline to be healthy.**
-
-The image ships the same five component probes the daemon uses
-(`networking/gateway/Dockerfile:148, 174`):
+Step 11:
 
 ```bash
 for i in $(seq 1 60); do
@@ -1730,16 +1820,15 @@ for i in $(seq 1 60); do
 done
 ```
 
-- **Expected:** exit 0 within ~60 s.
-- **Failure signature:** persistent non-zero. Read `docker logs gw` — a CoreDNS failure
-  here usually means step 3's env var was omitted or the image tag is wrong.
+- **Expected:** exit 0 within ~60 s (`networking/gateway/Dockerfile:148, 174`).
+- **Failure signature:** persistent non-zero. Read `docker logs gw`. A stall on "Envoy
+  bootstrap file" or "Envoy listener file" means steps 6–7 were skipped or wrote empty
+  files; a CoreDNS failure usually means step 4's env var was omitted.
 
-**Step 6 — inject the nft ruleset and seed the policy artifacts.**
-
-Do **not** hand-write the rules. `generate_dnat_ruleset(vm_subnet, gateway_ip)` is
-`pub` at `gateway.rs:1616` and produces the exact ruleset — render it once and paste the
-result into the script, rather than paraphrasing it. Its output for
-`vm_subnet=10.211.0.0/28`, `gateway_ip=10.211.0.2`:
+Step 12's ruleset — `generate_dnat_ruleset(vm_subnet, gateway_ip)` is `pub` at
+`gateway.rs:1616`. **Render it once and paste the literal output into the script**; the
+block below is illustrative and elides the real output's comments and multi-line set
+bodies:
 
 ```
 table inet sandbox_dnat {
@@ -1767,27 +1856,10 @@ table inet sandbox_dnat {
 }
 ```
 
-Port constants: DNS `53` (`gateway.rs:248`), Envoy `10000` (`:253`), deny-logger TCP
-`10001` (`:259`), NFLOG group `1` (`:276`).
+Ports: DNS `53` (`gateway.rs:248`), Envoy `10000` (`:253`), deny-logger TCP `10001`
+(`:259`), NFLOG group `1` (`:276`). **The empty sets are the fail-closed default.**
 
-**The empty sets are the fail-closed default** — until a policy lands, every non-53
-packet from the subnet DNATs to the deny-logger.
-
-```bash
-printf '%s' "$RULESET" | limactl shell "$GW" -- docker exec -i gw nft -f -
-```
-
-Two further artifacts are needed before the allow half (assertion 2) can pass. **Read
-the functions that produce them and replicate their output rather than inventing file
-contents:**
-
-- **Envoy listener** — Envoy will not start without one. The daemon seeds a deny-all
-  listener into `/etc/envoy/listeners/` via `docker exec`;
-  `write_listener_into_container` (`sandbox-core/src/atomic_listener_writer.rs:384`).
-- **CoreDNS policy** — written to `/etc/coredns/policy.conf`
-  (`sandbox-core/src/policy_distributor.rs:151`).
-
-**Step 7 — run the probe container.**
+**Step 13 — run the probe container.**
 
 ```bash
 limactl shell "$GW" -- docker run -d --name probe \
@@ -1806,30 +1878,13 @@ limactl shell "$GW" -- sudo nsenter -t "$PROBE_PID" -n \
 ```
 
 **Docker points a container's default route at the bridge `.1`, not at the gateway
-container. Without this step the probe bypasses the gateway entirely and everything
-passes — including the deny assertions, which then prove nothing.**
+container. Without this step the probe bypasses the gateway entirely.**
 
-This is also exactly why the production sandbox container runs `--cap-drop ALL`
-(`backend/container.rs`, `build_create_argv`) and therefore cannot install its own
-route, and why `sandbox-route-helper` exists: on macOS lite the route is installed from
-*outside* the container by `sandbox-route-helper --vm-gateway-mode`
-(`lite_macos.rs:262-277`):
-
-```rust
-vec![
-    "shell".to_string(),
-    gateway_vm_name.to_string(),
-    "--".to_string(),
-    "sudo".to_string(),
-    IN_VM_ROUTE_HELPER_PATH.to_string(),
-    "--vm-gateway-mode".to_string(),
-    vm_pid.to_string(),
-    gateway_ip.to_string(),
-]
-```
-
-invoked at `main.rs:5360-5364` (create) and `main.rs:6091` (restart). The gate's
-`nsenter` stands in for the helper.
+This is also why the production sandbox container runs `--cap-drop ALL` and cannot install
+its own route, and why `sandbox-route-helper` exists: on macOS lite the route is installed
+from *outside* the container by `sandbox-route-helper --vm-gateway-mode`
+(`lite_macos.rs:262-277`), invoked at `main.rs:5360-5364` (create) and `main.rs:6091`
+(restart). The gate's `nsenter` stands in for the helper.
 
 **Verify before asserting anything:**
 
@@ -1840,15 +1895,24 @@ limactl shell "$GW" -- sudo nsenter -t "$PROBE_PID" -n ip route show default
 
 ### 3.6 Assertions — deny first
 
-**The order is a correctness property, not a style preference.** A missing or wrong
-default route makes the **allow** case pass and the **deny** case fail. Asserting deny
-first turns the single most likely harness bug into a loud, immediate failure instead of
-a false green that would authorize weeks of migration on no evidence.
+**The order is a correctness property.** A missing or wrong default route makes the
+**allow** case pass, so asserting deny first turns the most likely harness bug into an
+immediate failure rather than a false green.
+
+⚠️ **That argument only works if the deny assertion discriminates** — and in an earlier
+draft it did not. It accepted `{6, 7, 28, 35, 56}`, borrowed from
+`tests/e2e/test_lite_macos.py:410`, where the set is applied to a **denied domain that
+NXDOMAINs** (exit 6) with DNS in the path. Against an IP literal that breadth is fatal:
+
+| Route | Path | curl |
+|---|---|---|
+| **Correct** (`via .2`) | prerouting DNATs unmatched TCP to the deny-logger (`gateway.rs:1651`), which accepts, logs and **closes with RST** | connect-then-reset → **52 or 56** |
+| **Bypassed** (via `.1`) | Docker NAT → VM slirp → internet → TEST-NET-3 is unrouted | **28** (timeout) or 7 |
+
+Both landed inside the accepted set, so **skipping §3.5 left assertion 1 green** and the
+"test your test" criterion was unsatisfiable.
 
 #### Assertion 1 — deny (run this first)
-
-Load a **CIDR-only** policy that does not cover the probe target, then probe an IP
-literal:
 
 ```bash
 limactl shell "$GW" -- docker exec gw nft add element inet sandbox_dnat \
@@ -1859,41 +1923,42 @@ limactl shell "$GW" -- docker exec probe \
 echo "exit=$?"
 ```
 
-- **Why a CIDR policy rather than an empty one:** a deny that passes because *nothing*
-  is configured is weak evidence. A live policy that simply does not cover the target
-  proves the pipeline is loaded and still denying.
-- **Why an IP literal:** `203.0.113.1` is TEST-NET-3, guaranteed unroutable, and a
-  literal keeps DNS entirely out of the deny path.
-- **Expected exit code:** one of `{6, 7, 28, 35, 56}` — the block signature already in
-  use at `tests/e2e/test_lite_macos.py:410` (`_BLOCK_CURL_EXITS`), covering
-  could-not-resolve / connection-refused / timeout / SSL-connect-error / recv-reset.
-- **Exit 0 means the probe reached the internet. Stop.** Re-check 3.5 first — a wrong
-  default route is by far the most likely cause. If the route is verified correct and
-  this still passes, that is **outcome (c)** in §3.8.
+- **Why a CIDR policy rather than an empty one:** a deny that passes because *nothing* is
+  configured is weak evidence. A live policy that does not cover the target proves the
+  pipeline is loaded and still denying.
+- **Why an IP literal:** `203.0.113.1` is TEST-NET-3, guaranteed unroutable, and it keeps
+  DNS out of the deny path.
+- **Assert `{52, 56}` — connect-then-reset.** A correctly-routed denied connection always
+  reaches the deny-logger and is reset.
+- **Exit 28 (timeout) is a harness failure, not a block.** It means the probe never
+  reached the deny-logger — almost always a wrong or missing default route. Treat it as
+  red and re-check §3.5.
+- **Exit 0** means the probe reached the internet: **outcome (c)** in §3.8.
 
 #### Assertion 2 — allow
 
 ```bash
-# Policy: example.com:80/tcp at transport level (L1).
-# Seed the DNS policy (step 6) and the transport allow tuple, then warm the cache:
 for i in $(seq 1 30); do
   limactl shell "$GW" -- docker exec probe nslookup example.com && break
   sleep 1
 done
+
+# Read back the resolved addresses and add the allow tuple for each:
+#   docker exec gw nft add element inet sandbox_dnat policy_allow_tcp '{ <ip> . 80 }'
 
 limactl shell "$GW" -- docker exec probe \
   curl -sS --max-time 15 http://example.com/
 echo "exit=$?"
 ```
 
-- **The `nslookup` warm-up poll is required, not optional.** L1 transport policy is
-  fail-closed against an empty resolved-IP cache — the allow tuple is keyed on resolved
-  addresses, so the first request can legitimately be denied before DNS propagation
-  lands. The same poll shape is at `tests/e2e/test_lite_macos.py:501-516`.
-- **Expected:** exit `0` **and** `Example Domain` present in stdout. Assert both — exit
-  0 alone can be produced by an unexpected intermediary.
-- **Failure signature — SERVFAIL on an allowed domain:** re-check that
-  `SANDBOX_COREDNS_UPSTREAM` was set in step 3.
+⚠️ **The allow tuple is a third artifact and the ordering is load-bearing** — an earlier
+draft implied step 6 produced it. It cannot: `policy_allow_tcp` is keyed on **resolved
+addresses**, so the real order is *resolve → read the resolved IPs → `nft add element` →
+curl*. The `nslookup` warm-up is not just cache-warming; it is what produces the input to
+the rule you must add.
+
+- **Expected:** exit `0` **and** `Example Domain` in stdout. Assert both.
+- **SERVFAIL on an allowed domain:** re-check `SANDBOX_COREDNS_UPSTREAM` in step 4.
 
 #### Assertion 3 — structural
 
@@ -1901,43 +1966,92 @@ echo "exit=$?"
 limactl shell "$GW" -- docker exec gw nft list ruleset > /tmp/ruleset.txt
 ```
 
-Assert against the same regexes the existing suite uses
-(`tests/e2e/test_networking.py:384, 388, 398, 412`):
+Assert the same regexes the existing suite uses — **all five**, not four. An earlier draft
+omitted `:416`, which is the rule that actually **drops** denied UDP; `:412` only mirrors
+it to NFLOG. A ruleset with the log rule and without the drop rule logs every denied UDP
+packet and forwards it — the worst possible regex to omit from an egress gate.
 
-| Regex | Meaning |
-|---|---|
-| `udp dport 53 dnat` | DNS UDP redirected to CoreDNS |
-| `tcp dport 53 dnat` | DNS TCP redirected to CoreDNS |
-| `meta l4proto 6 dnat` | non-DNS TCP catch-all lands on the deny-logger |
-| `meta l4proto 17 log group 1` | non-DNS UDP mirrored to NFLOG before drop |
+| Source | Regex | Meaning |
+|---|---|---|
+| `test_networking.py:384` | `udp dport 53 dnat` | DNS UDP → CoreDNS |
+| `:388` | `tcp dport 53 dnat` | DNS TCP → CoreDNS |
+| `:398` | `meta l4proto 6 dnat` | non-DNS TCP → deny-logger |
+| `:412` | `meta l4proto 17 log group 1` | denied UDP mirrored to NFLOG |
+| **`:416`** | **`meta l4proto 17 drop`** | **denied UDP actually dropped** |
 
-Plus: the table set is **exactly** `{sandbox, sandbox_dnat, sandbox_policy}` — the
-property pinned on Linux by `sandboxd/tests/gateway_deny_pipeline.rs:779`
-(`integration_session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables`).
+**Table set: assert exactly `{sandbox, sandbox_dnat}`.** ⚠️ An earlier draft required
+`{sandbox, sandbox_dnat, sandbox_policy}` while the procedure injected only one table —
+structurally impossible. With step 10 restored, `sandbox` exists (`generate_deny_all_ruleset`,
+`gateway.rs:1554`) and `sandbox_dnat` exists. **`sandbox_policy` is legitimately absent**:
+it is created by the policy-apply path, which needs the daemon, and §3 has no daemon. Say
+so in the script's output so a reader does not think it is missing by accident.
+
+Restoring step 10 matters for more than the assertion. Without `inject_deny_all` the gate
+never establishes the `sandbox` input chain's `policy drop` + trailing `reject`, so it
+would certify a **weaker topology than production** — proving egress control on a gateway
+container with no inbound filter at all.
 
 #### Assertion 4 — bypass resistance (**the most important one**)
+
+⚠️ **An earlier draft tested the wrong next hop and would have passed having proved
+nothing.** It installed a route via `192.168.5.2`, Lima's slirp gateway — borrowed from the
+full-backend regression (`test_networking.py:698, 799-809`), where the sandbox is a **VM**
+whose `eth0` genuinely is a slirp NIC. The probe here is a **container** whose only NIC is
+on `10.211.0.0/28`, so `192.168.5.2` is off-link and `ip route add … via …` fails with
+"Nexthop has invalid gateway". No route is installed, `curl` fails, and the assertion
+records a block having tested nothing.
+
+**The reachable bypass in this topology is the Docker bridge gateway**, which masquerades
+straight out `eth0` — the gateway VM's own nft policy deliberately declares no FORWARD
+chain, so Docker NAT is untouched.
 
 ```bash
 limactl shell "$GW" -- sudo nsenter -t "$PROBE_PID" -n ip route del default
 limactl shell "$GW" -- sudo nsenter -t "$PROBE_PID" -n \
-  ip route add default via 192.168.5.2 dev eth0 metric 1
+  ip route replace default via 10.211.0.1
+
+# ASSERT THE ROUTE INSTALLED — this is what the earlier version missed:
+limactl shell "$GW" -- sudo nsenter -t "$PROBE_PID" -n ip route show default \
+  | grep -q "via 10.211.0.1" || { echo "FAIL: route not installed; assertion is vacuous"; exit 1; }
+
 limactl shell "$GW" -- docker exec probe curl -sS --max-time 8 http://example.com/
 echo "exit=$?"
 ```
 
-`192.168.5.2` is Lima's slirp gateway — the same address the existing full-backend
-regression uses (`tests/e2e/test_networking.py:799-809`).
-
-- **Expected:** a block exit code from `{6, 7, 28, 35, 56}`. The internet remains
-  unreachable.
+- **Expected:** a block. **Exit 0 is outcome (c)** — the decision dies.
 - **This is the only assertion that proves *topological* control rather than *policy*
-  control** — that egress is forced through the gateway by the shape of the network
-  rather than by a rule the probe is choosing to obey. It is precisely the property that
-  changing VM ownership puts at risk, and it is the lite-side analogue of the
-  spec-mandated delete-the-gateway-route regression
-  (`.tasks/specs/2026-05-02-macos-support-design.md:610`;
-  `tests/e2e/test_networking.py:698`).
-- **Exit 0 here is outcome (c). The decision dies.**
+  control**, and it is the lite analogue of the spec-mandated full-backend regression
+  (`.tasks/specs/2026-05-02-macos-support-design.md:610`).
+- **It also has no durable successor unless phase 6 builds one.** The script is deleted at
+  phase 0's exit and `test_lite_macos.py` has no route-manipulation test. Phase 6 carries
+  an explicit criterion for this; do not let it lapse.
+
+#### Assertion 5 — hostile VM (the §1.6 property)
+
+**New, and it is the one assertion that can detect the cross-operator hole.** §3.7's
+existing isolation check pings between two **cooperatively configured** VMs, so of course
+they cannot see each other — neither was given a NIC on the other's slots. It measures the
+daemon's configuration, not the boundary.
+
+As operator B, hand-write an instance naming one of **operator A's** slot sockets — the
+same one-line YAML any operator can write — and try to start it:
+
+```bash
+# as operator B, with SLOT_A belonging to operator A:
+cat > /tmp/hostile.yaml <<YAML
+vmType: "qemu"
+images: [{location: "<image>", arch: aarch64}]
+networks:
+  - socket: "/var/run/sandbox/vmnet/slot-${SLOT_A}.sock"
+YAML
+limactl create --name=hostile --tty=false /tmp/hostile.yaml && limactl start hostile
+```
+
+- **Expected once §1.6 lands: failure at connect** — the kernel refuses, because the
+  socket's group does not include B.
+- **Expected today: success.** That is the point of the assertion, and a green here before
+  §1.6 is the finding, not a bug in the gate. Record which.
+- **If it succeeds after §1.6 lands:** outcome (d) in §3.8.
 
 #### Explicitly **not** asserted: the deny-event JSONL
 
@@ -1950,20 +2064,25 @@ reading a red run — but never as a pass condition.
 ### 3.7 Second-operator probe
 
 Stand up a **second** VM as a **different uid**, on a **disjoint slot range**, and repeat
-3.4–3.6 against it. Then assert the property all of §1 rests on.
+§3.4–§3.6 against it.
+
+⚠️ **Attach and address the slots.** An earlier draft asserted that operator B "gets a
+distinct `/29` from `vmnet_slot_addresses` and a distinct identifier from
+`vmnet_slot_network_identifier`" — but both are pure functions of the slot index
+(`network.rs:954`, `:897`), so with nothing attached that reduces to calling two pure
+functions and comparing their outputs. It proves arithmetic, not isolation. Both VMs must
+hold NICs on their own slots **with endpoints actually addressed on the `/29`s** for the
+reachability assertions to mean anything.
 
 ```
-VM A (operator A): slots {0..3}
-VM B (operator B): slots {4..7}
+VM A (operator A): slots {0..3}, endpoint on slot 0's /29
+VM B (operator B): slots {4..7}, endpoint on slot 4's /29
 ```
 
-Three assertions:
+Assertions:
 
-1. **B gets its own segment** — distinct `/29` from `vmnet_slot_addresses`, distinct
-   identifier from `vmnet_slot_network_identifier`.
-2. **Egress is enforced in both** — assertions 1–4 hold independently in each VM.
-3. **Neither VM can see the other's segment.** From inside VM A, addresses on B's `/29`
-   must be unreachable, and vice versa:
+1. **Egress is enforced in both** — §3.6 assertions 1–4 hold independently in each VM.
+2. **Neither VM can reach the other's segment**, with endpoints actually present:
 
    ```bash
    # From VM A, with B_BASE = 10.209.128.0 + 8*<B's slot>:
@@ -1971,41 +2090,35 @@ Three assertions:
    limactl shell "$GW_A" -- arping -c 2 <B_BASE+3>       # expect: no reply
    ```
 
-**Assertion 3 is the isolation claim.** Without it, partitioning is asserted rather than
-demonstrated. The in-tree precedent for the mechanism is
-`integration_vmnet_inter_slot_l2_isolation` (`network.rs:3021`), which establishes
-inter-slot L2 isolation for the singleton case; the gate extends it to two
-independently-owned VMs.
+   The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.rs:3021`).
 
-⚠️ **Prerequisite: issue #85 must be fixed first.** This probe needs a second uid enrolled
-in the vmnet socket group and able to run `limactl`, and the reference host cannot supply
-one honestly today: its plists are pre-rename, the real `_sandboxd` account does not
-exist, and the existing candidates are enrolled in Apple's reserved `_sandbox` (gid 60).
+3. **The hostile-VM assertion (§3.6 assertion 5)** — the one that tests the boundary
+   rather than the configuration.
 
-The decided path is **repair, not workaround**: fix #85 (create `_sandboxd`, regenerate
-the plists correctly, reload), then create a **dedicated test-operator account** in the
-proper group. Adding another member to gid 60 was rejected — it makes #85 worse.
-
-**Sequencing consequence:** §3.1–§3.6 (the single-operator gate) can run before #85 is
-fixed; this section cannot. Phase 0's acceptance criteria are split accordingly.
+⚠️ **Prerequisite: issue #85 must be fixed first**, and the second operator must be a
+**dedicated account in the correct group** — not another member of Apple's reserved
+`_sandbox` (gid 60), which was considered and rejected as deepening #85. It also needs a
+daemon-provisioned LIMA_HOME; it cannot create one itself
+(`ensure_operator_lima_home`, `lima.rs:574-660`, is daemon-side only).
 
 ### 3.8 Failure discrimination — a red run must say which
 
-The gate is worthless if a red result cannot be attributed. Structure the script so its
-output names one of these three:
-
 | Outcome | Signature | Effect on the decision |
 |---|---|---|
-| **(a) Socket-permission failure** | `limactl start` cannot open the slot socket; the forwarded Docker socket is unreachable; permission errors before any assertion runs | fixable; the decision **survives** |
-| **(b) Per-operator segment-allocation failure** | VMs start and enforce, but §3.7 assertion 1 or 3 fails — NIC identity wrong, address collision, or cross-segment reachability | points at a split model (lite-only per-operator, full backend on a shared VM); the decision **survives, modified** |
-| **(c) Interception coupled to daemon ownership** | assertion 1 or 4 fails with a **verified-correct** default route, for a reason that is not (a) or (b) | the decision **dies**; `shared:` needs a different mechanism entirely |
+| **(a) Socket-permission failure** | `limactl start` cannot open the slot socket; the forwarded Docker socket is unreachable; permission errors before any assertion runs | fixable; decision **survives** |
+| **(b) Per-operator segment-allocation failure** | VMs start and enforce, but §3.7 assertion 1 or 2 fails — NIC identity wrong, address collision, or cross-segment reachability between cooperating VMs | points at a split model; decision **survives, modified** |
+| **(c) Interception coupled to daemon ownership** | assertion 1 or 4 fails with a **verified-correct** route, for a reason that is not (a) or (b) | decision **dies**; `shared:` needs another mechanism |
+| **(d) Socket DAC does not bind slot→operator** | §3.6 assertion 5 succeeds **after §1.6 lands** — a hostile VM still attaches to a foreign slot | §1.6's mechanism is wrong or incompletely applied. Decision survives; the isolation claim does not, and §5.1's gateway-axis delta must be retracted rather than qualified |
 
-For **(a)** specifically, the prior evidence is favourable: access is group-scoped rather
-than uid-scoped (`network.rs:1027`), the sockets carry no ACLs, and **sandbox session VMs
-already run operator-owned QEMU against these very sockets in production**
-(`lima.rs:3607, 3617-3618` emit `vmType: "qemu"` plus a single `socket:` entry for the
-claimed slot). Moving the gateway VM changes *which* uid opens all N sockets, not
-*whether* that uid is permitted to.
+**Outcome (d) is new.** An earlier draft had three outcomes, none of which covered the
+cross-operator hole — so the gate could have gone green with it wide open and the failure
+would have had no bucket. Two other conditions previously had no bucket either and are now
+prevented rather than classified: the health-wait deadlock (fixed by the §3.4 ordering) and
+a structurally impossible table assertion (fixed in assertion 3).
+
+For **(a)** the prior evidence is favourable: access is group-scoped rather than uid-scoped
+(`network.rs:1027`), the sockets carry no ACLs, and **sandbox session VMs already run
+operator-owned QEMU against these sockets in production** (`lima.rs:3607, 3617-3618`).
 
 ### 3.9 Teardown
 
@@ -2013,11 +2126,17 @@ claimed slot). Moving the gateway VM changes *which* uid opens all N sockets, no
 limactl shell "$GW" -- docker rm -f probe gw || true
 limactl shell "$GW" -- docker network rm gate-session sandboxd-egress || true
 limactl stop --force "$GW" && limactl delete "$GW"
+limactl delete hostile 2>/dev/null || true
 ```
 
-Teardown is idempotent, so a failed run can be cleaned up and the procedure repeated
-while the question is still live. It **must not touch `sandboxd-gateway` or any real
-instance**.
+**Assert it worked** — "no residue" without a check is not a criterion:
+
+```bash
+limactl list --json | grep -q "egress-gate-" && echo "FAIL: gate instance survived"
+```
+
+Teardown is idempotent, so a failed run can be cleaned up and the procedure repeated while
+the question is live. It **must not touch `sandboxd-gateway` or any real instance**.
 
 When the question is answered, **delete the script** (see
 [Form and lifetime](#form-and-lifetime-a-throwaway-shell-script)).
@@ -2090,8 +2209,9 @@ exit**.
 - [ ] **Pre-check C (§2.9) run** — does an operator's VM survive logout? Records whether
       §2.4 and the §5.1 logged-out delta describe a real state.
 - [ ] Host `net.inet.ip.forwarding` recorded as context (§3.2) — **not** gated on.
-- [ ] Single-VM gate: assertions 1–5 (§3.6) all pass, **in that order**, with §3.5's route
-      verified before assertion 1 runs.
+- [ ] Single-VM gate: assertions **1–4** (§3.6) all pass, **in that order**, with §3.5's
+      route verified before assertion 1 runs. (Assertion 5, hostile VM, needs a second
+      operator and is Part B.)
 - [ ] A deliberately broken run (skip §3.5) produces a **red** result at **assertion 1**,
       not later. *Test your test* — and note this is only satisfiable because assertion 1
       now asserts the discriminating signature (§3.6).
