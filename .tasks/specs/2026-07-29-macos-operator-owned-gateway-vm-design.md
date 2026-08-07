@@ -31,9 +31,9 @@ and assumes **no** prior knowledge of this codebase.
 - **⚠️ §1.6 documents an active, exploitable defect on `master` that has no tracker
   issue** — this spec is its only record. If you read nothing else, read that. Its fix is
   independently shippable ahead of the rest of this design.
-- **[Open questions](#open-questions)** holds five undecided items, each tagged with the
-  phase it blocks, plus a trail of the decisions already made and where each lives. **Do
-  not start a phase whose blocking question is open.**
+- **[Open questions](#open-questions)** is empty — every design question is decided. What
+  it holds is a trail of those decisions and where each one lives, plus a short list of
+  facts still to be **verified** (not chosen), each with a 30-second check.
 
 Every claim cites a `file:line` in this repository. Line numbers are against `master`
 @ `7e5fa0c`. Where a line may have moved, the code is quoted inline so you can
@@ -440,7 +440,7 @@ here rather than documented away.
 | **2** | Docker broker ops + brokered streams | 1 |
 | **3** | Typed route-helper broker op | 2 |
 | **4** | Per-operator gateway VM ownership | **2 and 3 — hard boundary** |
-| **5** | Real `shared:` workspaces — *the feature #82 is named for* | 4; possibly #83 (mechanism undecided) |
+| **5** | Real `shared:` workspaces — *the feature #82 is named for* | 4. **Not #83** — declared export roots bounce the VM only on a root change, not per create |
 | **6** | Test and docs retarget | runs continuously across 1–5; **phase 4 depends on it**; gated on #84 |
 
 **⚠️ Ownership moved from phase 2 to phase 4.** The forwarded Docker socket lives inside
@@ -628,11 +628,33 @@ pool growth, which `decide_pool_resize`'s `RefuseNeedsPrivilegedRegen` arm
 should be stated rather than discovered: the earlier draft sold "no privileged work" as a
 benefit of partitioning, and §1.6 is why that is no longer true.
 
-**How the daemon learns a range.** From privileged, **operator-unwritable** configuration
-— the same reasoning §2.1 uses to reject reading `lima.yaml`. If an operator could write
-the file naming their own slot range, the range would stop being a control. The concrete
-shape (which file, which field, how it is kept in step with the plists and the group
-membership that actually enforce it) is **left to phase 1**; the constraint is not.
+**How the daemon learns a range: it derives it from the live sockets.** No config file, no
+new ingestion path. At startup and on demand, the daemon `stat`s each
+`/var/run/sandbox/vmnet/slot-N.sock`, reads its **gid**, and resolves which operator is a
+member of that group. That mapping *is* the operator's range.
+
+**Why derivation beats a config file.** This is §2.1's reasoning taken to its conclusion:
+read the strongest available authority. Here that authority is root-owned and
+kernel-mediated — the same bits the kernel itself checks on `connect(2)`.
+
+- **It cannot drift from enforcement, because it *is* the enforcement.** A config file
+  stating a range is a second copy that can disagree with the plists; the socket's gid
+  cannot disagree with itself.
+- **It self-heals in the #85 scenario.** When installed plists and running sockets
+  disagree — exactly what #85 produces, silently, until a reboot — the daemon sees **what
+  is actually running**, not what someone intended.
+- The daemon needs only traverse on `/var/run/sandbox/vmnet/` to `stat` the sockets, which
+  it already has; it does not need to open them.
+
+**Misconfiguration must have a defined response, not an assumption.** Two cases:
+
+| Slot's group contains | Response |
+|---|---|
+| **zero** operators | The slot is **unassignable**. Not a startup failure — a partially-enrolled host is a normal state — but log it and surface it in diagnostics, because it is silently lost capacity. |
+| **more than one** operator | The slot is **unassignable**, and this is the loud case. Two operators sharing a slot group is the §1.6 defect in miniature: assigning the slot to either would give the other undetectable access to it. **Refuse to assign it and surface it prominently.** Do not pick one. |
+
+Both cases mean a slot that exists and is running but is claimed by nobody, which is the
+correct fail-closed behaviour: capacity is lost, isolation is not.
 
 **A second operator with no assigned range fails explicitly.** This is a *configuration
 conflict*, not a capacity ceiling; §2.2 gives the two error shapes and why they must not
@@ -1054,6 +1076,32 @@ own** slots and misconfigure it. That is inherent to operator ownership and is a
 the boundary this restores is *between* operators, not between an operator and their own
 sessions.
 
+#### De-enrollment — specify it with enrollment, not after
+
+**Enrollment and de-enrollment are two halves of one mechanism**, and phase 1 must
+specify both. Leaving the second half to "later" is not a scheduling choice here; it is a
+correctness hole.
+
+**⚠️ Reclaiming a range without revoking the departing operator's group membership
+recreates this section's defect exactly.** The new owner is given the slots, the old owner
+retains group membership and therefore socket access, and **nothing detects it** — the
+plists look right, the daemon's derived mapping (§1.3) names the new owner, and the old
+owner's continued reach is invisible at every layer that anyone inspects.
+
+So the ordering is a requirement, not an implementation detail:
+
+1. **Revoke group membership first.**
+2. Only then may the range be reassigned to another operator.
+
+Note that under §1.3's derivation this is also what makes the daemon's view correct: while
+both operators are in the group, the slot has **two** members and is therefore
+*unassignable* by the rule above — so a half-done de-enrollment fails closed and shows up
+as lost capacity rather than as silent shared access. That is the behaviour to preserve;
+do not "fix" the two-member case by picking the newer operator.
+
+**§3.6 assertion 5 is already the right test.** Run it as the *departed* operator against
+the reassigned slot: it must fail at connect.
+
 #### Why no existing test catches this, and how to test the fix
 
 **Nothing in the suite can detect it, and the obvious test shape cannot either.** The
@@ -1128,13 +1176,13 @@ schema, not sandboxd's.
 
 **⚠️ This section previously specified a `sessions.db` refinery migration to persist
 ranges. That is no longer needed and has been removed.** §1.3 assigns ranges at
-enrollment and §1.6 enforces them in root-owned plists and group membership — so the
-assignment already lives in privileged, operator-unwritable configuration, which was the
-entire reason daemon-side persistence was chosen. Persisting a second copy in
-`sessions.db` would add a store that can disagree with the thing that actually enforces.
+enrollment and §1.6 enforces them in root-owned plists and group membership, and §1.3
+has the daemon **derive** the range from the live socket gids rather than read it from
+anywhere. Persisting a copy in `sessions.db` would add a store that can disagree with the
+thing that actually enforces — the precise failure this section exists to avoid.
 
-**Decision: the daemon reads the range from privileged configuration; it persists
-nothing new.**
+**Decision: the daemon derives the range from the running sockets (§1.3); it persists
+nothing new for ranges.**
 
 - **Ranges** — static from enrollment, read from operator-unwritable config (§1.3). No
   migration, no new table, no new file.
@@ -1143,6 +1191,34 @@ nothing new.**
   `NetworkInfo.vmnet_slot` via `restore_from_infos` (`network.rs:1320-1354`), exactly as
   it is now. The only change is that there are several pools and each validates against
   its own range rather than `0..max_slots`.
+
+#### One new persisted field: which operator a session belongs to
+
+Restore has to route each persisted session to the right operator's pool, and it currently
+cannot: `NetworkInfo` carries no operator identity, and `Session.owner_username`
+(`session.rs:935`) is a **username**, not a uid.
+
+**Decision: persist `operator_uid: Option<u32>` on `NetworkInfo`**, `#[serde(default)]`,
+per `CLAUDE.md`'s blob-field rules — a new optional field, so records written by an older
+daemon still deserialize and a newer daemon's records survive a rollback.
+
+**Why not derive it from the slot index?** It looks elegant — the slot already implies the
+range, and the range implies the operator — and it is wrong twice over. **Lite sessions
+claim a token, not a slot** (`claim_lite_token`, `network.rs:1202`), so it would cover only
+half the cases; and it would break **silently** if a slot's owner ever changed, attributing
+an old session to a new operator. An explicit field covers both backends uniformly and
+cannot be quietly wrong.
+
+**Older records lacking the field:** fall back to resolving `owner_username` → uid. If that
+fails — the account was removed, renamed, or is not resolvable at startup — **decline to
+restore the claim and surface it in diagnostics**. Do not guess, and do not drop it
+silently.
+
+⚠️ **A wrinkle worth naming:** the pool's existing leak-reporting accessor
+`claimed_slot_sessions` (`network.rs:1406-1415`) reports slots that *are* claimed, so it
+cannot by itself surface a claim that was **declined** — that is the inverse condition.
+Report it through the **same diagnostics endpoint** (`main.rs:11156-11157`) rather than a
+new channel, but expect it to need its own list alongside the claimed-slot one.
 
 The reasoning above still applies to anything that *is* persisted: an operator-writable
 file must never be the input to a security-relevant allocation.
@@ -1200,8 +1276,20 @@ Two changes:
 1. **Status class → 429.** Capacity exhaustion is a client-visible quota condition, not
    a server fault, and under partitioning it stops being rare: 8 slots across 2
    operators means an operator hits it at 4 sessions, across 4 operators at 2.
-   `429 Too Many Requests` needs a **new `SandboxError` variant** plus an arm in
-   `error_response`.
+   `429 Too Many Requests` needs a **new `SandboxError` variant** (in
+   `sandbox-core/src/error.rs:9`) plus an arm in `error_response`.
+
+   **Make it structured, not string-wrapped.** Carry the operator uid, the in-use count
+   and the quota as fields, and render the operator-facing text from a `Display` impl —
+   unlike `Network`/`Conflict`, which pass a pre-formatted string through verbatim
+   (`error.rs:69-70`). Name it for the domain condition rather than the HTTP code;
+   `QuotaExhausted { .. }` is indicative, not mandated — pick what fits the module.
+
+   **The deciding reason is that it collapses duplication rather than preserving it.** The
+   exhaustion message exists today as **three byte-identical copies**
+   (`network.rs:1161-1166`, `:1171-1176`, `:1208-1213`). A structured variant renders it in
+   one place; a string-wrapped one would keep three call sites free to drift — and they are
+   being rewritten anyway (point 2), which is exactly when drift gets introduced.
 2. **Rewrite the remediation text.** "set max_macos_sessions in config and restart
    sandboxd" becomes actively misleading once the binding constraint is the operator's
    *share*: raising the host total does not help, and the host total cannot exceed 32
@@ -1333,15 +1421,27 @@ Two properties sharpen this for later phases:
 
 Today that lane carries ~12 Lima ops per session. The brokered-ops phase puts the entire
 lite control plane on it, plus the DNS-gate bridge's **one stream open per DNS query**
-(§5.2). Candidate mitigations: pipeline by `request_id`, which the protocol already
-reserves for exactly this (`sandbox-agent/src/protocol.rs:99-101`), or add a second
-connection class for stream opens.
+(§5.2).
 
-**⚠️ This is not decided, and it is an open question — not an instruction.** An earlier
-draft said "decide the mitigation up front" and then declared the document to have no open
-questions, while the phase criterion deferred it to "measure it". That is three
-inconsistent positions on one item. It is listed in [Open questions](#open-questions) with
-the phase that must resolve it.
+**Decision: pipeline by `request_id`**, which the protocol already reserves for exactly
+this (`sandbox-agent/src/protocol.rs:99-101`).
+
+The alternative — a second connection class for stream opens — was rejected because it
+only takes *stream* opens off the critical path. This design moves roughly 28 Docker call
+sites onto the broker (§5.3), and **most of them are request/response, not streams**, so
+control ops would still queue behind one another on a connection that handles one at a
+time. The narrower fix does not address the larger half of the new load.
+
+**Protocol ordering is not the risk.** A dependent sequence — create, then start — is
+already serialized by the caller awaiting each response before issuing the next.
+Pipelining adds concurrency only *between independent operations*, which is precisely the
+case that is safe.
+
+**⚠️ The real risk is agent-side shared state**, and it is easy to overlook because the
+protocol change looks like the whole job. Handlers that today can assume they run one at a
+time may touch process-global state, filesystem staging paths, or `limactl` invocations
+whose working set collides. **Auditing the agent's handlers for concurrency safety is an
+explicit phase 2 work item**, not an implementation detail of the protocol change.
 
 **A second, sharper reason it matters — the exposure while an op is queued.** Container
 create today is `docker create` (`main.rs:5262`) → **`docker start` (`:5285`)** → **in-VM
@@ -2325,7 +2425,10 @@ enforces, with slot identity no longer positional.
 | File | Change |
 |---|---|
 | `sandbox-core/src/network.rs:999-1030` (`generate_vmnet_plist`) | **§1.6** — emit a per-operator `--socket-group`; the plist gains an operator dimension it has never had |
-| `Makefile` `setup-darwin-vmnet-plists`; `scripts/install.sh` plist + enrollment path (`:2679`) | **§1.6** — create the per-operator group, assign the slot range at enrollment, keep plist group / group membership / the range the daemon reads in step |
+| `Makefile` `setup-darwin-vmnet-plists`; `scripts/install.sh` plist + enrollment path (`:2679`) | **§1.6** — create the per-operator group and assign the slot range at enrollment; **and specify de-enrollment in the same change**, revoking group membership *before* a range may be reassigned |
+| new, daemon-side | **§1.3** — derive each operator's range by `stat`-ing `/var/run/sandbox/vmnet/slot-N.sock`, reading its gid and resolving members. No config file. Defined behaviour for zero-member and multi-member groups (both: slot unassignable) |
+| `sandbox-core/src/network.rs` (`NetworkInfo`) | **§2.1** — new `operator_uid: Option<u32>` with `#[serde(default)]`; `restore_from_infos` shards by it, falling back to `owner_username` and declining the claim if that fails |
+| `sandboxd/src/main.rs:11156-11157` | diagnostics gains a declined-restore list alongside the claimed-slot one (§2.1) |
 | `sandbox-core/src/network.rs:1090-1421` | `VmnetPool` unchanged in shape; range-scoped `claim_lima_slot` scan (`:1169-1170`), quota-scoped cap checks (`:1161`, `:1208`), range-aware `restore_from_infos` (`:1320`), operator dimension on `claimed_slot_sessions` (`:1406`) |
 | new | uid-keyed `VmnetPoolRegistry` — copy `LimaManagerRegistry`'s **locking discipline** (`lima.rs:1245-1280`), not its fields (§1.1) |
 | `sandbox-core/src/gateway_lima.rs:282-316` | `discover_nics_from_ip_json` — key by parsed suffix; **and** build the map daemon-side, using guest output only to verify (§1.4 fix 2) |
@@ -2337,7 +2440,7 @@ enforces, with slot identity no longer positional.
 | `sandboxd/src/main.rs:9884-9888`, `:12811-12816` | hard-error `unwrap_or(0u16)` on the **slot index** — the silent segment guess (§1.4 fix 4) |
 | `sandbox-core/src/gateway_lima.rs:99` | decide whether to bump `MIN_LIMA_VERSION` above 1.2.0, or add the runtime NIC-name assertion (§1.4 fix 1) |
 | `sandboxd/src/main.rs:13402-13440` | `SANDBOX_MAX_MACOS_SESSIONS` parse — reconcile with the per-operator range read |
-| `sandbox-core/src/error.rs:9` | **new `SandboxError` variant** for 429. The enum lives here, not in `sandboxd/src/error.rs` |
+| `sandbox-core/src/error.rs:9` | **new structured `SandboxError` variant** for 429 — operator uid, in-use count, quota, with a `Display` impl (§2.2). The enum lives here, not in `sandboxd/src/error.rs` |
 | `sandboxd/src/error.rs:57-79` | new arm in `error_response`; reuse existing `Conflict → 409` (`:69`) for range-unavailable |
 | `sandbox-core/src/network.rs:1161-1176`, `:1208-1213` | rewrite the exhaustion message (§2.2 condition 1) |
 
@@ -2372,6 +2475,22 @@ enforces, with slot identity no longer positional.
       hand-written instance naming one of operator A's slot sockets **fails at connect**.
       This is the criterion that distinguishes this phase from bookkeeping. It is the same
       assertion as §3.7's hostile-VM probe.
+- [ ] **De-enrollment revokes before it reassigns** (§1.6): after de-enrolling operator A
+      and reassigning their range to operator B, the **same hostile-VM assertion run as A**
+      fails at connect. Assert the ordering too — a reassignment attempted while A is still
+      in the group leaves the slot unassignable rather than shared.
+- [ ] **Range derivation matches the sockets** (§1.3): changing a slot socket's group
+      changes the derived owner with no config edit and no daemon restart beyond a
+      re-read. A slot whose group has **zero** members is unassignable and reported; a slot
+      whose group has **two or more** is unassignable and reported prominently — assert
+      that the daemon refuses to pick one.
+- [ ] **Restore shards correctly** (§2.1): sessions carrying `operator_uid` land in the
+      right pool; a record lacking it is resolved via `owner_username`; and one where that
+      resolution fails is **declined and surfaced in diagnostics**, not guessed and not
+      dropped silently.
+- [ ] The 429 variant is **structured** and renders its message from `Display`, and the
+      three former message copies (`network.rs:1161-1176`, `:1208-1213`) are gone rather
+      than rewritten in place (§2.2).
 - [ ] The instance socket path stays under `UNIX_PATH_MAX` — assert with a computed check
       against 104, not by inspection (§2.8).
 
@@ -2380,10 +2499,10 @@ enforces, with slot identity no longer positional.
 On Linux, `cargo build --workspace`, `cargo clippy --workspace` and `make test` compile and
 lint **none** of this phase's code. These criteria are only meaningful on a Mac.
 
-**Open items this phase must resolve** (see [Open questions](#open-questions)): the shape
-of the per-operator range configuration, and how `restore_from_infos` shards persisted
-sessions across per-operator pools — `NetworkInfo` carries no operator identity and
-`Session.owner_username` (`session.rs:935`) is a username, not a uid.
+**Previously open, now specified above:** the range configuration surface (derived from
+socket gids, §1.3), `restore_from_infos` sharding (`operator_uid` on `NetworkInfo`, §2.1),
+the 429 variant's shape (structured, §2.2), and de-enrollment (§1.6). None of them is an
+open question any more; all four are acceptance criteria.
 
 ---
 
@@ -2432,8 +2551,14 @@ ops and share the serialization concern in §2.5.
       `macos_session.rs:786` (guarded only by a `debug_assert!`, compiled out in release).
 - [ ] The pre-route window fails closed: a container whose route helper has not yet run
       **cannot** reach the internet (§2.5). Assert it directly.
-- [ ] Concurrency: the §2.5 mitigation is **decided and implemented**, not deferred to
-      measurement. Its acceptance criterion is whatever that decision makes testable.
+- [ ] **Pipelining by `request_id` is implemented** (§2.5): independent ops for one
+      operator complete concurrently rather than strictly serially, and a dependent
+      sequence (create → start) still completes in order because the caller awaits each
+      response.
+- [ ] **The agent's handlers have been audited for concurrency safety** — process-global
+      state, filesystem staging paths, colliding `limactl` working sets. This is a
+      **named work item**, not a side effect of the protocol change; record what was
+      audited and what was found (§2.5).
 - [ ] `make test-e2e-container` passes.
 
 ---
@@ -2535,43 +2660,51 @@ preamble. Phase 1 supplies the range.
 
 ### Phase 5 — Real `shared:` workspaces (the feature #82 is named for)
 
-**Goal.** `--workspace shared:<any operator-readable path>` works on macOS lite.
+**Goal.** `--workspace shared:<path under a declared export root>` works on macOS lite.
 
-**Depends on.** Phase 4. **And possibly issue #83** — see below.
+**Depends on.** Phase 4. **Not on issue #83** — the declared-roots mechanism bounces the VM
+only when the *roots* change, not on every `shared:` create (§5.1).
 
-**⚠️ The mechanism is not yet decided.** This phase was previously specified as a list of
-deletions with no replacement, which does not work: the deleted
+**Mechanism: operator-declared export roots** (§5.1). An earlier draft specified this phase
+as a list of deletions with no replacement, which does not work: the deleted
 `lite_shared_root_9p_stanza` is *how a host path becomes visible inside the gateway VM at
-all* (`gateway_lima.rs:355-356` → interpolated at `:409-415`). Docker's `--mount src=`
+all* (`gateway_lima.rs:355-356` → interpolated at `:409-415`), and Docker's `--mount src=`
 resolves **inside** the VM (`backend/container.rs:772`), so a bind can only reach what 9p
-already exported. Delete the stanza with nothing in its place and `shared:` has no path
-into the VM.
+already exported.
 
-The fork, and its costs, are recorded in [Open questions](#open-questions). **Do not start
-this phase until it is decided** — the two options differ in security posture, in cost, and
-in whether this phase depends on #83.
+**This is a generalisation of the existing mechanism**: one fixed root becomes N declared
+roots. The stanza generator is re-pointed, not removed.
 
-**Files (deletions — valid under either option).**
-`sandbox-core/src/lite_macos.rs` — `validate_shared_path` (`:159`), `translate_shared_path`
-(`:134`, already dead in production), `SharedPathError` (`:172-216`), `lite_shared_root`
-(`:76`), `DEFAULT_LITE_SHARED_ROOT` (`:54`), `LITE_SHARED_ROOT_ENV` (`:32`); the call site
-`main.rs:5072`; `Makefile:2110-2135` (`setup-darwin-sandbox-shared`);
-`docs/guides/lite-mode.md:55-95`. The 9p stanza and its interpolation are deleted **only
-once a replacement export mechanism exists**.
+**Files.**
+
+| File | Change |
+|---|---|
+| `sandbox-core/src/lite_macos.rs:110` | `lite_shared_root_9p_stanza` — generalise from one root to a declared set; **keep it**, do not delete |
+| `sandbox-core/src/gateway_lima.rs:355-356`, `:409-415` | template interpolation takes the declared set |
+| new | where an operator declares roots (JSON per project convention), and validation that each is an absolute, existing, operator-readable directory |
+| `sandbox-core/src/lite_macos.rs` | **delete** `validate_shared_path` (`:159`), `translate_shared_path` (`:134`, already dead), `SharedPathError` (`:172-216`), `lite_shared_root` (`:76`), `DEFAULT_LITE_SHARED_ROOT` (`:54`), `LITE_SHARED_ROOT_ENV` (`:32`) |
+| new, replacing them | containment check against the **declared roots**, with canonicalization (§5.1) |
+| `sandboxd/src/main.rs:5072` | call site moves to the new check |
+| `Makefile:2110-2135` | `setup-darwin-sandbox-shared` — the fixed root is no longer created |
+| `docs/guides/lite-mode.md:55-95` | rewrite; **document the Apply-&-Restart UX** (§5.1) |
 
 **Acceptance criteria.**
 
-- [ ] `sandbox create --lite --workspace shared:$HOME/Projects/foo` succeeds and the
+- [ ] With `~/Projects` declared as an export root,
+      `sandbox create --lite --workspace shared:$HOME/Projects/foo` succeeds and the
       container sees the real directory.
+- [ ] **A path outside every declared root is refused at create**, naming the declared
+      roots and how to add one.
 - [ ] **Bidirectional write**: host→container and container→host. Assert host-side
       ownership with `stat -f '%u'` and state the expected uid — 9p `mapped-xattr` does not
       necessarily produce the operator's uid on the host, and "owned by the operator" is
       not a testable claim without naming the mapping.
-- [ ] **Canonicalization, with a named containment root** (§5.1) — the root depends on the
-      chosen mechanism, and the criterion must name it rather than saying "the requested
-      subtree", which is circular.
-- [ ] The resolved path is the 9p export root, so a later symlink swap cannot widen what
-      the VM can see (§5.1).
+- [ ] **Canonicalization against the declared roots** — resolve the requested path, then
+      require containment in a declared root. A path using `..` or a symlink to escape a
+      declared root is rejected. (This criterion is now well-defined precisely because the
+      roots are declared; against "the requested subtree" it was circular.)
+- [ ] Changing the declared roots takes effect after a VM bounce, and the operator is told
+      so rather than seeing a silently stale export set.
 - [ ] `src=` values containing `,` or `=` are rejected (§5.1).
 - [ ] The replacement refusal names the cause and the working alternatives, preserving the
       intent of the deleted `outside_root_error_names_cause_and_alternatives` test.
@@ -2638,6 +2771,36 @@ criterion depends on this phase**, so the chain phase 4 → phase 6 → issue #8
 
 ### 5.1 Accepted security deltas
 
+#### The export mechanism: operator-declared roots
+
+**Decided.** The operator declares which host roots are exportable — `~/Projects`, say.
+Those roots are 9p-exported into their gateway VM **at VM creation**, and each session's
+Docker bind `src=` selects a subtree within them.
+
+**Frame this as a generalisation, not a new mechanism.** Today there is exactly one
+exportable root and it is fixed at `/tmp/sandbox-shared` (`lite_macos.rs:54`). This
+replaces *fixed* with *operator-declared*. The export plumbing, the identity mount, and the
+bind-selects-a-subtree shape are all unchanged.
+
+Consequences:
+
+- **No VM bounce per `shared:` create**, because the roots are already exported. **Phase 5
+  therefore does not depend on issue #83** — an earlier draft said it might.
+- **Blast radius on a container escape is the declared roots**, not the operator's whole
+  home. That is what makes the workspace delta below bounded enough to accept.
+- **§5.1's canonicalization requirement now has well-defined roots to resolve against**,
+  which is what turns it from aspirational into enforceable: resolve the requested path and
+  require containment within a declared root.
+- **UX: changing your export roots requires bouncing your VM** — exactly Docker Desktop's
+  "Apply & Restart". Familiar and acceptable, but say it in the docs rather than letting
+  operators discover it.
+
+⚠️ **One residual edge, stated because it is easy to miss:** a *root change* still bounces
+the VM, and under issue #83 that destroys the operator's running lite sessions with no
+recovery. The per-create dependency on #83 is gone; a per-root-change one remains. It is
+far milder — root changes are rare and operator-initiated, unlike every `shared:` create —
+but "phase 5 does not depend on #83" is true only for the create path.
+
 **Workspace-axis widening — accepted, and it *is* the feature.**
 
 Confining `shared:` to a fixed shared root structurally bounds what a container escape
@@ -2674,11 +2837,10 @@ shared-root phase does.
 wrote for it was circular — "reject a path that escapes the requested subtree" is vacuous
 when the requested path *defines* the subtree. Two further requirements:
 
-- **Name the containment root explicitly.** It depends on which mechanism the
-  shared-workspace phase adopts (see [Open questions](#open-questions)): with a
-  per-session export the root is the export itself and the property is *"the mounted
-  directory is exactly the canonicalized requested path"*; with a broad ancestor export it
-  must be that configured ancestor, named.
+- **Name the containment root explicitly.** With declared export roots (above) the roots
+  are exactly that: resolve the requested path, then require containment within one of the
+  operator's declared roots. This is what makes the requirement enforceable — against "the
+  requested subtree" it was circular, because the requested path defined the subtree.
 - **Close the resolve-then-mount race structurally.** The daemon canonicalizes; Docker
   resolves `src=` again later, inside the VM, from a different process. A sandboxed agent
   with write access to the tree — which is the feature — can swap a path component for a
@@ -2762,6 +2924,7 @@ them until the operator returns. If they do not survive, this delta does not exi
 | 4 | "the two long-lived streams" | There are **three**. The missed one is the **DNS-gate bridge** (`sandbox-core/src/dns_gate_bridge.rs:164` → `:224` → `:248`), which opens **one `docker exec` per DNS query**. It runs `socat UNIX-LISTEN` **without** `,fork` on purpose (`:30-42`), because `,fork` would multiplex concurrent gate frames onto one stdio stream and corrupt them. It is fail-closed (`:44-54`) and sits on the egress-**allow** critical path — i.e. the core promise. Its open rate interacts directly with §2.5. |
 | 5 | "a **single VM** hosting both lite workloads and the gateway containers" | Blurs two distinct VMs. An earlier evaluation of a per-operator model kept the **gateway container in the daemon-owned VM** and moved only the **lite workloads**. This design goes further — the gateway VM itself becomes operator-owned. The issue's phrasing describes neither shape precisely and should say which VM hosts what. |
 | 6 | "`gateway_recovery.rs` at ~1200 lines" | The file is 1236 lines but **only `:1-396` is production code (~330 lines)**; `:402-1236` is the hermetic test module. It is a generic injectable state machine with **no** discovery logic — one of the **cheapest** parts of the migration (a ~4-item change plus a caller rewrite), not one of the expensive ones. |
+| 7 | "it matches how Docker Desktop and Colima already work on macOS" — offered as the rationale for the whole direction | **Architecturally sound; not a security precedent, and it must not be read as one.** Docker Desktop does take the broad-export approach: a configured File Sharing set exported into its VM, binds selecting subtrees, changes requiring a restart. But **Docker Desktop has no adversary inside the container** — your containers are your code running on your files, so its file sharing is plumbing. sandboxd's premise is the exact opposite: the thing inside the container is what the product exists to contain. So the **mechanism** transfers and the **security posture** does not. What genuinely transfers is the **allowlist**: Docker Desktop refuses binds outside its configured set, and that is the property §5.1's declared roots reproduce. |
 
 **Two doc-comment corrections** fall out of the ownership change and should land with
 their phase rather than rotting:
@@ -2847,7 +3010,7 @@ would normally use to find it — **which is exactly why it is repeated here**.
 
 | Issue | Bearing |
 |---|---|
-| **#83** — gateway-VM recovery skips container-backend sessions (`gateway_recovery.rs:77-82`) | **Blocks bounce-to-resize** (§2.7), and **may block phase 5 outright**: if the `shared:` export mechanism is per-session (option (i) in [Open questions](#open-questions)), every `shared:` create bounces the operator's VM and kills their other lite sessions, which are never recovered — containers are `--restart no` (`container.rs:853-854`). |
+| **#83** — gateway-VM recovery skips container-backend sessions (`gateway_recovery.rs:77-82`) | **Blocks bounce-to-resize** (§2.7). **It does not block phase 5** — the declared-roots mechanism (§5.1) bounces the VM only when the roots change, not per `shared:` create. It does still bite on that rarer path: a root change destroys the operator's running lite sessions with no recovery, because containers are `--restart no` (`container.rs:853-854`). |
 | **#84** — `linux_only` declared and enforced but applied to zero tests | **Phase 6 depends on it.** `make test-e2e-macos SCOPE=full` currently collects the whole Linux-authored matrix on macOS. Close it first. |
 | **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **A prerequisite, not merely related.** The second-operator isolation probe (§3.7) cannot run until it is fixed, because the host has no honest second operator to offer: pre-rename plists, no real `_sandboxd` account, and the existing candidates enrolled in Apple's reserved gid 60 (adding another there was rejected — it deepens the same problem). Fixing it is also what makes `make setup-dev-env` safe again. **The single-operator gate does not depend on it.** See [Before you start](#before-you-start). |
 
@@ -2855,50 +3018,14 @@ would normally use to find it — **which is exactly why it is repeated here**.
 
 ## Open questions
 
-**⚠️ An earlier draft of this document claimed there were none. That was false**, and
-review found it: §2.5 left a mitigation explicitly undecided while the section here
-declared the design closed end to end. Do not invent answers to these; raise them.
+**None remain undecided.** Every design question raised by review has been answered; the
+decisions live in the sections named in the table below, and the items in *Still
+unverified* are facts to check rather than choices to make.
 
-| # | Question | Blocks |
-|---|---|---|
-| 1 | **The `shared:` export mechanism** (phase 5) — see the fork below. Decides phase 5's cost, its security posture, and whether it depends on #83. | phase 5 |
-| 2 | **The broker serialization mitigation** (§2.5) — pipeline by `request_id`, or a second connection class for stream opens. It must be *decided*, not measured: "measure it" was an earlier draft's way of not choosing. | phase 2 |
-| 3 | **The per-operator range configuration surface** (§1.3, §1.6) — which file, which field, and how it stays in step with the plist group and the group membership that actually enforce it. Note the constraint an earlier draft missed: `SANDBOX_MAX_MACOS_SESSIONS` is an **env-var** parse of a single `u16` (`main.rs:13402-13440`), so a per-operator *map* cannot land there without inventing a mini-format inside an env var — which is itself the second ingestion path that constraint was trying to avoid. | phase 1 |
-| 4 | **How `restore_from_infos` shards sessions across per-operator pools** (§1.2) — `NetworkInfo` carries no operator identity and `Session.owner_username` (`session.rs:935`) is a username, not a uid. Resolving username→uid at startup has a real failure mode (unresolvable user) and changes the caller at `main.rs:12166`. | phase 1 |
-| 5 | **The 429 variant's name and payload shape** (§2.2) — whether it string-wraps like `Network`/`Conflict` (`error.rs:69-70`) or uses its `Display`. It is a public enum in `sandbox-core` consumed by both binaries; renaming later is workspace-wide churn. | phase 1 |
+This section previously claimed to be empty when it was not — §2.5 left a mitigation open
+while the section declared the design closed. It is empty now, and the trail below is how
+you tell the difference.
 
-### Question 1 in full — the `shared:` export fork
-
-**Option (i): export the requested subtree, per session.** Secure by construction — the
-export root bounds the container, and §5.1's canonicalization requirement has a
-well-defined root. **Cost:** Lima composes `mounts:` at instance start and there is no
-hot-add, so every `shared:` create requires bouncing the operator's gateway VM — which
-kills **all** their lite sessions, because containers are `--restart no`
-(`backend/container.rs:853-854`) and `sessions_to_recover` (`gateway_recovery.rs:77-82`)
-filters to `BackendKind::Lima`. **That makes phase 5 depend on issue #83.**
-
-**Option (ii): export a broad ancestor once at VM creation** (the operator's home, or a
-configured root) and select the subtree with the Docker bind `src=`. No restart, works
-immediately — **and it is the option an engineer under phase-5 pressure will take.**
-
-**Option (ii) is a security regression that is not currently in §5.1.** The operator's
-entire home would be 9p-exported into the VM that hosts *every one of that operator's lite
-sessions* plus every gateway container. The existing accepted delta already concedes that a
-gateway-container escape reaching the in-VM Docker daemon compromises every concurrent
-session's enforcement; under (ii) that same escape also reads and writes the operator's
-whole home — `~/.ssh`, `~/Library/LaunchAgents`, every other project. §5.1's workspace
-delta says an escape "lands on their real working tree"; under (ii) it lands on
-everything. And the only thing separating session X's container from session Y's workspace
-becomes the `src=` string — the control phase 5 deletes.
-
-**If (ii) is chosen it must be a new entry in §5.1 and in the canonical spec's Known
-deltas**, worded as *"the operator's home is exported into the multi-session gateway VM"*,
-and the existing shared-gateway-VM delta must be updated to say what an escape now
-reaches.
-
-**Settle it with a pre-check, in §3.1's style:** *can `limactl` add a `mounts:` entry to a
-running instance?* Same 30-second shape as pre-check B. A yes collapses option (i)'s cost
-and makes the fork easy; a no is what makes this a real decision.
 
 ### Still unverified (facts, not decisions)
 
@@ -2926,6 +3053,12 @@ named, not here.
 | Per-operator gateway VM naming | **`sandboxd-gateway-<operator_uid>`** — keeps the greppable prefix, encodes the owner, structurally cannot match the `sandbox-<12hex>` session grammar; paired with an **explicit** reaper exclusion rather than reliance on the parse failing | §2.6; phase 2 files + criteria |
 | Which second uid plays "operator B" | **Fix issue #85 first**, then a dedicated test-operator account in the proper group; adding another member to Apple's reserved gid 60 was rejected as making #85 worse | §3.7; [Before you start](#before-you-start); phase 0 Part B |
 | Does `interface:` pinning work on `socket:` networks | **Yes — verified**, and it is a real fd-level binding rather than a relabel. Brings two obligations with it: the generator must guard the `lima<slot>` correspondence itself (Lima does not), and `UNIX_PATH_MAX` bounds how deep a LIMA_HOME may sit | §1.4 fix 1 + fix 1a; §2.8; phase 1 criteria |
+| `shared:` export mechanism | **Operator-declared export roots** — neither per-session subtree export nor a blanket home export. The operator declares which roots are exportable; they are exported at VM creation and the Docker bind `src=` selects the subtree per session. A **generalisation of today's fixed `/tmp/sandbox-shared`**, not a new mechanism | §5.1; phase 5 |
+| Broker serialization mitigation | **Pipeline by `request_id`.** A stream-only fix leaves ~28 request/response Docker call sites queueing on a one-at-a-time connection. Protocol ordering is not the risk; **agent-side shared state is**, and auditing it is an explicit phase 2 work item | §2.5; phase 2 |
+| Per-operator range configuration surface | **Derived from the live sockets** — `stat` each `slot-N.sock`, read its gid, resolve members. No config file, no new ingestion path. **The earlier constraint that this land at the `SANDBOX_MAX_MACOS_SESSIONS` parse site is withdrawn** — that site is an env-var parse of a single `u16` and cannot express a per-operator map. Do not reintroduce it | §1.3, §1.6; phase 1 |
+| `restore_from_infos` sharding | **Persist `operator_uid: Option<u32>` on `NetworkInfo`** (`#[serde(default)]`). Covers Lima and lite uniformly; slot-derivation was rejected because lite sessions claim a token, not a slot | §2.1; phase 1 |
+| The 429 variant's shape | **Structured, not string-wrapped** — carries operator uid, in-use count and quota, with a `Display` impl. Collapses three byte-identical message copies into one | §2.2; phase 1 |
+| De-enrollment | **Specified in phase 1 alongside enrollment.** Reclaiming a range without revoking the departing operator's group membership **recreates the §1.6 defect exactly** | §1.6; phase 1 |
 
 ---
 
