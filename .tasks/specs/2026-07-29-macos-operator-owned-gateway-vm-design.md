@@ -409,7 +409,8 @@ production is QEMU — `.tasks/specs/2026-05-02-macos-support-design.md:10`.)
 
 Absolute, unbypassable egress control is the project's reason to exist. Moving the VM
 that hosts every enforcement point into a different trust domain must have that
-property **re-proven before** three-to-five weeks of migration work, not after.
+property **re-proven before** the migration work, not after — and that work is now known
+to be larger than issue #82's three-to-five week estimate (§5.3).
 
 ### Why slot partitioning comes before ownership
 
@@ -428,8 +429,14 @@ VM would sit on the segment carrying operator B's session traffic and could addr
 both endpoints on it.
 
 Solving it only for lite defers the problem to whenever the full backend joins the
-model. Partitioning is what makes the isolation claim in §5.1 true, so it is designed
-here rather than documented away.
+model, so partitioning is designed here rather than documented away.
+
+**But be precise about what partitioning buys.** It removes the *addressing collision*
+above. It does **not** by itself make the isolation claim in §5.1 true — every enrolled
+operator can open every slot socket regardless of who the daemon thinks owns it. That is
+§1.6's job, and §1.6 is an active defect record, not a refinement. An earlier draft
+credited partitioning with the isolation property; it partitions the ledger, not the
+kernel's access control.
 
 ### Phase map
 
@@ -445,10 +452,8 @@ here rather than documented away.
 
 **⚠️ Ownership moved from phase 2 to phase 4.** The forwarded Docker socket lives inside
 the operator-owned instance directory, so the daemon loses Docker access the instant
-ownership flips — the brokered control plane has to exist first. Full reasoning in
-[§4](#4-phases).
-
-Full detail in [§4](#4-phases).
+ownership flips — the brokered control plane has to exist first. Full reasoning, and the
+per-phase detail, in [§4](#4-phases).
 
 ---
 
@@ -597,10 +602,12 @@ independently shippable ahead of the rest of this design.
 
 ### 1.3 Range assignment, lifetime and quota
 
-- **Assigned at operator enrollment**, in privileged configuration. Not claimed at VM
-  creation, not released at VM deletion.
-- **Read, not persisted, by the daemon** — §2.1, and §1.6 for where the assignment
-  actually lives.
+- **Assigned at operator enrollment**, which writes root-owned state (the slot plists'
+  group and that group's membership). Not claimed at VM creation, not released at VM
+  deletion.
+- **Derived by the daemon, not stored by it** — the daemon reads the assignment back off
+  the running sockets rather than from a config file or a database. See *How the daemon
+  learns a range* below, and §2.1 for what it consequently does **not** persist.
 
 **⚠️ This section reverses an earlier decision.** Ranges were previously claimed at VM
 creation and persisted by the daemon. §1.6 moves the enforcement into root-owned static
@@ -742,9 +749,16 @@ part of the validator-split work before treating the path as proven.
 `interface:`, and an older Lima that ignores an unknown key yields positional names on a
 non-positional range — the exact silent wrong-segment failure this fix exists to prevent.
 Note that **fix 1a would not catch it**: the generator asserts what it *emits*, not what
-Lima *honours*. **Decision required in phase 1: bump `MIN_LIMA_VERSION` to a version where
-`interface:` is known-honoured, or add a runtime assertion that the discovered NIC names
-match the requested ones.** Do not leave the floor at 1.2.0 unexamined.
+Lima *honours*.
+
+**This is already closed by fix 2, not left open.** Fix 2 requires the daemon to build the
+`NicMap` itself and use `ip -json link show` only to *verify* that each expected interface
+is present, failing closed on a mismatch — so an older Lima that ignored `interface:`
+produces a refused create rather than a silently misplaced session. Bumping
+`MIN_LIMA_VERSION` above 1.2.0 remains available as cheaper, earlier hardening (it fails at
+template validation instead of at NIC discovery), but it is **optional**: the hazard has a
+mandated backstop either way. An earlier draft framed this as an unresolved either/or,
+which double-counted a decision fix 2 had already made.
 
 #### Fix 1a — the generator must now guard the invariant itself
 
@@ -1536,7 +1550,7 @@ names, but they live in **different LIMA_HOMEs**, and a name is only meaningful 
 with the LIMA_HOME it resolves in. Any daemon-side map keyed on instance name must
 therefore be keyed by **(operator uid, name)** — or simply by operator uid, since each
 operator has exactly one gateway VM. Audit for name-keyed lookups when implementing
-phase 2.
+phase 4 (ownership).
 
 ### 2.7 Bounce-to-resize: available, deliberately unbuilt
 
@@ -1578,7 +1592,9 @@ pub fn sessions_to_recover(all: Vec<Session>) -> Vec<Session> {
 
 and sandbox containers are created `--restart no` (`backend/container.rs:853-854`), so
 they do not return when the VM's Docker daemon restarts. Until #83 lands, resizing a
-range means restarting the daemon and re-deriving ranges from persisted state.
+range is privileged re-enrollment (§1.6) plus a VM bounce — not something the daemon can
+do, and not something it can do without destroying that operator's running lite
+sessions.
 
 #### Future enhancement, explicitly out of scope: bounce-driven rebalancing
 
@@ -1595,9 +1611,12 @@ that holds, automatic rebalancing would silently destroy running work belonging 
 operator who did nothing but be first. Refusing B with an actionable 409 (§2.2 condition
 2) is the honest behaviour in the meantime.
 
-Revisit once #83 lands. The pieces it would need — persisted ranges (§2.1), a slot set
-derived at call time (§1.4 fix 3), and self-correcting provision scripts — are all
-already required by this design, so the future work is policy, not plumbing.
+Revisit once #83 lands. Two of the pieces it would need already exist here — a slot set
+passed per call (§1.4 fix 3) and self-correcting provision scripts — but note that a third
+does **not**: rebalancing has to rewrite root-owned plists and group membership (§1.6),
+which the daemon cannot do. So the future work is policy **plus a privileged step**, not
+policy alone. An earlier draft called it "policy, not plumbing" while ranges were
+daemon-persisted; that is no longer the shape.
 
 ---
 
@@ -2649,6 +2668,10 @@ preamble. Phase 1 supplies the range.
       to the agent while a `Create` is outstanding, then assert the VM is either absent
       (`limactl list` shows nothing, and a re-create succeeds) or present and startable.
       A stranded half-state is a VM that exists and cannot start.
+- [ ] **The instance socket path still fits `UNIX_PATH_MAX`** (§2.8). This phase is where
+      the name grows to `sandboxd-gateway-<operator_uid>`, so assert it here with a
+      computed check against 104 — phase 1's identical criterion was evaluated against the
+      old, shorter name.
 - [ ] `cargo nextest run --workspace --profile integration` passes (Docker required).
 - [ ] Egress enforcement is re-verified on the new shape. **The §3 gate script no longer
       exists** — deleted at phase 0's exit — so this rests on phase 6's retargeted e2e
@@ -2729,11 +2752,13 @@ criterion depends on this phase**, so the chain phase 4 → phase 6 → issue #8
 - `tests/e2e/conftest.py:1062` hard-codes the singleton name in a
   **delete-everything-else** state-dir sweep — under per-operator VMs it would delete
   every operator's instance dir on every pytest session.
-- **The LIMA_HOME formula disagreement is wider than two sites.** Truth is
-  `{root}/{daemon_uid}/{op_uid}/lima` (`lima.rs:197-199`). Wrong 2-level forms:
-  `test_networking.py:1511`, `gateway_lima.rs:772`, `:776-777`, `:797`,
-  `docs/concepts/networking.md:272-273`, and — **user-facing and currently broken** —
+- **The LIMA_HOME formula disagreement is wider than two sites — there are seven.** Truth
+  is `{root}/{daemon_uid}/{op_uid}/lima` (`lima.rs:197-199`). Wrong 2-level forms:
+  `gateway_lima.rs:7` (module doc), `:772`, `:797`, `docs/concepts/networking.md:272` and
+  `:273`, `tests/e2e/test_networking.py:1511`, and — **user-facing and currently broken** —
   `docs/guides/troubleshooting.md:32`, a `GW_SOCK=` snippet operators are told to run.
+  (`gateway_lima.rs:776-777` states the socket path relative to `daemon_lima_home`, so it
+  inherits the error rather than repeating it — fix the root and it becomes correct.)
 - **The larger coupling:** the cross-backend suite's structural gateway assertions run
   against a **host** Docker daemon that does not exist on macOS — `conftest.py:629-638`
   (`_preflight_checks` skips the entire session when `docker info` fails),
@@ -2752,7 +2777,8 @@ criterion depends on this phase**, so the chain phase 4 → phase 6 → issue #8
       `test_cross_user_helper_pivot.py:42`). Until then `make test-e2e-macos SCOPE=full`
       collects the whole Linux matrix and this phase cannot run.
 - [ ] No test hard-codes a single gateway instance name in a destructive sweep.
-- [ ] **All six** LIMA_HOME formulas agree, including `troubleshooting.md:32`.
+- [ ] **All seven** LIMA_HOME sites agree, including the user-facing `GW_SOCK=` snippet at
+      `troubleshooting.md:32` and the module doc at `gateway_lima.rs:7`.
 - [ ] A cross-operator isolation test exists and asserts the **inverted** property.
 - [ ] **A durable macOS-lite bypass-resistance test exists** — delete the helper-installed
       route, install one via the Docker bridge gateway, assert the block. This is the lite
@@ -2984,7 +3010,8 @@ builders". The measured Docker surface is roughly triple:
 
 **Do not invent a replacement number.** The bucket most likely to be under-scoped in the
 original estimate has measurably more surface than the estimate assumed. Re-estimate
-against these figures **after** the gate, when phase 3's shape is actually decided.
+against these figures **after** the gate, when phase 2's shape — the brokered Docker
+control plane — is actually decided.
 
 Two counterweights, for honesty: `gateway_recovery.rs` is far cheaper than #82 suggests
 (correction 6), and the `op_uid` routing change in §1.1 is free.
@@ -3018,13 +3045,24 @@ would normally use to find it — **which is exactly why it is repeated here**.
 
 ## Open questions
 
-**None remain undecided.** Every design question raised by review has been answered; the
-decisions live in the sections named in the table below, and the items in *Still
+**No design questions remain open.** Every question raised by review has been answered;
+the decisions live in the sections named in the table below, and the items in *Still
 unverified* are facts to check rather than choices to make.
 
-This section previously claimed to be empty when it was not — §2.5 left a mitigation open
-while the section declared the design closed. It is empty now, and the trail below is how
-you tell the difference.
+This section once claimed to be empty when it was not — §2.5 had left a mitigation open
+while the section declared the design closed. So the claim above is deliberately narrower
+than "nothing is undecided", and here is exactly what it excludes:
+
+**Two bounded implementation choices are delegated to their phase**, with both options
+stated and neither affecting anything outside the phase that makes it:
+
+| Choice | Options | Phase |
+|---|---|---|
+| Where the reaper's gateway exclusion lives (§2.6) | in `reap_lima_orphans_inner`, or `decide_lima_vm` gains a `name` parameter | 4 |
+| How `run_gateway_recovery` gets operator scope (§2.6) | operator scope on `GatewayRecoveryDeps`, or a filtering impl supplied by the caller | 4 |
+
+Those are implementation shape, not design. If either turns out to have a consequence
+outside its phase, it becomes an open question again — say so rather than absorbing it.
 
 
 ### Still unverified (facts, not decisions)
@@ -3085,7 +3123,8 @@ Everything this design touches, in one place.
 | Production gateway-image staging | `scripts/install.sh:3030`, `:3240` |
 | Exhaustion errors | `network.rs:1161-1176, 1208-1213` |
 | Inter-slot L2 isolation test | `network.rs:3021` |
-| Error → HTTP mapping | `sandboxd/src/error.rs:57-79` |
+| `SandboxError` enum (where new variants go) | `sandbox-core/src/error.rs:9` |
+| Error → HTTP mapping (arms only) | `sandboxd/src/error.rs:57-79` |
 | Lima executor seam / op enum | `sandbox-core/src/lima.rs:870-899`, `:766-810` |
 | Per-operator LIMA_HOME + ACE | `lima.rs:214-223`, `:574-660` (rationale `:601-610`) |
 | Manager registry precedent | `lima.rs:1245-1280` |
