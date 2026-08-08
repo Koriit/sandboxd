@@ -36,9 +36,12 @@ and assumes **no** prior knowledge of this codebase.
   it holds is a trail of those decisions and where each one lives, plus a short list of
   facts still to be **verified** (not chosen), each with a 30-second check.
 
-Every claim cites a `file:line` in this repository. Line numbers are against `master`
-@ `7e5fa0c`. Where a line may have moved, the code is quoted inline so you can
-recognise it.
+Every claim cites a `file:line` in this repository. **Line numbers are exact as of baseline
+commit `7e5fa0c`** — that is what made two rounds of review verifiable line by line. They
+**will drift** as the tree moves; the baseline is named here precisely so you can rebase
+them, and load-bearing code is quoted inline so you can recognise a site that has shifted.
+Treat a mismatch as drift to re-locate, not as an error in the claim, unless the quoted code
+is also absent.
 
 **One claim is still marked ⚠️ UNVERIFIED** (§2.7, `cidata.iso` regeneration). It is
 flagged at its point of use with a check you can run in under a minute. Do not build on
@@ -449,7 +452,7 @@ kernel's access control.
 | **3** | Typed route-helper broker op | 2 |
 | **4** | Per-operator gateway VM ownership | **2 and 3 — hard boundary** |
 | **5** | Real `shared:` workspaces — *the feature #82 is named for* | 4. **Not #83** — declared export roots bounce the VM only on a root change, not per create |
-| **6** | Test and docs retarget | runs continuously across 1–5; **phase 4 depends on it**; gated on #84 |
+| **6** | Test and docs retarget | runs continuously across 1–5; **phase 4 depends on it**; **owns #84 as its first item** |
 
 **⚠️ Ownership moved from phase 2 to phase 4.** The forwarded Docker socket lives inside
 the operator-owned instance directory, so the daemon loses Docker access the instant
@@ -2623,11 +2626,27 @@ An earlier draft treated this as one env-var row in the ownership phase's file t
 is not: ownership landing before the brokered ops produces a gateway manager that cannot
 reach its own VM, with acceptance criteria that are unreachable by construction.
 
-**Accepted cost of the reorder.** The new ops (phases 2–3) cannot be exercised
-end-to-end until ownership flips in phase 4 — they are built against a daemon-owned VM
-that does not yet need them. **Mitigation, and it is required, not optional:** phases 2
-and 3 each stand up a **scratch operator-owned VM inside an integration test** and
-exercise their ops against it. They must not ship on unit tests alone.
+**Accepted cost of the reorder — and it is an acceptance, not an oversight.** The new ops
+in phases 2–3 cannot be exercised end-to-end until ownership flips in phase 4: they are
+built against a daemon-owned VM that does not yet need them.
+
+**Phases 2 and 3 ship on unit tests. End-to-end integration lands at phase 4.** That was
+the trade accepted when the hard boundary was chosen, and it is recorded here so a later
+reader does not mistake it for something nobody noticed.
+
+A scratch operator-owned VM in an integration test was considered as a mitigation and
+**rejected**. Exercising the brokered path needs `op_uid != daemon_uid`, i.e. a live agent
+for that uid — and the tree has no such harness:
+`sandbox-core/tests/integration_macos_session_lifecycle.rs:1-47` states its own harness is
+`DirectLimaExecutor`, *"no broker, no agent"*, and explicitly **defers** the
+daemon+broker+agent path to the Python e2e suite. Building that infrastructure mid-migration,
+on the critical path, for a benefit that arrives once, costs more than the risk it covers.
+
+⚠️ **The consequence is that integration risk is concentrated at phase 4, deliberately and
+knowingly.** Phase 4 is the first place the brokered control plane runs for real, against a
+VM the daemon can no longer reach directly. Its acceptance criteria carry that weight and are
+written accordingly — if they are ever weakened, this is the paragraph that explains why they
+cannot be.
 
 **The feature issue #82 is named for still lands last.** `shared:` with real project
 paths cannot work until the VM is operator-owned, which cannot land until the brokered
@@ -2843,19 +2862,10 @@ ops and share the serialization concern in §2.5.
 
 **Acceptance criteria.**
 
-- [ ] **A scratch operator-owned VM is stood up and the new ops are exercised against it.**
-      This phase must not ship on unit tests alone — it is built before the thing that needs
-      it, and this is the mitigation for that.
-
-      ⚠️ **This needs harness that does not exist, and the tree says so.** "Operator-owned"
-      means `op_uid != daemon_uid`, which routes through the broker and needs a live agent
-      for that uid. `sandbox-core/tests/integration_macos_session_lifecycle.rs:1-47` states
-      its harness is `DirectLimaExecutor` — *"no broker, no agent"* — and explicitly **defers**
-      the daemon+broker+agent path to the Python e2e suite. `test_support/` contains only the
-      direct executor and a docker path stub. So this criterion is either **(a)** satisfied in
-      the Python e2e harness, inheriting its `setup-dev-env` / sudoers / `sg` requirements and
-      phase 0 Part B's #85 dependency, or **(b)** it is a sub-project of its own. **Decide
-      which before starting the phase**; it is not free either way.
+- [ ] **Unit coverage is the bar for this phase, and that is deliberate** (§4 preamble).
+      Every new op has unit tests for its argv construction and its agent-side validation;
+      end-to-end exercise arrives at phase 4. Do not build a broker+agent integration harness
+      to satisfy this — that was considered and rejected.
 - [ ] No production `docker` invocation targets an operator VM's socket directly from the
       daemon.
 - [ ] The op enum remains closed: **no** `DockerExec { args: Vec<String> }` or equivalent
@@ -2929,8 +2939,8 @@ current invocation is one of the five `limactl shell` sites the daemon loses at 
       box.
 - [ ] Only then: the stale perimeter claim is corrected in **both** files, describing the
       perimeter that now exists.
-- [ ] A scratch operator-owned VM integration test exercises the op (same rationale as
-      phase 2).
+- [ ] Unit coverage only, as for phase 2 — the op's argv construction and its agent-side
+      validation. This op is first exercised end-to-end at phase 4 (§4 preamble).
 
 ---
 
@@ -3002,6 +3012,16 @@ preamble. Phase 1 supplies the range.
       to the agent while a `Create` is outstanding, then assert the VM is either absent
       (`limactl list` shows nothing, and a re-create succeeds) or present and startable.
       A stranded half-state is a VM that exists and cannot start.
+- [ ] **Every op introduced in phases 2 and 3 is exercised against a real operator-owned
+      VM here, and this is the first time any of them runs for real** (§4 preamble). Enumerate
+      them and check them off individually — the ~11 in-VM shell/copy replacements, the Docker
+      op family, the brokered streams, and the typed route-helper op. A phase-4 sign-off that
+      does not name each one is not carrying the risk the preamble hands it.
+- [ ] **The failure mode is understood before starting, not after.** Because phases 2–3 ship
+      unvalidated end-to-end, defects in them surface here — in a phase that also flips
+      ownership. Land the ownership flip **behind a switch that can be reverted without
+      undoing phases 2–3**, so a brokered-op defect can be diagnosed against a daemon-owned VM
+      rather than only against the new shape.
 - [ ] **The instance socket path still fits `UNIX_PATH_MAX`** (§2.8). This phase is where
       the name grows to `sandboxd-gateway-<operator_uid>`, so assert it here with a
       computed check against 104 — phase 1's identical criterion was evaluated against the
@@ -3087,8 +3107,14 @@ roots. The stanza generator is re-pointed, not removed.
 **Goal.** The suite stops assuming one daemon-owned gateway VM and a host Docker daemon.
 
 **Depends on.** Runs alongside phases 1–5. Do not defer it to the end. **Phase 4's egress
-criterion depends on this phase**, so the chain phase 4 → phase 6 → issue #84 is real and
-#84 currently has no owner in this plan.
+criterion depends on this phase.**
+
+**First item of this phase: close issue #84.** It is a prerequisite, not a floating
+dependency — until `linux_only` is applied to the tests whose bodies assert on systemd,
+cgroup v2 and `sandbox-lima-helper`, `make test-e2e-macos SCOPE=full` collects the whole
+Linux-authored matrix on macOS and **this phase cannot produce a trustworthy result at all**.
+Named candidates: `test_hardening.py:37`, `test_cross_user_helper_pivot.py:42`. This phase
+owns it; it is not someone else's to schedule.
 
 **Why continuous.** The surface is not a tail:
 
@@ -3117,10 +3143,8 @@ criterion depends on this phase**, so the chain phase 4 → phase 6 → issue #8
 
 **Acceptance criteria.**
 
-- [ ] Issue #84 closed first — `linux_only` applied to the tests whose bodies assert on
-      systemd, cgroup v2 or `sandbox-lima-helper` (`test_hardening.py:37`,
-      `test_cross_user_helper_pivot.py:42`). Until then `make test-e2e-macos SCOPE=full`
-      collects the whole Linux matrix and this phase cannot run.
+- [ ] **Issue #84 closed — this phase's first item** (see *Depends on*). Nothing else in
+      phase 6 yields a trustworthy result until it is.
 - [ ] No test hard-codes a single gateway instance name in a destructive sweep.
 - [ ] **No 2-level `/var/lib/sandboxd/<uid>/lima` form survives anywhere — assert with a
       repo-wide grep, not a list.** ⚠️ A fixed count has now been wrong twice (six, then
@@ -3507,7 +3531,7 @@ would normally use to find it — **which is exactly why it is repeated here**.
 | Issue | Bearing |
 |---|---|
 | **#83** — gateway-VM recovery skips container-backend sessions (`gateway_recovery.rs:77-82`) | **Blocks bounce-to-resize** (§2.7). **It does not block phase 5** — the declared-roots mechanism (§5.1) bounces the VM only when the roots change, not per `shared:` create. It does still bite on that rarer path: a root change destroys the operator's running lite sessions with no recovery, because containers are `--restart no` (`container.rs:853-854`). |
-| **#84** — `linux_only` declared and enforced but applied to zero tests | **Phase 6 depends on it.** `make test-e2e-macos SCOPE=full` currently collects the whole Linux-authored matrix on macOS. Close it first. |
+| **#84** — `linux_only` declared and enforced but applied to zero tests | **Owned by phase 6, as its first item.** `make test-e2e-macos SCOPE=full` currently collects the whole Linux-authored matrix on macOS, so no phase-6 result is trustworthy until it closes — and phase 4's egress criterion rests on phase 6. |
 | **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **A prerequisite, not merely related.** The second-operator isolation probe (§3.7) cannot run until it is fixed, because the host has no honest second operator to offer: pre-rename plists, no real `_sandboxd` account, and the existing candidates enrolled in Apple's reserved gid 60 (adding another there was rejected — it deepens the same problem). Fixing it is also what makes `make setup-dev-env` safe again. **The single-operator gate does not depend on it.** See [Before you start](#before-you-start). |
 
 ---
