@@ -3017,11 +3017,28 @@ preamble. Phase 1 supplies the range.
       them and check them off individually — the ~11 in-VM shell/copy replacements, the Docker
       op family, the brokered streams, and the typed route-helper op. A phase-4 sign-off that
       does not name each one is not carrying the risk the preamble hands it.
-- [ ] **The failure mode is understood before starting, not after.** Because phases 2–3 ship
-      unvalidated end-to-end, defects in them surface here — in a phase that also flips
-      ownership. Land the ownership flip **behind a switch that can be reverted without
-      undoing phases 2–3**, so a brokered-op defect can be diagnosed against a daemon-owned VM
-      rather than only against the new shape.
+- [ ] **Land the phase in three ordered steps, each independently revertible.** ⚠️ An
+      earlier version of this criterion said "land the ownership flip behind a revertible
+      switch". **That is not sufficient, and it is partly unsatisfiable**: a daemon-side
+      switch can revert the *daemon's* behaviour, but the §1.6 socket-group flip is
+      **root-level host state** — regenerated plists plus a launchd reload — which no daemon
+      switch can undo. Worse, the two are coupled in one direction: once the sockets carry
+      per-operator groups, reverting to a daemon-owned VM **reproduces the outage §1.6 was
+      split across phases to avoid**, because that VM must open every slot.
+
+      So the order matters and the revert order is its inverse:
+
+      | Step | Lands | Revert |
+      |---|---|---|
+      | **4a** | Ownership flip + validator split. Sockets stay on the legacy group; `0666` unchanged | daemon-side switch — safe at any time |
+      | **4b** | §1.6 socket-group enforcement (plists + reload) | **only after 4a is reverted**, never before |
+      | **4c** | `0666` removal (§5.1 escape remediation) | independent of both |
+
+      **4a is where the phase-2/3 integration risk actually lands**, and it is the only step
+      that must be diagnosable against a daemon-owned VM. Do not collapse the three: with
+      four security-critical changes landing together — ownership, a TCB validator boundary,
+      the C1 enforcement flip and the escape remediation — a failure cannot be attributed,
+      and two of them are the fixes for live defects this document exists to record.
 - [ ] **The instance socket path still fits `UNIX_PATH_MAX`** (§2.8). This phase is where
       the name grows to `sandboxd-gateway-<operator_uid>`, so assert it here with a
       computed check against 104 — phase 1's identical criterion was evaluated against the
