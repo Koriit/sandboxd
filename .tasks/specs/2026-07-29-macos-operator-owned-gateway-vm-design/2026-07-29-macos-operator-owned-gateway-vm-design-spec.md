@@ -1260,11 +1260,31 @@ De-enrollment has an ordering requirement; enrollment needs one too, and it was 
 unstated. Create the group and add its members **before** regenerating any plist that names
 it.
 
-⚠️ **What `socket_vmnet` does with a `--socket-group` naming a nonexistent group is
-unknown**, and one plausible answer is worse than the defect being fixed: its documented
-default is `staff`, which on macOS contains essentially every local user. If it falls back to
-that default rather than refusing to start, a mis-ordered enrollment widens access instead of
-narrowing it, silently. **Pre-check D (§3.1) settles this before any plist is written.**
+✅ **RESOLVED by pre-check D (M24-S2, 2026-08-08): `socket_vmnet` refuses to start.** It exits
+**1** with `ERROR| unknown group name "<group>"` followed by `ERROR| socket_bindlisten`, and
+does so *before* `vmnet.framework` is initialized — no `INFO | Initializing vmnet.framework`
+line is ever emitted. **There is no `staff` fallback.** A positive control (identical argv with
+a real group) starts normally, which isolates group-name resolution as the cause rather than
+any environmental failure.
+
+So a mis-ordered enrollment fails loudly, and this ordering requirement is now verifiable
+rather than assumed. Two consequences for the enrollment work:
+
+- **The check is cheap.** An implementation may rely on the loud failure; it does not have to
+  defensively verify group existence before emitting a plist. It should still create the group
+  first — the rule stands — but the cost of getting it wrong is a job that does not start,
+  not a silently widened segment.
+- **"Loudly" means at next boot, on this host's plist shape.** The pre-exec preamble is an
+  `&&` chain and the job carries `KeepAlive`, so a plist naming a missing group produces a
+  retry loop in the launchd log at next boot rather than an error at the moment the plist is
+  written. That is the same deferred-failure shape issue #85 describes.
+
+Two secondary observations, both recorded because they shape the repair procedure. The failed
+run leaves a stale `srwxr-xr-x root:wheel` socket at the target path with **no listener** — it
+does not widen access, because `connect(2)` needs write permission and only root has it, but
+the symptom is "path exists, nothing serves it" rather than "job missing". And a corrected
+retry over that stale path **succeeds**, so repair is: create the group, let the job retry; no
+manual socket cleanup is required.
 
 #### Why no existing test catches this, and how to test the fix
 
@@ -1726,8 +1746,20 @@ Three pieces of evidence:
 2. **`cidata.iso` is written by the start path, not the create path.** In the reference
    instance dir it postdates `lima.yaml` by ~15 hours, and generation lives in
    `pkg/cidata.ExecuteTemplateCIDataISO` / `GenerateISO9660` / `writeCIDataDir`.
-   ⚠️ **UNVERIFIED that it regenerates on *every* start** — that is one mtime data
-   point. Pre-check B (§3.1) settles it in 30 seconds.
+   ✅ **VERIFIED by pre-check B (M24-S2, 2026-08-08): it regenerates on every start.**
+   Measured across a stop/start cycle of an already-once-started throwaway instance — so a
+   genuine second start, which is the claim that was in doubt:
+
+   ```
+   before: mtime=1786225364  sha256=ea0c5d1e…c429  size=19763200
+   after:  mtime=1786225560  sha256=7ce4aef5…735f  size=19763200
+   ```
+
+   **Both the mtime and the content hash change.** The content check matters: §3.1's procedure
+   compares mtime alone, which cannot distinguish "regenerated" from "rewritten identically" or
+   "merely touched". A differing sha256 at an unchanged size establishes a genuine rebuild.
+   Bounce-to-resize is therefore viable as described — a `networks:` change is a stop/start,
+   not an instance recreation.
 3. Lima ships `limactl edit INSTANCE` with `--network`, arbitrary `--set` yq mutation,
    and `--start`.
 
@@ -2601,6 +2633,103 @@ the question is live. It **must not touch `sandboxd-gateway` or any real instanc
 When the question is answered, **delete the script** (see
 [Form and lifetime](#form-and-lifetime-a-throwaway-shell-script)).
 
+### 3.10 Part A result — run 2026-08-08 (M24-S2)
+
+**The question is answered: YES, egress is still enforced when the gateway VM is
+operator-owned. §3.8 outcome (c) was not reached and the decision survives.**
+
+Part A only. §3.7 and assertion 5 remain M24-S3's. The script was deleted per
+[Form and lifetime](#form-and-lifetime-a-throwaway-shell-script); the durable record is this
+section plus issue #82.
+
+| | Result |
+|---|---|
+| VM start on an operator-owned QEMU against the daemon pool's slot socket | `lima0` up `LOWER_UP`; `docker info` green. **No socket-permission trouble — direct evidence against outcome (a)** |
+| §3.5 route verified before assertion 1 | `default via 10.211.0.2` |
+| Assertion 1 — deny | **exit 7 @ 129 µs** — a real block; not `{52,56}`. See below |
+| Assertion 2 — allow | **exit 0**, HTTP 200, `Example Domain` present |
+| Assertion 3 — structural | all six rows; `inet` table set exactly `{sandbox, sandbox_dnat}` |
+| Assertion 4 — bypass | **exit 0** — confirms the known-open #80 Docker-NAT bypass. No §3.8 outcome |
+| Negative control (skip §3.5) | **red at assertion 1**: 28 @ 8.005 s |
+| Teardown | no residue; `sandboxd-gateway` untouched |
+
+#### Assertion 1's qualified result, and why it is not outcome (c)
+
+Denied TCP is blocked — in 129 microseconds, by the gateway container, with a live policy
+loaded that does not cover the target — but `curl` returns **7**, not the connect-then-RST
+`{52,56}` this section specifies.
+
+**Cause.** `sandbox-nft-deny-logger` binds the wrong NIC's address on the macOS lite shape.
+`entrypoint.sh:231` derives its bind address as `hostname -i`, and
+`build_macos_gateway_docker_args` (`macos_session.rs:567-640`) starts the container with
+`--network sandboxd-egress` and passes no `GATEWAY_IP` override, attaching the session NIC only
+afterwards (`macos_session.rs:523`). So the logger binds the **egress** address while
+`inject_dnat` DNATs denied TCP to the **session-bridge** address `:10001`. Nothing listens
+there; the kernel RSTs. The Linux path is unaffected — `gateway.rs:549-557` starts the
+container with `--network <session-net> --ip <gateway_ip>`, so `hostname -i` already *is* the
+DNAT target.
+
+**Proof that interception itself is intact.** With a stand-in listener at the DNAT target, the
+identical `curl` returns **52** — this section's own PASS code — over the same route, rules and
+policy element.
+
+**Not (c).** (c) is defined as assertion 1 failing with a verified-correct route for a reason
+that is not (a) or (b), and §3.6 gives its operational signature as exit 0, *"the probe reached
+the internet"*. The probe did not reach the internet. And the cause is `hostname -i` inside a
+container — a function of Docker's NIC-attachment order *inside* the VM, identical whether that
+VM belongs to the daemon or the operator. Nothing about it is ownership-coupled, which is the
+only question this section exists to answer.
+
+**What it does mean:** on the macOS lite backend the deny-logger's TCP sink is never reached,
+so **TCP `deny` events are silently lost there**. Enforcement is unaffected (it fails closed);
+observability is. UDP deny logging is unaffected — NFLOG group 1 is netlink-based and carries no
+bind address. This also explains why `test_lite_macos.py:410` accepts exit 7: it asserts against
+the real macOS lite topology, where 7 is the ordinary denied-TCP outcome. Fix by passing
+`GATEWAY_IP` explicitly, binding the loggers to `0.0.0.0`, or attaching the session NIC before
+the container starts.
+
+#### Three defects in this section, found by running it
+
+Each would have produced a false red. Recorded so a re-run does not rediscover them.
+
+1. **§3.4 step 12 names only one of the three rulesets `inject_dnat` injects.** The production
+   reference is right; the generator citation is incomplete. `inject_dnat`
+   (`gateway.rs:1172-1190`) injects `generate_dnat_ruleset`, then
+   `generate_forward_allow_ruleset` (`:1760`), then `generate_input_allow_ruleset` (`:1705`).
+   The last is load-bearing here: step 10's deny-all input chain is `policy drop` with a
+   trailing `reject`, and input-allow is what contributes
+   `ip saddr <subnet> tcp dport 10001 accept` — the deny-logger port assertion 1 targets. The
+   code says so at `gateway.rs:1185-1188`. **Inject all three.**
+2. **§3.4 step 7's seeded listener is rejected by Envoy.**
+   `compile_initial_envoy_listener` (`policy.rs:1995`) is literally `filter_chains: []`, and
+   Envoy refuses it: *"error adding listener '0.0.0.0:10000': no filter chains specified"*. So
+   nothing binds `:10000`, which is where the DNAT rule sends policy-allowed TCP, and
+   **assertion 2 cannot pass as specified** — in production the chains are filled in afterwards
+   by the daemon's DNS-propagation loop (`PolicyDistributor` → `AtomicListenerWriter::write`),
+   and §3 has no daemon. Render the post-resolution listener with
+   `PolicyCompiler::compile_envoy_listener(&policy, &dns_cache)` (`policy.rs:1237`, public) over
+   a `DnsCache` seeded from a `ResolvedReport`, and install it by **atomic rename** — an
+   in-place write is not picked up by the filesystem LDS subscription.
+3. **§3.6 assertion 3's "exactly `{sandbox, sandbox_dnat}`" is unsatisfiable as written.**
+   Docker's own `table ip nat` (the `DOCKER_OUTPUT` / `DOCKER_POSTROUTING` redirect for
+   `127.0.0.11`) is present in a *fresh* gateway container with no sandboxd rules injected at
+   all, and `nft` itself warns it is managed by iptables-nft. Qualify the criterion to the
+   **`inet` family**, which is what sandboxd owns; it passes there.
+
+A fourth, mechanical: the gateway container is `--read-only`, and `docker cp` into it is refused
+(*"container rootfs is marked read-only"*) even for tmpfs targets. Production writes via
+`docker exec -i <ctr> sh -c "cat > '<path>'"` (`write_file_exec_argv`,
+`policy_distributor.rs:39-48`). Use that.
+
+#### A note on the "test your test" criterion
+
+On the literal `{52,56}`, *both* the good run (7) and the broken run (28) are red, so the
+criterion does not discriminate on this topology — the mirror image of the over-broad set this
+section already records from an earlier draft. Re-run with the bind defect compensated it is
+decisive: **52 with §3.5's route, 28 without.** Either way the gate discriminates; against the
+shipping topology the honest signature is `{7}` versus 28, separated by four orders of magnitude
+in latency as well as by exit code.
+
 ---
 
 ## 4. Phases
@@ -2682,26 +2811,39 @@ exit**.
 - [x] ~~Pre-check A~~ — **done.** `interface:` is honoured on `socket:` networks
       (§1.4 fix 1). Note its two limits: verified through bare `limactl`, **not** the
       broker path (§1.1a), and on Lima 2.1.2, **not** the declared 1.2.0 floor.
-- [ ] Pre-check B (§3.1) run; result recorded.
-- [ ] **Pre-check D (§3.1) run** — `socket_vmnet`'s behaviour with a nonexistent
-      `--socket-group`. **Blocks phase 1's plist work**, not just this phase: one plausible
-      answer (`staff` fallback) would make a mis-ordered enrollment worse than the defect.
+- [x] Pre-check B (§3.1) run; result recorded. **`cidata.iso` regenerates on every start**
+      (mtime *and* sha256 change). See §2.7 item 2.
+- [x] **Pre-check D (§3.1) run** — `socket_vmnet`'s behaviour with a nonexistent
+      `--socket-group`. **It refuses to start (exit 1); no `staff` fallback.** Phase 1's plist
+      work is unblocked. See §1.6 → *Enrollment ordering*.
 - [ ] **Pre-check C (§2.9) run** — does an operator's VM survive logout? Records whether
-      §2.4 and the §5.1 logged-out delta describe a real state.
-- [ ] Host `net.inet.ip.forwarding` recorded as context (§3.2) — **not** gated on.
-- [ ] Single-VM gate: assertions **1–3** (§3.6) pass, **in that order**, with §3.5's route
-      verified before assertion 1 runs.
-- [ ] Assertion 4 **run and its result recorded** — expected exit 0, confirming the
+      §2.4 and the §5.1 logged-out delta describe a real state. ⚠️ **NOT RUN — needs a human**;
+      an agent running as the operator cannot log that operator out without killing itself.
+      See § Still unverified.
+- [x] Host `net.inet.ip.forwarding` recorded as context (§3.2) — **not** gated on.
+      Measured `net.inet.ip.forwarding: 0`, `net.inet6.ip6.forwarding: 0`.
+- [~] Single-VM gate: assertions **1–3** (§3.6) pass, **in that order**, with §3.5's route
+      verified before assertion 1 runs. **Route verified (`default via 10.211.0.2`) before
+      assertion 1. Assertions 2 and 3 pass. Assertion 1 is QUALIFIED** — it blocks, in 129 µs,
+      but returns `7` rather than `{52,56}`, for the deny-logger bind reason in §3.10. With
+      that defect compensated the same assertion returns **52**. Routed to no §3.8 outcome;
+      explicitly **not (c)**.
+- [x] Assertion 4 **run and its result recorded** — **exit 0**, confirming the
       known-open Docker-NAT bypass (#80). It is not a pass/fail gate and does not map to any
       §3.8 outcome; the real assertion lands in phase 2. (Assertion 5, hostile VM, needs a
       second operator and is Part B.)
-- [ ] A deliberately broken run (skip §3.5) produces a **red** result at **assertion 1**,
-      not later. *Test your test* — and note this is only satisfiable because assertion 1
-      now asserts the discriminating signature (§3.6).
-- [ ] Any red result names outcome (a), (b), (c) or (d) per §3.8.
-- [ ] Teardown leaves no residue: `limactl list` shows no `egress-gate-*` instance, and
+- [x] A deliberately broken run (skip §3.5) produces a **red** result at **assertion 1**,
+      not later. *Test your test*. **Broken: `28` after 8.005 s. Good: `7` after 0.000126 s** —
+      discriminating by exit code and by four orders of magnitude in latency. On the spec's
+      literal `{52,56}` the pair was re-run with the bind defect compensated: **52 with the
+      route, 28 without.** See §3.10.
+- [x] Any red result names outcome (a), (b), (c) or (d) per §3.8. **Assertion 1's red is
+      routed in §3.10 and is not (a), (b), (c) or (d)** — it is a pre-existing backend defect
+      the gate surfaced, not a gate outcome. Its non-(c) status is argued from evidence there.
+- [x] Teardown leaves no residue: `limactl list` shows no `egress-gate-*` instance, and
       `docker network ls` inside any surviving VM shows no `gate-session`. Assert both;
-      "no residue" without a check is not a criterion.
+      "no residue" without a check is not a criterion. **Both asserted, plus the instance check
+      under the default LIMA_HOME; `sandboxd-gateway` still present and `Stopped`.**
 
 **Acceptance criteria — Part B (gated on issue #85).**
 
@@ -3577,11 +3719,25 @@ outside its phase, it becomes an open question again — say so rather than abso
 
 ### Still unverified (facts, not decisions)
 
-- **`cidata.iso` regeneration on every start** (§2.7) — pre-check B.
 - **Whether an operator's VM survives logout** (§2.9) — pre-check C. Decides whether §2.4
-  and one §5.1 delta describe a real state.
+  and one §5.1 delta describe a real state. ⚠️ **STILL OUTSTANDING after M24-S2, and it needs a
+  human.** The procedure requires logging the operator out; on the reference host the operator
+  is the same uid every agent session runs as, so logging out kills the process trying to run
+  the check. The remaining options are a human running it manually, or deferring it to a moment
+  when no agent session is live. Running it as a *different* operator needs M24-S3's dedicated
+  test-operator account. Until it is answered, §5.1's logged-out delta must not be published.
 - **`interface:` on the broker path and at the version floor** (§1.4 fix 1) — the Lima
   behaviour is confirmed; the production path and Lima 1.2.0 are not.
+
+**Settled by M24-S2 (2026-08-08), kept here as a trail:**
+
+- ✅ **`cidata.iso` regeneration on every start** (§2.7) — pre-check B. **Yes**; mtime *and*
+  sha256 both change across a stop/start. Recorded at §2.7 item 2.
+- ✅ **`socket_vmnet` with a `--socket-group` naming a nonexistent group** (§1.6 →
+  *Enrollment ordering*) — pre-check D. **It refuses to start** (exit 1, before
+  `vmnet.framework` initialization); there is no `staff` fallback. Recorded at §1.6 →
+  *Enrollment ordering*. This bullet did not previously exist — D had no home in this list even
+  though §4 Phase 0 gates on it — so it is added here for completeness.
 
 **And the gate itself can still change the answer.** Phase 0 exists because the egress
 question is unproven. A red gate routes to §3.8 — outcome (c) reopens the whole decision,
