@@ -1553,11 +1553,12 @@ session the daemon believes is gone keeps egressing under whatever policy was la
 indefinitely, if the operator never logs back in. That belongs in §5.1 as a delta (it is
 listed there), not here as a hygiene note.
 
-**And it rests on an unverified assumption — see §2.9.** Everything above presumes the VM
-*survives* logout. §2.5's supporting evidence is about **agent restart**, which is a
-different event. If macOS tears down the per-user domain at logout and kills QEMU, the
-behaviour is fail-closed and most of this section is unnecessary. The design does not know
-which, and §2.9 adds the check.
+**The assumption this rests on is now verified — see §2.9.** Everything above presumes the
+VM *survives* logout. §2.5's supporting evidence was about **agent restart**, which is a
+different event, so the design did not actually know. Pre-check C settled it on 2026-08-09:
+**the VM survives** — same QEMU and hostagent processes, unchanged guest `boot_id`, and
+`lima0` still `LOWER_UP` across a confirmed logout. The behaviour is therefore **fail-open**
+and this section describes a real state.
 
 **A related site, for a different reason.** `SessionStore::new` shells `docker ps` /
 `volume ls` / `network ls` at store-open time (verbs at `store.rs:245, 266, 286`; the
@@ -1844,26 +1845,71 @@ recomputing against 104. In particular, do not "temporarily" relocate a LIMA_HOM
 scratchpad or temp directory to test something — that is exactly what failed here, and
 the error does not name path length as the cause.
 
-### 2.9 ⚠️ Unverified: does an operator's VM survive logout?
+### 2.9 ✅ Answered: an operator's VM **does** survive logout
 
-**§2.3, §2.4 and §2.5 all presuppose that it does**, and none of them checks.
+**§2.3, §2.4 and §2.5 all presuppose that it does**, and none of them checked. Pre-check C
+now has. **It survives** — so the presupposition holds and §2.4 describes a real state.
 
-The evidence offered for survival is about a **different event**: §2.5 observes that
-`limactl start` detaches QEMU, so a VM survives an *agent restart*. Logout is not an agent
-restart. On macOS, launchd tears down the per-user domain at logout, and if that kills
-QEMU it takes every one of that operator's lite sessions with it.
+The evidence originally offered for survival was about a **different event**: §2.5 observes
+that `limactl start` detaches QEMU, so a VM survives an *agent restart*. Logout is not an
+agent restart. The concern was that launchd tears down the per-user domain at logout, and
+that if that killed QEMU it would take every one of that operator's lite sessions with it.
 
 **Which is true flips the security character of §2.4 entirely:**
 
 | If the VM… | Then §2.4 describes… | Character |
 |---|---|---|
 | **dies at logout** | nothing — there is no unreachable VM to reason about | fail-closed; most of §2.4 is unnecessary |
-| **survives logout** | running sandbox containers with live egress that the daemon cannot stop, re-policy or reap | fail-open; belongs in §5.1 as a delta (it is there) |
+| ✅ **survives logout** ← **this is the true row** | running sandbox containers with live egress that the daemon cannot stop, re-policy or reap | fail-open; belongs in §5.1 as a delta (it is there) |
 
-**Pre-check C, in the same 30-second shape as pre-check B:** create a VM as an operator,
-log that operator out, log back in, and observe whether the QEMU process survived and
-whether the agent re-registers cleanly. Run it alongside the other pre-checks; it costs a
-logout and it decides whether a whole section is describing a real state.
+#### Pre-check C result (2026-08-09) — SURVIVED, after a confirmed logout
+
+An operator-owned QEMU VM (`vmType: qemu`, one `socket_vmnet` NIC on slot-0, created as
+uid 501 in that operator's own LIMA_HOME) was left running across a real macOS logout and
+re-login. **Both the QEMU process and the `limactl hostagent` survived, and the guest
+kernel never restarted.**
+
+- **A real logout demonstrably occurred** — checked first, because "the VM survived" and
+  "no logout happened" produce identical process state. The unified log records
+  `Received a kAELogOutEvent` / `logoutType:1 - Logout` at `14:20:35` naming
+  `session: 100002` and `pid: 470`; launchd logged `[gui/501 [100002]:] cleaning up` at
+  `14:20:50`; the Aqua asid changed `100002` → `103833` with a new `loginwindow`; `wtmp`
+  shows the 38-day console session ending at `14:20` and a new one beginning; and the host
+  did not reboot (`up 38 days`). Not a screen lock, not a fast-user-switch, not a restart.
+- **Same processes, not restarted ones** — QEMU pid `16217` and hostagent pid `16206`, both
+  with `lstart` matching the pre-logout baseline to the second, `ELAPSED 03:46:44`.
+- **The guest ran continuously** — `boot_id` still `e372404a-434b-49ce-91c3-bfae1aa7da8c`,
+  identical to baseline; `journalctl --list-boots` shows exactly one boot, spanning
+  `10:36:48` → `14:25:01`, straight through the logout.
+- **The segment stayed attached** — `lima0` still `LOWER_UP`, and QEMU's fd chain to
+  `socket_vmnet`'s `slot-0.sock` is the *same kernel socket object* by address
+  (`0x733380cbe9dc4959 -> 0x14ef1ac0de89ab8b`), not a reconnection.
+- **Still functional** — `limactl shell` works from the new login session.
+
+**Why it survives.** Both processes are *still tagged with the destroyed audit session*
+(`session id = 100002`) yet were never signalled. macOS tore down the `gui/501` **launchd
+domain** and killed its launchd-managed jobs and GUI apps, but an unmanaged process with no
+controlling tty, orphaned to pid 1 by `limactl start`, is not killed merely for carrying the
+old asid. Responsibility rooted in the terminal app did not propagate either: `responsible
+pid` collapsed from the terminal to *self* when the terminal died.
+
+**Not exercised by this run — do not read these as passed:**
+
+- **The second half of §2.9 — whether the `sandbox-agent` LaunchAgent re-registers cleanly
+  after login.** The reference host has **no `sandbox-agent` LaunchAgent installed**
+  (verified: `~/Library/LaunchAgents/` holds only three Google updater plists,
+  `/Library/LaunchAgents/` is empty, no `sandbox-agent` process). This needs a host with the
+  agent installed and remains open — see § Still unverified.
+- **The hostagent-dies-QEMU-lives split.** Both halves survived, so that third outcome was
+  not produced. §2.4's reasoning that it would still be a live-egress case — QEMU holds its
+  own fd to `slot-0.sock`, so killing the hostagent alone does not sever the segment —
+  stands as analysis, not observation.
+- **Generality.** One VM, one host, one logout, launched from a terminal under `tmux`, with
+  no gateway container, no policy and no mounts in the guest. The result is about
+  QEMU/hostagent process survival, not about a fully-loaded gateway VM.
+
+Full evidence, including verbatim command output for every claim above:
+`.tasks/handoffs/20260809-m24-s2-precheck-c-state.md` § 7.
 
 ### 2.10 Resource multiplication — N VMs, not one
 
@@ -1942,9 +1988,12 @@ Two were originally scoped here. **A is already answered** — its result is fol
 path; Lima 2.1.2, not the declared 1.2.0 floor). **B is still outstanding**, takes about
 30 seconds, and should be done before §3.4.
 
-**Pre-check C (§2.9) also belongs here** — does an operator's VM survive logout? Create a
-VM, log the operator out, log back in, observe whether QEMU survived and whether the agent
-re-registers. It decides whether §2.4 and one §5.1 delta describe a real state.
+**Pre-check C (§2.9) also belonged here** — does an operator's VM survive logout? **Its
+VM-survival half is answered: it survives** (2026-08-09; §2.9 carries the result and the
+evidence). So §2.4 and the §5.1 logged-out delta describe a real state. Its second half —
+whether the `sandbox-agent` LaunchAgent re-registers cleanly after login — is **not
+exercised**, because the reference host has no such agent installed; it needs a host where
+one is. Do not re-run the VM-survival half.
 
 #### Pre-check A — ✅ ALREADY ANSWERED, do not re-run
 
@@ -2816,10 +2865,15 @@ exit**.
 - [x] **Pre-check D (§3.1) run** — `socket_vmnet`'s behaviour with a nonexistent
       `--socket-group`. **It refuses to start (exit 1); no `staff` fallback.** Phase 1's plist
       work is unblocked. See §1.6 → *Enrollment ordering*.
-- [ ] **Pre-check C (§2.9) run** — does an operator's VM survive logout? Records whether
-      §2.4 and the §5.1 logged-out delta describe a real state. ⚠️ **NOT RUN — needs a human**;
-      an agent running as the operator cannot log that operator out without killing itself.
-      See § Still unverified.
+- [x] **Pre-check C (§2.9) run** — does an operator's VM survive logout? **Yes, it survives**
+      (2026-08-09; a human operator logged out and back in, and the logout was confirmed
+      independently before the result was read). QEMU and hostagent pids and `lstart`
+      unchanged, guest `boot_id` unchanged with one boot in its journal, `lima0` still
+      `LOWER_UP` on the same socket object. **§2.4 and the §5.1 logged-out delta describe a
+      real state; the character is fail-open and that delta may be published.** See §2.9.
+      ⚠️ Its **second half is NOT exercised** — the `sandbox-agent` LaunchAgent does not
+      exist on this host, so re-registration after login was not observed. Still open; see
+      § Still unverified.
 - [x] Host `net.inet.ip.forwarding` recorded as context (§3.2) — **not** gated on.
       Measured `net.inet.ip.forwarding: 0`, `net.inet6.ip6.forwarding: 0`.
 - [~] Single-VM gate: assertions **1–3** (§3.6) pass, **in that order**, with §3.5's route
@@ -3575,10 +3629,10 @@ restore rather than merely re-document.
 
 **New delta — unreapable sessions with live egress while an operator is logged out.**
 
-If a VM survives logout (**unverified — §2.9**), its sandbox containers keep running with
-whatever policy was last pushed, and the daemon can neither stop nor re-policy nor reap
-them until the operator returns. If they do not survive, this delta does not exist. Resolve
-§2.9's pre-check C before publishing this list.
+A VM **does** survive logout (**verified 2026-08-09 — §2.9**), so its sandbox containers
+keep running with whatever policy was last pushed, and the daemon can neither stop nor
+re-policy nor reap them until the operator returns. This delta is real. Pre-check C is
+resolved, so the prohibition on publishing it is lifted: this list may be published.
 
 ### 5.2 Corrections issue #82 needs
 
@@ -3719,22 +3773,34 @@ outside its phase, it becomes an open question again — say so rather than abso
 
 ### Still unverified (facts, not decisions)
 
-- **Whether an operator's VM survives logout** (§2.9) — pre-check C. Decides whether §2.4
-  and one §5.1 delta describe a real state. ⚠️ **STILL OUTSTANDING after M24-S2, and it needs a
-  human.** The procedure requires logging the operator out; on the reference host the operator
-  is the same uid every agent session runs as, so logging out kills the process trying to run
-  the check. The remaining options are a human running it manually, or deferring it to a moment
-  when no agent session is live. Running it as a *different* operator needs M24-S3's dedicated
-  test-operator account. Until it is answered, §5.1's logged-out delta must not be published.
+- **Whether the `sandbox-agent` LaunchAgent re-registers cleanly after login** (§2.9,
+  second half) — the remaining half of pre-check C. ⚠️ **NOT EXERCISED.** Pre-check C
+  answered the VM-survival half (below), but the reference host has **no `sandbox-agent`
+  LaunchAgent installed**, so there was nothing to observe re-register. Answering it needs a
+  host with the agent installed — naturally M24-S3's dedicated test-operator account, or any
+  host where phase 1's plist work has landed. Report it as not exercised, never as passed.
 - **`interface:` on the broker path and at the version floor** (§1.4 fix 1) — the Lima
   behaviour is confirmed; the production path and Lima 1.2.0 are not.
 
-**Settled by M24-S2 (2026-08-08), kept here as a trail:**
+**Settled by M24-S2, kept here as a trail:**
 
-- ✅ **`cidata.iso` regeneration on every start** (§2.7) — pre-check B. **Yes**; mtime *and*
-  sha256 both change across a stop/start. Recorded at §2.7 item 2.
-- ✅ **`socket_vmnet` with a `--socket-group` naming a nonexistent group** (§1.6 →
-  *Enrollment ordering*) — pre-check D. **It refuses to start** (exit 1, before
+- ✅ **Whether an operator's VM survives logout** (2026-08-09, §2.9) — pre-check C,
+  VM-survival half. **Yes, it survives.** Run by a human operator logging out and back
+  in. A real logout was confirmed independently before the result was read
+  (`kAELogOutEvent` / `logoutType:1 - Logout` in the unified log, `gui/501` asid `100002` →
+  `103833`, launchd `cleaning up` on the old domain, a `wtmp` console logout/login pair, and
+  no host reboot). Across it: QEMU pid `16217` and hostagent pid `16206` both survived with
+  `lstart` unchanged to the second, the guest `boot_id` was unchanged with a single boot in
+  its journal, and `lima0` stayed `LOWER_UP` on the *same* kernel socket object to
+  `slot-0.sock`. **So §2.4 and §5.1's logged-out delta describe a real state, the character
+  is fail-open, and that delta may now be published.** Recorded at §2.9; full evidence in
+  `.tasks/handoffs/20260809-m24-s2-precheck-c-state.md` § 7. Two things the run did *not*
+  establish: the `sandbox-agent` re-registration half (above), and the
+  hostagent-dies-QEMU-lives split, which did not occur and stays analysis.
+- ✅ **`cidata.iso` regeneration on every start** (2026-08-08, §2.7) — pre-check B.
+  **Yes**; mtime *and* sha256 both change across a stop/start. Recorded at §2.7 item 2.
+- ✅ **`socket_vmnet` with a `--socket-group` naming a nonexistent group** (2026-08-08,
+  §1.6 → *Enrollment ordering*) — pre-check D. **It refuses to start** (exit 1, before
   `vmnet.framework` initialization); there is no `staff` fallback. Recorded at §1.6 →
   *Enrollment ordering*. This bullet did not previously exist — D had no home in this list even
   though §4 Phase 0 gates on it — so it is added here for completeness.
