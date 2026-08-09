@@ -48,10 +48,13 @@ fn makefile() -> String {
 
 /// Fold backslash-continued lines into the logical lines make sees.
 ///
-/// Both lints need this. The edge lint needs it so a rule whose prerequisites
-/// wrap is not truncated; the warn-then-skip lint needs it because a recipe's
-/// entire `if`/`then`/`else` chain is one logical line, and that is the unit in
-/// which "printed a warning, then exited 0" is meaningful.
+/// Three of the four lints here need this. The edge lint needs it so a rule
+/// whose prerequisites wrap is not truncated; the warn-then-skip lint needs it
+/// because a recipe's entire `if`/`then`/`else` chain is one logical line, and
+/// that is the unit in which "printed a warning, then exited 0" is meaningful;
+/// the operator-identity lint needs it for the same reason, to keep each guard's
+/// condition attached to its remedy. Each of the three calls
+/// `assert_fold_folded` before trusting what this returns.
 fn logical_lines(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut pending: Option<(usize, String)> = None;
@@ -81,6 +84,63 @@ fn logical_lines(text: &str) -> Vec<(usize, String)> {
         out.push(last);
     }
     out
+}
+
+/// Positive control on the fold: assert something was actually joined.
+///
+/// Every test here that consumes `logical_lines` calls this at its own top,
+/// before trusting anything the fold returned. Counting lines cannot detect a
+/// fold that stopped folding — the counts go *up* in that state — so a count is
+/// the wrong instrument regardless of the threshold.
+///
+/// Threshold-free by construction: if any continuation was joined, that line is
+/// longer than the longest single physical line; if folding stopped, the two
+/// maxima are equal. Measured 2550 against 1044 when this was written.
+///
+/// Called explicitly by each consumer rather than hidden inside
+/// `logical_lines`, for two reasons. The degradation harnesses that prove these
+/// lints work do so by driving a deliberately broken fold, and an assertion
+/// inside the fold would fight them. And a test that stops consuming the fold
+/// should drop its own call rather than keep inheriting a check it no longer
+/// needs.
+///
+/// This is deliberately not the coupling argument rejected elsewhere in this
+/// file. That argument was "test A's control protects test B", which holds only
+/// while both keep using the same helper and evaporates without a failure. Here
+/// each test carries the control itself; sharing the assertion is code reuse,
+/// not shared protection.
+///
+/// What each consumer actually does under a broken fold, measured rather than
+/// assumed — the three differ, and only one of them was ever vacuous:
+///
+/// - `no_setup_step_warns_and_then_reports_success` **passed silently**, which
+///   is why this control exists. Its assertion is "no offenders found", and its
+///   signal is manufactured by the join: `WARNING` and `exit 0` reach the same
+///   string only once continuations are collapsed.
+/// - `operator_enrolling_steps_refuse…` fails, reporting every site as an
+///   offender, because unfolding separates each guard's condition from the
+///   remedy on the next physical line.
+/// - `setup_steps_declare_the_producers_they_probe_for` cannot go vacuous. Its
+///   assertion is "these specific edges are present", and a degraded fold can
+///   only *remove* edges, so anything it checks fails closed. It passes under a
+///   broken fold today only because no pinned edge's declaration wraps; wrap one
+///   and it fails, loudly and by name, rather than dropping the edge quietly.
+///
+/// So for the last two this control buys attribution rather than coverage: a
+/// broken fold reports itself as a broken fold, instead of as seven unrouted
+/// guards or a Makefile that dropped an edge it still declares.
+fn assert_fold_folded(text: &str) {
+    let lines = logical_lines(text);
+    let longest_folded = lines.iter().map(|(_, line)| line.len()).max().unwrap_or(0);
+    let longest_physical = text.lines().map(str::len).max().unwrap_or(0);
+    assert!(
+        longest_folded > longest_physical,
+        "the longest folded line ({longest_folded} chars) is no longer than the \
+         longest physical line ({longest_physical}) — nothing was joined, so the \
+         fold has stopped folding. Line counts do not catch this: they rise when \
+         folding stops. Whatever this test went on to report, it was reading \
+         physical lines, not the logical lines make sees"
+    );
 }
 
 /// Map every target to the union of its declared prerequisites.
@@ -180,7 +240,15 @@ const REQUIRED_EDGES: &[(&str, &str, &str)] = &[
 
 #[test]
 fn setup_steps_declare_the_producers_they_probe_for() {
-    let graph = prerequisites(&makefile());
+    let text = makefile();
+
+    // This lint cannot go vacuous — it asserts specific edges are present, and a
+    // broken fold can only remove edges — so the control here is for attribution,
+    // not coverage. Pin an edge whose prerequisite list wraps and a broken fold
+    // makes this test blame the Makefile for dropping an edge it still declares.
+    assert_fold_folded(&text);
+
+    let graph = prerequisites(&text);
 
     // Guard the parser before trusting it: an extractor that silently returns
     // nothing would make every assertion below pass against an empty map.
@@ -230,6 +298,12 @@ fn setup_steps_declare_the_producers_they_probe_for() {
 #[test]
 fn no_setup_step_warns_and_then_reports_success() {
     let text = makefile();
+
+    // This lint's signal is manufactured by the join, so the control on the fold
+    // comes before anything else here. Neither floor below can stand in for it:
+    // both count lines, and an unfolded extractor makes both counts go *up*.
+    assert_fold_folded(&text);
+
     let lines = logical_lines(&text);
 
     // Guard the extractor before trusting it, for the same reason the edge lint
@@ -242,38 +316,6 @@ fn no_setup_step_warns_and_then_reports_success() {
         "folded only {} logical lines out of the Makefile — the line folder is \
          broken, and a broken folder makes this lint vacuous rather than failing",
         lines.len()
-    );
-
-    // Positive control on the fold itself. Both floors here count lines, and
-    // neither can tell whether anything was actually joined: a fold that
-    // returned each physical line separately makes both counts go *up*, sails
-    // past them, and drops detection to zero. Detection depends on the join —
-    // `WARNING` and `exit 0` reach the same string only after continuations are
-    // joined, so an unfolded extractor never sees the shape this lint hunts and
-    // reports success against a Makefile full of offenders.
-    //
-    // Nothing to tune: if any continuation was joined, that line is longer than
-    // the longest single physical line, and if folding stopped the two maxima
-    // are equal by construction. The margin is not marginal — 2542 against 1044
-    // when this was written, with 14 folded lines clearing the bar.
-    //
-    // The objection to expect is that this is already covered, since
-    // `operator_enrolling_steps_refuse…` shares the folder and fails closed
-    // under the same degradation. That is the coupling argument, rejected here
-    // for the same reason as before: it holds only while both tests keep using
-    // this helper, and it disappears without anything failing at the moment it
-    // goes. This lint is also the only one of the four whose *signal* depends on
-    // the join rather than merely being weakened by it — the others lose edges
-    // or split a guard away from its remedy and fail loudly — which is why it
-    // needs a control they do not.
-    let longest_folded = lines.iter().map(|(_, line)| line.len()).max().unwrap_or(0);
-    let longest_physical = text.lines().map(str::len).max().unwrap_or(0);
-    assert!(
-        longest_folded > longest_physical,
-        "the longest folded line ({longest_folded} chars) is no longer than the \
-         longest physical line ({longest_physical}) — nothing was joined, so the \
-         fold has stopped folding. Both counts above still pass in that state, \
-         and this lint stops detecting the multi-line shape it exists to find"
     );
 
     let total = lines.len();
@@ -334,6 +376,14 @@ fn operator_identity_branches(text: &str) -> Vec<(usize, String)> {
 #[test]
 fn operator_enrolling_steps_refuse_instead_of_skipping_when_there_is_no_operator() {
     let text = makefile();
+
+    // Like the edge lint, this one fails rather than passes under a broken fold —
+    // unfolding splits each guard's condition from the remedy on the next
+    // physical line, so all seven sites report as offenders. The control is here
+    // so that failure says "the fold broke" instead of accusing seven correct
+    // guards of skipping the helper.
+    assert_fold_folded(&text);
+
     let branches = operator_identity_branches(&text);
 
     // Anti-vacuous floor. The assertion below is "every match does X", which a
@@ -408,6 +458,10 @@ const ROOT_REFUSAL_REQUIREMENTS: &[(&str, &str)] = &[
 fn setup_dev_env_refuses_to_run_as_root() {
     let text = makefile();
 
+    // No `assert_fold_folded` here, and that is a decision rather than an
+    // omission: this is the one lint that never touches the fold. It substring-
+    // matches the raw text, so folding cannot affect what it sees. Adding the
+    // control would assert something this test does not depend on.
     let missing: Vec<String> = ROOT_REFUSAL_REQUIREMENTS
         .iter()
         .filter(|(needle, _)| !text.contains(*needle))
