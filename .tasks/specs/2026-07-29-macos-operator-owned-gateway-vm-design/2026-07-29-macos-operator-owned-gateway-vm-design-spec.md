@@ -1392,17 +1392,23 @@ same instant. An enrolled principal reaches **every** slot regardless of which o
 - **The next-hop hijack was not driven end to end.** No gateway container was deployed and
   no victim traffic was diverted. What is demonstrated is same-segment peering with
   bidirectional address resolution; the hijack follows from that by ordinary L2 behaviour,
-  but it is an inference here, not a measurement.
+  but it is an inference here, not a measurement. **This one remains open** — nothing
+  recorded since has settled it, and in particular the multi-slot upgrade in the next bullet
+  is about a *different* claim and does not touch it. Two unrelated inferences live in this
+  list; resolving one never resolves the other.
 - **Inter-slot L2 isolation holds** and was tested separately (§3.7 assertion 2). The
   broken boundary is *which principals share one slot's group*, not slots leaking into one
   another. Say it that way; the two are routinely conflated.
   🚨 **But it is not a mitigation for this defect, and must never be cited as one.** The
   same run measured `CONNECT_OK` for the enrolled hostile principal on **all eight** slot
-  sockets. When admission covers every slot, isolation *between* slots buys the attacker
-  nothing to defeat — they attach to slot 4 directly rather than reaching slot 4 through
-  slot 0. Inter-slot isolation prevents accidental crosstalk; against the adversary this
-  section describes it provides **no protection at all**. See §3.7 assertion 2 for the
-  measured-vs-inferred breakdown.
+  sockets, and separately measured one operator holding NICs on **two slots concurrently**.
+  When admission covers every slot and nothing stops a principal occupying several at once,
+  isolation *between* slots buys the attacker nothing to defeat — they attach to slot 4
+  directly rather than reaching slot 4 through slot 0. Inter-slot isolation prevents
+  accidental crosstalk; against the adversary this section describes it provides **no
+  protection at all**. The concurrency measurement makes this defect **broader**, not the
+  isolation result more protective. Canonical measured-vs-inferred breakdown — including
+  which principal held the two slots — at §3.7 assertion 2; it is not restated here.
 - The socket group at the time of the run was the post-#85-repair `_sandboxd` (gid 310),
   not the legacy `_sandbox` (gid 60). The defect is a property of *one shared group*, not
   of which group it is.
@@ -2851,17 +2857,29 @@ The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.r
    nothing against the adversary §1.6 describes.** The two results must be read together;
    apart, the isolation result reads as reassurance it has not earned.
 
-   **Measured vs. inferred, labelled** — the distinction matters and the run does not settle
-   all of it:
+   #### Measured vs. inferred — the canonical statement
 
-   | Claim | Status |
-   |---|---|
-   | Enrolled uid 528 `connect(2)` succeeds on all eight slot sockets | **measured** — one probe per slot |
-   | B's VM attaches to slot 0 and reaches A's guest on that segment | **measured** — accept-count delta 1, `lima0` present, ping 0% loss |
-   | B could equally attach to slot 4, or hold NICs on several slots at once, and reach each | **inferred, not measured.** No multi-NIC VM was built and no attach was attempted on any slot but 0. The inference rests on the connect succeeding on all eight — so DAC is not the obstacle anywhere — plus slot 0 showing that a successful connect suffices to attach and reach. Nothing slot-specific is known to sit between the two. Strong, and still an inference. |
+   **This table is the single source for this boundary.** Other sections state the fact and
+   point here; they do not re-derive it. Four independently-worded versions of the same
+   measured/inferred line is how the line erodes.
 
-   *To settle the third row:* repeat assertion 5's attach against a **second** slot that has
-   another operator's VM on it, and show the same accept-count delta and reach there.
+   | Claim | Status | Evidence, or what is missing |
+   |---|---|---|
+   | **One operator can hold NICs on multiple slots at once** | **MEASURED** | In the assertion-2 window, **operator A (uid 501)** held `xopb0` on slot 0 and `xopb4` on slot 4 **concurrently** — each with its own `socket_vmnet` accept-count delta and a live `LOWER_UP` NIC in its guest. Direct observation, not an inference from the admission result. |
+   | **Enrolled admission to all 8 slots** | **MEASURED** | One `connect(2)` probe per slot as enrolled uid 528, all eight `RESULT=CONNECT_OK`. Not a sample. |
+   | **Reaching a foreign operator's VM via a second slot** | **INFERRED** — strong, not directly observed | The mechanism is slot-agnostic by construction and admission is measured on every slot, so the two rows above compose. The only unmeasured link is a foreign victim *happening to sit* on the second slot — which is a property of the fixture, not of the mechanism. |
+
+   ⚠️ **Read the first row precisely.** The principal holding two slots was **A**, not the
+   adversary. What it establishes is that concurrent multi-slot occupancy needs nothing but
+   ordinary enrolled membership — and **B holds identical membership**, so the mechanism is
+   established for B too. It does **not** say the adversary was observed doing it. Those are
+   two different statements and only the first was measured; do not let the text slide from
+   one to the other.
+
+   **The third row was deliberately declined, not overlooked.** Settling it costs two more
+   VMs to re-confirm a composition of two already-measured facts across a fixture detail that
+   carries no mechanism. If it is ever wanted: repeat assertion 5's attach against a **second**
+   slot carrying another operator's VM, and show the same accept-count delta and reach there.
 
 3. **The hostile-VM assertion (§3.6 assertion 5)** — the one that tests the boundary
    rather than the configuration.
@@ -3088,9 +3106,12 @@ definition of "failure at connect" that M24-S20's inverted assertion inherits.
   rather than reaching slot 4 through slot 0. Isolation prevents *accidental* crosstalk and
   gives **no protection** against §1.6's attacker. **Never cite the isolation result on its
   own** — a true finding that reads as protection it does not provide is the same failure
-  mode as a criterion that is void rather than met. Measured-vs-inferred breakdown at §3.7
-  assertion 2; the one unmeasured link is that B could attach on a slot other than 0, which
-  is a strong inference and not a measurement.
+  mode as a criterion that is void rather than met.
+  **And concurrent multi-slot occupancy is measured, not inferred:** operator A held NICs on
+  slot 0 and slot 4 at the same time in this very run. The only inferred link left is
+  *reaching a foreign operator's VM via a second slot*. Full breakdown — and the caution that
+  the concurrent holder was A rather than the adversary — at **§3.7 assertion 2 →
+  *Measured vs. inferred***, which is the canonical statement; do not restate it here.
 - **No §3.8 outcome was reached.** See §3.8 → *No §3.8 outcome was reached in Part B*.
 
 **Two host-state findings from the same run**, both recorded where they belong rather than
@@ -4181,9 +4202,10 @@ outside its phase, it becomes an open question again — say so rather than abso
   against a same-slot positive control. The §1.6 hole is *within* a slot, not across slots.
   Run A-vs-A, which is the correct shape and is accepted: isolation belongs to the vmnet
   daemons and the host, not to guest ownership. 🚨 **It is not a mitigation** — the same run
-  measured `CONNECT_OK` on all eight slots for the enrolled hostile principal, so the
-  attacker attaches to the target slot directly and never needs to cross one. Cite it only
-  alongside that.
+  measured `CONNECT_OK` on all eight slots for the enrolled hostile principal, **and measured
+  one operator holding NICs on two slots concurrently**, so the attacker attaches to the
+  target slot directly and never needs to cross one. Cite it only alongside that. Canonical
+  measured-vs-inferred breakdown at §3.7 assertion 2.
 - ❌ **"A second operator cannot create its own LIMA_HOME" — FALSE.** Struck from §3.7 and
   from phase 0 Part B. A hostile operator runs `limactl` under its own uid against a
   `LIMA_HOME` it created itself — in Part B, a hand-made B-owned tree at
