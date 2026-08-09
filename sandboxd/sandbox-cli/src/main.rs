@@ -105,6 +105,17 @@ enum Command {
         /// `mapped-xattr` (alternative: `none`). See
         /// `docs/guides/workspaces.md` for the full grammar.
         ///
+        /// Both paths must be spelled as already resolved: `..`, `.` and
+        /// empty (`//`) components are refused, because the path is not
+        /// resolved before it reaches the backend and a `..` can name a
+        /// location the containment check treated as excluded.
+        /// `cd <dir> && pwd -P` prints an accepted spelling. Characters
+        /// outside letters, digits, space and `/ - _ . + @ ~ :` are also
+        /// refused: the path is interpolated into backend mount
+        /// configuration, where `,` `=` `"` and `\` are syntax rather than
+        /// filename. Rename the directory, stage a copy under an accepted
+        /// name, or use --repo, which never names a host path.
+        ///
         /// Mutually exclusive with --repo.
         #[arg(long, conflicts_with = "repo")]
         workspace: Option<String>,

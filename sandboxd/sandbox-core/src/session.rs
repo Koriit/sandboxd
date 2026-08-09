@@ -723,6 +723,47 @@ pub(crate) fn is_workspace_path_char(ch: char) -> bool {
 /// Both checks are lexical and pure: no filesystem access, no dependence on
 /// whether the path exists. That matters because a workspace directory is
 /// allowed not to exist yet at parse time.
+///
+/// # The character rule is deliberately uniform across backends
+///
+/// One set is applied to every path, rather than each backend's own syntax
+/// being refused only on the path that reaches it. `,` and `=` are syntax
+/// solely in the Docker `--mount` option list; `"` and `\` are syntax solely
+/// in the Lima YAML template. So this rejects more than either sink needs —
+/// a `,` in a host path is harmless to Lima and is refused there anyway.
+///
+/// That over-refusal is the intended trade, not an oversight. A per-backend
+/// rule can only be decided once the backend is known, which is after
+/// parsing, so it would have to live at each sink — and every defect this
+/// validator was written to close had exactly that shape: two copies of one
+/// containment check, where fixing one missed the other; a YAML allowlist
+/// maintained apart from the sink it guarded; and a mount spec assembled
+/// with no check at all. A single rule that is slightly too strict has no
+/// second copy to drift from.
+///
+/// A reader who observes that the `,` ban has no sink behind it on the Lima
+/// path has read it correctly. Before narrowing it to the backend that needs
+/// it, solve the thing that motivated the uniform rule: a session's path is
+/// parsed before its backend is chosen.
+///
+/// # Depth is not uniform across the spellings it rejects
+///
+/// "Defence in depth" holds for `..` and not for the rest, so do not read
+/// the layering as flat:
+///
+/// - `..` is refused three times independently — here, by
+///   [`crate::lite_macos::validate_shared_path`]'s component scan, and by
+///   the shared-root containment check that scan protects.
+/// - `.` and `//` are refused **once**, here, and nowhere else.
+///   `Path::components()` normalises them away, so the later layers cannot
+///   observe them even in principle.
+///
+/// No redundant check is wanted for the second group: a component that
+/// normalises away cannot change where the path resolves, which is why
+/// refusing it is a legibility measure rather than a containment one. The
+/// asymmetry is recorded because it decides what breaks if the choke point
+/// is ever bypassed — `..` would still be caught downstream; `.` and `//`
+/// would not be caught at all.
 fn validate_workspace_path_shape(path: &str, mode_label: &str, side: &str) -> Result<(), String> {
     for (index, segment) in path.split('/').enumerate() {
         // The leading empty segment is the root marker of an absolute path,

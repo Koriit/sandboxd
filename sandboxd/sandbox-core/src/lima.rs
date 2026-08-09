@@ -4279,13 +4279,37 @@ fn parse_limactl_error(subcommand: &str, stderr: &str) -> SandboxError {
 /// path is also interpolated into the container backend's Docker `--mount`
 /// option list; two copies of the list would be two things to keep in step.
 ///
-/// If any other character is found the function panics. That is only
-/// defensible because the precondition is enforced upstream rather than
-/// merely assumed: `WorkspaceMode::parse_flag` rejects these characters when
-/// it parses `shared:`/`local:`, and it is the sole route from the wire
-/// format to a `WorkspaceMode` on both the CLI and the daemon. A panic here
-/// therefore means a `SessionConfig` was constructed in-process without going
-/// through the parser, which is a programming error.
+/// If any other character is found the function panics.
+///
+/// # What guarantees the precondition, stated precisely
+///
+/// It holds **because of today's call graph, not because the types make it
+/// impossible to violate.** The distinction matters, because a doc comment
+/// on this function previously asserted the precondition outright while
+/// nothing enforced it, and a wire request carrying `"` reached this panic.
+///
+/// What is actually true: `WorkspaceMode::parse_flag` rejects these
+/// characters, and it is the sole route from the wire format to a
+/// `WorkspaceMode` on both the CLI and the daemon. Every `SessionConfig`
+/// that reaches this function came through `create_vm`, whose config comes
+/// from the session-create path, which parses the wire `workspace` string
+/// with that parser. So no operator input can produce a panic here.
+///
+/// What is *not* true, and is the reason this is a call-graph fact rather
+/// than a structural one:
+///
+/// - `WorkspaceMode` is a `pub` enum whose variant fields are public, so any
+///   caller can build `WorkspaceMode::Shared { host_path, .. }` directly and
+///   never meet the parser. Serde can construct one too.
+/// - [`LimaManager::generate_template`] is `pub`, so this path is reachable
+///   from outside this module without a wire request at all.
+///
+/// A panic here therefore means a `SessionConfig` was built in-process
+/// without going through the parser. That is a programming error today, but
+/// it is one the type system permits: adding a second caller that assembles
+/// a `WorkspaceMode` itself turns operator input into a panicking daemon
+/// again. If that caller is ever added, validate at it or make this return
+/// `Result` — do not rely on this comment having stayed true.
 fn sanitize_yaml_path(path: &str) -> &str {
     for (i, ch) in path.char_indices() {
         if !crate::session::is_workspace_path_char(ch) {
