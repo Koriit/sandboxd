@@ -710,10 +710,10 @@ pub(crate) fn is_workspace_path_char(ch: char) -> bool {
 /// Two independent properties, each required by a different consumer:
 ///
 /// 1. **Canonical components.** Containment against a configured root is
-///    checked lexically on the host, while the mount source is resolved much
+///    tested lexically on the host, while the mount source is resolved much
 ///    later — inside the gateway VM, on the lite backend. A `..` component
-///    survives the lexical check (`strip_prefix` matches it as an ordinary
-///    component) and is then resolved somewhere the check believed it had
+///    survives that lexical test (`strip_prefix` matches it as an ordinary
+///    component) and is then resolved somewhere the test believed it had
 ///    excluded. `.` and empty components do not escape, but they make the
 ///    path the operator wrote differ from the path that gets mounted, which
 ///    is the same gap in a weaker form.
@@ -736,10 +736,10 @@ pub(crate) fn is_workspace_path_char(ch: char) -> bool {
 /// rule can only be decided once the backend is known, which is after
 /// parsing, so it would have to live at each sink — and every defect this
 /// validator was written to close had exactly that shape: two copies of one
-/// containment check, where fixing one missed the other; a YAML allowlist
-/// maintained apart from the sink it guarded; and a mount spec assembled
-/// with no check at all. A single rule that is slightly too strict has no
-/// second copy to drift from.
+/// root-containment test, where fixing one missed the other; a YAML
+/// allowlist maintained apart from the sink it guarded; and a mount spec
+/// assembled with no check at all. A single rule that is slightly too strict
+/// has no second copy to drift from.
 ///
 /// A reader who observes that the `,` ban has no sink behind it on the Lima
 /// path has read it correctly. Before narrowing it to the backend that needs
@@ -748,25 +748,32 @@ pub(crate) fn is_workspace_path_char(ch: char) -> bool {
 ///
 /// # Depth is thinner than it looks — count refusals, not layers
 ///
-/// Only a check that can fail on its own counts. By that test:
+/// Only a check that can fail on its own counts. Downstream of this parser,
+/// [`crate::lite_macos::validate_shared_path`] holds two checks that behave
+/// oppositely on `..`, so they are named separately — the **component
+/// scan** and the **root-containment test** — here and in that module. Do
+/// not collapse them back into "the containment check": one phrase covering
+/// both is what let a wrong refusal count survive review.
+///
+/// By the can-it-fail test:
 ///
 /// - `..` is refused **twice**, and only on the macOS lite path: here, and
-///   by [`crate::lite_macos::validate_shared_path`]'s component scan. That
-///   scan has a single production caller, the lite session-create handler,
-///   so on the Lima and container backends `..` is refused **once** — here.
+///   by the component scan. That scan has a single production caller, the
+///   lite session-create handler, so on the Lima and container backends
+///   `..` is refused **once** — here.
 /// - `.` and `//` are refused **once** everywhere, here.
 ///   `Path::components()` normalises them away, so no later layer can
 ///   observe them even in principle.
 ///
-/// The shared-root containment check is **not** a third refusal, despite
-/// sitting downstream of both. It accepts `..`: `strip_prefix` matches a
-/// `ParentDir` as an ordinary component, so `<root>/../../var/run` strips
-/// cleanly and is judged inside the root. The test at
+/// The root-containment test is **not** a third refusal, despite sitting
+/// downstream of both. It accepts `..`: `strip_prefix` matches a `ParentDir`
+/// as an ordinary component, so `<root>/../../var/run` strips cleanly and is
+/// judged inside the root. The test at
 /// `lite_macos.rs::validate_shared_path_rejects_parent_dir_escape` asserts
-/// exactly that, as its stated premise. Containment decides *outside-root*
-/// and is unsound against `..` alone; the component scan in front of it is
-/// what makes it sound. It is the layer being protected, not one that
-/// protects.
+/// exactly that, as its stated premise. The root-containment test decides
+/// *outside-root* and is unsound against `..` alone; the component scan in
+/// front of it is what makes it sound. It is the layer being protected, not
+/// one that protects.
 ///
 /// No redundant check is wanted for `.` and `//`: a component that
 /// normalises away cannot change where the path resolves, which is why
@@ -1859,10 +1866,10 @@ mod tests {
         assert!(err.contains("must be absolute"), "err = {err}");
     }
 
-    /// A `..` in a `shared:` host path escapes the lite backend's shared-root
-    /// containment check. The check is lexical (`strip_prefix`), so `..`
+    /// A `..` in a `shared:` host path escapes the lite backend's
+    /// root-containment test. That test is lexical (`strip_prefix`), so `..`
     /// matches as an ordinary component and the path passes; it is resolved
-    /// only later, inside the gateway VM, where it names a location the check
+    /// only later, inside the gateway VM, where it names a location the test
     /// believed it had excluded.
     ///
     /// The path below is chosen so the test cannot pass for the wrong reason.

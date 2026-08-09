@@ -5088,8 +5088,9 @@ async fn create_session_macos_lite(
                 );
             }
             // Record who reads the host side of the mount. This fires only
-            // after the path cleared the shared-root check above, so the
-            // source is already somewhere the daemon user can traverse —
+            // after the path cleared both halves of `validate_shared_path`
+            // above — the component scan and the root-containment test — so
+            // the source is already somewhere the daemon user can traverse —
             // there is nothing for the operator to act on here, and naming
             // TCC-protected directories at this point would be misleading
             // (a path under the shared root is not in one).

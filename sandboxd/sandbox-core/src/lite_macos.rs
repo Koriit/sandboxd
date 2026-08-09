@@ -167,10 +167,11 @@ pub fn translate_shared_path(
     host_path: &Path,
     shared_root: &Path,
 ) -> Result<PathBuf, SharedPathError> {
-    // Delegate the containment decision rather than repeating it. The two
-    // functions previously carried separate copies of the same `strip_prefix`
-    // check, and so also carried the same defect; sharing one implementation
-    // is what keeps a fix to one from missing the other.
+    // Delegate both halves — component scan and root-containment test —
+    // rather than repeating either. The two functions previously carried
+    // separate copies of the same `strip_prefix`, and so also carried the
+    // same defect; sharing one implementation is what keeps a fix to one
+    // from missing the other.
     validate_shared_path(host_path, shared_root)?;
     let rel = host_path
         .strip_prefix(shared_root)
@@ -181,25 +182,46 @@ pub fn translate_shared_path(
 /// Validate that `host_path` is under `shared_root` without performing the
 /// full translation.
 ///
-/// Returns `Ok(())` when valid, `Err` when the path is outside the root.
 /// Equivalent to checking whether [`translate_shared_path`] would succeed,
 /// but communicates intent more clearly at call sites that only need the
 /// validation step.
 ///
-/// Containment is decided lexically. We do NOT call `std::fs::canonicalize`
-/// because (a) the path may not exist yet — the operator may create the
-/// workspace after provisioning — and (b) the function must be hermetic /
-/// pure. A lexical check is only sound on a path with no `..` component:
-/// `strip_prefix` matches `..` as an ordinary component, so
-/// `<root>/../../var/run` strips cleanly and rejoins to a path that resolves
-/// outside the root once the *VM* resolves it. Hence the component check
-/// below — it is what makes the lexical prefix test mean containment.
+/// # Two checks, and they need separate names
 ///
-/// Scope of that check: `Path::components()` normalises interior `.` and
-/// repeated separators away before this function ever sees them, so on an
-/// absolute path `..` is the only non-canonical component it *can* observe.
-/// That is sufficient here, because `..` is also the only one that changes
-/// where the path resolves. The other spellings are rejected upstream by
+/// This function body is two sequential checks with opposite behaviour on
+/// the same input, so "the containment check" is not a usable name for
+/// either. Throughout this module they are called:
+///
+/// - the **component scan** — the `ParentDir` / `CurDir` search, which
+///   *rejects* `..`, returning [`SharedPathError::NonCanonicalComponent`];
+/// - the **root-containment test** — the `strip_prefix` against
+///   `shared_root`, which *accepts* `..` and decides only outside-root,
+///   returning [`SharedPathError::OutsideRoot`].
+///
+/// The distinction is not stylistic. Both statements below are true and
+/// they read as a contradiction under one name: removing the component scan
+/// makes three tests fail, and the root-containment test on its own returns
+/// `Ok` for `<root>/../../var/run`. Naming the halves separately is what
+/// keeps that from being re-litigated.
+///
+/// # Why lexical
+///
+/// We do NOT call `std::fs::canonicalize` because (a) the path may not exist
+/// yet — the operator may create the workspace after provisioning — and (b)
+/// the function must be hermetic / pure. A lexical test is only sound on a
+/// path with no `..` component: `strip_prefix` matches `..` as an ordinary
+/// component, so `<root>/../../var/run` strips cleanly and rejoins to a path
+/// that resolves outside the root once the *VM* resolves it. The component
+/// scan running first is what makes the root-containment test mean
+/// containment; the ordering is load-bearing, not incidental.
+///
+/// # Scope of the component scan
+///
+/// `Path::components()` normalises interior `.` and repeated separators away
+/// before this function ever sees them, so on an absolute path `..` is the
+/// only non-canonical component the scan *can* observe. That is sufficient
+/// here, because `..` is also the only one that changes where the path
+/// resolves. The other spellings are rejected upstream by
 /// `WorkspaceMode::parse_flag`, which inspects the raw string and can still
 /// see them; do not read the `CurDir` arm below as this function covering
 /// them — it fires only for a relative path, which cannot be contained by any
@@ -227,7 +249,7 @@ pub fn validate_shared_path(host_path: &Path, shared_root: &Path) -> Result<(), 
 
 /// Error returned when a `shared:` host path is not usable as a lite-backend
 /// mount source — either outside the configured `lite_shared_root`, or
-/// spelled in a way that makes the containment check unsound.
+/// spelled in a way that makes the root-containment test unsound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedPathError {
     /// The requested host path is not under the shared root.
@@ -235,9 +257,9 @@ pub enum SharedPathError {
         host_path: PathBuf,
         shared_root: PathBuf,
     },
-    /// The requested host path contains a component that makes a lexical
-    /// containment check unable to decide where it actually points. On the
-    /// absolute paths this backend receives that means `..`; see
+    /// The requested host path contains a component that leaves the lexical
+    /// root-containment test unable to decide where it actually points. On
+    /// the absolute paths this backend receives that means `..`; see
     /// [`validate_shared_path`] for why the other non-canonical spellings are
     /// not visible here and are rejected upstream instead.
     NonCanonicalComponent {
@@ -534,11 +556,12 @@ mod tests {
         );
     }
 
-    /// The shared-root check is lexical, and `strip_prefix` treats `..` as an
-    /// ordinary component: `<root>/../../var/run` strips cleanly against
-    /// `<root>` and rejoins to a path that resolves outside the root. Nothing
-    /// on the host catches it, because the host never resolves it — the
-    /// gateway VM does, at mount time.
+    /// The root-containment test is lexical, and `strip_prefix` treats `..`
+    /// as an ordinary component: `<root>/../../var/run` strips cleanly
+    /// against `<root>` and rejoins to a path that resolves outside the root.
+    /// Nothing on the host catches it, because the host never resolves it —
+    /// the gateway VM does, at mount time. Hence the component scan, which is
+    /// what this pins.
     ///
     /// `/var/run` is deliberate. A target that merely does not exist would be
     /// refused later by the bind failing on a missing source, so a test
@@ -549,13 +572,16 @@ mod tests {
         let root = Path::new("/tmp/sandbox-shared");
         let host = Path::new("/tmp/sandbox-shared/../../var/run");
 
-        // The premise: the lexical prefix test this function is built on does
+        // The premise: the root-containment test half of this function does
         // not, by itself, reject the path. If this ever stops holding, the
-        // assertion below is no longer testing what it claims to.
+        // assertion below is no longer testing what it claims to. Read this
+        // together with the rejection at the end — the two are not in
+        // conflict, they are the two halves behaving differently on one
+        // input, which is why they carry separate names.
         assert!(
             host.strip_prefix(root).is_ok(),
-            "premise: `..` passes strip_prefix, which is why an explicit \
-             component check is required"
+            "premise: `..` passes strip_prefix, which is why the component \
+             scan in front of it is required"
         );
 
         // Second premise, and the reason the parser checks the raw string
