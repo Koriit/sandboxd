@@ -1396,6 +1396,13 @@ same instant. An enrolled principal reaches **every** slot regardless of which o
 - **Inter-slot L2 isolation holds** and was tested separately (§3.7 assertion 2). The
   broken boundary is *which principals share one slot's group*, not slots leaking into one
   another. Say it that way; the two are routinely conflated.
+  🚨 **But it is not a mitigation for this defect, and must never be cited as one.** The
+  same run measured `CONNECT_OK` for the enrolled hostile principal on **all eight** slot
+  sockets. When admission covers every slot, isolation *between* slots buys the attacker
+  nothing to defeat — they attach to slot 4 directly rather than reaching slot 4 through
+  slot 0. Inter-slot isolation prevents accidental crosstalk; against the adversary this
+  section describes it provides **no protection at all**. See §3.7 assertion 2 for the
+  measured-vs-inferred breakdown.
 - The socket group at the time of the run was the post-#85-repair `_sandboxd` (gid 310),
   not the legacy `_sandbox` (gid 60). The defect is a property of *one shared group*, not
   of which group it is.
@@ -2825,13 +2832,36 @@ The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.r
 
 2. **Neither VM can reach the other's segment**, using the shared-subnet method above.
 
-   ✅ **Holds, with a stated deviation (2026-08-09).** Measured between `198.51.100.10`
-   (slot 0) and `198.51.100.24` (slot 4): no reply, `ip neigh` `FAILED`, against a positive
-   control on the same slot that returned `REACHABLE`. **Deviation:** both VMs were owned by
-   operator **A**, not one each by A and B. That makes it a sound test of *inter-slot L2
-   isolation* — which is what the assertion's wording is about — but it does **not** exercise
-   the cross-*operator* axis, which assertion 3 covers instead. Recorded rather than
-   dismissed, because a future reader would otherwise assume A-vs-B.
+   ✅ **Holds (2026-08-09).** Measured between `198.51.100.10` (slot 0) and `198.51.100.24`
+   (slot 4): no reply, `ip neigh` `FAILED`, against a positive control on the same slot that
+   returned `REACHABLE`.
+
+   **Both VMs were operator A's, and that is the correct shape — accepted, not a shortfall.**
+   Inter-slot L2 isolation is a property of the vmnet daemons and the host, not of who owns
+   the guests. A second uid would introduce a variable without testing a new property. The
+   cross-*operator* axis is assertion 3's subject, and assertion 3 established it. Recorded
+   explicitly so a later reader neither assumes A-vs-B nor files A-vs-A as a gap.
+
+   🚨 **Do not read this as protection. Against the §1.6 adversary it provides none.** From
+   the same run: an **enrolled** principal got `CONNECT_OK` on **all eight** slot sockets
+   (`uid=528 … slot-0..7`, a measured `connect(2)` per slot, not a sample). If admission
+   covers every slot, isolation between slots does not stand between a hostile operator and
+   a target — they attach a NIC to slot 4 directly instead of trying to reach slot 4 through
+   slot 0. **What this assertion buys is protection against accidental crosstalk, and
+   nothing against the adversary §1.6 describes.** The two results must be read together;
+   apart, the isolation result reads as reassurance it has not earned.
+
+   **Measured vs. inferred, labelled** — the distinction matters and the run does not settle
+   all of it:
+
+   | Claim | Status |
+   |---|---|
+   | Enrolled uid 528 `connect(2)` succeeds on all eight slot sockets | **measured** — one probe per slot |
+   | B's VM attaches to slot 0 and reaches A's guest on that segment | **measured** — accept-count delta 1, `lima0` present, ping 0% loss |
+   | B could equally attach to slot 4, or hold NICs on several slots at once, and reach each | **inferred, not measured.** No multi-NIC VM was built and no attach was attempted on any slot but 0. The inference rests on the connect succeeding on all eight — so DAC is not the obstacle anywhere — plus slot 0 showing that a successful connect suffices to attach and reach. Nothing slot-specific is known to sit between the two. Strong, and still an inference. |
+
+   *To settle the third row:* repeat assertion 5's attach against a **second** slot that has
+   another operator's VM on it, and show the same accept-count delta and reach there.
 
 3. **The hostile-VM assertion (§3.6 assertion 5)** — the one that tests the boundary
    rather than the configuration.
@@ -3025,12 +3055,12 @@ in latency as well as by exit code.
 ### 3.11 Part B result — **PARTIAL**, run 2026-08-09 (M24-S3)
 
 **Part B is not complete.** One of its three assertions was run and is decisive, one holds
-with a stated deviation, and one was never run. Part A's conclusion is unaffected.
+in the shape it should have, and one was never run. Part A's conclusion is unaffected.
 
 | §3.7 assertion | Status | Where the evidence is |
 |---|---|---|
 | **1** — egress enforced in both VMs (§3.6 assertions 1–3, independently, in B's VM) | ❌ **NOT RUN** | nothing; no second-operator VM ever built the §3.3 topology |
-| **2** — neither VM reaches the other's segment | ✅ **holds**, deviation: both VMs were operator **A**'s, so this tests inter-slot L2 isolation, not the cross-operator axis | §3.7 assertion 2 |
+| **2** — neither VM reaches the other's segment | ✅ **holds.** Run A-vs-A, which is the **correct** shape and is accepted: isolation is a property of the vmnet daemons and the host, not of guest ownership. 🚨 **Not a mitigation** — see below | §3.7 assertion 2 |
 | **3** — hostile VM (§3.6 assertion 5) | ✅ **run, and it succeeded** — the §1.6 reproduction, which is the expected pre-fix result | §1.6 → *✅ REPRODUCED* |
 
 **The headline finding: §1.6 is reproduced with a real second operator.** A loginable
@@ -3050,6 +3080,15 @@ definition of "failure at connect" that M24-S20's inverted assertion inherits.
 - **Inter-slot L2 isolation held throughout.** The hole is *within* a slot, reached by
   enrolling in the group — not a leak across slots. Both statements are needed to describe
   the boundary correctly.
+  🚨 **And it is not a mitigation.** The same run measured the enrolled hostile principal
+  getting `CONNECT_OK` on **all eight** slot sockets. Admission covering every slot is what
+  makes inter-slot isolation irrelevant to this adversary: they attach to slot 4 directly
+  rather than reaching slot 4 through slot 0. Isolation prevents *accidental* crosstalk and
+  gives **no protection** against §1.6's attacker. **Never cite the isolation result on its
+  own** — a true finding that reads as protection it does not provide is the same failure
+  mode as a criterion that is void rather than met. Measured-vs-inferred breakdown at §3.7
+  assertion 2; the one unmeasured link is that B could attach on a slot other than 0, which
+  is a strong inference and not a measurement.
 - **No §3.8 outcome was reached.** See §3.8 → *No §3.8 outcome was reached in Part B*.
 
 **Two host-state findings from the same run**, both recorded where they belong rather than
@@ -3204,13 +3243,17 @@ exit**.
         gave **8/8 `state = running`, `runs = 1`**, and the drift detector went from 8×
         `exit 3` to 8× `exit 0`. ⚠️ **Not verified across a real reboot** — the simulation is
         the strongest evidence available without one.
-  - [ ] **Dedicated test-operator account in the proper group — NOT satisfied as an end
-        state.** `operator-b` (uid 528) exists and is loginable, and it *was* enrolled for
+  - [ ] **Dedicated test-operator account in the proper group — DEFERRED BY DESIGN, not an
+        omission.** `operator-b` (uid 528) exists and is loginable, and it *was* enrolled for
         the run, but it was **de-enrolled afterwards** and is not a member now
         (`dseditgroup -o checkmember` → not a member). More importantly, it was enrolled in
-        the **legacy shared `_sandboxd` group**, because §1.6's per-operator group does not
-        exist until phase 1. There is no "proper group" to be in yet. This sub-clause cannot
-        close before phase 1 lands, and stating that is more useful than ticking it.
+        the **legacy shared `_sandboxd` group**, because §1.6's per-operator group **does not
+        exist until phase 1**. There is no "proper group" to be in yet, so nothing phase 0
+        could have done would satisfy this sub-clause. **Owners: M24-S7** creates the
+        per-operator groups and assigns ranges; **M24-S20** moves the slot sockets onto them
+        and is the session that must re-run the enrollment against the real group — it has
+        to, because inverting assertion 5 is its exit criterion. A later reader should file
+        this as scheduled work with named owners, **not** as something phase 0 skipped.
 - [ ] ~~That account has a provisioned LIMA_HOME. It cannot create one itself — the parent
       `{state_root}/{daemon_uid}/{op_uid}` is daemon-owned and provisioning is
       `ensure_operator_lima_home` (`lima.rs:574-660`), daemon-side only. Budget a
@@ -4131,7 +4174,11 @@ outside its phase, it becomes an open question again — say so rather than abso
   §3.11.
 - ✅ **Inter-slot L2 isolation holds** (§3.7 assertion 2) — measured on a shared probe subnet
   against a same-slot positive control. The §1.6 hole is *within* a slot, not across slots.
-  Deviation recorded at the assertion: both VMs were operator A's.
+  Run A-vs-A, which is the correct shape and is accepted: isolation belongs to the vmnet
+  daemons and the host, not to guest ownership. 🚨 **It is not a mitigation** — the same run
+  measured `CONNECT_OK` on all eight slots for the enrolled hostile principal, so the
+  attacker attaches to the target slot directly and never needs to cross one. Cite it only
+  alongside that.
 - ❌ **"A second operator cannot create its own LIMA_HOME" — FALSE.** Struck from §3.7 and
   from phase 0 Part B. A hostile operator runs `limactl` under its own uid against its own
   home directory; the daemon is not in the loop. The attacker needs nothing from the daemon
