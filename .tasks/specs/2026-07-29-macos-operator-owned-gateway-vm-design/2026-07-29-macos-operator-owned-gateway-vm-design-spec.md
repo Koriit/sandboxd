@@ -2878,11 +2878,13 @@ The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.r
 ❌ **False — struck 2026-08-09.** `ensure_operator_lima_home` is how the *daemon* provisions
 the LIMA_HOME it will later drive, and it is daemon-side only; that says nothing about
 whether an account can create a directory and point `LIMA_HOME` at it. A hostile operator
-runs `limactl` directly, under their own uid, with `LIMA_HOME=/Users/<them>/.lima` — no
-daemon involvement at any point. Part B did exactly this. The premise mattered: as written it
-implied a hostile operator is gated on daemon cooperation, which would have made §1.6's
-threat model look weaker than it is. **The attacker needs nothing from the daemon but the
-socket.**
+runs `limactl` directly, under their own uid, against a `LIMA_HOME` they created themselves —
+no daemon involvement at any point. Part B did exactly this, and did it in the sharpest
+possible form: B's tree was hand-made **at the daemon's own state-root path shape**,
+`/var/lib/sandboxd/528/528/lima`, B-owned. The operator built, unaided, the very directory the
+criterion says only the daemon can provide. The premise mattered: as written it implied a
+hostile operator is gated on daemon cooperation, which would have made §1.6's threat model
+look weaker than it is. **The attacker needs nothing from the daemon but the socket.**
 
 ### 3.8 Failure discrimination — a red run must say which
 
@@ -3259,11 +3261,14 @@ exit**.
       `ensure_operator_lima_home` (`lima.rs:574-660`), daemon-side only. Budget a
       daemon-driven provision step.~~
       ❌ **Premise falsified 2026-08-09 — this criterion is void, not met.** A hostile
-      operator runs `limactl` under their own uid with `LIMA_HOME` pointed at their own home
-      directory; the daemon is not in the loop and `ensure_operator_lima_home` never runs.
-      Part B did exactly that. No daemon-driven provision step is needed, and no budget
-      should be carried for one. See §3.7's struck prerequisite for why the false premise
-      mattered: it made §1.6's threat model look weaker than it is.
+      operator runs `limactl` under their own uid against a `LIMA_HOME` they created
+      themselves; the daemon is not in the loop and `ensure_operator_lima_home` never runs.
+      Part B did exactly that, and pointedly: B's hand-made, B-owned tree sat at
+      `/var/lib/sandboxd/528/528/lima` — **the daemon's own `{state_root}/{daemon_uid}/{op_uid}`
+      path shape**, the very thing this criterion says only the daemon can provide. No
+      daemon-driven provision step is needed, and no budget should be carried for one. See
+      §3.7's struck prerequisite for why the false premise mattered: it made §1.6's threat
+      model look weaker than it is.
 - [~] Second-operator isolation probe (§3.7): all assertions pass, **including the hostile
       VM assertion** — which is expected to **fail** until §1.6 lands. Record which.
       **One of three run and decisive; one holds with a deviation; one not run.**
@@ -4180,9 +4185,10 @@ outside its phase, it becomes an open question again — say so rather than abso
   attacker attaches to the target slot directly and never needs to cross one. Cite it only
   alongside that.
 - ❌ **"A second operator cannot create its own LIMA_HOME" — FALSE.** Struck from §3.7 and
-  from phase 0 Part B. A hostile operator runs `limactl` under its own uid against its own
-  home directory; the daemon is not in the loop. The attacker needs nothing from the daemon
-  but the socket.
+  from phase 0 Part B. A hostile operator runs `limactl` under its own uid against a
+  `LIMA_HOME` it created itself — in Part B, a hand-made B-owned tree at
+  `/var/lib/sandboxd/528/528/lima`, i.e. the daemon's own state-root path shape. The daemon
+  is not in the loop. The attacker needs nothing from the daemon but the socket.
 - ⚠️ **`net.inet.ip.forwarding = 0` (v4 and v6) is a latent dependency, not context.** The
   host holds an interface on all eight segments, so at `1` they become mutually routable
   through the host and the L2 isolation above stops holding — independently of §1.6. Recorded
