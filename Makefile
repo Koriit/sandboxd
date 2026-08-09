@@ -556,18 +556,24 @@ DARWIN_LAUNCH_DAEMONS_DIR   := /Library/LaunchDaemons
 DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 
 # no_operator_identity — the failure branch shared by every setup step that
-# records the *invoking* operator: a group membership, or a sudoers fragment
-# naming them. Those steps read `$USER`, and when it is empty or `root` there is
-# nobody to record.
+# records the *invoking* operator: a group membership, a sudoers fragment, or an
+# entry in a config file's ACL naming them. Those steps read `$USER`, and when it
+# is empty or `root` there is nobody to record.
 #
-# They used to print `✓ already configured … skipped (no non-root $USER set)` and
-# carry on. That is a green line for an effect that did not happen: the operator
-# never joins the group, and the failure resurfaces much later as the daemon
-# socket being unreachable, or as sudo prompting for a password in the middle of
-# an e2e run. Every one of them now fails here instead.
+# Six of them used to print `✓ already configured … skipped (no non-root $USER
+# set)` and carry on. That is a green line for an effect that did not happen: the
+# operator never joins the group, and the failure resurfaces much later as the
+# daemon socket being unreachable, or as sudo prompting for a password in the
+# middle of an e2e run.
 #
-# Factored into one definition because the six call sites must agree on what the
-# operator is told to do next; six hand-maintained copies of a remediation
+# The seventh, `setup-users-conf`, had no guard at all — it substituted whatever
+# `$USER` held straight into the pool ACL. That is the same defect with the sign
+# flipped: not an effect skipped, but an effect applied to the wrong principal,
+# which fails in the more confusing direction because the file then looks
+# configured. All seven now fail here instead.
+#
+# Factored into one definition because the seven call sites must agree on what
+# the operator is told to do next; seven hand-maintained copies of a remediation
 # message drift, and a stale one is worse than none. $(1) is the make target to
 # name in the remedy, so the message is runnable as printed.
 #
@@ -577,9 +583,10 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 # out what to type.
 define no_operator_identity
 echo "ERROR: no operator identity to record (USER='$$USER', uid=$$(id -u))."; \
-echo "  This step grants the invoking operator access — a group membership or a"; \
-echo "  sudoers fragment naming them. Run as root there is nobody to name, and the"; \
-echo "  access the rest of setup assumes silently never gets granted."; \
+echo "  This step records the invoking operator — a group membership, a sudoers"; \
+echo "  fragment, or a config entry naming them. Run as root there is nobody to"; \
+echo "  name, so the access the rest of setup assumes either never gets granted at"; \
+echo "  all, or gets written down under the wrong name."; \
 if [ -n "$${SUDO_USER:-}" ] && [ "$${SUDO_USER}" != "root" ]; then \
   echo "  Re-run as:  sudo -u $${SUDO_USER} make $(1)"; \
   echo "  or without sudo entirely:  make $(1)"; \
@@ -1530,7 +1537,23 @@ setup-bridge-conf:
 # added. The append goes through a Python `json.load`/`json.dump`
 # round-trip rather than regex/sed so we cannot corrupt the file's
 # JSON shape.
+#
+# `$USER` is written into the pool ACL, so this step refuses the same root/empty
+# case the operator-enrolling steps do — and for a sharper reason. Those steps
+# skip an effect, which fails closed. This one would apply the *wrong* effect:
+# `root` goes into `allow_users` and the real operator stays out, so the file
+# looks configured and is not.
+#
+# `root` is never a legitimate entry here. `allow_users` gates two things: which
+# uid may run the daemon, and which `--for-user` the route helper will install a
+# route for. The daemon runs unprivileged by design and never as root, and a
+# peer uid of 0 is rejected at the accept-time perimeter before its first frame
+# is read — so a `root` entry names a principal the daemon refuses to serve, in
+# the ACL that gates a cap'd helper.
 setup-users-conf:
+	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	  $(call no_operator_identity,setup-users-conf); \
+	fi
 	@if [ ! -f "$(USERS_CONF_PATH)" ]; then \
 	  rendered=$$(sed 's/$$USER/'"$$USER"'/g' contrib/users.conf.example); \
 	  echo "[sudo] mkdir -p /etc/sandboxd  (creating sandboxd config directory)"; \
@@ -1560,8 +1583,10 @@ setup-users-conf:
 	@# allow_users differs or is missing, and only ever touches these two
 	@# managed entries — never reorders or removes other (operator-authored)
 	@# entries. A pre-existing non-canonical entry (e.g. a legacy
-	@# 10.209.0.0/24) is left in place; remove it by hand or
-	@# `sudo rm $(USERS_CONF_PATH) && make setup-users-conf` to regenerate.
+	@# 10.209.0.0/24) is left in place; remove it by hand, or regenerate with
+	@# `sudo rm $(USERS_CONF_PATH)` followed by `make setup-users-conf`. The
+	@# sudo belongs to the `rm`: run the make target as yourself, or it has no
+	@# operator name to write into the pool and refuses.
 	@tmp1=$$(mktemp); tmp2=$$(mktemp); \
 	ensure_pool() { USER="$$USER" WANT_DAEMON="$$1" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); cidr=sys.argv[3]; comment=sys.argv[4]; want=[os.environ["USER"],os.environ["WANT_DAEMON"]]; subnets=cfg.setdefault("subnets",[]); entry=next((s for s in subnets if s.get("cidr")==cidr),None); changed=(entry is None or sorted(entry.get("allow_users",[]))!=sorted(want)); (subnets.append({"comment":comment,"cidr":cidr,"allow_users":want}) if entry is None else entry.__setitem__("allow_users",want)); json.dump(cfg,open(sys.argv[2],"w"),indent=2); open(sys.argv[2],"a").write("\n"); print("changed" if changed else "unchanged")' "$$2" "$$3" "$$4" "$$5" 2>/dev/null; }; \
 	r1=$$(ensure_pool sandbox "$(USERS_CONF_PATH)" "$$tmp1" "10.209.0.0/20" "Production pool: sandbox daemon caller plus operator for the route-helper pair-check") || { \
