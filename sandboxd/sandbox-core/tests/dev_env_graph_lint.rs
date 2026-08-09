@@ -55,13 +55,36 @@ fn makefile() -> String {
 /// the operator-identity lint needs it for the same reason, to keep each guard's
 /// condition attached to its remedy. Each of the three calls
 /// `assert_fold_folded` before trusting what this returns.
+///
+/// Continuation is decided by the **parity** of the trailing backslash run, not
+/// by "ends in a backslash". A line ending `\\` is a literal backslash and the
+/// line ends there — the first backslash escapes the second, so nothing is left
+/// to escape the newline. Verified against GNU make 3.81 for runs of one through
+/// five: odd continues, even does not.
+///
+/// Treating `\\` as a continuation is not a harmless over-join. It welds the
+/// next line onto this one, which invents prerequisites on the current target,
+/// deletes the next rule from the graph entirely, and — where the swallowed line
+/// was a recipe — hides it from every filter keyed on the leading tab. The
+/// warn-then-skip lint stops seeing an offender that is right there in the file.
+///
+/// What this deliberately does not model: for an odd run longer than one, make
+/// also rewrites the backslashes that precede the escaping one, and this strips
+/// only the escaping one. The residual is bounded and one-directional — a
+/// prerequisite name keeps trailing backslashes make would have removed, so it
+/// fails to match a pinned edge rather than spuriously matching one. Left
+/// unmodelled on purpose: make's collapsing rule for long runs did not fall out
+/// of measurement cleanly (runs of 1, 3 and 5 retained 0, 0 and 1 backslashes),
+/// and implementing a guess at it would put an unverified model in the place
+/// where the verified parity rule now sits.
 fn logical_lines(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut pending: Option<(usize, String)> = None;
 
     for (idx, raw) in text.lines().enumerate() {
         let lineno = idx + 1;
-        let continues = raw.ends_with('\\');
+        let trailing_backslashes = raw.len() - raw.trim_end_matches('\\').len();
+        let continues = trailing_backslashes % 2 == 1;
         let body = if continues {
             &raw[..raw.len() - 1]
         } else {
@@ -84,6 +107,59 @@ fn logical_lines(text: &str) -> Vec<(usize, String)> {
         out.push(last);
     }
     out
+}
+
+/// Pins the fold's continuation rule, so a future "simplification" back to
+/// `ends_with('\\')` fails here rather than silently corrupting the graph.
+///
+/// Each case was checked against real GNU make before being written down.
+#[test]
+fn the_fold_decides_continuation_by_backslash_parity() {
+    let even = "target-A: dep-1\\\\\ntarget-B: dep-2\n";
+    assert_eq!(
+        logical_lines(even).len(),
+        2,
+        "a line ending in two backslashes is a literal backslash and ends there, \
+         so these two rules must stay separate"
+    );
+    let graph = prerequisites(even);
+    assert!(
+        graph.contains_key("target-B"),
+        "the rule following a line that ends in two backslashes was swallowed — \
+         over-joining deletes rules from the graph as well as inventing \
+         prerequisites on the rule before them: {graph:?}"
+    );
+    assert!(
+        !graph["target-A"].contains("dep-2"),
+        "`target-A` acquired a prerequisite the Makefile declares on another \
+         target: {graph:?}"
+    );
+
+    let odd = "target-C: dep-3\\\n  dep-4\n";
+    assert_eq!(
+        logical_lines(odd).len(),
+        1,
+        "a single trailing backslash escapes the newline and continues the line"
+    );
+    assert!(
+        prerequisites(odd)["target-C"].contains("dep-4"),
+        "a wrapped prerequisite list was truncated"
+    );
+
+    // The consequence that reaches the warn-then-skip lint: a mis-join absorbs a
+    // tab-prefixed recipe line into a rule line, and every filter keyed on the
+    // leading tab then skips it. The offender stays in the file and stops being
+    // reported.
+    let recipe = "warn-step: dep-5\\\\\n\t@echo \"WARNING: x\"; exit 0\n";
+    assert_eq!(
+        logical_lines(recipe)
+            .into_iter()
+            .filter(|(_, line)| line.starts_with('\t'))
+            .count(),
+        1,
+        "the recipe line stopped being a recipe line, which hides it from the \
+         warn-then-skip and operator-identity lints entirely"
+    );
 }
 
 /// Positive control on the fold: assert something was actually joined.
@@ -110,8 +186,9 @@ fn logical_lines(text: &str) -> Vec<(usize, String)> {
 /// each test carries the control itself; sharing the assertion is code reuse,
 /// not shared protection.
 ///
-/// What each consumer actually does under a broken fold, measured rather than
-/// assumed — the three differ, and only one of them was ever vacuous:
+/// This detects exactly one failure direction: a fold that **stops joining**.
+/// Under that degradation the three consumers behave differently, measured
+/// rather than assumed, and only one of them was ever vacuous:
 ///
 /// - `no_setup_step_warns_and_then_reports_success` **passed silently**, which
 ///   is why this control exists. Its assertion is "no offenders found", and its
@@ -120,15 +197,32 @@ fn logical_lines(text: &str) -> Vec<(usize, String)> {
 /// - `operator_enrolling_steps_refuse…` fails, reporting every site as an
 ///   offender, because unfolding separates each guard's condition from the
 ///   remedy on the next physical line.
-/// - `setup_steps_declare_the_producers_they_probe_for` cannot go vacuous. Its
-///   assertion is "these specific edges are present", and a degraded fold can
-///   only *remove* edges, so anything it checks fails closed. It passes under a
-///   broken fold today only because no pinned edge's declaration wraps; wrap one
-///   and it fails, loudly and by name, rather than dropping the edge quietly.
+/// - `setup_steps_declare_the_producers_they_probe_for` cannot go vacuous *in
+///   this direction*. Its assertion is "these specific edges are present", and a
+///   fold that stops joining can only *remove* edges, so anything it checks
+///   fails closed. It passes under a stopped fold today only because no pinned
+///   edge's declaration wraps; wrap one and it fails, loudly and by name, rather
+///   than dropping the edge quietly.
 ///
 /// So for the last two this control buys attribution rather than coverage: a
-/// broken fold reports itself as a broken fold, instead of as seven unrouted
+/// stopped fold reports itself as a stopped fold, instead of as seven unrouted
 /// guards or a Makefile that dropped an edge it still declares.
+///
+/// The opposite direction — a fold that joins **more** than make would — is a
+/// different failure with none of those properties, and **this control cannot
+/// see it**. A spurious join makes some line longer, which is the very thing the
+/// assertion below looks for, so it passes with more confidence than it has
+/// earned. A mis-join also breaks the fail-closed argument above: welding the
+/// next rule onto this one invents prerequisites the Makefile never declared and
+/// deletes that next rule from the graph, so edges can appear as well as vanish.
+/// It hides warn-then-skip offenders too, by absorbing a tab-prefixed recipe line
+/// into a rule line that no leading-tab filter will match.
+///
+/// One such bug lived in the fold — `\\` treated as a continuation — and is
+/// fixed. Fixing it does not close the class: nothing here establishes that no
+/// other over-joining divergence from make's lexing exists, only that the known
+/// one is gone. Read this control as covering the stopped direction and nothing
+/// more.
 fn assert_fold_folded(text: &str) {
     let lines = logical_lines(text);
     let longest_folded = lines.iter().map(|(_, line)| line.len()).max().unwrap_or(0);
@@ -242,10 +336,12 @@ const REQUIRED_EDGES: &[(&str, &str, &str)] = &[
 fn setup_steps_declare_the_producers_they_probe_for() {
     let text = makefile();
 
-    // This lint cannot go vacuous — it asserts specific edges are present, and a
-    // broken fold can only remove edges — so the control here is for attribution,
-    // not coverage. Pin an edge whose prerequisite list wraps and a broken fold
-    // makes this test blame the Makefile for dropping an edge it still declares.
+    // This lint cannot go vacuous under a fold that stops joining — it asserts
+    // specific edges are present, and unfolding can only remove edges — so the
+    // control here is for attribution, not coverage. Pin an edge whose
+    // prerequisite list wraps and a stopped fold makes this test blame the
+    // Makefile for dropping an edge it still declares. A fold that *over*-joins
+    // is a different matter; see `assert_fold_folded`.
     assert_fold_folded(&text);
 
     let graph = prerequisites(&text);
