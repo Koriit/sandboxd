@@ -2830,11 +2830,60 @@ The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.r
 1. **Egress is enforced in both** — §3.6 assertions **1–3** hold independently in each VM.
    (Assertion 4 is recorded, not asserted, in either VM — see its note.)
 
-   ❌ **NOT RUN as of 2026-08-09.** Part B stood up bare VMs to probe the segment boundary
-   and never built the §3.3 bridge topology, the gateway container, or the probe container
-   in a second operator's VM — so none of assertions 1–3 were evaluated for B. This
-   assertion is **open**, and it is the axis on which §3.8 outcome **(b)** is still
-   unevaluated. Do not read Part B's green on assertion 5 as covering it.
+   ✅ **REPRODUCED — 2026-08-09 (M24-S3). It holds: egress enforcement is not coupled to
+   daemon ownership.** This is the **canonical record** for this assertion. §3.8, §3.11,
+   phase 0's Part B list and § Still unverified state the result and point here; they do not
+   re-derive it. Verbatim evidence:
+   `.tasks/handoffs/20260809-cross-operator-slot-probe.md` § *§3.7 assertion 1* (gitignored,
+   retained locally).
+
+   **What was built, and by whom.** The full §3.3 gate topology stood up **inside operator-b's
+   VM** — `bgate`, uid **528**, slot-1 NIC, hand-written Lima YAML, an operator-owned
+   `LIMA_HOME` at the daemon's own state-root path shape, `sandbox-gateway:0.1.10`
+   `docker load`ed by the operator, both bridges (`sandboxd-egress`, `gate-session`) and both
+   containers (`gw`, `probe`) created by the operator. **No daemon at any point.** §3.5's route
+   was verified first — `default via 10.211.0.2` in the probe's netns — and then assertions
+   1–3 ran, in that order.
+
+   | Assertion | operator-b's VM (uid 528) | Part A, operator A (§3.10) |
+   |---|---|---|
+   | **1 — deny** | **exit 7 @ 242 µs** with the route via `.2` — a real block; **negative control** (route via `.1`, §3.5 skipped) **28 @ 8.004 s** | 7 @ 129 µs; control 28 @ 8.005 s |
+   | **2 — allow** | **exit 0, HTTP 200**, `Example Domain` present @ 0.118 s. CoreDNS resolved `example.com`, `policy_allow_tcp` tuples were added for both answers on :80, Envoy proxied | exit 0, HTTP 200, `Example Domain` |
+   | **3 — structural** | all **five** positive regexes present, the negative `"10002" not in nft_rules` holds, `inet` table set exactly `{sandbox, sandbox_dnat}` | same |
+
+   ⚠️ **The negative control is part of the result — never record the deny alone.** "Deny
+   works" on its own is indistinguishable from the trap this very section fell into (P1/P2/P3
+   above, and assertion 5's false green): a probe that never left produces the expected answer
+   with the property absent. What carries the evidence is **red-then-green on the same route in
+   the same run** — 28 after 8.004 s with §3.5 skipped, 7 after 242 µs with it applied, four
+   orders of magnitude apart. Any re-run must reproduce the pair, not the green.
+
+   **Assertion 1 returned 7, not `{52,56}` — that is Part A's existing qualification carried
+   forward, not a new anomaly.** Same `hostname -i` deny-logger bind defect, same
+   ownership-*independent* cause, same consequence: enforcement is unaffected (it fails
+   closed), only the TCP deny-*event* is lost. It is argued in full at §3.10 → *Assertion 1's
+   qualified result, and why it is not outcome (c)* and is not restated here.
+
+   **`sandbox_policy` is legitimately absent**, not a gap — it is created by the policy-apply
+   path, which needs the daemon, and §3 has no daemon. Assertion 3 already says so; repeated
+   here because a five-vs-six row count between this run and Part A is exactly what a later
+   reader files as a discrepancy. Both runs assert the same thing: **five positive regexes plus
+   the `10002` negative**, which §3.10 tabulated as "six rows".
+
+   **Deviation, recorded rather than glossed: the two halves come from different runs.** The
+   assertion says "in **each** VM"; A's half is Part A (2026-08-08, §3.10) and B's half is this
+   run (2026-08-09). The two VMs never ran concurrently. **This is the right shape, for the
+   same reason assertion 2's A-vs-A shape is** — per-VM egress enforcement is not a pairwise
+   property, so running the two halves together would add a variable without testing a new one.
+   The pairwise question (can one VM reach the other's segment) is assertion 2's subject and
+   *was* run pairwise. Stated explicitly so a later reader neither reads "both VMs" as
+   simultaneous nor files the sequencing as a shortfall.
+
+   **What it settles.** §3.8 outcome **(c)** — "interception coupled to daemon ownership" — is
+   the outcome that would kill the `shared:` design, and it **did not occur**: assertion 1
+   passes with a verified-correct route in a VM a genuine second operator built unaided.
+   **The decision survives on evidence, not on argument.** Together with assertion 2, this also
+   takes §3.8 outcome **(b)** from *unevaluated* to *not reached*.
 
 2. **Neither VM can reach the other's segment**, using the shared-subnet method above.
 
@@ -2867,18 +2916,23 @@ The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.r
    |---|---|---|
    | **One operator can hold NICs on multiple slots at once** | **MEASURED** | In the assertion-2 window, **operator A (uid 501)** held `xopb0` on slot 0 and `xopb4` on slot 4 **concurrently** — each with its own `socket_vmnet` accept-count delta and a live `LOWER_UP` NIC in its guest. Direct observation, not an inference from the admission result. |
    | **Enrolled admission to all 8 slots** | **MEASURED** | One `connect(2)` probe per slot as enrolled uid 528, all eight `RESULT=CONNECT_OK`. Not a sample. |
-   | **Reaching a foreign operator's VM via a second slot** | **INFERRED** — strong, not directly observed | The mechanism is slot-agnostic by construction and admission is measured on every slot, so the two rows above compose. The only unmeasured link is a foreign victim *happening to sit* on the second slot — which is a property of the fixture, not of the mechanism. |
+   | **An enrolled operator can *attach* on a slot other than 0** | **MEASURED** — and by the adversary principal itself | Upgraded 2026-08-09 by the assertion-1 run, at no extra cost. `bgate` (**uid 528**, the §1.6 principal) brought its NIC up on **slot 1** — inside A's nominal `{0..3}` range — with guest-side `lima1 <…,UP,LOWER_UP>` as primary ground truth (a vmnet socket NIC reaches carrier only after the daemon accepts the QEMU connection) and slot-1's accept count 17 → 18 as corroboration. Until then, only `connect(2)` had been measured off slot 0; an actual attach elsewhere was an inference. |
+   | **Reaching a foreign operator's VM via a second slot** | **INFERRED** — strong, not directly observed | The mechanism is slot-agnostic by construction; admission is measured on every slot and a real attach is now measured off slot 0 by the adversary principal, so the rows above compose. The only unmeasured link is a foreign victim *happening to sit* on the second slot — a property of the fixture, not of the mechanism. |
 
-   ⚠️ **Read the first row precisely.** The principal holding two slots was **A**, not the
-   adversary. What it establishes is that concurrent multi-slot occupancy needs nothing but
-   ordinary enrolled membership — and **B holds identical membership**, so the mechanism is
-   established for B too. It does **not** say the adversary was observed doing it. Those are
-   two different statements and only the first was measured; do not let the text slide from
-   one to the other.
+   ⚠️ **Read rows one and three precisely — they are about different principals.** The
+   principal holding two slots **concurrently** was **A**, not the adversary; what that
+   establishes is that concurrent multi-slot occupancy needs nothing but ordinary enrolled
+   membership, and **B holds identical membership**, so the mechanism is established for B
+   too. Separately, **B was measured attaching on a non-zero slot** — but singly: `bgate` held
+   exactly one vmnet NIC. So "B attached off slot 0" is measured and "B held two slots at
+   once" is not. Three adjacent statements, only two of them measured; do not let the text
+   slide between them.
 
-   **The third row was deliberately declined, not overlooked.** Settling it costs two more
-   VMs to re-confirm a composition of two already-measured facts across a fixture detail that
-   carries no mechanism. If it is ever wanted: repeat assertion 5's attach against a **second**
+   **The one inferred row was deliberately declined, not overlooked** — twice now, on the same
+   reasoning both times. Settling it costs two more VMs to re-confirm a composition of
+   already-measured facts across a fixture detail that carries no mechanism; the assertion-1
+   run put `bgate` on slot 1 and could have paired it with a victim there, and that pairing was
+   consciously not built. If it is ever wanted: repeat assertion 5's attach against a **second**
    slot carrying another operator's VM, and show the same accept-count delta and reach there.
 
 3. **The hostile-VM assertion (§3.6 assertion 5)** — the one that tests the boundary
@@ -2940,15 +2994,36 @@ When in doubt about which side of the line a result falls on, the discriminator 
 this outcome have been produced by a run with the property absent?** If yes, it is a
 methodology result, not an outcome.
 
+**The bucket earned its keep on its first use — 2026-08-09, §3.7 assertion 1.** Assertion 2
+(allow) first came back **SERVFAIL / exit 6**: the probe's DNS to `10.211.0.2:53` was answered
+`connection refused`. The cause was in the run's **own harness**, not the system — the injected
+DNAT ruleset carried only `generate_dnat_ruleset` and omitted the other two rulesets
+`inject_dnat` applies (`gateway.rs:1181-1189`), so with no input-allow the `sandbox` input
+chain was still deny-all with a trailing `reject` and inbound DNS was rejected. That is
+**§3.10 defect #1 reproduced independently, in a second harness, by someone who had the
+written warning available** — which is the strongest argument that defect note is load-bearing
+and must not be trimmed. It was self-caught, classified as a harness defect rather than as
+(a)–(d), fixed by injecting all three rulesets, and the **re-run** was classified: assertions
+1–3 green. The corrected complete ruleset is embedded in the handoff so a rebuild works from
+that document alone.
+
+This is exactly what the bucket exists for. A red with this shape filed as (a) — "fixable,
+decision survives" — would have been an accurate-sounding sentence that recorded nothing, and
+the run would have been remembered as having tested the boundary when it had tested its own
+fixture. **Write these down; do not tidy them away.**
+
 #### No §3.8 outcome was reached in Part B
 
-Neither **(b)** nor **(d)** was reached, and this is a statement about coverage, not a
-clean bill:
+Neither **(b)** nor **(d)** was reached. Read the two bullets separately — one is now a real
+exclusion and the other is still only a statement about coverage:
 
-- **(b) is unevaluated, not excluded.** It keys off §3.7 assertion 1 *or* 2. Assertion 2
-  holds (with the ownership deviation noted there); **assertion 1 was never run** — no second
-  VM ever built the bridge topology or enforced egress. The (b) bucket stays open on that
-  axis until assertion 1 is run.
+- **(b) is evaluated and NOT reached** (updated 2026-08-09). It keys off §3.7 assertion 1
+  *or* 2. Assertion 2 holds (with the ownership shape accepted there); **assertion 1 now also
+  holds** — a second operator's VM built the §3.3 topology unaided and enforced egress, with
+  §3.5's route verified first and a negative control on the same route. No NIC-identity error,
+  no address collision, no cross-segment reachability between cooperating VMs. Canonical
+  record at §3.7 assertion 1. This bullet previously read "unevaluated, not excluded"; that is
+  superseded.
 - **(d) is not applicable yet, by construction.** It triggers only on assertion 5 succeeding
   **after §1.6 lands**. §1.6 has not landed, so assertion 5's success is the pre-fix
   reproduction the fix must invert — the expected result, not outcome (d). M24-S20 is where
@@ -3042,6 +3117,10 @@ Each would have produced a false red. Recorded so a re-run does not rediscover t
    trailing `reject`, and input-allow is what contributes
    `ip saddr <subnet> tcp dport 10001 accept` — the deny-logger port assertion 1 targets. The
    code says so at `gateway.rs:1185-1188`. **Inject all three.**
+   ⚠️ **Reproduced independently 2026-08-09**, in the §3.7 assertion-1 harness, by a run that
+   had this note available: the allow assertion came back SERVFAIL until all three rulesets
+   were injected. Twice from the same omission makes this the most re-discoverable defect in
+   §3 — **do not trim this item**. See §3.8 → *A fifth bucket*.
 2. **§3.4 step 7's seeded listener is rejected by Envoy.**
    `compile_initial_envoy_listener` (`policy.rs:1995`) is literally `filter_chains: []`, and
    Envoy refuses it: *"error adding listener '0.0.0.0:10000': no filter chains specified"*. So
@@ -3072,14 +3151,23 @@ decisive: **52 with §3.5's route, 28 without.** Either way the gate discriminat
 shipping topology the honest signature is `{7}` versus 28, separated by four orders of magnitude
 in latency as well as by exit code.
 
-### 3.11 Part B result — **PARTIAL**, run 2026-08-09 (M24-S3)
+### 3.11 Part B result — **COMPLETE**, run 2026-08-09 (M24-S3)
 
-**Part B is not complete.** One of its three assertions was run and is decisive, one holds
-in the shape it should have, and one was never run. Part A's conclusion is unaffected.
+**All three §3.7 assertions have been run.** This section read **PARTIAL** earlier the same
+day, when assertion 1 had not been attempted; that is **superseded**, not wrong — it was
+accurate for the state it described. Part B took two sittings on 2026-08-09: the
+cross-operator slot probe (assertions 2 and 3), then the second-operator egress run
+(assertion 1). Part A's conclusion is unaffected by either.
+
+⚠️ **"Part B complete" means the gate's measurement program is complete. It does not mean
+phase 0's Part B acceptance list is green** — two items there are not measurements and cannot
+be closed by running anything: the dedicated-account-in-the-proper-group sub-clause (deferred
+by design; the group does not exist until phase 1) and the issue #82 write-up. See §4 phase 0
+→ *Acceptance criteria — Part B*, which carries the arithmetic.
 
 | §3.7 assertion | Status | Where the evidence is |
 |---|---|---|
-| **1** — egress enforced in both VMs (§3.6 assertions 1–3, independently, in B's VM) | ❌ **NOT RUN** | nothing; no second-operator VM ever built the §3.3 topology |
+| **1** — egress enforced in both VMs (§3.6 assertions 1–3, independently, in B's VM) | ✅ **REPRODUCED — it holds.** The §3.3 topology stood up inside operator-b's VM with **no daemon at any point**, §3.5's route verified first, assertions 1–3 green in order, deny carrying its negative control. **§3.8 outcome (c) not reached — the decision survives on evidence** | §3.7 assertion 1 (canonical) |
 | **2** — neither VM reaches the other's segment | ✅ **holds.** Run A-vs-A, which is the **correct** shape and is accepted: isolation is a property of the vmnet daemons and the host, not of guest ownership. 🚨 **Not a mitigation** — see below | §3.7 assertion 2 |
 | **3** — hostile VM (§3.6 assertion 5) | ✅ **run, and it succeeded** — the §1.6 reproduction, which is the expected pre-fix result | §1.6 → *✅ REPRODUCED* |
 
@@ -3091,10 +3179,16 @@ on the group bit: unenrolled, all eight slots refuse with `errno=13`; enrolled, 
 accept. §1.6 → *✅ REPRODUCED* carries the ground-truth rule, the uid-floor argument, and the
 definition of "failure at connect" that M24-S20's inverted assertion inherits.
 
+**The second headline, and it cuts the other way: egress enforcement is not coupled to daemon
+ownership.** The same second operator built the entire §3.3 gate topology inside its own VM
+without the daemon in the loop, and §3.6 assertions 1–3 held there — so the isolation defect
+above is a defect in *who may attach to a segment*, not in whether an operator-owned gateway
+can enforce. §3.8 outcome **(c)** was the decision-killer and it did not occur. Both headlines
+belong to the same day and neither cancels the other: **the substrate works; the admission
+control does not.** Evidence at §3.7 assertion 1.
+
 **What Part B did *not* establish** — stated so no later reader over-claims it:
 
-- **§3.7 assertion 1 was not evaluated.** §3.8 outcome **(b)** therefore remains open on that
-  axis. Part B's VMs were bare — no bridge topology, no gateway container, no probe container.
 - **The hijack was not driven end-to-end.** Attachment and L2 reach were demonstrated;
   traffic interception, policy subversion, and data exfiltration were not attempted.
 - **Inter-slot L2 isolation held throughout.** The hole is *within* a slot, reached by
@@ -3108,11 +3202,16 @@ definition of "failure at connect" that M24-S20's inverted assertion inherits.
   own** — a true finding that reads as protection it does not provide is the same failure
   mode as a criterion that is void rather than met.
   **And concurrent multi-slot occupancy is measured, not inferred:** operator A held NICs on
-  slot 0 and slot 4 at the same time in this very run. The only inferred link left is
-  *reaching a foreign operator's VM via a second slot*. Full breakdown — and the caution that
-  the concurrent holder was A rather than the adversary — at **§3.7 assertion 2 →
+  slot 0 and slot 4 at the same time during the slot-probe sitting, and the assertion-1
+  sitting separately measured the **adversary principal itself** attaching on a non-zero slot.
+  The only inferred link left is *reaching a foreign operator's VM via a second slot*. Full
+  breakdown — and the caution that these are three different statements about two different
+  principals — at **§3.7 assertion 2 →
   *Measured vs. inferred***, which is the canonical statement; do not restate it here.
-- **No §3.8 outcome was reached.** See §3.8 → *No §3.8 outcome was reached in Part B*.
+- **No §3.8 outcome was reached** — but (b) and (d) are now open for *different* reasons.
+  **(b) is evaluated and excluded**, since assertions 1 and 2 both hold. **(d) is still
+  inapplicable by construction**, because it triggers only on assertion 5 succeeding *after*
+  §1.6 lands, and §1.6 has not landed. See §3.8 → *No §3.8 outcome was reached in Part B*.
 
 **Two host-state findings from the same run**, both recorded where they belong rather than
 only here:
@@ -3121,12 +3220,18 @@ only here:
   → *It is more than context for the lite topology too* and §1.6's precondition.
 - The vmnet slot pool was repaired to a bootable state and drift-clean (8/8 `running`, 8×
   `exit 0`); **issue #85 is still open**, and the fix is unpushed local commits. See §5.4.
+  The assertion-1 sitting exercised the repaired pool for real — `bgate` attached a NIC to
+  slot 1 and the pool was re-verified intact afterwards (8 jobs, 8 sockets `root:_sandboxd
+  0770`, dir `0750`, 8 `socket_vmnet` processes). That is corroboration for the repair, **not**
+  the reboot; see § Still unverified.
 
 **Procedure defects found by running it.** §3.7's `/29` endpoint-addressing steps were wrong
 in three independent ways and are corrected in place, with the wrong version kept visible;
 §3.6 assertion 5's `limactl`-exit-status reading produced a false green and now carries two
 mandatory corrections. §3.8 gained a note for the class of red neither describes: **the probe
-itself is wrong.**
+itself is wrong** — and the assertion-1 sitting then landed in that bucket, re-discovering
+§3.10 defect #1 (a SERVFAIL caused by injecting one of the three `inject_dnat` rulesets)
+in its own harness, self-catching it, fixing it and classifying the re-run.
 
 Local-only working records (untracked, not part of the repo's durable history):
 `.tasks/handoffs/20260809-cross-operator-slot-probe.md`,
@@ -3290,29 +3395,69 @@ exit**.
       daemon-driven provision step is needed, and no budget should be carried for one. See
       §3.7's struck prerequisite for why the false premise mattered: it made §1.6's threat
       model look weaker than it is.
-- [~] Second-operator isolation probe (§3.7): all assertions pass, **including the hostile
+- [x] Second-operator isolation probe (§3.7): all assertions pass, **including the hostile
       VM assertion** — which is expected to **fail** until §1.6 lands. Record which.
-      **One of three run and decisive; one holds with a deviation; one not run.**
-  - [ ] Assertion 1 (egress enforced in both VMs) — ❌ **NOT RUN.** §3.8 outcome (b) stays
-        open on this axis.
+      **SATISFIED 2026-08-09 — all three run, all three recorded, and the criterion's "record
+      which" clause is met.** This entry read `[~]` earlier the same day, before assertion 1.
+  - [x] Assertion 1 (egress enforced in both VMs) — ✅ **REPRODUCED; it holds.** A second
+        operator built the §3.3 topology inside its own VM with no daemon in the loop, §3.5's
+        route verified first, assertions 1–3 green in order, deny carrying its negative
+        control. **§3.8 outcome (b) is now excluded on this axis, not merely open**, and
+        outcome (c) — the decision-killer — did not occur. Canonical record with the evidence,
+        the exit-7 qualification and the different-sittings deviation: §3.7 assertion 1.
   - [x] Assertion 2 (neither VM reaches the other's segment) — holds, with the recorded
         deviation that both VMs were operator A's.
   - [x] Assertion 3 / §3.6 assertion 5 (hostile VM) — **run; it succeeded**, which is the
         expected pre-fix result and is now the §1.6 reproduction. Recorded per the criterion.
 
+**Where Part B stands — recomputed 2026-08-09 after assertion 1, not just one row flipped.**
+
+| | Before assertion 1 | Now |
+|---|---|---|
+| Top-level criteria fully satisfied | **0 of 3** | **1 of 3** (the §3.7 probe) |
+| Sub-clauses satisfied, void B2 excluded from the denominator | **4 of 6** | **5 of 6** |
+| Sub-clauses satisfied, on the earlier denominator that counted void B2 | 4 of 7 | 5 of 7 |
+| Exit clauses | 1 `[~]`, 1 `[x]` *with a live warning* | 1 `[~]`, 1 `[x]` **clean** |
+
+**Nothing measurable is left.** Every §3.7 assertion has been run. The four things still
+standing between Part B and a clean sheet are all non-measurement, and they are **not the same
+kind of thing** — keep them distinguished:
+
+1. **B1.c — deferred by design, structurally unsatisfiable in phase 0.** §1.6's per-operator
+   group does not exist until phase 1, so there is no "proper group" to enroll into. Owners
+   named above: **M24-S7** and **M24-S20**. File as scheduled work, never as a phase-0 gap.
+2. **B2 — void.** The premise was falsified; the criterion was **wrong**. It does not become
+   satisfied and it does not become a gap. Do not carry a budget for it and do not re-open it.
+3. **B1.b's reboot caveat — blocked on the user's host.** The bootout/re-bootstrap simulation
+   is the strongest evidence short of rebooting, and only the user can reboot. The observation
+   that would settle it: after a real reboot, 8/8 `state = running` with `runs = 1` and the
+   drift detector at 8× `exit 0`.
+4. **Exit-1 / issue #82 — blocked on the user's authorization.** The write-up is drafted and
+   ready; the five local commits behind it are deliberately unpushed. Neither the comment nor
+   the closing of issue #85 is posted without the user saying so.
+
+**So the honest one-liner is: Part B's measurement program is complete and its residue is
+administrative or scheduled.** That is a different statement from "Part B is green", and the
+difference matters — read item 1 as done and phase 1 loses the session that must re-run
+enrollment against the real group.
+
 **Exit (both parts).**
 
 - [~] Findings recorded in this spec and on issue #82. The findings are the durable
-      artifact. **Spec: done** (§1.6 reproduction, §3.2, §3.7, §3.8, §3.11, §5.4).
-      **Issue #82: outstanding** — it carries Part A's result and pre-check C, and nothing
-      for Part B.
+      artifact. **Spec: done** (§1.6 reproduction, §3.2, §3.7 assertions 1 and 2, §3.8,
+      §3.10, §3.11, §5.4). **Issue #82: outstanding, and blocked on the user's
+      authorization** — it carries Part A's result and pre-check C, and nothing for Part B.
+      The Part B write-up is drafted and ready to post; it is not owed by this session's
+      work, it is waiting on a decision that is not ours to make.
 - [x] **The gate script is deleted.** It is not carried into phase 1 and not inherited by
       anyone. **Satisfied vacuously for Part B: no gate script was written.** Part A's was
-      deleted at the end of M24-S2. ⚠️ **But the probe's working directory survived** —
-      `/private/tmp/xop-probe/` (19 entries, world-readable) still contains the raw
-      `socket_vmnet` client and the VM configs that demonstrate the attach. It is outside
-      the repo, so no commit carries it, but it is exactly the kind of residue this clause
-      exists to prevent. Delete it or move it under the scratchpad.
+      deleted at the end of M24-S2. ✅ **The residue warning that stood here is discharged
+      (2026-08-09).** `/private/tmp/xop-probe/` — 19 entries, world-readable, holding a
+      working raw-`socket_vmnet` exploit client for a live unfixed vulnerability — **has been
+      deleted**, with its full contents embedded in the probe handoff so the fixture is
+      rebuildable from that document alone. The later assertion-1 run kept all of its scratch
+      under the `0700` session scratchpad and never wrote to `/private/tmp`. Nothing
+      exploit-related is left on disk between runs.
 
 **Gating rule — this was previously ambiguous and is now explicit.**
 
@@ -3322,6 +3467,15 @@ detects outcome (c), the decision-killing one — while Part B validates the iso
 property phase 1 exists to deliver. Starting phase 1 without Part B is acceptable;
 *finishing* it without Part B would mean shipping partitioning whose central claim is
 untested.
+
+⚠️ **Read this rule against the recomputed status above, because its live content has
+changed.** Part B's measurement program is complete, so this rule no longer holds anything
+back pending a run. Of its two remaining items, **one is circular by construction**: B1.c
+cannot be satisfied until phase 1 creates the per-operator groups, so "Part B gates phase 1's
+completion" must not be read as requiring B1.c *before* phase 1 finishes — the enrollment
+against the real group is **M24-S20's** job, and M24-S20 is where the criterion is discharged.
+The only item this rule genuinely still gates on is the issue #82 write-up. Stated explicitly
+because a literal reading produces a deadlock that was never intended.
 
 Red → route per §3.8; only (c) kills the decision.
 
@@ -4185,12 +4339,23 @@ outside its phase, it becomes an open question again — say so rather than abso
 - **Whether the repaired vmnet plists survive a real reboot** (§5.4, issue #85) — the repair
   was validated by a bootout/re-bootstrap **simulation** (8/8 `running`, `runs = 1`, drift
   detector 8× `exit 0`), which is the strongest evidence short of rebooting the host. A real
-  reboot has not happened. Report it as simulated, never as rebooted.
-- **§3.7 assertion 1 — egress enforced in a second operator's VM** — ❌ not run in Part B.
-  §3.8 outcome **(b)** is unevaluated on that axis. See §3.11.
+  reboot has not happened. Report it as simulated, never as rebooted. **Blocked on the user's
+  host**, not on any work here. Later the same day the §3.7 assertion-1 run drove a real
+  attach against the repaired pool (slot 1) and re-verified it intact afterwards — that is
+  corroboration that the repair works in use, and it is **not** a reboot; do not let it be
+  read as one.
 
 **Settled by M24-S3 (2026-08-09), kept here as a trail:**
 
+- ✅ **Whether egress is enforced in a *second operator's* VM** (§3.7 assertion 1) —
+  **YES, and the decision survives on evidence.** This bullet previously sat in the unverified
+  list above; it was moved here when the assertion ran. A genuine second operator (uid 528)
+  built the whole §3.3 gate topology inside its own VM with **no daemon in the loop**, and
+  §3.6 assertions 1–3 held there with §3.5's route verified first and a negative control on
+  the same route. **Enforcement is not coupled to daemon ownership**, so §3.8 outcome **(c)**
+  did not occur and outcome **(b)** is now excluded rather than unevaluated. Canonical record —
+  including the exit-7 qualification inherited from Part A and the deviation that A's half and
+  B's half come from different sittings — at §3.7 assertion 1.
 - ✅ **Whether a second operator can attach to another operator's slot** (§1.6) —
   **YES, reproduced with a real second operator.** A loginable non-admin account above
   `SYSTEM_UID_FLOOR`, enrolled by the byte-for-byte `install.sh:2679` command, attached its
