@@ -571,6 +571,13 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 # but ordering a prerequisite list is only advisory under `-j`, so the targets
 # that need the account also declare it as a real prerequisite.
 #
+# That is the general rule for every step here, not just the account: whatever a
+# step probes for at runtime — an account, a uid, a live vmnet socket — it
+# declares as a real prerequisite, and a probe that comes back empty is a hard
+# failure. Neither half is optional. Without the edge, `-j` can run the step
+# before its input exists; without the failure, the step reports success having
+# done nothing, and setup-dev-env still ends in `✓ complete`.
+#
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
 setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
@@ -1228,6 +1235,23 @@ build-guest-linux-aarch64:
 	           --target aarch64-unknown-linux-gnu"
 	@echo "$(GREEN)✓ built: sandboxd/target/aarch64-unknown-linux-gnu/release/sandbox-guest$(RESET)"
 
+# Both staging targets below resolve their destination from SANDBOX_DAEMON_UID,
+# the uid of SANDBOX_DAEMON_USER. When that user is the default production
+# account, the target that creates it is a real prerequisite: position in the
+# setup-dev-env list orders them only for a serial build, and under `-j` the
+# staging could otherwise run first, resolve no uid, and skip.
+#
+# The edge is conditional because SANDBOX_DAEMON_USER is a genuine knob. An
+# operator running the daemon under their own uid passes
+# SANDBOX_DAEMON_USER=$(id -un); making the edge unconditional would create the
+# `_sandboxd` system account and group behind their back, for an install that
+# does not use it. When the knob is set to anything else, the account-resolution
+# check in each recipe is what catches a bad value.
+ifeq ($(SANDBOX_DAEMON_USER),$(DARWIN_SANDBOXD_ACCOUNT))
+stage-route-helper-linux-aarch64: setup-darwin-sandboxd-user
+stage-lite-image: setup-darwin-sandboxd-user
+endif
+
 # stage-route-helper-linux-aarch64 — copy the Linux aarch64 route-helper into
 # the daemon's LIMA_HOME so `ensure_route_helper_in_vm` can find it at startup.
 #
@@ -1254,11 +1278,13 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 	_daemon_user="$(SANDBOX_DAEMON_USER)"; \
 	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
 	if [ -z "$$_daemon_uid" ]; then \
-	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping route-helper staging."; \
+	  echo "ERROR: daemon user '$$_daemon_user' does not resolve to a uid; cannot stage the route helper."; \
+	  echo "  That uid is the staging path, so nothing can be written and ensure_route_helper_in_vm"; \
+	  echo "  finds no binary to install into the gateway VM."; \
 	  echo "  For a production install, run 'make setup-darwin-sandboxd-user' to create the"; \
 	  echo "  '$(DARWIN_SANDBOXD_ACCOUNT)' account, then re-run 'make stage-route-helper-linux-aarch64'."; \
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
-	  exit 0; \
+	  exit 1; \
 	fi; \
 	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/sandbox-route-helper-linux-aarch64"; \
@@ -1302,11 +1328,13 @@ stage-lite-image: lite-image
 	_daemon_user="$(SANDBOX_DAEMON_USER)"; \
 	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
 	if [ -z "$$_daemon_uid" ]; then \
-	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping lite-image staging."; \
+	  echo "ERROR: daemon user '$$_daemon_user' does not resolve to a uid; cannot stage the lite image."; \
+	  echo "  That uid is the staging path, so nothing can be written and lite session creation"; \
+	  echo "  fails inside the gateway VM."; \
 	  echo "  For a production install, run 'make setup-darwin-sandboxd-user' to create the"; \
 	  echo "  '$(DARWIN_SANDBOXD_ACCOUNT)' account, then re-run 'make stage-lite-image'."; \
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
-	  exit 0; \
+	  exit 1; \
 	fi; \
 	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/lite-image.tar"; \
@@ -2145,7 +2173,13 @@ setup-darwin-test-sudoers-fragment:
 #
 # The image must already be built (make gateway-image). Darwin-only.
 # Idempotent: skipped when the destination is byte-identical to the saved tarball.
-stage-gateway-image-test:
+#
+# Depends on: setup-darwin-sandboxd-test-user — the staging path is derived from
+# that account's uid. The edge is required, not decorative: position in the
+# setup-dev-env prerequisite list orders these two only for a serial build, so
+# under `-j` this target could run first, find no account, and skip the staging
+# while the run still reported success.
+stage-gateway-image-test: setup-darwin-sandboxd-test-user
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ stage-gateway-image-test skipped (not macOS)$(RESET)"; \
 	  exit 0; \
@@ -2156,9 +2190,11 @@ stage-gateway-image-test:
 	  exit 1; \
 	fi; \
 	if ! id -u _sandboxd-test >/dev/null 2>&1; then \
-	  echo "WARNING: system user '_sandboxd-test' not found; skipping gateway-image staging."; \
-	  echo "  Run 'make setup-darwin-sandboxd-test-user' first."; \
-	  exit 0; \
+	  echo "ERROR: system user '_sandboxd-test' not found; cannot stage the gateway image."; \
+	  echo "  Its uid is the staging path, so without the account nothing can be written and"; \
+	  echo "  the e2e gateway VM has no image to load."; \
+	  echo "  Run: make setup-darwin-sandboxd-test-user"; \
+	  exit 1; \
 	fi; \
 	_test_uid=$$(id -u _sandboxd-test); \
 	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
@@ -2194,7 +2230,10 @@ stage-gateway-image-test:
 #
 # The image must already be built (make lite-image). Darwin-only.
 # Idempotent: skipped when the destination is byte-identical to the saved tarball.
-stage-lite-image-test: lite-image
+#
+# Depends on: setup-darwin-sandboxd-test-user — see the note on
+# stage-gateway-image-test; the same `-j` ordering gap applies here.
+stage-lite-image-test: lite-image setup-darwin-sandboxd-test-user
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ stage-lite-image-test skipped (not macOS)$(RESET)"; \
 	  exit 0; \
@@ -2205,9 +2244,11 @@ stage-lite-image-test: lite-image
 	  exit 1; \
 	fi; \
 	if ! id -u _sandboxd-test >/dev/null 2>&1; then \
-	  echo "WARNING: system user '_sandboxd-test' not found; skipping lite-image staging."; \
-	  echo "  Run 'make setup-darwin-sandboxd-test-user' first."; \
-	  exit 0; \
+	  echo "ERROR: system user '_sandboxd-test' not found; cannot stage the lite image."; \
+	  echo "  Its uid is the staging path, so without the account nothing can be written and"; \
+	  echo "  lite session creation fails inside the gateway VM."; \
+	  echo "  Run: make setup-darwin-sandboxd-test-user"; \
+	  exit 1; \
 	fi; \
 	_test_uid=$$(id -u _sandboxd-test); \
 	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
@@ -2241,7 +2282,10 @@ stage-lite-image-test: lite-image
 #
 # Idempotent: skipped when the installed binary is byte-identical to the built one.
 # Darwin-only.
-stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64
+#
+# Depends on: setup-darwin-sandboxd-test-user — see the note on
+# stage-gateway-image-test; the same `-j` ordering gap applies here.
+stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64 setup-darwin-sandboxd-test-user
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ stage-route-helper-linux-aarch64-test skipped (not macOS)$(RESET)"; \
 	  exit 0; \
@@ -2252,9 +2296,11 @@ stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64
 	  exit 1; \
 	fi; \
 	if ! id -u _sandboxd-test >/dev/null 2>&1; then \
-	  echo "WARNING: system user '_sandboxd-test' not found; skipping route-helper staging."; \
-	  echo "  Run 'make setup-darwin-sandboxd-test-user' first."; \
-	  exit 0; \
+	  echo "ERROR: system user '_sandboxd-test' not found; cannot stage the route helper."; \
+	  echo "  Its uid is the staging path, so without the account nothing can be written and"; \
+	  echo "  ensure_route_helper_in_vm finds no binary to install into the gateway VM."; \
+	  echo "  Run: make setup-darwin-sandboxd-test-user"; \
+	  exit 1; \
 	fi; \
 	_test_uid=$$(id -u _sandboxd-test); \
 	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
@@ -2279,27 +2325,55 @@ stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64
 # than hardcoded. New installs (from setup-darwin-vmnet-plists) use `_sandboxd`
 # as the socket group; hosts provisioned before that change may use `_sandbox`
 # (macOS's built-in Seatbelt group, GID 60). Reading the actual socket's group
-# keeps this target correct for both.
+# keeps this target correct for both, and is what carried it through the
+# `_sandbox` → `_sandboxd` migration without an edit.
+#
+# The socket is stat'd unprivileged first and only re-read under sudo when that
+# fails. An operator already enrolled in the socket group can traverse
+# /var/run/sandbox (0750, group-readable), so the warm path prompts for nothing;
+# the sudo fallback covers the first setup-dev-env on a host, where the
+# operator's own membership has been granted but is not yet live in the invoking
+# login session.
 #
 # Idempotence: dseditgroup membership check; sudo only when not yet a member.
 #
-# Ordering: must run after setup-darwin-sandboxd-test-user.
-setup-darwin-sandboxd-test-vmnet-group-membership: setup-darwin-sandboxd-test-user
+# Depends on: setup-darwin-sandboxd-test-user (the account being enrolled) and
+# setup-darwin-vmnet-daemons (the sockets whose group is read).
+#
+# The second edge is load-bearing rather than documentation. The two steps used
+# to be ordered only by their relative position in the setup-dev-env prerequisite
+# list — an ordering GNU make honours for a serial build and explicitly does not
+# under `-j`. A parallel run could reach this target before any socket existed,
+# take the absent-socket branch, and skip the grant while setup-dev-env still
+# printed `✓ complete`; the consequence surfaced much later as an opaque EACCES
+# from the e2e daemon.
+#
+# With the edge declared the absent-socket branch is unreachable in any ordinary
+# invocation, because setup-darwin-vmnet-daemons polls for every slot socket and
+# hard-fails on one that does not appear. It is kept anyway, as a hard failure,
+# for the cases that bypass the edge — `make -o setup-darwin-vmnet-daemons`,
+# DARWIN_VMNET_SLOTS=0, or a pool that dies between the two steps. An unreachable
+# branch that fails loudly costs nothing; one that exits 0 is a trap.
+setup-darwin-sandboxd-test-vmnet-group-membership: setup-darwin-sandboxd-test-user setup-darwin-vmnet-daemons
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-test-vmnet-group-membership skipped (not macOS)$(RESET)"; \
 	  exit 0; \
 	fi
-	@_sock=$$(ls /var/run/sandbox/vmnet/slot-0.sock 2>/dev/null); \
-	if [ -z "$$_sock" ]; then \
-	  echo "WARNING: /var/run/sandbox/vmnet/slot-0.sock not found; skipping vmnet group membership."; \
-	  echo "  The vmnet pool daemons may not be running. Run 'make setup-darwin-vmnet-daemons' first,"; \
-	  echo "  then re-run this target."; \
-	  exit 0; \
-	fi; \
-	_vmnet_group=$$(stat -f '%Sg' /var/run/sandbox/vmnet/slot-0.sock 2>/dev/null); \
+	@_sock="/var/run/sandbox/vmnet/slot-0.sock"; \
+	_vmnet_group=$$(stat -f '%Sg' "$$_sock" 2>/dev/null || true); \
 	if [ -z "$$_vmnet_group" ]; then \
-	  echo "WARNING: could not determine vmnet socket group; skipping."; \
-	  exit 0; \
+	  _vmnet_group=$$(sudo stat -f '%Sg' "$$_sock" 2>/dev/null || true); \
+	fi; \
+	if [ -z "$$_vmnet_group" ]; then \
+	  echo "ERROR: could not read the group of $$_sock (absent, or unreadable even under sudo)."; \
+	  echo "  Without it '_sandboxd-test' cannot be granted vmnet access, and the e2e daemon"; \
+	  echo "  fails later with an opaque EACCES when it opens a slot."; \
+	  echo "  setup-darwin-vmnet-daemons is a prerequisite of this target and hard-fails on a"; \
+	  echo "  socket that never appears, so reaching this line means the pool went away after"; \
+	  echo "  that step ran, or the edge was bypassed (make -o, or DARWIN_VMNET_SLOTS=0)."; \
+	  echo "  Check: sudo ls -l /var/run/sandbox/vmnet/"; \
+	  echo "  Then:  make setup-darwin-vmnet-daemons"; \
+	  exit 1; \
 	fi; \
 	if dseditgroup -o checkmember -m _sandboxd-test "$$_vmnet_group" >/dev/null 2>&1; then \
 	  echo "$(GREEN)✓ already configured: _sandboxd-test is in vmnet socket group '$$_vmnet_group'$(RESET)"; \
