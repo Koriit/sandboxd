@@ -627,6 +627,7 @@ fn parse_host_guest_pair_from_tokens(
             "{mode_label} workspace host_path must be absolute, got: {host_path:?}"
         ));
     }
+    validate_workspace_path_shape(&host_path, mode_label, "host")?;
 
     // `guest_path` undergoes `~` expansion on both sides as a literal
     // string replacement to `/home/sandbox` — environment-free, so the
@@ -662,6 +663,12 @@ fn parse_host_guest_pair_from_tokens(
         // corresponding migration of those tests and a documented user decision.
         None => host_path.clone(),
     };
+    // The guest side reaches the same sinks as the host side: it is the `dst=`
+    // of the Docker mount option list and the `mountPoint:` of the Lima
+    // stanza. Validated unconditionally rather than only in the `Some` arm —
+    // the echo branch is already covered by the host check above, and running
+    // both through one call keeps that from becoming a fact to remember.
+    validate_workspace_path_shape(&guest_path, mode_label, "guest")?;
 
     Ok((host_path, guest_path))
 }
@@ -678,6 +685,84 @@ fn strip_trailing_slashes(path: &str) -> String {
         return "/".to_string();
     }
     trimmed.to_string()
+}
+
+/// Characters permitted in an operator-supplied workspace path.
+///
+/// A workspace path does not stay a string the daemon controls. It is
+/// interpolated into backend mount configuration: a Docker `--mount` option
+/// list (`type=bind,src=…,dst=…`, which the daemon splits on `,` and `=`) and
+/// a Lima YAML template (inside a double-quoted scalar, where `"` and `\` are
+/// string syntax). A character that is syntax in either sink lets an
+/// operator-supplied path contribute mount options or YAML keys the daemon
+/// never wrote.
+///
+/// This predicate is the single definition of that set — [`crate::lima`]'s
+/// YAML-path check defers to it rather than repeating the list, so the two
+/// cannot drift apart.
+pub(crate) fn is_workspace_path_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.' | ' ' | '+' | '@' | '~' | ':')
+}
+
+/// Reject workspace path spellings that are unsafe to carry into a backend's
+/// mount configuration.
+///
+/// Two independent properties, each required by a different consumer:
+///
+/// 1. **Canonical components.** Containment against a configured root is
+///    checked lexically on the host, while the mount source is resolved much
+///    later — inside the gateway VM, on the lite backend. A `..` component
+///    survives the lexical check (`strip_prefix` matches it as an ordinary
+///    component) and is then resolved somewhere the check believed it had
+///    excluded. `.` and empty components do not escape, but they make the
+///    path the operator wrote differ from the path that gets mounted, which
+///    is the same gap in a weaker form.
+///
+/// 2. **Interpolation-safe characters.** See [`is_workspace_path_char`].
+///
+/// Both checks are lexical and pure: no filesystem access, no dependence on
+/// whether the path exists. That matters because a workspace directory is
+/// allowed not to exist yet at parse time.
+fn validate_workspace_path_shape(path: &str, mode_label: &str, side: &str) -> Result<(), String> {
+    for (index, segment) in path.split('/').enumerate() {
+        // The leading empty segment is the root marker of an absolute path,
+        // and `"/"` is entirely root — neither is a non-canonical component.
+        let component = match segment {
+            ".." => "a `..` component",
+            "." => "a `.` component",
+            "" if index > 0 && path != "/" => "an empty (`//`) component",
+            _ => continue,
+        };
+        return Err(format!(
+            "{mode_label} workspace {side}_path must not contain {component}, \
+             got: {path:?}. The path is not resolved before it reaches the backend: the \
+             daemon checks containment against the shared root lexically, on the host, \
+             while the mount source is resolved later — inside the gateway VM on the lite \
+             backend — so a `..` can reach a location the containment check treated as \
+             excluded. What works instead: pass the already-resolved spelling. It does not \
+             have to exist yet (nothing here stats it); for a directory that does exist, \
+             `cd <dir> && pwd -P` prints it."
+        ));
+    }
+
+    if let Some((offset, ch)) = path
+        .char_indices()
+        .find(|(_, c)| !is_workspace_path_char(*c))
+    {
+        return Err(format!(
+            "{mode_label} workspace {side}_path contains unsupported character {ch:?} at byte \
+             offset {offset}, got: {path:?}. Workspace paths are interpolated into backend \
+             mount configuration — a Docker `--mount` option list, which is split on `,` and \
+             `=`, and a Lima YAML template, where `\"` and `\\` are string syntax — so such a \
+             character could contribute mount options or YAML keys that were never written by \
+             the daemon. Permitted: letters, digits, space, and / - _ . + @ ~ : \
+             What works instead: (a) rename the directory to a name in that set; (b) stage a \
+             copy at such a path and point the workspace there; or (c) for a git-backed \
+             project use clone:<repo-url> or --repo, which never names a host path at all."
+        ));
+    }
+
+    Ok(())
 }
 
 /// Expand a leading `~` in a guest-side path to the canonical guest user
@@ -1719,6 +1804,109 @@ mod tests {
     fn parse_flag_shared_relative_host_path_errors() {
         let err = WorkspaceMode::parse_flag("shared:rel/path").unwrap_err();
         assert!(err.contains("must be absolute"), "err = {err}");
+    }
+
+    /// A `..` in a `shared:` host path escapes the lite backend's shared-root
+    /// containment check. The check is lexical (`strip_prefix`), so `..`
+    /// matches as an ordinary component and the path passes; it is resolved
+    /// only later, inside the gateway VM, where it names a location the check
+    /// believed it had excluded.
+    ///
+    /// The path below is chosen so the test cannot pass for the wrong reason.
+    /// A target outside the root that merely does not exist (say
+    /// `/tmp/sandbox-shared/../../Users/alice`) would be refused downstream by
+    /// the bind failing on a missing source, and a test written against it
+    /// would still pass with this rejection removed. `/var/run` exists inside
+    /// the VM, so nothing but this rejection stops it.
+    #[test]
+    fn parse_flag_shared_rejects_parent_dir_component() {
+        let err = WorkspaceMode::parse_flag("shared:/tmp/sandbox-shared/../../var/run")
+            .expect_err("`..` must be rejected");
+        assert!(err.contains(".."), "err = {err}");
+        // The refusal names its cause and a way forward, not just the rule.
+        assert!(err.contains("resolved"), "err = {err}");
+        assert!(err.contains("pwd -P"), "err = {err}");
+    }
+
+    /// The guest side reaches the same sinks as the host side (`dst=` of the
+    /// docker mount option list, `mountPoint:` of the Lima stanza), so it is
+    /// held to the same rule.
+    #[test]
+    fn parse_flag_shared_rejects_parent_dir_in_guest_path() {
+        let err = WorkspaceMode::parse_flag("shared:/tmp/sandbox-shared:/home/sandbox/../../etc")
+            .expect_err("`..` in the guest path must be rejected");
+        assert!(err.contains("guest_path"), "err = {err}");
+        assert!(err.contains(".."), "err = {err}");
+    }
+
+    /// `local:` shares the host/guest classifier with `shared:`, so it inherits
+    /// the same rule. Pinned separately because the two modes reach different
+    /// backends and a future change could plausibly special-case one.
+    #[test]
+    fn parse_flag_local_rejects_parent_dir_component() {
+        let err = WorkspaceMode::parse_flag("local:/tmp/sandbox-shared/../../var/run")
+            .expect_err("`..` must be rejected");
+        assert!(err.contains("local workspace host_path"), "err = {err}");
+        assert!(err.contains(".."), "err = {err}");
+    }
+
+    /// `.` and `//` do not escape anything, but they make the path the
+    /// operator wrote differ from the path that is interpolated into the mount
+    /// configuration. The sinks consume the string, not a normalised `Path`.
+    #[test]
+    fn parse_flag_shared_rejects_other_non_canonical_components() {
+        for (flag, expected) in [
+            ("shared:/tmp/./sandbox-shared", "`.` component"),
+            ("shared:/tmp//sandbox-shared", "empty (`//`) component"),
+        ] {
+            let err =
+                WorkspaceMode::parse_flag(flag).expect_err(&format!("{flag} must be rejected"));
+            assert!(err.contains(expected), "flag {flag} gave: {err}");
+        }
+    }
+
+    /// The characters that are syntax in a downstream sink are refused at the
+    /// parser, which is the single route from the wire format to a
+    /// `WorkspaceMode` on both the CLI and the daemon.
+    ///
+    /// `,` and `=` end an option in docker's `--mount` option list, so a path
+    /// containing one can append options the daemon never wrote. `"` and a
+    /// newline are YAML string syntax in the Lima template. The `"` case is
+    /// also the one that used to reach `sanitize_yaml_path` and panic the
+    /// daemon task rather than returning an error.
+    #[test]
+    fn parse_flag_shared_rejects_sink_syntax_characters() {
+        for flag in [
+            "shared:/tmp/w,bind-propagation=rshared",
+            "shared:/tmp/w=x",
+            "shared:/tmp/w\"quoted",
+            "shared:/tmp/w\nnewkey: injected",
+        ] {
+            let err =
+                WorkspaceMode::parse_flag(flag).expect_err(&format!("{flag:?} must be rejected"));
+            assert!(
+                err.contains("unsupported character"),
+                "flag {flag:?} gave: {err}"
+            );
+        }
+    }
+
+    /// Ordinary absolute paths — including the ones the positive parser tests
+    /// above rely on — must keep parsing. A rejection rule that also refused
+    /// these would pass every negative test while breaking the feature.
+    #[test]
+    fn parse_flag_shared_still_accepts_ordinary_paths() {
+        for flag in [
+            "shared:/tmp",
+            "shared:/Users/alice/My Project",
+            "shared:/opt/work-space_1.0+beta@host",
+            "shared:/",
+        ] {
+            assert!(
+                WorkspaceMode::parse_flag(flag).is_ok(),
+                "{flag} must still parse"
+            );
+        }
     }
 
     #[test]

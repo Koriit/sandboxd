@@ -135,18 +135,15 @@ pub fn translate_shared_path(
     host_path: &Path,
     shared_root: &Path,
 ) -> Result<PathBuf, SharedPathError> {
-    // Canonicalize-free relative-path check: strip the shared_root prefix
-    // from host_path to get the relative component, then rejoin it under
-    // shared_root.  We do NOT call std::fs::canonicalize because (a) the path
-    // may not exist yet (the operator may create the workspace after
-    // provisioning) and (b) the function must be hermetic / pure.
-    match host_path.strip_prefix(shared_root) {
-        Ok(rel) => Ok(shared_root.join(rel)),
-        Err(_) => Err(SharedPathError::OutsideRoot {
-            host_path: host_path.to_path_buf(),
-            shared_root: shared_root.to_path_buf(),
-        }),
-    }
+    // Delegate the containment decision rather than repeating it. The two
+    // functions previously carried separate copies of the same `strip_prefix`
+    // check, and so also carried the same defect; sharing one implementation
+    // is what keeps a fix to one from missing the other.
+    validate_shared_path(host_path, shared_root)?;
+    let rel = host_path
+        .strip_prefix(shared_root)
+        .expect("validate_shared_path accepted the path, so the prefix strips");
+    Ok(shared_root.join(rel))
 }
 
 /// Validate that `host_path` is under `shared_root` without performing the
@@ -156,7 +153,27 @@ pub fn translate_shared_path(
 /// Equivalent to checking whether [`translate_shared_path`] would succeed,
 /// but communicates intent more clearly at call sites that only need the
 /// validation step.
+///
+/// Containment is decided lexically. We do NOT call `std::fs::canonicalize`
+/// because (a) the path may not exist yet — the operator may create the
+/// workspace after provisioning — and (b) the function must be hermetic /
+/// pure. A lexical check is only sound on a path with no `..` component:
+/// `strip_prefix` matches `..` as an ordinary component, so
+/// `<root>/../../var/run` strips cleanly and rejoins to a path that resolves
+/// outside the root once the *VM* resolves it. Hence the component check
+/// below — it is what makes the lexical prefix test mean containment.
 pub fn validate_shared_path(host_path: &Path, shared_root: &Path) -> Result<(), SharedPathError> {
+    if let Some(component) = host_path.components().find_map(|c| match c {
+        std::path::Component::ParentDir => Some(".."),
+        std::path::Component::CurDir => Some("."),
+        _ => None,
+    }) {
+        return Err(SharedPathError::NonCanonicalComponent {
+            host_path: host_path.to_path_buf(),
+            shared_root: shared_root.to_path_buf(),
+            component: component.to_string(),
+        });
+    }
     host_path
         .strip_prefix(shared_root)
         .map(|_| ())
@@ -166,14 +183,22 @@ pub fn validate_shared_path(host_path: &Path, shared_root: &Path) -> Result<(), 
         })
 }
 
-/// Error returned when a `shared:` host path falls outside the configured
-/// `lite_shared_root`.
+/// Error returned when a `shared:` host path is not usable as a lite-backend
+/// mount source — either outside the configured `lite_shared_root`, or
+/// spelled in a way that makes the containment check unsound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedPathError {
     /// The requested host path is not under the shared root.
     OutsideRoot {
         host_path: PathBuf,
         shared_root: PathBuf,
+    },
+    /// The requested host path contains a `..` or `.` component, so a lexical
+    /// containment check cannot decide where it actually points.
+    NonCanonicalComponent {
+        host_path: PathBuf,
+        shared_root: PathBuf,
+        component: String,
     },
 }
 
@@ -186,6 +211,11 @@ impl std::fmt::Display for SharedPathError {
     /// directory is not traversable by it. Callers surface this verbatim (see
     /// the lite `shared:` validation in the daemon's macOS create path) — keep
     /// it self-contained.
+    ///
+    /// The same bar applies to `NonCanonicalComponent`: a refusal that said
+    /// only "invalid path" would be a regression even though it rejects the
+    /// same inputs, because the operator would have no way to tell a typo from
+    /// a rule they had not met.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SharedPathError::OutsideRoot {
@@ -208,6 +238,31 @@ impl std::fmt::Display for SharedPathError {
                  is overridable via SANDBOX_LITE_SHARED_ROOT); or \
                  (d) use the full backend (drop --lite), whose per-session VM mounts the host \
                  directory as your own uid and so accepts any path.",
+                host = host_path.display(),
+                root = shared_root.display()
+            ),
+            SharedPathError::NonCanonicalComponent {
+                host_path,
+                shared_root,
+                component,
+            } => write!(
+                f,
+                "lite shared: path {host} contains a `{component}` component, which this \
+                 backend cannot accept. The shared-root check that guards this mount is \
+                 lexical — it compares path components on the host and never touches the \
+                 filesystem, because the workspace directory is allowed not to exist yet. \
+                 A `..` defeats that check rather than failing it: it compares as an \
+                 ordinary component, so the path passes, and is only resolved later, inside \
+                 the gateway VM, where it can land anywhere in the VM's filesystem rather \
+                 than under the root. Refusing the spelling is therefore the check, not an \
+                 extra restriction on top of it. What works instead: \
+                 (a) pass the already-resolved path — it still does not need to exist, and \
+                 for a directory that does, `cd <dir> && pwd -P` prints it; \
+                 (b) if the resolved path turns out to be outside {root}, stage the content \
+                 under that root and point shared: there (the root itself is overridable \
+                 via SANDBOX_LITE_SHARED_ROOT); or \
+                 (c) use the full backend (drop --lite), whose per-session VM mounts the \
+                 host directory as your own uid.",
                 host = host_path.display(),
                 root = shared_root.display()
             ),
@@ -411,6 +466,7 @@ mod tests {
                 assert_eq!(host_path, host);
                 assert_eq!(shared_root, root);
             }
+            other => panic!("expected OutsideRoot for a canonical path, got: {other:?}"),
         }
         // Error message must be human-readable.
         let msg = err.to_string();
@@ -431,6 +487,91 @@ mod tests {
             result.is_err(),
             "sibling directory with matching prefix must be rejected"
         );
+    }
+
+    /// The shared-root check is lexical, and `strip_prefix` treats `..` as an
+    /// ordinary component: `<root>/../../var/run` strips cleanly against
+    /// `<root>` and rejoins to a path that resolves outside the root. Nothing
+    /// on the host catches it, because the host never resolves it — the
+    /// gateway VM does, at mount time.
+    ///
+    /// `/var/run` is deliberate. A target that merely does not exist would be
+    /// refused later by the bind failing on a missing source, so a test
+    /// written against one would still pass with this rejection removed and
+    /// would be pinning the wrong mechanism. `/var/run` exists inside the VM.
+    #[test]
+    fn validate_shared_path_rejects_parent_dir_escape() {
+        let root = Path::new("/tmp/sandbox-shared");
+        let host = Path::new("/tmp/sandbox-shared/../../var/run");
+
+        // The premise: the lexical prefix test this function is built on does
+        // not, by itself, reject the path. If this ever stops holding, the
+        // assertion below is no longer testing what it claims to.
+        assert!(
+            host.strip_prefix(root).is_ok(),
+            "premise: `..` passes strip_prefix, which is why an explicit \
+             component check is required"
+        );
+
+        let err = validate_shared_path(host, root).expect_err("`..` escape must be rejected");
+        match &err {
+            SharedPathError::NonCanonicalComponent {
+                host_path,
+                shared_root,
+                component,
+            } => {
+                assert_eq!(host_path, host);
+                assert_eq!(shared_root, root);
+                assert_eq!(component, "..");
+            }
+            other => panic!("expected NonCanonicalComponent, got: {other:?}"),
+        }
+    }
+
+    /// `translate_shared_path` had its own copy of the same lexical check and
+    /// therefore its own copy of the same defect. It now delegates; this pins
+    /// that it does, so a future edit cannot reintroduce a second
+    /// implementation that drifts.
+    #[test]
+    fn translate_shared_path_rejects_parent_dir_escape() {
+        let root = Path::new("/tmp/sandbox-shared");
+        let host = Path::new("/tmp/sandbox-shared/../../var/run");
+        let err = translate_shared_path(host, root).expect_err("`..` escape must be rejected");
+        assert!(
+            matches!(err, SharedPathError::NonCanonicalComponent { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    /// A new refusal path must meet the same bar as the one below it: name the
+    /// cause and the alternatives. A bare "invalid path" would reject the same
+    /// inputs and still be a regression, because the operator could not tell a
+    /// typo from a rule they had not met.
+    #[test]
+    fn non_canonical_error_names_cause_and_alternatives() {
+        let err = validate_shared_path(
+            Path::new("/tmp/sandbox-shared/../../var/run"),
+            Path::new("/tmp/sandbox-shared"),
+        )
+        .expect_err("`..` must be rejected");
+        let msg = err.to_string();
+
+        // What was rejected, and against which root.
+        assert!(
+            msg.contains("/tmp/sandbox-shared/../../var/run"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("/tmp/sandbox-shared"), "got: {msg}");
+
+        // Cause: the check is lexical and the resolution happens elsewhere —
+        // not "this character is banned".
+        assert!(msg.contains("lexical"), "got: {msg}");
+        assert!(msg.contains("gateway VM"), "got: {msg}");
+
+        // Alternatives, in the same shape the OutsideRoot refusal uses.
+        assert!(msg.contains("pwd -P"), "got: {msg}");
+        assert!(msg.contains("SANDBOX_LITE_SHARED_ROOT"), "got: {msg}");
+        assert!(msg.contains("full backend"), "got: {msg}");
     }
 
     /// The refusal an operator actually sees must name the real cause — the

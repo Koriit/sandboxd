@@ -4273,19 +4273,22 @@ fn parse_limactl_error(subcommand: &str, stderr: &str) -> SandboxError {
 /// `foo"\nnewkey: injected` could therefore inject arbitrary YAML when
 /// interpolated with `format!("location: \"{path}\"")`.
 ///
-/// This function validates that every character in the path is in a
-/// known-safe set for filesystem paths:
+/// This function validates that every character in the path is in the
+/// known-safe set defined by [`crate::session::is_workspace_path_char`].
+/// The set lives there rather than here because the same operator-supplied
+/// path is also interpolated into the container backend's Docker `--mount`
+/// option list; two copies of the list would be two things to keep in step.
 ///
-///   alphanumeric, `/`, `-`, `_`, `.`, ` `, `+`, `@`, `~`, `:`
-///
-/// If any other character is found the function panics — this is
-/// intentional because an unsafe path reaching template generation is a
-/// programming error (the caller should validate earlier).
+/// If any other character is found the function panics. That is only
+/// defensible because the precondition is enforced upstream rather than
+/// merely assumed: `WorkspaceMode::parse_flag` rejects these characters when
+/// it parses `shared:`/`local:`, and it is the sole route from the wire
+/// format to a `WorkspaceMode` on both the CLI and the daemon. A panic here
+/// therefore means a `SessionConfig` was constructed in-process without going
+/// through the parser, which is a programming error.
 fn sanitize_yaml_path(path: &str) -> &str {
     for (i, ch) in path.char_indices() {
-        if !(ch.is_alphanumeric()
-            || matches!(ch, '/' | '-' | '_' | '.' | ' ' | '+' | '@' | '~' | ':'))
-        {
+        if !crate::session::is_workspace_path_char(ch) {
             panic!(
                 "host_path contains unsafe character {ch:?} at index {i} — \
                  refusing to interpolate into YAML template: {path:?}",

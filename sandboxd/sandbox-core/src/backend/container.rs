@@ -737,6 +737,9 @@ pub(crate) fn effective_container_user(
 /// Pure function — no syscalls, no docker invocation. The runtime
 /// hands off the returned `Vec<String>` to `run_docker`.
 ///
+/// Fallible because the operator-supplied workspace paths are interpolated
+/// into a `--mount` option list; see the workspace-mount block below.
+///
 /// Argument order is part of the contract: the unit tests in
 /// `tests::container_run_argv_contains_guest_bind_mount` pin the
 /// expected `-v` mount string so a regression in the bind-mount
@@ -758,7 +761,7 @@ fn build_create_argv(
     cpus: f64,
     guest_bind_source: &Path,
     skip_guest_bind: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, SandboxError> {
     let container_name = format!("sandbox-{session_id}");
     let home_volume = home_volume_name(session_id);
     let user_arg = format!("{user_uid}:{user_gid}");
@@ -769,20 +772,58 @@ fn build_create_argv(
     let ip_arg = network.container_ip.to_string();
     let session_label_arg = format!("sandbox.session_id={session_id}");
     let home_mount = format!("type=volume,src={home_volume},dst=/home/sandbox");
-    let workspace_mount = network.workspace_bind.as_ref().map(|bind| {
-        // The bind target is the operator-resolved `guest_path`,
-        // unified with Lima's workspace mount. The home volume
-        // mounts at `/home/sandbox`; a bind whose `guest_path`
-        // lands anywhere under `/home/sandbox` shadows the volume's
-        // content at that subpath, which is the intended semantics
-        // (operator-supplied workspace files take precedence over
-        // the volume's empty contents).
-        format!(
-            "type=bind,src={},dst={}",
-            bind.host_path.to_string_lossy(),
-            bind.guest_path.to_string_lossy(),
-        )
-    });
+    let workspace_mount = network
+        .workspace_bind
+        .as_ref()
+        .map(|bind| {
+            // The bind target is the operator-resolved `guest_path`,
+            // unified with Lima's workspace mount. The home volume
+            // mounts at `/home/sandbox`; a bind whose `guest_path`
+            // lands anywhere under `/home/sandbox` shadows the volume's
+            // content at that subpath, which is the intended semantics
+            // (operator-supplied workspace files take precedence over
+            // the volume's empty contents).
+            //
+            // Both paths are operator-supplied and both are interpolated
+            // into a `--mount` value, which docker parses as a
+            // comma-separated list of `key=value` options. A `,` or `=`
+            // inside either path is therefore not data: it ends the option
+            // and starts another one that the daemon never wrote (for
+            // example a trailing `,bind-propagation=rshared`). Reject
+            // rather than escape — docker's option-list parser is the only
+            // authority on what an escape would mean, and this builder is a
+            // pure function with no way to consult it.
+            //
+            // `WorkspaceMode::parse_flag` already rejects these characters
+            // for every path that arrives over the wire, so this is the
+            // second of two independent checks rather than the only one.
+            // It is kept because the check that is co-located with the
+            // interpolation is the one that cannot be bypassed by a future
+            // caller that builds a `WorkspaceBind` directly.
+            for (label, path) in [
+                ("host_path", &bind.host_path),
+                ("guest_path", &bind.guest_path),
+            ] {
+                let rendered = path.to_string_lossy();
+                if let Some(ch) = rendered.chars().find(|c| matches!(c, ',' | '=')) {
+                    return Err(SandboxError::InvalidArgument(format!(
+                        "workspace {label} {rendered:?} contains {ch:?}, which docker reads \
+                         as option-list syntax in a `--mount` value rather than as part of \
+                         the path — a path containing it would silently add mount options \
+                         the daemon never wrote. What works instead: rename the directory \
+                         to a name without `,` or `=`, stage a copy at such a path and \
+                         point the workspace there, or for a git-backed project use \
+                         clone:<repo-url> / --repo, which never names a host path."
+                    )));
+                }
+            }
+            Ok(format!(
+                "type=bind,src={},dst={}",
+                bind.host_path.to_string_lossy(),
+                bind.guest_path.to_string_lossy(),
+            ))
+        })
+        .transpose()?;
     let ca_args = build_ca_mount_args(network);
     let ssh_args = build_ssh_mount_args(network);
     // per-caller isolation — the installed
@@ -889,7 +930,7 @@ fn build_create_argv(
     // Trailing positional: image tag — must come last so subsequent
     // entrypoint args (none here) line up with the docker CLI grammar.
     args.push(image_tag.to_string());
-    args
+    Ok(args)
 }
 
 /// Compose the `docker restart` argv for the container backend's
@@ -994,7 +1035,7 @@ impl SessionRuntime for ContainerRuntime {
             // socket; the host-side guest binary path is absent in the VM,
             // so skip the overlay and use the image-baked guest.
             self.docker_socket.is_some(),
-        );
+        )?;
 
         // Explicitly pre-create the home volume with ownership labels so the
         // orphan reaper can attribute it to this daemon even after the session
@@ -2689,7 +2730,8 @@ mod tests {
             1.0,
             &guest_bind_source,
             false,
-        );
+        )
+        .expect("fixture paths carry no `,` or `=`, so the argv builds");
 
         // Locate the `-v` flag — there is exactly one in the canonical
         // argv (workspace bind-mounts use `--mount`, the CA bind-mount
@@ -2770,7 +2812,8 @@ mod tests {
             1.0,
             &guest_bind_source,
             false,
-        );
+        )
+        .expect("fixture paths carry no `,` or `=`, so the argv builds");
 
         // The workspace bind appears as an adjacent `--mount` / spec
         // pair. Find every `--mount` flag, look for the one whose value
@@ -2809,6 +2852,84 @@ mod tests {
             mount_idx < image_idx,
             "workspace `--mount` (at index {mount_idx}) must precede image tag \
              (at index {image_idx})",
+        );
+    }
+
+    /// Build the argv with a single workspace bind, returning the builder's
+    /// result so a test can assert on either outcome.
+    fn argv_with_workspace_bind(host: &str, guest: &str) -> Result<Vec<String>, SandboxError> {
+        let sid = SessionId::parse("0123456789ab").unwrap();
+        let network = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: Some(WorkspaceBind {
+                host_path: std::path::PathBuf::from(host),
+                guest_path: std::path::PathBuf::from(guest),
+            }),
+            route_helper_path: None,
+            ca_host_path: None,
+            ssh_host_dir: None,
+            operator_identity: None,
+            owner_pool: None,
+        };
+        build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            1000,
+            1000,
+            512,
+            1.0,
+            std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-guest"),
+            false,
+        )
+    }
+
+    /// The `--mount` value is a comma-separated list of `key=value` options,
+    /// so a `,` or `=` inside an interpolated path is syntax, not data. Both
+    /// operand paths are operator-supplied, so both are checked.
+    ///
+    /// This is the second of two independent checks — `parse_flag` rejects the
+    /// same characters for anything arriving over the wire. It is kept here
+    /// because a check co-located with the interpolation cannot be bypassed by
+    /// a future caller that builds a `WorkspaceBind` directly, which is what
+    /// this test exercises.
+    #[test]
+    fn workspace_mount_rejects_option_list_separators() {
+        for (host, guest, side) in [
+            (
+                "/tmp/w,bind-propagation=rshared",
+                "/srv/g",
+                "workspace host_path",
+            ),
+            (
+                "/tmp/w",
+                "/srv/g,bind-propagation=rshared",
+                "workspace guest_path",
+            ),
+            ("/tmp/w=x", "/srv/g", "workspace host_path"),
+        ] {
+            let err = argv_with_workspace_bind(host, guest)
+                .expect_err(&format!("{host} -> {guest} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains(side), "for {host} -> {guest}, got: {msg}");
+            // The refusal explains why the character is a problem and what to
+            // do instead, rather than only restating the rule.
+            assert!(msg.contains("option-list syntax"), "got: {msg}");
+            assert!(msg.contains("rename the directory"), "got: {msg}");
+        }
+    }
+
+    /// Without this, the rejection above could be satisfied by a builder that
+    /// refuses every workspace bind.
+    #[test]
+    fn workspace_mount_accepts_ordinary_paths() {
+        let args = argv_with_workspace_bind("/tmp/h", "/srv/g")
+            .expect("an ordinary bind must still build");
+        assert!(
+            args.iter().any(|a| a == "type=bind,src=/tmp/h,dst=/srv/g"),
+            "argv {args:?}"
         );
     }
 
@@ -3469,7 +3590,8 @@ mod tests {
             1.0,
             &guest_bind_source,
             false,
-        );
+        )
+        .expect("fixture paths carry no `,` or `=`, so the argv builds");
 
         // The `--user` flag must be present with the operator's pair —
         // a regression that silently propagated the daemon defaults
@@ -3514,7 +3636,8 @@ mod tests {
             1.0,
             &guest_bind_source,
             false,
-        );
+        )
+        .expect("fixture paths carry no `,` or `=`, so the argv builds");
 
         let user_idx = args
             .iter()
@@ -3561,7 +3684,8 @@ mod tests {
             1.0,
             &guest_bind_source,
             false,
-        );
+        )
+        .expect("fixture paths carry no `,` or `=`, so the argv builds");
 
         // The three SSH mounts appear as adjacent `--mount` / spec
         // pairs (docker's CLI grammar requires each `--mount` to be
@@ -3648,7 +3772,8 @@ mod tests {
             1.0,
             &guest_bind_source,
             true,
-        );
+        )
+        .expect("fixture paths carry no `,` or `=`, so the argv builds");
 
         // Guest `-v` overlay must be absent — the image-baked guest is used.
         assert!(
@@ -3702,7 +3827,8 @@ mod tests {
             1.0,
             &guest_bind_source,
             false,
-        );
+        )
+        .expect("fixture paths carry no `,` or `=`, so the argv builds");
         assert_eq!(
             linux_args.iter().filter(|a| a.as_str() == "-v").count(),
             1,
