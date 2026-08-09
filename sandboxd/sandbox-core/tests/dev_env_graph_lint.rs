@@ -244,9 +244,28 @@ fn no_setup_step_warns_and_then_reports_success() {
         lines.len()
     );
 
-    let offenders: Vec<String> = lines
+    let total = lines.len();
+    let recipe_lines: Vec<(usize, String)> = lines
         .into_iter()
         .filter(|(_, line)| line.starts_with('\t'))
+        .collect();
+
+    // Second floor, on the filtered set — the stage the first floor cannot see.
+    // A fold that kept every line but stopped preserving the leading tab reports
+    // the same plausible total and hands this lint an empty set, so the
+    // assertion below would pass by observing nothing. Flooring one stage of a
+    // two-stage extractor leaves the guard resting on an invariant nothing
+    // checks.
+    assert!(
+        recipe_lines.len() > 75,
+        "only {} of {total} folded lines start with a tab — the fold has stopped \
+         preserving recipe lines, so this lint has nothing left to check and \
+         would report success by finding nothing",
+        recipe_lines.len()
+    );
+
+    let offenders: Vec<String> = recipe_lines
+        .iter()
         .filter(|(_, line)| line.contains("WARNING") && line.contains("exit 0"))
         .map(|(lineno, line)| {
             let excerpt: String = line.trim().chars().take(120).collect();
