@@ -1,7 +1,7 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-e2e-linux test-e2e-macos test-linux test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image gateway-image-multiarch lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod install-agent-test setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
-	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership \
+	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-sandboxd-user setup-darwin-operator-group-membership \
 	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
 	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image \
 	stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test \
@@ -505,6 +505,23 @@ TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
 #   make setup-dev-env DARWIN_VMNET_SLOTS=4
 DARWIN_VMNET_SLOTS          ?= 8
 
+# DARWIN_SANDBOXD_ACCOUNT — the macOS daemon account and group named by every
+# vmnet launchd plist. macOS reserves `_sandbox` (uid/gid 60) for its Seatbelt
+# subsystem, so sandboxd uses a dedicated account of its own.
+#
+# This is the Makefile *declaration* of that identity, and the only place the
+# name is written here. Two other emitters declare it independently —
+# `SANDBOXD_ACCOUNT` in `sandbox-core/src/network.rs` and `_sandboxd_acct` in
+# `scripts/install.sh` — because a `curl | sh` installer cannot read a file from
+# the repo and `make` cannot read a Rust constant.
+# `scripts/check-vmnet-uuid-equivalence.py` extracts all three, plus the account
+# the installer actually *creates*, and fails when they disagree; that
+# comparison, rather than a shared literal, is what keeps them from drifting.
+#
+# Deliberately `:=`, not `?=`: the plists, the account-creation target, and the
+# installer must all name the same identity, so this is not a knob.
+DARWIN_SANDBOXD_ACCOUNT     := _sandboxd
+
 # SANDBOX_DAEMON_USER / SANDBOX_DAEMON_UID — identity the daemon runs as,
 # used by the Darwin staging targets to derive the daemon's per-uid
 # LIMA_HOME (`/var/lib/sandboxd/<uid>/<uid>/lima`, matching
@@ -518,7 +535,7 @@ DARWIN_VMNET_SLOTS          ?= 8
 #   make stage-route-helper-linux-aarch64 SANDBOX_DAEMON_USER=youruser
 # SANDBOX_DAEMON_UID may also be set directly; it defaults to the uid of
 # SANDBOX_DAEMON_USER.
-SANDBOX_DAEMON_USER         ?= _sandboxd
+SANDBOX_DAEMON_USER         ?= $(DARWIN_SANDBOXD_ACCOUNT)
 SANDBOX_DAEMON_UID          ?= $(shell id -u $(SANDBOX_DAEMON_USER) 2>/dev/null)
 
 # Staged root-exec'd socket_vmnet binary (root:wheel 0755). install.sh
@@ -542,14 +559,21 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 #
 # Linux: the existing setcap-helper, bridge-conf, users-conf, qemu-bridge-helper,
 #        sandbox user/group, and state-dir steps.
-# Darwin: socket_vmnet staging, plist generation + bootstrap, state dirs,
-#         _sandboxd group, and operator group membership. The Linux-only steps
-#         (setcap helpers, bridge.conf, users.conf, qemu-bridge-helper, kvm group)
-#         are skipped on Darwin — macOS has none of these mechanisms.
+# Darwin: the daemon account, socket_vmnet staging, plist generation +
+#         bootstrap, state dirs, and operator group membership. The Linux-only
+#         steps (setcap helpers, bridge.conf, users.conf, qemu-bridge-helper,
+#         kvm group) are skipped on Darwin — macOS has none of these mechanisms.
+#
+# Ordering on Darwin: the account comes first. Everything downstream names it —
+# the plists' boot-time `install -d -o <account>`, /var/log/sandbox's owner, the
+# operator's group membership — and each of those is either a hard failure or a
+# deferred one if the account is absent. The list below is ordered accordingly,
+# but ordering a prerequisite list is only advisory under `-j`, so the targets
+# that need the account also declare it as a real prerequisite.
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod install-agent-test setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
+setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1231,8 +1255,8 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
 	if [ -z "$$_daemon_uid" ]; then \
 	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping route-helper staging."; \
-	  echo "  For a production install, run 'make setup-dev-env' to create the _sandboxd user,"; \
-	  echo "  then re-run 'make stage-route-helper-linux-aarch64'."; \
+	  echo "  For a production install, run 'make setup-darwin-sandboxd-user' to create the"; \
+	  echo "  '$(DARWIN_SANDBOXD_ACCOUNT)' account, then re-run 'make stage-route-helper-linux-aarch64'."; \
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 0; \
 	fi; \
@@ -1279,8 +1303,8 @@ stage-lite-image: lite-image
 	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
 	if [ -z "$$_daemon_uid" ]; then \
 	  echo "WARNING: daemon user '$$_daemon_user' not found (no uid); skipping lite-image staging."; \
-	  echo "  For a production install, run 'make setup-dev-env' to create the _sandboxd user,"; \
-	  echo "  then re-run 'make stage-lite-image'."; \
+	  echo "  For a production install, run 'make setup-darwin-sandboxd-user' to create the"; \
+	  echo "  '$(DARWIN_SANDBOXD_ACCOUNT)' account, then re-run 'make stage-lite-image'."; \
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 0; \
 	fi; \
@@ -1541,11 +1565,36 @@ setup-darwin-socket-vmnet-staging:
 # The DARWIN_VMNET_SLOTS variable controls how many plists to generate (default 8,
 # matches max_macos_sessions default). Override with DARWIN_VMNET_SLOTS=4 etc.
 #
-# Depends on: setup-darwin-socket-vmnet-staging (binary must be staged first).
-setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging
+# Refuses to emit a plist naming an account that does not resolve. The preamble
+# runs `install -d -o <account> …` as root at every boot (/var/run is cleared
+# each time); with the account absent that fails, the `&&`-chain short-circuits,
+# and socket_vmnet is never exec'd — every slot in the pool dies. Because the
+# plist is only *read* at boot, writing one would succeed here and fail hours or
+# days later, detached from the run that caused it. So this step hard-fails
+# instead, even though setup-darwin-sandboxd-user is a prerequisite: the guard
+# also covers `make setup-darwin-vmnet-plists` run on its own and any future
+# caller that skips the account step.
+#
+# Depends on: setup-darwin-sandboxd-user (account must exist first),
+#             setup-darwin-socket-vmnet-staging (binary must be staged first).
+setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging setup-darwin-sandboxd-user
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-vmnet-plists skipped (not macOS)$(RESET)"; \
 	  exit 0; \
+	fi
+	@_acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
+	_missing=""; \
+	id -u "$$_acct" >/dev/null 2>&1 || _missing="user"; \
+	dscl . -read "/Groups/$$_acct" >/dev/null 2>&1 || _missing="$${_missing:+$$_missing and }group"; \
+	if [ -n "$$_missing" ]; then \
+	  echo "ERROR: refusing to generate vmnet plists naming '$$_acct': no such $$_missing on this host."; \
+	  echo "  The plists' root pre-exec preamble runs"; \
+	  echo "    install -d -o $$_acct -g $$_acct -m 0750 /var/run/sandbox"; \
+	  echo "  at every boot. With the account absent that fails, the &&-chain short-circuits,"; \
+	  echo "  and no socket_vmnet slot starts — a failure that would not surface until the"; \
+	  echo "  next reboot."; \
+	  echo "  Create the account first:  make setup-darwin-sandboxd-user"; \
+	  exit 1; \
 	fi
 	@mkdir -p "$(DARWIN_STAMPS_DIR)"
 	@for slot in $$(seq 0 $$(($(DARWIN_VMNET_SLOTS) - 1))); do \
@@ -1553,11 +1602,12 @@ setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging
 	  plist_path="$(DARWIN_LAUNCH_DAEMONS_DIR)/$$label.plist"; \
 	  socket_path="/var/run/sandbox/vmnet/slot-$$slot.sock"; \
 	  staged_binary="$(DARWIN_SOCKET_VMNET_STAGED)"; \
+	  acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
 	  \
 	  network_id=$$(python3 -c "import sys,hashlib,struct; ns=bytes([0x6d,0x4f,0x6e,0x2b,0x95,0x8a,0x4f,0x1a,0xa2,0x31,0x7e,0x8c,0xd0,0x12,0x3e,0x5b]); h=hashlib.sha1(ns+struct.pack('>H',int(sys.argv[1]))).digest(); b=bytearray(h[:16]); b[6]=(b[6]&0x0f)|0x50; b[8]=(b[8]&0x3f)|0x80; print('%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x'%tuple(b))" $$slot); \
 	  \
 	  tmp=$$(mktemp -t io.sandboxd.vmnet); \
-	  exec_cmd="install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict $$staged_binary || { echo 'sandboxd: codesign verify failed for $$staged_binary -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=_sandboxd $$socket_path"; \
+	  exec_cmd="install -d -o $$acct -g $$acct -m 0750 /var/run/sandbox &amp;&amp; install -d -o $$acct -g $$acct -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict $$staged_binary || { echo 'sandboxd: codesign verify failed for $$staged_binary -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=$$acct $$socket_path"; \
 	  python3 -c "import sys; label,exec_cmd,slot,uuid=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]; print('<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>'+label+'</string>\n\n    <key>ProgramArguments</key>\n    <array>\n        <string>/bin/sh</string>\n        <string>-c</string>\n        <string>'+exec_cmd+'</string>\n    </array>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n        <key>Crashed</key>\n        <true/>\n    </dict>\n\n    <key>ThrottleInterval</key>\n    <integer>5</integer>\n\n    <key>StandardOutPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stdout.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stderr.log</string>\n</dict>\n</plist>')" "$$label" "$$exec_cmd" "$$slot" "$$network_id" > "$$tmp"; \
 	  \
 	  if [ -f "$$plist_path" ] && cmp -s "$$tmp" "$$plist_path" 2>/dev/null; then \
@@ -1570,13 +1620,24 @@ setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging
 	  fi; \
 	done
 
-# setup-darwin-vmnet-daemons — bootstrap (load) and enable the N
-# io.sandboxd.vmnet.<n> launchd daemons, then wait for their slot sockets to
-# appear under /var/run/sandbox/vmnet/.
+# setup-darwin-vmnet-daemons — load the N io.sandboxd.vmnet.<n> launchd daemons
+# from their current plists, then wait for their slot sockets to appear under
+# /var/run/sandbox/vmnet/.
+#
+# "Loaded" is not "up to date". launchd caches a job's definition in memory at
+# bootstrap time; rewriting the plist afterwards changes nothing until the job is
+# booted out and bootstrapped again (`kickstart -k` restarts the cached job — it
+# does not re-read the plist). Treating "the job is loaded" as "nothing to do"
+# therefore lets setup-darwin-vmnet-plists install a corrected plist, this step
+# report success, and the old definition keep serving until the next reboot
+# silently swaps it in. scripts/darwin-vmnet-drift.sh compares the loaded argv
+# against the plist on disk so that gap is detected instead of inherited.
 #
 # Idempotence:
-#   - Daemon already loaded and socket present → ✓ already running.
-#   - Daemon not loaded → bootstrap + enable.
+#   - Loaded, in sync with the plist, socket present → ✓ already running.
+#   - Loaded but the argv diverges from the plist  → bootout + bootstrap.
+#   - Loaded and in sync but the socket is missing → bootout + bootstrap.
+#   - Not loaded                                   → bootstrap + enable.
 #
 # Depends on: setup-darwin-vmnet-plists (plists must be installed first).
 #
@@ -1595,31 +1656,71 @@ setup-darwin-vmnet-daemons: setup-darwin-vmnet-plists
 	  plist_path="$(DARWIN_LAUNCH_DAEMONS_DIR)/$$label.plist"; \
 	  socket_path="/var/run/sandbox/vmnet/slot-$$slot.sock"; \
 	  \
-	  if [ -f "$$plist_path" ] && launchctl print "system/$$label" >/dev/null 2>&1; then \
-	    echo "$(GREEN)✓ already configured: $$label running, socket $$socket_path present$(RESET)"; \
-	  else \
-	    if ! launchctl print "system/$$label" >/dev/null 2>&1; then \
-	      echo "[sudo] launchctl bootstrap system $$plist_path"; \
-	      sudo -k launchctl bootstrap system "$$plist_path" 2>/dev/null || true; \
-	      echo "[sudo] launchctl enable system/$$label"; \
-	      sudo launchctl enable "system/$$label" 2>/dev/null || true; \
-	    fi; \
-	    echo "  waiting for socket $$socket_path (up to 60 s)..."; \
-	    i=0; \
-	    while [ $$i -lt 60 ]; do \
-	      sudo test -S "$$socket_path" 2>/dev/null && break; \
-	      sleep 2; \
-	      i=$$((i + 2)); \
-	    done; \
-	    if sudo test -S "$$socket_path" 2>/dev/null; then \
-	      echo "$(GREEN)✓ $$label started, socket $$socket_path present$(RESET)"; \
-	    else \
-	      echo "ERROR: socket $$socket_path did not appear after 60 s."; \
-	      echo "  Check: sudo launchctl print system/$$label"; \
-	      echo "  Check: sudo launchctl list | grep vmnet"; \
-	      exit 1; \
-	    fi; \
+	  if [ ! -f "$$plist_path" ]; then \
+	    echo "ERROR: $$plist_path is missing — run 'make setup-darwin-vmnet-plists' first."; \
+	    exit 1; \
 	  fi; \
+	  \
+	  scripts/darwin-vmnet-drift.sh "$$label" "$$plist_path"; \
+	  drift=$$?; \
+	  case $$drift in \
+	    0) \
+	      if sudo test -S "$$socket_path" 2>/dev/null; then \
+	        echo "$(GREEN)✓ already configured: $$label running from the current plist, socket $$socket_path present$(RESET)"; \
+	        continue; \
+	      fi; \
+	      echo "  $$label is loaded and in sync but socket $$socket_path is missing — reloading"; \
+	      reload=1 ;; \
+	    3) \
+	      echo "  $$label is running a stale definition (see the diff above) — reloading from $$plist_path"; \
+	      reload=1 ;; \
+	    4) \
+	      reload=0 ;; \
+	    *) \
+	      echo "ERROR: could not compare $$label against $$plist_path."; \
+	      exit 1 ;; \
+	  esac; \
+	  \
+	  if [ "$$reload" = "1" ]; then \
+	    echo "[sudo] launchctl bootout system/$$label"; \
+	    sudo -k launchctl bootout "system/$$label" 2>/dev/null || true; \
+	  fi; \
+	  echo "[sudo] launchctl bootstrap system $$plist_path"; \
+	  sudo -k launchctl bootstrap system "$$plist_path" || { \
+	    echo "ERROR: launchctl bootstrap system $$plist_path failed."; \
+	    echo "  Check: sudo launchctl print system/$$label"; \
+	    exit 1; \
+	  }; \
+	  echo "[sudo] launchctl enable system/$$label"; \
+	  sudo -k launchctl enable "system/$$label" 2>/dev/null || true; \
+	  \
+	  echo "  waiting for socket $$socket_path (up to 60 s)..."; \
+	  i=0; \
+	  while [ $$i -lt 60 ]; do \
+	    sudo test -S "$$socket_path" 2>/dev/null && break; \
+	    sleep 2; \
+	    i=$$((i + 2)); \
+	  done; \
+	  if ! sudo test -S "$$socket_path" 2>/dev/null; then \
+	    echo "ERROR: socket $$socket_path did not appear after 60 s."; \
+	    echo "  Check: sudo launchctl print system/$$label"; \
+	    echo "  Check: sudo launchctl list | grep vmnet"; \
+	    echo "  Check: tail /var/log/sandbox/vmnet-$$slot.stderr.log"; \
+	    exit 1; \
+	  fi; \
+	  \
+	  if ! scripts/darwin-vmnet-drift.sh "$$label" "$$plist_path"; then \
+	    echo "ERROR: $$label still does not match $$plist_path after a bootout/bootstrap cycle."; \
+	    exit 1; \
+	  fi; \
+	  _sock_group=$$(sudo stat -f '%Sg' "$$socket_path" 2>/dev/null); \
+	  if [ "$$_sock_group" != "$(DARWIN_SANDBOXD_ACCOUNT)" ]; then \
+	    echo "ERROR: $$socket_path is group '$$_sock_group', expected '$(DARWIN_SANDBOXD_ACCOUNT)'."; \
+	    echo "  The running socket_vmnet was started with a different --socket-group;"; \
+	    echo "  enrolled operators will not be able to connect to this slot."; \
+	    exit 1; \
+	  fi; \
+	  echo "$(GREEN)✓ $$label started from $$plist_path, socket $$socket_path (group $$_sock_group) present$(RESET)"; \
 	done
 
 # setup-darwin-state-dirs — create the daemon state and runtime directories.
@@ -1634,12 +1735,19 @@ setup-darwin-vmnet-daemons: setup-darwin-vmnet-plists
 # would not survive a reboot. The daemon and vmnet daemons handle /var/run
 # creation at each boot.
 #
-# The per-uid daemon state dir (/var/lib/sandboxd/<_sandboxd-uid>/) is created
+# The per-uid daemon state dir (/var/lib/sandboxd/<daemon-uid>/) is created
 # lazily by the daemon itself at startup (daemon knows its own uid). This target
 # creates only the root dir (common to all daemon uid subtrees).
 #
 # Idempotence: stat-based checks; sudo only when dir is absent or has wrong mode.
-setup-darwin-state-dirs:
+#
+# Depends on: setup-darwin-sandboxd-user — /var/log/sandbox is owned by that
+# account, and this step hard-fails if it cannot be created. It used to
+# downgrade that failure to a note on the theory that the daemon would create
+# the directory on first start; but the vmnet daemons write their stdout/stderr
+# logs there from boot, long before any daemon start, so a missing
+# /var/log/sandbox loses exactly the output you need to debug a dead pool.
+setup-darwin-state-dirs: setup-darwin-sandboxd-user
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-state-dirs skipped (not macOS)$(RESET)"; \
 	  exit 0; \
@@ -1659,56 +1767,142 @@ setup-darwin-state-dirs:
 	    sudo -k chmod 0755 /var/lib/sandboxd; \
 	  fi; \
 	fi
-	@if [ ! -d /var/log/sandbox ]; then \
-	  echo "[sudo] install -d -o _sandboxd -g _sandboxd -m 0750 /var/log/sandbox"; \
-	  sudo -k install -d -o _sandboxd -g _sandboxd -m 0750 /var/log/sandbox 2>/dev/null || \
-	    { echo "  (note: _sandboxd user may not exist yet; /var/log/sandbox will be created on first daemon start)"; }; \
+	@_acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
+	if [ ! -d /var/log/sandbox ]; then \
+	  echo "[sudo] install -d -o $$_acct -g $$_acct -m 0750 /var/log/sandbox"; \
+	  sudo -k install -d -o "$$_acct" -g "$$_acct" -m 0750 /var/log/sandbox || { \
+	    echo "ERROR: could not create /var/log/sandbox owned by $$_acct:$$_acct."; \
+	    echo "  The vmnet LaunchDaemons write their stdout/stderr there from boot;"; \
+	    echo "  without it a failing slot leaves no diagnosable trace."; \
+	    echo "  If the account is missing, run: make setup-darwin-sandboxd-user"; \
+	    exit 1; \
+	  }; \
 	else \
 	  echo "$(GREEN)✓ already configured: /var/log/sandbox present$(RESET)"; \
 	fi
 
-# setup-darwin-sandboxd-group — ensure the sandboxd `_sandboxd` system group exists.
+# setup-darwin-sandboxd-group — create the sandboxd daemon system group.
 #
 # macOS reserves `_sandbox` (GID 60) for its Seatbelt subsystem, so sandboxd uses
-# a dedicated `_sandboxd` group (next free GID below 500). This target verifies the
-# group exists — it does NOT create it (creation is install.sh's job).
+# a dedicated group (next free GID ≥ 300). The GID selection and the dscl
+# attribute set match the sandbox-user step in scripts/install.sh, so a dev host
+# provisioned by make and a production host provisioned by the installer end up
+# with the same identity.
+#
+# This target creates the group. It used to only *verify*, on the theory that
+# creation was install.sh's job — but every Darwin dev-env step downstream names
+# the account, so a verify-only step just moved the failure somewhere less
+# legible (or, for the vmnet plists, to the next reboot).
 #
 # Idempotence:
 #   - Group exists → ✓ already configured (no sudo).
-#   - Group missing → informational note; run install.sh to create it.
+#   - Group missing → emit [sudo] announce lines, then create via dscl.
 setup-darwin-sandboxd-group:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-group skipped (not macOS)$(RESET)"; \
 	  exit 0; \
 	fi
-	@if dscl . -read /Groups/_sandboxd >/dev/null 2>&1; then \
-	  echo "$(GREEN)✓ already configured: system group '_sandboxd' exists$(RESET)"; \
+	@_acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
+	if dscl . -read "/Groups/$$_acct" >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: system group '$$_acct' exists$(RESET)"; \
 	else \
-	  echo "INFO: system group '_sandboxd' does not exist on this macOS host."; \
-	  echo "  Run 'scripts/install.sh' to create it via sysadminctl/dscl."; \
+	  _gid=$$(dscl . -list /Groups PrimaryGroupID | awk '{print $$2}' | sort -n | awk 'BEGIN{gid=300} {if ($$1==gid){gid++}} END{print gid}'); \
+	  echo "[sudo] dscl . -create /Groups/$$_acct  (GID $$_gid)"; \
+	  sudo -k dscl . -create "/Groups/$$_acct" || { echo "ERROR: failed to create group '$$_acct'"; exit 1; }; \
+	  sudo -k dscl . -create "/Groups/$$_acct" PrimaryGroupID "$$_gid" || { echo "ERROR: failed to set PrimaryGroupID on group '$$_acct'"; exit 1; }; \
+	  sudo -k dscl . -create "/Groups/$$_acct" RealName "sandboxd daemon" || true; \
+	  echo "$(GREEN)✓ created system group '$$_acct' (GID $$_gid)$(RESET)"; \
 	fi
 
+# setup-darwin-sandboxd-user — create the sandboxd daemon system user.
+#
+# The account the daemon runs as, and the owner named by every vmnet launchd
+# plist's boot-time `install -d -o <account> …` preamble. Mirrors the sandbox-user
+# step in scripts/install.sh: next free UID ≥ 300, per-attribute dscl, home at
+# /var/lib/sandboxd/<uid>, no shell, no password.
+#
+# Created via per-attribute dscl rather than `sysadminctl -roleAccount`, which
+# silently exits 0 without creating a record when the UID falls outside the
+# 450-499 range it reserves — and next-free-at-300 lands below that on a typical
+# host.
+#
+# Idempotence:
+#   - User exists → ✓ already configured (no sudo).
+#   - User missing → emit [sudo] announce lines, then create.
+#
+# Ordering: must run after setup-darwin-sandboxd-group (needs its GID).
+setup-darwin-sandboxd-user: setup-darwin-sandboxd-group
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-user skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
+	if dscl . -read "/Users/$$_acct" >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: system user '$$_acct' exists$(RESET)"; \
+	else \
+	  _uid=$$(dscl . -list /Users UniqueID | awk '{print $$2}' | sort -n | awk 'BEGIN{uid=300} {if ($$1==uid){uid++}} END{print uid}'); \
+	  _gid=$$(dscl . -read "/Groups/$$_acct" PrimaryGroupID 2>/dev/null | awk '{print $$2}'); \
+	  if [ -z "$$_gid" ]; then \
+	    echo "ERROR: group '$$_acct' has no PrimaryGroupID — run 'make setup-darwin-sandboxd-group' first."; \
+	    exit 1; \
+	  fi; \
+	  _home="/var/lib/sandboxd/$$_uid"; \
+	  echo "[sudo] dscl . -create /Users/$$_acct  (UID $$_uid GID $$_gid home $$_home)"; \
+	  sudo -k dscl . -create "/Users/$$_acct" || { echo "ERROR: failed to create user '$$_acct'"; exit 1; }; \
+	  sudo -k dscl . -create "/Users/$$_acct" UniqueID "$$_uid" || { echo "ERROR: failed to set UniqueID on user '$$_acct'"; exit 1; }; \
+	  sudo -k dscl . -create "/Users/$$_acct" PrimaryGroupID "$$_gid" || { echo "ERROR: failed to set PrimaryGroupID on user '$$_acct'"; exit 1; }; \
+	  sudo -k dscl . -create "/Users/$$_acct" NFSHomeDirectory "$$_home" || true; \
+	  sudo -k dscl . -create "/Users/$$_acct" UserShell /usr/bin/false || true; \
+	  sudo -k dscl . -create "/Users/$$_acct" RealName "sandboxd daemon" || true; \
+	  sudo -k dscl . -create "/Users/$$_acct" Password '*' || true; \
+	  echo "$(GREEN)✓ created system user '$$_acct' (UID $$_uid GID $$_gid)$(RESET)"; \
+	fi
+	@_acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
+	if ! id -u "$$_acct" >/dev/null 2>&1 || ! dscl . -read "/Groups/$$_acct" >/dev/null 2>&1; then \
+	  echo "ERROR: '$$_acct' still does not resolve as both a user and a group after creation."; \
+	  echo "  Directory Services may not have picked up the new records."; \
+	  echo "  Check: dscl . -read /Users/$$_acct  and  dscl . -read /Groups/$$_acct"; \
+	  exit 1; \
+	fi; \
+	echo "$(GREEN)✓ '$$_acct' resolves as both user and group$(RESET)"
+
 # setup-darwin-operator-group-membership — add the invoking developer ($USER)
-# to the `_sandboxd` group so the operator's CLI can connect to the daemon socket
-# (mode 0660, group=_sandboxd) and the per-operator agent can check in.
+# to the sandboxd group so the operator's CLI can connect to the daemon socket
+# (mode 0660, group=the daemon account) and the per-operator agent can check in.
 #
 # Idempotence: dseditgroup membership check; sudo only when not yet a member.
 #
+# The add is verified with a second checkmember rather than assumed: dseditgroup
+# can report success on a partially-applied edit, and `✓ added` printed over a
+# membership that was never granted turns a socket-permission failure into a
+# mystery.
+#
 # Note: the new group membership takes effect for NEW processes only (a re-login
 # in the current shell). The step prints a reminder when the membership is newly added.
-setup-darwin-operator-group-membership:
+#
+# Depends on: setup-darwin-sandboxd-group (the group must exist to join).
+setup-darwin-operator-group-membership: setup-darwin-sandboxd-group
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-operator-group-membership skipped (not macOS)$(RESET)"; \
 	  exit 0; \
 	fi
-	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	@_acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
+	if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
 	  echo "$(GREEN)✓ already configured: operator-group-add skipped (no non-root $$USER set)$(RESET)"; \
-	elif dseditgroup -o checkmember -m "$$USER" _sandboxd >/dev/null 2>&1; then \
-	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '_sandboxd'$(RESET)"; \
+	elif dseditgroup -o checkmember -m "$$USER" "$$_acct" >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '$$_acct'$(RESET)"; \
 	else \
-	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandboxd  (operator-group membership; takes effect at next login)"; \
-	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandboxd; \
-	  echo "$(GREEN)✓ added '$$USER' to group '_sandboxd' — re-login required for the change to take effect in the current shell$(RESET)"; \
+	  echo "[sudo] dseditgroup -o edit -a $$USER -t user $$_acct  (operator-group membership; takes effect at next login)"; \
+	  sudo -k dseditgroup -o edit -a "$$USER" -t user "$$_acct" || { \
+	    echo "ERROR: dseditgroup failed to add '$$USER' to group '$$_acct'."; \
+	    exit 1; \
+	  }; \
+	  dseditgroup -o checkmember -m "$$USER" "$$_acct" >/dev/null 2>&1 || { \
+	    echo "ERROR: '$$USER' is still not a member of group '$$_acct' after the add."; \
+	    echo "  Check: dseditgroup -o read $$_acct"; \
+	    exit 1; \
+	  }; \
+	  echo "$(GREEN)✓ added '$$USER' to group '$$_acct' — re-login required for the change to take effect in the current shell$(RESET)"; \
 	fi
 
 # setup-darwin-sandboxd-test-group — create the `_sandboxd-test` system group
@@ -1870,7 +2064,15 @@ setup-darwin-sandboxd-test-operator-group-membership: setup-darwin-sandboxd-test
 	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '_sandboxd-test'$(RESET)"; \
 	else \
 	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandboxd-test  (operator-group membership; takes effect at next login or fresh sudo process)"; \
-	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandboxd-test; \
+	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandboxd-test || { \
+	    echo "ERROR: dseditgroup failed to add '$$USER' to group '_sandboxd-test'."; \
+	    exit 1; \
+	  }; \
+	  dseditgroup -o checkmember -m "$$USER" _sandboxd-test >/dev/null 2>&1 || { \
+	    echo "ERROR: '$$USER' is still not a member of group '_sandboxd-test' after the add."; \
+	    echo "  Check: dseditgroup -o read _sandboxd-test"; \
+	    exit 1; \
+	  }; \
 	  echo "$(GREEN)✓ added '$$USER' to group '_sandboxd-test' — re-login or re-exec under sudo required for the group to be active in the current shell$(RESET)"; \
 	fi
 
@@ -2103,7 +2305,15 @@ setup-darwin-sandboxd-test-vmnet-group-membership: setup-darwin-sandboxd-test-us
 	  echo "$(GREEN)✓ already configured: _sandboxd-test is in vmnet socket group '$$_vmnet_group'$(RESET)"; \
 	else \
 	  echo "[sudo] dseditgroup -o edit -a _sandboxd-test -t user $$_vmnet_group  (vmnet socket access)"; \
-	  sudo -k dseditgroup -o edit -a _sandboxd-test -t user "$$_vmnet_group"; \
+	  sudo -k dseditgroup -o edit -a _sandboxd-test -t user "$$_vmnet_group" || { \
+	    echo "ERROR: dseditgroup failed to add '_sandboxd-test' to group '$$_vmnet_group'."; \
+	    exit 1; \
+	  }; \
+	  dseditgroup -o checkmember -m _sandboxd-test "$$_vmnet_group" >/dev/null 2>&1 || { \
+	    echo "ERROR: '_sandboxd-test' is still not a member of group '$$_vmnet_group' after the add."; \
+	    echo "  Check: dseditgroup -o read $$_vmnet_group"; \
+	    exit 1; \
+	  }; \
 	  echo "$(GREEN)✓ added _sandboxd-test to group '$$_vmnet_group'$(RESET)"; \
 	fi
 

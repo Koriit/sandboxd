@@ -69,6 +69,110 @@ privileged setup step and restart sandboxd once more:
 make setup-dev-env DARWIN_VMNET_SLOTS=<n>
 ```
 
+## The `socket_vmnet` pool and its daemon account
+
+The pool is `DARWIN_VMNET_SLOTS` root LaunchDaemons (default 8), labelled
+`io.sandboxd.vmnet.0` … `io.sandboxd.vmnet.7`, installed at
+`/Library/LaunchDaemons/<label>.plist`. Each one's `ProgramArguments` is a
+`/bin/sh -c` preamble that creates the socket directory, verifies the staged
+binary's code signature, and only then execs `socket_vmnet`:
+
+```
+install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox && \
+install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet && \
+codesign --verify --strict /Library/sandboxd/socket_vmnet || { …; exit 1; } && \
+exec /Library/sandboxd/socket_vmnet --vmnet-mode=host … --socket-group=_sandboxd …
+```
+
+macOS clears `/var/run` at every boot, so that first `install -d` is what
+recreates the socket directory each time the machine starts. If `_sandboxd`
+does not resolve as both a user and a group, `install` exits non-zero with
+`install: unknown group _sandboxd`, the `&&`-chain short-circuits, no slot ever
+execs `socket_vmnet`, and `KeepAlive` retries the same failure every
+`ThrottleInterval` seconds. Every full-backend session then fails to get a
+network segment.
+
+Nothing about that is visible when the plists are written — only at the next
+boot, arbitrarily long after. So **every emitter refuses to write a plist
+naming an account that does not resolve**: `network.rs`, the
+`setup-darwin-vmnet-plists` make target, and `scripts/install.sh` all check
+first and exit non-zero with the account name. Create the account with
+`make setup-darwin-sandboxd-user` (a dev host; `make setup-dev-env` runs it as
+a prerequisite) or by running `scripts/install.sh` (a production install).
+
+### Is a loaded daemon still running what its plist says?
+
+launchd caches a job's definition in memory when it is bootstrapped. Rewriting
+the plist afterwards changes nothing: the running job keeps the argv it was
+bootstrapped with until it is booted out and bootstrapped again, and
+`launchctl kickstart -k` does **not** re-read the plist — it restarts the
+cached job. "The job is loaded" is therefore not "the job is up to date", and
+a provisioning run that installs a corrected plist, sees the job loaded, and
+reports success can leave the old definition serving until the next reboot
+silently swaps it in.
+
+```bash
+scripts/darwin-vmnet-drift.sh io.sandboxd.vmnet.0 \
+    /Library/LaunchDaemons/io.sandboxd.vmnet.0.plist
+```
+
+Exit `0` in sync, `3` drift (the two argvs are printed to stderr), `4` not
+loaded, `1` error. It needs no sudo — `launchctl print` reads the in-memory
+job. `make setup-darwin-vmnet-daemons` runs it for every slot and re-bootstraps
+the ones that diverge. The manual equivalent, if you want to eyeball it:
+
+```bash
+launchctl print system/io.sandboxd.vmnet.0 | sed -n '/arguments = {/,/^	}$/p'
+plutil -extract ProgramArguments.2 raw -o - \
+    /Library/LaunchDaemons/io.sandboxd.vmnet.0.plist
+```
+
+### Repairing a pool provisioned with an account that does not exist
+
+If a host was provisioned before the account existed, the plists on disk name
+an unresolvable account and the failure is queued for the next boot. The
+procedure below repairs it *and* makes the deferred failure immediate, so the
+repair is verified without rebooting: booting the jobs out and removing
+`/var/run/sandbox` reproduces exactly the state a boot leaves behind.
+
+It is disruptive — it stops every full-backend session — and it is not run by
+any target automatically. Run it deliberately, as the operator, with sudo.
+
+```bash
+# 1. Stop the daemon so nothing tries to claim a slot mid-repair.
+sudo launchctl stop system/io.sandboxd.daemon
+
+# 2. Tear down all eight pool jobs and the socket directory. After this the
+#    host is in the state a fresh boot leaves it in.
+for slot in $(seq 0 7); do
+    sudo launchctl bootout system/io.sandboxd.vmnet.$slot 2>/dev/null || true
+done
+sudo rm -rf /var/run/sandbox
+
+# 3. Create the account, then rewrite the plists. In this order: the
+#    generator refuses to emit a plist for an account that does not resolve.
+make setup-darwin-sandboxd-user
+make setup-darwin-vmnet-plists
+
+# 4. Bring the pool back. This re-reads the plists from disk.
+make setup-darwin-vmnet-daemons
+
+# 5. Verify. Every slot must have a socket, owned by the group the plist
+#    names, and every loaded job must match its plist.
+ls -l /var/run/sandbox/vmnet/
+for slot in $(seq 0 7); do
+    scripts/darwin-vmnet-drift.sh io.sandboxd.vmnet.$slot \
+        /Library/LaunchDaemons/io.sandboxd.vmnet.$slot.plist || echo "slot $slot: FAILED"
+done
+
+# 6. Restart the daemon.
+sudo launchctl start system/io.sandboxd.daemon
+```
+
+Step 5 is the part that matters. A repair that skips it has verified only that
+the plists were written, which is precisely the check that let the original
+failure through.
+
 ## Disk usage and APFS accounting
 
 sandboxd stores sandbox VM disk images under the daemon's LIMA_HOME. On APFS

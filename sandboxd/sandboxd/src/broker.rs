@@ -1089,7 +1089,14 @@ pub async fn run_broker_listener(
                 warn!(uid, group = %group_name, "broker: rejected non-member check-in");
             }
             AuthOutcome::RejectedResolutionFailed(uid) => {
-                warn!(uid, "broker: rejected — peer-cred resolution failed");
+                // Naming the group matters: the usual cause is not a bad uid
+                // but a group that does not exist on this host, which denies
+                // every operator identically and gives no other clue.
+                warn!(
+                    uid,
+                    group = %group_name,
+                    "broker: rejected — peer-cred resolution failed (does the group exist?)"
+                );
             }
         }
     }
@@ -1183,7 +1190,8 @@ async fn classify_and_dispatch_connection(
             AuthOutcome::RejectedResolutionFailed(_) => {
                 warn!(
                     uid,
-                    "broker: rejected CHECKIN — group membership resolution failed"
+                    group = %group_name,
+                    "broker: rejected CHECKIN — group membership resolution failed (does the group exist?)"
                 );
                 return;
             }

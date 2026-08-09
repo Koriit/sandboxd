@@ -868,6 +868,23 @@ pub const VMNET_SOCKET_DIR: &str = "/var/run/sandbox/vmnet";
 #[cfg(target_os = "macos")]
 pub const STAGED_SOCKET_VMNET_PATH: &str = "/Library/sandboxd/socket_vmnet";
 
+/// The macOS daemon account and group named by every vmnet launchd plist.
+///
+/// macOS reserves `_sandbox` (uid/gid 60) for its Seatbelt subsystem, so
+/// sandboxd uses a dedicated `_sandboxd` account and group of its own.
+///
+/// This is the Rust *declaration* of that identity, and the only place the
+/// name is written in this crate. Two other emitters declare it
+/// independently — `DARWIN_SANDBOXD_ACCOUNT` in the `Makefile` and
+/// `_sandboxd_acct` in `scripts/install.sh` — because a `curl | sh`
+/// installer cannot read a file from the repo and `make` cannot read a Rust
+/// constant. `scripts/check-vmnet-uuid-equivalence.py` extracts all three,
+/// plus the account the installer actually *creates*, and fails when they
+/// disagree; that comparison, rather than a shared literal, is what keeps
+/// them from drifting.
+#[cfg(target_os = "macos")]
+pub const SANDBOXD_ACCOUNT: &str = "_sandboxd";
+
 /// Fixed sandboxd namespace UUID for per-slot network-identifier derivation.
 ///
 /// Used as the UUIDv5 namespace when deriving each slot's `--vmnet-network-identifier`.
@@ -972,31 +989,81 @@ pub fn vmnet_slot_daemon_label(slot: u16) -> String {
     format!("io.sandboxd.vmnet.{slot}")
 }
 
-/// Generate the launchd plist XML for a single socket_vmnet pool slot.
+/// Verify that the account a vmnet plist names resolves on this host.
+///
+/// The plist's root `/bin/sh -c` preamble runs
+/// `install -d -o <account> -g <account> …` at every boot, because `/var/run`
+/// is cleared each time. `install` exits non-zero with `unknown user` /
+/// `unknown group` when the account is absent, and the preamble is
+/// `&&`-chained, so socket_vmnet is never exec'd: every slot in the pool
+/// dies, `KeepAlive` turns it into a throttled retry loop, and the failure
+/// surfaces at the next reboot — detached from whatever wrote the plist and
+/// reported success.
+///
+/// Emitting such a plist is therefore never useful, and every emitter must
+/// refuse rather than defer. Returns an error naming the account and the way
+/// to create it.
+#[cfg(target_os = "macos")]
+pub fn ensure_vmnet_account_resolvable(account: &str) -> Result<(), SandboxError> {
+    let user_ok = nix::unistd::User::from_name(account)
+        .ok()
+        .flatten()
+        .is_some();
+    let group_ok = nix::unistd::Group::from_name(account)
+        .ok()
+        .flatten()
+        .is_some();
+    if user_ok && group_ok {
+        return Ok(());
+    }
+
+    let missing = if !user_ok && !group_ok {
+        "user and group do"
+    } else if !user_ok {
+        "user does"
+    } else {
+        "group does"
+    };
+    Err(SandboxError::Network(format!(
+        "refusing to generate a vmnet plist naming '{account}': that {missing} not exist on \
+         this host. The plist's root pre-exec preamble runs \
+         `install -d -o {account} -g {account} -m 0750 /var/run/sandbox` at every boot; with \
+         the account absent that fails, the &&-chain short-circuits, and no socket_vmnet slot \
+         starts. Create the account first: `make setup-darwin-sandboxd-user` on a dev host, \
+         or run `scripts/install.sh` for a production install."
+    )))
+}
+
+/// Render the launchd plist XML for a single socket_vmnet pool slot.
+///
+/// Pure: takes the account name rather than reading it from the host, so the
+/// exact bytes that would be installed can be asserted without a provisioned
+/// machine. [`generate_vmnet_plist`] is the emitter to call in anger — it
+/// refuses to produce a plist for an account that does not resolve.
 ///
 /// The generated plist is installed at
 /// `/Library/LaunchDaemons/io.sandboxd.vmnet.<n>.plist` as a root-owned
 /// LaunchDaemon. Key design properties:
 ///
 /// - Shell wrapper as `ProgramArguments`: creates socket parent directories
-///   with explicit `_sandboxd:_sandboxd 0750` ownership *before* socket_vmnet
+///   with explicit `<account>:<account> 0750` ownership *before* socket_vmnet
 ///   binds. `/var/run` is cleared on every macOS boot; launchd imposes no
 ///   ordering between independent jobs, so the daemon cannot rely on the
 ///   directory surviving a reboot or on `sandboxd` having run first. Using
-///   `install -d -o _sandboxd -g _sandboxd -m 0750` is idempotent and yields
+///   `install -d -o <account> -g <account> -m 0750` is idempotent and yields
 ///   the correct owner regardless of which root job wins the boot race.
 /// - `--vmnet-mode=host`: isolated virtual network, no NAT to internet.
 /// - `--vmnet-network-identifier=<uuid>`: deterministic, per-slot UUID
 ///   (derived from the fixed sandboxd namespace + slot index) — each unique
 ///   identifier gets its own isolated L2 bridge, preventing cross-slot
 ///   traffic; deterministic so it is stable across daemon/host restarts.
-/// - `--socket-group=_sandboxd`: overrides socket_vmnet's `staff` default;
-///   only `_sandboxd`/enrolled operators can connect.
+/// - `--socket-group=<account>`: overrides socket_vmnet's `staff` default;
+///   only the daemon account and enrolled operators can connect.
 /// - No `--vmnet-gateway`/`--vmnet-dhcp-end`: network-identifier mode
 ///   carries no DHCP; all addresses are assigned statically.
 /// - `RunAtLoad=true` + `KeepAlive`: start at boot, restart on crash.
 #[cfg(target_os = "macos")]
-pub fn generate_vmnet_plist(slot: u16) -> String {
+pub fn render_vmnet_plist(slot: u16, account: &str) -> String {
     let label = vmnet_slot_daemon_label(slot);
     let socket_path = vmnet_slot_socket_path(slot);
     let network_identifier = vmnet_slot_network_identifier(slot);
@@ -1018,13 +1085,13 @@ pub fn generate_vmnet_plist(slot: u16) -> String {
     // the pool silently on every socket_vmnet update.  The Apple code signature
     // covers integrity without requiring a manually-maintained pin.
     let exec_cmd = format!(
-        "install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; \
-install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; \
+        "install -d -o {account} -g {account} -m 0750 /var/run/sandbox &amp;&amp; \
+install -d -o {account} -g {account} -m 0750 /var/run/sandbox/vmnet &amp;&amp; \
 codesign --verify --strict {STAGED_SOCKET_VMNET_PATH} || {{ echo 'sandboxd: codesign verify failed for {STAGED_SOCKET_VMNET_PATH} -- binary may be tampered; refusing to exec'; exit 1; }} &amp;&amp; \
 exec {STAGED_SOCKET_VMNET_PATH} \
 --vmnet-mode=host \
 --vmnet-network-identifier={network_identifier} \
---socket-group=_sandboxd \
+--socket-group={account} \
 {socket_path}"
     );
 
@@ -1066,6 +1133,18 @@ exec {STAGED_SOCKET_VMNET_PATH} \
 </plist>
 "#
     )
+}
+
+/// Generate the launchd plist XML for a pool slot, or refuse.
+///
+/// The emitter to call in anger. Checks that [`SANDBOXD_ACCOUNT`] resolves on
+/// this host *before* rendering, so a plist that would break the whole pool at
+/// the next boot is never produced. See [`ensure_vmnet_account_resolvable`] for
+/// why deferring that failure is so expensive.
+#[cfg(target_os = "macos")]
+pub fn generate_vmnet_plist(slot: u16) -> Result<String, SandboxError> {
+    ensure_vmnet_account_resolvable(SANDBOXD_ACCOUNT)?;
+    Ok(render_vmnet_plist(slot, SANDBOXD_ACCOUNT))
 }
 
 // ---------------------------------------------------------------------------
@@ -2051,7 +2130,7 @@ mod tests {
 
         #[test]
         fn test_plist_contains_required_argv() {
-            let plist = generate_vmnet_plist(2);
+            let plist = render_vmnet_plist(2, SANDBOXD_ACCOUNT);
             assert!(
                 plist.contains("--vmnet-mode=host"),
                 "plist must include --vmnet-mode=host"
@@ -2076,7 +2155,7 @@ mod tests {
 
         #[test]
         fn test_plist_has_run_at_load_and_keep_alive() {
-            let plist = generate_vmnet_plist(0);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
             assert!(plist.contains("<key>RunAtLoad</key>"));
             assert!(plist.contains("<true/>"));
             assert!(plist.contains("<key>KeepAlive</key>"));
@@ -2084,7 +2163,7 @@ mod tests {
 
         #[test]
         fn test_plist_has_pre_exec_dir_creation() {
-            let plist = generate_vmnet_plist(0);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
             // The pre-exec wrapper must create /var/run/sandbox and
             // /var/run/sandbox/vmnet with _sandboxd ownership.
             assert!(
@@ -2103,7 +2182,7 @@ mod tests {
         #[test]
         fn test_plist_has_codesign_guard() {
             for slot in 0u16..4 {
-                let plist = generate_vmnet_plist(slot);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
                 let guard_fragment =
                     format!("codesign --verify --strict {STAGED_SOCKET_VMNET_PATH}");
                 assert!(
@@ -2120,7 +2199,7 @@ mod tests {
         #[test]
         fn test_plist_label_matches_slot() {
             for slot in 0u16..4 {
-                let plist = generate_vmnet_plist(slot);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
                 assert!(
                     plist.contains(&format!("io.sandboxd.vmnet.{slot}")),
                     "plist label must be io.sandboxd.vmnet.{slot}"
@@ -2130,19 +2209,104 @@ mod tests {
 
         #[test]
         fn test_plist_network_identifier_is_deterministic_across_calls() {
-            let plist_a = generate_vmnet_plist(3);
-            let plist_b = generate_vmnet_plist(3);
+            let plist_a = render_vmnet_plist(3, SANDBOXD_ACCOUNT);
+            let plist_b = render_vmnet_plist(3, SANDBOXD_ACCOUNT);
             assert_eq!(plist_a, plist_b, "plist generation must be deterministic");
         }
 
         #[test]
         fn test_plist_no_networks_yaml() {
             // The plist must NOT reference networks.yaml anywhere.
-            let plist = generate_vmnet_plist(0);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
             assert!(
                 !plist.contains("networks.yaml"),
                 "plist must not reference networks.yaml"
             );
+        }
+
+        /// Every occurrence of the account name in the rendered plist comes
+        /// from the parameter — nothing is hardcoded behind the caller's back.
+        ///
+        /// A stray literal would survive a rename of [`SANDBOXD_ACCOUNT`] and
+        /// re-introduce exactly the split-brain this parameterization removes.
+        #[test]
+        fn test_plist_account_is_fully_parameterized() {
+            let plist = render_vmnet_plist(0, "nobody");
+            assert!(
+                !plist.contains(SANDBOXD_ACCOUNT),
+                "rendering for 'nobody' must not leak the default account name:\n{plist}"
+            );
+            assert!(
+                plist.contains("install -d -o nobody -g nobody -m 0750 /var/run/sandbox"),
+                "the dir preamble must name the account it was given:\n{plist}"
+            );
+            assert!(
+                plist.contains("install -d -o nobody -g nobody -m 0750 /var/run/sandbox/vmnet"),
+                "the vmnet dir preamble must name the account it was given:\n{plist}"
+            );
+            assert!(
+                plist.contains("--socket-group=nobody"),
+                "--socket-group must name the account it was given:\n{plist}"
+            );
+        }
+
+        /// A plist naming an account that does not resolve is never emitted.
+        ///
+        /// `install -d -o <absent> …` fails at every boot and `&&`-short-circuits
+        /// the whole preamble, so such a plist silently kills the entire pool.
+        /// The emitter must fail loudly instead, naming the account.
+        #[test]
+        fn test_generate_refuses_when_account_is_absent() {
+            let absent = "_sandboxd_definitely_absent_test_account";
+            let err = ensure_vmnet_account_resolvable(absent)
+                .expect_err("an account that cannot exist must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(absent),
+                "the refusal must name the offending account, got: {msg}"
+            );
+            assert!(
+                msg.contains("install -d"),
+                "the refusal must explain what breaks, got: {msg}"
+            );
+            assert!(
+                msg.contains("setup-darwin-sandboxd-user") || msg.contains("install.sh"),
+                "the refusal must say how to fix it, got: {msg}"
+            );
+        }
+
+        /// The resolvability check passes for an account that does exist.
+        ///
+        /// `daemon` is a stock macOS account whose user *and* group both
+        /// resolve (unlike `root`, whose group is `wheel`), so this pins the
+        /// happy path without depending on sandboxd being provisioned here.
+        #[test]
+        fn test_ensure_account_resolvable_accepts_existing_account() {
+            ensure_vmnet_account_resolvable("daemon")
+                .expect("the stock 'daemon' user and group resolve on every macOS host");
+        }
+
+        /// `generate_vmnet_plist` agrees byte-for-byte with the pure renderer.
+        ///
+        /// Only meaningful once the host is provisioned; before that the
+        /// generator correctly refuses and there is nothing to compare.
+        #[test]
+        fn test_generate_matches_render_when_account_resolves() {
+            match generate_vmnet_plist(1) {
+                Ok(plist) => assert_eq!(
+                    plist,
+                    render_vmnet_plist(1, SANDBOXD_ACCOUNT),
+                    "the guarded emitter must return exactly what the renderer produces"
+                ),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains(SANDBOXD_ACCOUNT),
+                        "on an unprovisioned host the refusal must name {SANDBOXD_ACCOUNT}, \
+                         got: {msg}"
+                    );
+                }
+            }
         }
 
         /// The plist must not contain bare `&` (only `&amp;`).
@@ -2153,7 +2317,7 @@ mod tests {
         #[test]
         fn test_plist_ampersand_is_xml_escaped() {
             for slot in 0u16..4 {
-                let plist = generate_vmnet_plist(slot);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
 
                 // No bare & should appear in the XML (outside of &amp; etc.).
                 // Scan character by character: any `&` not followed by `amp;`
@@ -2202,7 +2366,7 @@ mod tests {
             }
 
             for slot in 0u16..2 {
-                let plist = generate_vmnet_plist(slot);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
                 let mut f = NamedTempFile::with_suffix(".plist").unwrap();
                 f.write_all(plist.as_bytes()).unwrap();
                 f.flush().unwrap();
@@ -2824,7 +2988,7 @@ mod tests {
                 "slot socket path must not reference networks.yaml"
             );
             // Plist content must not reference networks.yaml.
-            let plist = generate_vmnet_plist(0);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
             assert!(!plist.contains("networks.yaml"));
         }
 

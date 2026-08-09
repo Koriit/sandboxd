@@ -2257,6 +2257,19 @@ _LOG="\$3"
 _BASE_DIR_HINT="\$4"
 _SANDBOX_UID_HINT="\$5"
 
+# The macOS daemon account and group. macOS reserves _sandbox (uid/gid 60) for
+# its Seatbelt subsystem, so sandboxd uses a dedicated account of its own.
+#
+# This is the installer's declaration of that identity: the account created by
+# the sandbox-user step, and the account named by every vmnet launchd plist this
+# script emits. Two other emitters declare it independently — SANDBOXD_ACCOUNT
+# in sandbox-core/src/network.rs and DARWIN_SANDBOXD_ACCOUNT in the Makefile —
+# because this script is fetched and run standalone (curl | sh) and cannot read
+# a file from the repo. scripts/check-vmnet-uuid-equivalence.py extracts all
+# three and fails when they disagree; that comparison, rather than a shared
+# literal, is what keeps them from drifting.
+_sandboxd_acct="_sandboxd"
+
 # BEGIN_TEST_ENV — stripped from published install.sh at docs-deploy time
 #
 # SANDBOX_INSTALL_PRIV_CHILD_FAIL_BEFORE_FIFO — test hook that causes the
@@ -2598,18 +2611,18 @@ if [ "\$OS" = "darwin" ]; then
     if [ "\$PLAN_SANDBOX_USER" = "create" ]; then
         # Determine a free UID below 500.  Apple reserves UIDs < 500 for system accounts.
         _next_uid=\$(dscl . -list /Users UniqueID | awk '{print \$2}' | sort -n | awk 'BEGIN{uid=300} {if (\$1==uid){uid++}} END{print uid}')
-        # Create a fresh _sandboxd group at the next free GID below 500 (not GID 60,
+        # Create a fresh group at the next free GID below 500 (not GID 60,
         # which belongs to Apple's reserved _sandbox Seatbelt group).
-        if dscl . -read /Groups/_sandboxd >/dev/null 2>&1; then
-            _sandbox_gid=\$(dscl . -read /Groups/_sandboxd PrimaryGroupID 2>/dev/null | awk '{print \$2}')
+        if dscl . -read "/Groups/\$_sandboxd_acct" >/dev/null 2>&1; then
+            _sandbox_gid=\$(dscl . -read "/Groups/\$_sandboxd_acct" PrimaryGroupID 2>/dev/null | awk '{print \$2}')
             _log "step=sandbox_group action=exists gid=\$_sandbox_gid status=ok"
         else
             # Pick next free GID below 500 (skip 60 — that belongs to Apple's _sandbox).
             _sandbox_gid=\$(dscl . -list /Groups PrimaryGroupID | awk '{print \$2}' | sort -n | awk 'BEGIN{gid=300} {if (\$1==gid){gid++}} END{print gid}')
-            dscl . -create /Groups/_sandboxd >> "\$_LOG" 2>&1 \\
+            dscl . -create "/Groups/\$_sandboxd_acct" >> "\$_LOG" 2>&1 \\
                 || { _log "step=sandbox_group action=create-fail status=fail"; _step_fail; }
-            dscl . -create /Groups/_sandboxd PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
-            dscl . -create /Groups/_sandboxd RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
+            dscl . -create "/Groups/\$_sandboxd_acct" PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
+            dscl . -create "/Groups/\$_sandboxd_acct" RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
             _log "step=sandbox_group action=create gid=\$_sandbox_gid status=ok"
         fi
         # Use per-attribute dscl for user creation. sysadminctl -roleAccount
@@ -2618,21 +2631,21 @@ if [ "\$OS" = "darwin" ]; then
         # next-free UID starting at 300 lands below that range on a typical
         # macOS host. dscl works unconditionally regardless of UID value.
         _home="/var/lib/sandboxd/\$_next_uid"
-        dscl . -create /Users/_sandboxd >> "\$_LOG" 2>&1 \\
+        dscl . -create "/Users/\$_sandboxd_acct" >> "\$_LOG" 2>&1 \\
             || { _log "step=dscl_create_user action=fail status=fail"; _step_fail; }
-        dscl . -create /Users/_sandboxd UniqueID "\$_next_uid" >> "\$_LOG" 2>&1 || true
-        dscl . -create /Users/_sandboxd PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
-        dscl . -create /Users/_sandboxd NFSHomeDirectory "\$_home" >> "\$_LOG" 2>&1 || true
-        dscl . -create /Users/_sandboxd UserShell /usr/bin/false >> "\$_LOG" 2>&1 || true
-        dscl . -create /Users/_sandboxd RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
-        dscl . -create /Users/_sandboxd Password '*' >> "\$_LOG" 2>&1 || true
+        dscl . -create "/Users/\$_sandboxd_acct" UniqueID "\$_next_uid" >> "\$_LOG" 2>&1 || true
+        dscl . -create "/Users/\$_sandboxd_acct" PrimaryGroupID "\$_sandbox_gid" >> "\$_LOG" 2>&1 || true
+        dscl . -create "/Users/\$_sandboxd_acct" NFSHomeDirectory "\$_home" >> "\$_LOG" 2>&1 || true
+        dscl . -create "/Users/\$_sandboxd_acct" UserShell /usr/bin/false >> "\$_LOG" 2>&1 || true
+        dscl . -create "/Users/\$_sandboxd_acct" RealName "sandboxd daemon" >> "\$_LOG" 2>&1 || true
+        dscl . -create "/Users/\$_sandboxd_acct" Password '*' >> "\$_LOG" 2>&1 || true
         SANDBOX_USER_CREATED=1
         _log "step=sandbox_user action=create uid=\$_next_uid gid=\$_sandbox_gid status=ok"
     else
         _log "step=sandbox_user action=skip status=ok"
     fi
     # Resolve uid after user is guaranteed to exist.
-    SANDBOX_UID=\$(id -u _sandboxd 2>/dev/null) \\
+    SANDBOX_UID=\$(id -u "\$_sandboxd_acct" 2>/dev/null) \\
         || { _log "step=resolve_sandbox_uid action=fail status=fail"; _step_fail; }
     BASE_DIR="/var/lib/sandboxd/\$SANDBOX_UID"
     STATE_PATH="\$BASE_DIR/.install-state.json"
@@ -2836,6 +2849,21 @@ _priv_maybe_abort_at "install-vmnet-plists"
 _vmnet_slots="\${DARWIN_VMNET_SLOTS:-8}"
 _svmnet_staged="/Library/sandboxd/socket_vmnet"
 _namespace_hex="6d4f6e2b958a4f1aa2317e8cd0123e5b"
+
+# Refuse to emit a plist naming an account that does not resolve.
+#
+# The preamble below runs \`install -d -o \$_sandboxd_acct …\` as root at every
+# boot, because /var/run is cleared each time. With the account absent that
+# fails, the &&-chain short-circuits, and socket_vmnet is never exec'd — every
+# slot in the pool dies. Since the plist is only read at boot, writing one here
+# would succeed and fail much later, detached from this install. The sandbox-user
+# step above creates the account; this guard catches the case where it was
+# skipped (PLAN_SANDBOX_USER != create) against a host that never had it.
+if ! id -u "\$_sandboxd_acct" >/dev/null 2>&1 || ! dscl . -read "/Groups/\$_sandboxd_acct" >/dev/null 2>&1; then
+    _log "step=install_vmnet_plists action=fail reason=account-unresolvable account=\$_sandboxd_acct status=fail"
+    _step_fail
+fi
+
 _i=0
 while [ "\$_i" -lt "\$_vmnet_slots" ]; do
     _slot="\$_i"
@@ -2860,7 +2888,7 @@ print('%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x' % t
 
     # Build the exec_cmd — must match generate_vmnet_plist in network.rs and
     # the Makefile Python generator exactly.
-    _exec_cmd="install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox &amp;&amp; install -d -o _sandboxd -g _sandboxd -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict \$_svmnet_staged || { echo 'sandboxd: codesign verify failed for \$_svmnet_staged -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec \$_svmnet_staged --vmnet-mode=host --vmnet-network-identifier=\$_network_id --socket-group=_sandboxd \$_socket_path"
+    _exec_cmd="install -d -o \$_sandboxd_acct -g \$_sandboxd_acct -m 0750 /var/run/sandbox &amp;&amp; install -d -o \$_sandboxd_acct -g \$_sandboxd_acct -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict \$_svmnet_staged || { echo 'sandboxd: codesign verify failed for \$_svmnet_staged -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec \$_svmnet_staged --vmnet-mode=host --vmnet-network-identifier=\$_network_id --socket-group=\$_sandboxd_acct \$_socket_path"
 
     _tmp=\$(mktemp -t io.sandboxd.vmnet) || { _step_fail; }
     python3 -c "
@@ -2924,6 +2952,38 @@ _priv_maybe_fail_after "install-vmnet-plists"
 # ----- Step: bootstrap vmnet daemons (macOS) -----
 _step_begin "bootstrap-vmnet-daemons"
 _priv_maybe_abort_at "bootstrap-vmnet-daemons"
+
+# _vmnet_plist_argv <plist> — the plist's ProgramArguments, one entry per line.
+# Walks ProgramArguments.<i> until plutil says there is no such index; the cap
+# keeps a malformed plist from looping.
+_vmnet_plist_argv() {
+    _vpa_i=0
+    while [ "\$_vpa_i" -lt 64 ]; do
+        if _vpa_arg=\$(plutil -extract "ProgramArguments.\$_vpa_i" raw -o - "\$1" 2>/dev/null); then
+            printf '%s\n' "\$_vpa_arg"
+            _vpa_i=\$((_vpa_i + 1))
+        else
+            break
+        fi
+    done
+}
+
+# _vmnet_loaded_argv <label> — the argv launchd is actually running, one entry
+# per line. \`launchctl print\` renders the in-memory job; the argv lives in an
+# \`arguments = { ... }\` block, one tab-indented entry per line. The closing brace
+# is matched only when alone on its line: our own argv contains a \`}\` (the
+# codesign guard's \`|| { ...; exit 1; }\`), so a looser match would truncate the
+# block mid-argument. Kept identical to scripts/darwin-vmnet-drift.sh, which is
+# the same comparison for the make path.
+_vmnet_loaded_argv() {
+    launchctl print "system/\$1" 2>/dev/null | awk '
+        /^[[:space:]]*arguments = \{[[:space:]]*\$/ { in_args = 1; next }
+        in_args && /^[[:space:]]*\}[[:space:]]*\$/  { in_args = 0; next }
+        in_args                                    { sub(/^[\t ]+/, ""); print; seen = 1 }
+        END                                        { exit(seen ? 0 : 1) }
+    '
+}
+
 _vmnet_slots="\${DARWIN_VMNET_SLOTS:-8}"
 _i=0
 while [ "\$_i" -lt "\$_vmnet_slots" ]; do
@@ -2932,19 +2992,43 @@ while [ "\$_i" -lt "\$_vmnet_slots" ]; do
     _plist_dst="/Library/LaunchDaemons/\$_label.plist"
     _socket_path="/var/run/sandbox/vmnet/slot-\$_slot.sock"
 
-    if launchctl print "system/\$_label" >> "\$_LOG" 2>&1; then
-        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=skip reason=already-loaded status=ok"
+    # "Loaded" is not "up to date". launchd caches the job definition in memory
+    # at bootstrap time; the plist installed above changes nothing until the job
+    # is booted out and bootstrapped again (\`kickstart -k\` restarts the cached
+    # job — it does not re-read the plist). Skipping on "already loaded" would
+    # let a re-run over an older install report success while the stale
+    # definition keeps serving until the next reboot swaps it in.
+    _reload=0
+    _loaded_argv=\$(_vmnet_loaded_argv "\$_label") || _loaded_argv=""
+    if [ -z "\$_loaded_argv" ]; then
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=bootstrap reason=not-loaded status=ok"
     else
-        launchctl bootstrap system "\$_plist_dst" >> "\$_LOG" 2>&1 || {
-            _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=bootstrap status=fail"
-            _step_fail
-        }
-        launchctl enable "system/\$_label" >> "\$_LOG" 2>&1 || {
-            _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=enable status=fail"
-            _step_fail
-        }
-        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=bootstrap-enable status=ok"
+        _disk_argv=\$(_vmnet_plist_argv "\$_plist_dst")
+        if [ "\$_loaded_argv" = "\$_disk_argv" ] && [ -S "\$_socket_path" ]; then
+            _log "step=bootstrap_vmnet_daemons slot=\$_slot action=skip reason=loaded-and-in-sync status=ok"
+            _i=\$((_i + 1))
+            continue
+        fi
+        if [ "\$_loaded_argv" = "\$_disk_argv" ]; then
+            _log "step=bootstrap_vmnet_daemons slot=\$_slot action=reload reason=socket-missing status=ok"
+        else
+            _log "step=bootstrap_vmnet_daemons slot=\$_slot action=reload reason=stale-definition status=ok"
+        fi
+        _reload=1
     fi
+
+    if [ "\$_reload" -eq 1 ]; then
+        launchctl bootout "system/\$_label" >> "\$_LOG" 2>&1 || true
+    fi
+    launchctl bootstrap system "\$_plist_dst" >> "\$_LOG" 2>&1 || {
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=bootstrap status=fail"
+        _step_fail
+    }
+    launchctl enable "system/\$_label" >> "\$_LOG" 2>&1 || {
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=enable status=fail"
+        _step_fail
+    }
+    _log "step=bootstrap_vmnet_daemons slot=\$_slot action=bootstrap-enable status=ok"
 
     # Wait for the slot socket to appear (up to 30 s).
     _ready=0
@@ -2960,7 +3044,22 @@ while [ "\$_i" -lt "\$_vmnet_slots" ]; do
         _log "step=bootstrap_vmnet_daemons slot=\$_slot action=socket-wait-fail path=\$_socket_path status=fail"
         _step_fail
     fi
-    _log "step=bootstrap_vmnet_daemons slot=\$_slot socket=\$_socket_path action=ready status=ok"
+
+    # The bootstrap must have picked up the plist we just installed, and the
+    # socket it created must be group-owned by the daemon account — otherwise
+    # enrolled operators cannot connect to this slot.
+    _loaded_argv=\$(_vmnet_loaded_argv "\$_label") || _loaded_argv=""
+    _disk_argv=\$(_vmnet_plist_argv "\$_plist_dst")
+    if [ "\$_loaded_argv" != "\$_disk_argv" ]; then
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=drift-after-bootstrap status=fail"
+        _step_fail
+    fi
+    _sock_group=\$(stat -f '%Sg' "\$_socket_path" 2>/dev/null) || _sock_group=""
+    if [ "\$_sock_group" != "\$_sandboxd_acct" ]; then
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=socket-group group=\$_sock_group expected=\$_sandboxd_acct status=fail"
+        _step_fail
+    fi
+    _log "step=bootstrap_vmnet_daemons slot=\$_slot socket=\$_socket_path group=\$_sock_group action=ready status=ok"
 
     _i=\$((_i + 1))
 done

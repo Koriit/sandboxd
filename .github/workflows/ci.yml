@@ -64,13 +64,13 @@ jobs:
         run: go test ./...
         working-directory: networking/coredns-plugin
 
-  # Shellcheck for the install / uninstall scripts and their shared engine.
-  # All four scripts must pass POSIX-sh (`-s sh`) plus stylistic warnings
-  # (`-S style`). `-x` enables cross-file source-following so shellcheck
-  # can resolve variables that install.sh/uninstall.sh set and ui.sh reads
-  # (and vice versa). The scripts themselves are not yet present in older
-  # checkouts; until then the step short-circuits when none of the files
-  # exist rather than failing CI.
+  # Shellcheck for the install / uninstall scripts, their shared engine, and
+  # the vmnet drift checker. All must pass POSIX-sh (`-s sh`) plus stylistic
+  # warnings (`-S style`). `-x` enables cross-file source-following so
+  # shellcheck can resolve variables that install.sh/uninstall.sh set and
+  # ui.sh reads (and vice versa). The scripts themselves are not yet present
+  # in older checkouts; until then the step short-circuits when none of the
+  # files exist rather than failing CI.
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -83,6 +83,11 @@ jobs:
           else
             echo "scripts/ not present yet; skipping."
           fi
+
+      - name: Shellcheck (vmnet drift checker)
+        # Separate step because this script is macOS-only in what it calls
+        # (`plutil`, `launchctl`) but is plain POSIX sh, so it lints on Linux.
+        run: shellcheck -s sh -S style scripts/darwin-vmnet-drift.sh
 
   # Integration tests: every `integration_*`-prefixed test in the Rust
   # workspace. These require out-of-process state — a real gateway container,
@@ -264,9 +269,13 @@ jobs:
             fi
           done
 
-      - name: Cross-language UUID equivalence check
-        # Verifies that the Python (Makefile plist generator) and Rust (network.rs)
-        # vmnet slot network-identifier derivations produce identical UUIDs.
+      - name: Cross-emitter vmnet plist equivalence check
+        # Three code paths emit the vmnet LaunchDaemon plists — network.rs, the
+        # Makefile, and scripts/install.sh — and nothing in any one language
+        # ties them to the others. This compares the slot network-identifier
+        # derivations, the daemon account name (including the account install.sh
+        # actually creates), the staged binary path, and the pre-exec wrapper
+        # template across all three.
         run: python3 scripts/check-vmnet-uuid-equivalence.py
 
       - name: Hermetic Rust tests (macOS paths)

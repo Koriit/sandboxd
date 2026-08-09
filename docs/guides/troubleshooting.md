@@ -38,6 +38,17 @@ Most recipes below are written for the Linux substrate and reference Linux-only 
   sudo launchctl print system/io.sandboxd.vmnet.0    # repeat per slot
   sudo tail -f /var/log/sandbox/vmnet-0.stderr.log
   ```
+  Two failure shapes are worth recognising on sight.
+
+  **`install: unknown group _sandboxd` in `vmnet-<n>.stderr.log`, every slot down, first noticed after a reboot.** The plists were installed naming an account that does not exist on this host. Each plist's root preamble runs `install -d -o _sandboxd -g _sandboxd … /var/run/sandbox` before exec'ing `socket_vmnet`, and macOS clears `/var/run` at every boot — so the pool works until the machine restarts and then never comes back. Confirm with `id -u _sandboxd` and `dscl . -read /Groups/_sandboxd`; repair with the procedure in [macOS Operations](/sandboxd/guides/macos-operations/#repairing-a-pool-provisioned-with-an-account-that-does-not-exist). Provisioning cannot produce this state any more — every plist emitter now refuses to write a plist naming an unresolvable account — but a host provisioned by an older version can still be carrying it.
+
+  **The plists look correct but the running jobs misbehave.** launchd serves the definition it cached at bootstrap; editing the plist does not change a loaded job, and `launchctl kickstart -k` restarts the cached copy rather than re-reading the file. Compare the two directly:
+  ```bash
+  scripts/darwin-vmnet-drift.sh io.sandboxd.vmnet.0 \
+      /Library/LaunchDaemons/io.sandboxd.vmnet.0.plist
+  # 0 in sync · 3 drift (both argvs printed) · 4 not loaded
+  ```
+  `make setup-darwin-vmnet-daemons` performs this check per slot and re-bootstraps whatever diverges.
 - **No host TAP / host Docker bridge.** The "TAP device missing" and "Docker bridge missing" recipes do not apply as written — macOS uses `socket_vmnet` segments and a macvlan network inside the gateway VM. Confirm a session's slot with `sandbox describe <id>` (its `vmnet_slot`) and inspect the macvlan network via the gateway-VM Docker socket shown above.
 - **`sandbox health`, `sandbox logs`, `sandbox events`, and `sandbox doctor` are backend-agnostic** — prefer them over raw `docker`/`launchctl` plumbing; they already target the right substrate on both platforms.
 
