@@ -49,6 +49,12 @@ Most recipes below are written for the Linux substrate and reference Linux-only 
   # 0 in sync · 3 drift (both argvs printed) · 4 not loaded
   ```
   `make setup-darwin-vmnet-daemons` performs this check per slot and re-bootstraps whatever diverges.
+- **Every operator refused by the agent broker.** The broker admits an operator only if their uid is a member of the `_sandboxd` group, and it fails closed when that lookup cannot be resolved — including when the group itself does not exist, which denies *everyone* identically. The startup log says so once, and each refusal carries a `reason` field:
+  ```bash
+  sudo grep -F 'enrollment group does not exist' /var/log/sandbox/sandboxd.log
+  sudo grep -F 'resolution failed' /var/log/sandbox/sandboxd.log
+  ```
+  This is the same missing account as the pool failure above and has the same fix — the two symptoms travel together on a host provisioned by an older version. A refusal that names the *uid* rather than the group is the ordinary case: that operator is simply not enrolled, and `sudo dseditgroup -o edit -a <user> -t user _sandboxd` adds them.
 - **No host TAP / host Docker bridge.** The "TAP device missing" and "Docker bridge missing" recipes do not apply as written — macOS uses `socket_vmnet` segments and a macvlan network inside the gateway VM. Confirm a session's slot with `sandbox describe <id>` (its `vmnet_slot`) and inspect the macvlan network via the gateway-VM Docker socket shown above.
 - **`sandbox health`, `sandbox logs`, `sandbox events`, and `sandbox doctor` are backend-agnostic** — prefer them over raw `docker`/`launchctl` plumbing; they already target the right substrate on both platforms.
 

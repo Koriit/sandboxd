@@ -110,7 +110,7 @@ use sandbox_agent_protocol::{BrokerRequest, BrokerResponse, BrokerResult, STREAM
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -208,11 +208,17 @@ pub fn test_set_heartbeat_ms(ms: u64) {
 /// without risk of blocking the caller long enough to matter.
 const REQUEST_CHANNEL_CAPACITY: usize = 4;
 
-/// The `_sandboxd` group name — the enrollment gate on macOS.
+/// The sandboxd group name — the enrollment gate on macOS.
 ///
-/// macOS reserves `_sandbox` (uid/gid 60) for its Seatbelt subsystem, so
-/// sandboxd uses a dedicated `_sandboxd` account and group instead.
-const SANDBOX_GROUP_NAME: &str = "_sandboxd";
+/// Deliberately an alias rather than its own literal. This is the same
+/// identity the socket_vmnet LaunchDaemon plists name in their boot-time
+/// `install -d -o <account>` preamble, and the account
+/// `make setup-darwin-sandboxd-user` / `scripts/install.sh` create. A private
+/// copy of the string here would be a fourth independent declaration of a name
+/// that has already drifted once, and the failure it produces is the least
+/// legible of the four: an unresolvable group denies every operator with no
+/// indication that the group, rather than the operator, is the problem.
+const SANDBOX_GROUP_NAME: &str = sandbox_core::network::SANDBOXD_ACCOUNT;
 
 // test-env-override seams
 #[cfg(feature = "test-env-override")]
@@ -280,6 +286,46 @@ fn agent_not_running_error(uid: u32) -> String {
         "session agent for {} is not running — \
          the operator must be logged in for Lima VM operations",
         uid_display(uid)
+    )
+}
+
+/// Explain a [`AuthOutcome::RejectedResolutionFailed`] in operator-actionable
+/// terms.
+///
+/// Diagnostics only. This runs *after* the deny decision and cannot change it:
+/// failing closed on an identity that cannot be resolved is the correct
+/// behaviour for an authorization gate, and nothing here relaxes it.
+///
+/// What it fixes is legibility. [`uid_in_sandbox_group`] collapses every
+/// resolution error into `None`, which is right for the decision but leaves
+/// two very different causes indistinguishable in the log. A uid that does not
+/// resolve is one operator's problem. A *group* that does not exist on this
+/// host denies every operator identically, is a provisioning fault rather than
+/// an authorization one, and — because the denial otherwise looks exactly like
+/// a legitimate refusal — can persist indefinitely with no one able to tell
+/// why. Re-probing each half separates them and names the remedy.
+fn resolution_failure_hint(uid: u32, group_name: &str) -> String {
+    // The sentinel `authenticate_peer` uses when `peer_cred()` itself failed;
+    // there is no uid to resolve in that case.
+    if uid == u32::MAX {
+        return "peer credentials could not be read from the socket".to_string();
+    }
+
+    let group_exists = group_name_to_gid(group_name).is_some();
+    if !group_exists {
+        return format!(
+            "group '{group_name}' does not exist on this host — every operator will be \
+             denied until it is created, regardless of enrollment. Create it with \
+             `make setup-darwin-sandboxd-user` on a dev host, or run `scripts/install.sh` \
+             for a production install"
+        );
+    }
+    if uid_to_username(uid).is_none() {
+        return format!("uid {uid} does not resolve to a user account on this host");
+    }
+    format!(
+        "group '{group_name}' and uid {uid} both resolve, but the membership lookup \
+         (getgrouplist) failed — Directory Services may be unavailable"
     )
 }
 
@@ -1030,6 +1076,24 @@ pub async fn run_broker_listener(
     on_admit_tx: Option<tokio::sync::mpsc::Sender<u32>>,
 ) {
     let group_name = sandbox_group_name();
+
+    // Say it once, at startup, if the enrollment group does not exist.
+    //
+    // Without this the fault is only observable as a per-connection denial
+    // that looks identical to a legitimate one, so the first person to notice
+    // is an operator being refused for a reason the log does not state. The
+    // listener still starts and still denies — failing closed on an
+    // unresolvable identity is correct — but it no longer does so silently.
+    if group_name_to_gid(&group_name).is_none() {
+        error!(
+            group = %group_name,
+            "broker: enrollment group does not exist on this host — every operator \
+             check-in will be denied until it is created. Create it with \
+             `make setup-darwin-sandboxd-user` on a dev host, or run `scripts/install.sh` \
+             for a production install."
+        );
+    }
+
     // Capture the effective heartbeat timeout at listener startup, before any
     // connection arrives. This isolates each listener's connections from
     // concurrent process-wide heartbeat env var mutations by other test threads.
@@ -1089,13 +1153,11 @@ pub async fn run_broker_listener(
                 warn!(uid, group = %group_name, "broker: rejected non-member check-in");
             }
             AuthOutcome::RejectedResolutionFailed(uid) => {
-                // Naming the group matters: the usual cause is not a bad uid
-                // but a group that does not exist on this host, which denies
-                // every operator identically and gives no other clue.
                 warn!(
                     uid,
                     group = %group_name,
-                    "broker: rejected — peer-cred resolution failed (does the group exist?)"
+                    reason = %resolution_failure_hint(uid, &group_name),
+                    "broker: rejected — peer-cred resolution failed"
                 );
             }
         }
@@ -1191,7 +1253,8 @@ async fn classify_and_dispatch_connection(
                 warn!(
                     uid,
                     group = %group_name,
-                    "broker: rejected CHECKIN — group membership resolution failed (does the group exist?)"
+                    reason = %resolution_failure_hint(uid, &group_name),
+                    "broker: rejected CHECKIN — group membership resolution failed"
                 );
                 return;
             }
@@ -2414,7 +2477,10 @@ mod tests {
     /// real socket where `peer_cred()` returns the test runner's own uid.
     #[test]
     fn auth_rejects_uid_zero() {
-        assert_eq!(classify_peer_uid(0, "_sandboxd"), AuthOutcome::RejectedRoot);
+        assert_eq!(
+            classify_peer_uid(0, SANDBOX_GROUP_NAME),
+            AuthOutcome::RejectedRoot
+        );
     }
 
     /// Verify that `classify_peer_uid` rejects uids below the system-account
@@ -2423,7 +2489,7 @@ mod tests {
     fn auth_rejects_system_uids() {
         for uid in [1u32, 100, 499] {
             assert_eq!(
-                classify_peer_uid(uid, "_sandboxd"),
+                classify_peer_uid(uid, SANDBOX_GROUP_NAME),
                 AuthOutcome::RejectedSystemUid(uid),
                 "uid {uid} should be rejected as a system uid"
             );
@@ -2449,6 +2515,108 @@ mod tests {
             AuthOutcome::RejectedNotMember(_) | AuthOutcome::RejectedResolutionFailed(_) => {}
             other => panic!("expected rejection for nonexistent group; got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unresolvable enrollment group — deny, and say why
+    // -----------------------------------------------------------------------
+
+    /// A group name that cannot exist on any host: `_` and a suffix no
+    /// provisioning path produces. Shared by the tests below so the "absent"
+    /// half of each assertion means the same thing everywhere.
+    const ABSENT_GROUP: &str = "_sandboxd_absent_group_fixture";
+
+    /// A uid comfortably above `SYSTEM_UID_FLOOR` that no host allocates, so
+    /// the classification below reaches the membership gate and then fails to
+    /// resolve — without depending on which uid runs the tests.
+    const UNRESOLVABLE_UID: u32 = 4_000_000_000;
+
+    /// The deny half: a group that does not exist denies, it does not admit.
+    ///
+    /// `uid_in_sandbox_group` returning `None` is what every caller treats as
+    /// "not a member". Pinning it keeps a future refactor from turning an
+    /// unresolvable group into a permissive default.
+    #[test]
+    fn absent_group_denies_membership() {
+        let own_uid = unsafe { libc::getuid() };
+        assert_eq!(
+            uid_in_sandbox_group(own_uid, ABSENT_GROUP),
+            None,
+            "an absent group must not resolve to a membership answer"
+        );
+    }
+
+    /// The same deny, end to end through the production classifier.
+    #[test]
+    fn absent_group_classifies_as_resolution_failed() {
+        assert_eq!(
+            classify_peer_uid(UNRESOLVABLE_UID, ABSENT_GROUP),
+            AuthOutcome::RejectedResolutionFailed(UNRESOLVABLE_UID),
+            "an unresolvable identity must be rejected, not admitted"
+        );
+    }
+
+    /// The diagnostic half: the denial names the group, says it is the group
+    /// rather than the caller that is wrong, and names the remedy.
+    ///
+    /// This is the part that regresses invisibly. A deny with no explanation
+    /// passes every behavioural test while being indistinguishable, in the
+    /// log, from a legitimate refusal of an unenrolled operator.
+    #[test]
+    fn absent_group_hint_names_group_and_remedy() {
+        let hint = resolution_failure_hint(UNRESOLVABLE_UID, ABSENT_GROUP);
+        assert!(
+            hint.contains(ABSENT_GROUP),
+            "hint must name the group that failed to resolve; got: {hint}"
+        );
+        assert!(
+            hint.contains("does not exist"),
+            "hint must say the group is absent, not merely that resolution failed; got: {hint}"
+        );
+        assert!(
+            hint.contains("every operator"),
+            "hint must say the fault is host-wide, not specific to this caller; got: {hint}"
+        );
+        assert!(
+            hint.contains("setup-darwin-sandboxd-user") && hint.contains("install.sh"),
+            "hint must name the remedy for both dev and production hosts; got: {hint}"
+        );
+    }
+
+    /// Positive control: when the group *does* exist, the hint must not blame
+    /// the group. Without this the test above passes on a hint hardcoded to
+    /// the group-missing message.
+    ///
+    /// `daemon` (uid 1 / gid 1) exists as both a user and a group on macOS and
+    /// on the Linux distributions this builds on; `root` is unusable here
+    /// because root's group on macOS is `wheel`.
+    #[test]
+    fn present_group_hint_does_not_blame_the_group() {
+        if group_name_to_gid("daemon").is_none() {
+            // No suitable fixture group on this host; the negative assertions
+            // below would be vacuous.
+            return;
+        }
+        let hint = resolution_failure_hint(UNRESOLVABLE_UID, "daemon");
+        assert!(
+            !hint.contains("does not exist"),
+            "hint must not claim an existing group is absent; got: {hint}"
+        );
+        assert!(
+            hint.contains(&UNRESOLVABLE_UID.to_string()),
+            "hint must point at the uid when the group resolves; got: {hint}"
+        );
+    }
+
+    /// The peer-cred sentinel is not a uid and must not be reported as one.
+    #[test]
+    fn peer_cred_sentinel_hint_blames_the_socket() {
+        let hint = resolution_failure_hint(u32::MAX, ABSENT_GROUP);
+        assert!(
+            hint.contains("peer credentials"),
+            "the peer_cred() failure sentinel must not be described as a uid \
+             or group problem; got: {hint}"
+        );
     }
 
     // -----------------------------------------------------------------------

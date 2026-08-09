@@ -882,7 +882,13 @@ pub const STAGED_SOCKET_VMNET_PATH: &str = "/Library/sandboxd/socket_vmnet";
 /// plus the account the installer actually *creates*, and fails when they
 /// disagree; that comparison, rather than a shared literal, is what keeps
 /// them from drifting.
-#[cfg(target_os = "macos")]
+///
+/// Rust code must use this constant rather than repeating the literal. The
+/// broker's enrollment gate does — the group it checks membership in and the
+/// group these plists name are the same identity, and a fourth declaration
+/// would be a fourth thing to keep in step. Not `cfg`-gated for that reason:
+/// `broker.rs` compiles on every platform even though the account is a macOS
+/// concept.
 pub const SANDBOXD_ACCOUNT: &str = "_sandboxd";
 
 /// Fixed sandboxd namespace UUID for per-slot network-identifier derivation.

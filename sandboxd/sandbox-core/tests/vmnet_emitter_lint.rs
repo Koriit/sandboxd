@@ -198,6 +198,48 @@ fn checker_rejects_an_installer_that_creates_a_different_account() {
     );
 }
 
+/// The broker's enrollment gate must not re-declare the account name.
+///
+/// The group `broker.rs` checks membership in and the account the plists name
+/// are one identity. A private literal there would be a fourth independent
+/// declaration of a name that has already drifted once — and the failure it
+/// produces is the least legible of the four: an unresolvable group denies
+/// every operator with nothing to distinguish that from a legitimate refusal.
+/// The checker does not read `broker.rs`, so this is the guard.
+#[test]
+fn broker_does_not_redeclare_the_account_name() {
+    let broker = repo_root().join("sandboxd/sandboxd/src/broker.rs");
+    let text = fs::read_to_string(&broker).expect("broker.rs must be readable");
+
+    // Comments and doc-comments may name the account freely — this is about
+    // declarations. A Rust string literal is the only form that compiles into
+    // a second source of truth.
+    let offenders: Vec<usize> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//") && line.contains("\"_sandboxd\"")
+        })
+        .map(|(i, _)| i + 1)
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "broker.rs re-declares the account name as a string literal at line(s) {offenders:?}; \
+         use `sandbox_core::network::SANDBOXD_ACCOUNT` (or the `SANDBOX_GROUP_NAME` alias) \
+         so the plists, the installer and the enrollment gate cannot drift apart"
+    );
+
+    // Non-tautological: the alias must actually be wired to the shared
+    // constant, or the assertion above would pass on a broker that had simply
+    // spelled the literal differently.
+    assert!(
+        text.contains("sandbox_core::network::SANDBOXD_ACCOUNT"),
+        "broker.rs must take its group name from the shared constant"
+    );
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
