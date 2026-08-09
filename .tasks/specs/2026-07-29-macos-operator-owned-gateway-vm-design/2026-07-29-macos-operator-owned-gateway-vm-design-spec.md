@@ -22,7 +22,11 @@ and assumes **no** prior knowledge of this codebase.
 - **[§1](#1-ownership-model-and-slot-identity)** and **[§2](#2-lifecycle-and-failure-modes)**
   are the design: what changes and why.
 - **[§3](#3-the-egress-validation-gate)** is a runnable procedure, not a
-  description. It is the go/no-go for everything after it.
+  description. It is the go/no-go for everything after it. **It has now been run, both
+  parts, and its result is two-sided: the enforcement substrate works; the admission control
+  does not.** Egress is still enforced when the gateway VM is operator-owned — the
+  decision survives — and the same runs reproduced §1.6's defect. Full result at §3.11; do
+  not carry away only the half that suits the direction you are heading.
 - **[§4](#4-phases)** breaks the work into seven independently actionable phases,
   each with its own acceptance criteria. **If you own one phase, go straight there**
   — each phase links back to the design sections it implements.
@@ -339,6 +343,12 @@ probe (§3.7) needs a purpose-made test-operator account in the **correct** grou
 another member to Apple's reserved `_sandbox` (gid 60) was considered and **rejected** —
 it deepens exactly the problem #85 describes. Fix #85, then create a dedicated
 test-operator account in the proper group.
+
+⚠️ **"Correct group" means two different things in this document, and conflating them once
+already produced a deadlocked gate.** *Here* it means **not gid 60** — a dedicated account in
+the shared `_sandboxd` satisfies what §3.7 needs, and that is what Part B ran with. The
+stronger sense — the account in **its own per-operator group** — is a **phase 1** acceptance
+criterion, because that group does not exist until phase 1 creates it.
 
 **The single-operator half of the gate does not need any of this** and can proceed on the
 host as it stands.
@@ -3175,10 +3185,13 @@ cross-operator slot probe (assertions 2 and 3), then the second-operator egress 
 (assertion 1). Part A's conclusion is unaffected by either.
 
 ⚠️ **"Part B complete" means the gate's measurement program is complete. It does not mean
-phase 0's Part B acceptance list is green** — two items there are not measurements and cannot
-be closed by running anything: the dedicated-account-in-the-proper-group sub-clause (deferred
-by design; the group does not exist until phase 1) and the issue #82 write-up. See §4 phase 0
-→ *Acceptance criteria — Part B*, which carries the arithmetic.
+phase 0's Part B acceptance list is green** — what remains there is not a measurement and
+cannot be closed by running anything: the **issue #82 write-up** is outstanding and blocked on
+the user's authorization, criterion B2 is **void** rather than met, and B1.b's plist reload
+carries a caveat only a real reboot on the user's host can clear. Separately, the
+dedicated-account criterion that used to sit here **moved to phase 1** — relocated, not
+satisfied. See §4 phase 0 → *Acceptance criteria — Part B*, which carries the arithmetic and
+all three denominators.
 
 | §3.7 assertion | Status | Where the evidence is |
 |---|---|---|
@@ -3249,6 +3262,14 @@ mandatory corrections. §3.8 gained a note for the class of red neither describe
 itself is wrong** — and the assertion-1 sitting then landed in that bucket, re-discovering
 §3.10 defect #1 (a SERVFAIL caused by injecting one of the three `inject_dnat` rulesets)
 in its own harness, self-catching it, fixing it and classifying the re-run.
+
+**One defect was in the spec's own assembly rather than in the procedure**, recorded here
+because it is the kind that recurs unnoticed: §4 phase 0's gate rule ("Part B gates phase 1's
+completion") was written over a Part B list containing a criterion — the dedicated account in
+its per-operator group — that **only phase 1 could satisfy**, so a literal reading deadlocked.
+Found by recomputing the acceptance list rather than by running anything. The criterion has
+been moved to phase 1's acceptance criteria and the gate rule now names what it actually gates.
+**This paragraph is a record, not an instruction** — the operative text is at §4.
 
 Local-only working records (untracked, not part of the repo's durable history):
 `.tasks/handoffs/20260809-cross-operator-slot-probe.md`,
@@ -3380,25 +3401,31 @@ exit**.
 **Acceptance criteria — Part B (gated on issue #85).** Status as of **2026-08-09**; see
 §3.11 for the run. `[x]` satisfied, `[~]` partially satisfied, `[ ]` outstanding.
 
-- [~] `_sandboxd` account exists, vmnet plists regenerated correctly **and reloaded**, and
-      a **dedicated test-operator account** exists in the proper group (not gid 60).
+- [x] `_sandboxd` account exists, vmnet plists regenerated correctly **and reloaded**.
+      ~~and a **dedicated test-operator account** exists in the proper group (not gid 60)~~
+      — **that third clause has moved to phase 1's acceptance criteria** (2026-08-09). It was
+      never satisfiable here: §1.6's per-operator group does not exist until phase 1, so
+      phase 0 had no "proper group" to enroll into. It is **relocated, not dropped, and not
+      weakened** — see the phase 1 criterion, which states it in stronger terms than this
+      clause did. The count below moves because the criterion moved, not because anything
+      became true.
   - [x] `_sandboxd` exists — uid/gid **310**, created during the repair.
   - [x] Plists regenerated **and reloaded** — all eight rewritten to name `_sandboxd` and
         carry a root `codesign --verify --strict` gate; a bootout/re-bootstrap simulation
         gave **8/8 `state = running`, `runs = 1`**, and the drift detector went from 8×
         `exit 3` to 8× `exit 0`. ⚠️ **Not verified across a real reboot** — the simulation is
         the strongest evidence available without one.
-  - [ ] **Dedicated test-operator account in the proper group — DEFERRED BY DESIGN, not an
-        omission.** `operator-b` (uid 528) exists and is loginable, and it *was* enrolled for
-        the run, but it was **de-enrolled afterwards** and is not a member now
-        (`dseditgroup -o checkmember` → not a member). More importantly, it was enrolled in
-        the **legacy shared `_sandboxd` group**, because §1.6's per-operator group **does not
-        exist until phase 1**. There is no "proper group" to be in yet, so nothing phase 0
-        could have done would satisfy this sub-clause. **Owners: M24-S7** creates the
-        per-operator groups and assigns ranges; **M24-S20** moves the slot sockets onto them
-        and is the session that must re-run the enrollment against the real group — it has
-        to, because inverting assertion 5 is its exit criterion. A later reader should file
-        this as scheduled work with named owners, **not** as something phase 0 skipped.
+  - **↗ Moved to phase 1** (2026-08-09) — *dedicated test-operator account in the proper
+        group*. Not a phase-0 sub-clause any more, so it is neither `[x]` nor `[ ]` here.
+        Host state as of this session, for whoever picks the criterion up: `operator-b`
+        (uid 528) exists and is loginable; it *was* enrolled for the run and was
+        **de-enrolled afterwards**, so it is not a member now (`dseditgroup -o checkmember`
+        → not a member); and the group it was briefly in was the **legacy shared
+        `_sandboxd`**, which is not the "proper group" this criterion means. **Owners:
+        M24-S7** creates the per-operator groups and assigns ranges — that is where the
+        criterion now lives; **M24-S20** moves the slot sockets onto those groups and must
+        re-run the enrollment against the real group, because inverting assertion 5 is its
+        exit criterion.
 - [ ] ~~That account has a provisioned LIMA_HOME. It cannot create one itself — the parent
       `{state_root}/{daemon_uid}/{op_uid}` is daemon-owned and provisioning is
       `ensure_operator_lima_home` (`lima.rs:574-660`), daemon-side only. Budget a
@@ -3427,36 +3454,46 @@ exit**.
   - [x] Assertion 3 / §3.6 assertion 5 (hostile VM) — **run; it succeeded**, which is the
         expected pre-fix result and is now the §1.6 reproduction. Recorded per the criterion.
 
-**Where Part B stands — recomputed 2026-08-09 after assertion 1, not just one row flipped.**
+**Where Part B stands — recomputed 2026-08-09, twice: once after assertion 1 ran, and again
+after B1.c was relocated to phase 1. Neither recomputation is a row flip.**
 
-| | Before assertion 1 | Now |
-|---|---|---|
-| Top-level criteria fully satisfied | **0 of 3** | **1 of 3** (the §3.7 probe) |
-| Sub-clauses satisfied, void B2 excluded from the denominator | **4 of 6** | **5 of 6** |
-| Sub-clauses satisfied, on the earlier denominator that counted void B2 | 4 of 7 | 5 of 7 |
-| Exit clauses | 1 `[~]`, 1 `[x]` *with a live warning* | 1 `[~]`, 1 `[x]` **clean** |
+| | Before assertion 1 | After assertion 1 | Now (B1.c relocated) |
+|---|---|---|---|
+| Top-level criteria fully satisfied | **0 of 3** | **1 of 3** | **2 of 2 live** (B2 is void and out of the denominator) |
+| Sub-clauses satisfied | **4 of 6** | **5 of 6** | **5 of 5** |
+| Sub-clauses, on the oldest denominator that still counted void B2 | 4 of 7 | 5 of 7 | — |
+| Exit clauses | 1 `[~]`, 1 `[x]` *with a live warning* | 1 `[~]`, 1 `[x]` **clean** | unchanged: 1 `[~]`, 1 `[x]` clean |
 
-**Nothing measurable is left.** Every §3.7 assertion has been run. The four things still
-standing between Part B and a clean sheet are all non-measurement, and they are **not the same
-kind of thing** — keep them distinguished:
+🚨 **The last column moves for two different reasons and only one of them is progress.**
+Assertion 1 made a criterion *true*. Relocating B1.c made a criterion *not Part B's* — the
+requirement is unchanged and is now stated more strongly in phase 1. Anyone comparing these
+counts across revisions is comparing different denominators, which is why all three columns
+are kept rather than the table being rewritten to the current one.
 
-1. **B1.c — deferred by design, structurally unsatisfiable in phase 0.** §1.6's per-operator
-   group does not exist until phase 1, so there is no "proper group" to enroll into. Owners
-   named above: **M24-S7** and **M24-S20**. File as scheduled work, never as a phase-0 gap.
-2. **B2 — void.** The premise was falsified; the criterion was **wrong**. It does not become
+**Nothing measurable is left.** Every §3.7 assertion has been run. What still stands between
+Part B and a clean sheet is entirely non-measurement, and the items are **not the same kind of
+thing** — keep them distinguished:
+
+1. **B2 — void.** The premise was falsified; the criterion was **wrong**. It does not become
    satisfied and it does not become a gap. Do not carry a budget for it and do not re-open it.
-3. **B1.b's reboot caveat — blocked on the user's host.** The bootout/re-bootstrap simulation
-   is the strongest evidence short of rebooting, and only the user can reboot. The observation
+2. **B1.b's reboot caveat — blocked on the user's host.** B1.b is `[x]`, and this is a caveat
+   on a satisfied clause rather than an unsatisfied one. The bootout/re-bootstrap simulation is
+   the strongest evidence short of rebooting, and only the user can reboot. The observation
    that would settle it: after a real reboot, 8/8 `state = running` with `runs = 1` and the
    drift detector at 8× `exit 0`.
-4. **Exit-1 / issue #82 — blocked on the user's authorization.** The write-up is drafted and
+3. **Exit-1 / issue #82 — blocked on the user's authorization.** The write-up is drafted and
    ready; the five local commits behind it are deliberately unpushed. Neither the comment nor
    the closing of issue #85 is posted without the user saying so.
 
-**So the honest one-liner is: Part B's measurement program is complete and its residue is
-administrative or scheduled.** That is a different statement from "Part B is green", and the
-difference matters — read item 1 as done and phase 1 loses the session that must re-run
-enrollment against the real group.
+**Formerly item 1 and no longer on this list: B1.c.** It moved to phase 1's acceptance criteria
+rather than being closed. Do not read its absence here as it having been satisfied or dropped —
+and do not re-add it to Part B as an apparent omission.
+
+**So the honest one-liner is: Part B's measurement program is complete, its live criteria are
+satisfied, and its residue is one void criterion, one caveat the user's host must clear, and
+one write-up the user must authorize.** That is still a different statement from "Part B is
+green" — Exit-1 is outstanding, so the list is not green, and it will not be green on anything
+this session can do.
 
 **Exit (both parts).**
 
@@ -3485,14 +3522,11 @@ property phase 1 exists to deliver. Starting phase 1 without Part B is acceptabl
 *finishing* it without Part B would mean shipping partitioning whose central claim is
 untested.
 
-⚠️ **Read this rule against the recomputed status above, because its live content has
-changed.** Part B's measurement program is complete, so this rule no longer holds anything
-back pending a run. Of its two remaining items, **one is circular by construction**: B1.c
-cannot be satisfied until phase 1 creates the per-operator groups, so "Part B gates phase 1's
-completion" must not be read as requiring B1.c *before* phase 1 finishes — the enrollment
-against the real group is **M24-S20's** job, and M24-S20 is where the criterion is discharged.
-The only item this rule genuinely still gates on is the issue #82 write-up. Stated explicitly
-because a literal reading produces a deadlock that was never intended.
+**What that gate now consists of, concretely: the issue #82 write-up, and nothing else.** Every
+§3.7 assertion has been run, so nothing here waits on a measurement. **The dedicated-account
+criterion is deliberately not in this gate** — it is a phase 1 acceptance criterion, because
+the per-operator group it names does not exist until phase 1 creates it; do not read its
+absence as an omission and do not move it back.
 
 Red → route per §3.8; only (c) kills the decision.
 
@@ -3569,10 +3603,23 @@ enforces, with slot identity no longer positional.
       fail-closed rule would have caused.
 - [ ] **Service accounts are excluded from the operator count** by an enumerable list, not a
       name prefix. Assert with the daemon account *and* `_sandboxd-test` present in a group.
+- [ ] **A dedicated test-operator account exists and is a member of its own per-operator
+      group** — the group this phase's enrollment path creates, **not** Apple's reserved
+      `_sandbox` (gid 60) and **not** the legacy shared `_sandboxd`. Assert it, do not assume
+      it: `dseditgroup -o checkmember` against the group the enrollment actually created, not
+      a reading of the script. The account must be **loginable with a uid above
+      `SYSTEM_UID_FLOOR` (500)** — a service account does not exercise the gate the broker
+      applies, so it corroborates and never establishes. Assert the inverse too: de-enrollment
+      removes the membership, per §1.6's requirement that de-enrollment ship with enrollment.
+      **Inherited from phase 0 Part B, where it was structurally unsatisfiable** — the
+      per-operator group does not exist until this phase creates it, so phase 0 had no proper
+      group to enroll into. This account is also the fixture §3.7's second-operator probe
+      re-runs against once the sockets move onto these groups; **M24-S20**'s exit requires that
+      re-run to produce the *inverted* result.
 - [ ] **Exercised where the daemon uid ≠ the operator uid.** The single-operator criterion
       above cannot discriminate on a host where the daemon *is* the operator, which is the
       reference host's shape — so it must be run in the production shape too, or it proves
-      nothing about production.
+      nothing about production. The dedicated account above is what makes this runnable.
 - [ ] **Restore shards correctly** (§2.1): sessions carrying `operator_uid` land in the
       right pool; a record lacking it is resolved via `owner_username`; and one where that
       resolution fails is **declined and surfaced in diagnostics**, not guessed and not
@@ -4440,7 +4487,7 @@ named, not here.
 | Quota model | **Superseded in part.** "First-claim-wins at VM creation" is withdrawn: ranges are assigned at enrollment. What survives is the *default* (a single-operator host gets the whole pool, so nothing regresses) and the two distinct error shapes | §1.3, §2.2 |
 | Gate harness form and lifetime | **A throwaway shell script**, executed once in phase 0 and **deleted at that phase's exit**; phase 6's retargeted e2e suite owns ongoing regression coverage, and a parallel bespoke harness would be a second system that can disagree with it | §3 *Form and lifetime*; phase 0 files + exit |
 | Per-operator gateway VM naming | **`sandboxd-gateway-<operator_uid>`** — keeps the greppable prefix, encodes the owner, structurally cannot match the `sandbox-<12hex>` session grammar; paired with an **explicit** reaper exclusion rather than reliance on the parse failing | §2.6; phase 4 files + criteria |
-| Which second uid plays "operator B" | **Fix issue #85 first**, then a dedicated test-operator account in the proper group; adding another member to Apple's reserved gid 60 was rejected as making #85 worse | §3.7; [Before you start](#before-you-start); phase 0 Part B |
+| Which second uid plays "operator B" | **Fix issue #85 first**, then a dedicated test-operator account in the proper group; adding another member to Apple's reserved gid 60 was rejected as making #85 worse. **The "own per-operator group" half of this is a phase 1 criterion, not phase 0's** — that group does not exist until phase 1 creates it, and Part B ran with a dedicated account in the shared `_sandboxd` | §3.7; [Before you start](#before-you-start); **phase 1 criteria** |
 | Does `interface:` pinning work on `socket:` networks | **Yes — verified**, and it is a real fd-level binding rather than a relabel. Brings two obligations with it: the generator must guard the `lima<slot>` correspondence itself (Lima does not), and `UNIX_PATH_MAX` bounds how deep a LIMA_HOME may sit | §1.4 fix 1 + fix 1a; §2.8; phase 1 criteria |
 | `shared:` export mechanism | **Operator-declared export roots** — neither per-session subtree export nor a blanket home export. The operator declares which roots are exportable; they are exported at VM creation and the Docker bind `src=` selects the subtree per session. A **generalisation of today's fixed `/tmp/sandbox-shared`**, not a new mechanism | §5.1; phase 5 |
 | Broker serialization mitigation | **Pipeline by `request_id`.** A stream-only fix leaves ~28 request/response Docker call sites queueing on a one-at-a-time connection. Protocol ordering is not the risk; **agent-side shared state is**, and auditing it is an explicit phase 2 work item | §2.5; phase 2 |
