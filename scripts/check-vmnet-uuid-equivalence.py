@@ -13,9 +13,16 @@ needs and this script — run in CI on macOS — extracts all three from source 
 fails when they disagree. That comparison, not a shared constant, is what keeps
 them from drifting.
 
+The three paths are also checked to still be *all* of them: every tracked file
+is scanned for the signatures of a plist emitter, and one that matches without
+being registered fails the run. Comparing three emitters proves nothing about a
+fourth nobody registered.
+
 What is compared
 ----------------
 
+* **Emitter inventory** — that no unregistered file emits these plists, and
+  that the known emitters still match the signatures used to find them.
 * **Daemon account name** — `SANDBOXD_ACCOUNT` / `DARWIN_SANDBOXD_ACCOUNT` /
   `_sandboxd_acct`, plus the account `install.sh` actually *creates* via `dscl`.
   A plist naming an account nobody creates installs cleanly and then kills the
@@ -69,6 +76,61 @@ EXPECTED = {
 NETWORK_RS = "sandboxd/sandbox-core/src/network.rs"
 MAKEFILE = "Makefile"
 INSTALL_SH = "scripts/install.sh"
+
+# ---------------------------------------------------------------------------
+# Emitter inventory — discovery, not enumeration
+# ---------------------------------------------------------------------------
+#
+# The three paths above are hardcoded, which is fine for *comparing* emitters
+# but useless for noticing a fourth one. A new shell or Python path that writes
+# these plists would simply not be read by this script, and the comparison
+# would keep passing while the new emitter drifted freely. That is the same
+# shape of failure this script exists to prevent: a green exit that means
+# nothing.
+#
+# So the file list is also checked the other way round. Every tracked file is
+# scanned for the signatures below, and anything that matches without being
+# registered here is a failure telling the author to register it.
+
+# A file that renders these plists gives itself away in one of two ways.
+#
+# `preamble` — the boot-time directory setup whose failure is the whole point
+# of #85. Matched by shape, not by exact bytes, so a reordered flag or a
+# changed mode still trips it.
+#
+# `plist-body` — building the launchd job itself: the vmnet label prefix and a
+# ProgramArguments array in the same file. This catches an emitter that changed
+# the preamble beyond recognition but still writes the job.
+SIGNATURES = {
+    "preamble": re.compile(r"install\s+-d\b[^\n]*/var/run/sandbox"),
+}
+SIG_VMNET_LABEL = re.compile(r"io\.sandboxd\.vmnet\.")
+SIG_PROGRAM_ARGUMENTS = re.compile(r"ProgramArguments")
+
+# Prose trees. Documentation about the pool quotes the preamble constantly —
+# `docs/guides/troubleshooting.md` explains the exact `install -d` failure — and
+# design notes reproduce whole plists. Scanning them would make this check
+# nothing but noise, and an emitter is not going to live in a Markdown tree.
+PROSE_DIRS = ("docs", ".tasks", ".claude")
+
+# Every file allowed to match a signature, and why. Adding a path here is the
+# deliberate act of registering an emitter; a reviewer sees it in the diff.
+REGISTERED = {
+    NETWORK_RS: "emitter: render_vmnet_plist",
+    MAKEFILE: "emitter: setup-darwin-vmnet-plists",
+    INSTALL_SH: "emitter: install-vmnet-plists step",
+    "scripts/check-vmnet-uuid-equivalence.py": (
+        "not an emitter: this script, which quotes the fragments it checks for"
+    ),
+    "sandboxd/sandbox-core/tests/vmnet_emitter_lint.rs": (
+        "not an emitter: the test that runs this script and renders fixtures"
+    ),
+}
+
+# The subset of the above that must actually still look like emitters. If one
+# of these stops matching every signature, the signature has gone stale and the
+# scan has quietly stopped detecting the thing it exists to detect.
+REGISTERED_EMITTERS = (NETWORK_RS, MAKEFILE, INSTALL_SH)
 
 # Canonical placeholders the three wrapper templates are normalized to.
 PH_ACCOUNT = "{account}"
@@ -378,6 +440,116 @@ def check_three_way(rust: dict, make: dict, sh: dict) -> int:
     return failures
 
 
+def _candidate_files(root: pathlib.Path):
+    """Every file worth scanning, relative to `root`.
+
+    Prefers git, which excludes build output and captured test logs for free —
+    `build/` and `tests/install-e2e/logs/` are both gitignored, and both hold
+    files that match the signatures without being emitters (a copy of the
+    installer, and captured `launchctl print` transcripts). Untracked files are
+    included as long as they are not ignored, so a new emitter trips this
+    before it is even staged. Falls back to a filesystem walk when `root` is
+    not a git repository, which is how the Rust lint drives this script against
+    a perturbed temporary copy.
+    """
+    try:
+        names = []
+        for extra in (["ls-files", "-z"], ["ls-files", "--others", "--exclude-standard", "-z"]):
+            out = subprocess.run(
+                ["git", "-C", str(root), *extra],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            names.extend(n for n in out.split("\0") if n)
+        if names:
+            return names
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    names = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if any(part in (".git", "target", ".venv", "node_modules") for part in rel.parts):
+            continue
+        names.append(str(rel))
+    return names
+
+
+def discover_plist_emitters(root: pathlib.Path) -> dict:
+    """Map each file that looks like a plist emitter to the signatures it matched."""
+    found = {}
+    for name in _candidate_files(root):
+        if name.split("/", 1)[0] in PROSE_DIRS:
+            continue
+        try:
+            text = (root / name).read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        matched = [label for label, rx in SIGNATURES.items() if rx.search(text)]
+        if SIG_VMNET_LABEL.search(text) and SIG_PROGRAM_ARGUMENTS.search(text):
+            matched.append("plist-body")
+        if matched:
+            found[name] = sorted(matched)
+    return found
+
+
+def check_emitter_inventory(root: pathlib.Path) -> int:
+    """Fail on any unregistered emitter, and on any signature that has gone stale."""
+    print()
+    print("=== Emitter inventory (discovered, not enumerated) ===")
+    found = discover_plist_emitters(root)
+    for name in sorted(found):
+        role = REGISTERED.get(name, "UNREGISTERED")
+        print(f"     {name}: {', '.join(found[name])}  [{role}]")
+
+    failures = 0
+
+    unregistered = sorted(set(found) - set(REGISTERED))
+    if unregistered:
+        print(
+            "FAIL: these files look like they emit the vmnet launchd plists but are "
+            "not registered in this script:\n"
+            + "".join(f"  - {name} ({', '.join(found[name])})\n" for name in unregistered)
+            + "  Nothing compares an unregistered emitter against the others, so it can "
+            "name a\n"
+            "  different account or exec a different binary and every check here will "
+            "still\n"
+            "  pass. Add each to REGISTERED with the reason — as an emitter if it writes "
+            "the\n"
+            "  plists (and give it an extract_* function so it is actually compared), or "
+            "with\n"
+            "  a note saying why it merely mentions them.",
+            file=sys.stderr,
+        )
+        failures += 1
+
+    # The other direction: a signature that no longer matches a known emitter
+    # is a scan that has stopped scanning. Without this, narrowing a signature
+    # into uselessness would make the check above pass trivially.
+    expected_signatures = set(SIGNATURES) | {"plist-body"}
+    for name in REGISTERED_EMITTERS:
+        if not (root / name).exists():
+            continue  # perturbed-copy runs carry only a subset of the tree
+        missing = expected_signatures - set(found.get(name, []))
+        if missing:
+            print(
+                f"FAIL: {name} is a known emitter but no longer matches "
+                f"{sorted(missing)}. Either the emitter changed shape or the signature "
+                "was narrowed; in both cases this scan can no longer find a fourth "
+                "emitter and must be repaired, not relaxed.",
+                file=sys.stderr,
+            )
+            failures += 1
+
+    if not failures:
+        print(
+            f"OK   {len(found)} file(s) match an emitter signature, all registered; "
+            f"all {len(REGISTERED_EMITTERS)} known emitters still match every signature"
+        )
+    return failures
+
+
 def check_wrapper_structure(template: str, account: str, staged: str) -> int:
     """The wrapper must still contain the parts that make it safe.
 
@@ -488,6 +660,7 @@ def main() -> int:
 
     slots = list(range(args.slots))
     failures = check_uuids(slots)
+    failures += check_emitter_inventory(root)
     failures += check_three_way(rust, make, sh)
     failures += check_wrapper_structure(rust["wrapper"], rust["account"], rust["staged"])
     try:

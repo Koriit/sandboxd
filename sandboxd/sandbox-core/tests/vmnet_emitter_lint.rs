@@ -198,6 +198,174 @@ fn checker_rejects_an_installer_that_creates_a_different_account() {
     );
 }
 
+/// A fourth emitter, in a file the checker was never told about, must fail.
+///
+/// The three-way comparison is only as good as its inventory: it reads three
+/// hardcoded paths, so an emitter added in a *new* file would not be compared
+/// against anything and could name any account it liked while every check
+/// still passed. The checker discovers candidates by signature for that
+/// reason; this pins the discovery.
+#[test]
+fn checker_rejects_an_unregistered_fourth_emitter() {
+    let tmp = perturbed_repo(&[]);
+    let planted = tmp.path().join("scripts/emit-vmnet-plists.sh");
+    fs::write(
+        &planted,
+        // Both signatures: the boot-time preamble, and a vmnet-labelled job
+        // with a ProgramArguments array.
+        "#!/bin/sh\n\
+         # A fourth emitter nobody registered.\n\
+         _label=\"io.sandboxd.vmnet.$1\"\n\
+         printf '%s' \"<key>ProgramArguments</key>\"\n\
+         printf '%s' \"install -d -o _nobody -g _nobody -m 0750 /var/run/sandbox\"\n",
+    )
+    .expect("plant a fourth emitter");
+
+    let output = run_checker(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a new file emitting the vmnet plists went unnoticed.\n{}",
+        describe(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("scripts/emit-vmnet-plists.sh"),
+        "the failure must name the unregistered file so its author knows what to \
+         register.\n{}",
+        describe(&output)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The duplicated `launchctl print` parser
+// ---------------------------------------------------------------------------
+
+/// Undo an unquoted heredoc's escaping.
+///
+/// `scripts/install.sh` writes its privileged half into a `<<PRIV_SCRIPT_EOF`
+/// heredoc with no quoting, so the shell strips the backslash before `$`, a
+/// backtick, and another backslash before the child ever sees the text. Every
+/// other backslash — `\{`, `\t`, `\}` in the awk program — is passed through
+/// untouched. Reproducing that rule here rather than special-casing `\$` keeps
+/// the comparison honest if the parser ever grows a backtick.
+fn unescape_unquoted_heredoc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('$') | Some('`') | Some('\\') => {
+                    out.push(chars.next().expect("peeked"));
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Pull the body of a single-quoted `awk '…'` program out of a shell script.
+///
+/// Scans from `anchor` (or the top of the file) for a line ending in `awk '`,
+/// then takes every following line until one that begins the closing quote.
+/// The awk program contains no single quote of its own, so the terminator is
+/// unambiguous.
+///
+/// Lines come back trimmed: the two copies sit at different nesting depths and
+/// awk does not care about leading whitespace, so indentation is the one
+/// difference that must not fail the comparison.
+fn extract_awk_program(rel: &str, anchor: Option<&str>) -> Vec<String> {
+    let text =
+        fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let lines: Vec<&str> = text.lines().collect();
+
+    let start = match anchor {
+        Some(a) => lines
+            .iter()
+            .position(|l| l.contains(a))
+            .unwrap_or_else(|| panic!("{rel}: anchor not found, the extractor is stale: {a}")),
+        None => 0,
+    };
+    let open = lines[start..]
+        .iter()
+        .position(|l| l.trim_end().ends_with("awk '"))
+        .map(|i| start + i)
+        .unwrap_or_else(|| panic!("{rel}: no `awk '` opener found after the anchor"));
+
+    let mut body = Vec::new();
+    for line in &lines[open + 1..] {
+        if line.trim_start().starts_with('\'') {
+            return body;
+        }
+        body.push(line.trim().to_string());
+    }
+    panic!(
+        "{rel}: unterminated awk program starting at line {}",
+        open + 1
+    );
+}
+
+/// The two copies of the `launchctl print` argv parser must stay identical.
+///
+/// `scripts/darwin-vmnet-drift.sh` and `scripts/install.sh` each carry the same
+/// awk program. The duplication is forced — a `curl | sh` installer cannot
+/// source a script out of the repo — but nothing except a comment held the two
+/// in step, and only the drift script's copy was under test.
+///
+/// An edit that lands on one copy and misses the other breaks the *installer's*
+/// drift detection, and breaks it in the worst available way: the parser
+/// silently yields no argv, the installer reads that as "not loaded", and a
+/// stale definition survives a run that reports success. That is #85's own
+/// pathology reproduced inside the mechanism built to prevent it, on the path a
+/// fresh production host actually takes.
+#[test]
+fn launchctl_argv_parser_is_identical_in_both_copies() {
+    const DRIFT: &str = "scripts/darwin-vmnet-drift.sh";
+    const INSTALL: &str = "scripts/install.sh";
+
+    let drift = extract_awk_program(DRIFT, None);
+    let install: Vec<String> = extract_awk_program(INSTALL, Some("_vmnet_loaded_argv() {"))
+        .iter()
+        .map(|l| unescape_unquoted_heredoc(l))
+        .collect();
+
+    // Guard the extractor itself. If either side came back empty, or lost the
+    // brace rule that the whole parser turns on, the comparison below could
+    // pass while comparing nothing.
+    for (rel, body) in [(DRIFT, &drift), (INSTALL, &install)] {
+        assert!(
+            !body.is_empty(),
+            "{rel}: extracted an empty awk program — the extractor is stale"
+        );
+        assert!(
+            body.iter().any(|l| l.contains("in_args = 1")),
+            "{rel}: extracted text is not the argv parser:\n{}",
+            body.join("\n")
+        );
+        assert!(
+            body.iter().any(|l| l.contains(r"\}")),
+            "{rel}: the closing-brace rule is gone. The argv contains a literal `}}` \
+             (the codesign guard's `|| {{ …; exit 1; }}`), so the block terminator must \
+             match `}}` only when alone on its line:\n{}",
+            body.join("\n")
+        );
+    }
+
+    assert_eq!(
+        drift,
+        install,
+        "the two copies of the launchctl argv parser have diverged.\n\
+         \n  {DRIFT}:\n{}\n\n  {INSTALL} (heredoc-unescaped):\n{}\n\n\
+         Whichever was edited, the other still ships. {INSTALL} is the path a fresh \
+         production host takes, and a parser that yields nothing there reads as \
+         \"not loaded\" — the installer then reports success over a stale definition.",
+        drift.join("\n"),
+        install.join("\n"),
+    );
+}
+
 /// The broker's enrollment gate must not re-declare the account name.
 ///
 /// The group `broker.rs` checks membership in and the account the plists name
