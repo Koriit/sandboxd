@@ -746,24 +746,36 @@ pub(crate) fn is_workspace_path_char(ch: char) -> bool {
 /// it, solve the thing that motivated the uniform rule: a session's path is
 /// parsed before its backend is chosen.
 ///
-/// # Depth is not uniform across the spellings it rejects
+/// # Depth is thinner than it looks — count refusals, not layers
 ///
-/// "Defence in depth" holds for `..` and not for the rest, so do not read
-/// the layering as flat:
+/// Only a check that can fail on its own counts. By that test:
 ///
-/// - `..` is refused three times independently — here, by
-///   [`crate::lite_macos::validate_shared_path`]'s component scan, and by
-///   the shared-root containment check that scan protects.
-/// - `.` and `//` are refused **once**, here, and nowhere else.
-///   `Path::components()` normalises them away, so the later layers cannot
+/// - `..` is refused **twice**, and only on the macOS lite path: here, and
+///   by [`crate::lite_macos::validate_shared_path`]'s component scan. That
+///   scan has a single production caller, the lite session-create handler,
+///   so on the Lima and container backends `..` is refused **once** — here.
+/// - `.` and `//` are refused **once** everywhere, here.
+///   `Path::components()` normalises them away, so no later layer can
 ///   observe them even in principle.
 ///
-/// No redundant check is wanted for the second group: a component that
+/// The shared-root containment check is **not** a third refusal, despite
+/// sitting downstream of both. It accepts `..`: `strip_prefix` matches a
+/// `ParentDir` as an ordinary component, so `<root>/../../var/run` strips
+/// cleanly and is judged inside the root. The test at
+/// `lite_macos.rs::validate_shared_path_rejects_parent_dir_escape` asserts
+/// exactly that, as its stated premise. Containment decides *outside-root*
+/// and is unsound against `..` alone; the component scan in front of it is
+/// what makes it sound. It is the layer being protected, not one that
+/// protects.
+///
+/// No redundant check is wanted for `.` and `//`: a component that
 /// normalises away cannot change where the path resolves, which is why
-/// refusing it is a legibility measure rather than a containment one. The
-/// asymmetry is recorded because it decides what breaks if the choke point
-/// is ever bypassed — `..` would still be caught downstream; `.` and `//`
-/// would not be caught at all.
+/// refusing it is a legibility measure rather than a containment one.
+///
+/// The counts are recorded because they decide what survives if this parser
+/// is ever bypassed. On the macOS lite path `..` would still be caught by
+/// the scan. On every other backend, and for `.` and `//` everywhere,
+/// nothing downstream catches anything — this function is all there is.
 fn validate_workspace_path_shape(path: &str, mode_label: &str, side: &str) -> Result<(), String> {
     for (index, segment) in path.split('/').enumerate() {
         // The leading empty segment is the root marker of an absolute path,

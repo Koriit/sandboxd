@@ -84,6 +84,9 @@ Notes:
 
 - `--repo` and `--workspace` are mutually exclusive.
 - `--workspace` must use the `shared:<absolute-path>` format. The path must exist.
+- Both the host and the guest path must be spelled as already resolved. A `..`, `.`, or empty (`//`) component is refused — `shared:/tmp/proj/../proj`, `shared:/tmp/proj/./x`, and `shared:/tmp//proj` are errors even though `shared:/tmp/proj` is accepted. (Trailing slashes are stripped first, so `shared:/tmp/proj/` is fine.) The path is not resolved before it reaches the backend, so a `..` can name a directory the daemon's containment check treated as excluded. `cd <dir> && pwd -P` prints an accepted spelling.
+- Both paths may contain only letters, digits, space, and `/ - _ . + @ ~ :`. Anything else is refused — a directory named `foo,bar` cannot be used as a workspace. Paths are interpolated into backend mount configuration, where `,` and `=` are Docker `--mount` option syntax and `"` and `\` are Lima YAML string syntax, so a path carrying them could contribute mount options the daemon never wrote. Rename the directory, stage a copy under an accepted name, or use `--repo`, which never names a host path.
+- Both rules are narrower than earlier releases, which accepted `..`, `.`, `//`, and arbitrary characters. A workspace path that used to work may now be rejected; the error names the offending component or character and the ways forward.
 - `--boot-cmd` runs as `bash -c "<cmd>"` via the guest agent after all other provisioning.
 - `--no-hardening` disables QEMU device lockdown and cgroup resource limits. Use for debugging only.
 

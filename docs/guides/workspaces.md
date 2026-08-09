@@ -115,7 +115,11 @@ Constraints:
 
 - The host path must be absolute (after `~` expansion) and must already exist.
 - The guest path must be absolute. A leading `~` on the guest token is rewritten to `/home/sandbox` literally.
+- Both paths must be spelled as already resolved. A `..`, `.`, or empty (`//`) component is refused: `shared:/tmp/proj/../proj`, `shared:/tmp/proj/./x`, and `shared:/tmp//proj` are errors, though `shared:/tmp/proj` is accepted. Trailing slashes are stripped before the check, so `shared:/tmp/proj/` is fine. Neither the CLI nor the daemon resolves the path before handing it to the backend — containment against the shared root is checked lexically on the host while the mount source is resolved later, inside the gateway VM, so a `..` can reach a directory the containment check treated as excluded. Run `cd <dir> && pwd -P` to print a spelling that is accepted.
+- Both paths may contain only letters, digits, space, and `/ - _ . + @ ~ :`. A directory named `foo,bar` cannot be used as a workspace, on either backend. The path is interpolated into backend mount configuration — a Docker `--mount` option list, which is split on `,` and `=`, and a Lima YAML template, where `"` and `\` are string syntax — so a path carrying one of those characters could contribute mount options or YAML keys the daemon never wrote. The rule is the same on both backends rather than per-backend, so it refuses slightly more than either sink strictly needs: a `,` is harmless to Lima and is refused there too.
 - `--workspace` and `--repo` are mutually exclusive.
+
+Both spelling rules are narrower than earlier releases, which accepted `..`, `.`, `//`, and arbitrary characters in either path. A workspace invocation that used to work may now be rejected. The error names the offending component or character, why it is refused, and three ways forward: rename the directory, stage a copy under an accepted name, or use `--repo` (or `clone:`), which never names a host path. Note that the character rule applies to the *path*, not to your files — a directory named `src` containing a file named `a,b` mounts normally.
 
 Verify the mount, substituting your chosen guest path:
 
