@@ -162,6 +162,16 @@ pub fn translate_shared_path(
 /// `<root>/../../var/run` strips cleanly and rejoins to a path that resolves
 /// outside the root once the *VM* resolves it. Hence the component check
 /// below — it is what makes the lexical prefix test mean containment.
+///
+/// Scope of that check: `Path::components()` normalises interior `.` and
+/// repeated separators away before this function ever sees them, so on an
+/// absolute path `..` is the only non-canonical component it *can* observe.
+/// That is sufficient here, because `..` is also the only one that changes
+/// where the path resolves. The other spellings are rejected upstream by
+/// `WorkspaceMode::parse_flag`, which inspects the raw string and can still
+/// see them; do not read the `CurDir` arm below as this function covering
+/// them — it fires only for a relative path, which cannot be contained by any
+/// root and is rejected as absoluteness upstream.
 pub fn validate_shared_path(host_path: &Path, shared_root: &Path) -> Result<(), SharedPathError> {
     if let Some(component) = host_path.components().find_map(|c| match c {
         std::path::Component::ParentDir => Some(".."),
@@ -193,8 +203,11 @@ pub enum SharedPathError {
         host_path: PathBuf,
         shared_root: PathBuf,
     },
-    /// The requested host path contains a `..` or `.` component, so a lexical
-    /// containment check cannot decide where it actually points.
+    /// The requested host path contains a component that makes a lexical
+    /// containment check unable to decide where it actually points. On the
+    /// absolute paths this backend receives that means `..`; see
+    /// [`validate_shared_path`] for why the other non-canonical spellings are
+    /// not visible here and are rejected upstream instead.
     NonCanonicalComponent {
         host_path: PathBuf,
         shared_root: PathBuf,
@@ -512,6 +525,24 @@ mod tests {
             "premise: `..` passes strip_prefix, which is why an explicit \
              component check is required"
         );
+
+        // Second premise, and the reason the parser checks the raw string
+        // rather than delegating here: `components()` normalises interior `.`
+        // and `//` away, so `..` is the only non-canonical component this
+        // function can observe. If that ever changes, the division of labour
+        // documented on `validate_shared_path` needs rewriting.
+        for normalised in ["/tmp/sandbox-shared/./x", "/tmp/sandbox-shared//x"] {
+            assert!(
+                !Path::new(normalised)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::CurDir)),
+                "premise: {normalised} has no CurDir component to find"
+            );
+            assert!(
+                validate_shared_path(Path::new(normalised), root).is_ok(),
+                "{normalised} is accepted here by design — the parser rejects it"
+            );
+        }
 
         let err = validate_shared_path(host, root).expect_err("`..` escape must be rejected");
         match &err {
