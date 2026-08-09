@@ -507,6 +507,8 @@ Multiple `[sudo]` announce lines do not mean multiple password prompts: `sudo` c
 make setup-dev-env
 ```
 
+**Run it as yourself, not under `sudo`.** The target refuses to start as root and tells you what to run instead. Individual steps invoke `sudo` for the specific commands that need it, which is why the run as a whole must not be privileged: under `sudo` the cargo artifacts and every operator-owned path the run creates would land owned by root, and the steps that grant *you* access — group membership, the e2e sudoers fragment — would have no operator to name, since `sudo` overwrites `$USER` with `root`. Those steps refuse individually too, so invoking one of them directly under `sudo` fails the same way rather than quietly doing nothing.
+
 This composes the sub-targets below. Each is independently runnable if you only need to (re)apply one step:
 
 | Sub-target                             | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                           |

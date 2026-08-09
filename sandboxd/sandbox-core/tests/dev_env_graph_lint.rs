@@ -19,6 +19,14 @@
 //! success and silently did not configure the host. These tests pin both
 //! halves: the edges that must be declared, and the absence of the
 //! warn-then-skip shape anywhere in the Makefile.
+//!
+//! A third variant of the same defect has nothing to do with ordering. The
+//! steps that enroll the *invoking operator* read `$USER` to learn who that is,
+//! and under `sudo make` they get `root`. Skipping in that case is the same
+//! trap: no membership is granted, no sudoers fragment is written, and the run
+//! still reports success. The remaining tests pin the refusal — once at the
+//! `setup-dev-env` entry point, and once per step for the direct invocation
+//! that bypasses it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -210,11 +218,33 @@ fn setup_steps_declare_the_producers_they_probe_for() {
     );
 }
 
+/// Catches the literal `WARNING` + `exit 0` shape, and only that.
+///
+/// It is not a total detector for swallowed failures. A recipe can still report
+/// success without doing its work by printing something other than `WARNING`
+/// (`echo "skipping …"`), by ending a command in `|| true`, by prefixing the
+/// recipe line with `-`, or by discarding stderr. Widening the pattern to reach
+/// those trades false negatives for false positives — several are legitimate in
+/// cleanup and probe recipes — so the line is drawn here deliberately. Anyone
+/// extending this should know which edge they are standing on.
 #[test]
 fn no_setup_step_warns_and_then_reports_success() {
     let text = makefile();
+    let lines = logical_lines(&text);
 
-    let offenders: Vec<String> = logical_lines(&text)
+    // Guard the extractor before trusting it, for the same reason the edge lint
+    // does: this assertion is satisfied by finding nothing, so a fold that
+    // returned nothing would pass it silently. Sharing `logical_lines` with that
+    // lint is not protection — that only holds while both tests keep using the
+    // same helper, and it disappears without a failure the moment one stops.
+    assert!(
+        lines.len() > 500,
+        "folded only {} logical lines out of the Makefile — the line folder is \
+         broken, and a broken folder makes this lint vacuous rather than failing",
+        lines.len()
+    );
+
+    let offenders: Vec<String> = lines
         .into_iter()
         .filter(|(_, line)| line.starts_with('\t'))
         .filter(|(_, line)| line.contains("WARNING") && line.contains("exit 0"))
@@ -234,5 +264,105 @@ fn no_setup_step_warns_and_then_reports_success() {
          nothing to do — say that plainly instead of calling it a WARNING, so \
          the line does not read as a swallowed failure.",
         offenders.join("\n  ")
+    );
+}
+
+/// Recipe lines that decide what to do when `$USER` is absent or `root`.
+///
+/// Discovered rather than listed: a new step that enrolls the operator picks up
+/// the same guard for free, and one that is deleted does not leave a stale
+/// entry behind. The shell spelling is stable across all of them.
+fn operator_identity_branches(text: &str) -> Vec<(usize, String)> {
+    logical_lines(text)
+        .into_iter()
+        .filter(|(_, line)| line.starts_with('\t'))
+        .filter(|(_, line)| line.contains(r#"[ "$$USER" = "root" ]"#))
+        .collect()
+}
+
+#[test]
+fn operator_enrolling_steps_refuse_instead_of_skipping_when_there_is_no_operator() {
+    let text = makefile();
+    let branches = operator_identity_branches(&text);
+
+    // Anti-vacuous floor. The assertion below is "every match does X", which a
+    // matcher that finds nothing passes trivially. This is a floor, not a pinned
+    // count — deleting one of these steps should not fail the test, but a
+    // matcher that stops matching should.
+    assert!(
+        branches.len() >= 4,
+        "found only {} recipe branches testing $USER for root/empty — the matcher \
+         has stopped matching, which would make the assertion below vacuous",
+        branches.len()
+    );
+
+    let offenders: Vec<String> = branches
+        .iter()
+        .filter(|(_, line)| !line.contains("no_operator_identity"))
+        .map(|(lineno, line)| {
+            let excerpt: String = line.trim().chars().take(140).collect();
+            format!("Makefile:{lineno}: {excerpt}...")
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "these steps enroll the invoking operator but do not route the \
+         no-operator case through $(call no_operator_identity,<target>):\n  {}\n\n\
+         Printing `✓ already configured … skipped (no non-root $USER set)` here \
+         is a green line for an effect that did not happen — the operator never \
+         joins the group, and it resurfaces later as an unreachable daemon \
+         socket or a sudo password prompt mid-e2e-run. Fail instead, and use the \
+         shared helper so all of these agree on what the operator is told to do \
+         next.",
+        offenders.join("\n  ")
+    );
+}
+
+/// The pieces of the entry-point refusal, and why each one carries weight.
+const ROOT_REFUSAL_REQUIREMENTS: &[(&str, &str)] = &[
+    (
+        "ifeq ($(shell id -u),0)",
+        "the guard must key on the real uid, not on $USER — `sudo -E make` \
+         preserves $USER while still running as root",
+    ),
+    (
+        "$(error $(DEV_ENV_ROOT_REFUSAL))",
+        "it must be a parse-time $(error): make runs a target's prerequisites \
+         before its recipe, so a check inside the setup-dev-env recipe would \
+         fire only after the whole run had already happened",
+    ),
+    (
+        "$(filter setup-dev-env,$(DEV_ENV_GOALS))",
+        "it must be gated on the goal, so that unrelated targets — `make test` \
+         in a root container, say — stay runnable as root",
+    ),
+    (
+        "sudo -u $(SUDO_USER) make setup-dev-env",
+        "the refusal must name the operator concretely from $SUDO_USER rather \
+         than saying `do not run as root` and leaving them to work it out",
+    ),
+];
+
+#[test]
+fn setup_dev_env_refuses_to_run_as_root() {
+    let text = makefile();
+
+    let missing: Vec<String> = ROOT_REFUSAL_REQUIREMENTS
+        .iter()
+        .filter(|(needle, _)| !text.contains(*needle))
+        .map(|(needle, why)| format!("`{needle}` is gone.\n     It was there because {why}."))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "the setup-dev-env root refusal has been weakened:\n  - {}\n\n\
+         Running the whole setup under sudo leaves cargo artifacts and every \
+         operator-owned path it creates owned by root, and gives the \
+         operator-enrolling steps no operator to enroll. Falling back to \
+         $SUDO_USER instead of refusing would make a root-invoked run look \
+         supported while staying broken in the ways the fallback does not \
+         address.",
+        missing.join("\n  - ")
     );
 }

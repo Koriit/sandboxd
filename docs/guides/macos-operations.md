@@ -63,7 +63,9 @@ sandboxd; with nothing running, startup rebuilds the gateway to the new NIC
 count. A resize also requires the root-owned vmnet daemon set to match the new
 size; if it does not, startup logs that requirement and again keeps the
 current pool rather than rebuilding. Re-provision the daemon set with the
-privileged setup step and restart sandboxd once more:
+setup step — run it as yourself, not under `sudo`; it invokes `sudo` for the
+privileged commands it needs and refuses to start as root — and restart
+sandboxd once more:
 
 ```
 make setup-dev-env DARWIN_VMNET_SLOTS=<n>

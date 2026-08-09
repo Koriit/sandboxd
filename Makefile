@@ -555,6 +555,42 @@ DARWIN_LAUNCH_DAEMONS_DIR   := /Library/LaunchDaemons
 # Stamp dir for Darwin-specific steps (reuse the same stamp root as Linux).
 DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 
+# no_operator_identity — the failure branch shared by every setup step that
+# records the *invoking* operator: a group membership, or a sudoers fragment
+# naming them. Those steps read `$USER`, and when it is empty or `root` there is
+# nobody to record.
+#
+# They used to print `✓ already configured … skipped (no non-root $USER set)` and
+# carry on. That is a green line for an effect that did not happen: the operator
+# never joins the group, and the failure resurfaces much later as the daemon
+# socket being unreachable, or as sudo prompting for a password in the middle of
+# an e2e run. Every one of them now fails here instead.
+#
+# Factored into one definition because the six call sites must agree on what the
+# operator is told to do next; six hand-maintained copies of a remediation
+# message drift, and a stale one is worse than none. $(1) is the make target to
+# name in the remedy, so the message is runnable as printed.
+#
+# The remedy reads $SUDO_USER because that is where the real operator's name
+# survives when sudo overwrites $USER — the information needed to fix this is
+# already in the environment, and a user who hits this should not have to work
+# out what to type.
+define no_operator_identity
+echo "ERROR: no operator identity to record (USER='$$USER', uid=$$(id -u))."; \
+echo "  This step grants the invoking operator access — a group membership or a"; \
+echo "  sudoers fragment naming them. Run as root there is nobody to name, and the"; \
+echo "  access the rest of setup assumes silently never gets granted."; \
+if [ -n "$${SUDO_USER:-}" ] && [ "$${SUDO_USER}" != "root" ]; then \
+  echo "  Re-run as:  sudo -u $${SUDO_USER} make $(1)"; \
+  echo "  or without sudo entirely:  make $(1)"; \
+else \
+  echo "  Re-run as your own login user, without sudo:  make $(1)"; \
+fi; \
+echo "  The step invokes sudo itself for the one privileged command it needs, so it"; \
+echo "  does not need to be run under sudo as a whole."; \
+exit 1
+endef
+
 # `setup-dev-env` dispatches to the OS-appropriate sub-steps.
 #
 # Linux: the existing setcap-helper, bridge-conf, users-conf, qemu-bridge-helper,
@@ -579,6 +615,74 @@ DARWIN_STAMPS_DIR           := sandboxd/target/.dev-env-stamps
 # done nothing, and setup-dev-env still ends in `✓ complete`.
 #
 # Both platforms install the sandbox-guest binary (sandboxd stages it into VMs).
+#
+# ---------------------------------------------------------------------------
+# `make setup-dev-env` refuses to run as root.
+# ---------------------------------------------------------------------------
+#
+# Not because of any single step, but because the run as a whole is wrong under
+# root: it builds cargo artifacts into `sandboxd/target/`, and every
+# operator-owned path it touches gets created with root as the owner. The
+# operator then hits permission errors on their own workspace, far from here.
+#
+# Three steps have a sharper version of the same problem — they enroll the
+# invoking operator, read `$USER` to find out who that is, and get `root`. The
+# tempting fix is to fall back to `$SUDO_USER` in those steps. That is the wrong
+# trade: it would make a root-invoked run *look* supported while leaving the
+# root-owned `target/` and the wrong-owner paths exactly as broken, which is
+# precisely the "green exit that does not imply the effect" shape the rest of
+# this section exists to eliminate. `scripts/install.sh` does take the
+# `$SUDO_USER` fallback (`detect_operator`), and can: privileged work is its
+# entire job, it writes no build artifacts, and it drops back to the operator
+# with an explicit `sudo -u "$OPERATOR_NAME"` for the unprivileged parts. This
+# Makefile has none of that machinery, so it declines the invocation instead.
+#
+# Refusing at the entry point covers all of the affected steps on both platforms
+# with one guard, rather than N fallbacks each guessing at the operator's name.
+#
+# It is a parse-time `$(error)` rather than a check in the recipe because make
+# runs a target's prerequisites *before* its recipe: a guard in the recipe below
+# would fire only after the entire dev-env run had already happened. `$(error)`
+# aborts before make so much as builds the dependency graph, which is also what
+# makes it immune to `-j`.
+#
+# Gated on the goal, so it constrains only this entry point — `make test` in a
+# root container, for instance, is untouched. $(MAKECMDGOALS) is empty for a
+# bare `make`, hence the fallback to $(.DEFAULT_GOAL): that resolves here
+# because this sits below the first target in the file, and it means a future
+# change that makes setup-dev-env the default goal stays covered.
+DEV_ENV_GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),$(.DEFAULT_GOAL))
+
+ifneq ($(filter setup-dev-env,$(DEV_ENV_GOALS)),)
+ifeq ($(shell id -u),0)
+
+# $(SUDO_USER) is make's view of the environment variable sudo sets to the
+# invoking user. filter-out leaves it empty for both "unset" and the literal
+# "root", the two cases where there is no operator worth naming.
+ifeq ($(filter-out root,$(SUDO_USER)),)
+DEV_ENV_ROOT_REMEDY := Re-run as your own login user, without sudo:  make setup-dev-env
+else
+DEV_ENV_ROOT_REMEDY := Re-run as:  sudo -u $(SUDO_USER) make setup-dev-env       (or drop the sudo entirely:  make setup-dev-env)
+endif
+
+define DEV_ENV_ROOT_REFUSAL
+
+`make setup-dev-env` must not be run as root (this process has uid 0).
+
+  $(DEV_ENV_ROOT_REMEDY)
+
+The run builds cargo artifacts into sandboxd/target/ and creates operator-owned
+paths; under root every one of them lands owned by root, and the steps that
+enroll the invoking operator have no operator to enroll. Individual steps invoke
+sudo themselves for the specific commands that need it, so the run as a whole
+must not be privileged.
+
+endef
+
+$(error $(DEV_ENV_ROOT_REFUSAL))
+endif
+endif
+
 ifeq ($(HOST_OS),Darwin)
 setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
@@ -805,7 +909,7 @@ setup-sandbox-test-user:
 	  fi; \
 	fi
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
-	  echo "$(GREEN)✓ already configured: operator-group-add for sandbox-test skipped (no non-root $$USER set)$(RESET)"; \
+	  $(call no_operator_identity,setup-sandbox-test-user); \
 	elif id -nG "$$USER" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox-test; then \
 	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group 'sandbox-test'$(RESET)"; \
 	else \
@@ -827,7 +931,7 @@ setup-sandbox-test-user:
 # remediation instructions if the test process is not in the group.
 setup-operator-group-membership:
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
-	  echo "$(GREEN)✓ already configured: operator-group-add skipped (no non-root $$USER set)$(RESET)"; \
+	  $(call no_operator_identity,setup-operator-group-membership); \
 	elif id -nG "$$USER" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then \
 	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group 'sandbox'$(RESET)"; \
 	else \
@@ -854,7 +958,7 @@ setup-operator-group-membership:
 # we would write, print `✓ already configured` and invoke no sudo.
 setup-test-sudoers-fragment:
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
-	  echo "$(GREEN)✓ already configured: sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
+	  $(call no_operator_identity,setup-test-sudoers-fragment); \
 	else \
 	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP\""; \
 	  fragment="$$USER ALL=(sandbox,sandbox-test) NOPASSWD: ALL"; \
@@ -1916,7 +2020,7 @@ setup-darwin-operator-group-membership: setup-darwin-sandboxd-group
 	fi
 	@_acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
 	if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
-	  echo "$(GREEN)✓ already configured: operator-group-add skipped (no non-root $$USER set)$(RESET)"; \
+	  $(call no_operator_identity,setup-darwin-operator-group-membership); \
 	elif dseditgroup -o checkmember -m "$$USER" "$$_acct" >/dev/null 2>&1; then \
 	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '$$_acct'$(RESET)"; \
 	else \
@@ -2087,7 +2191,7 @@ setup-darwin-sandboxd-test-operator-group-membership: setup-darwin-sandboxd-test
 	  exit 0; \
 	fi
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
-	  echo "$(GREEN)✓ already configured: operator-group-add skipped (no non-root $$USER set)$(RESET)"; \
+	  $(call no_operator_identity,setup-darwin-sandboxd-test-operator-group-membership); \
 	elif dseditgroup -o checkmember -m "$$USER" _sandboxd-test >/dev/null 2>&1; then \
 	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '_sandboxd-test'$(RESET)"; \
 	else \
@@ -2131,7 +2235,7 @@ setup-darwin-test-sudoers-fragment:
 	  exit 0; \
 	fi
 	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
-	  echo "$(GREEN)✓ already configured: sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
+	  $(call no_operator_identity,setup-darwin-test-sudoers-fragment); \
 	else \
 	  fragment_envkeep="Defaults:$$USER env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET SANDBOX_LIMA_HELPER_PATH SANDBOX_LIMA_HELPER_TEST_GUEST_BINARY_PATH SANDBOX_LIMA_HELPER_TEST_SANDBOX_USER SANDBOX_LIMA_HELPER_TEST_SANDBOX_GROUP\""; \
 	  fragment="$$USER ALL=(_sandboxd-test) NOPASSWD: ALL"; \
