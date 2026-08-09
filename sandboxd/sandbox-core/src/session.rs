@@ -1947,18 +1947,29 @@ mod tests {
     /// Ordinary absolute paths — including the ones the positive parser tests
     /// above rely on — must keep parsing. A rejection rule that also refused
     /// these would pass every negative test while breaking the feature.
+    ///
+    /// The expected value is spelled out rather than asserted with `is_ok`.
+    /// These inputs exist to exercise the character allowlist, so each one
+    /// carries a character the rule had to decide about — a space, `+`, `@`,
+    /// `_`, `-`, `.` — and a validator that accepted the path but truncated
+    /// it at that character would satisfy `is_ok` while mangling the mount.
+    /// A positive control that cannot detect mangling is not a control.
     #[test]
     fn parse_flag_shared_still_accepts_ordinary_paths() {
-        for flag in [
-            "shared:/tmp",
-            "shared:/Users/alice/My Project",
-            "shared:/opt/work-space_1.0+beta@host",
-            "shared:/",
+        for (flag, host) in [
+            ("shared:/tmp", "/tmp"),
+            ("shared:/Users/alice/My Project", "/Users/alice/My Project"),
+            (
+                "shared:/opt/work-space_1.0+beta@host",
+                "/opt/work-space_1.0+beta@host",
+            ),
+            ("shared:/", "/"),
         ] {
-            assert!(
-                WorkspaceMode::parse_flag(flag).is_ok(),
-                "{flag} must still parse"
-            );
+            let mode = WorkspaceMode::parse_flag(flag)
+                .unwrap_or_else(|e| panic!("{flag} must still parse, got: {e}"));
+            // The guest path echoes the host path when no guest token is
+            // given, so one literal pins both sides of the round trip.
+            assert_eq!(mode, shared(host, host, None), "flag {flag:?}");
         }
     }
 

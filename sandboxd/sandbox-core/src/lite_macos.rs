@@ -14,7 +14,11 @@
 //!   generation time.
 //! - **Host→VM path translation** ([`translate_shared_path`] / [`validate_shared_path`]):
 //!   pure path rewriting from a host `shared:` path to the in-VM 9p mountpoint
-//!   path the sandbox container will bind-mount.
+//!   path the sandbox container will bind-mount. Of the pair, only
+//!   [`validate_shared_path`] has a production caller; the mount is an
+//!   identity mount, so the daemon validates and then uses the host path
+//!   unchanged. See [`translate_shared_path`] for why the unused half is
+//!   still here and what would justify deleting it.
 //! - **In-VM route-helper argv** ([`build_in_vm_route_helper_argv`]): constructs
 //!   the `limactl shell … sandbox-route-helper` argv vector for the gateway VM.
 //!   Pure; no execution.
@@ -131,6 +135,34 @@ pub fn lite_shared_root_9p_stanza(shared_root: &Path) -> String {
 /// path).
 ///
 /// This is a pure function — no filesystem I/O.
+///
+/// # No production caller — a seam the identity mount made unnecessary
+///
+/// Nothing outside this module's tests calls this. It has never had a
+/// production caller: it arrived with the container-backend seams for lite
+/// mode, ahead of a translation step that turned out not to be needed,
+/// because the 9p stanza mounts `shared_root` at the same absolute path in
+/// the VM. Read the body with that in mind — `shared_root.join(rel)` where
+/// `rel` was just stripped from `shared_root` reconstructs the input, so the
+/// whole function is an identity transform on every path it accepts. Identity
+/// as a [`Path`], not byte-for-byte: given `shared_root` itself, `rel` is
+/// empty and the join returns `<shared_root>/` with a trailing separator.
+/// The two compare equal because `Path` compares components, but a caller
+/// that formatted the result into a string would not get back what it passed
+/// in. The live path calls [`validate_shared_path`] and then uses the host
+/// path directly (`sandboxd/src/main.rs`, lite session create), which is the
+/// same result without the round trip.
+///
+/// It is kept, not deleted, for one reason: it is where a non-identity
+/// mapping would go if the mount ever stopped being an identity mount — a
+/// per-session subdirectory, or a VM-side prefix. If that has not happened
+/// by the time someone next reads this, delete it and the re-export in
+/// `lib.rs`; a `pub` identity function with no caller costs more in reader
+/// confusion than the seam saves.
+///
+/// Its test is a drift guard on this function, not a second confirmation
+/// that the escape is closed on a live path. Only [`validate_shared_path`]
+/// gives that.
 pub fn translate_shared_path(
     host_path: &Path,
     shared_root: &Path,
@@ -563,6 +595,11 @@ mod tests {
     /// therefore its own copy of the same defect. It now delegates; this pins
     /// that it does, so a future edit cannot reintroduce a second
     /// implementation that drifts.
+    ///
+    /// That is all it is. The function under test has no production caller,
+    /// so passing here does not add a second confirmation that the escape is
+    /// closed on a path an operator can reach — that comes from
+    /// `validate_shared_path` alone. Do not count this one twice.
     #[test]
     fn translate_shared_path_rejects_parent_dir_escape() {
         let root = Path::new("/tmp/sandbox-shared");
