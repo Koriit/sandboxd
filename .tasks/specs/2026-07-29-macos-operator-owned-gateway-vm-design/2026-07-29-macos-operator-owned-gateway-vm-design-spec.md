@@ -113,7 +113,7 @@ The `/29` role map (`network.rs:938-947`), where `B` is the slot's base address:
 
 | Offset | Role |
 |---|---|
-| `B+1` | host-side vmnet gateway (`bridgeN` on the Mac) — reachable, but no internet transit |
+| `B+1` | ⚠️ **claimed** host-side vmnet gateway (`bridgeN` on the Mac) — **measured false, 2026-08-09.** `bridge100`–`bridge107` carry the *vmnet-chosen* `192.168.18.1`–`192.168.25.1`; nothing answers at `10.209.128.<B+1>`. The `/29` map is a sandboxd-side overlay with **no host participation** on this axis. `network.rs:938-947` carries the same wrong claim and needs the same correction. Any procedure that aims at a host endpoint on the `/29` fails inexplicably — see §3.7 |
 | `B+2` | gateway VM's slot NIC — link-up only, no L3 address (it is a macvlan parent) |
 | `B+3` | **gateway container IP** |
 | `B+4` | **sandbox VM IP**, default route = `B+3` |
@@ -1193,6 +1193,14 @@ root, as every multi-user isolation model does. A root-capable operator can star
 any control at this layer and is not specific to this design. Record it; do not build
 machinery for it.
 
+⚠️ **A second precondition, added 2026-08-09 on measurement: `net.inet.ip.forwarding = 0`.**
+The host holds an interface on **every** segment (`bridge100`–`bridge107`), so at `1` all
+eight become mutually routable *through the host* — no socket, group or plist involved, and
+this section's mechanism does nothing about it. Unlike the root precondition, this one is a
+single command away and is flipped by ordinary features such as Internet Sharing, so it
+warrants detection rather than only a note. See §3.2 → *It is more than context for the lite
+topology too*.
+
 #### De-enrollment — specify it with enrollment, not after
 
 **Enrollment and de-enrollment are two halves of one mechanism**, and phase 1 must
@@ -1307,6 +1315,90 @@ that exercises the DAC check rather than the bookkeeping.
 first. It succeeds today — that success *is* the reproduction — and must fail at connect
 once per-operator groups land. §3.8 outcome (d) exists to catch the case where it still
 succeeds afterwards, which would mean the mechanism was applied incompletely.
+
+#### ✅ REPRODUCED — 2026-08-09. This is the baseline the fix must invert
+
+**The defect is confirmed exploitable on this host by a genuine second operator.** Recorded
+here, in the place *To verify a fix* designates, because it is the measurement M24-S20's
+inverted assertion is scored against. Verbatim evidence:
+`.tasks/handoffs/20260809-cross-operator-slot-probe.md` (gitignored, retained locally).
+
+| | |
+|---|---|
+| **Principal** | `operator-b`, **uid 528** — a freshly created, loginable, non-admin local account, primary group `staff` (20). Not a system account |
+| **Enrollment** | `sudo dseditgroup -o edit -a operator-b -t user _sandboxd` — byte-for-byte the line `install.sh:2679` runs for **every** operator. No privilege beyond ordinary enrollment |
+| **Target** | `/var/run/sandbox/vmnet/slot-0.sock`, carrying operator A's (`olek`, uid 501) VM `xopa0` |
+| **Result** | operator B's VM attached to A's segment, ARP-resolved A's VM and exchanged ICMP with it, bidirectionally |
+
+**Why uid 528 makes this a real operator, and why the corroborating uid does not.** The
+daemon's accept-time gate rejects any peer uid strictly below `SYSTEM_UID_FLOOR = 500`
+(`broker.rs:129`, applied in `classify_peer_uid_floor`, `broker.rs:501`). uid 528 clears
+that floor, so the daemon would treat it as an operator; the account also passes gate 2
+(sandbox-group membership) once enrolled. The same run corroborated the finding with a raw
+`socket_vmnet` client as `_sandboxd-test` (**uid 309**), which reached A's segment with no
+VM and no hypervisor at all — but 309 is a *system* account **below** the floor and the
+daemon would never treat it as an operator. **309 is supporting evidence; 528 is the
+load-bearing principal.** Do not let a future run substitute a sub-floor uid and call it a
+second operator.
+
+**Ground truth is the accept-count delta — never `limactl`'s exit status.** This is the
+single most important operational rule this reproduction establishes, and M24-S20 inherits
+it. `socket_vmnet` logs `Accepted a connection` to
+`/var/log/sandbox/vmnet-<SLOT>.stderr.log` per client attach; snapshot it before the
+attempt and diff after. Cross-check with the presence of `lima<SLOT>` in the guest.
+
+| Run | `limactl start` | accept-count | guest NIC | truth |
+|---|---|---|---|---|
+| B **unenrolled** | `READY`, **exit 0** | 32 → 32, **delta 0** | `lo`, `eth0` only — **no `lima0`** | never connected |
+| B **enrolled** | `READY`, exit 0 | 32 → **33**, delta 1 | `lima0 52:55:55:ab:8f:ba` | attached |
+
+The unenrolled run is the trap: `limactl create` fails the socket `stat` (the `0750`
+directory refuses B even traversal), **silently drops the network entry**, and `start` then
+boots a *networkless* VM and reports success. Reading the exit status alone records a
+catastrophic false green. So **"failure at connect" for M24-S20's inverted assertion means:
+no new `Accepted a connection` line across the attempt, and no `lima<SLOT_A>` in the
+guest** — not a non-zero `limactl` exit, which has a dozen unrelated causes (a missing
+netplan `dhcp4: no` / `optional: true` stanza on the slot NIC blocks boot in
+`systemd-networkd` and reads identically).
+
+**The reach itself.** From `hostile` (B, uid 528, slot 0, `198.51.100.40`) to `xopa0`
+(A, uid 501, slot 0, `198.51.100.10`):
+
+```
+ping -c 3 198.51.100.10   -> 3 packets transmitted, 3 received, 0% packet loss
+ip neigh show 198.51.100.10 dev lima0
+  198.51.100.10 lladdr 52:55:55:9c:32:43 REACHABLE     # xopa0's real lima0 MAC
+```
+
+and symmetrically, on the victim: `198.51.100.40 lladdr 52:55:55:ab:8f:ba STALE` —
+`hostile`'s real MAC. Both MACs were read independently from each guest's own kernel. From
+here the attack this section describes — become the victim's next hop, void its egress
+policy — is ordinary L2 behaviour.
+
+**Two-sided admission control, same uid, only membership changed.** This is what identifies
+the group as the *entire* access decision rather than one factor among several:
+
+```
+uid=528 UNENROLLED  slot-0..7  -> CONNECT_FAIL errno=13 (EACCES)  [all eight]
+uid=528 ENROLLED    slot-0..7  -> CONNECT_OK                      [all eight]
+```
+
+Directory traversal (`ls -l /var/run/sandbox/vmnet/`) flips from denied to permitted at the
+same instant. An enrolled principal reaches **every** slot regardless of which operator
+"owns" it — and enrollment is what `install.sh` does to every operator.
+
+**What this reproduction does *not* establish**, stated so nobody over-reads it:
+
+- **The next-hop hijack was not driven end to end.** No gateway container was deployed and
+  no victim traffic was diverted. What is demonstrated is same-segment peering with
+  bidirectional address resolution; the hijack follows from that by ordinary L2 behaviour,
+  but it is an inference here, not a measurement.
+- **Inter-slot L2 isolation holds** and was tested separately (§3.7 assertion 2). The
+  broken boundary is *which principals share one slot's group*, not slots leaking into one
+  another. Say it that way; the two are routinely conflated.
+- The socket group at the time of the run was the post-#85-repair `_sandboxd` (gid 310),
+  not the legacy `_sandbox` (gid 60). The defect is a property of *one shared group*, not
+  of which group it is.
 
 ---
 
@@ -2076,6 +2168,43 @@ sysctl net.inet.ip.forwarding net.inet6.ip6.forwarding
 
 Carry the correct model into phase 4: this is a known hole, not a retired concern.
 
+#### ⚠️ It is more than context for the *lite* topology too — slot isolation depends on it
+
+**Upgraded from context to a stated dependency, 2026-08-09, on measurement.** An earlier
+version of this section filed host IP forwarding purely as a full-backend concern and
+"interpretive context" for this gate. That understates it, and the second-operator probe
+found out why.
+
+**The host sits on all eight segments.** Measured: `bridge100`–`bridge107` exist and carry
+the vmnet-chosen addresses `192.168.18.1`–`192.168.25.1` (confirmed against
+`/var/log/sandbox/vmnet-*.stderr.log`). `--vmnet-mode=host` gives each network identifier
+its own bridge, and the host holds an interface on every one of them.
+
+**So the L2 isolation between slots is one sysctl deep.** With
+`net.inet.ip.forwarding = 0` the host does not bridge between segments, and that is *part
+of why* §3.7 assertion 2 returns no reply. Set it to `1` — which Internet Sharing does, and
+which any admin can do in one command — and **all eight segments become mutually routable
+through the host**, entirely independently of the slot-group defect in §1.6. Every
+cross-operator isolation claim in this document silently assumes the `0`.
+
+Measured on the reference host at the time of both the Part A and Part B runs:
+`net.inet.ip.forwarding: 0`, `net.inet6.ip6.forwarding: 0` — so the isolation results are
+valid, and they are valid *conditionally*.
+
+Three consequences, none of which this design currently owns:
+
+1. **It belongs in §1.6's precondition paragraph**, next to "operators cannot become root".
+   A root-capable principal can void segment isolation with one sysctl without touching a
+   socket, a group or a plist — so the socket-group mechanism is necessary, not sufficient,
+   for the isolation claim as a whole.
+2. **Phase 1 or phase 4 should assert it**, not merely record it: a `sandbox doctor` check
+   reading both sysctls is cheap, host-side, needs no daemon, and is the only thing that
+   would notice the state changing under a running install.
+3. **Do not paper over it by reinstating the old startup gate.** The daemon deliberately
+   stopped refusing to start on forwarding-enabled hosts (`main.rs:13344-13347`); #80 tracks
+   the real fix. This is a documentation and detection gap, not an argument to restore a
+   check that only hid it.
+
 ### 3.3 What the gate builds
 
 The topology mirrors the **lite** shape (an in-VM Docker bridge), not the full-backend
@@ -2570,6 +2699,27 @@ limactl create --name=hostile --tty=false /tmp/hostile.yaml && limactl start hos
   §1.6 is the finding, not a bug in the gate. Record which.
 - **If it succeeds after §1.6 lands:** outcome (d) in §3.8.
 
+✅ **RUN 2026-08-09 (Part B). It succeeded — the reproduction.** The full record, with the
+evidence M24-S20 must invert, is at §1.6 → *✅ REPRODUCED*; the run summary is §3.11.
+
+⚠️ **Two corrections to the procedure above, both found by running it. Neither is optional.**
+
+1. **The four-line YAML is not enough — give the hostile instance the slot-NIC netplan
+   provisioning** (`dhcp4: no`, `optional: true`, IPv6 off) that Part A's gate used. Without
+   it `systemd-networkd` blocks boot waiting for a DHCP lease that never arrives on a
+   host-mode segment, and the hang reads as *failure at connect* — **a false green on the
+   security property**, which is the worst error available here.
+2. **Never read the outcome from `limactl`'s exit status.** An unenrolled B produces
+   `READY` and **exit 0** having never touched the socket: `limactl create` fails the socket
+   `stat`, silently drops the `networks:` entry, and `start` boots a networkless VM. Read the
+   `socket_vmnet` accept-count delta in `/var/log/sandbox/vmnet-<SLOT_A>.stderr.log` and the
+   presence of `lima<SLOT_A>` in the guest. See §1.6 for the side-by-side.
+
+**Preconditions that must hold or the result means nothing:** B is a member of the *live*
+socket group (`stat -f '%Sg'` the target socket — do not assume the name); `SLOT_A` genuinely
+belongs to A and has A's VM attached, so a success is a *shared segment* and not an unused
+socket; and the `location:` image is readable by B out of B's own cache.
+
 #### Explicitly **not** asserted: the deny-event JSONL
 
 The project already made this call, and the reasoning is recorded at
@@ -2592,8 +2742,8 @@ hold NICs on their own slots **with endpoints actually addressed on the `/29`s**
 reachability assertions to mean anything.
 
 ```
-VM A (operator A): slots {0..3}, endpoint on slot 0's /29
-VM B (operator B): slots {4..7}, endpoint on slot 4's /29
+VM A (operator A): slots {0..3}, probe endpoint attached to slot 0's socket
+VM B (operator B): slots {4..7}, probe endpoint attached to slot 4's socket
 ```
 
 ⚠️ **§3.4 does not produce those endpoints, and an earlier draft stated the requirement
@@ -2603,47 +2753,106 @@ all — in production the address at `B+3` is the *gateway container*, placed th
 which §3.3 deliberately does not build. So a bare `ping <B_BASE+3>` fails for the trivial
 reason (no local address, no route) and proves nothing.
 
-**Add the missing steps, in each VM:**
+#### ⚠️ Do not address the probe endpoints on their `/29`s. Corrected 2026-08-09.
+
+An earlier draft of this section prescribed exactly that, in these words:
 
 ```bash
-# Derive this VM's own /29 from its slot: B = 10.209.128.0 + 8*SLOT
+# ⚠️ WRONG — kept visible so the trap is recognisable, do not run this
 limactl shell "$GW_A" -- sudo ip addr add <B_A+2>/29 dev "lima${SLOT_A}"
-limactl shell "$GW_A" -- sudo ip link set "lima${SLOT_A}" up
+limactl shell "$GW_B" -- sudo ip addr add <B_B+2>/29 dev "lima${SLOT_B}"
+# then, from A:
+limactl shell "$GW_A" -- ping -c 2 -W 2 <B_BASE+3>    # "expect: 100% packet loss"
+limactl shell "$GW_A" -- arping -c 2 <B_BASE+3>       # "expect: no reply"
 ```
 
-and stand up a peer to aim at — the simplest is to give **each** VM an address on its own
-`/29` and have A attempt to reach **B's** address, which requires B's to exist:
+**That procedure cannot fail, and therefore cannot pass.** Three independent defects, each
+sufficient on its own to make the green meaningless:
+
+| | Defect | Why the "expected" result arrives regardless of isolation |
+|---|---|---|
+| **P1** | **Nothing ever assigns `B+3`.** It is the gateway container's macvlan address in production, and §3.3 deliberately does not build the container. The two `ip addr add` lines above place `B+2`, not `B+3`. | The target address does not exist on any interface in the run. Silence is guaranteed. |
+| **P2** | **The two endpoints sit on *different* `/29`s.** A packet from `B_A+2` to `B_BASE_B+3` is off-link, and the VM has no route to B's prefix — the kernel rejects it at the local routing table. Additionally **`arping` is not installed** in the Lima Ubuntu image, so the second line is a `command not found` that a careless reader scores as "no reply". | The packet is never emitted. "100% packet loss" measures the absence of a route, not the presence of a boundary. |
+| **P3** | **No positive control.** A one-sided procedure whose only outcome is silence cannot distinguish *isolated* from *the probe is broken*. | Every misconfiguration in the harness scores as a pass. |
+
+**The corrected method — put both endpoints on one shared subnet.** Isolation is an L2
+property of the segment, so make L3 a non-variable: give every probe endpoint an address in
+a **single** subnet unrelated to the `/29` map, and let the *only* difference between two
+VMs be which slot socket their NIC is attached to. Then reachability is a clean question
+about the segment and nothing else.
 
 ```bash
-limactl shell "$GW_B" -- sudo ip addr add <B_B+2>/29 dev "lima${SLOT_B}"
+# One flat probe subnet for every VM in the run — NOT the /29 map.
+# A on slot 0:
+limactl shell "$GW_A" -- sudo ip addr add 198.51.100.10/24 dev "lima${SLOT_A}"
+limactl shell "$GW_A" -- sudo ip link set "lima${SLOT_A}" up
+# B on slot 4, byte-identical except for the slot:
+limactl shell "$GW_B" -- sudo ip addr add 198.51.100.24/24 dev "lima${SLOT_B}"
 limactl shell "$GW_B" -- sudo ip link set "lima${SLOT_B}" up
 ```
 
-Only then does the reachability assertion below distinguish "isolated" from "nothing was
-listening".
+**A positive control is mandatory, not optional.** Before believing any silence, stand up a
+*third* VM whose config is byte-identical to A's except that it names **A's** slot, give it
+another address in the same `/24`, and show that A reaches it. Only a run that has
+demonstrated it *can* see a reply is allowed to interpret the absence of one.
 
-Assertions:
+**`arping` is absent — do not reach for it.** Use `ping` plus the neighbour table, which
+reads the ARP result directly and needs nothing installed:
+
+```bash
+limactl shell "$GW_A" -- ping -c 3 -W 2 <peer>
+limactl shell "$GW_A" -- ip neigh show <peer> dev "lima${SLOT_A}"
+# same-slot peer  → "lladdr 52:55:55:.. REACHABLE"   (positive control passes)
+# foreign-slot peer → "FAILED" or no entry           (isolation holds)
+```
+
+`ip neigh` is the load-bearing line: a `REACHABLE` lladdr is proof a frame crossed the
+segment and one came back, and `FAILED` is proof ARP was actually emitted and went
+unanswered — which is what distinguishes isolation from a packet that never left.
+
+The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.rs:3021`).
+
+#### Assertions
 
 1. **Egress is enforced in both** — §3.6 assertions **1–3** hold independently in each VM.
    (Assertion 4 is recorded, not asserted, in either VM — see its note.)
-2. **Neither VM can reach the other's segment**, with endpoints actually present:
 
-   ```bash
-   # From VM A, with B_BASE = 10.209.128.0 + 8*<B's slot>:
-   limactl shell "$GW_A" -- ping -c 2 -W 2 <B_BASE+3>    # expect: 100% packet loss
-   limactl shell "$GW_A" -- arping -c 2 <B_BASE+3>       # expect: no reply
-   ```
+   ❌ **NOT RUN as of 2026-08-09.** Part B stood up bare VMs to probe the segment boundary
+   and never built the §3.3 bridge topology, the gateway container, or the probe container
+   in a second operator's VM — so none of assertions 1–3 were evaluated for B. This
+   assertion is **open**, and it is the axis on which §3.8 outcome **(b)** is still
+   unevaluated. Do not read Part B's green on assertion 5 as covering it.
 
-   The in-tree precedent is `integration_vmnet_inter_slot_l2_isolation` (`network.rs:3021`).
+2. **Neither VM can reach the other's segment**, using the shared-subnet method above.
+
+   ✅ **Holds, with a stated deviation (2026-08-09).** Measured between `198.51.100.10`
+   (slot 0) and `198.51.100.24` (slot 4): no reply, `ip neigh` `FAILED`, against a positive
+   control on the same slot that returned `REACHABLE`. **Deviation:** both VMs were owned by
+   operator **A**, not one each by A and B. That makes it a sound test of *inter-slot L2
+   isolation* — which is what the assertion's wording is about — but it does **not** exercise
+   the cross-*operator* axis, which assertion 3 covers instead. Recorded rather than
+   dismissed, because a future reader would otherwise assume A-vs-B.
 
 3. **The hostile-VM assertion (§3.6 assertion 5)** — the one that tests the boundary
    rather than the configuration.
 
+   ✅ **Run 2026-08-09, and it succeeded — the §1.6 reproduction.** See §1.6 → *✅
+   REPRODUCED* for the evidence and §3.11 for the run summary.
+
 ⚠️ **Prerequisite: issue #85 must be fixed first**, and the second operator must be a
 **dedicated account in the correct group** — not another member of Apple's reserved
-`_sandbox` (gid 60), which was considered and rejected as deepening #85. It also needs a
-daemon-provisioned LIMA_HOME; it cannot create one itself
-(`ensure_operator_lima_home`, `lima.rs:574-660`, is daemon-side only).
+`_sandbox` (gid 60), which was considered and rejected as deepening #85.
+
+~~It also needs a daemon-provisioned LIMA_HOME; it cannot create one itself
+(`ensure_operator_lima_home`, `lima.rs:574-660`, is daemon-side only).~~
+❌ **False — struck 2026-08-09.** `ensure_operator_lima_home` is how the *daemon* provisions
+the LIMA_HOME it will later drive, and it is daemon-side only; that says nothing about
+whether an account can create a directory and point `LIMA_HOME` at it. A hostile operator
+runs `limactl` directly, under their own uid, with `LIMA_HOME=/Users/<them>/.lima` — no
+daemon involvement at any point. Part B did exactly this. The premise mattered: as written it
+implied a hostile operator is gated on daemon cooperation, which would have made §1.6's
+threat model look weaker than it is. **The attacker needs nothing from the daemon but the
+socket.**
 
 ### 3.8 Failure discrimination — a red run must say which
 
@@ -2663,6 +2872,37 @@ a structurally impossible table assertion (fixed in assertion 3).
 For **(a)** the prior evidence is favourable: access is group-scoped rather than uid-scoped
 (`network.rs:1027`), the sockets carry no ACLs, and **sandbox session VMs already run
 operator-owned QEMU against these sockets in production** (`lima.rs:3607, 3617-3618`).
+
+#### ⚠️ A fifth bucket is missing: the probe itself is wrong
+
+Every row above assumes the measurement is trustworthy and only disputes what it means. Part
+B produced a class of red the table cannot express: **the procedure was defective, so the
+result — green or red — carries no information.** The three §3.7 defects (P1/P2/P3) each
+would have delivered the *expected* answer with the boundary wide open, and the assertion-5
+`limactl` exit-status reading did deliver a false green until the accept-count check
+overturned it.
+
+**Rule for any future run:** a red or green traced to the harness is **not** classified into
+(a)–(d). Fix the procedure in-spec, re-run, and classify the *re-run*. A methodology red
+that gets filed as (a) "fixable, decision survives" is how a real (c) or (d) escapes — and
+a methodology *green* filed as a pass is worse, because nothing later looks at it again.
+When in doubt about which side of the line a result falls on, the discriminator is: **would
+this outcome have been produced by a run with the property absent?** If yes, it is a
+methodology result, not an outcome.
+
+#### No §3.8 outcome was reached in Part B
+
+Neither **(b)** nor **(d)** was reached, and this is a statement about coverage, not a
+clean bill:
+
+- **(b) is unevaluated, not excluded.** It keys off §3.7 assertion 1 *or* 2. Assertion 2
+  holds (with the ownership deviation noted there); **assertion 1 was never run** — no second
+  VM ever built the bridge topology or enforced egress. The (b) bucket stays open on that
+  axis until assertion 1 is run.
+- **(d) is not applicable yet, by construction.** It triggers only on assertion 5 succeeding
+  **after §1.6 lands**. §1.6 has not landed, so assertion 5's success is the pre-fix
+  reproduction the fix must invert — the expected result, not outcome (d). M24-S20 is where
+  a success becomes (d).
 
 ### 3.9 Teardown
 
@@ -2781,6 +3021,57 @@ section already records from an earlier draft. Re-run with the bind defect compe
 decisive: **52 with §3.5's route, 28 without.** Either way the gate discriminates; against the
 shipping topology the honest signature is `{7}` versus 28, separated by four orders of magnitude
 in latency as well as by exit code.
+
+### 3.11 Part B result — **PARTIAL**, run 2026-08-09 (M24-S3)
+
+**Part B is not complete.** One of its three assertions was run and is decisive, one holds
+with a stated deviation, and one was never run. Part A's conclusion is unaffected.
+
+| §3.7 assertion | Status | Where the evidence is |
+|---|---|---|
+| **1** — egress enforced in both VMs (§3.6 assertions 1–3, independently, in B's VM) | ❌ **NOT RUN** | nothing; no second-operator VM ever built the §3.3 topology |
+| **2** — neither VM reaches the other's segment | ✅ **holds**, deviation: both VMs were operator **A**'s, so this tests inter-slot L2 isolation, not the cross-operator axis | §3.7 assertion 2 |
+| **3** — hostile VM (§3.6 assertion 5) | ✅ **run, and it succeeded** — the §1.6 reproduction, which is the expected pre-fix result | §1.6 → *✅ REPRODUCED* |
+
+**The headline finding: §1.6 is reproduced with a real second operator.** A loginable
+non-admin account (uid 528, above `SYSTEM_UID_FLOOR`) enrolled by the byte-for-byte
+`install.sh:2679` command attached a VM of its own to another operator's live slot socket and
+reached that operator's VM on the segment. Admission control is two-sided and turns entirely
+on the group bit: unenrolled, all eight slots refuse with `errno=13`; enrolled, all eight
+accept. §1.6 → *✅ REPRODUCED* carries the ground-truth rule, the uid-floor argument, and the
+definition of "failure at connect" that M24-S20's inverted assertion inherits.
+
+**What Part B did *not* establish** — stated so no later reader over-claims it:
+
+- **§3.7 assertion 1 was not evaluated.** §3.8 outcome **(b)** therefore remains open on that
+  axis. Part B's VMs were bare — no bridge topology, no gateway container, no probe container.
+- **The hijack was not driven end-to-end.** Attachment and L2 reach were demonstrated;
+  traffic interception, policy subversion, and data exfiltration were not attempted.
+- **Inter-slot L2 isolation held throughout.** The hole is *within* a slot, reached by
+  enrolling in the group — not a leak across slots. Both statements are needed to describe
+  the boundary correctly.
+- **No §3.8 outcome was reached.** See §3.8 → *No §3.8 outcome was reached in Part B*.
+
+**Two host-state findings from the same run**, both recorded where they belong rather than
+only here:
+
+- `net.inet.ip.forwarding = 0` (v4 and v6) — a **latent dependency**, not context. See §3.2
+  → *It is more than context for the lite topology too* and §1.6's precondition.
+- The vmnet slot pool was repaired to a bootable state and drift-clean (8/8 `running`, 8×
+  `exit 0`); **issue #85 is still open**, and the fix is unpushed local commits. See §5.4.
+
+**Procedure defects found by running it.** §3.7's `/29` endpoint-addressing steps were wrong
+in three independent ways and are corrected in place, with the wrong version kept visible;
+§3.6 assertion 5's `limactl`-exit-status reading produced a false green and now carries two
+mandatory corrections. §3.8 gained a note for the class of red neither describes: **the probe
+itself is wrong.**
+
+Local-only working records (untracked, not part of the repo's durable history):
+`.tasks/handoffs/20260809-cross-operator-slot-probe.md`,
+`.tasks/handoffs/20260809-vmnet-pool-repair.md`,
+`.tasks/handoffs/20260809-operator-b-provisioning.md`,
+`.tasks/handoffs/20260809-s3-exit-reconciliation.md`. **This section and §1.6 are the durable
+record** — anything that must survive belongs here, not there.
 
 ---
 
@@ -2902,23 +3193,57 @@ exit**.
       "no residue" without a check is not a criterion. **Both asserted, plus the instance check
       under the default LIMA_HOME; `sandboxd-gateway` still present and `Stopped`.**
 
-**Acceptance criteria — Part B (gated on issue #85).**
+**Acceptance criteria — Part B (gated on issue #85).** Status as of **2026-08-09**; see
+§3.11 for the run. `[x]` satisfied, `[~]` partially satisfied, `[ ]` outstanding.
 
-- [ ] `_sandboxd` account exists, vmnet plists regenerated correctly **and reloaded**, and
+- [~] `_sandboxd` account exists, vmnet plists regenerated correctly **and reloaded**, and
       a **dedicated test-operator account** exists in the proper group (not gid 60).
-- [ ] That account has a provisioned LIMA_HOME. It cannot create one itself — the parent
+  - [x] `_sandboxd` exists — uid/gid **310**, created during the repair.
+  - [x] Plists regenerated **and reloaded** — all eight rewritten to name `_sandboxd` and
+        carry a root `codesign --verify --strict` gate; a bootout/re-bootstrap simulation
+        gave **8/8 `state = running`, `runs = 1`**, and the drift detector went from 8×
+        `exit 3` to 8× `exit 0`. ⚠️ **Not verified across a real reboot** — the simulation is
+        the strongest evidence available without one.
+  - [ ] **Dedicated test-operator account in the proper group — NOT satisfied as an end
+        state.** `operator-b` (uid 528) exists and is loginable, and it *was* enrolled for
+        the run, but it was **de-enrolled afterwards** and is not a member now
+        (`dseditgroup -o checkmember` → not a member). More importantly, it was enrolled in
+        the **legacy shared `_sandboxd` group**, because §1.6's per-operator group does not
+        exist until phase 1. There is no "proper group" to be in yet. This sub-clause cannot
+        close before phase 1 lands, and stating that is more useful than ticking it.
+- [ ] ~~That account has a provisioned LIMA_HOME. It cannot create one itself — the parent
       `{state_root}/{daemon_uid}/{op_uid}` is daemon-owned and provisioning is
       `ensure_operator_lima_home` (`lima.rs:574-660`), daemon-side only. Budget a
-      daemon-driven provision step.
-- [ ] Second-operator isolation probe (§3.7): all assertions pass, **including the hostile
+      daemon-driven provision step.~~
+      ❌ **Premise falsified 2026-08-09 — this criterion is void, not met.** A hostile
+      operator runs `limactl` under their own uid with `LIMA_HOME` pointed at their own home
+      directory; the daemon is not in the loop and `ensure_operator_lima_home` never runs.
+      Part B did exactly that. No daemon-driven provision step is needed, and no budget
+      should be carried for one. See §3.7's struck prerequisite for why the false premise
+      mattered: it made §1.6's threat model look weaker than it is.
+- [~] Second-operator isolation probe (§3.7): all assertions pass, **including the hostile
       VM assertion** — which is expected to **fail** until §1.6 lands. Record which.
+      **One of three run and decisive; one holds with a deviation; one not run.**
+  - [ ] Assertion 1 (egress enforced in both VMs) — ❌ **NOT RUN.** §3.8 outcome (b) stays
+        open on this axis.
+  - [x] Assertion 2 (neither VM reaches the other's segment) — holds, with the recorded
+        deviation that both VMs were operator A's.
+  - [x] Assertion 3 / §3.6 assertion 5 (hostile VM) — **run; it succeeded**, which is the
+        expected pre-fix result and is now the §1.6 reproduction. Recorded per the criterion.
 
 **Exit (both parts).**
 
-- [ ] Findings recorded in this spec and on issue #82. The findings are the durable
-      artifact.
-- [ ] **The gate script is deleted.** It is not carried into phase 1 and not inherited by
-      anyone.
+- [~] Findings recorded in this spec and on issue #82. The findings are the durable
+      artifact. **Spec: done** (§1.6 reproduction, §3.2, §3.7, §3.8, §3.11, §5.4).
+      **Issue #82: outstanding** — it carries Part A's result and pre-check C, and nothing
+      for Part B.
+- [x] **The gate script is deleted.** It is not carried into phase 1 and not inherited by
+      anyone. **Satisfied vacuously for Part B: no gate script was written.** Part A's was
+      deleted at the end of M24-S2. ⚠️ **But the probe's working directory survived** —
+      `/private/tmp/xop-probe/` (19 entries, world-readable) still contains the raw
+      `socket_vmnet` client and the VM configs that demonstrate the attach. It is outside
+      the repo, so no commit carries it, but it is exactly the kind of residue this clause
+      exists to prevent. Delete it or move it under the scratchpad.
 
 **Gating rule — this was previously ambiguous and is now explicit.**
 
@@ -3748,7 +4073,7 @@ would normally use to find it — **which is exactly why it is repeated here**.
 |---|---|
 | **#83** — gateway-VM recovery skips container-backend sessions (`gateway_recovery.rs:77-82`) | **Blocks bounce-to-resize** (§2.7). **It does not block phase 5** — the declared-roots mechanism (§5.1) bounces the VM only when the roots change, not per `shared:` create. It does still bite on that rarer path: a root change destroys the operator's running lite sessions with no recovery, because containers are `--restart no` (`container.rs:853-854`). |
 | **#84** — `linux_only` declared and enforced but applied to zero tests | **Owned by phase 6, as its first item.** `make test-e2e-macos SCOPE=full` currently collects the whole Linux-authored matrix on macOS, so no phase-6 result is trustworthy until it closes — and phase 4's egress criterion rests on phase 6. |
-| **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **A prerequisite, not merely related.** The second-operator isolation probe (§3.7) cannot run until it is fixed, because the host has no honest second operator to offer: pre-rename plists, no real `_sandboxd` account, and the existing candidates enrolled in Apple's reserved gid 60 (adding another there was rejected — it deepens the same problem). Fixing it is also what makes `make setup-dev-env` safe again. **The single-operator gate does not depend on it.** See [Before you start](#before-you-start). |
+| **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **A prerequisite, not merely related.** The second-operator isolation probe (§3.7) cannot run until it is fixed, because the host has no honest second operator to offer: pre-rename plists, no real `_sandboxd` account, and the existing candidates enrolled in Apple's reserved gid 60 (adding another there was rejected — it deepens the same problem). Fixing it is also what makes `make setup-dev-env` safe again. **The single-operator gate does not depend on it.** See [Before you start](#before-you-start).<br><br>**Status 2026-08-09 — the host is repaired; the issue is not closed.** The reference host now has a real `_sandboxd` account (uid/gid 310), eight plists rewritten to name it and to gate on a root `codesign --verify --strict`, 8/8 daemons `running` with `runs = 1` after a bootout/re-bootstrap **simulation**, and a drift detector at 8× `exit 0`. That was enough to unblock Part B. But **issue #85 is still OPEN**, the fix lives in **unpushed local commits**, and **no real reboot has confirmed it** — so a fresh host, or this one after `make setup-dev-env` runs from an unfixed tree, still reproduces. Do not treat "the probe ran" as "the issue is fixed"; those came apart in exactly this session. |
 
 ---
 
@@ -3782,8 +4107,39 @@ outside its phase, it becomes an open question again — say so rather than abso
   LaunchAgent installed**, so there was nothing to observe re-register. Answering it needs a
   host with the agent installed — naturally M24-S3's dedicated test-operator account, or any
   host where phase 1's plist work has landed. Report it as not exercised, never as passed.
+  ⚠️ **Still not exercised after M24-S3 (2026-08-09).** The dedicated account now exists and
+  is loginable (`operator-b`, uid 528), which removes the *account* obstacle — but **no
+  `sandbox-agent` LaunchAgent was installed for it**, so there is still nothing to observe
+  re-register. The remaining work is installing the agent, not creating an operator.
 - **`interface:` on the broker path and at the version floor** (§1.4 fix 1) — the Lima
   behaviour is confirmed; the production path and Lima 1.2.0 are not.
+- **Whether the repaired vmnet plists survive a real reboot** (§5.4, issue #85) — the repair
+  was validated by a bootout/re-bootstrap **simulation** (8/8 `running`, `runs = 1`, drift
+  detector 8× `exit 0`), which is the strongest evidence short of rebooting the host. A real
+  reboot has not happened. Report it as simulated, never as rebooted.
+- **§3.7 assertion 1 — egress enforced in a second operator's VM** — ❌ not run in Part B.
+  §3.8 outcome **(b)** is unevaluated on that axis. See §3.11.
+
+**Settled by M24-S3 (2026-08-09), kept here as a trail:**
+
+- ✅ **Whether a second operator can attach to another operator's slot** (§1.6) —
+  **YES, reproduced with a real second operator.** A loginable non-admin account above
+  `SYSTEM_UID_FLOOR`, enrolled by the byte-for-byte `install.sh:2679` command, attached its
+  own VM to another operator's live slot socket and reached that operator's VM on the
+  segment; unenrolled, all eight slots refuse with `errno=13`. This is the baseline M24-S20
+  must invert. Evidence and the ground-truth rule at §1.6 → *✅ REPRODUCED*; run summary at
+  §3.11.
+- ✅ **Inter-slot L2 isolation holds** (§3.7 assertion 2) — measured on a shared probe subnet
+  against a same-slot positive control. The §1.6 hole is *within* a slot, not across slots.
+  Deviation recorded at the assertion: both VMs were operator A's.
+- ❌ **"A second operator cannot create its own LIMA_HOME" — FALSE.** Struck from §3.7 and
+  from phase 0 Part B. A hostile operator runs `limactl` under its own uid against its own
+  home directory; the daemon is not in the loop. The attacker needs nothing from the daemon
+  but the socket.
+- ⚠️ **`net.inet.ip.forwarding = 0` (v4 and v6) is a latent dependency, not context.** The
+  host holds an interface on all eight segments, so at `1` they become mutually routable
+  through the host and the L2 isolation above stops holding — independently of §1.6. Recorded
+  at §3.2 and as a second precondition in §1.6.
 
 **Settled by M24-S2, kept here as a trail:**
 
