@@ -1908,8 +1908,11 @@ pid` collapsed from the terminal to *self* when the terminal died.
   no gateway container, no policy and no mounts in the guest. The result is about
   QEMU/hostagent process survival, not about a fully-loaded gateway VM.
 
-Full evidence, including verbatim command output for every claim above:
-`.tasks/handoffs/20260809-m24-s2-precheck-c-state.md` § 7.
+The pids, `lstart` values, `boot_id`, socket object addresses and unified-log
+excerpts quoted in this section are the durable record — it stands on its own.
+Verbatim command output for every claim above was also captured at
+`.tasks/handoffs/20260809-m24-s2-precheck-c-state.md` § 7 (gitignored, retained
+locally).
 
 ### 2.10 Resource multiplication — N VMs, not one
 
@@ -3793,8 +3796,10 @@ outside its phase, it becomes an open question again — say so rather than abso
   `lstart` unchanged to the second, the guest `boot_id` was unchanged with a single boot in
   its journal, and `lima0` stayed `LOWER_UP` on the *same* kernel socket object to
   `slot-0.sock`. **So §2.4 and §5.1's logged-out delta describe a real state, the character
-  is fail-open, and that delta may now be published.** Recorded at §2.9; full evidence in
-  `.tasks/handoffs/20260809-m24-s2-precheck-c-state.md` § 7. Two things the run did *not*
+  is fail-open, and that delta may now be published.** Recorded at §2.9, which carries the
+  evidence; verbatim output also at
+  `.tasks/handoffs/20260809-m24-s2-precheck-c-state.md` § 7 (gitignored, retained locally).
+  Two things the run did *not*
   establish: the `sandbox-agent` re-registration half (above), and the
   hostagent-dies-QEMU-lives split, which did not occur and stays analysis.
 - ✅ **`cidata.iso` regeneration on every start** (2026-08-08, §2.7) — pre-check B.

@@ -61,6 +61,28 @@ For iteration on a single integration test, layer an `-E` filter on
 top of the profile:
 `cd sandboxd && cargo nextest run --profile integration -E 'test(integration_gateway_lifecycle)'`.
 
+### `make test-integration` is Linux-only — it cannot run on a macOS host
+
+The target's prerequisites include `install-route-helper-test-cap` and
+`install-lima-helper-test-cap`. Both stamp recipes call `getcap` to
+compare installed capabilities and `setcap` to install them; neither
+tool exists on macOS, and the guard's `cmp -s` against the (absent)
+`/usr/local/libexec/sandboxd-test/` binary always takes the `setcap`
+branch. So the target dies in its prerequisites, before `cargo nextest`
+is ever reached. This is structural, not a missing-setup problem —
+Linux capabilities have no macOS equivalent, and `sandbox-route-helper`
+/ `sandbox-lima-helper` are inert stubs on a macOS host anyway.
+
+Do **not** work around it by running the profile bare. `cargo nextest
+run --workspace --profile integration` without
+`--features sandbox-route-helper/test-env-override,sandbox-lima-helper/test-env-override`
+yields ~17 spurious failures, and even with the features the tests
+checksum the installed cap'd binary and reject a missing one as stale.
+
+On macOS the honest answer for the integration tier is **not
+applicable**: run `make test` (hermetic) plus the macOS-relevant e2e
+files, and get integration coverage from a Linux host or CI.
+
 ## E2E tests
 
 E2E tests boot real Lima/QEMU VMs and are SLOW. Individual test files take 3-10 minutes. The full suite takes 30-45 minutes.
