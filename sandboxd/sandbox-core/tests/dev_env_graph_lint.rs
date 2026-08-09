@@ -244,6 +244,38 @@ fn no_setup_step_warns_and_then_reports_success() {
         lines.len()
     );
 
+    // Positive control on the fold itself. Both floors here count lines, and
+    // neither can tell whether anything was actually joined: a fold that
+    // returned each physical line separately makes both counts go *up*, sails
+    // past them, and drops detection to zero. Detection depends on the join —
+    // `WARNING` and `exit 0` reach the same string only after continuations are
+    // joined, so an unfolded extractor never sees the shape this lint hunts and
+    // reports success against a Makefile full of offenders.
+    //
+    // Nothing to tune: if any continuation was joined, that line is longer than
+    // the longest single physical line, and if folding stopped the two maxima
+    // are equal by construction. The margin is not marginal — 2542 against 1044
+    // when this was written, with 14 folded lines clearing the bar.
+    //
+    // The objection to expect is that this is already covered, since
+    // `operator_enrolling_steps_refuse…` shares the folder and fails closed
+    // under the same degradation. That is the coupling argument, rejected here
+    // for the same reason as before: it holds only while both tests keep using
+    // this helper, and it disappears without anything failing at the moment it
+    // goes. This lint is also the only one of the four whose *signal* depends on
+    // the join rather than merely being weakened by it — the others lose edges
+    // or split a guard away from its remedy and fail loudly — which is why it
+    // needs a control they do not.
+    let longest_folded = lines.iter().map(|(_, line)| line.len()).max().unwrap_or(0);
+    let longest_physical = text.lines().map(str::len).max().unwrap_or(0);
+    assert!(
+        longest_folded > longest_physical,
+        "the longest folded line ({longest_folded} chars) is no longer than the \
+         longest physical line ({longest_physical}) — nothing was joined, so the \
+         fold has stopped folding. Both counts above still pass in that state, \
+         and this lint stops detecting the multi-line shape it exists to find"
+    );
+
     let total = lines.len();
     let recipe_lines: Vec<(usize, String)> = lines
         .into_iter()
@@ -308,6 +340,15 @@ fn operator_enrolling_steps_refuse_instead_of_skipping_when_there_is_no_operator
     // matcher that finds nothing passes trivially. This is a floor, not a pinned
     // count — deleting one of these steps should not fail the test, but a
     // matcher that stops matching should.
+    //
+    // That draws a deliberate boundary, and it is a boundary rather than an
+    // oversight: this catches a guard that has been *weakened* — still matching,
+    // no longer routing through the helper — but not one deleted outright, which
+    // stops matching while the remaining sites still clear the floor. That is
+    // the accepted trade of discovering the sites instead of listing them: a new
+    // enrolling step is covered for free and a removed one leaves no stale entry
+    // behind. Pinning an exact count to close the gap would swap that live
+    // property for a brittle one that fails on every legitimate add or remove.
     assert!(
         branches.len() >= 4,
         "found only {} recipe branches testing $USER for root/empty — the matcher \
