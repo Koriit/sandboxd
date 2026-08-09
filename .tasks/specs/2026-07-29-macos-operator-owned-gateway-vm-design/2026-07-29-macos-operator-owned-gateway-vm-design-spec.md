@@ -4091,6 +4091,15 @@ passes `strip_prefix` and would be handed to `docker create --mount src=…`.
 > all exist in it. **The export root bounds what of the *host* the VM can see; it bounds
 > nothing about what of the *VM* a bind can reach**, and the VM is where resolution happens.
 >
+> ⚠️ **`/Users/alice` is therefore not a valid regression target.** It is quoted here as a
+> record of a *wrong example*, never as a test case. A test asserting that
+> `/tmp/sandbox-shared/../../Users/alice` fails passes whether or not the validator rejects
+> anything, because the bind errors on the missing source — it **cannot fail for the right
+> reason**, so it cannot pass for one either, and a green from it would record this escape as
+> closed while it is open. **The shape to assert against is
+> `shared:/tmp/sandbox-shared/../../var/run`**, which resolves in the guest to a path that
+> exists and carries the payoff.
+>
 > **Decision: no standalone issue and no standalone fix — the remediation is folded into
 > this work, at phase 4.** Not phase 5, and the reason is specific: the `0666` exists because
 > Lima establishes its ControlPersist SSH master at VM boot, so every forwarded channel
@@ -4104,6 +4113,14 @@ passes `strip_prefix` and would be handed to `docker create --mount src=…`.
 > **Independently of the socket**, reject `..` and non-canonical paths wherever `shared:` is
 > validated. That closes this variant cheaply and immediately; it does **not** close the
 > symlink variant below.
+>
+> **The `,`/`=` rejection travels with *this* remedy, not with the symlink variant.** It is
+> written up further down, under the symlink section's supporting measures, only because that
+> is where the mount spec is discussed — and left there it falls between two sessions and is
+> lost. It is the **same operator-controlled input reaching the same privileged interface
+> through the same function** as the non-canonical-path check: `container.rs` formats the mount
+> spec unescaped two lines after the path is validated. Do both in one pass over that function,
+> rather than hardening the path and leaving an injection in the spec the path feeds.
 >
 > **Reasoned but not executed**, with how to confirm each: that QEMU's Darwin 9p path stores
 > the xattr on APFS as expected (create the symlink in a container, then `ls -l@` the host
@@ -4187,6 +4204,11 @@ implied, a free win.
   once operators supply arbitrary paths, `…/proj,bind-propagation=rshared` is a well-formed
   extra mount option. Operator-supplied, so robustness rather than escalation — but it
   lives in the function being changed.
+  **↗ Pulled forward: this bullet is done with the non-canonical-path remedy above, not with
+  the symlink variant it is filed under.** It is listed in this section because the mount spec
+  is discussed here, and that placement is what left it belonging to no session at all. See the
+  paragraph following *Independently of the socket* for the reasoning, and do not defer it to
+  the guest-containment work.
 
 **Also preserve the refusal's quality.** The shared-workspace phase deletes
 `outside_root_error_names_cause_and_alternatives` (`lite_macos.rs:442-470`). Its *intent* —
@@ -4209,6 +4231,26 @@ ledger does not partition the kernel's access control; §1.6 does.
 **Until §1.6 ships, the gateway axis is not merely unimproved — it is a live defect**
 (§1.6, §5.4). Do not record a gateway-axis improvement in any external document before
 that lands.
+
+✅ **That paragraph was reasoning when it was written. It is now measured — cite the
+measurement rather than re-arguing it** (2026-08-09). "An operator can attach to any slot
+regardless of assignment" is no longer an inference from the code: a loginable non-admin
+account above the broker's uid floor, enrolled by the byte-for-byte command `install.sh` runs
+for every operator, was **admitted to all eight slot sockets**, attached a VM of its own to
+another operator's live slot socket, reached that operator's guest on the segment, and in a
+second sitting brought a NIC up on a **non-zero** slot. Concurrent occupancy of two slots by
+one principal was measured separately. Canonical records: **§1.6 → *✅ REPRODUCED*** and
+**§3.7 assertion 2's four-row table**, which is also the authority on which of these are
+measured and which remain inferred — do not restate either from memory.
+
+⚠️ **Guard the payoff premise when amending this record.** The blast radius above rests on the
+gateway VM being a **daemon-owned singleton on `master`** — that is why the payoff is not
+confined to the attacker. The same 2026-08-09 run demonstrated that an **operator-owned** VM
+enforces egress correctly and independently of daemon ownership (§3.7 assertion 1). It did
+**not** ship one; the singleton is still what `master` runs. Those two facts sit one section
+apart and the second does not shrink the first. **A later reader will blur "an operator-owned
+VM enforces egress correctly" into "the escape got smaller." It does not, and it will not until
+the ownership flip actually lands.**
 
 **New delta — the operator uid becomes a path into the enforcement plane.**
 
