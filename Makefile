@@ -247,10 +247,12 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # the venv and runs pytest directly, so pytest inherits the invoking user's
 # credentials and whatever groups that shell already carries. Activating a
 # freshly-added `_sandboxd-test` membership is therefore the caller's job —
-# log out and back in, or run pytest yourself under `sudo -n -u $(id -un)`.
-# Skipping that does not fail obscurely: conftest's
+# log out and back in. Skipping that does not fail obscurely: conftest's
 # `_assert_operator_in_sandbox_group` checks the group before launching the
-# daemon and fails the run with that instruction.
+# daemon and fails the run with that instruction. Re-exec'ing pytest under
+# sudo is not an alternative `setup-dev-env` provides: the NOPASSWD fragment
+# it installs has runas list `(_sandboxd-test)`, which authorizes no sudo to
+# your own account.
 #
 # A green exit does NOT mean the suite ran — read the counts, not the exit
 # status. The harness skips rather than fails when the host is unprovisioned:
