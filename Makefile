@@ -218,7 +218,7 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 	  sg sandbox-test -c "$$_pytest"
 
 # macOS e2e suite — explicit, host-asserting target for CI and as the canonical
-# macOS entry point. Hard-fails if invoked on Linux so a misconfigured CI
+# macOS entry point. Hard-fails on any non-Darwin host so a misconfigured CI
 # runner surfaces loudly. Runs the macOS-native matrix (QEMU+HVF sandbox VMs
 # + gateway-Lima container backend), excluding linux_only tests.
 # SCOPE=container limits to the container-only slice (PR-time gate on macOS).
@@ -252,15 +252,14 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # daemon and fails the run with that instruction.
 #
 # A green exit does NOT mean the suite ran — read the counts, not the exit
-# status. The
-# harness skips rather than fails when the host is unprovisioned: conftest's
-# session-scoped autouse `_preflight_checks` calls `pytest.skip` when `docker
-# info` fails or the versioned gateway image is absent, and a session-wide
-# skip leaves pytest at exit 0 with every collected test skipped. This target
-# is the most exposed of the e2e targets, because it is the only one that does
-# not take `gateway-image` as a prerequisite — nothing here builds the image
-# the preflight demands. `-rs` below prints every skip reason; grade a run on
-# collected/passed counts against those.
+# status. The harness skips rather than fails when the host is unprovisioned:
+# conftest's session-scoped autouse `_preflight_checks` calls `pytest.skip`
+# when `docker info` fails or the versioned gateway image is absent, and a
+# session-wide skip leaves pytest at exit 0 with every collected test
+# skipped. This target is the most exposed of the e2e targets, because it is
+# the only one that does not take `gateway-image` as a prerequisite — nothing
+# here builds the image the preflight demands. `-rs` below prints every skip
+# reason; grade a run on collected/passed counts against those.
 test-e2e-macos: $(VENV_STAMP)
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "ERROR: test-e2e-macos must run on a macOS host (detected: $$(uname -s))"; \
