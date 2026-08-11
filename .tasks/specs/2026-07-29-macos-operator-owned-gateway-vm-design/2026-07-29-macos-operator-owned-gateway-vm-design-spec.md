@@ -3498,8 +3498,10 @@ and neither is an unsatisfied criterion:
    the user's authorization. The write-up is drafted and ready; the five local commits behind
    it are deliberately unpushed. Neither the comment nor the closing of issue #85 is posted
    without the user saying so."* The authorization came, and all three moved on 2026-08-10 —
-   the branch was **pushed** (`origin/master` is `0e1a7cc`; the two-way count
-   `git rev-list --left-right --count origin/master...HEAD` reports `0 0`), the
+   the branch was **pushed** (`0e1a7cc` is an ancestor of `origin/master` on the remote
+   itself — `git ls-remote origin refs/heads/master`, not the local tracking ref, which
+   is only as fresh as the last fetch — so every commit behind it is fetchable rather
+   than a reference only some working copy can resolve), the
    **Part B write-up was posted** to issue #82
    (comment `2026-08-10T09:57:50Z`, *Egress validation gate — Part B result: COMPLETE*), and
    **issue #85 was closed** as completed (`2026-08-10T10:02:28Z`). The blocker is kept on the
@@ -3507,6 +3509,12 @@ and neither is an unsatisfied criterion:
    make, and a later reader is better served by *was blocked, discharged on this date, by
    this* than by a list that never shows the wait. **Issue #82 itself remains open** — it is
    the feature request this milestone delivers, not the gate's record.
+   The evidence first recorded here was a two-way count,
+   `git rev-list --left-right --count origin/master...HEAD` reporting `0 0`. Read it as a
+   timestamp and not an invariant: it read `0 1` at the moment of the commit that recorded
+   it, and `0 3` before the hour was out. Ancestry is the form of the same fact that
+   survives the next commit; it fails only if `master` is rewritten upstream, which the
+   count does not survive either.
 
 **Formerly item 1 and no longer on this list: B1.c.** It moved to phase 1's acceptance criteria
 rather than being closed. Do not read its absence here as it having been satisfied or dropped —
