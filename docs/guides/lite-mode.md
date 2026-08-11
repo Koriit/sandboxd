@@ -65,7 +65,7 @@ On macOS, the lite and Lima backends expose `shared:` workspaces through differe
 
 The load-bearing constraint is ownership, not privacy consent: **nothing under your home directory is reachable by `_sandboxd`**, whether or not it sits in a TCC-protected location. TCC (Desktop, Documents, Downloads, `~/Library`) is a second gate layered on top, and it only becomes relevant once the ownership gate is passed.
 
-The default lite shared root is `/tmp/sandbox-shared`, which `_sandboxd` can traverse because `/tmp` is world-traversable. Per-session `shared:` paths must be under this root, and the daemon rejects anything outside it at `sandbox create` time.
+The default lite shared root is `/tmp/sandbox-shared`, which `_sandboxd` can traverse because `/tmp` is world-traversable. Per-session `shared:` paths must be under this root, and the daemon rejects any path *spelled* outside it at `sandbox create` time. That check is lexical — it compares components on the host and never touches the filesystem, because the workspace directory is allowed not to exist yet — so it constrains the spelling, not what the path resolves to once the gateway VM mounts it. `..` components are refused outright for exactly that reason. A symlink planted inside the workspace is a different matter: it is followed when the VM resolves the mount source, and the lexical check above cannot see one. Treat the shared root as the content you have chosen to expose, not as a boundary the sandbox cannot cross.
 
 ```bash
 # Works — /tmp is world-traversable, so _sandboxd can read the shared root.
