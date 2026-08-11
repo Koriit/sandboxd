@@ -2242,8 +2242,10 @@ setup-darwin-sandboxd-test-state-dir: setup-darwin-sandboxd-test-user setup-darw
 # Membership added here is not active in the shell that ran this target, and
 # nothing downstream activates it: macOS has no `sg`, and test-e2e-macos runs
 # pytest as the invoking user rather than re-execing. So activate it before
-# running the e2e suite: log out and back in, or run pytest in a fresh process
-# under `sudo -n -u $(id -un)` — the same pair the ✓ line below points at.
+# running the e2e suite: log out and back in — the same remediation the ✓ line
+# below points at. Re-exec'ing pytest under sudo is not an alternative: the
+# NOPASSWD fragment `setup-darwin-test-sudoers-fragment` installs below has
+# runas list `(_sandboxd-test)`, which authorizes no sudo to your own account.
 #
 # Idempotence: dseditgroup membership check; sudo only when not yet a member.
 #
@@ -2258,7 +2260,7 @@ setup-darwin-sandboxd-test-operator-group-membership: setup-darwin-sandboxd-test
 	elif dseditgroup -o checkmember -m "$$USER" _sandboxd-test >/dev/null 2>&1; then \
 	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group '_sandboxd-test'$(RESET)"; \
 	else \
-	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandboxd-test  (operator-group membership; takes effect at next login or fresh sudo process)"; \
+	  echo "[sudo] dseditgroup -o edit -a $$USER -t user _sandboxd-test  (operator-group membership; takes effect at next login)"; \
 	  sudo -k dseditgroup -o edit -a "$$USER" -t user _sandboxd-test || { \
 	    echo "ERROR: dseditgroup failed to add '$$USER' to group '_sandboxd-test'."; \
 	    exit 1; \
@@ -2268,7 +2270,7 @@ setup-darwin-sandboxd-test-operator-group-membership: setup-darwin-sandboxd-test
 	    echo "  Check: dseditgroup -o read _sandboxd-test"; \
 	    exit 1; \
 	  }; \
-	  echo "$(GREEN)✓ added '$$USER' to group '_sandboxd-test' — re-login or re-exec under sudo required for the group to be active in the current shell$(RESET)"; \
+	  echo "$(GREEN)✓ added '$$USER' to group '_sandboxd-test' — re-login required for the group to be active in the current shell$(RESET)"; \
 	fi
 
 # setup-darwin-test-sudoers-fragment — install a NOPASSWD sudoers fragment at
