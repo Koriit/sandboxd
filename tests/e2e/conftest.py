@@ -2157,8 +2157,9 @@ def _macos_operator_agent(sandbox_daemon):
         return
 
     if not _agent_test_bin_available():
-        # Binary absent — tests that strictly require the agent will fail
-        # at _platform_axis_gate (the launchctl fallback also fails).
+        # Binary absent — `macos_only` + `lima` tests skip at
+        # _platform_axis_gate rather than fail, unless the production
+        # LaunchAgent is loaded (the gate's other accepted path).
         yield None
         return
 

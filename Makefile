@@ -229,8 +229,9 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # prerequisite, and that target does not build the image: it exits 1 pointing at
 # `make gateway-image`, and its own `docker save` needs the daemon up. So the
 # order is Docker, then the image, then `setup-dev-env`, then this target.
-# Unlike the three above, these two do not fail this target when absent — the
-# harness skips instead, which is what the skip note below is about.
+# An absent Docker daemon or a missing versioned gateway image does not fail
+# this target — the harness skips instead, which is what the skip note below
+# is about.
 #
 # macOS has no `sg`, and this recipe does not substitute for it: it activates
 # the venv and runs pytest directly, so pytest inherits the invoking user's
