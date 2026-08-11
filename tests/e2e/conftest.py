@@ -832,10 +832,15 @@ def _assert_operator_in_sandbox_group() -> None:
     # Accept either.
     if sandbox_gid == os.getegid() or sandbox_gid in os.getgroups():
         return
-    # Membership exists in /etc/group but is not yet active in this
-    # process — most likely the operator was just added and has not
-    # re-logged-in. The remediation depends on whether the operator
-    # statically is a member.
+    # Membership is configured but is not yet active in this process —
+    # most likely the operator was just added and has not re-logged-in.
+    # The remediation depends on whether the operator statically is a
+    # member. The `id -nG` probe below resolves membership through
+    # getgrouplist(3)/NSS, whose backing store varies by platform and
+    # host configuration — so neither this comment nor the message it
+    # feeds names one. (On this project's macOS hosts the group is in
+    # the local Directory Services node and absent from /etc/group, so
+    # naming a file would send a blocked operator to an empty grep.)
     operator = getpass.getuser()
     static_groups = subprocess.run(
         ["id", "-nG", operator],
@@ -860,7 +865,7 @@ def _assert_operator_in_sandbox_group() -> None:
                 "so the new group is visible to the test process."
             )
         remediation = (
-            "Operator '{op}' is listed in /etc/group as a member of "
+            "Operator '{op}' is listed as a member of "
             "'{grp}' but the group is not active in the current "
             "process. {steps}"
         ).format(op=operator, grp=group_name, steps=group_activate_steps)
