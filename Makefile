@@ -222,18 +222,19 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # runner surfaces loudly. Runs the macOS-native matrix (QEMU+HVF sandbox VMs
 # + gateway-Lima container backend), excluding linux_only tests.
 # SCOPE=container limits to the container-only slice (PR-time gate on macOS).
-# Requires the socket_vmnet pool and the sandboxd-gateway Lima VM. Four more
-# are enforced by conftest's `sandbox_daemon` fixture: an *active*
-# `_sandboxd-test` group membership, the base dir
-# `/var/lib/sandboxd/<_sandboxd-test-uid>`, and the NOPASSWD sudoers fragment
-# each fail the run before the daemon launches; an absent `_sandboxd-test`
-# user skips it instead. That fixture is session-scoped and not autouse, so
-# those four reach only tests that request a daemon — narrower than the
-# `_preflight_checks` skips described below. `macos_only` + `lima` tests
-# additionally need an operator agent: either the test-feature binary that
-# `make install-agent-test` installs, which the harness launches itself, or
-# the production LaunchAgent loaded via launchctl. With neither, those tests
-# skip rather than fail, and SCOPE=container selects none of them.
+# Requires the socket_vmnet pool. The sandboxd-gateway Lima VM is not a host
+# precondition: `GatewayLimaManager::ensure_ready` creates it when absent and
+# starts it when stopped. Four further requirements are enforced by conftest's
+# `sandbox_daemon` fixture: an *active* `_sandboxd-test` group membership, the
+# base dir `/var/lib/sandboxd/<_sandboxd-test-uid>`, and the NOPASSWD sudoers
+# fragment each fail the run before the daemon launches; an absent
+# `_sandboxd-test` user skips it instead. That fixture is session-scoped and
+# not autouse, so those four reach only tests that request a daemon — narrower
+# than the `_preflight_checks` skips described below. `macos_only` + `lima`
+# tests additionally need an operator agent: either the test-feature binary
+# that `make install-agent-test` installs, which the harness launches itself,
+# or the production LaunchAgent loaded via launchctl. With neither, those
+# tests skip rather than fail, and SCOPE=container selects none of them.
 #
 # `make setup-dev-env` provisions those four and the agent binary; activating
 # a freshly-added group membership it cannot do for you, and the paragraph
