@@ -233,6 +233,17 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # Skipping that does not fail obscurely: conftest's
 # `_assert_operator_in_sandbox_group` checks the group before launching the
 # daemon and fails the run with that instruction.
+#
+# A green exit does NOT mean the suite ran — read the counts, not the exit
+# status. The
+# harness skips rather than fails when the host is unprovisioned: conftest's
+# session-scoped autouse `_preflight_checks` calls `pytest.skip` when `docker
+# info` fails or the versioned gateway image is absent, and a session-wide
+# skip leaves pytest at exit 0 with every collected test skipped. This target
+# is the most exposed of the e2e targets, because it is the only one that does
+# not take `gateway-image` as a prerequisite — nothing here builds the image
+# the preflight demands. `-rs` below prints every skip reason; grade a run on
+# collected/passed counts against those.
 test-e2e-macos: $(VENV_STAMP)
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "ERROR: test-e2e-macos must run on a macOS host (detected: $$(uname -s))"; \
