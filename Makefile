@@ -225,8 +225,14 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # Requires: socket_vmnet pool, the sandboxd-gateway Lima VM, and the operator
 # agent running. See `make setup-dev-env`.
 #
-# macOS has no `sg`; group membership is activated by re-execing pytest under
-# `sudo -n -u <op>` so the fresh process picks up _sandboxd-test membership.
+# macOS has no `sg`, and this recipe does not substitute for it: it activates
+# the venv and runs pytest directly, so pytest inherits the invoking user's
+# credentials and whatever groups that shell already carries. Activating a
+# freshly-added `_sandboxd-test` membership is therefore the caller's job —
+# log out and back in, or run pytest yourself under `sudo -n -u $(id -un)`.
+# Skipping that does not fail obscurely: conftest's
+# `_assert_operator_in_sandbox_group` checks the group before launching the
+# daemon and fails the run with that instruction.
 test-e2e-macos: $(VENV_STAMP)
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "ERROR: test-e2e-macos must run on a macOS host (detected: $$(uname -s))"; \
@@ -2203,9 +2209,11 @@ setup-darwin-sandboxd-test-state-dir: setup-darwin-sandboxd-test-user setup-darw
 # developer ($USER) to the `_sandboxd-test` group so the pytest process can
 # connect to the e2e daemon socket (mode 0660, group=_sandboxd-test).
 #
-# On macOS there is no `sg`; the test-e2e-macos target re-execs pytest under
-# `sudo -n -u $(id -un)` to activate the group in a fresh process without
-# requiring a full re-login.
+# Membership added here is not active in the shell that ran this target, and
+# nothing downstream activates it: macOS has no `sg`, and test-e2e-macos runs
+# pytest as the invoking user rather than re-execing. So activate it before
+# running the e2e suite: log out and back in, or run pytest in a fresh process
+# under `sudo -n -u $(id -un)` — the same pair the ✓ line below points at.
 #
 # Idempotence: dseditgroup membership check; sudo only when not yet a member.
 #

@@ -214,9 +214,13 @@ PLATFORM: _PlatformConfig = _make_platform_config()
 # The operator must be a member of the daemon-test group so the pytest
 # process can reach the e2e daemon socket (mode 0660, group=<daemon_test_user>).
 # On Linux: ``make test-e2e`` wraps pytest in ``sg sandbox-test -c '…'`` to
-# activate the group without requiring a re-login.  On macOS there is no
-# ``sg``; ``make test-e2e-macos`` re-execs pytest under
-# ``sudo -n -u $(id -un)`` so a fresh process picks up the group.
+# activate the group without requiring a re-login.  macOS has no ``sg`` and
+# ``make test-e2e-macos`` has no substitute for it — it activates the venv and
+# runs pytest directly, so pytest carries the invoking shell's groups.
+# Activating a freshly-added membership there is the caller's job (re-login,
+# or run pytest under ``sudo -n -u $(id -un)``), and
+# :func:`_assert_operator_in_sandbox_group` fails the run with that
+# instruction rather than letting every CLI call fail with EACCES.
 
 # The e2e daemon runs as the dedicated test system user so its per-uid
 # state tree is structurally disjoint from the prod daemon's tree
@@ -801,8 +805,10 @@ def _assert_operator_in_sandbox_group() -> None:
     On Linux, group changes from ``usermod -aG sandbox-test <operator>`` do
     **not** take effect in the current login session; the Makefile wraps pytest
     in ``sg sandbox-test -c '…'`` to activate the group without a re-login.
-    On macOS there is no ``sg``; the Makefile re-execs pytest under
-    ``sudo -n -u $(id -un)`` so the fresh process carries the group.
+    On macOS there is no ``sg`` and the Makefile does not substitute for it:
+    ``test-e2e-macos`` runs pytest as the invoking user, so the group has to be
+    active in the calling shell already — which is why this check exists and
+    why the remediation below has a macOS branch.
     """
     import grp
     group_name = PLATFORM.group_name

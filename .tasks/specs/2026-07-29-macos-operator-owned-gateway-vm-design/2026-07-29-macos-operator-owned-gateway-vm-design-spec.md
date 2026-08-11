@@ -3249,7 +3249,9 @@ only here:
 - `net.inet.ip.forwarding = 0` (v4 and v6) — a **latent dependency**, not context. See §3.2
   → *It is more than context for the lite topology too* and §1.6's precondition.
 - The vmnet slot pool was repaired to a bootable state and drift-clean (8/8 `running`, 8×
-  `exit 0`); **issue #85 is still open**, and the fix is unpushed local commits. See §5.4.
+  `exit 0`). At the time of the run **issue #85 was still open** and the fix was unpushed
+  local commits; both changed on 2026-08-10 — the branch is pushed and `f400f87` is contained
+  in `origin/master`, and #85 is closed as completed. See §5.4.
   The assertion-1 sitting exercised the repaired pool for real — `bgate` attached a NIC to
   slot 1 and the pool was re-verified intact afterwards (8 jobs, 8 sockets `root:_sandboxd
   0770`, dir `0750`, 8 `socket_vmnet` processes). That is corroboration for the repair, **not**
@@ -3455,24 +3457,29 @@ exit**.
         expected pre-fix result and is now the §1.6 reproduction. Recorded per the criterion.
 
 **Where Part B stands — recomputed 2026-08-09, twice: once after assertion 1 ran, and again
-after B1.c was relocated to phase 1. Neither recomputation is a row flip.**
+after B1.c was relocated to phase 1; then a fourth column added 2026-08-10 when Exit-1 was
+posted. No recomputation is a row flip.**
 
-| | Before assertion 1 | After assertion 1 | Now (B1.c relocated) |
-|---|---|---|---|
-| Top-level criteria fully satisfied | **0 of 3** | **1 of 3** | **2 of 2 live** (B2 is void and out of the denominator) |
-| Sub-clauses satisfied | **4 of 6** | **5 of 6** | **5 of 5** |
-| Sub-clauses, on the oldest denominator that still counted void B2 | 4 of 7 | 5 of 7 | — |
-| Exit clauses | 1 `[~]`, 1 `[x]` *with a live warning* | 1 `[~]`, 1 `[x]` **clean** | unchanged: 1 `[~]`, 1 `[x]` clean |
+| | Before assertion 1 | After assertion 1 | B1.c relocated | Now (Exit-1 posted) |
+|---|---|---|---|---|
+| Top-level criteria fully satisfied | **0 of 3** | **1 of 3** | **2 of 2 live** (B2 is void and out of the denominator) | unchanged: **2 of 2 live** |
+| Sub-clauses satisfied | **4 of 6** | **5 of 6** | **5 of 5** | unchanged: **5 of 5** |
+| Sub-clauses, on the oldest denominator that still counted void B2 | 4 of 7 | 5 of 7 | — | — |
+| Exit clauses | 1 `[~]`, 1 `[x]` *with a live warning* | 1 `[~]`, 1 `[x]` **clean** | unchanged: 1 `[~]`, 1 `[x]` clean | **2 `[x]`** |
 
-🚨 **The last column moves for two different reasons and only one of them is progress.**
-Assertion 1 made a criterion *true*. Relocating B1.c made a criterion *not Part B's* — the
-requirement is unchanged and is now stated more strongly in phase 1. Anyone comparing these
-counts across revisions is comparing different denominators, which is why all three columns
-are kept rather than the table being rewritten to the current one.
+🚨 **The columns move for three different reasons and only one of them is progress against
+the gate's question.** Assertion 1 made a criterion *true*. Relocating B1.c made a criterion
+*not Part B's* — the requirement is unchanged and is now stated more strongly in phase 1. The
+fourth column moves **only** the exit row, and it moves because an authorization arrived and a
+comment was posted: **no criterion was re-evaluated and nothing was measured to produce it**,
+which is why the other three rows read *unchanged* rather than being recomputed. Anyone
+comparing these counts across revisions is comparing different denominators, which is why all
+four columns are kept rather than the table being rewritten to the current one.
 
-**Nothing measurable is left.** Every §3.7 assertion has been run. What still stands between
-Part B and a clean sheet is entirely non-measurement, and the items are **not the same kind of
-thing** — keep them distinguished:
+**Nothing measurable is left.** Every §3.7 assertion has been run. What stood between Part B
+and a clean sheet was entirely non-measurement, and the items are **not the same kind of
+thing** — keep them distinguished. Item 3 has since been discharged; items 1 and 2 have not,
+and neither is an unsatisfied criterion:
 
 1. **B2 — void.** The premise was falsified; the criterion was **wrong**. It does not become
    satisfied and it does not become a gap. Do not carry a budget for it and do not re-open it.
@@ -3481,28 +3488,44 @@ thing** — keep them distinguished:
    the strongest evidence short of rebooting, and only the user can reboot. The observation
    that would settle it: after a real reboot, 8/8 `state = running` with `runs = 1` and the
    drift detector at 8× `exit 0`.
-3. **Exit-1 / issue #82 — blocked on the user's authorization.** The write-up is drafted and
-   ready; the five local commits behind it are deliberately unpushed. Neither the comment nor
-   the closing of issue #85 is posted without the user saying so.
+3. **Exit-1 / issue #82 — ✅ discharged 2026-08-10.** This item read, verbatim: *"blocked on
+   the user's authorization. The write-up is drafted and ready; the five local commits behind
+   it are deliberately unpushed. Neither the comment nor the closing of issue #85 is posted
+   without the user saying so."* The authorization came, and all three moved on 2026-08-10 —
+   the branch was **pushed** (`origin/master` is `0e1a7cc`; the two-way count
+   `git rev-list --left-right --count origin/master...HEAD` reports `0 0`), the
+   **Part B write-up was posted** to issue #82
+   (comment `2026-08-10T09:57:50Z`, *Egress validation gate — Part B result: COMPLETE*), and
+   **issue #85 was closed** as completed (`2026-08-10T10:02:28Z`). The blocker is kept on the
+   record rather than deleted: what gated this was a decision that was not this session's to
+   make, and a later reader is better served by *was blocked, discharged on this date, by
+   this* than by a list that never shows the wait. **Issue #82 itself remains open** — it is
+   the feature request this milestone delivers, not the gate's record.
 
 **Formerly item 1 and no longer on this list: B1.c.** It moved to phase 1's acceptance criteria
 rather than being closed. Do not read its absence here as it having been satisfied or dropped —
 and do not re-add it to Part B as an apparent omission.
 
-**So the honest one-liner is: Part B's measurement program is complete, its live criteria are
-satisfied, and its residue is one void criterion, one caveat the user's host must clear, and
-one write-up the user must authorize.** That is still a different statement from "Part B is
-green" — Exit-1 is outstanding, so the list is not green, and it will not be green on anything
-this session can do.
+**So the honest one-liner, as of 2026-08-10: Part B's measurement program is complete, its
+live criteria are satisfied, and both exit clauses are now `[x]`.** The sentence that stood
+here ended *"…and one write-up the user must authorize"*, and added that this was **not** the
+same as "Part B is green" because Exit-1 was outstanding. Exit-1 moved because the write-up
+was authorized and posted, **not because anything was re-measured** — that distinction is the
+whole reason the previous wording is quoted rather than overwritten. **Two residues survive
+and neither is an unsatisfied criterion:** B2 is void and out of the denominator, and B1.b's
+reboot caveat rides an `[x]` clause that only a real reboot can settle. Read "green" here as
+*this list is discharged*, not as *nothing is left to check*.
 
 **Exit (both parts).**
 
-- [~] Findings recorded in this spec and on issue #82. The findings are the durable
+- [x] Findings recorded in this spec and on issue #82. The findings are the durable
       artifact. **Spec: done** (§1.6 reproduction, §3.2, §3.7 assertions 1 and 2, §3.8,
-      §3.10, §3.11, §5.4). **Issue #82: outstanding, and blocked on the user's
-      authorization** — it carries Part A's result and pre-check C, and nothing for Part B.
-      The Part B write-up is drafted and ready to post; it is not owed by this session's
-      work, it is waiting on a decision that is not ours to make.
+      §3.10, §3.11, §5.4). **Issue #82: done 2026-08-10.** This clause read `[~]` for as long
+      as the issue carried Part A's result and pre-check C and *nothing for Part B* — the
+      Part B write-up was drafted and ready, waiting on a decision that was not this
+      session's to make, so the gap was an authorization gap and never a work gap. The
+      authorization came and the comment went up: `2026-08-10T09:57:50Z`, *Egress validation
+      gate — Part B result: COMPLETE*. The issue now carries all three.
 - [x] **The gate script is deleted.** It is not carried into phase 1 and not inherited by
       anyone. **Satisfied vacuously for Part B: no gate script was written.** Part A's was
       deleted at the end of M24-S2. ✅ **The residue warning that stood here is discharged
@@ -3522,11 +3545,14 @@ property phase 1 exists to deliver. Starting phase 1 without Part B is acceptabl
 *finishing* it without Part B would mean shipping partitioning whose central claim is
 untested.
 
-**What that gate now consists of, concretely: the issue #82 write-up, and nothing else.** Every
-§3.7 assertion has been run, so nothing here waits on a measurement. **The dedicated-account
+**What that gate consisted of, concretely, was the issue #82 write-up and nothing else — and
+that write-up was posted on 2026-08-10, so ✅ the gate is discharged and phase 1 is free to
+complete on this axis.** Every §3.7 assertion had already been run, so nothing here ever
+waited on a measurement; it waited on an authorization, which arrived. **The dedicated-account
 criterion is deliberately not in this gate** — it is a phase 1 acceptance criterion, because
 the per-operator group it names does not exist until phase 1 creates it; do not read its
-absence as an omission and do not move it back.
+absence as an omission and do not move it back. **Discharging this gate says nothing about
+phase 1's other criteria**, which are unaffected either way.
 
 Red → route per §3.8; only (c) kills the decision.
 
@@ -4402,7 +4428,7 @@ would normally use to find it — **which is exactly why it is repeated here**.
 |---|---|
 | **#83** — gateway-VM recovery skips container-backend sessions (`gateway_recovery.rs:77-82`) | **Blocks bounce-to-resize** (§2.7). **It does not block phase 5** — the declared-roots mechanism (§5.1) bounces the VM only when the roots change, not per `shared:` create. It does still bite on that rarer path: a root change destroys the operator's running lite sessions with no recovery, because containers are `--restart no` (`container.rs:853-854`). |
 | **#84** — `linux_only` declared and enforced but applied to zero tests | **Owned by phase 6, as its first item.** `make test-e2e-macos SCOPE=full` currently collects the whole Linux-authored matrix on macOS, so no phase-6 result is trustworthy until it closes — and phase 4's egress criterion rests on phase 6. |
-| **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **A prerequisite, not merely related.** The second-operator isolation probe (§3.7) cannot run until it is fixed, because the host has no honest second operator to offer: pre-rename plists, no real `_sandboxd` account, and the existing candidates enrolled in Apple's reserved gid 60 (adding another there was rejected — it deepens the same problem). Fixing it is also what makes `make setup-dev-env` safe again. **The single-operator gate does not depend on it.** See [Before you start](#before-you-start).<br><br>**Status 2026-08-09 — the host is repaired; the issue is not closed.** The reference host now has a real `_sandboxd` account (uid/gid 310), eight plists rewritten to name it and to gate on a root `codesign --verify --strict`, 8/8 daemons `running` with `runs = 1` after a bootout/re-bootstrap **simulation**, and a drift detector at 8× `exit 0`. That was enough to unblock Part B. But **issue #85 is still OPEN**, the fix lives in **unpushed local commits**, and **no real reboot has confirmed it** — so a fresh host, or this one after `make setup-dev-env` runs from an unfixed tree, still reproduces. Do not treat "the probe ran" as "the issue is fixed"; those came apart in exactly this session. |
+| **#85** — `make setup-dev-env` regenerates vmnet plists referencing an account only `install.sh` creates | **A prerequisite, not merely related.** The second-operator isolation probe (§3.7) cannot run until it is fixed, because the host has no honest second operator to offer: pre-rename plists, no real `_sandboxd` account, and the existing candidates enrolled in Apple's reserved gid 60 (adding another there was rejected — it deepens the same problem). Fixing it is also what makes `make setup-dev-env` safe again. **The single-operator gate does not depend on it.** See [Before you start](#before-you-start).<br><br>**Status 2026-08-09 — the host is repaired; the issue is not closed.** The reference host now has a real `_sandboxd` account (uid/gid 310), eight plists rewritten to name it and to gate on a root `codesign --verify --strict`, 8/8 daemons `running` with `runs = 1` after a bootout/re-bootstrap **simulation**, and a drift detector at 8× `exit 0`. That was enough to unblock Part B. But **issue #85 is still OPEN**, the fix lives in **unpushed local commits**, and **no real reboot has confirmed it** — so a fresh host, or this one after `make setup-dev-env` runs from an unfixed tree, still reproduces. Do not treat "the probe ran" as "the issue is fixed"; those came apart in exactly this session.<br><br>**Update 2026-08-10 — two of those three cleared and the third did not, which is the part to carry forward.** Issue #85 is **CLOSED as completed** (`2026-08-10T10:02:28Z`), its closing comment naming the code fix `f400f87` — the Makefile creating the account, the emitter refusing to render a plist for an unresolvable one, and the drift check replacing the "already loaded ⇒ up to date" predicate — plus a series of follow-ups hardening the same path. The fix is no longer local either: `f400f87` is contained in `origin/master`. **But no real reboot has confirmed it, so that caveat stands untouched** and is now the only one of the three still live. Read the closure narrowly: do not treat "the issue is closed" as "a reboot confirmed it", which is the same substitution as the one this row already warns about one sentence earlier. |
 
 ---
 
