@@ -226,6 +226,30 @@ pub fn translate_shared_path(
 /// see them; do not read the `CurDir` arm below as this function covering
 /// them — it fires only for a relative path, which cannot be contained by any
 /// root and is rejected as absoluteness upstream.
+///
+/// # One route of three — what refusing `..` here does not reach
+///
+/// This closes one way of naming a mount source outside the root: *spelling*
+/// it. Two others reach the same place and are open by design, so a reader
+/// who takes this check for "a workspace path cannot leave the shared root"
+/// has read more than is here.
+///
+/// - **A symlink planted inside the workspace.** The 9p export above is
+///   `mapped-xattr`, under which a guest-created symlink is stored host-side
+///   as a *regular file* carrying `S_IFLNK` in a `user.virtfs.*` xattr.
+///   Nothing on the host sees a link — not this scan, not
+///   `std::fs::canonicalize` — while dockerd, resolving `src=` inside the VM,
+///   is handed a real symlink and follows it. That is structural, not a race:
+///   the two views genuinely disagree about what the inode is, so no
+///   re-check, retry or narrower window changes it, and containment has to be
+///   decided in the namespace where the path is used. An agent with write
+///   access to its own workspace — which is the feature — can plant one.
+/// - **The payoff at the far end.** The gateway VM's `/var/run/docker.sock`
+///   is mode `0666` ([`crate::gateway_lima`]) and that VM is a daemon-owned
+///   singleton shared by every operator, so a mount source landing on it is
+///   root over every concurrent session's egress enforcement. That is what
+///   makes the traversal worth attempting. Removing the mode is a separate
+///   fix with a constraint of its own, documented at that site.
 pub fn validate_shared_path(host_path: &Path, shared_root: &Path) -> Result<(), SharedPathError> {
     if let Some(component) = host_path.components().find_map(|c| match c {
         std::path::Component::ParentDir => Some(".."),

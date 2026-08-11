@@ -234,6 +234,12 @@ pub fn validate_shared_path(host_path: &Path, shared_root: &Path) -> Result<(), 
 }
 ```
 
+⚠️ **That body is the function as it stood before `cd46f08`, quoted here because §5.1's
+escape record is written against it.** It now runs a component scan that rejects `..` ahead
+of the `strip_prefix` (`lite_macos.rs:229-248`), and `WorkspaceMode::parse_flag` rejects that
+spelling earlier still. What that did and did not close is at §5.1 → *⚠️ ACTIVE ESCAPE ON
+`master`* → **Status**: one variant refused, two open by design.
+
 Staging projects under `/tmp/sandbox-shared` is not a workflow anyone wants, and it is
 independently fragile: macOS periodically clears `/private/tmp` under a long-lived VM,
 leaving a stale 9p export that fails every subsequent `shared:` create until the VM is
@@ -4088,21 +4094,84 @@ deliberately so, since the path may not exist yet and the function is kept pure
 Consequently `..` traversal and symlinks go unresolved: `/tmp/sandbox-shared/../../Users/alice`
 passes `strip_prefix` and would be handed to `docker create --mount src=…`.
 
+⚠️ **Half of that sentence is now false and the other half is not** (`cd46f08`, M24-S4). `..`
+no longer passes: a component scan in front of the `strip_prefix` rejects it, and `parse_flag`
+rejects the spelling before either check runs. **Symlinks still go unresolved, and no
+host-side check can resolve them** — see *Containment must be decided in the guest*. There is
+still no canonicalization, for the reasons stated above; the fix does not add one.
+
 > ### ⚠️ ACTIVE ESCAPE ON `master` — this document is its only record
 >
 > **A previous draft of this section said "this is prospective, not a live hole". That was
 > wrong**, and it was wrong because it reasoned from an example that happens to be safe.
 > Targeted verification established the following, each hop read from the code.
 >
-> **Status: exploitable today**, by any operator authorized to create a lite session — and
-> because today's gateway VM is a **daemon-owned singleton shared by every operator**, the
-> payoff is not confined to the attacker.
+> **Status: one variant refused at create — the escape is *not* resolved.**
 >
-> **Mechanism.** `validate_shared_path` is a lexical `strip_prefix` with no `..` handling, so
-> `shared:/tmp/sandbox-shared/../../var/run` passes it. It also passes the CLI's check, which
-> tests only `Path::exists()` on the **host**, where `/private/var/run` is real. dockerd then
-> resolves `src=` **inside the VM**, where that path is the *VM's* `/var/run` — which contains
-> `docker.sock` at **mode 0666** (`gateway_lima.rs:455-460`).
+> ✅ **Amended 2026-08-11 (M24-S4).** This line previously read *"**Status: exploitable
+> today**, by any operator authorized to create a lite session — and because today's gateway
+> VM is a **daemon-owned singleton shared by every operator**, the payoff is not confined to
+> the attacker."* One spelling changed and nothing else did, so read the *Mechanism* and
+> *Impact* paragraphs below as the description of an escape that is **narrower by one variant
+> and otherwise intact**.
+>
+> **Closed — the non-canonical-path variant** (`cd46f08`): the remedy at *Independently of
+> the socket* below, together with the `,`/`=` bullet that travels with it.
+> `WorkspaceMode::parse_flag` — the single route from the wire format to a `WorkspaceMode` on
+> both the CLI and the daemon — refuses `..`, `.` and empty components, and the characters
+> that are syntax at a mount sink, for `shared:` and `local:`, host and guest path, on both
+> backends and both platforms. `validate_shared_path` refuses `..` again on the lite path,
+> and `build_create_argv` refuses `,`/`=` at the interpolation itself. The regression tests
+> assert against **`shared:/tmp/sandbox-shared/../../var/run`** — the shape that carries the
+> payoff — and deliberately not against the `/Users/alice` shape this record files as a wrong
+> example. The evidence is **unit-level**: the hermetic suite, plus the verification recorded
+> in that commit, which reverted each of the three checks in turn and watched its tests go
+> red. The macOS e2e tier has **not** run at this commit (M24-S4 exit 4b, blocked on the
+> unrun `make setup-dev-env`), so no live create was observed.
+>
+> **Open — the symlink variant → M24-S22.** *Containment must be decided in the guest* below
+> establishes that host-side resolution is **permanently** blind to it: under `mapped-xattr` a
+> guest-planted symlink is a host-side *regular file*, so neither the check just added nor
+> `canonicalize` sees what dockerd resolves inside the VM. Note that variant's own evidential
+> standing while you are here — it is **reasoned from the code and the 9p semantics, not
+> executed** (*Reasoned but not executed*, below).
+>
+> **Open — the payoff → M24-S21.** The gateway VM still `chmod 666`s `/var/run/docker.sock`
+> (`gateway_lima.rs:460`); M24-S4 went nowhere near it. It is the fix that does not depend on
+> getting path validation exactly right, and the *Decision* paragraph below says why it is not
+> the one-liner it looks like.
+>
+> **Deferred separately, and not a variant of this escape — declared export roots →
+> M24-S23.** They are the containment root that turns *Canonicalization is necessary but not
+> sufficient* below from aspiration into an enforceable check. Until they land there is still
+> one configured root (`/tmp/sandbox-shared` by default, `SANDBOX_LITE_SHARED_ROOT`).
+>
+> ⚠️ **The premise the blast radius rests on did not move: the gateway VM is a daemon-owned
+> singleton on `master`.** One instance, `sandboxd-gateway`
+> (`gateway_lima.rs::GATEWAY_INSTANCE_NAME`), owned by the daemon user and shared by every
+> operator — which is why the payoff is not confined to the attacker. The 2026-08-09 run
+> demonstrated that an **operator-owned** VM enforces egress correctly (§3.7 assertion 1); it
+> did **not** ship one, and M24-S4 did not either. **Do not blur that into "the escape got
+> smaller."**
+>
+> ✅ **The gateway-axis conditional stated further down is measured — cite it, do not
+> re-argue it.** An ordinarily-enrolled, non-admin account (uid **528**, enrolled by the same
+> line `install.sh` runs for every operator) was admitted to **all eight** slot sockets and
+> reached another operator's segment. **§1.6 → *✅ REPRODUCED*** carries that evidence and the
+> ground-truth rule; **§3.7 assertion 2's four-row table** is the authority on which parts are
+> measured and which are not — including that concurrent multi-slot occupancy is measured for
+> uid **501**, *not* for the adversary, and that reaching a **foreign** operator's VM via a
+> second slot remains deliberately **inferred**. Do not restate either from memory.
+>
+> **Mechanism** — stated as it stood before `cd46f08`, because that is the mechanism this
+> record exists to describe. The first hop no longer holds: `validate_shared_path` was a
+> lexical `strip_prefix` with no `..` handling, so `shared:/tmp/sandbox-shared/../../var/run`
+> passed it; it now rejects that component, and `parse_flag` rejects the spelling before
+> either check is reached. Every later hop is unchanged: the CLI's check tests only
+> `Path::exists()` on the **host**, where `/private/var/run` is real, and dockerd resolves
+> `src=` **inside the VM**, where that path is the *VM's* `/var/run` — which contains
+> `docker.sock` at **mode 0666** (`gateway_lima.rs:455-460`). Any *other* way of reaching that
+> source — the symlink variant — still runs the whole chain.
 >
 > **Impact.** A documented CLI flag yields a bind of the gateway VM's Docker socket into a
 > sandbox container, i.e. root in the VM that runs **every operator's** gateway containers.
@@ -4139,6 +4208,10 @@ passes `strip_prefix` and would be handed to `docker create --mount src=…`.
 > **Independently of the socket**, reject `..` and non-canonical paths wherever `shared:` is
 > validated. That closes this variant cheaply and immediately; it does **not** close the
 > symlink variant below.
+>
+> ✅ **Done in `cd46f08` (M24-S4).** Kept as written, because a remedy paragraph rewritten in
+> the past tense stops being checkable against what was built. The sites, the asserted shape
+> and the limits of the evidence are in the amended status above.
 >
 > **The `,`/`=` rejection travels with *this* remedy, not with the symlink variant.** It is
 > written up further down, under the symlink section's supporting measures, only because that
@@ -4235,6 +4308,11 @@ implied, a free win.
   is discussed here, and that placement is what left it belonging to no session at all. See the
   paragraph following *Independently of the socket* for the reasoning, and do not defer it to
   the guest-containment work.
+  ✅ **Done in `cd46f08` (M24-S4)**, on both counts and at two layers: `parse_flag` refuses
+  `,` and `=` in any workspace path, and `build_create_argv` refuses them again at the
+  interpolation, returning an error rather than emitting a mount spec it cannot vouch for.
+  Rejected rather than escaped — docker's option-list parser is the only authority on what an
+  escape would mean there, and a pure argv builder cannot consult it.
 
 **Also preserve the refusal's quality.** The shared-workspace phase deletes
 `outside_root_error_names_cause_and_alternatives` (`lite_macos.rs:442-470`). Its *intent* —

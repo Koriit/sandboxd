@@ -783,6 +783,17 @@ pub(crate) fn is_workspace_path_char(ch: char) -> bool {
 /// is ever bypassed. On the macOS lite path `..` would still be caught by
 /// the scan. On every other backend, and for `.` and `//` everywhere,
 /// nothing downstream catches anything — this function is all there is.
+///
+/// # This is one route out of the workspace root, not the only one
+///
+/// Refusing these spellings closes the variant that *names* an escape
+/// outright. On the macOS lite backend two others reach the same place and
+/// stay open by design: a symlink planted inside the workspace, which no
+/// host-side check can see, and the gateway VM's world-writable Docker
+/// socket, which is what makes reaching outside the root worth the attempt.
+/// Both are written up where they are properties of the code that has them —
+/// [`crate::lite_macos::validate_shared_path`]. Do not read a green result
+/// here as a contained workspace path.
 fn validate_workspace_path_shape(path: &str, mode_label: &str, side: &str) -> Result<(), String> {
     for (index, segment) in path.split('/').enumerate() {
         // The leading empty segment is the root marker of an absolute path,
