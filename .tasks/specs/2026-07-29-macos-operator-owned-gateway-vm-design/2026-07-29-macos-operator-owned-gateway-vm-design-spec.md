@@ -4134,8 +4134,11 @@ still no canonicalization, for the reasons stated above; the fix does not add on
 > payoff — and deliberately not against the `/Users/alice` shape this record files as a wrong
 > example. The evidence is **unit-level**: the hermetic suite, plus the verification recorded
 > in that commit, which reverted each of the three checks in turn and watched its tests go
-> red. The macOS e2e tier has **not** run at this commit (M24-S4 exit 4b, blocked on the
-> unrun `make setup-dev-env`), so no live create was observed.
+> red. The macOS e2e tier has **not** run at this commit (M24-S4 exit 4b), so no live create
+> was observed. What blocks that tier is not a single cause, and this line deliberately does
+> not restate it: the preamble's `setup-dev-env` note in `docs/internal/milestones/M24.md` is the
+> authority, and records that the authorised run is necessary but **not** sufficient — a live
+> Docker daemon and the versioned gateway image sit upstream of it, not beside it.
 >
 > **Open — the symlink variant → M24-S22.** *Containment must be decided in the guest* below
 > establishes that host-side resolution is **permanently** blind to it: under `mapped-xattr` a

@@ -223,7 +223,14 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # + gateway-Lima container backend), excluding linux_only tests.
 # SCOPE=container limits to the container-only slice (PR-time gate on macOS).
 # Requires: socket_vmnet pool, the sandboxd-gateway Lima VM, and the operator
-# agent running. See `make setup-dev-env`.
+# agent running. See `make setup-dev-env`. Two further requirements sit upstream
+# of that run rather than beside it — a live Docker daemon, and a built
+# versioned gateway image. `setup-dev-env` takes `stage-gateway-image-test` as a
+# prerequisite, and that target does not build the image: it exits 1 pointing at
+# `make gateway-image`, and its own `docker save` needs the daemon up. So the
+# order is Docker, then the image, then `setup-dev-env`, then this target.
+# Unlike the three above, these two do not fail this target when absent — the
+# harness skips instead, which is what the skip note below is about.
 #
 # macOS has no `sg`, and this recipe does not substitute for it: it activates
 # the venv and runs pytest directly, so pytest inherits the invoking user's
