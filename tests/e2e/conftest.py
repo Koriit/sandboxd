@@ -217,10 +217,12 @@ PLATFORM: _PlatformConfig = _make_platform_config()
 # activate the group without requiring a re-login.  macOS has no ``sg`` and
 # ``make test-e2e-macos`` has no substitute for it — it activates the venv and
 # runs pytest directly, so pytest carries the invoking shell's groups.
-# Activating a freshly-added membership there is the caller's job (re-login,
-# or run pytest under ``sudo -n -u $(id -un)``), and
-# :func:`_assert_operator_in_sandbox_group` fails the run with that
+# Activating a freshly-added membership there is the caller's job (re-login),
+# and :func:`_assert_operator_in_sandbox_group` fails the run with that
 # instruction rather than letting every CLI call fail with EACCES.
+# Re-exec'ing pytest under sudo is not an alternative ``make setup-dev-env``
+# provides: the NOPASSWD fragment it installs has runas list
+# ``(_sandboxd-test)``, which authorizes no sudo to the operator's own account.
 
 # The e2e daemon runs as the dedicated test system user so its per-uid
 # state tree is structurally disjoint from the prod daemon's tree
@@ -841,21 +843,27 @@ def _assert_operator_in_sandbox_group() -> None:
     ).stdout.split()
     if group_name in static_groups:
         if sys.platform == "darwin":
-            group_activate_hint = (
-                f"re-run pytest under `sudo -n -u {operator} python -m pytest …` "
-                f"(macOS has no `sg`; a fresh sudo process picks up the group)"
+            # No `sg` on macOS, and no sudo shortcut either: the NOPASSWD
+            # fragment `make setup-dev-env` installs has runas list
+            # `(<daemon_test_user>)` alone, so it grants the operator no sudo
+            # to their own account. A fresh login session is the remediation.
+            group_activate_steps = (
+                "Log out and back in, then re-run pytest. (macOS has no `sg`, "
+                "and the NOPASSWD sudoers fragment `make setup-dev-env` "
+                f"installs has runas list `({PLATFORM.daemon_test_user})`, "
+                "which authorizes no sudo to your own account.)"
             )
         else:
-            group_activate_hint = (
+            group_activate_steps = (
+                "Log out and back in, or re-run pytest under "
                 f"`sg {group_name} -c 'python -m pytest …'` "
-                f"so the new group is visible to the test process"
+                "so the new group is visible to the test process."
             )
         remediation = (
             "Operator '{op}' is listed in /etc/group as a member of "
             "'{grp}' but the group is not active in the current "
-            "process. Log out and back in, or re-run pytest under "
-            "{hint}."
-        ).format(op=operator, grp=group_name, hint=group_activate_hint)
+            "process. {steps}"
+        ).format(op=operator, grp=group_name, steps=group_activate_steps)
     else:
         remediation = (
             "Operator '{op}' is not a member of the '{grp}' group. "
