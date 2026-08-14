@@ -394,6 +394,19 @@ def gateway_container_name(session_id: str) -> str:
     return f"sandbox-gw-{session_id}"
 
 
+#: ``find -name`` patterns matching every gateway Lima instance directory,
+#: for use in the state-dir reset's keep lists.
+#:
+#: A pattern, not a name, and deliberately so. The reset deletes everything a
+#: keep list does not match, so spelling one instance name there is only safe
+#: while exactly one gateway VM can exist. The moment gateway VMs are owned
+#: per operator, a literal name preserves one operator's instance and deletes
+#: every other operator's on every pytest session — a destructive act by a
+#: test harness against state it does not own. The prefix is the stable part
+#: of the naming scheme; what follows it identifies the owner.
+_GATEWAY_INSTANCE_KEEP: tuple[str, ...] = ("sandboxd-gateway*",)
+
+
 # ---------------------------------------------------------------------------
 # Cross-user Lima helpers
 # ---------------------------------------------------------------------------
@@ -928,7 +941,13 @@ def _wait_for_daemon_socket(
 
 def _sudo_rm_children_except(directory: Path, keep: list[str]) -> None:
     """As the ``sandbox`` user, remove every direct child of ``directory``
-    whose name is not in ``keep``.
+    whose name matches no entry in ``keep``.
+
+    ``keep`` entries are ``find -name`` patterns, not literal names, so a
+    trailing ``*`` preserves a whole family of instance directories. That
+    matters wherever the thing being preserved is one of N per-owner
+    instances rather than a fixed singleton: a literal name preserves the
+    one instance it spells and deletes every sibling.
 
     Implementation-independent on purpose: it uses
     ``find -maxdepth 1 … -exec rm -rf {} +`` rather than ``find … -delete``.
@@ -1061,15 +1080,15 @@ def _reset_sandbox_state_dir() -> None:
         # ensure_ready() can start it without re-creating (and re-downloading
         # the cloud image). Also keep staging artifacts and the Lima SSH config.
         #
-        # Daemon Lima home = {base_dir}/{op_uid}/lima.
-        # _SANDBOX_E2E_BASE_DIR already encodes the daemon uid (309), so the
-        # per-operator path adds just one more uid component (also 309 in the
-        # e2e cross-user setup where daemon_uid == op_uid == _SANDBOX_TEST_UID).
+        # Daemon Lima home = _SANDBOX_E2E_BASE_DIR / {op_uid} / lima, which is
+        # the 3-level path above: the base dir supplies state root + daemon
+        # uid, and this adds the operator uid (also _SANDBOX_TEST_UID in the
+        # e2e setup, where the daemon is its own operator).
         daemon_lima_home = (
             _SANDBOX_E2E_BASE_DIR / str(_SANDBOX_TEST_UID) / "lima"
         )
         # Remove per-session Lima clones (if any leaked from a crashed run).
-        # Keep: staging artifacts, Lima SSH config, the gateway VM, and the
+        # Keep: staging artifacts, Lima SSH config, every gateway VM, and the
         # golden base VM (if it exists).
         _sudo_rm_children_except(
             daemon_lima_home,
@@ -1078,7 +1097,7 @@ def _reset_sandbox_state_dir() -> None:
                 "lite-image.tar",
                 "sandbox-route-helper-linux-aarch64",
                 "_config",
-                "sandboxd-gateway",
+                *_GATEWAY_INSTANCE_KEEP,
                 base_vm,
                 ".cache",
                 "base-image-meta.json",
@@ -1087,17 +1106,18 @@ def _reset_sandbox_state_dir() -> None:
 
     # Per-operator LIMA_HOME under the 3-level path
     # (``/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima``): keep the download
-    # cache, the golden base VM, and the freshness metadata; remove
-    # per-session VM clones and any stale config so a partially-initialised
-    # base VM left by a killed run is not reused via a stale meta file. The
-    # base VM lives directly under LIMA_HOME here (LIMA_HOME *is* the Lima
-    # home), not under a .lima subdir.
+    # cache, the golden base VM, the freshness metadata and any gateway VM
+    # instance; remove per-session VM clones and any stale config so a
+    # partially-initialised base VM left by a killed run is not reused via a
+    # stale meta file. The base VM lives directly under LIMA_HOME here
+    # (LIMA_HOME *is* the Lima home), not under a .lima subdir.
     # The LIMA_HOME root is sandbox-test-owned (provisioned by the daemon via
     # ensure_operator_lima_home); delete via the sandbox-test pivot so rm has
     # write+exec on the parent dir even when child files are operator-owned.
     op_lima_home = Path(OP_LIMA_HOME)
     _sudo_rm_children_except(
-        op_lima_home, [".cache", base_vm, "base-image-meta.json"]
+        op_lima_home,
+        [".cache", base_vm, "base-image-meta.json", *_GATEWAY_INSTANCE_KEEP],
     )
 
 
