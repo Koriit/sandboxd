@@ -157,7 +157,7 @@ The cross-user matrix boots real VMs and runs ~1.5–2h on the 8 GB host. Launch
 
 ### Disk pressure (ENOSPC)
 
-`/` (≈96 GB) holds `/var/lib/docker` (image layers + build cache), the Lima VM disk images under `/var/lib/sandboxd/<uid>/lima/`, and `/tmp`. Long or repeated e2e / integration runs accumulate fast: every `make gateway-image` / `lite-image` rebuild adds build-cache layers (tens of GB over a session), each Lima VM is a multi-GB qcow2, and a crashed run can leave an orphaned QEMU process still holding its disk image. When `/` fills, the failure is usually **confusing rather than an obvious "disk full"** — `cargo` dies mid-link, `docker build` fails, or VM creation hangs.
+`/` (≈96 GB) holds `/var/lib/docker` (image layers + build cache), the Lima VM disk images under `/var/lib/sandboxd/<daemon-uid>/<op-uid>/lima/`, and `/tmp`. Long or repeated e2e / integration runs accumulate fast: every `make gateway-image` / `lite-image` rebuild adds build-cache layers (tens of GB over a session), each Lima VM is a multi-GB qcow2, and a crashed run can leave an orphaned QEMU process still holding its disk image. When `/` fills, the failure is usually **confusing rather than an obvious "disk full"** — `cargo` dies mid-link, `docker build` fails, or VM creation hangs.
 
 **Watch it.** `df -h /`. During a long background run, arm a watcher that alerts when free space drops below a threshold (e.g. a poll loop that emits only when free space is under ~10–12 GB) rather than discovering ENOSPC after a wasted hour.
 

@@ -207,7 +207,7 @@ impl Daemon {
             // it never touches the operator's real ~/.local/bin/limactl.
             .env("SANDBOX_LIMA_HELPER_TEST_LIMACTL_PATH", fake_limactl)
             // Redirect the per-operator LIMA_HOME state root into the test
-            // tempdir so the daemon provisions `<root>/<uid>/lima` somewhere
+            // tempdir so the daemon provisions `<root>/<daemon_uid>/<op_uid>/lima`
             // the test runner can write, instead of the production
             // `/var/lib/sandboxd` (which needs root/dev-env setup to exist).
             .env("SANDBOX_LIMA_HELPER_TEST_STATE_ROOT", tmp.path())

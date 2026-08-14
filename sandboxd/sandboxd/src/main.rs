@@ -10428,7 +10428,7 @@ async fn session_health(
 ///   not designed for.
 /// * Lima sessions: Lima manages per-VM SSH credentials in the
 ///   operator's per-operator LIMA_HOME under
-///   `/var/lib/sandboxd/<op_uid>/lima/_config/user`. That file is
+///   `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/_config/user`. That file is
 ///   mode 0600 owned by the operator uid; the daemon reads it by
 ///   pivoting through `sandbox-lima-helper read-user-key` (same
 ///   cross-user pattern as the proxy WebSocket's `list-json`/
@@ -10486,8 +10486,9 @@ async fn get_ssh_config(
         },
         BackendKind::Lima => {
             // Lima manages per-VM SSH credentials under the operator's
-            // per-operator LIMA_HOME (`/var/lib/sandboxd/<op_uid>/lima/
-            // _config/user`). That file is mode 0600 owned by the operator
+            // per-operator LIMA_HOME
+            // (`/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/_config/user`).
+            // That file is mode 0600 owned by the operator
             // uid — the daemon (uid 999) cannot read it directly. The helper
             // binary (`sandbox-lima-helper read-user-key`) pivots to the
             // operator uid via setresuid, reads the file, and writes the

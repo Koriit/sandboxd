@@ -4,7 +4,9 @@
 /// Linux VM that hosts all gateway containers across all sandbox sessions.
 ///
 /// The gateway instance is daemon infrastructure, not per-operator. It lives
-/// under the daemon's own LIMA_HOME (`/var/lib/sandboxd/<_sandboxd-uid>/lima/`)
+/// under the daemon's own LIMA_HOME
+/// (`/var/lib/sandboxd/<_sandboxd-uid>/<_sandboxd-uid>/lima/` — the daemon is its
+/// own operator, so both uid components of the 3-level path are its uid)
 /// and all `limactl` ops on it run via the `op_uid == daemon_uid` degenerate
 /// path of the `LimaExecutor` seam (i.e., `run_limactl_direct` in the daemon —
 /// no agent, no privilege pivot needed because the daemon already is `_sandboxd`).
@@ -769,7 +771,7 @@ pub fn lite_stage_rm_argv(vm_dir: &str) -> Vec<String> {
 /// - The baseline `eth0` nft policy is in place.
 #[cfg(target_os = "macos")]
 pub struct GatewayLimaManager {
-    /// Daemon's LIMA_HOME: `/var/lib/sandboxd/<daemon-uid>/lima/`.
+    /// Daemon's LIMA_HOME: `/var/lib/sandboxd/<daemon-uid>/<daemon-uid>/lima/`.
     daemon_lima_home: PathBuf,
 
     /// Derived path to the forwarded Docker socket:
@@ -794,7 +796,7 @@ impl GatewayLimaManager {
     /// Construct a new manager.
     ///
     /// - `daemon_lima_home` — the daemon's LIMA_HOME root (e.g.
-    ///   `/var/lib/sandboxd/<daemon_uid>/lima/`).
+    ///   `/var/lib/sandboxd/<daemon_uid>/<daemon_uid>/lima/`).
     /// - `executor` — the `LimaExecutor` implementation (on macOS this is
     ///   `AgentBrokerExecutor`; when `op_uid == daemon_uid` it routes to
     ///   `run_limactl_direct`).

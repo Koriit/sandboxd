@@ -644,7 +644,7 @@ mod tests {
     /// ordering here is load-bearing, not cosmetic.
     #[test]
     fn docker_with_socket_some_prepends_h_unix_prefix() {
-        let sock = Path::new("/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock");
+        let sock = Path::new("/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock");
         let cmd = docker_with_socket(Some(sock));
         assert_eq!(cmd.get_program().to_str().unwrap(), "docker");
         let args = args_of(&cmd);
@@ -652,7 +652,7 @@ mod tests {
             args,
             vec![
                 "-H",
-                "unix:///var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock"
+                "unix:///var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock"
             ],
             "macOS transport must prepend exactly `-H unix://<path>`"
         );

@@ -29,7 +29,7 @@ Most recipes below are written for the Linux substrate and reference Linux-only 
 - **The gateway runs inside a Lima VM, not on the host Docker daemon.** There is no host Docker on macOS. Gateway containers live inside the persistent `sandboxd-gateway` Lima VM and are reached over the forwarded Docker socket. To run the `docker exec sandbox-gw-<id> …` recipes below, target that socket (the daemon runs as `_sandboxd`, which owns it):
   ```bash
   SANDBOX_UID=$(id -u _sandboxd)
-  GW_SOCK="/var/lib/sandboxd/${SANDBOX_UID}/lima/sandboxd-gateway/gateway-docker.sock"
+  GW_SOCK="/var/lib/sandboxd/${SANDBOX_UID}/${SANDBOX_UID}/lima/sandboxd-gateway/gateway-docker.sock"
   sudo -u _sandboxd docker -H "unix://${GW_SOCK}" ps
   sudo -u _sandboxd docker -H "unix://${GW_SOCK}" exec sandbox-gw-<id> nft list ruleset
   ```

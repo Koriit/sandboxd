@@ -416,7 +416,7 @@ _GATEWAY_INSTANCE_KEEP: tuple[str, ...] = ("sandboxd-gateway*",)
 # *operator* uid before exec'ing limactl.  The resulting Lima state lives at
 # the per-operator path:
 #
-#   /var/lib/sandboxd/<op_uid>/lima/
+#   /var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/
 #
 # NOT at the test-runner's ``~/.lima/``.  Any test-side helper that invokes
 # ``limactl`` directly (for inspection or cleanup) must therefore pass
@@ -575,7 +575,8 @@ def wait_for_state(
 def capture_lima_logs(session_id: str) -> str:
     """Best-effort capture of Lima VM logs for debugging failures.
 
-    Lima state lives at ``OP_LIMA_HOME`` (``/var/lib/sandboxd/<op_uid>/lima/``).
+    Lima state lives at ``OP_LIMA_HOME``
+    (``/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/``).
     """
     vm = lima_vm_name(session_id)
     logs = []
@@ -1045,10 +1046,12 @@ def _reset_sandbox_state_dir() -> None:
     base_vm = os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
 
     if sys.platform == "darwin":
-        # On macOS the daemon's Lima home lives at a 3-level path
-        # ``{base_dir}/{daemon_uid}/{op_uid}/lima`` where daemon_uid = op_uid =
-        # _SANDBOX_TEST_UID (the e2e daemon runs as the test user and creates
-        # sessions for itself). This subtree contains staging artifacts
+        # On macOS the daemon's Lima home lives at the 3-level path
+        # ``{state_root}/{daemon_uid}/{op_uid}/lima`` where daemon_uid = op_uid
+        # = _SANDBOX_TEST_UID (the e2e daemon runs as the test user and creates
+        # sessions for itself). ``_SANDBOX_E2E_BASE_DIR`` is
+        # ``{state_root}/{daemon_uid}``, i.e. the first two components of that
+        # path already. This subtree contains staging artifacts
         # (gateway-image.tar, lite-image.tar, sandbox-route-helper) that the
         # daemon needs at startup and which are not cheaply re-downloadable.
         #
@@ -1268,11 +1271,11 @@ def _launch_daemon_as_sandbox_via_sudo(
     #   /var/log/sandbox (root:wheel 0744), which uid 309 cannot write and
     #   which aborts the daemon before it binds its socket. Routing logs to
     #   the base dir lets the harness surface them on failure.
-    # Gateway VM Docker socket path:
-    # {_SANDBOX_E2E_BASE_DIR}/{daemon_uid}/{op_uid}/lima/sandboxd-gateway/gateway-docker.sock
+    # Gateway VM Docker socket path, under the 3-level LIMA_HOME:
+    # {state_root}/{daemon_uid}/{op_uid}/lima/sandboxd-gateway/gateway-docker.sock
     # On the e2e harness daemon_uid == op_uid == _SANDBOX_TEST_UID.
-    # _SANDBOX_E2E_BASE_DIR already contains the test uid as its last component,
-    # so the two-level path is: _SANDBOX_E2E_BASE_DIR / {_SANDBOX_TEST_UID} / lima /...
+    # _SANDBOX_E2E_BASE_DIR is {state_root}/{daemon_uid}, so the remainder
+    # appended below is: {_SANDBOX_TEST_UID} / lima / ...
     _gateway_docker_sock = (
         _SANDBOX_E2E_BASE_DIR
         / str(_SANDBOX_TEST_UID)

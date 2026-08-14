@@ -6484,7 +6484,7 @@ mod tests {
     #[test]
     fn registry_operators_have_isolated_lima_homes() {
         // Each operator's LimaManager must be rooted at a distinct
-        // LIMA_HOME path under <state_root>/<op_uid>/lima.
+        // LIMA_HOME path under <state_root>/<daemon_uid>/<op_uid>/lima.
         let tmp = tempfile::tempdir().expect("tmpdir");
         let root = tmp.path().to_path_buf();
         let registry = LimaManagerRegistry::new_with_provisioner(

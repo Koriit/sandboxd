@@ -2352,7 +2352,7 @@ mod tests {
             1000,
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
-            "/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock",
+            "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
             "/var/lib/sandboxd/501",
         )
     }
@@ -2391,7 +2391,7 @@ mod tests {
         assert_eq!(
             rt.docker_socket(),
             Some(Path::new(
-                "/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock"
+                "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock"
             ))
         );
     }
@@ -3183,7 +3183,7 @@ mod tests {
             1000,
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
-            "/var/lib/sandboxd/501/lima/sandboxd-gateway/gateway-docker.sock",
+            "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
             "/var/lib/sandboxd/501",
         );
 

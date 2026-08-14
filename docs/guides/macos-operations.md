@@ -10,7 +10,7 @@ sandboxd uses Lima internally but is completely isolated from any Lima or
 Colima installation you use for personal development.
 
 **Separate home directories.** sandboxd stores all its Lima instance state
-under `/var/lib/sandboxd/<_sandboxd-uid>/lima/` (gateway VM, per-operator base
+under `/var/lib/sandboxd/<_sandboxd-uid>/<op-uid>/lima/` (gateway VM, per-operator base
 images). Your personal Lima home (`~/.lima/`) and any Colima state are never
 read or written by sandboxd.
 
@@ -34,7 +34,7 @@ reservation isolating them.
 
 | Resource | sandboxd uses | Personal Lima/Colima |
 |---|---|---|
-| Lima home | `/var/lib/sandboxd/<uid>/lima/` | `~/.lima/` |
+| Lima home | `/var/lib/sandboxd/<daemon-uid>/<op-uid>/lima/` | `~/.lima/` |
 | vmnet sockets | `/var/run/sandbox/vmnet/` | `/var/run/lima/` (Homebrew default) |
 | Docker daemon | Inside gateway VM only | Host Docker / Desktop / OrbStack |
 | `networks.yaml` | Never written | Managed by Lima/Colima |

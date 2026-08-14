@@ -43,7 +43,7 @@
 //! # Privilege model
 //!
 //! File caps: `cap_setuid+ep`. No `cap_chown` — POSIX ACLs on
-//! `/var/lib/sandboxd/<op-uid>/lima/` handle file ownership; the
+//! `/var/lib/sandboxd/<daemon-uid>/<op-uid>/lima/` handle file ownership; the
 //! chown-bracket pattern is gone. Installed at
 //! `/usr/local/libexec/sandboxd/sandbox-lima-helper`.
 //!
@@ -80,7 +80,8 @@
 // * No root op-uid. Even with cap_setuid, the helper refuses
 //   --op-uid 0 explicitly.
 //
-// * No cap_chown. POSIX ACLs on /var/lib/sandboxd/<op-uid>/lima/
+// * No cap_chown. POSIX ACLs on
+//   /var/lib/sandboxd/<daemon-uid>/<op-uid>/lima/
 //   handle file ownership; the chown-bracket pattern of
 //   sandbox-spawn-helper does not exist here.
 //

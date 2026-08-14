@@ -269,8 +269,8 @@ The gateway instance exposes the Linux Docker daemon running inside it to the ma
 | Resource | Path |
 | -------- | ---- |
 | Lima instance name | `sandboxd-gateway` |
-| Daemon's `LIMA_HOME` | `/var/lib/sandboxd/<_sandboxd-uid>/lima/` |
-| Forwarded Docker socket (host side) | `/var/lib/sandboxd/<_sandboxd-uid>/lima/sandboxd-gateway/gateway-docker.sock` |
+| Daemon's `LIMA_HOME` | `/var/lib/sandboxd/<_sandboxd-uid>/<_sandboxd-uid>/lima/` |
+| Forwarded Docker socket (host side) | `/var/lib/sandboxd/<_sandboxd-uid>/<_sandboxd-uid>/lima/sandboxd-gateway/gateway-docker.sock` |
 
 All `docker` commands the daemon issues for gateway container lifecycle (create, inspect, nft injection, image load) target this forwarded socket via `DOCKER_HOST`, never the host Docker daemon. The forwarded socket is `0600` owned by `_sandboxd` — group-readable only by the daemon, not by enrolled operators. Controlling this socket is root-equivalent inside the gateway VM and therefore a cross-session blast radius; restricting it is load-bearing.
 

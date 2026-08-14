@@ -1503,12 +1503,16 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
 def _daemon_lima_home() -> str:
     """Return the daemon uid's LIMA_HOME for the e2e harness.
 
-    The sandboxd-gateway instance lives here, under the daemon-uid's
-    per-uid Lima registry: /var/lib/sandboxd/<daemon-test-uid>/lima/.
+    The gateway instance lives here, in the daemon's own Lima registry —
+    the 3-level path ``/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima``, where
+    the daemon acts as its own operator so both uid components are the
+    daemon test uid.  Getting this wrong is silent rather than loud: limactl
+    against a LIMA_HOME holding no instances reports the gateway simply
+    absent, so a stop is a no-op and a state probe reads ``None``.
     """
     import pwd as _pwd
     daemon_test_uid = _pwd.getpwnam(PLATFORM.daemon_test_user).pw_uid
-    return f"/var/lib/sandboxd/{daemon_test_uid}/lima"
+    return f"/var/lib/sandboxd/{daemon_test_uid}/{daemon_test_uid}/lima"
 
 
 def _gateway_docker_socket() -> str:
