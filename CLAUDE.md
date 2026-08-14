@@ -104,6 +104,37 @@ python -m pytest -v --timeout=600                           # full suite
 
 If `python -m pytest` reports `ModuleNotFoundError: No module named 'pytest'` despite `pip list` showing it, the host's `python3` was upgraded under the venv since it was built — `tests/e2e/.venv/bin/python` is now ABI-mismatched with the new interpreter. `make test-e2e` (and friends) auto-rebuild the venv via a version-stamped marker (`.installed.pythonX.Y`); for the manual `source .venv/bin/activate` path above, run `rm -rf tests/e2e/.venv && make test-e2e-container` once to rebuild against the current `python3`, then the activate-and-iterate flow works again.
 
+### Two selection axes: backend and platform
+
+E2E selection is controlled by two orthogonal marker pairs, and the
+distinction matters because they answer different questions:
+
+- **Backend** — `lima` / `container`. Which session backend the test
+  drives. Unmarked cross-backend tests are parametrized over both.
+- **Platform** — `linux_only` / `macos_only`. Which *host* the test can
+  run on at all. Unmarked is the majority and means "both".
+
+Apply a platform marker only when the test body asserts on a host facility
+the other platform does not have — systemd scopes, cgroup v2,
+`sandbox-lima-helper` and `/etc/sandboxd/users.conf` on the Linux side;
+the `socket_vmnet` pool, gateway-Lima lifecycle and the launchd agent on
+the macOS side. A test that merely *fails* on the other platform because
+the harness points at something absent there is a harness bug; marking it
+converts a fixable defect into a permanent exclusion, and the coverage
+never comes back. State the evidence at the mark — name the assertion and
+the facility it needs — so a later reader can re-examine the claim.
+
+The platform markers are enforced per-test by conftest's autouse
+`_platform_axis_gate` and consumed as deselect filters by the
+platform-specific make targets (`-m "not linux_only"` on macOS,
+`-m "not macos_only"` on Linux). A declared marker applied to zero tests
+deselects nothing while appearing to gate — a state the suite has been in
+before, with the macOS entry point silently collecting the whole
+Linux-authored matrix — so conftest's `pytest_configure` refuses to start
+a run in which either marker is unapplied. The full-file marker
+declaration is the usual home for both, since the platform axis is
+normally a property of the whole file.
+
 ### Cross-user harness
 
 The suite runs the e2e daemon as the dedicated `sandbox-test` system user via `sudo -u sandbox-test`, while the test runner acts as the *operator* (a separate uid) — the real cross-user path. `make test-e2e` is the single env-agnostic trigger. All sudo is pre-authorized by `make setup-dev-env`, which installs a NOPASSWD sudoers fragment (`/etc/sudoers.d/sandboxd-test`) granting the operator blanket passwordless impersonation of both `sandbox` and `sandbox-test`.

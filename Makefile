@@ -222,6 +222,12 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # runner surfaces loudly. Runs the macOS-native matrix (QEMU+HVF sandbox VMs
 # + gateway-Lima container backend), excluding linux_only tests.
 # SCOPE=container limits to the container-only slice (PR-time gate on macOS).
+# The `not linux_only` clause below is load-bearing rather than decorative,
+# which is worth stating because it once was not: the marker was declared,
+# documented and filtered on here while carried by zero tests, so this entry
+# point collected the whole Linux-authored matrix while appearing to exclude
+# it. conftest's `pytest_configure` now fails the run if either platform
+# marker goes unapplied, so that state cannot recur silently.
 # Requires the socket_vmnet pool. The sandboxd-gateway Lima VM is not a host
 # precondition: `GatewayLimaManager::ensure_ready` creates it when absent and
 # starts it when stopped. Four further requirements are enforced by conftest's

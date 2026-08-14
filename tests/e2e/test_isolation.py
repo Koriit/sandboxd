@@ -36,6 +36,19 @@ from conftest import (
     write_policy_file,
 )
 
+# Linux-only. The property under test — which pool a session's subnet comes
+# from — is platform-neutral, but the *gate* this file is built on is not:
+# it turns on the host route helper reading `/etc/sandboxd/users.conf` and
+# checking pair membership. On macOS the route helper runs inside the gateway
+# VM in `--vm-gateway-mode`, which skips the users.conf load and the
+# membership check outright, and `make setup-dev-env` never runs
+# `setup-users-conf` on Darwin — so the file is always absent, the guard below
+# always fires, and the run is told to fix it with a target that does not
+# apply there. Marking the file keeps that skip honest instead of misdirecting.
+# Restoring macOS coverage means giving the guard a macOS path, not deleting
+# the marker.
+pytestmark = pytest.mark.linux_only
+
 
 # Production pool CIDR — the operator's canonical pool that the test
 # daemon must NOT touch. Intentionally hard-coded here rather than

@@ -2124,9 +2124,31 @@ def backend(request) -> str:
 #   Platform axis — ``@pytest.mark.linux_only`` / ``@pytest.mark.macos_only``
 #
 # No platform marker → the test runs on both platforms (the majority).
-# ``linux_only`` → qemu-bridge-helper, /dev/kvm, route-helper netns, systemd.
+# ``linux_only`` → qemu-bridge-helper, /dev/kvm, route-helper netns, systemd,
+#   cgroup v2, `sandbox-lima-helper`, host `/etc/sandboxd/users.conf`.
 # ``macos_only`` → socket_vmnet pool lifecycle, gateway Lima instance lifecycle,
 #   vmnet NIC discovery, per-operator agent check-in/broker, launchd control.
+#
+# When to reach for a platform marker, and when not to
+# ----------------------------------------------------
+# The bar is that the test *body* asserts on a host facility the other
+# platform does not have, so the test could not pass there however well the
+# product worked. Two shapes look similar and are not:
+#
+#   * A test that would pass on both platforms but is written against
+#     Linux-only plumbing needs that plumbing generalised, not a marker.
+#     Marking it silently removes coverage rather than describing reality.
+#   * A test that fails on macOS because the *harness* points at something
+#     absent — the host Docker daemon, say — is a harness bug. A marker
+#     converts a fixable defect into a permanent exclusion.
+#
+# Marking is a claim about the platform, so state the evidence at the mark:
+# name the assertion and the facility it needs. A marker whose reason is
+# "fails on macOS" cannot be re-examined by the next reader.
+#
+# Both markers are enforced by ``_platform_axis_gate`` below and consumed as
+# deselect filters by the platform-specific make targets; ``pytest_configure``
+# refuses to start a run in which either is applied to no test at all.
 #
 # For ``macos_only`` tests the fixture also checks whether the per-operator
 # sandboxd agent is loaded (Aqua/GUI mode), because the full Lima backend
@@ -2136,6 +2158,47 @@ def backend(request) -> str:
 # Cross-user SSH/Background sessions bypass the Aqua gate by using the
 # test-feature agent binary (AGENT_TEST_BIN, installed by `make install-agent-test`)
 # launched by the _macos_operator_agent session-scoped fixture below.
+
+
+# Platform markers that must actually be applied to something.
+#
+# Both are consumed as deselect filters by the platform-specific make
+# targets (`-m "not linux_only"` on macOS, `-m "not macos_only"` on Linux).
+# A marker that is declared, documented and filtered on but carried by zero
+# tests deselects nothing, and nothing about that is visible in a run: the
+# suite is simply green while the gate it advertises is inert. That is not
+# hypothetical — `linux_only` sat in exactly that state, so the macOS entry
+# point collected the whole Linux-authored matrix while appearing to exclude
+# it.  This check makes the next occurrence fail at startup instead.
+_PLATFORM_MARKERS = ("linux_only", "macos_only")
+
+
+def pytest_configure(config):
+    """Fail the run if a platform marker is applied to no test at all.
+
+    Deliberately a source scan of ``test_*.py`` rather than a count over
+    collected items: under ``-m "not linux_only"`` — the macOS entry point —
+    every ``linux_only`` item is deselected, so a collected-item count is
+    zero whether the marker is applied everywhere or nowhere. The scan is
+    also stable under partial runs (``pytest test_lite.py``), which an
+    item-based check is not.
+    """
+    e2e_dir = Path(__file__).resolve().parent
+    unapplied = [
+        marker
+        for marker in _PLATFORM_MARKERS
+        if not any(
+            f"pytest.mark.{marker}" in path.read_text(errors="replace")
+            for path in sorted(e2e_dir.glob("test_*.py"))
+        )
+    ]
+    if unapplied:
+        raise pytest.UsageError(
+            "platform marker(s) declared and filtered on but applied to zero "
+            f"tests: {', '.join(unapplied)}. A marker in this state silently "
+            "deselects nothing — apply it to the tests it describes, or drop "
+            "it from pyproject.toml and from the make targets' -m expressions."
+        )
 
 
 def _agent_test_bin_available() -> bool:
@@ -2270,8 +2333,11 @@ def _platform_axis_gate(request, _macos_operator_agent):
 
     if has_linux_only and sys.platform == "darwin":
         pytest.skip(
-            "linux_only test; run on Linux (requires qemu-bridge-helper, "
-            "/dev/kvm, route-helper netns, or systemd)."
+            "linux_only test; run on Linux. Its assertions need a host "
+            "facility macOS does not have — qemu-bridge-helper, /dev/kvm, "
+            "route-helper netns, systemd scopes, cgroup v2, "
+            "sandbox-lima-helper, or /etc/sandboxd/users.conf. See the "
+            "marker's own comment at the test for which one."
         )
 
     if has_macos_only and sys.platform != "darwin":

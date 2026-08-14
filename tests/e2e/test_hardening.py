@@ -34,7 +34,20 @@ from conftest import (
 
 # Whole-file Lima-only: gates the per-test Lima prereq fixture and lets
 # `-m "not lima"` exclude this file on container-only runs.
-pytestmark = pytest.mark.lima
+#
+# Also whole-file Linux-only. Every test here asserts on something only the
+# Linux QEMU wrapper produces, so none of them can pass on macOS:
+#
+#   * `test_cgroup_limits` reads `systemctl --user list-units --type=scope`
+#     and `/sys/fs/cgroup<path>/memory.max`. The macOS wrapper applies no
+#     cgroup limits at all — cgroups do not exist there.
+#   * `test_hardened_qemu_args` requires `-vga none` and `virtio-rng-pci`,
+#     and `test_no_hardening_flag` requires `pcie-root-port`. All three are
+#     injected by the Linux wrapper only; the macOS wrapper rewrites the
+#     slirp netdev and execs QEMU without appending any of them.
+#
+# See `sandbox-core::lima`'s two wrapper scripts for the delta.
+pytestmark = [pytest.mark.lima, pytest.mark.linux_only]
 
 # ---------------------------------------------------------------------------
 # Helpers (file-specific)

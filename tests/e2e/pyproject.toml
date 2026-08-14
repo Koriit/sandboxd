@@ -28,6 +28,6 @@ timeout_func_only = true
 markers = [
     "lima: test runs only on the Lima/QEMU backend",
     "container: test runs only on the lite container backend",
-    "linux_only: test exercises Linux-specific behavior (qemu-bridge-helper, /dev/kvm, route-helper netns, systemd) — skip on macOS",
+    "linux_only: test exercises Linux-specific behavior (qemu-bridge-helper, /dev/kvm, route-helper netns, systemd scopes, cgroup v2, sandbox-lima-helper, host /etc/sandboxd/users.conf) — skip on macOS",
     "macos_only: test exercises macOS-specific behavior (socket_vmnet pool, gateway Lima lifecycle, per-operator agent, launchd) — skip on Linux",
 ]

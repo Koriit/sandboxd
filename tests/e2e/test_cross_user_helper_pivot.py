@@ -13,7 +13,8 @@ These tests verify that every daemon limactl invocation goes through
 These tests exercise the cross-user path: the daemon runs as the
 ``sandbox-test`` system user (via ``sudo -u sandbox-test``) so the
 ``SO_PEERCRED`` uid captured on session-create differs from the operator
-invoking the CLI.  They are marked ``lima`` (Lima/QEMU only).
+invoking the CLI.  They are marked ``lima`` (Lima/QEMU only) and
+``linux_only`` (the helper does not exist on macOS).
 
 Runtime: 5–15 minutes depending on whether the base image needs building.
 Run individually before the full matrix:
@@ -39,7 +40,12 @@ from conftest import (
     parse_session_id,
 )
 
-pytestmark = pytest.mark.lima
+# Lima-only (no container analogue) and Linux-only: every assertion here is
+# about `sandbox-lima-helper`, which exists only on Linux. On macOS the helper
+# builds as a stub that prints "this binary runs on Linux only" and exits 2,
+# and its uid-pivot role is filled by the per-operator agent over the broker —
+# a different mechanism with a different set of properties to assert.
+pytestmark = [pytest.mark.lima, pytest.mark.linux_only]
 
 
 # ---------------------------------------------------------------------------
