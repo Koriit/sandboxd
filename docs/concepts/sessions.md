@@ -30,6 +30,8 @@ Every session has a 12-character lowercase-hex **session ID** (for example `550e
 - any unique prefix of the session ID (Docker-style), or
 - the session's `--name`.
 
+A name belongs to one of your sessions at a time: creating a session with a name another of your live sessions already holds is refused. A session that failed to create releases its name (it stays listed, and is removed by ID) so an immediate retry under the same name works.
+
 See the [CLI reference](/sandboxd/reference/cli/) for the prefix-disambiguation rules.
 
 ## Session ownership

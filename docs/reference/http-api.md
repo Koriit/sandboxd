@@ -5,7 +5,7 @@ description: Endpoints served by sandboxd over its Unix socket — request and r
 
 `sandboxd` listens for HTTP/1.1 requests on a Unix domain socket. The default path is `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock`, falling back to `~/.local/share/sandboxd/sandboxd.sock`. The socket path is overridden by the `SANDBOX_SOCKET` environment variable or the `--socket` flag — see the [daemon config reference](/sandboxd/reference/config/).
 
-The CLI is a thin wrapper over this API. Every endpoint accepts and returns JSON. All `{id}` path parameters accept either a full session ID, a unique session-ID prefix, or a session name.
+The CLI is a thin wrapper over this API. Every endpoint accepts and returns JSON. All `{id}` path parameters accept either a full session ID, a unique session-ID prefix, or a session name. A reference that matches more than one of the caller's sessions — an ambiguous prefix, or a name duplicated in a database written by an older daemon — is refused with `400 Bad Request` listing every matching ID; the daemon never picks one on the caller's behalf.
 
 ## Caller identity and per-caller isolation
 
@@ -111,6 +111,7 @@ Request body (all fields optional):
 
 Semantics:
 
+- `name` is a per-caller handle, not an identifier. It must not already belong to one of the caller's live sessions (`creating`, `running` or `stopped`) — a create that would duplicate one is refused with `409 Conflict` naming the session that holds it, and allocates nothing. A name held only by sessions in the `error` state is reclaimed: those rows stay listed and removable by ID for diagnosis, but give up the name, so retrying a failed create with the same name works. Two different callers may each use the same name.
 - `workspace` takes precedence over `repo` if both are set. Only `shared:<absolute-path>` is currently accepted.
 - `policy`, when present, is applied immediately after the session boots. The matching `source_presets` array (the original CLI `--preset` invocation strings, in order) is stored as an audit trail on the `policy_applied` lifecycle event; the daemon does not re-expand presets server-side, so `policy` already carries the merged effective rules.
 - `hardened` defaults to `true` (device lockdown + cgroup limits). Set `false` for debugging.

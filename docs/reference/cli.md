@@ -48,6 +48,8 @@ Every session has an auto-generated 12-character lowercase hex **session ID** (e
 
 For example, if a session has ID `550e8400e29b`, then `sandbox start 550e` works as long as no other session ID starts with `550e`.
 
+A name resolves to exactly one of your sessions — `sandbox create` refuses a name that is already taken (see below). If a database written by an older daemon still holds two sessions under one name, the reference is reported as ambiguous with both IDs listed, the same way an ambiguous ID prefix is; address them by ID to sort it out. No command silently picks one.
+
 ---
 
 ## sandbox create
@@ -64,7 +66,7 @@ sandbox create [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--name <name>` | (optional) | Human-readable name for the session. If omitted, the session is identified solely by its auto-generated 12-character hex session ID. |
+| `--name <name>` | (optional) | Human-readable name for the session. If omitted, the session is identified solely by its auto-generated 12-character hex session ID. The name must not already belong to one of your live sessions (creating, running or stopped): the daemon refuses the create and names the session holding it, without allocating anything. A name left behind by a *failed* session is reclaimed — the failed session stays listed for diagnosis and is removed by ID, so retrying a failed create with the same name works. Names are per-operator; two operators can both have a session called `dev`. |
 | `--cpus <n>` | backend default | Number of CPU cores. Lima sessions fall back to 2 cores; container ("lite") sessions fall back to the daemon's host-80% ceiling. Accepts a fractional value (`0.8`, `1.5`, `2.0`, …); the container backend rounds to one decimal at request-parse time. Lima sessions truncate the fractional part because QEMU's `-smp` flag pins integer cores. Passing a fractional value with an explicit `--backend lima` (or a Lima resolved default) is rejected; use an integer instead. |
 | `--memory <mb>` | backend default | Memory in megabytes. Lima sessions fall back to 4096 MB; container ("lite") sessions fall back to the daemon's host-80% ceiling. |
 | `--disk <gb>` | `20` | Disk size in gigabytes |
