@@ -249,9 +249,19 @@ test-e2e-linux: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod
 # built versioned gateway image — so on Darwin those two sit upstream of the
 # setup run rather than beside it. See that recipe below.
 #
-# macOS has no `sg`, and this recipe does not substitute for it: it activates
-# the venv and runs pytest directly, so pytest inherits the invoking user's
-# credentials and whatever groups that shell already carries. Activating a
+# macOS has no `sg`, and this recipe does not substitute for it: the `sh -c`
+# below re-parses the command but changes no credentials, so pytest inherits
+# the invoking user's identity and whatever groups that shell already carries.
+#
+# That `sh -c` is load-bearing, not ceremony, and inlining it back into a
+# direct `python -m pytest ... $$_extra` call silently breaks the run. `_extra`
+# holds a marker expression with embedded quotes; an unquoted expansion is
+# word-split without quote removal, so pytest receives `-m` `"not`
+# `linux_only"` and dies on the stray word as a path — never collecting a
+# single test, on any host, in either scope. The Linux target survives the
+# identical construct only because `sg ... -c` happens to re-parse it. Both
+# platform paths now assemble the command into `_pytest` and hand it to a
+# shell; keep them structurally parallel. Activating a
 # freshly-added `_sandboxd-test` membership is therefore the caller's job —
 # log out and back in. Skipping that does not fail obscurely: conftest's
 # `_assert_operator_in_sandbox_group` checks the group before launching the
@@ -282,7 +292,8 @@ test-e2e-macos: $(VENV_STAMP)
 	  else \
 	    _extra="-m \"not linux_only\""; \
 	  fi; \
-	  . .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $$_extra $(TEST)
+	  _pytest=". .venv/bin/activate && python -m pytest -v -rs --timeout=600 --durations=20 --color=$$_color $$_extra $(TEST)"; \
+	  sh -c "$$_pytest"
 
 # Auto-detecting dev-convenience entry point. Reads `uname -s` and dispatches
 # to the host's native flow: test-e2e-linux on Linux, test-e2e-macos on macOS.
