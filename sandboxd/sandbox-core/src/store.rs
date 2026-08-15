@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::SandboxError;
 use crate::policy::{
@@ -513,6 +513,13 @@ impl SessionStore {
     /// possible with 48 bits of entropy), the session is regenerated and
     /// re-inserted up to `INSERT_COLLISION_RETRIES` times before failing.
     ///
+    /// Names are per-owner handles: a create whose `name` is already held
+    /// by a *live* caller-owned session (anything but the terminal `Error`
+    /// state) is refused with [`SandboxError::Conflict`] — HTTP 409 — and
+    /// inserts nothing. A name held only by failed sessions is reclaimed;
+    /// see [`claim_session_name`] for why those rows survive but give up
+    /// the name.
+    ///
     /// `owner_username` is stamped into the `sessions.owner_username`
     /// column added by V006 (per-caller isolation) so every
     /// subsequent read or mutation filters by the caller's identity.
@@ -596,18 +603,46 @@ impl SessionStore {
                         "session id collision after {INSERT_COLLISION_RETRIES} retries"
                     )));
                 }
+                // Not retried: regenerating the id does not change who
+                // holds the name. `Conflict` maps to HTTP 409.
+                Err(InsertError::NameInUse { id, state }) => {
+                    let name = name.as_deref().unwrap_or_default();
+                    return Err(SandboxError::Conflict(format!(
+                        "session name {name:?} is already in use by session {id} \
+                         (state {state}); choose a different name, or remove that \
+                         session first: `sandbox rm {id}`"
+                    )));
+                }
                 Err(InsertError::Other(e)) => return Err(e),
             }
         }
     }
 
     /// Insert a session row. Returns `InsertError::Collision` if the id
-    /// violates the PRIMARY KEY uniqueness constraint; all other DB errors
-    /// surface as `InsertError::Other`.
+    /// violates the PRIMARY KEY uniqueness constraint,
+    /// `InsertError::NameInUse` if a live caller-owned row already holds
+    /// the requested name; all other DB errors surface as
+    /// `InsertError::Other`.
+    ///
+    /// The name claim ([`claim_session_name`]) and the insert share one
+    /// transaction, taken while the store's connection mutex is held, so
+    /// two concurrent creates of the same name cannot both observe a free
+    /// name and both insert. Every early return drops the transaction,
+    /// which rolls it back — a refused create leaves no row and no
+    /// released name behind.
     fn try_insert_session(&self, session: &Session, config_json: &str) -> Result<(), InsertError> {
-        let conn = self.conn.lock().map_err(|e| {
+        let mut conn = self.conn.lock().map_err(|e| {
             InsertError::Other(SandboxError::Internal(format!("lock poisoned: {e}")))
         })?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| InsertError::Other(SandboxError::from(e)))?;
+
+        match claim_session_name(&tx, session) {
+            Ok(None) => {}
+            Ok(Some((id, state))) => return Err(InsertError::NameInUse { id, state }),
+            Err(e) => return Err(InsertError::Other(e)),
+        }
 
         // Per the cross-user CLI access spec, the SSH keypair persists
         // plaintext in `ssh_keypair_json` (BLOB NULL added by V007).
@@ -625,7 +660,7 @@ impl SessionStore {
             None => None,
         };
 
-        let res = conn.execute(
+        let res = tx.execute(
             "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend, \
                  owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json, \
                  operator_uid, operator_gid, sshd_ready)
@@ -652,7 +687,9 @@ impl SessionStore {
         );
 
         match res {
-            Ok(_) => Ok(()),
+            Ok(_) => tx
+                .commit()
+                .map_err(|e| InsertError::Other(SandboxError::from(e))),
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
@@ -1054,8 +1091,10 @@ impl SessionStore {
     /// holds across name lookup, ID prefix, and full-ID paths.
     ///
     /// Returns `None` if no session matches. Returns
-    /// [`SandboxError::InvalidArgument`] if the prefix matches multiple
-    /// caller-owned sessions (ambiguous).
+    /// [`SandboxError::InvalidArgument`] if the query is ambiguous —
+    /// either a name or an ID prefix matching multiple caller-owned
+    /// sessions. Both branches report the ambiguity the same way and list
+    /// the matching ids; neither picks a row on the operator's behalf.
     pub fn get_session_by_name_or_id(
         &self,
         query: &str,
@@ -1069,22 +1108,46 @@ impl SessionStore {
         }
 
         // Try exact name lookup, scoped to caller-owned rows.
-        {
+        //
+        // Collect *every* match rather than taking the first row: a name
+        // that resolves to more than one session is ambiguous, and picking
+        // one silently is how `sandbox rm <name>` came to remove a
+        // different session than the operator named. `create` maintains
+        // the one-live-row-per-name invariant, so duplicates only survive
+        // in databases written before that check existed — those must
+        // report, not guess.
+        let name_matches: Vec<String> = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
             let mut stmt = conn.prepare(
-                "SELECT id, name, state, config, created_at, updated_at, backend, \
-                     owner_username, guest_protocol_version, guest_binary_version, \
-                     ssh_keypair_json, operator_uid, operator_gid, sshd_ready
-                 FROM sessions WHERE name = ?1 AND owner_username = ?2",
+                "SELECT id FROM sessions \
+                 WHERE name = ?1 AND owner_username = ?2 ORDER BY id",
             )?;
-
-            let mut rows = stmt.query(params![query, caller_username])?;
-            if let Some(row) = rows.next()? {
-                return Ok(Some(row_to_session(row)?));
+            let rows = stmt.query_map(params![query, caller_username], |row| {
+                let id: String = row.get(0)?;
+                Ok(id)
+            })?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?);
+            }
+            ids
+        };
+        match name_matches.len() {
+            0 => {}
+            1 => {
+                let id = SessionId::parse(&name_matches[0])
+                    .map_err(|e| SandboxError::Internal(format!("invalid id in database: {e}")))?;
+                return self.get_session(&id, caller_username);
+            }
+            _ => {
+                let list = name_matches.join(", ");
+                return Err(SandboxError::InvalidArgument(format!(
+                    "session name {query:?} is ambiguous; matches: {list}"
+                )));
             }
         }
 
@@ -1867,8 +1930,87 @@ fn read_policy(conn: &Connection, id: &SessionId) -> Result<Option<Policy>, Sand
 enum InsertError {
     /// Primary-key uniqueness violation — the id clashed with an existing row.
     Collision,
+    /// The requested name is already held by a live session owned by the
+    /// same caller. Carries the holder's id and state so the operator-facing
+    /// message can name the session standing in the way. Unlike
+    /// [`InsertError::Collision`] this is never retried — a retry would
+    /// produce the same answer.
+    NameInUse { id: String, state: String },
     /// Any other DB or serialization failure.
     Other(SandboxError),
+}
+
+/// Claim `session.name` for the row about to be inserted, inside the
+/// caller's transaction.
+///
+/// Names are per-owner handles to a session, and the store keeps one
+/// invariant: **at most one live row per (owner, name)**. "Live" means
+/// any state other than the terminal `Error` — `Creating`, `Running` and
+/// `Stopped` sessions all still answer to their name.
+///
+/// Two things happen here:
+///
+/// 1. If a live row already holds the name, the claim is refused. The
+///    caller turns that into a 409 rather than silently creating a second
+///    row with the same handle (which is how `rm <name>` came to delete a
+///    session the operator did not name).
+/// 2. Otherwise any *terminal* rows holding the name release it (`name =
+///    NULL`). A failed create leaves an `Error` row behind on purpose —
+///    it is how the operator finds out that a create got far enough to
+///    allocate a session id, and it is what `sandbox rm <id>` cleans up —
+///    but that row must not squat on the name and make the operator's
+///    immediate retry ambiguous. Releasing the name keeps the diagnostic
+///    row and frees the handle; the row stays listed and addressable by id.
+///
+/// `updated_at` is deliberately left alone on the released rows: the
+/// timestamp an operator reads off a failed session is when it failed,
+/// not when some later create reused its name.
+///
+/// Returns `Ok(Some((id, state)))` when a live row blocks the claim,
+/// `Ok(None)` when the name is now free (or the session is unnamed —
+/// `NULL` names never collide, since SQL equality never matches `NULL`).
+fn claim_session_name(
+    tx: &rusqlite::Transaction<'_>,
+    session: &Session,
+) -> Result<Option<(String, String)>, SandboxError> {
+    let Some(name) = session.name.as_deref() else {
+        return Ok(None);
+    };
+    let terminal = SessionState::Error.to_string();
+
+    let holder = {
+        let mut stmt = tx.prepare(
+            "SELECT id, state FROM sessions \
+             WHERE name = ?1 AND owner_username = ?2 AND state <> ?3 \
+             ORDER BY id LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![name, session.owner_username, terminal])?;
+        match rows.next()? {
+            Some(row) => {
+                let id: String = row.get(0)?;
+                let state: String = row.get(1)?;
+                Some((id, state))
+            }
+            None => None,
+        }
+    };
+    if holder.is_some() {
+        return Ok(holder);
+    }
+
+    let released = tx.execute(
+        "UPDATE sessions SET name = NULL \
+         WHERE name = ?1 AND owner_username = ?2 AND state = ?3",
+        params![name, session.owner_username, terminal],
+    )?;
+    if released > 0 {
+        info!(
+            name,
+            released, "reusing session name; released it from failed session(s)"
+        );
+    }
+
+    Ok(None)
 }
 
 /// Parse a row from the sessions table into a `Session`.
@@ -2482,6 +2624,213 @@ mod tests {
             .expect("should not error");
 
         assert!(result.is_none());
+    }
+
+    // -- Name uniqueness and ambiguity ------------------------------------
+    //
+    // Names are per-owner handles. Two rows answering to one name is how
+    // `rm <name>` came to remove a session the operator did not name — the
+    // stale row from a failed create was returned first and deleted while
+    // the live session (and the resources it holds) kept running. These
+    // tests pin the three properties that make that impossible: a live
+    // session's name cannot be taken, a name that still resolves to two
+    // rows reports rather than guesses, and a failed create does not keep
+    // the name away from the operator's retry.
+
+    fn create_named(
+        store: &SessionStore,
+        name: &str,
+        caller: &str,
+    ) -> Result<Session, SandboxError> {
+        store.create_session(SessionConfig::default(), Some(name.into()), caller, 0, "")
+    }
+
+    #[test]
+    fn create_refuses_name_held_by_live_session() {
+        let (store, _dir) = test_store();
+
+        let live = create_named(&store, "dup", TEST_CALLER).expect("first create");
+
+        let err = create_named(&store, "dup", TEST_CALLER)
+            .expect_err("a name held by a live session must not be taken again");
+        match err {
+            SandboxError::Conflict(msg) => {
+                assert!(
+                    msg.contains("dup"),
+                    "message must name the contested name; got: {msg}"
+                );
+                assert!(
+                    msg.contains(live.id.as_str()),
+                    "message must identify the session holding the name so the \
+                     operator can act on it; got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict (HTTP 409), got {other:?}"),
+        }
+
+        // The refused create is a no-op: no second row, and the name still
+        // resolves to the live session.
+        let all = store.list_sessions(TEST_CALLER).expect("list");
+        assert_eq!(all.len(), 1, "refused create must not insert a row");
+        let resolved = store
+            .get_session_by_name_or_id("dup", TEST_CALLER)
+            .expect("resolve")
+            .expect("name still resolves");
+        assert_eq!(resolved.id, live.id);
+    }
+
+    #[test]
+    fn create_refuses_name_held_by_stopped_session() {
+        let (store, _dir) = test_store();
+
+        let live = create_named(&store, "dup", TEST_CALLER).expect("first create");
+        store
+            .update_state(&live.id, TEST_CALLER, SessionState::Running)
+            .expect("to running");
+        store
+            .update_state(&live.id, TEST_CALLER, SessionState::Stopped)
+            .expect("to stopped");
+
+        // A stopped session still exists and can be started again — it
+        // keeps its handle.
+        let err = create_named(&store, "dup", TEST_CALLER)
+            .expect_err("a stopped session still holds its name");
+        assert!(matches!(err, SandboxError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_reclaims_name_from_failed_session() {
+        let (store, _dir) = test_store();
+
+        let failed = create_named(&store, "dup", TEST_CALLER).expect("first create");
+        store
+            .update_state(&failed.id, TEST_CALLER, SessionState::Error)
+            .expect("to error");
+
+        // The operator's immediate retry of a failed create must work.
+        let retried = create_named(&store, "dup", TEST_CALLER)
+            .expect("a failed session must not hold the name against a retry");
+
+        // The failed row survives — it is how the operator sees that a
+        // create allocated a session id, and what `sandbox rm <id>` cleans
+        // up — but it no longer answers to the name.
+        let corpse = store
+            .get_session(&failed.id, TEST_CALLER)
+            .expect("get failed row")
+            .expect("failed row must not be deleted");
+        assert_eq!(corpse.state, SessionState::Error);
+        assert_eq!(
+            corpse.name, None,
+            "the failed row must release the name it no longer owns"
+        );
+        assert_eq!(retried.name, Some("dup".into()));
+    }
+
+    #[test]
+    fn name_lookup_resolves_to_live_session_after_failed_create() {
+        let (store, _dir) = test_store();
+
+        // The reported defect, end to end at the storage boundary: a
+        // create fails and leaves an `Error` row holding the name, a
+        // second create takes the same name, and `rm <name>` resolves to
+        // the stale row while the live session keeps running.
+        let failed = create_named(&store, "dup", TEST_CALLER).expect("first create");
+        store
+            .update_state(&failed.id, TEST_CALLER, SessionState::Error)
+            .expect("to error");
+        let live = create_named(&store, "dup", TEST_CALLER).expect("second create");
+
+        let resolved = store
+            .get_session_by_name_or_id("dup", TEST_CALLER)
+            .expect("resolve by name")
+            .expect("name must resolve");
+        assert_eq!(
+            resolved.id, live.id,
+            "the name must resolve to the live session, not the failed row"
+        );
+
+        // The failed row is still reachable — by id.
+        let by_id = store
+            .get_session_by_name_or_id(failed.id.as_str(), TEST_CALLER)
+            .expect("resolve by id")
+            .expect("failed row must still be addressable");
+        assert_eq!(by_id.id, failed.id);
+    }
+
+    #[test]
+    fn name_lookup_reports_ambiguity_for_duplicate_names() {
+        let (store, _dir) = test_store();
+
+        // Databases written before the create-time check can hold two
+        // rows with one name. Nothing in the store may resolve that on
+        // the operator's behalf — the ambiguity is reported the same way
+        // the ID-prefix branch reports its own.
+        let first = create_named(&store, "dup", TEST_CALLER).expect("first create");
+        let second = store
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
+            .expect("second create");
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "UPDATE sessions SET name = ?1 WHERE id = ?2",
+                params!["dup", second.id.as_str()],
+            )
+            .expect("seed a pre-existing duplicate name");
+        }
+
+        let err = store
+            .get_session_by_name_or_id("dup", TEST_CALLER)
+            .expect_err("a name matching two rows must not resolve");
+        match err {
+            SandboxError::InvalidArgument(msg) => {
+                assert!(msg.contains("ambiguous"), "got: {msg}");
+                assert!(
+                    msg.contains(first.id.as_str()) && msg.contains(second.id.as_str()),
+                    "both candidates must be listed so the operator can pick one; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_uniqueness_is_scoped_to_owner() {
+        let (store, _dir) = test_store();
+
+        // Names are per-operator handles: two operators may each have a
+        // session called `dev`, and each resolves to their own.
+        let alice = create_named(&store, "dev", "alice").expect("alice create");
+        let bob = create_named(&store, "dev", "bob").expect("bob create");
+        assert_ne!(alice.id, bob.id);
+
+        let for_alice = store
+            .get_session_by_name_or_id("dev", "alice")
+            .expect("resolve for alice")
+            .expect("alice's session");
+        assert_eq!(for_alice.id, alice.id);
+
+        let for_bob = store
+            .get_session_by_name_or_id("dev", "bob")
+            .expect("resolve for bob")
+            .expect("bob's session");
+        assert_eq!(for_bob.id, bob.id);
+    }
+
+    #[test]
+    fn unnamed_sessions_never_collide() {
+        let (store, _dir) = test_store();
+
+        // `NULL` names are not a handle and must not be treated as one —
+        // SQL equality never matches `NULL`, and the guard must not
+        // regress that into "one unnamed session per operator".
+        store
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
+            .expect("first unnamed create");
+        store
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
+            .expect("second unnamed create must not collide");
+
+        assert_eq!(store.list_sessions(TEST_CALLER).expect("list").len(), 2);
     }
 
     // -- Prefix resolution -------------------------------------------------
