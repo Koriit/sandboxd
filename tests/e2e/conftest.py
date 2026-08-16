@@ -1384,6 +1384,135 @@ def _launch_daemon_as_sandbox_via_sudo(
     }
 
 
+def _daemon_pids(staged_sandboxd: str | Path) -> list[int]:
+    """PIDs of live ``sandboxd`` processes launched from ``staged_sandboxd``.
+
+    The harness starts the daemon as ``sudo -n -u <daemon_test_user> env …
+    <staged_sandboxd> …``, so the ``Popen`` handle names ``sudo``, not the
+    daemon. ``sudo`` is setuid-root but keeps the caller's *real* uid, which
+    is why signalling that handle from the test runner succeeds — and why it
+    is misleading: SIGKILL cannot be forwarded, so it kills only the wrapper
+    and the daemon is reparented to PID 1, keeps its bound sockets, and
+    outlives the "restart". (SIGTERM *is* forwarded by sudo; only the
+    SIGKILL path orphans, which matches the daemons found alive after past
+    runs.)
+
+    Matching is on (uid == daemon test uid, argv contains the staged path).
+    The uid clause excludes the ``sudo`` wrapper, whose argv also contains
+    that path but which runs as uid 0; the staged path is a fresh mkdtemp
+    per pytest session, so this can never name a daemon from another
+    session — nor the production daemon, which runs as a different user
+    from a different binary.
+    """
+    marker = str(staged_sandboxd)
+    try:
+        listing = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,uid=,command="],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids: list[int] = []
+    for line in listing.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3:
+            continue
+        pid_text, uid_text, command = fields
+        try:
+            pid, uid = int(pid_text), int(uid_text)
+        except ValueError:
+            continue
+        if uid == _SANDBOX_TEST_UID and marker in command:
+            pids.append(pid)
+    return pids
+
+
+def stop_test_daemon(
+    sandbox_daemon: dict,
+    sig: int = signal.SIGKILL,
+    *,
+    timeout: float = 20.0,
+    escalate: bool = True,
+) -> list[int]:
+    """Stop the daemon(s) this pytest session started, and prove they died.
+
+    Signals the real ``sandboxd`` process rather than the ``sudo`` wrapper —
+    see :func:`_daemon_pids` for why the wrapper is the wrong target. The
+    signal is delivered via ``sudo -n -u <daemon_test_user> kill``: the
+    daemon runs as that user, so the test runner cannot signal it directly,
+    and running ``kill`` as that user also means this can only ever reach
+    processes of the e2e daemon's uid.
+
+    Kills every daemon started from this session's staged binary, not just
+    the one in ``sandbox_daemon["process"]``. That matters because an
+    earlier restart may have left one behind, and a stale daemon is not
+    inert: each new one unlinks and rebinds ``broker.sock``, so a leftover
+    that later exits leaves the path naming a dead socket while the live
+    daemon holds the old, unlinked inode — after which no agent can check
+    in for the rest of the run.
+
+    Escalates to SIGKILL if a gentler signal has not taken effect by half
+    the timeout, and raises if anything is still alive at the end rather
+    than letting the run continue against a daemon that was supposed to be
+    gone. Returns the PIDs it signalled.
+
+    Pass ``escalate=False`` when the point of the call is to *assert* that
+    the daemon honours the signal — a test of the graceful-shutdown
+    contract must not have its subject killed out from under it at the
+    halfway mark.
+    """
+    staged = sandbox_daemon["_staged_sandboxd"]
+    pids = _daemon_pids(staged)
+    if pids:
+        subprocess.run(
+            [
+                "sudo", "-n", "-u", PLATFORM.daemon_test_user,
+                "kill", f"-{int(sig)}", *[str(pid) for pid in pids],
+            ],
+            capture_output=True, timeout=30,
+        )
+
+    deadline = time.monotonic() + timeout
+    escalate_at = time.monotonic() + timeout / 2
+    escalated = sig == signal.SIGKILL or not escalate
+    while True:
+        alive = _daemon_pids(staged)
+        if not alive:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"sandboxd still alive after {timeout}s: pids {alive} "
+                f"(staged binary {staged}). Leaving it running would let it "
+                "keep or rebind broker.sock behind the next daemon."
+            )
+        if not escalated and now >= escalate_at:
+            subprocess.run(
+                [
+                    "sudo", "-n", "-u", PLATFORM.daemon_test_user,
+                    "kill", "-9", *[str(pid) for pid in alive],
+                ],
+                capture_output=True, timeout=30,
+            )
+            escalated = True
+        time.sleep(0.25)
+
+    # The wrapper exits on its own once its child is gone; reap it so the
+    # handle reports a status, and only force it if it somehow outlives the
+    # daemon it was waiting on.
+    proc = sandbox_daemon.get("process")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    return pids
+
+
 def restart_test_daemon(
     sandbox_daemon: dict,
     sandbox_binaries: SandboxBinaries,
@@ -1396,11 +1525,19 @@ def restart_test_daemon(
     Used by the restart-recovery e2e tests (``test_networking::
     test_daemon_restart_recovery``, ``test_lite::
     test_lite_orphan_cleanup_on_daemon_restart``, ``test_policy_persistence::
-    test_policy_persists_across_daemon_restart``). All three tests
-    SIGKILL the daemon first to assert state-reconciliation behaviour
-    that depends on no graceful shutdown happening; this helper handles
-    the *restart* leg and the in-place re-registration into
+    test_policy_persists_across_daemon_restart``). Those tests stop the
+    daemon first — mostly via SIGKILL, to assert state-reconciliation
+    behaviour that depends on no graceful shutdown happening; this helper
+    handles the *restart* leg and the in-place re-registration into
     ``sandbox_daemon`` so the session-scoped fixture stays coherent.
+
+    Stops any surviving daemon before spawning the replacement, so a
+    restart replaces rather than accumulates. This is deliberately
+    unconditional and not an assertion: a test that fails between its
+    create and its stop still reaches its ``finally`` restart, and the
+    honest thing to do there is take the old daemon down rather than let
+    two of them fight over ``broker.sock``. When the caller already
+    stopped it, :func:`stop_test_daemon` finds nothing and returns.
 
     Re-spawns ``sudo -n -u sandbox-test sandboxd`` against the same socket
     and base-dir. Reuses the session-scope log files (the session teardown
@@ -1414,6 +1551,8 @@ def restart_test_daemon(
     automatically because the tests need the returned handle accessible to
     their per-test cleanup ``finally`` blocks.
     """
+    stop_test_daemon(sandbox_daemon)
+
     socket_path = sandbox_daemon["socket"]
     base_dir = sandbox_daemon["base_dir"]
     stdout_log = sandbox_daemon["_stdout_log"]
@@ -1646,17 +1785,18 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
     except Exception:
         pass
 
-    # Send SIGTERM and wait for graceful shutdown.
-    # Use info["process"] (not the local `proc`) because a test like
-    # test_daemon_restart_recovery may have replaced it with a new Popen.
-    current_proc = info["process"]
-    if current_proc.poll() is None:
-        current_proc.terminate()
-        try:
-            current_proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            current_proc.kill()
-            current_proc.wait(timeout=5)
+    # Send SIGTERM and wait for graceful shutdown, escalating to SIGKILL.
+    # Goes through stop_test_daemon rather than info["process"] so it stops
+    # the daemon itself rather than the sudo wrapper, and so it also
+    # collects any daemon a restart test left behind — an orphan holding a
+    # rebound broker.sock is what makes the *next* session's agent
+    # unreachable. Report rather than raise: the rest of this teardown
+    # still has VMs, containers and networks to reap, and a surviving
+    # daemon must not cost us those too.
+    try:
+        stop_test_daemon(info, signal.SIGTERM)
+    except RuntimeError as exc:
+        print(f"[conftest] daemon teardown: {exc}", file=sys.stderr)
 
     # Force-delete any leftover VMs through the same prefix so we
     # actually mutate the daemon-owned registry under cross-user.

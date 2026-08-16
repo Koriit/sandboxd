@@ -55,6 +55,7 @@ from conftest import (
     make_create_args,
     parse_session_id,
     restart_test_daemon,
+    stop_test_daemon,
     wait_for_state,
     write_policy_file,
 )
@@ -207,20 +208,22 @@ def test_policy_survives_daemon_restart(
             context="pre-restart denied",
         )
 
-        # 4. SIGTERM the daemon (a ``sudo -u sandbox`` Popen) and await
-        #    graceful exit.
-        daemon_proc = sandbox_daemon["process"]
-        daemon_proc.send_signal(signal.SIGTERM)
+        # 4. SIGTERM the daemon and await graceful exit. Signalling the
+        #    fixture's Popen handle would signal the ``sudo`` wrapper, which
+        #    *does* forward SIGTERM — but then the assertion below would be
+        #    about sudo's exit, not the daemon's. Signal the daemon directly
+        #    so the graceful-shutdown contract is actually what is measured,
+        #    and forbid the escalation to SIGKILL: a test of that contract
+        #    must not have its subject killed for it at the halfway mark.
         try:
-            daemon_proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
+            stop_test_daemon(
+                sandbox_daemon, signal.SIGTERM, timeout=15, escalate=False,
+            )
+        except RuntimeError as exc:
             pytest.fail(
                 "Daemon did not exit within 15s after SIGTERM — graceful "
-                "shutdown contract broken."
+                f"shutdown contract broken. {exc}"
             )
-        assert daemon_proc.poll() is not None, (
-            "Daemon did not exit after SIGTERM"
-        )
 
         # The daemon's shutdown handler removes the socket file; give it a
         # moment to settle before we rebind on the same path.

@@ -44,6 +44,7 @@ from conftest import (
     make_create_args,
     parse_session_id,
     restart_test_daemon,
+    stop_test_daemon,
     wait_for_state,
     write_policy_file,
 )
@@ -1272,11 +1273,12 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "net-daemon-test", "Running", timeout=10)
 
-        # 2. Kill the daemon process (a ``sudo -u sandbox`` Popen).
-        daemon_proc = sandbox_daemon["process"]
-        daemon_proc.send_signal(signal.SIGKILL)
-        daemon_proc.wait(timeout=10)
-        assert daemon_proc.poll() is not None, "Daemon did not die after SIGKILL"
+        # 2. Kill the daemon. Not via the fixture's Popen handle: that names
+        #    the ``sudo`` wrapper, and SIGKILL is the one signal sudo cannot
+        #    forward, so the daemon would survive the "restart" reparented to
+        #    PID 1 and still holding its sockets.
+        killed = stop_test_daemon(sandbox_daemon, signal.SIGKILL)
+        assert killed, "no sandboxd process was found to kill"
 
         # Wait briefly for the socket to be cleaned up.
         time.sleep(1)
@@ -1929,9 +1931,9 @@ def test_macos_slot_reclaimed_after_vm_death(sandbox_cli, sandbox_binaries, sand
         time.sleep(3)
 
         # 3. Restart the daemon to trigger the startup reconcile (step 6b).
-        daemon_proc = sandbox_daemon["process"]
-        daemon_proc.send_signal(signal.SIGKILL)
-        daemon_proc.wait(timeout=10)
+        #    Kills the daemon itself, not the ``sudo`` wrapper the fixture
+        #    holds — see stop_test_daemon.
+        stop_test_daemon(sandbox_daemon, signal.SIGKILL)
 
         time.sleep(1)
 

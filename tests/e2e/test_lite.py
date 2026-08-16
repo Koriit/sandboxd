@@ -40,6 +40,7 @@ from conftest import (
     cleanup_policy_file,
     parse_session_id,
     restart_test_daemon,
+    stop_test_daemon,
     wait_for_state,
     write_policy_file,
 )
@@ -793,7 +794,6 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         f"daemon is killed; docker volume ls listed:\n{pre_volumes.stdout}"
     )
 
-    daemon_proc = sandbox_daemon["process"]
     base_dir = sandbox_daemon["base_dir"]
     db_path = os.path.join(base_dir, "sessions.db")
 
@@ -803,11 +803,11 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         # 1. SIGKILL the daemon. Abrupt — no graceful shutdown, so the
         #    daemon has no chance to remove the container/volume on the
         #    way out. This is the regime the orphan reaper exists for.
-        daemon_proc.send_signal(signal.SIGKILL)
-        daemon_proc.wait(timeout=10)
-        assert daemon_proc.poll() is not None, (
-            "Daemon did not die after SIGKILL"
-        )
+        #    Signals the daemon itself: the fixture's Popen handle is the
+        #    ``sudo`` wrapper, and SIGKILL is precisely the signal sudo
+        #    cannot pass on, so that route leaves the daemon running.
+        killed = stop_test_daemon(sandbox_daemon, signal.SIGKILL)
+        assert killed, "no sandboxd process was found to kill"
         # Give the kernel a beat to release the abstract socket file so
         # the restarted daemon can rebind on the same path without
         # racing the EADDRINUSE window.
