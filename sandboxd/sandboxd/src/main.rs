@@ -11474,6 +11474,37 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
     );
 }
 
+/// Dispatch [`reconcile`] onto a blocking task.
+///
+/// [`reconcile`] is synchronous top to bottom: SQLite reads and writes,
+/// per-operator LIMA_HOME provisioning (a `setfacl` / `chmod +a` shell-out
+/// under a 10 s timeout), and one `limactl list` per operator. None of that
+/// belongs on a runtime worker thread, per the one-shot-`Command` convention
+/// in `CLAUDE.md`.
+///
+/// Here the wrapper is load-bearing rather than merely polite. On macOS the
+/// `limactl list` is dispatched through `broker::AgentBrokerExecutor::run`,
+/// which — for every operator uid other than the daemon's own — `block_on`s
+/// the broker send. `tokio::runtime::Handle::block_on` panics outright
+/// ("Cannot start a runtime from within a runtime") when the calling thread
+/// is driving the runtime, so calling `reconcile` directly from `main` aborts
+/// the daemon at startup whenever the store holds a Lima session owned by
+/// another uid — the ordinary macOS deployment shape, and the reason every
+/// restart of a populated daemon died. `spawn_blocking` moves the call to a
+/// blocking-pool thread, where `Handle::current()` is still available and
+/// `block_on` is legal.
+///
+/// A join error is logged rather than propagated: reconciliation is
+/// best-effort (every failure inside it already degrades to `warn!` and
+/// continues) and must not stop the daemon from serving.
+async fn run_startup_reconcile(store: &Arc<SessionStore>, lima_runtime: &Arc<LimaRuntime>) {
+    let store = Arc::clone(store);
+    let lima_runtime = Arc::clone(lima_runtime);
+    if let Err(e) = tokio::task::spawn_blocking(move || reconcile(&store, &lima_runtime)).await {
+        warn!(error = %e, "startup reconciliation task failed; continuing");
+    }
+}
+
 /// Reconcile networking state for sessions after daemon startup.
 ///
 /// For each Running session: check if its gateway container is running and
@@ -13933,8 +13964,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Run startup reconciliation (VM state).
-    reconcile(&store, &lima_runtime);
+    // Run startup reconciliation (VM state). Dispatched through
+    // `spawn_blocking` — see `run_startup_reconcile`.
+    run_startup_reconcile(&store, &lima_runtime).await;
 
     // Lite container backend orphan cleanup.
     // on daemon start" extends the gateway-container reconcile pattern
@@ -17438,4 +17470,164 @@ mod tests {
     // on all platforms under the default nextest profile.
     //
     // mod recovery_seams — removed; see sandbox-core/src/gateway_recovery.rs
+
+    // -----------------------------------------------------------------------
+    // Startup reconciliation must not touch the executor from a runtime thread
+    //
+    // `reconcile` walks every persisted Lima session and calls `list_vms()`
+    // per operator, which lands on `LimaExecutor::run`. The macOS executor
+    // (`broker::AgentBrokerExecutor`) serves any operator uid other than the
+    // daemon's own by `block_on`-ing the broker send, and
+    // `Handle::block_on` panics when the calling thread is driving the
+    // runtime. Calling `reconcile` bare from the async `main` therefore
+    // aborted the daemon on every restart whose store held a Lima row owned
+    // by another uid — which is the ordinary macOS deployment shape.
+    //
+    // The guard drives `run_startup_reconcile` — the exact wrapper `main`
+    // calls — with an executor that reproduces the offending shape, so
+    // deleting the `spawn_blocking` reintroduces the panic here first.
+    // -----------------------------------------------------------------------
+
+    /// `LimaExecutor` double that blocks on an async future through
+    /// `Handle::block_on`, exactly as the cross-uid arm of
+    /// `broker::AgentBrokerExecutor::run` does. Legal on a `spawn_blocking`
+    /// thread; panics with "Cannot start a runtime from within a runtime" on
+    /// a runtime worker. Counts its invocations so the test can prove the
+    /// executor was actually reached rather than passing vacuously.
+    struct BlockOnRuntimeExecutor {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl sandbox_core::lima::LimaExecutor for BlockOnRuntimeExecutor {
+        fn run(
+            &self,
+            _op_uid: u32,
+            _op: sandbox_core::lima::LimaOp<'_>,
+            _timeout: std::time::Duration,
+            label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async {
+                Err(SandboxError::Lima(format!("{label}: no agent registered")))
+            })
+        }
+
+        async fn guest_socat(
+            &self,
+            _op_uid: u32,
+            _vm: &str,
+        ) -> Result<Box<dyn sandbox_core::backend::AsyncReadWrite + Send + Unpin>, SandboxError>
+        {
+            unreachable!("startup reconciliation never opens a guest stream")
+        }
+    }
+
+    /// Build a store in `dir` holding one Running Lima session owned by
+    /// `operator_uid`, plus a `LimaRuntime` whose registry provisions
+    /// per-operator LIMA_HOMEs inside `dir` and dispatches through
+    /// `executor`.
+    fn store_with_lima_session(
+        dir: &std::path::Path,
+        operator_uid: u32,
+        executor: Arc<dyn sandbox_core::lima::LimaExecutor>,
+    ) -> (Arc<SessionStore>, Arc<LimaRuntime>) {
+        let (store, _orphans) = SessionStore::new(dir.to_path_buf()).expect("open session store");
+        let store = Arc::new(store);
+        let session = store
+            .create_session_with_backend(
+                SessionConfig::default(),
+                Some("reconcile-guard".into()),
+                BackendKind::Lima,
+                "test-operator",
+                0,
+                "",
+                Some(operator_uid),
+                Some(operator_uid),
+            )
+            .expect("create Lima session");
+        store
+            .update_state(&session.id, "test-operator", SessionState::Running)
+            .expect("transition Creating → Running");
+
+        let lima_home_root = dir.to_path_buf();
+        let registry = Arc::new(LimaManagerRegistry::new_with_provisioner(
+            "sandbox-base".to_string(),
+            executor,
+            "10.209.0.0/16".to_string(),
+            cfg!(target_os = "macos"),
+            move |uid| {
+                let home = lima_home_root.join(format!("{uid}/lima"));
+                std::fs::create_dir_all(&home)?;
+                Ok(home)
+            },
+        ));
+        (store, LimaRuntime::new(registry))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_reconcile_dispatches_lima_ops_off_the_runtime_thread() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor = Arc::new(BlockOnRuntimeExecutor {
+            calls: Arc::clone(&calls),
+        });
+
+        // Operator uid deliberately unequal to any daemon uid: this is the
+        // cross-user shape that routes through the broker on macOS.
+        let (store, lima_runtime) = store_with_lima_session(tmp.path(), 4242, executor);
+
+        // Panics inside the blocking task surface as a join error, so the
+        // wrapper's own `warn!`-and-continue would hide a regression from a
+        // "did it panic?" assertion. Assert on the executor instead: it must
+        // have been reached, and reaching it must not have panicked.
+        run_startup_reconcile(&store, &lima_runtime).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "startup reconciliation must reach LimaExecutor::run once for the \
+             single operator with Lima sessions; 0 means the guard passed \
+             vacuously, and a panic there means the spawn_blocking wrapper is gone"
+        );
+    }
+
+    /// Same property, driven through the real macOS executor rather than a
+    /// double. No agent is checked in for the operator uid, so `send_op`
+    /// fails immediately — but only after the `block_on` that panics when
+    /// this runs on a runtime thread.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_reconcile_survives_agent_broker_executor_with_no_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon_uid = 999;
+        let operator_uid = 4242;
+        let executor = Arc::new(broker::AgentBrokerExecutor::new(
+            broker::AgentRegistry::new(),
+            broker::PendingStreamRegistry::new(),
+            daemon_uid,
+        ));
+
+        let (store, lima_runtime) = store_with_lima_session(tmp.path(), operator_uid, executor);
+        let sessions = store.list_sessions_unfiltered().expect("list sessions");
+        let session_id = sessions[0].id;
+
+        run_startup_reconcile(&store, &lima_runtime).await;
+
+        // The VM listing failed (no agent), so the Running session has no
+        // matching VM and reconciliation marks it Error. Reaching this state
+        // at all proves the daemon completed startup reconciliation instead
+        // of aborting on "Cannot start a runtime from within a runtime".
+        let session = store
+            .get_session(&session_id, "test-operator")
+            .expect("get session")
+            .expect("session present");
+        assert_eq!(
+            session.state,
+            SessionState::Error,
+            "reconciliation must complete and mark the VM-less session Error"
+        );
+    }
 }
