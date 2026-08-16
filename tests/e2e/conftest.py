@@ -395,6 +395,14 @@ def gateway_container_name(session_id: str) -> str:
     return f"sandbox-gw-{session_id}"
 
 
+#: Per-session Docker resource names, and the session ID inside them:
+#: ``sandbox-<id>`` (the lite container), ``sandbox-gw-<id>`` (its gateway)
+#: and ``sandbox-net-<id>`` (its network). Anchored and ID-shaped on purpose:
+#: cleanup driven by this pattern can only ever name a per-session resource,
+#: never a long-lived one that merely starts with ``sandbox``.
+_SESSION_DOCKER_RESOURCE_RE = re.compile(r"^sandbox-(?:gw-|net-)?([0-9a-f]{12})$")
+
+
 #: ``find -name`` patterns matching every gateway Lima instance directory,
 #: for use in the state-dir reset's keep lists.
 #:
@@ -1640,18 +1648,17 @@ def restart_test_daemon(
     return proc
 
 
-def _purge_sessions_via_api(socket_path: str) -> None:
-    """Delete every session known to the daemon via the HTTP API.
+def _get_sessions_via_api(socket_path: str, timeout: float = 5.0) -> list | None:
+    """Return the daemon's session list, or ``None`` if it could not be asked.
 
-    Used during teardown so the next pytest session boots against a clean
-    DB. Sessions left behind would survive a daemon restart and corrupt the
-    next session. Best-effort: any failure is logged but does not block
-    teardown — the dir-wipe at the start of the next session handles the
-    cold-state case.
+    The ``None`` case is deliberately distinct from the empty list: callers
+    that decide what to *delete* based on which sessions are live must do
+    nothing at all when the daemon is unreachable, rather than conclude that
+    nothing is live.
     """
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(5.0)
+            s.settimeout(timeout)
             s.connect(socket_path)
             s.sendall(
                 b"GET /sessions HTTP/1.1\r\n"
@@ -1670,9 +1677,24 @@ def _purge_sessions_via_api(socket_path: str) -> None:
         start = text.find("[")
         end = text.rfind("]")
         if start == -1 or end == -1:
-            return
-        sessions = json.loads(text[start : end + 1])
+            return None
+        parsed = json.loads(text[start : end + 1])
     except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _purge_sessions_via_api(socket_path: str) -> None:
+    """Delete every session known to the daemon via the HTTP API.
+
+    Used during teardown so the next pytest session boots against a clean
+    DB. Sessions left behind would survive a daemon restart and corrupt the
+    next session. Best-effort: any failure is logged but does not block
+    teardown — the dir-wipe at the start of the next session handles the
+    cold-state case.
+    """
+    sessions = _get_sessions_via_api(socket_path)
+    if sessions is None:
         return
 
     for entry in sessions:
@@ -1695,6 +1717,197 @@ def _purge_sessions_via_api(socket_path: str) -> None:
                     pass
         except OSError:
             pass
+
+
+def _gateway_vm_docker_argv(*args: str) -> list[str] | None:
+    """Argv for a ``docker`` call against the gateway VM's Docker daemon.
+
+    Returns ``None`` where no such endpoint exists — on Linux the session
+    containers live in the host's own Docker, which plain ``docker`` already
+    reaches.
+
+    On macOS they do not: every session container and gateway container runs
+    *inside* the gateway Lima VM, reachable only through the socket that VM
+    forwards. Plain ``docker`` on a macOS host talks to Docker Desktop or
+    colima, which has never held a sandbox session container — so cleanup
+    written against it silently sweeps nothing while reporting success.
+
+    The forwarded socket is mode 0600 under a 0700 directory, both owned by
+    the daemon test user, so the test runner cannot open it directly however
+    many groups it is in: the call has to pivot through
+    ``sudo -u <daemon test user>``. That pivot is also what bounds the blast
+    radius — this endpoint belongs to the e2e daemon's own gateway VM, and
+    the production daemon's gateway VM lives under a different uid's state
+    tree entirely.
+    """
+    if sys.platform != "darwin" or _SANDBOX_TEST_UID is None:
+        return None
+    sock = (
+        _SANDBOX_E2E_BASE_DIR
+        / str(_SANDBOX_TEST_UID)
+        / "lima"
+        / "sandboxd-gateway"
+        / "gateway-docker.sock"
+    )
+    return [
+        "sudo", "-n", "-u", PLATFORM.daemon_test_user,
+        # sudo's env_reset would otherwise leave DOCKER_CONFIG pointing at
+        # the operator's ~/.docker, which the daemon user cannot read.
+        "env", f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
+        "docker", "-H", f"unix://{sock}",
+        *args,
+    ]
+
+
+def _sweep_session_docker_state(docker_argv: list[str]) -> None:
+    """Force-remove every per-session container and network at one endpoint.
+
+    Teardown-only: it does not ask which sessions are live, so it must run
+    after the sessions have been purged and the daemon stopped.
+    """
+    try:
+        containers = subprocess.run(
+            docker_argv + [
+                "ps", "-a", "--filter", "name=sandbox-", "--format", "{{.Names}}",
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in containers.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    docker_argv + ["rm", "-f", name],
+                    capture_output=True, timeout=30,
+                )
+    except Exception:
+        pass
+
+    try:
+        networks = subprocess.run(
+            docker_argv + [
+                "network", "ls", "--filter", "name=sandbox-", "--format", "{{.Name}}",
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in networks.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    docker_argv + ["network", "rm", name],
+                    capture_output=True, timeout=30,
+                )
+    except Exception:
+        pass
+
+
+def _reap_orphaned_session_docker_state(socket_path: str) -> list[str]:
+    """Remove per-session containers/networks the daemon no longer owns.
+
+    Runs *between* tests, unlike :func:`_sweep_session_docker_state`, so it
+    cannot simply delete everything: it removes only resources whose session
+    ID the daemon does not know about, and among those only containers that
+    are not running. Either condition alone would be enough to protect a live
+    session; both are cheap.
+
+    This exists because an orphan here is not inert. A gateway container
+    whose session is gone keeps its ``unless-stopped`` restart policy, and
+    its entrypoint waits for an Envoy bootstrap file the daemon deleted with
+    the session's staging dir — so it exits, restarts ~every 30 s, and spawns
+    another mitmproxy each cycle, inside a gateway VM with under 2 GiB of
+    RAM. Past runs ended with several of these looping at restart counts in
+    the tens, and the VM's dockerd stalled mid-run.
+
+    Best-effort throughout: this is a safety net, and it must never turn a
+    passing test into a failing one. When the daemon cannot be asked which
+    sessions are live, it does nothing.
+    """
+    docker_argv = _gateway_vm_docker_argv()
+    if docker_argv is None:
+        return []
+    sessions = _get_sessions_via_api(socket_path)
+    if sessions is None:
+        return []
+    live = {
+        str(entry.get("id") or entry.get("session_id") or "")[:12]
+        for entry in sessions
+        if isinstance(entry, dict)
+    }
+
+    removed: list[str] = []
+    try:
+        listing = subprocess.run(
+            docker_argv + [
+                "ps", "-a", "--filter", "name=sandbox-",
+                "--format", "{{.Names}}\t{{.State}}",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in listing.stdout.strip().splitlines():
+            name, _, state = line.partition("\t")
+            match = _SESSION_DOCKER_RESOURCE_RE.match(name.strip())
+            if match is None or match.group(1) in live:
+                continue
+            if state.strip() == "running":
+                continue
+            result = subprocess.run(
+                docker_argv + ["rm", "-f", name.strip()],
+                capture_output=True, timeout=60,
+            )
+            if result.returncode == 0:
+                removed.append(name.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        networks = subprocess.run(
+            docker_argv + [
+                "network", "ls", "--filter", "name=sandbox-", "--format", "{{.Name}}",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in networks.stdout.strip().splitlines():
+            name = line.strip()
+            match = _SESSION_DOCKER_RESOURCE_RE.match(name)
+            if match is None or match.group(1) in live:
+                continue
+            # A network still attached to something refuses removal; that is
+            # the desired outcome, and docker says so on stderr.
+            result = subprocess.run(
+                docker_argv + ["network", "rm", name],
+                capture_output=True, timeout=30,
+            )
+            if result.returncode == 0:
+                removed.append(name)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    return removed
+
+
+@pytest.fixture(autouse=True)
+def _reap_gateway_container_leaks(request):
+    """Reap orphaned session containers/networks after every test.
+
+    The session-scoped teardown sweep is not enough on its own: orphans do
+    damage while the run is still going (see
+    :func:`_reap_orphaned_session_docker_state`), and a leak that stalls the
+    gateway VM's dockerd mid-run costs every test that follows it.
+
+    No-op off macOS — there the session containers are in the host's Docker,
+    shared with any production daemon on the box, and a between-tests reaper
+    pointed at a shared endpoint is exactly the destructive sweep this
+    harness deliberately removed years ago.
+    """
+    if _SANDBOX_TEST_UID is None or _gateway_vm_docker_argv() is None:
+        yield
+        return
+    sandbox_daemon = request.getfixturevalue("sandbox_daemon")
+    yield
+    removed = _reap_orphaned_session_docker_state(sandbox_daemon["socket"])
+    if removed:
+        print(
+            "[conftest] reaped orphaned gateway-VM Docker resources: "
+            + ", ".join(removed),
+            file=sys.stderr,
+        )
 
 
 @pytest.fixture(scope="session")
@@ -1811,35 +2024,16 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
 
     # Force-remove any leftover Docker containers and networks so they don't
     # block subsequent tests with subnet-pool overlap errors.
-    try:
-        containers = subprocess.run(
-            ["docker", "ps", "-a", "--filter", "name=sandbox-",
-             "--format", "{{.Names}}"],
-            capture_output=True, text=True, timeout=15,
-        )
-        for name in containers.stdout.strip().splitlines():
-            if name:
-                subprocess.run(
-                    ["docker", "rm", "-f", name],
-                    capture_output=True, timeout=30,
-                )
-    except Exception:
-        pass
+    _sweep_session_docker_state(["docker"])
 
-    try:
-        networks = subprocess.run(
-            ["docker", "network", "ls", "--filter", "name=sandbox-",
-             "--format", "{{.Name}}"],
-            capture_output=True, text=True, timeout=15,
-        )
-        for name in networks.stdout.strip().splitlines():
-            if name:
-                subprocess.run(
-                    ["docker", "network", "rm", name],
-                    capture_output=True, timeout=30,
-                )
-    except Exception:
-        pass
+    # On macOS the sweep above reaches only the host's Docker, which never
+    # holds a sandbox session container — those live inside the gateway Lima
+    # VM. Sweep that endpoint too, or every gateway container the run leaked
+    # survives it, crash-looping in a memory-constrained VM until someone
+    # notices. No-op elsewhere.
+    gateway_vm_docker = _gateway_vm_docker_argv()
+    if gateway_vm_docker is not None:
+        _sweep_session_docker_state(gateway_vm_docker)
 
 
 # Per-test dump-window caps: keep failure output bounded even when a test
