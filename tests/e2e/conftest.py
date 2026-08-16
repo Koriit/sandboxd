@@ -30,6 +30,7 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -1706,6 +1707,13 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
 _DUMP_MAX_LINES = 4000
 _DUMP_MAX_BYTES = 1 << 20  # 1 MiB
 
+#: Path the operator agent's merged stdout+stderr is written to, set by
+#: ``_macos_operator_agent`` when it launches the agent. Read by
+#: ``_dump_daemon_log_on_failure`` so a failing macOS test shows the agent's
+#: own view alongside the daemon's. ``None`` when no agent was launched
+#: (non-macOS, or the test-feature binary is not installed).
+_AGENT_LOG_PATH: Path | None = None
+
 
 def _capture_log_offset(path: Path) -> int:
     """Return current size of ``path``, or 0 if it doesn't exist yet."""
@@ -1749,6 +1757,26 @@ def _read_log_window(path: Path, start_offset: int) -> tuple[str, int, int]:
     if truncated:
         lines.insert(0, "(truncated)")
     return ("\n".join(lines), effective_start, end)
+
+
+def _read_log_tail(path: Path, max_bytes: int = 4096) -> str:
+    """Return the last ``max_bytes`` of ``path``, for inclusion in an error.
+
+    Used where a fixture is about to raise and the process it was waiting on
+    wrote its diagnosis to a log file rather than to a pipe the fixture could
+    ``communicate()`` with.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            tail = fh.read().decode(errors="replace")
+    except OSError as exc:
+        return f"(could not read {path}: {exc})"
+    if not tail.strip():
+        return f"(empty: {path})"
+    return tail
 
 
 @pytest.fixture(autouse=True)
@@ -1797,6 +1825,11 @@ def _dump_daemon_log_on_failure(request):
         key: _capture_log_offset(sandbox_daemon[key])
         for _, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log"))
     }
+    # The operator agent (macOS full backend) logs to its own file; capture
+    # its offset too so the dump shows the agent's view of the same window.
+    agent_offset = (
+        _capture_log_offset(_AGENT_LOG_PATH) if _AGENT_LOG_PATH is not None else None
+    )
     yield
     rep = getattr(request.node, "rep_call", None)
     if rep is None or not rep.failed:
@@ -1811,6 +1844,17 @@ def _dump_daemon_log_on_failure(request):
             f"=== end sandboxd {label} ===\n",
             file=sys.stderr,
         )
+    if _AGENT_LOG_PATH is not None and agent_offset is not None:
+        text, eff_start, end = _read_log_window(_AGENT_LOG_PATH, agent_offset)
+        if text.strip():
+            print(
+                f"\n=== sandbox-agent "
+                f"(test window bytes [{eff_start}, {end}), "
+                f"from {_AGENT_LOG_PATH}) ===\n"
+                f"{text}\n"
+                f"=== end sandbox-agent ===\n",
+                file=sys.stderr,
+            )
 
 
 def _query_base_image_status(socket_path: str, timeout: float = 5.0) -> str | None:
@@ -2282,14 +2326,37 @@ def _macos_operator_agent(sandbox_daemon):
     # by the agent (checked before the test seam) — set it as a belt-and-suspenders
     # fallback for any future code path that reaches broker_socket_path() first.
     agent_env["SANDBOX_BROKER_SOCKET"] = broker_socket
-    # Structured logging: surface agent info/warn lines in pytest output.
+    # Structured logging: surface agent info/warn lines in the agent log.
     agent_env.setdefault("RUST_LOG", "sandbox_agent=info")
+
+    # The agent logs through tracing_subscriber::fmt() to *stdout* and emits
+    # several lines per brokered guest stream. Its output must go to a file,
+    # not a pipe: a pipe nobody reads fills at its 64 KiB capacity (measured
+    # on this host) and the agent then blocks forever inside write(2) —
+    # answering no further broker traffic while still holding its connection.
+    # Two full macOS suite runs each wedged after the daemon brokered exactly
+    # 109 guest streams, the same integer to the unit, which is a
+    # fixed-capacity buffer filling rather than a timing or load effect. The
+    # visible symptom differed between those runs (a 60 s heartbeat timeout
+    # in one, a 30 s StreamReady deadline in the other) because both are
+    # downstream of the same wedged writer.
+    #
+    # A file keeps the output — the agent's log explains Lima-backend
+    # failures the daemon log can only report second-hand — and never blocks
+    # the writer. It sits beside the daemon's logs so a failing run has both
+    # in one place; ``_dump_daemon_log_on_failure`` prints the per-test window
+    # of it next to the daemon's.
+    global _AGENT_LOG_PATH
+    agent_log = Path(sandbox_daemon["_stdout_log"]).parent / "sandbox-agent.log"
+    agent_log_fh = open(agent_log, "w")
+    _AGENT_LOG_PATH = agent_log
+    print(f"[conftest] sandbox-agent log: {agent_log}", file=sys.stderr)
 
     # The agent takes no command-line arguments; all config is via env.
     proc = subprocess.Popen(
         [str(AGENT_TEST_BIN)],
         env=agent_env,
-        stdout=subprocess.PIPE,
+        stdout=agent_log_fh,
         stderr=subprocess.STDOUT,
     )
 
@@ -2301,11 +2368,12 @@ def _macos_operator_agent(sandbox_daemon):
     checked_in = False
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            # Agent exited early — self-gate or connection error.
-            out, _ = proc.communicate()
+            # Agent exited early — self-gate or connection error. Its output
+            # is in the log file, not a pipe, so read the tail of that.
+            agent_log_fh.close()
             raise RuntimeError(
-                f"sandbox-agent exited before check-in (rc={proc.returncode}). "
-                f"Output: {(out or b'').decode(errors='replace')[:500]}"
+                f"sandbox-agent exited before check-in (rc={proc.returncode}).\n"
+                f"Agent log ({agent_log}):\n{_read_log_tail(agent_log)}"
             )
         if _daemon_log.exists():
             try:
@@ -2323,10 +2391,12 @@ def _macos_operator_agent(sandbox_daemon):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+        agent_log_fh.close()
         raise RuntimeError(
             f"sandbox-agent did not check in within 10 s "
             f"(uid={agent_uid}, broker={broker_socket}). "
-            "Check daemon log for broker rejection details."
+            "Check the daemon log for broker rejection details.\n"
+            f"Agent log ({agent_log}):\n{_read_log_tail(agent_log)}"
         )
 
     yield proc
@@ -2338,6 +2408,7 @@ def _macos_operator_agent(sandbox_daemon):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+    agent_log_fh.close()
 
 
 @pytest.fixture(autouse=True, scope="function")
