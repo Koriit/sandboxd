@@ -13406,7 +13406,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .join("gateway-docker.sock");
         broker_executor = Some(Arc::new(
             AgentBrokerExecutor::new(agent_registry.clone(), pending_streams, daemon_uid)
-                .with_local_docker(daemon_gateway_socket, daemon_lima_home),
+                .with_local_docker(daemon_gateway_socket, daemon_lima_home.clone())
+                .with_local_in_vm(sandbox_core::GATEWAY_INSTANCE_NAME, daemon_lima_home),
         ));
         Arc::clone(broker_executor.as_ref().expect("just set"))
             as Arc<dyn sandbox_core::lima::LimaExecutor>
@@ -13634,10 +13635,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("macOS startup: step 4 — gateway Lima instance init");
         let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
 
+        // The in-VM seam alongside the Docker one: `limactl shell` / `limactl
+        // copy` work as typed ops for the uid that owns the gateway VM.
+        let in_vm_route = sandbox_core::in_vm::InVmRoute::new(
+            daemon_uid,
+            Arc::clone(broker_executor.as_ref().expect("set by the executor block"))
+                as Arc<dyn sandbox_core::in_vm::InVmExecutor>,
+        );
+
         let manager_arc = Arc::new(sandbox_core::GatewayLimaManager::new(
             daemon_lima_home,
             lima_registry.executor().clone(),
             docker_route.clone(),
+            in_vm_route,
             daemon_uid,
         ));
 

@@ -19,6 +19,7 @@ tempfile.workspace = true
 time.workspace = true
 rusqlite.workspace = true
 sandbox-docker-argv.workspace = true
+sandbox-invm-argv.workspace = true
 schemars.workspace = true
 semver.workspace = true
 serde.workspace = true

@@ -1054,6 +1054,50 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
     Ok(())
 }
 
+/// Re-validate every field of a [`crate::protocol::InVmOp`] before the agent
+/// builds any argv from it.
+///
+/// There is very little to check, and that is the shape working rather than
+/// the check being thin. Nine of the eleven variants carry no daemon-supplied
+/// value at all — what they do is fixed by the variant and rendered from
+/// constants. What remains is two kinds of value, and each gets the check its
+/// destination needs:
+///
+/// - **The session identifier**, which is joined onto a constant root to name
+///   a directory that is created, written into and eventually `rm -rf`'d. A
+///   value with a `/` or a `..` in it would move that `rm -rf` somewhere else
+///   in the VM, so it gets the same charset check a VM or session name gets —
+///   which admits neither.
+/// - **The nftables ruleset and the staged file bodies**, which are content.
+///   They are deliberately *not* pattern-checked: an nftables ruleset that had
+///   to survive a syntax filter here would have two parsers disagreeing about
+///   what the policy says, and the one that matters is `nft`'s. What makes
+///   them safe is where they go — a parser's stdin and a file's contents —
+///   not what they look like.
+pub fn validate_in_vm_op(op: &crate::protocol::InVmOp) -> Result<(), String> {
+    use crate::protocol::InVmOp;
+
+    match op {
+        InVmOp::LiteStageCreate { session_id }
+        | InVmOp::LiteStageRemove { session_id }
+        | InVmOp::LiteStageWrite { session_id, .. } => {
+            validate_session_name(session_id)?;
+        }
+        // Nothing daemon-supplied crosses the wire on these. The commands are
+        // constants of the argv crate; the ruleset on `ApplyNftBaseline` is
+        // content for `nft`'s parser, not a value with a shape to check.
+        InVmOp::DockerReady
+        | InVmOp::LinkShowJson
+        | InVmOp::ApplyNftBaseline { .. }
+        | InVmOp::RouteHelperProbe
+        | InVmOp::RouteHelperMakeInstallDir
+        | InVmOp::RouteHelperStage
+        | InVmOp::RouteHelperInstall
+        | InVmOp::RouteHelperSetcap => {}
+    }
+    Ok(())
+}
+
 /// Validate one network `--opt` value.
 fn validate_network_option(option: &crate::protocol::NetworkOption) -> Result<(), String> {
     use crate::protocol::NetworkOption;
@@ -2587,6 +2631,242 @@ user:
                     .is_ok()
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // In-VM op validation
+    // -----------------------------------------------------------------------
+
+    mod in_vm {
+        use super::super::*;
+        use crate::protocol::{
+            InVmOp, InVmTransferSource, LiteStageFile, in_vm_shell_steps, in_vm_stdin_body,
+            in_vm_transfer,
+        };
+
+        /// Every in-VM op the daemon can send, in its well-formed shape.
+        ///
+        /// The mirror of `broker.rs`'s `in_vm_wire::every_op`, held in step by
+        /// the count assertion below — the same number on both sides. Same
+        /// arrangement, and same reason, as the Docker set above.
+        fn every_op() -> Vec<InVmOp> {
+            vec![
+                InVmOp::DockerReady,
+                InVmOp::LinkShowJson,
+                InVmOp::ApplyNftBaseline {
+                    ruleset: "table inet sandbox_eth0 {\n  chain out { drop }\n}\n".to_string(),
+                },
+                InVmOp::RouteHelperProbe,
+                InVmOp::RouteHelperMakeInstallDir,
+                InVmOp::RouteHelperStage,
+                InVmOp::RouteHelperInstall,
+                InVmOp::RouteHelperSetcap,
+                InVmOp::LiteStageCreate {
+                    session_id: "abc123def456".to_string(),
+                },
+                InVmOp::LiteStageWrite {
+                    session_id: "abc123def456".to_string(),
+                    file: LiteStageFile::CertPem,
+                    body: "-----BEGIN CERTIFICATE-----\nMIIB\n".to_string(),
+                },
+                InVmOp::LiteStageRemove {
+                    session_id: "abc123def456".to_string(),
+                },
+            ]
+        }
+
+        #[test]
+        fn every_well_formed_op_is_accepted() {
+            let ops = every_op();
+            assert_eq!(ops.len(), 11, "every InVmOp variant must be covered here");
+            for op in ops {
+                assert!(
+                    validate_in_vm_op(&op).is_ok(),
+                    "well-formed op rejected: {op:?} → {:?}",
+                    validate_in_vm_op(&op).err()
+                );
+            }
+        }
+
+        /// The session identifier is joined onto a constant root to name a
+        /// directory that gets `rm -rf`'d. A traversal, an absolute path or a
+        /// bare `..` would move that `rm -rf` somewhere else inside the VM —
+        /// so every op carrying one must refuse all three, not just the op
+        /// that does the removing.
+        #[test]
+        fn no_lite_stage_op_accepts_a_session_id_that_escapes_the_stage_root() {
+            for bad in [
+                "../../etc",
+                "..",
+                "/",
+                "abc/../..",
+                "abc/def",
+                "a b",
+                "",
+                "-rf",
+            ] {
+                for op in [
+                    InVmOp::LiteStageCreate {
+                        session_id: bad.to_string(),
+                    },
+                    InVmOp::LiteStageRemove {
+                        session_id: bad.to_string(),
+                    },
+                    InVmOp::LiteStageWrite {
+                        session_id: bad.to_string(),
+                        file: LiteStageFile::Passwd,
+                        body: "x".to_string(),
+                    },
+                ] {
+                    assert!(
+                        validate_in_vm_op(&op).is_err(),
+                        "session id {bad:?} must be refused: {op:?}"
+                    );
+                }
+            }
+        }
+
+        /// An accepted session identifier cannot make the rendered path leave
+        /// the stage root. The validator is the guard; this asserts the guard
+        /// actually buys the property, rather than asserting the guard exists.
+        #[test]
+        fn an_accepted_session_id_keeps_every_rendered_path_under_the_stage_root() {
+            for op in every_op() {
+                if let Some(steps) = in_vm_shell_steps(&op) {
+                    for step in steps {
+                        for word in step {
+                            if word.starts_with("/tmp/sandbox-lite") {
+                                assert!(
+                                    !word.contains(".."),
+                                    "{op:?} rendered a traversing path: {word}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(transfer) = in_vm_transfer(&op) {
+                    assert!(!transfer.destination.contains(".."), "{op:?}");
+                }
+            }
+        }
+
+        /// The whole point of the set: no op renders a shell. Asserted here as
+        /// well as in the argv crate because this is the side that runs it,
+        /// and because a future variant could render its own argv rather than
+        /// going through a builder.
+        #[test]
+        fn no_op_renders_a_shell_invocation() {
+            for op in every_op() {
+                let Some(steps) = in_vm_shell_steps(&op) else {
+                    continue;
+                };
+                for step in steps {
+                    for word in &step {
+                        assert!(
+                            !matches!(word.as_str(), "sh" | "bash" | "zsh" | "dash" | "-c"),
+                            "{op:?} renders {step:?}, which invokes a shell"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Every op is a command or a transfer, never both and never neither.
+        #[test]
+        fn every_op_is_exactly_one_of_a_command_or_a_transfer() {
+            for op in every_op() {
+                assert!(
+                    in_vm_shell_steps(&op).is_some() ^ in_vm_transfer(&op).is_some(),
+                    "{op:?} is not exactly one of a command or a transfer"
+                );
+            }
+        }
+
+        /// Only the nftables baseline feeds stdin, and it feeds it verbatim.
+        /// A ruleset that were transformed anywhere between the generator and
+        /// `nft` would be a policy change nobody wrote.
+        #[test]
+        fn only_the_nft_baseline_carries_a_body_and_it_is_unmodified() {
+            let ruleset =
+                "table inet t {\n  chain c { type filter hook output priority 0; drop }\n}\n";
+            for op in every_op() {
+                match &op {
+                    InVmOp::ApplyNftBaseline { .. } => {
+                        let op = InVmOp::ApplyNftBaseline {
+                            ruleset: ruleset.to_string(),
+                        };
+                        assert_eq!(in_vm_stdin_body(&op), Some(ruleset));
+                    }
+                    _ => assert!(
+                        in_vm_stdin_body(&op).is_none(),
+                        "{op:?} unexpectedly carries a stdin body"
+                    ),
+                }
+            }
+        }
+
+        /// The nftables ruleset survives the JSON frame. It is the largest
+        /// thing that crosses the newline-delimited channel and it is full of
+        /// newlines, braces and quotes; a frame that split would deliver a
+        /// prefix of the egress policy, which `nft` would accept as a whole
+        /// and much more permissive one.
+        #[test]
+        fn the_nft_ruleset_is_escaped_by_the_json_encoding() {
+            let hostile = "table inet t {\n  \"quoted\"\n}\n\r\ttrailing\n";
+            let op = crate::protocol::BrokerOp::InVm {
+                op_uid: 501,
+                op: InVmOp::ApplyNftBaseline {
+                    ruleset: hostile.to_string(),
+                },
+            };
+            let line = serde_json::to_string(&op).expect("serialize");
+            assert!(
+                !line.contains('\n'),
+                "the encoded frame contains a literal newline"
+            );
+
+            let back: crate::protocol::BrokerOp = serde_json::from_str(&line).expect("round trip");
+            let crate::protocol::BrokerOp::InVm {
+                op: InVmOp::ApplyNftBaseline { ruleset },
+                ..
+            } = back
+            else {
+                panic!("wrong variant after round trip");
+            };
+            assert_eq!(ruleset, hostile);
+        }
+
+        /// Neither transfer carries a source path — the whole reason the lite
+        /// files travel as content. A path field would be a request to copy
+        /// an arbitrary file into a VM with passwordless sudo.
+        #[test]
+        fn no_transfer_names_a_source_path() {
+            for op in every_op() {
+                let Some(transfer) = in_vm_transfer(&op) else {
+                    continue;
+                };
+                match transfer.source {
+                    InVmTransferSource::RouteHelperBinary => {}
+                    InVmTransferSource::Content { basename, mode, .. } => {
+                        assert!(
+                            !basename.contains('/'),
+                            "a transfer source basename must not be a path: {basename}"
+                        );
+                        assert_eq!(mode, 0o644);
+                    }
+                }
+                assert!(transfer.destination.starts_with('/'));
+            }
+        }
+
+        /// An unknown op name is rejected at deserialization rather than
+        /// reaching a handler. This is what "the enum is closed" means on the
+        /// wire, as opposed to in the source.
+        #[test]
+        fn an_op_name_not_in_the_enum_fails_to_deserialize() {
+            let json = r#"{"in_vm_op":"run_shell","command":"rm -rf /"}"#;
+            assert!(serde_json::from_str::<InVmOp>(json).is_err());
         }
     }
 

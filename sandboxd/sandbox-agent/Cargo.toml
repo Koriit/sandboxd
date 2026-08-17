@@ -57,6 +57,11 @@ regex = "1"
 # leaf crate exists to preserve (see its crate docs). Scoped to macOS with the
 # rest of the agent's real dependencies — the Linux build is an inert stub.
 sandbox-docker-argv = { workspace = true }
+# sandbox-invm-argv: the same arrangement for the commands the agent runs
+# *inside* its own gateway VM through `limactl shell` / `limactl copy`. A
+# separate leaf crate from the docker one because the transport and its trust
+# story differ — see its crate docs.
+sandbox-invm-argv = { workspace = true }
 # serde_yaml: structural YAML parsing for lima.yaml shape validation. String-
 # based line matching cannot reliably detect flow-style, quoted keys, or
 # anchors/aliases — all reachable via a YAML serializer in a buggy daemon.

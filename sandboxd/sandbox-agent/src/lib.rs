@@ -24,6 +24,16 @@ pub use protocol::{
     NftTable, RemoveForce, StagedImage, StdinCommand, WorkspaceBindSpec, docker_argv,
 };
 
+/// The in-VM op set and the typed values it carries. Exported for the same
+/// reason the Docker set is: the daemon builds the requests the agent
+/// validates, and one definition is what keeps the two sides from disagreeing
+/// about what an op does inside the VM.
+#[cfg(target_os = "macos")]
+pub use protocol::{
+    InVmOp, InVmTransfer, InVmTransferSource, LiteStageFile, in_vm_shell_steps, in_vm_stdin_body,
+    in_vm_transfer,
+};
+
 /// The stream-class op set — the long-lived byte pumps into a container.
 /// Exported for the same reason as the Docker op set: the daemon builds the
 /// requests the agent validates, and one definition is what keeps the two

@@ -295,6 +295,7 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
         }
         BrokerOp::RestrictOnVerify { op_uid: _, vm } => handle_restrict_on_verify(ctx, vm).await,
         BrokerOp::Docker { op_uid: _, op } => handle_docker(ctx, op).await,
+        BrokerOp::InVm { op_uid: _, op } => handle_in_vm(ctx, op).await,
     }
 }
 
@@ -675,6 +676,244 @@ async fn run_limactl_steps(ctx: &RunContext, steps: &[Vec<&str>]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// In-VM ops
+// ---------------------------------------------------------------------------
+
+/// The gateway Lima instance this agent drives.
+///
+/// An agent-side constant, exactly like [`own_gateway_docker_socket`]'s two
+/// components, and for a reason that is sharper here. A `limactl shell` runs a
+/// command as the VM's login user, and Lima provisions that user with
+/// passwordless `sudo`. If the daemon named the instance, "the agent only runs
+/// reviewed operations" would become "the agent only runs reviewed operations,
+/// as root, in whichever VM it was told to" — and the review would be bounding
+/// nothing that matters.
+///
+/// If a test needs a different instance, give the test its own agent with its
+/// own `RunContext.lima_home`. That is the seam, and it widens no production
+/// behaviour.
+fn own_gateway_vm(_ctx: &RunContext) -> &'static str {
+    GATEWAY_VM_NAME
+}
+
+/// `umask` for in-VM operations.
+///
+/// Deliberately **not** the `0o077` the Lima lifecycle ops use. That value
+/// exists so `limactl` writes SSH private keys at 0600, and it is right there.
+/// It is wrong here: these ops create a staging directory and copy four files
+/// that are bound into a container and read by processes running as the
+/// session uid — not as the file's owner. At 0o077 the container cannot read
+/// its own `authorized_keys`, which surfaces as an SSH failure a long way from
+/// this constant. 0o022 is what the daemon's own ambient umask produced when
+/// these ran daemon-side.
+const IN_VM_UMASK: libc::mode_t = 0o022;
+
+/// Validate an in-VM op, render it, and run it against this agent's own
+/// gateway VM.
+async fn handle_in_vm(ctx: &RunContext, op: crate::protocol::InVmOp) -> BrokerResult {
+    if let Err(reason) = validation::validate_in_vm_op(&op) {
+        warn!(reason, "in-vm op rejected: field validation");
+        return BrokerResult::Rejected { reason };
+    }
+
+    if let Some(transfer) = crate::protocol::in_vm_transfer(&op) {
+        return run_in_vm_transfer(ctx, transfer).await;
+    }
+
+    let Some(steps) = crate::protocol::in_vm_shell_steps(&op) else {
+        return BrokerResult::Rejected {
+            reason: "in-vm op is neither a command nor a transfer".to_string(),
+        };
+    };
+    let body = crate::protocol::in_vm_stdin_body(&op).map(|b| b.to_string());
+
+    let mut last: Option<std::process::Output> = None;
+    for step in &steps {
+        let argv = sandbox_invm_argv::shell_argv(own_gateway_vm(ctx), step);
+        let output = match run_limactl_capture(ctx, &argv, body.as_deref()).await {
+            Ok(o) => o,
+            Err(result) => return result,
+        };
+        let failed = !output.status.success();
+        last = Some(output);
+        // A failed step short-circuits, and its output is what comes back, so
+        // the daemon reads the step that failed rather than a later one that
+        // never ran.
+        if failed {
+            break;
+        }
+    }
+
+    match last {
+        Some(output) => output_to_result(output),
+        None => BrokerResult::Rejected {
+            reason: "in-vm op produced no steps".to_string(),
+        },
+    }
+}
+
+/// Resolve a transfer's source inside the agent's own LIMA_HOME and copy it
+/// into the VM.
+async fn run_in_vm_transfer(
+    ctx: &RunContext,
+    transfer: crate::protocol::InVmTransfer,
+) -> BrokerResult {
+    use crate::protocol::InVmTransferSource;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Both arms resolve under `ctx.lima_home`, which the agent built from its
+    // own uid. The confinement check is belt-and-braces against a future
+    // variant that resolves somewhere else.
+    let (source, scratch) = match &transfer.source {
+        InVmTransferSource::RouteHelperBinary => (
+            format!(
+                "{}/{}",
+                ctx.lima_home,
+                sandbox_invm_argv::route_helper::HOST_BINARY_FILENAME
+            ),
+            false,
+        ),
+        InVmTransferSource::Content { basename, .. } => {
+            (format!("{}/{basename}", ctx.lima_home), true)
+        }
+    };
+    if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &source) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    if let InVmTransferSource::Content { mode, body, .. } = &transfer.source {
+        if let Err(e) = std::fs::write(&source, body.as_bytes()) {
+            return BrokerResult::Failed {
+                stdout: String::new(),
+                stderr: format!("failed to stage {source} for transfer: {e}"),
+                exit_code: 1,
+            };
+        }
+        // The mode is set on the source because `limactl copy` preserves it,
+        // and the preserved mode is what the container reads the file under.
+        if let Err(e) = std::fs::set_permissions(&source, std::fs::Permissions::from_mode(*mode)) {
+            let _ = std::fs::remove_file(&source);
+            return BrokerResult::Failed {
+                stdout: String::new(),
+                stderr: format!("failed to chmod {mode:o} on {source}: {e}"),
+                exit_code: 1,
+            };
+        }
+    }
+
+    let argv = sandbox_invm_argv::copy_argv(&source, own_gateway_vm(ctx), &transfer.destination);
+    let result = run_limactl_capture(ctx, &argv, None).await;
+    if scratch {
+        let _ = std::fs::remove_file(&source);
+    }
+    match result {
+        Ok(output) => output_to_result(output),
+        Err(result) => result,
+    }
+}
+
+/// Run one `limactl` invocation for an in-VM op and hand back the raw output.
+///
+/// Distinct from [`run_limactl`] in two ways that both matter here: it returns
+/// the `Output` rather than a `BrokerResult`, so a multi-step op can decide
+/// whether to continue; and it writes `body` to the child's stdin when the op
+/// has one, which is how the nftables ruleset reaches `nft -f -`.
+async fn run_limactl_capture(
+    ctx: &RunContext,
+    argv: &[String],
+    body: Option<&str>,
+) -> Result<std::process::Output, BrokerResult> {
+    use tokio::io::AsyncWriteExt;
+
+    let limactl = match resolve_limactl() {
+        Some(p) => p,
+        None => {
+            return Err(BrokerResult::Rejected {
+                reason: "limactl not found in PATH; check agent PATH setup".to_string(),
+            });
+        }
+    };
+
+    let op_home = resolve_op_home(ctx.own_uid)
+        .await
+        .unwrap_or_else(|| "/nonexistent".to_string());
+    let env = build_env(&ctx.lima_home, &op_home, &[]);
+
+    let mut cmd = Command::new(&limactl);
+    cmd.args(argv);
+    cmd.env_clear();
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    // SAFETY: called in the child process after fork, before exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(IN_VM_UMASK);
+            Ok(())
+        });
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let Some(body) = body else {
+        cmd.stdin(Stdio::null());
+        return cmd.output().await.map_err(|e| BrokerResult::Rejected {
+            reason: format!("failed to spawn limactl: {e}"),
+        });
+    };
+
+    cmd.stdin(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| BrokerResult::Rejected {
+        reason: format!("failed to spawn limactl: {e}"),
+    })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| BrokerResult::Rejected {
+        reason: "failed to take limactl stdin".to_string(),
+    })?;
+    let written = stdin.write_all(body.as_bytes()).await;
+    let flushed = stdin.flush().await;
+    // The pipe must be closed after the write: `nft -f -` reads to EOF, and an
+    // open write half leaves it waiting forever on a parent that thinks it is
+    // done.
+    drop(stdin);
+    if let Err(e) = written.and(flushed) {
+        let _ = child.kill().await;
+        return Err(BrokerResult::Failed {
+            stdout: String::new(),
+            stderr: format!("failed to write the op body to limactl stdin: {e}"),
+            exit_code: 1,
+        });
+    }
+    child
+        .wait_with_output()
+        .await
+        .map_err(|e| BrokerResult::Failed {
+            stdout: String::new(),
+            stderr: format!("limactl did not complete: {e}"),
+            exit_code: 1,
+        })
+}
+
+/// The common `Output` → `BrokerResult` mapping.
+fn output_to_result(output: std::process::Output) -> BrokerResult {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(1);
+    if output.status.success() {
+        BrokerResult::Ok {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    } else {
+        BrokerResult::Failed {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

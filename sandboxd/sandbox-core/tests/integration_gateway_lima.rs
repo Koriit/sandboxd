@@ -136,10 +136,18 @@ mod tests {
                 lima_home.clone(),
             )),
         };
+        let in_vm = sandbox_core::in_vm::InVmRoute::new(
+            daemon_uid,
+            Arc::new(sandbox_core::in_vm::LocalLimactlInVmExecutor::new(
+                sandbox_core::GATEWAY_INSTANCE_NAME,
+                lima_home.clone(),
+            )),
+        );
         GatewayLimaManager::new(
             lima_home,
             Arc::new(DirectLimaExecutor { daemon_uid }),
             docker,
+            in_vm,
             daemon_uid,
         )
     }

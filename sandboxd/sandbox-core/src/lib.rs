@@ -25,6 +25,11 @@ pub mod gateway_lima;
 /// state-machine behaviours can be covered by hermetic unit tests on any host.
 pub mod gateway_recovery;
 pub mod guest;
+/// Typed operations that run inside the gateway Lima VM, and the seam that
+/// executes them. Platform-neutral for the same reason [`docker`] is: the op
+/// set and its argv rendering are compiled and tested on every host. Nothing
+/// off macOS constructs one, because there is no gateway VM there.
+pub mod in_vm;
 pub mod lds_ack;
 pub mod lima;
 /// Pure helpers for the lite-mode container backend on macOS:

@@ -6,6 +6,7 @@ members = [
     "sandbox-core",
     "sandbox-docker-argv",
     "sandbox-event-emitter",
+    "sandbox-invm-argv",
     "sandbox-nft-allow-logger",
     "sandbox-nft-deny-logger",
     "sandbox-guest",
@@ -67,3 +68,8 @@ sandbox-core = { path = "sandbox-core" }
 # `sandbox-core` and `sandbox-agent` build. It is a separate crate precisely so
 # neither of those two has to depend on the other — see its crate docs.
 sandbox-docker-argv = { path = "sandbox-docker-argv" }
+# The same arrangement one transport over: the argv fragments for commands run
+# *inside* the gateway VM through `limactl shell` / `limactl copy`. Separate
+# from `sandbox-docker-argv` because the transport and its trust story differ —
+# see its crate docs.
+sandbox-invm-argv = { path = "sandbox-invm-argv" }

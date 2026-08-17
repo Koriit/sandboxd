@@ -1928,6 +1928,12 @@ pub struct AgentBrokerExecutor {
     /// startup; `None` leaves the Docker seam unusable rather than silently
     /// falling back to a host Docker that does not exist there.
     local_docker: Option<sandbox_core::docker::LocalSocketDockerExecutor>,
+    /// Executes in-VM ops for the daemon's own uid — the same degenerate case
+    /// as `local_docker`, one layer down: `limactl shell` / `limactl copy`
+    /// against the gateway instance the daemon still owns. `None` leaves the
+    /// in-VM seam unusable rather than silently reaching for a `limactl` whose
+    /// LIMA_HOME nobody chose.
+    local_in_vm: Option<sandbox_core::in_vm::LocalLimactlInVmExecutor>,
 }
 
 impl AgentBrokerExecutor {
@@ -1948,6 +1954,7 @@ impl AgentBrokerExecutor {
             daemon_uid,
             next_request_id: std::sync::atomic::AtomicU64::new(1),
             local_docker: None,
+            local_in_vm: None,
         }
     }
 
@@ -1965,6 +1972,24 @@ impl AgentBrokerExecutor {
         self.local_docker = Some(sandbox_core::docker::LocalSocketDockerExecutor::new(
             socket,
             staging_dir,
+        ));
+        self
+    }
+
+    /// Wire the executor that runs in-VM ops for the daemon's own uid.
+    ///
+    /// `instance` is the gateway Lima instance and `lima_home` the daemon's
+    /// own LIMA_HOME — the root both `limactl`'s environment and every
+    /// transfer source resolve against. Both are the daemon's own; this is the
+    /// "the daemon is the operator" case, not a way to drive somebody else's
+    /// VM.
+    pub fn with_local_in_vm(
+        mut self,
+        instance: impl Into<String>,
+        lima_home: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.local_in_vm = Some(sandbox_core::in_vm::LocalLimactlInVmExecutor::new(
+            instance, lima_home,
         ));
         self
     }
@@ -2076,6 +2101,105 @@ impl sandbox_core::docker::DockerExecutor for AgentBrokerExecutor {
             // `None` as "no diagnosis available" rather than as "clean".
             exit: None,
         })
+    }
+}
+
+impl sandbox_core::in_vm::InVmExecutor for AgentBrokerExecutor {
+    /// Run one typed in-VM op as `op_uid`.
+    ///
+    /// Same two-branch shape as the Docker executor above: the daemon's own
+    /// uid drives `limactl` in-process against its own gateway VM — the
+    /// degenerate case where "act as the operator" and "act as yourself"
+    /// coincide — and any other uid goes to that operator's agent as a typed
+    /// op on the pipelined lane.
+    fn run(
+        &self,
+        op_uid: u32,
+        op: sandbox_core::in_vm::InVmOp,
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<std::process::Output, sandbox_core::error::SandboxError> {
+        use sandbox_core::error::SandboxError;
+
+        if op_uid == self.daemon_uid {
+            let Some(local) = self.local_in_vm.as_ref() else {
+                return Err(SandboxError::Internal(format!(
+                    "{label}: no local in-VM executor is wired for the daemon's own uid; \
+                     the daemon cannot run in-VM ops against its own gateway VM"
+                )));
+            };
+            return local.run(op_uid, op, timeout, label);
+        }
+
+        let request_id = self.next_id();
+        let request = sandbox_agent_protocol::BrokerRequest {
+            request_id,
+            op: sandbox_agent_protocol::BrokerOp::InVm {
+                op_uid,
+                op: in_vm_op_to_wire(&op),
+            },
+        };
+
+        let registry = self.registry.clone();
+        let handle = tokio::runtime::Handle::current();
+        let result = handle
+            .block_on(registry.send_op(op_uid, request))
+            .map_err(|e| SandboxError::Gateway(format!("{label}: {e}")))?;
+
+        broker_result_to_output(result, label)
+    }
+}
+
+/// Map the daemon's in-process in-VM op onto its wire form.
+///
+/// Exhaustive by construction, like [`docker_op_to_wire`]: a variant added to
+/// `sandbox_core::in_vm::InVmOp` without a wire counterpart fails to compile
+/// here.
+fn in_vm_op_to_wire(op: &sandbox_core::in_vm::InVmOp) -> sandbox_agent_protocol::InVmOp {
+    use sandbox_agent_protocol::InVmOp as Wire;
+    use sandbox_core::in_vm::InVmOp as Core;
+
+    match op {
+        Core::DockerReady => Wire::DockerReady,
+        Core::LinkShowJson => Wire::LinkShowJson,
+        Core::ApplyNftBaseline { ruleset } => Wire::ApplyNftBaseline {
+            ruleset: ruleset.clone(),
+        },
+        Core::RouteHelperProbe => Wire::RouteHelperProbe,
+        Core::RouteHelperMakeInstallDir => Wire::RouteHelperMakeInstallDir,
+        Core::RouteHelperStage => Wire::RouteHelperStage,
+        Core::RouteHelperInstall => Wire::RouteHelperInstall,
+        Core::RouteHelperSetcap => Wire::RouteHelperSetcap,
+        Core::LiteStageCreate { session_id } => Wire::LiteStageCreate {
+            session_id: session_id.clone(),
+        },
+        Core::LiteStageWrite {
+            session_id,
+            file,
+            body,
+        } => Wire::LiteStageWrite {
+            session_id: session_id.clone(),
+            file: lite_stage_file_to_wire(*file),
+            body: body.clone(),
+        },
+        Core::LiteStageRemove { session_id } => Wire::LiteStageRemove {
+            session_id: session_id.clone(),
+        },
+    }
+}
+
+/// Map the argv crate's staged-file discriminant onto its wire form.
+fn lite_stage_file_to_wire(
+    file: sandbox_invm_argv::lite_stage::LiteStageFile,
+) -> sandbox_agent_protocol::LiteStageFile {
+    use sandbox_agent_protocol::LiteStageFile as Wire;
+    use sandbox_invm_argv::lite_stage::LiteStageFile as Argv;
+
+    match file {
+        Argv::CertPem => Wire::CertPem,
+        Argv::AuthorizedKeys => Wire::AuthorizedKeys,
+        Argv::Passwd => Wire::Passwd,
+        Argv::Group => Wire::Group,
     }
 }
 
@@ -2939,6 +3063,156 @@ async fn run_limactl_guest_socat_direct(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // -----------------------------------------------------------------------
+    // In-VM op wire mapping
+    // -----------------------------------------------------------------------
+
+    mod in_vm_wire {
+        use super::super::in_vm_op_to_wire;
+        use sandbox_core::in_vm::InVmOp;
+        use sandbox_invm_argv::lite_stage::LiteStageFile;
+
+        /// Every in-VM op the daemon can send, with every field populated.
+        ///
+        /// The mirror of `validation.rs`'s `in_vm::every_op` on the receiving
+        /// side, held in step by the count assertion each of them makes.
+        fn every_op() -> Vec<InVmOp> {
+            vec![
+                InVmOp::DockerReady,
+                InVmOp::LinkShowJson,
+                InVmOp::ApplyNftBaseline {
+                    ruleset: hostile_ruleset(),
+                },
+                InVmOp::RouteHelperProbe,
+                InVmOp::RouteHelperMakeInstallDir,
+                InVmOp::RouteHelperStage,
+                InVmOp::RouteHelperInstall,
+                InVmOp::RouteHelperSetcap,
+                InVmOp::LiteStageCreate {
+                    session_id: "abc123def456".to_string(),
+                },
+                InVmOp::LiteStageWrite {
+                    session_id: "abc123def456".to_string(),
+                    file: LiteStageFile::CertPem,
+                    body: hostile_ruleset(),
+                },
+                InVmOp::LiteStageRemove {
+                    session_id: "abc123def456".to_string(),
+                },
+            ]
+        }
+
+        /// A body built to break anything that reinterprets it between the
+        /// generator and the VM: newline-delimited framing, shell quoting,
+        /// command substitution, a nested request object and a heredoc
+        /// terminator of the kind the previous nft shape used.
+        fn hostile_ruleset() -> String {
+            [
+                "table inet sandbox_eth0 {",
+                "  # newline-delimited channel, meet a newline",
+                r#"  'single' "double" `backtick` \backslash"#,
+                "  $(id) ${HOME} $HOME; rm -rf /",
+                r#"  {"request_id": 99, "op": {"subcommand": "delete"}}"#,
+                "SANDBOXD_NFT_EOF",
+                "  ünïcode — 日本語 — \u{1F512}",
+                "}",
+            ]
+            .join("\n")
+                + "\n"
+        }
+
+        /// The property the seam rests on, one transport over from the Docker
+        /// one: what the daemon means by an in-VM op and what the agent runs
+        /// for it are the same command inside the VM. A mismatch here runs a
+        /// different privileged command than the one the daemon's tests
+        /// pinned — including, for one variant, a different egress policy.
+        #[test]
+        fn the_daemon_and_the_agent_render_the_same_command_for_every_op() {
+            let ops = every_op();
+            assert_eq!(ops.len(), 11, "every InVmOp variant must be covered here");
+            for op in ops {
+                let wire = in_vm_op_to_wire(&op);
+                assert_eq!(
+                    op.shell_steps(),
+                    sandbox_agent_protocol::in_vm_shell_steps(&wire),
+                    "daemon and agent disagree about the command for {op:?}"
+                );
+                assert_eq!(
+                    op.stdin_body(),
+                    sandbox_agent_protocol::in_vm_stdin_body(&wire),
+                    "daemon and agent disagree about the stdin body for {op:?}"
+                );
+            }
+        }
+
+        /// A transfer must land at the same in-VM path on both sides. The
+        /// four lite files are bound into the container by path; a
+        /// disagreement here binds nothing and surfaces as an SSH or TLS
+        /// failure a long way from this mapping.
+        #[test]
+        fn the_daemon_and_the_agent_agree_where_every_transfer_lands() {
+            for op in every_op() {
+                let Some(_) = op.transfer() else { continue };
+                let wire = in_vm_op_to_wire(&op);
+                let agent = sandbox_agent_protocol::in_vm_transfer(&wire)
+                    .expect("the agent sees the same op as a transfer");
+                let expected = match &op {
+                    InVmOp::RouteHelperStage => {
+                        sandbox_invm_argv::route_helper::STAGED_PATH_IN_VM.to_string()
+                    }
+                    InVmOp::LiteStageWrite {
+                        session_id, file, ..
+                    } => sandbox_invm_argv::lite_stage::file_path(
+                        &sandbox_invm_argv::lite_stage::stage_dir(session_id),
+                        *file,
+                    ),
+                    other => panic!("unexpected transfer op {other:?}"),
+                };
+                assert_eq!(agent.destination, expected, "{op:?}");
+            }
+        }
+
+        /// The wire form survives the channel it crosses. The ruleset is the
+        /// largest thing on it and the one whose corruption is silent.
+        #[test]
+        fn the_wire_form_survives_a_json_round_trip_for_every_op() {
+            for op in every_op() {
+                let wire = in_vm_op_to_wire(&op);
+                let json = serde_json::to_string(&wire).expect("wire op serializes");
+                assert!(
+                    !json.contains('\n'),
+                    "the encoded frame for {op:?} contains a literal newline"
+                );
+                let back: sandbox_agent_protocol::InVmOp =
+                    serde_json::from_str(&json).expect("wire op deserializes");
+                assert_eq!(
+                    sandbox_agent_protocol::in_vm_shell_steps(&wire),
+                    sandbox_agent_protocol::in_vm_shell_steps(&back),
+                    "{op:?} did not survive the round trip"
+                );
+                assert_eq!(
+                    sandbox_agent_protocol::in_vm_stdin_body(&wire),
+                    sandbox_agent_protocol::in_vm_stdin_body(&back),
+                    "{op:?} lost its body in the round trip"
+                );
+            }
+        }
+
+        /// Nothing on this op carries the instance name. The agent derives it
+        /// from its own uid, which is what stops a compromised daemon from
+        /// aiming a passwordless-sudo shell at a VM of its choosing.
+        #[test]
+        fn no_op_carries_the_vm_instance_name_on_the_wire() {
+            for op in every_op() {
+                let json = serde_json::to_string(&in_vm_op_to_wire(&op)).expect("serializes");
+                assert!(
+                    !json.contains(sandbox_core::GATEWAY_INSTANCE_NAME),
+                    "{op:?} put the instance name on the wire: {json}"
+                );
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Docker op wire mapping

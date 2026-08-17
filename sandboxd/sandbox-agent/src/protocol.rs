@@ -369,6 +369,22 @@ pub enum BrokerOp {
     /// `-H unix://<own socket>` the sole target authority and keeps every
     /// path in this op set inside the agent's own subtree.
     Docker { op_uid: u32, op: DockerOp },
+    /// Run one typed operation **inside** the agent's own gateway VM, through
+    /// `limactl shell` or `limactl copy`.
+    ///
+    /// Grouped behind one variant for the same reason [`BrokerOp::Docker`] is:
+    /// a reviewer asking "what can the daemon make happen inside my VM?" reads
+    /// one enum, [`InVmOp`], rather than picking eleven variants out of a list
+    /// that also contains VM lifecycle.
+    ///
+    /// **The daemon does not name the VM.** No instance name crosses the wire
+    /// on this op; the agent addresses its own gateway instance, derived from
+    /// its own uid — the same discipline that keeps `-H unix://<own socket>`
+    /// the sole target authority on the Docker ops. It matters more here, not
+    /// less: a `limactl shell` runs as the VM's login user, which has
+    /// passwordless `sudo`, so a caller-chosen instance would be a root shell
+    /// in a VM of the caller's choosing.
+    InVm { op_uid: u32, op: InVmOp },
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +782,100 @@ pub struct NetworkCreateSpec {
 }
 
 // ---------------------------------------------------------------------------
+// In-VM op set
+// ---------------------------------------------------------------------------
+
+/// The closed set of operations the daemon may ask the agent to perform
+/// **inside** its own gateway VM.
+///
+/// Read this enum as the answer to "what is the daemon allowed to do inside my
+/// VM?". It is a shorter list than the Docker one and a sharper one: these run
+/// as the VM's login user, which has passwordless `sudo`, so there is no
+/// variant carrying a command, a shell string, a capability set or a path to
+/// write. Where the Docker set had to enumerate formats and templates to stop
+/// a read from widening, this set has to enumerate whole operations to stop a
+/// write from becoming root.
+///
+/// # Adding a variant is a security change
+///
+/// Each variant is one more thing a compromised daemon can run as root inside
+/// the VM that terminates the session's TLS and carries its egress policy.
+/// Name the operation, never the command — and check whether an existing
+/// variant already does it.
+///
+/// The counterpart on the daemon side is `sandbox_core::in_vm::InVmOp`; both
+/// render their command lines through the shared `sandbox-invm-argv` crate, so
+/// the two sides cannot disagree about what an op means.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "in_vm_op", rename_all = "snake_case")]
+pub enum InVmOp {
+    /// Is the VM's own Docker daemon answering?
+    DockerReady,
+    /// The guest's own view of its NICs, as JSON.
+    LinkShowJson,
+    /// Apply the VM's `eth0` default-drop nftables baseline, the ruleset
+    /// arriving on `nft`'s standard input.
+    ///
+    /// **This is the egress-enforcement op in this set.** The body is the
+    /// policy: multi-KB, full of newlines, and read as content by a parser
+    /// rather than as a command line by anything. It travels as a JSON string
+    /// field on the newline-delimited channel for the same reason
+    /// [`DockerOp::ContainerExecStdin`]'s does, and is safe for the same
+    /// reason — JSON string encoding is what escapes the frame delimiter.
+    ApplyNftBaseline { ruleset: String },
+    /// Report whether `sandbox-route-helper` is installed in the VM with its
+    /// capabilities. Reports; does not decide.
+    RouteHelperProbe,
+    /// Create the root-owned directory the helper installs into.
+    RouteHelperMakeInstallDir,
+    /// Copy the pre-staged helper binary into the VM.
+    ///
+    /// Carries no source path: the binary is named by a constant of the argv
+    /// crate and resolved against the **agent's own** LIMA_HOME. A path field
+    /// here would be a request to copy an arbitrary file into a VM that is
+    /// about to hand it `cap_net_admin`.
+    RouteHelperStage,
+    /// Move the staged copy into its final root-owned location.
+    RouteHelperInstall,
+    /// Mark the installed helper executable and apply its capabilities.
+    ///
+    /// The capability set is a constant of the argv crate, not a field. A
+    /// caller-chosen capability set on a root-owned binary is the same
+    /// authority as a caller-chosen command.
+    RouteHelperSetcap,
+    /// Create a session's lite-container staging directory.
+    LiteStageCreate { session_id: String },
+    /// Put one of four enumerated provisioning files into a session's staging
+    /// directory, its content carried in `body`.
+    ///
+    /// The basename and the mode come from `file`, not from the daemon. The
+    /// content has to travel because the daemon writes these files into its
+    /// own session directory at mode 0700 — which the agent cannot read at
+    /// all once the VM is the operator's.
+    LiteStageWrite {
+        session_id: String,
+        file: LiteStageFile,
+        body: String,
+    },
+    /// Remove a session's staging directory.
+    LiteStageRemove { session_id: String },
+}
+
+/// The four files a lite session stages into its VM directory.
+///
+/// Mirrors `sandbox_invm_argv::lite_stage::LiteStageFile` — see the warning
+/// there. Adding a variant is a security change: it is one more filename the
+/// daemon can write into a directory about to be bound into a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiteStageFile {
+    CertPem,
+    AuthorizedKeys,
+    Passwd,
+    Group,
+}
+
+// ---------------------------------------------------------------------------
 // Wire → argv-crate conversions
 // ---------------------------------------------------------------------------
 //
@@ -774,6 +884,17 @@ pub struct NetworkCreateSpec {
 // that lets it sit under both). These conversions are the seam: the wire
 // types carry serde, the argv types carry the rendering, and the mapping
 // between them is total.
+
+impl From<LiteStageFile> for sandbox_invm_argv::lite_stage::LiteStageFile {
+    fn from(value: LiteStageFile) -> Self {
+        match value {
+            LiteStageFile::CertPem => Self::CertPem,
+            LiteStageFile::AuthorizedKeys => Self::AuthorizedKeys,
+            LiteStageFile::Passwd => Self::Passwd,
+            LiteStageFile::Group => Self::Group,
+        }
+    }
+}
 
 impl From<RemoveForce> for sandbox_docker_argv::container::RemoveForce {
     fn from(value: RemoveForce) -> Self {
@@ -1196,7 +1317,8 @@ impl BrokerOp {
             | BrokerOp::GuestSocat { op_uid, .. }
             | BrokerOp::RestrictOnVerify { op_uid, .. }
             | BrokerOp::DockerStream { op_uid, .. }
-            | BrokerOp::Docker { op_uid, .. } => *op_uid,
+            | BrokerOp::Docker { op_uid, .. }
+            | BrokerOp::InVm { op_uid, .. } => *op_uid,
         }
     }
 
@@ -1228,7 +1350,8 @@ impl BrokerOp {
             | BrokerOp::RunRsync { .. }
             | BrokerOp::ReadOwnerMarker { .. }
             | BrokerOp::RestrictOnVerify { .. }
-            | BrokerOp::Docker { .. } => None,
+            | BrokerOp::Docker { .. }
+            | BrokerOp::InVm { .. } => None,
         }
     }
 
@@ -1250,6 +1373,7 @@ impl BrokerOp {
             BrokerOp::RestrictOnVerify { .. } => "restrict-on-verify",
             BrokerOp::DockerStream { .. } => "docker-stream",
             BrokerOp::Docker { .. } => "docker",
+            BrokerOp::InVm { .. } => "in-vm",
         }
     }
 }
@@ -1299,6 +1423,115 @@ pub const RESTRICT_ON_MARKER: &str = "restrict=on";
 /// handler for why that distinction is the whole point.
 pub fn docker_stream_argv(op: &DockerStreamOp, socket: Option<&std::path::Path>) -> Vec<String> {
     sandbox_docker_argv::stream::stream_exec_argv(socket, op.container(), op.target())
+}
+
+/// Render an in-VM op's command, as the sequence of argv to run inside the VM.
+///
+/// `None` for the two ops that are file transfers rather than commands — see
+/// [`in_vm_transfer`].
+///
+/// Mirrors `sandbox_core::in_vm::InVmOp::shell_steps` and renders through the
+/// same builders, which is what keeps the daemon's idea of an op and the
+/// agent's from drifting.
+pub fn in_vm_shell_steps(op: &InVmOp) -> Option<Vec<Vec<String>>> {
+    use sandbox_invm_argv::{lite_stage, route_helper, vm};
+
+    let steps = match op {
+        InVmOp::DockerReady => vec![vm::docker_ready_argv()],
+        InVmOp::LinkShowJson => vec![vm::link_show_json_argv()],
+        InVmOp::ApplyNftBaseline { .. } => vec![vm::apply_nft_baseline_argv()],
+        InVmOp::RouteHelperProbe => vec![
+            route_helper::probe_executable_argv(),
+            route_helper::probe_caps_argv(),
+        ],
+        InVmOp::RouteHelperMakeInstallDir => vec![route_helper::make_install_dir_argv()],
+        InVmOp::RouteHelperInstall => route_helper::install_argv(),
+        InVmOp::RouteHelperSetcap => {
+            vec![route_helper::chmod_argv(), route_helper::setcap_argv()]
+        }
+        InVmOp::LiteStageCreate { session_id } => {
+            vec![lite_stage::mkdir_argv(&lite_stage::stage_dir(session_id))]
+        }
+        InVmOp::LiteStageRemove { session_id } => {
+            vec![lite_stage::rm_argv(&lite_stage::stage_dir(session_id))]
+        }
+        InVmOp::RouteHelperStage | InVmOp::LiteStageWrite { .. } => return None,
+    };
+    Some(steps)
+}
+
+/// The file transfer an in-VM op performs, if it is one: which file, and
+/// where inside the VM it lands.
+///
+/// The *source* is not part of the answer, deliberately. It is resolved by the
+/// agent against its own LIMA_HOME — either the enumerated route-helper
+/// filename already sitting there, or a scratch copy of the content the op
+/// carried.
+pub fn in_vm_transfer(op: &InVmOp) -> Option<InVmTransfer> {
+    use sandbox_invm_argv::lite_stage;
+
+    match op {
+        InVmOp::RouteHelperStage => Some(InVmTransfer {
+            source: InVmTransferSource::RouteHelperBinary,
+            destination: sandbox_invm_argv::route_helper::STAGED_PATH_IN_VM.to_string(),
+        }),
+        InVmOp::LiteStageWrite {
+            session_id,
+            file,
+            body,
+        } => {
+            let file: lite_stage::LiteStageFile = (*file).into();
+            Some(InVmTransfer {
+                destination: lite_stage::file_path(&lite_stage::stage_dir(session_id), file),
+                source: InVmTransferSource::Content {
+                    basename: lite_stage::transfer_basename(session_id, file),
+                    mode: file.mode(),
+                    body: body.clone(),
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+/// One file transfer into the VM.
+#[derive(Debug, Clone)]
+pub struct InVmTransfer {
+    /// Where the source comes from on the agent's side.
+    pub source: InVmTransferSource,
+    /// The absolute path inside the VM the file lands at.
+    pub destination: String,
+}
+
+/// Where the agent gets a transfer's source from.
+///
+/// Both arms resolve inside the agent's own LIMA_HOME. Neither carries a path
+/// the daemon chose.
+#[derive(Debug, Clone)]
+pub enum InVmTransferSource {
+    /// The pre-staged Linux/aarch64 route-helper binary, already present in
+    /// the agent's LIMA_HOME under its enumerated filename.
+    RouteHelperBinary,
+    /// Content the op carried, to be written to a scratch file in the agent's
+    /// LIMA_HOME at `mode` and copied from there. The mode matters: `limactl
+    /// copy` preserves the source's, and that is what the container sees.
+    Content {
+        basename: String,
+        mode: u32,
+        body: String,
+    },
+}
+
+/// The artifact an in-VM op writes to the child's standard input, if any.
+///
+/// Only the nftables baseline has one. Stdin on a `limactl shell` is a pipe
+/// into a VM with passwordless `sudo`; that its single reader is an `nft`
+/// parser is a property worth keeping true.
+pub fn in_vm_stdin_body(op: &InVmOp) -> Option<&str> {
+    match op {
+        InVmOp::ApplyNftBaseline { ruleset } => Some(ruleset),
+        _ => None,
+    }
 }
 
 pub fn docker_argv(op: &crate::protocol::DockerOp) -> Result<Vec<String>, String> {

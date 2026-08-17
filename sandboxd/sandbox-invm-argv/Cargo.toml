@@ -1,0 +1,13 @@
+[package]
+name = "sandbox-invm-argv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Intentionally empty, for the same reason `sandbox-docker-argv`'s is: this
+# crate is a leaf depended on by both `sandbox-core` and `sandbox-agent`, and
+# `sandbox-agent` deliberately carries no `sandbox-core` dependency. Adding a
+# dependency here widens the agent's trust base and needs the review a new
+# agent dependency would get.
+[dependencies]

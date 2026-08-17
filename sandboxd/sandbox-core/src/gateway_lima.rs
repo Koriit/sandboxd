@@ -84,9 +84,13 @@ use crate::error::SandboxError;
 #[cfg(target_os = "macos")]
 use crate::gateway::gateway_image_tag_for_daemon;
 #[cfg(target_os = "macos")]
+use crate::in_vm::{InVmOp, InVmRoute};
+#[cfg(target_os = "macos")]
 use crate::lima::{LimaExecutor, LimaOp};
 #[cfg(target_os = "macos")]
 use crate::process::run_with_timeout;
+#[cfg(target_os = "macos")]
+use sandbox_invm_argv::lite_stage::{LiteStageFile, stage_dir as lite_stage_dir};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -207,41 +211,14 @@ pub const GATEWAY_IMAGE_TARBALL_FILENAME: &str = "gateway-image.tar";
 #[cfg(target_os = "macos")]
 pub const LITE_IMAGE_TARBALL_FILENAME: &str = "lite-image.tar";
 
-/// Filename of the Linux aarch64 `sandbox-route-helper` binary staged in the
-/// daemon LIMA_HOME for copying into the gateway VM.
-///
-/// The operator populates this once via:
-///   make build-route-helper-linux-aarch64
-/// or by downloading from the release assets. The daemon copies it into the
-/// gateway VM and setcap's it during `ensure_ready`.
-#[cfg(target_os = "macos")]
-pub const ROUTE_HELPER_LINUX_BINARY_FILENAME: &str = "sandbox-route-helper-linux-aarch64";
-
-/// In-VM install path for `sandbox-route-helper` inside the gateway Lima VM.
-/// Mirrors the host FHS install path used on Linux.
-#[cfg(target_os = "macos")]
-pub const IN_VM_ROUTE_HELPER_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-route-helper";
-
-/// Timeout for `limactl copy` (binary staging into the gateway VM).
+/// Timeout for the route-helper provisioning steps (probe, `limactl copy` of
+/// the binary, install, setcap).
 #[cfg(target_os = "macos")]
 const ROUTE_HELPER_COPY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Timeout for staging a per-session lite container file into the gateway VM
-/// (`limactl shell mkdir` and per-file `limactl copy`).
+/// Timeout for staging a per-session lite container file into the gateway VM.
 #[cfg(target_os = "macos")]
 const LITE_FILE_STAGE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Parent of the per-session lite staging directories inside the gateway VM.
-///
-/// `/tmp` is `1777` (sticky, world-writable) so the operator's Lima SSH login
-/// can `mkdir` and `limactl copy` into it without sudo, while root-in-VM (the
-/// Docker daemon applying the bind) can still read it. The material staged here
-/// is non-secret: the per-session public CA cert, the operator's SSH public key
-/// (`authorized_keys`), and the synthetic `passwd`/`group` files. The sole
-/// secret — the mitmproxy CA private key — never lands here; it is written
-/// straight into the gateway container's tmpfs (see `macos_session`).
-#[cfg(target_os = "macos")]
-pub const LITE_STAGE_ROOT: &str = "/tmp/sandbox-lite";
 
 // ---------------------------------------------------------------------------
 // NIC map
@@ -934,47 +911,6 @@ fn apply_limactl_env(cmd: &mut Command, daemon_uid: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Lite-session staging path + argv builders (pure, testable)
-// ---------------------------------------------------------------------------
-
-/// VM staging directory for a session's lite-container provisioning files.
-///
-/// `{LITE_STAGE_ROOT}/<session_id>`. Pure string composition — no I/O.
-#[cfg(target_os = "macos")]
-pub fn lite_stage_dir(session_id: &str) -> String {
-    format!("{LITE_STAGE_ROOT}/{session_id}")
-}
-
-/// `limactl shell` argv that creates the per-session staging directory inside
-/// the gateway VM. Shape: `["shell", "<vm>", "--", "mkdir", "-p", "<dir>"]`,
-/// matching the prefix `run_gateway_shell_argv` expects.
-#[cfg(target_os = "macos")]
-pub fn lite_stage_mkdir_argv(vm_dir: &str) -> Vec<String> {
-    vec![
-        "shell".to_string(),
-        GATEWAY_INSTANCE_NAME.to_string(),
-        "--".to_string(),
-        "mkdir".to_string(),
-        "-p".to_string(),
-        vm_dir.to_string(),
-    ]
-}
-
-/// `limactl shell` argv that removes the per-session staging directory from the
-/// gateway VM. Shape: `["shell", "<vm>", "--", "rm", "-rf", "<dir>"]`.
-#[cfg(target_os = "macos")]
-pub fn lite_stage_rm_argv(vm_dir: &str) -> Vec<String> {
-    vec![
-        "shell".to_string(),
-        GATEWAY_INSTANCE_NAME.to_string(),
-        "--".to_string(),
-        "rm".to_string(),
-        "-rf".to_string(),
-        vm_dir.to_string(),
-    ]
-}
-
-// ---------------------------------------------------------------------------
 // GatewayLimaManager
 // ---------------------------------------------------------------------------
 
@@ -1006,6 +942,11 @@ pub struct GatewayLimaManager {
     /// Where this manager's `docker` operations against the gateway VM go.
     docker: DockerRoute,
 
+    /// Where this manager's operations *inside* the gateway VM go — the
+    /// `limactl shell` and `limactl copy` work, as typed ops rather than
+    /// command lines.
+    in_vm: InVmRoute,
+
     /// Verified slot→NIC map, populated after a successful `ensure_ready`.
     nic_map: Mutex<Option<NicMap>>,
 }
@@ -1031,6 +972,7 @@ impl GatewayLimaManager {
         daemon_lima_home: PathBuf,
         executor: Arc<dyn LimaExecutor>,
         docker: DockerRoute,
+        in_vm: InVmRoute,
         daemon_uid: u32,
     ) -> Self {
         let gateway_docker_socket = daemon_lima_home
@@ -1042,6 +984,7 @@ impl GatewayLimaManager {
             daemon_uid,
             executor,
             docker,
+            in_vm,
             nic_map: Mutex::new(None),
         }
     }
@@ -1572,21 +1515,21 @@ impl GatewayLimaManager {
         );
 
         // Phase 1: wait for Docker inside the VM to be running.
+        //
+        // The answer is the exit status. The shape this replaced discarded
+        // `docker info`'s output with a shell redirection and echoed a
+        // sentinel word instead, which said exactly what the status already
+        // did.
         loop {
-            let docker_check = self.run_gateway_shell(
-                "docker info >/dev/null 2>&1 && echo READY",
+            let docker_check = self.in_vm.run(
+                InVmOp::DockerReady,
                 Duration::from_secs(15),
+                InVmOp::DockerReady.label(),
             );
 
-            match docker_check {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if stdout.contains("READY") {
-                        info!("gateway Docker daemon running inside VM");
-                        break;
-                    }
-                }
-                _ => {}
+            if matches!(&docker_check, Ok(output) if output.status.success()) {
+                info!("gateway Docker daemon running inside VM");
+                break;
             }
 
             if Instant::now() >= deadline {
@@ -1633,9 +1576,11 @@ impl GatewayLimaManager {
     /// The map itself is built from `slots`; the guest output is only checked
     /// against it. See [`discover_nics_from_ip_json`].
     fn discover_nics(&self, slots: &[u16]) -> Result<NicMap, SandboxError> {
-        // Run `ip -json link show` inside the gateway VM.
-        // We use a shell command via limactl shell.
-        let output = self.run_gateway_shell("ip -json link show", GATEWAY_SHELL_TIMEOUT)?;
+        let output = self.in_vm.run(
+            InVmOp::LinkShowJson,
+            GATEWAY_SHELL_TIMEOUT,
+            InVmOp::LinkShowJson.label(),
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1693,51 +1638,31 @@ impl GatewayLimaManager {
     }
 
     /// Apply the baseline default-drop egress nft policy on the gateway VM's
-    /// `eth0` NIC via `nft -f -` with the ruleset on stdin.
-    fn apply_eth0_nft_policy(&self) -> Result<(), SandboxError> {
-        let ruleset = generate_gateway_eth0_nft_policy();
-        self.inject_nft_via_shell(&ruleset)
-    }
-
-    /// Inject an nft ruleset inside the gateway VM via `limactl shell … nft -f -`.
+    /// `eth0` NIC.
     ///
-    /// The ruleset is written to the child's stdin. The gateway VM's `nft`
-    /// binary must be present (it is part of `nftables`, installed by default
-    /// on Ubuntu 24.04).
-    fn inject_nft_via_shell(&self, ruleset: &str) -> Result<(), SandboxError> {
-        // We cannot pass stdin through `LimaExecutor::run` (which captures
-        // output via `run_with_timeout`). Instead, use the shell command to
-        // echo the ruleset and pipe into nft.
-        //
-        // The safest approach: write the ruleset to a tempfile in the gateway
-        // VM via `limactl shell -- bash -c 'cat > /tmp/sandboxd-nft.conf'`
-        // and then apply it with `nft -f /tmp/sandboxd-nft.conf`.
-        //
-        // This avoids shell quoting issues with the ruleset content on stdin.
+    /// # This is the egress-enforcement path
+    ///
+    /// The ruleset applied here is what makes the gateway VM's uplink refuse
+    /// anything the session policy did not allow. If it does not land, the
+    /// session still comes up, the containers still talk to the gateway, and
+    /// the uplink forwards whatever it is handed — a failure invisible from
+    /// inside the sandbox. So the error is returned, never logged and
+    /// swallowed, and `ensure_ready` fails with it.
+    ///
+    /// The ruleset reaches `nft` on standard input, unmodified from its
+    /// generator. See [`InVmOp::ApplyNftBaseline`] and
+    /// [`sandbox_invm_argv::vm::apply_nft_baseline_argv`] for what the two
+    /// earlier shapes — a `bash -c` heredoc, then a fixed path under the VM's
+    /// world-writable `/tmp` — each got wrong.
+    fn apply_eth0_nft_policy(&self) -> Result<(), SandboxError> {
+        let op = InVmOp::ApplyNftBaseline {
+            ruleset: generate_gateway_eth0_nft_policy(),
+        };
+        let label = op.label();
+        let output = self.in_vm.run(op, NFT_INJECT_TIMEOUT, label)?;
 
-        // Step 1: write the ruleset to a tempfile inside the VM.
-        let write_cmd = format!(
-            "cat > /tmp/sandboxd-gateway-eth0-nft.conf << 'SANDBOXD_NFT_EOF'\n{ruleset}\nSANDBOXD_NFT_EOF",
-        );
-        let write_output = self.run_gateway_shell(&write_cmd, GATEWAY_SHELL_TIMEOUT)?;
-        if !write_output.status.success() {
-            let stderr = String::from_utf8_lossy(&write_output.stderr);
-            return Err(SandboxError::Internal(format!(
-                "gateway nft: failed to write ruleset to tempfile in VM: {stderr}"
-            )));
-        }
-
-        // Step 2: apply the ruleset. `nft` requires CAP_NET_ADMIN (root inside
-        // the VM); the Lima SSH user connects as the operator (non-root), so we
-        // use `sudo nft`. Lima provisions the Ubuntu VM with passwordless sudo
-        // for all users, so this is safe in the gateway VM context.
-        let apply_output = self.run_gateway_shell(
-            "sudo nft -f /tmp/sandboxd-gateway-eth0-nft.conf",
-            NFT_INJECT_TIMEOUT,
-        )?;
-
-        if !apply_output.status.success() {
-            let stderr = String::from_utf8_lossy(&apply_output.stderr);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SandboxError::Gateway(format!(
                 "gateway nft: failed to apply eth0 baseline policy: {stderr}"
             )));
@@ -1753,23 +1678,6 @@ impl GatewayLimaManager {
     /// importing the module-level constant directly.
     pub const GATEWAY_INSTANCE_NAME: &'static str = GATEWAY_INSTANCE_NAME;
 
-    /// Run a shell command inside the gateway Lima VM via `limactl shell`.
-    ///
-    /// This is the degenerate direct path (daemon_uid == op_uid) — the daemon
-    /// runs `limactl` directly as `_sandboxd`, which already owns the gateway
-    /// instance's LIMA_HOME.
-    pub fn run_gateway_shell(
-        &self,
-        command: &str,
-        timeout: Duration,
-    ) -> Result<std::process::Output, SandboxError> {
-        let mut cmd = Command::new("limactl");
-        apply_limactl_env(&mut cmd, self.daemon_uid);
-        cmd.args(["shell", GATEWAY_INSTANCE_NAME, "--", "bash", "-c", command]);
-
-        run_with_timeout(&mut cmd, timeout, "gateway: limactl shell")
-    }
-
     /// Run an arbitrary argv inside the gateway Lima VM via `limactl shell`.
     ///
     /// The argv is expected to be in the form returned by
@@ -1777,9 +1685,19 @@ impl GatewayLimaManager {
     /// The first two elements (`shell` and the VM name) are extracted as
     /// positional args after `limactl`; the rest are passed verbatim.
     ///
-    /// This is used for the in-VM `sandbox-route-helper --vm-gateway-mode`
-    /// invocation, which cannot go through `run_gateway_shell` (string command)
-    /// because the helper's argv cannot be safely shell-escaped in general.
+    /// # The last direct `limactl shell` in this file, and why it is still here
+    ///
+    /// Every other in-VM operation now goes through the typed [`InVmRoute`]
+    /// seam, which is what lets them run against a VM the daemon does not own.
+    /// This one does not, because its only callers are the in-VM
+    /// `sandbox-route-helper --vm-gateway-mode` invocation — an operation with
+    /// its own authorization question (it rewrites a container's default
+    /// route) that is being typed separately, along with the sudoers grant it
+    /// leans on.
+    ///
+    /// Until that lands, this remains an ownership-blocked site: it builds
+    /// `limactl` directly and applies the *daemon's* LIMA_HOME, so it works
+    /// only while the gateway VM belongs to the daemon account.
     pub fn run_gateway_shell_argv(
         &self,
         argv: &[String],
@@ -1829,20 +1747,29 @@ impl GatewayLimaManager {
     /// the gateway VM can still serve Lima sessions without the route-helper.
     ///
     /// If the binary is already present in the VM and setcap'd correctly, this
-    /// method is a fast no-op (checked via a `test -x` probe).
+    /// method is a fast no-op — the probe checks the capabilities, not merely
+    /// the executable bit.
     ///
     /// # Security
     ///
     /// The copy targets `/usr/local/libexec/sandboxd/sandbox-route-helper` in
-    /// the VM. After copying, `sudo setcap 'cap_net_admin,cap_sys_admin,
+    /// the VM. After copying, `setcap 'cap_net_admin,cap_sys_admin,
     /// cap_sys_ptrace=eip'` is applied. The VM's sudo is passwordless for root
-    /// operations (Lima's provisioning model).
+    /// operations (Lima's provisioning model). Neither the source filename, the
+    /// destination path nor the capability set crosses the seam: all three are
+    /// constants of `sandbox-invm-argv`, so the op names the operation and
+    /// carries nothing.
     pub fn ensure_route_helper_in_vm(&self) -> Result<(), SandboxError> {
         use tracing::debug;
 
-        let host_binary = self
-            .daemon_lima_home
-            .join(ROUTE_HELPER_LINUX_BINARY_FILENAME);
+        // The presence check is deliberately made here rather than by the op:
+        // an absent binary is an operator-setup problem worth one clear
+        // warning at startup, not four failing ops. It reads the *daemon's*
+        // LIMA_HOME, which is the same tree the executor resolves the transfer
+        // source against while the gateway VM is the daemon's own. When the VM
+        // becomes the operator's, this check has to move to the side that owns
+        // the file — the op itself already names it rather than pathing to it.
+        let host_binary = crate::in_vm::route_helper_host_binary(&self.daemon_lima_home);
 
         if !host_binary.exists() {
             warn!(
@@ -1854,25 +1781,21 @@ impl GatewayLimaManager {
             return Ok(());
         }
 
-        // Probe: check that the binary is installed, executable, and has the expected
-        // capability set. Checking only `test -x` is insufficient — a binary that was
-        // copied but whose `setcap` step failed (or whose caps were stripped) passes
-        // the executable probe but then fails at route-install time with EPERM. The
-        // `getcap | grep` check catches that case and forces a reinstall.
-        let probe_result = self.run_gateway_shell(
-            &format!(
-                "test -x {IN_VM_ROUTE_HELPER_PATH} && \
-                 getcap {IN_VM_ROUTE_HELPER_PATH} | grep -q cap_net_admin && echo exists"
-            ),
-            ROUTE_HELPER_COPY_TIMEOUT,
-        );
-        let already_installed = match probe_result {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                output.status.success() && stdout.trim() == "exists"
-            }
-            Err(_) => false,
-        };
+        // Probe. Checking only that the file is executable is insufficient: a
+        // binary that was copied but whose `setcap` step failed (or whose caps
+        // were later stripped) passes an executable check and then fails at
+        // route-install time with EPERM. The op reports `getcap`'s output and
+        // the decision is made here — see
+        // `crate::in_vm::route_helper_probe_says_installed`.
+        let already_installed = self
+            .in_vm
+            .run(
+                InVmOp::RouteHelperProbe,
+                ROUTE_HELPER_COPY_TIMEOUT,
+                InVmOp::RouteHelperProbe.label(),
+            )
+            .map(|output| crate::in_vm::route_helper_probe_says_installed(&output))
+            .unwrap_or(false);
 
         if already_installed {
             debug!("gateway VM route-helper already installed with caps; skipping copy");
@@ -1881,78 +1804,28 @@ impl GatewayLimaManager {
 
         info!(
             src = %host_binary.display(),
-            dst = %format!("{}:{IN_VM_ROUTE_HELPER_PATH}", GATEWAY_INSTANCE_NAME),
             "installing sandbox-route-helper into gateway VM"
         );
 
-        // Create the target directory inside the VM.
-        let mkdir_output = self.run_gateway_shell(
-            "sudo mkdir -p /usr/local/libexec/sandboxd",
-            ROUTE_HELPER_COPY_TIMEOUT,
-        )?;
-        if !mkdir_output.status.success() {
-            let stderr = String::from_utf8_lossy(&mkdir_output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "ensure_route_helper_in_vm: failed to mkdir in gateway VM: {stderr}"
-            )));
-        }
-
-        // Copy the binary from the host into the gateway VM using `limactl copy`.
-        //
-        // `limactl copy` runs rsync-over-ssh as the unprivileged Lima SSH user
-        // (the operator), which cannot write into the root-owned
-        // /usr/local/libexec/sandboxd directory created above. So stage the
-        // binary at a writable temp path first, then `sudo install` it into the
-        // final root-owned location below.
-        const STAGED_ROUTE_HELPER_PATH: &str = "/tmp/sandbox-route-helper.staged";
-        let dst = format!("{GATEWAY_INSTANCE_NAME}:{STAGED_ROUTE_HELPER_PATH}");
-        let mut copy_cmd = Command::new("limactl");
-        apply_limactl_env(&mut copy_cmd, self.daemon_uid);
-        copy_cmd.args(["copy", host_binary.to_str().unwrap_or(""), &dst]);
-        let copy_output = run_with_timeout(
-            &mut copy_cmd,
-            ROUTE_HELPER_COPY_TIMEOUT,
-            "gateway: limactl copy",
-        )?;
-        if !copy_output.status.success() {
-            let stderr = String::from_utf8_lossy(&copy_output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "ensure_route_helper_in_vm: limactl copy failed: {stderr}"
-            )));
-        }
-
-        // Move the staged binary into the root-owned final location as root.
-        // `install -m 0755` places it atomically with the correct mode, then
-        // remove the staging copy. This is the privileged step the unprivileged
-        // `limactl copy` above cannot perform directly.
-        let install_output = self.run_gateway_shell(
-            &format!(
-                "sudo install -m 0755 {STAGED_ROUTE_HELPER_PATH} {IN_VM_ROUTE_HELPER_PATH} && \
-                 rm -f {STAGED_ROUTE_HELPER_PATH}"
-            ),
-            ROUTE_HELPER_COPY_TIMEOUT,
-        )?;
-        if !install_output.status.success() {
-            let stderr = String::from_utf8_lossy(&install_output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "ensure_route_helper_in_vm: install into {IN_VM_ROUTE_HELPER_PATH} failed: {stderr}"
-            )));
-        }
-
-        // Set execute bit and apply capabilities.
-        let setcap_output = self.run_gateway_shell(
-            &format!(
-                "sudo chmod +x {IN_VM_ROUTE_HELPER_PATH} && \
-                 sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip' \
-                 {IN_VM_ROUTE_HELPER_PATH}"
-            ),
-            ROUTE_HELPER_COPY_TIMEOUT,
-        )?;
-        if !setcap_output.status.success() {
-            let stderr = String::from_utf8_lossy(&setcap_output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "ensure_route_helper_in_vm: setcap failed: {stderr}"
-            )));
+        // Four steps, each its own op: create the root-owned install
+        // directory, copy the binary to a path the unprivileged Lima login
+        // user can write, move it into place as root, then give it its
+        // capabilities. The copy cannot land in the final location directly —
+        // `limactl copy` runs rsync-over-ssh as that unprivileged user.
+        for op in [
+            InVmOp::RouteHelperMakeInstallDir,
+            InVmOp::RouteHelperStage,
+            InVmOp::RouteHelperInstall,
+            InVmOp::RouteHelperSetcap,
+        ] {
+            let label = op.label();
+            let output = self.in_vm.run(op, ROUTE_HELPER_COPY_TIMEOUT, label)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(SandboxError::Lima(format!(
+                    "ensure_route_helper_in_vm: {label} failed: {stderr}"
+                )));
+            }
         }
 
         info!("sandbox-route-helper installed and setcap'd in gateway VM");
@@ -1970,14 +1843,20 @@ impl GatewayLimaManager {
     /// therefore have to be copied into the VM before `docker create` can bind
     /// them into the container at their canonical in-container paths.
     ///
-    /// The staging directory is `{LITE_STAGE_ROOT}/<session_id>/`. The four
-    /// files keep their canonical basenames so the existing bind builders
+    /// The staging directory is
+    /// `{sandbox_invm_argv::lite_stage::STAGE_ROOT_IN_VM}/<session_id>/`. The
+    /// four files keep their canonical basenames so the existing bind builders
     /// (`build_ca_mount_args` binds `<dir>/cert.pem`; `build_ssh_mount_args`
     /// joins `<dir>` with the three SSH filenames) can point at the returned
-    /// VM directory unchanged.
+    /// VM directory unchanged — which is why the basename is a property of the
+    /// [`LiteStageFile`] variant rather than a value on the op.
     ///
-    /// Idempotent: the `mkdir -p` and per-file `limactl copy` overwrite, so it
-    /// is safe to call on both the create and restart paths.
+    /// Each file is read here and travels as content. The host paths below are
+    /// therefore this function's inputs and go no further; nothing the seam
+    /// carries names a path on the daemon's filesystem.
+    ///
+    /// Idempotent: the `mkdir -p` and the per-file writes overwrite, so it is
+    /// safe to call on both the create and restart paths.
     ///
     /// Returns the VM staging directory path (e.g.
     /// `/tmp/sandbox-lite/<session_id>`). The caller sets the
@@ -1995,8 +1874,11 @@ impl GatewayLimaManager {
 
         // Create the per-session staging directory in the VM's sticky /tmp.
         // Runs as the operator's Lima SSH login — no sudo needed.
-        let mkdir_argv = lite_stage_mkdir_argv(&vm_dir);
-        let mkdir_output = self.run_gateway_shell_argv(&mkdir_argv)?;
+        let create = InVmOp::LiteStageCreate {
+            session_id: session_id.to_string(),
+        };
+        let label = create.label();
+        let mkdir_output = self.in_vm.run(create, LITE_FILE_STAGE_TIMEOUT, label)?;
         if !mkdir_output.status.success() {
             let stderr = String::from_utf8_lossy(&mkdir_output.stderr);
             return Err(SandboxError::Lima(format!(
@@ -2004,28 +1886,38 @@ impl GatewayLimaManager {
             )));
         }
 
-        // Copy each file into the staging directory under its canonical
-        // basename so the bind builders resolve the same paths the Linux
-        // host binds use.
-        for (host_src, basename) in [
-            (cert_pem_host, "cert.pem"),
-            (authorized_keys_host, "authorized_keys"),
-            (passwd_host, "passwd"),
-            (group_host, "group"),
+        // Each file travels as **content**, not as a path.
+        //
+        // These four are written into the daemon's own session directory at
+        // mode 0700, which the operator's agent cannot read at all once the
+        // gateway VM belongs to the operator. A source path on the op would
+        // therefore not merely be a weaker control than an enumerated
+        // filename — it would not work. Which of the four a body is decides
+        // the basename and the mode on the far side.
+        for (host_src, file) in [
+            (cert_pem_host, LiteStageFile::CertPem),
+            (authorized_keys_host, LiteStageFile::AuthorizedKeys),
+            (passwd_host, LiteStageFile::Passwd),
+            (group_host, LiteStageFile::Group),
         ] {
-            let dst = format!("{GATEWAY_INSTANCE_NAME}:{vm_dir}/{basename}");
-            let mut copy_cmd = Command::new("limactl");
-            apply_limactl_env(&mut copy_cmd, self.daemon_uid);
-            copy_cmd.args(["copy", host_src.to_str().unwrap_or(""), &dst]);
-            let copy_output = run_with_timeout(
-                &mut copy_cmd,
-                LITE_FILE_STAGE_TIMEOUT,
-                "gateway: limactl copy (lite session file)",
-            )?;
-            if !copy_output.status.success() {
-                let stderr = String::from_utf8_lossy(&copy_output.stderr);
+            let body = std::fs::read_to_string(host_src).map_err(|e| {
+                SandboxError::Internal(format!(
+                    "stage_lite_session_files: failed to read {}: {e}",
+                    host_src.display()
+                ))
+            })?;
+            let op = InVmOp::LiteStageWrite {
+                session_id: session_id.to_string(),
+                file,
+                body,
+            };
+            let label = op.label();
+            let output = self.in_vm.run(op, LITE_FILE_STAGE_TIMEOUT, label)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(SandboxError::Lima(format!(
-                    "stage_lite_session_files: limactl copy of {basename} into {vm_dir} failed: {stderr}"
+                    "stage_lite_session_files: staging {} into {vm_dir} failed: {stderr}",
+                    file.as_str()
                 )));
             }
         }
@@ -2046,8 +1938,11 @@ impl GatewayLimaManager {
     /// non-secret bytes; a failure here never blocks teardown.
     pub fn cleanup_lite_session_files(&self, session_id: &str) {
         let vm_dir = lite_stage_dir(session_id);
-        let argv = lite_stage_rm_argv(&vm_dir);
-        match self.run_gateway_shell_argv(&argv) {
+        let op = InVmOp::LiteStageRemove {
+            session_id: session_id.to_string(),
+        };
+        let label = op.label();
+        match self.in_vm.run(op, LITE_FILE_STAGE_TIMEOUT, label) {
             Ok(output) if output.status.success() => {
                 info!(
                     session_id = %session_id,
@@ -3803,59 +3698,52 @@ mod tests {
         );
     }
 
-    /// `lite_stage_mkdir_argv` produces the `limactl shell <vm> -- mkdir -p
-    /// <dir>` shape that `run_gateway_shell_argv` expects (prefix
-    /// `["shell", "<vm>", "--", ...]`).
+    /// The staging ops render the in-VM commands the gateway VM's `/tmp`
+    /// layout expects — and, still, no shell.
     #[cfg(target_os = "macos")]
     #[test]
-    fn lite_stage_mkdir_argv_shape() {
-        let argv = lite_stage_mkdir_argv("/tmp/sandbox-lite/0123456789ab");
+    fn lite_stage_ops_render_the_expected_in_vm_commands() {
+        let create = InVmOp::LiteStageCreate {
+            session_id: "0123456789ab".to_string(),
+        };
         assert_eq!(
-            argv,
-            vec![
-                "shell".to_string(),
-                GATEWAY_INSTANCE_NAME.to_string(),
-                "--".to_string(),
-                "mkdir".to_string(),
-                "-p".to_string(),
-                "/tmp/sandbox-lite/0123456789ab".to_string(),
-            ],
+            create.shell_steps().expect("a command"),
+            vec![vec!["mkdir", "-p", "/tmp/sandbox-lite/0123456789ab"]]
+        );
+
+        let remove = InVmOp::LiteStageRemove {
+            session_id: "0123456789ab".to_string(),
+        };
+        assert_eq!(
+            remove.shell_steps().expect("a command"),
+            vec![vec!["rm", "-rf", "/tmp/sandbox-lite/0123456789ab"]]
         );
     }
 
-    /// `lite_stage_rm_argv` produces the `limactl shell <vm> -- rm -rf <dir>`
-    /// shape used by the delete path's best-effort cleanup.
+    /// Each staged file lands under its canonical basename inside the staging
+    /// dir, so the bind builders (`build_ca_mount_args` reading
+    /// `<dir>/cert.pem`, `build_ssh_mount_args` joining `<dir>` with the three
+    /// SSH filenames) resolve unchanged now that the transfer is a typed op
+    /// carrying content rather than a `limactl copy` of a host path.
     #[cfg(target_os = "macos")]
     #[test]
-    fn lite_stage_rm_argv_shape() {
-        let argv = lite_stage_rm_argv("/tmp/sandbox-lite/0123456789ab");
-        assert_eq!(
-            argv,
-            vec![
-                "shell".to_string(),
-                GATEWAY_INSTANCE_NAME.to_string(),
-                "--".to_string(),
-                "rm".to_string(),
-                "-rf".to_string(),
-                "/tmp/sandbox-lite/0123456789ab".to_string(),
-            ],
-        );
-    }
-
-    /// The per-file `limactl copy` destination places each file under its
-    /// canonical basename inside the staging dir, so the bind builders
-    /// (`build_ca_mount_args` reading `<dir>/cert.pem`, `build_ssh_mount_args`
-    /// joining `<dir>` with the three SSH filenames) resolve unchanged.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lite_stage_copy_destinations() {
+    fn lite_stage_writes_land_where_the_bind_builders_look() {
         let vm_dir = lite_stage_dir("0123456789ab");
-        for basename in ["cert.pem", "authorized_keys", "passwd", "group"] {
-            let dst = format!("{GATEWAY_INSTANCE_NAME}:{vm_dir}/{basename}");
+        for file in LiteStageFile::ALL {
+            let op = InVmOp::LiteStageWrite {
+                session_id: "0123456789ab".to_string(),
+                file: *file,
+                body: "content".to_string(),
+            };
+            let Some(crate::in_vm::InVmTransfer::LiteStageFile { file, body, .. }) = op.transfer()
+            else {
+                panic!("expected a lite-stage transfer");
+            };
             assert_eq!(
-                dst,
-                format!("sandboxd-gateway:/tmp/sandbox-lite/0123456789ab/{basename}"),
+                sandbox_invm_argv::lite_stage::file_path(&vm_dir, file),
+                format!("/tmp/sandbox-lite/0123456789ab/{}", file.basename())
             );
+            assert_eq!(body, "content");
         }
     }
 }

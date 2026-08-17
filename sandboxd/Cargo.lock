@@ -1771,6 +1771,7 @@ dependencies = [
  "libc",
  "regex",
  "sandbox-docker-argv",
+ "sandbox-invm-argv",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1822,6 +1823,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "sandbox-docker-argv",
+ "sandbox-invm-argv",
  "schemars",
  "semver",
  "serde",
@@ -1863,6 +1865,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "sandbox-invm-argv"
+version = "0.1.10"
 
 [[package]]
 name = "sandbox-lima-helper"
@@ -1951,6 +1957,7 @@ dependencies = [
  "sandbox-agent",
  "sandbox-core",
  "sandbox-docker-argv",
+ "sandbox-invm-argv",
  "serde",
  "serde_json",
  "tempfile",

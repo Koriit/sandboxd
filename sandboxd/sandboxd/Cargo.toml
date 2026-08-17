@@ -82,6 +82,7 @@ sandbox-agent = { path = "../sandbox-agent" }
 # `sandbox-core`; the direct edge is what lets the broker's tests construct
 # op payloads and compare the daemon's rendering against the agent's.
 sandbox-docker-argv = { workspace = true }
+sandbox-invm-argv = { workspace = true }
 
 [features]
 # `test-env-override` — forwarded to `sandbox-core/test-env-override`.
