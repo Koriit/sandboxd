@@ -297,21 +297,45 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
 
 /// The Lima instance hosting the operator's gateway containers.
 ///
-/// An agent-side constant, not a field on the op. The daemon says *what* to
-/// do; which Docker daemon it happens to is the agent's own business, and
-/// keeping it that way is what makes `-H unix://<own socket>` the sole
-/// target authority.
+/// An agent-side constant, not a field on the op. See
+/// [`own_gateway_docker_socket`] for why that distinction is the whole
+/// point.
 const GATEWAY_VM_NAME: &str = "sandboxd-gateway";
 
 /// Filename of the gateway VM's forwarded Docker socket inside the instance
 /// directory. Mirrors the `hostSocket:` entry in the generated `lima.yaml`.
 const GATEWAY_DOCKER_SOCKET_FILENAME: &str = "gateway-docker.sock";
 
-/// The forwarded Docker socket for this agent's own gateway VM.
+/// The forwarded Docker socket for this agent's own gateway VM:
+/// `{lima_home}/sandboxd-gateway/gateway-docker.sock`.
 ///
-/// `{lima_home}/sandboxd-gateway/gateway-docker.sock` — inside the agent's
-/// own LIMA_HOME, which is what keeps the NON-FEATURES path rule true for
-/// the whole Docker op set.
+/// # Do not make this a parameter
+///
+/// It would be easy — and it would look harmless — to let the daemon send
+/// the socket path on the op, or to add an override so a test can point the
+/// agent somewhere else. Both destroy the property this function exists to
+/// hold.
+///
+/// The op set is closed so that a compromised daemon can only ask for
+/// operations someone reviewed. That bound is worth exactly as much as the
+/// guarantee about *where* those operations land. If the daemon names the
+/// endpoint, then "the agent only runs reviewed operations" becomes "the
+/// agent only runs reviewed operations, against whatever Docker daemon it
+/// was told to" — and a Docker daemon is a root shell on its host. The
+/// closed enum would still be closed and would no longer bound anything
+/// that matters.
+///
+/// Deriving the path here means the daemon *cannot* misdirect the agent,
+/// rather than merely *does not*: there is no field to get wrong, no call
+/// site that has to remember to pass the right value, and no env var an
+/// attacker who can write the agent's environment could set. It also keeps
+/// `protocol.rs`'s "no path outside the agent's own LIMA_HOME" rule true for
+/// the entire Docker op set by construction, since `ctx.lima_home` is the
+/// agent's own and the rest is two constants.
+///
+/// If a test needs a different endpoint, give the test its own agent with
+/// its own `RunContext.lima_home` — that is the seam, and it does not widen
+/// production behaviour by one byte.
 fn own_gateway_docker_socket(ctx: &RunContext) -> String {
     format!(
         "{}/{GATEWAY_VM_NAME}/{GATEWAY_DOCKER_SOCKET_FILENAME}",

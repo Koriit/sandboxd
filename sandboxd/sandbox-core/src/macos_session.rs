@@ -84,10 +84,20 @@ const DOCKER_RM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Build a `docker -H unix://<socket>` command targeting the gateway VM's
 /// forwarded Docker socket.
 ///
-/// Replicates the env-sanitization discipline from `gateway_lima.rs`
-/// (`apply_docker_env`): clears the inherited environment and reconstructs
-/// only the vars the docker CLI needs (`PATH`, `HOME`). This prevents
-/// `DOCKER_HOST` or other ambient overrides from redirecting the command.
+/// Clears the inherited environment and reconstructs only the vars the
+/// docker CLI needs (`PATH`, `HOME`), so `DOCKER_HOST` or another ambient
+/// override cannot redirect the command away from `-H`.
+///
+/// ⚠️ **One caller remains, deliberately.** Every container- and
+/// network-lifecycle operation in this module now goes through the typed
+/// Docker op seam; this helper survives for
+/// [`write_file_to_gateway_container`], which pipes a multi-KB file body
+/// into `docker exec … sh -c 'cat > path'`. That shape is part of the
+/// policy-plane family, which is being moved separately so it can be
+/// reviewed as an egress-enforcement change rather than as hunks inside a
+/// lifecycle refactor. Converting it here is not a tidy-up — it is the
+/// change that was separated out on purpose. Do not add a second caller;
+/// when that one moves, this helper goes with it.
 #[cfg(target_os = "macos")]
 fn gateway_docker_cmd(gateway_docker_socket: &Path) -> Command {
     let socket_str = format!("unix://{}", gateway_docker_socket.display());

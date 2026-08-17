@@ -449,6 +449,10 @@ pub enum RemoveForce {
 }
 
 /// The enumerated `docker inspect --format` templates.
+///
+/// Adding a variant here widens what a compromised daemon can read out of
+/// the operator's VM — see the warning on
+/// `sandbox_docker_argv::container::InspectFormat`, which this mirrors.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InspectFormat {
@@ -468,6 +472,11 @@ pub enum InspectFlag {
 }
 
 /// The enumerated commands the daemon may run inside a container.
+///
+/// Adding a variant here widens what a compromised daemon can execute
+/// inside the operator's container, and needs the matching validation arm
+/// in the same change — see the warning on
+/// `sandbox_docker_argv::container::ContainerCommand`, which this mirrors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ContainerCommand {
@@ -482,6 +491,10 @@ pub enum ContainerCommand {
 }
 
 /// The gateway container's five long-running components.
+///
+/// A new component means a new probe body running inside the operator's
+/// container — see the warning on
+/// `sandbox_docker_argv::container::GatewayComponent`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayComponent {

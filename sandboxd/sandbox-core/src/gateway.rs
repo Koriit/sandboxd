@@ -324,14 +324,35 @@ pub const NFT_POLICY_ALLOW_UDP_SET: &str = "policy_allow_udp";
 /// container is granted `CAP_NET_ADMIN` and includes the `nft` binary so it
 /// can manage its own nftables rules without requiring host-level privileges.
 ///
-/// ## Docker socket parameterization
+/// ## ⚠️ This type is half-migrated, deliberately — do not finish it
 ///
-/// On Linux, all `docker` invocations target the host Docker daemon (default
-/// socket, `docker_socket: None`). On macOS, the gateway containers run inside
-/// the `sandboxd-gateway` Lima VM; all `docker` commands — including
-/// `docker exec` for nft injection — must be directed to the forwarded socket
-/// via `-H unix://<path>`. Set `docker_socket: Some(path)` via
-/// [`Self::with_gateway_socket`] for macOS session managers.
+/// Its container-lifecycle and health-probe operations go through the typed
+/// Docker op seam ([`Self::docker`]). Its **policy-plane** operations — nft
+/// ruleset injection, the Envoy admin stats probe, and the free functions in
+/// `policy_distributor` and `dns_propagation` that take a `&GatewayManager`
+/// and mirror its transport — still build their own `docker` command from
+/// [`Self::docker_socket`].
+///
+/// That is not an unfinished refactor. The two halves were split by what
+/// breaks when they break: a lifecycle bug breaks a session, an
+/// egress-plane bug means traffic that should have been blocked was not.
+/// The second half is being moved separately so it can be reviewed as an
+/// egress-enforcement change on its own terms, rather than as a handful of
+/// diff hunks inside a lifecycle refactor where nobody would read them that
+/// way.
+///
+/// So if you are here because the file looks inconsistent: converting the
+/// remaining sites is not a tidy-up, it is the change that was deliberately
+/// separated out, and doing it here destroys the reviewability the split
+/// exists to create. When those sites move, [`Self::docker_socket`] goes
+/// with them and this note goes away.
+///
+/// ## Docker target selection
+///
+/// On Linux, all `docker` invocations target the host Docker daemon
+/// ([`DockerRoute::Host`], `docker_socket: None`). On macOS the gateway
+/// containers run inside the `sandboxd-gateway` Lima VM; use
+/// [`Self::with_vm_route`], which sets both halves consistently.
 pub struct GatewayManager {
     /// Where this manager's container-lifecycle and probe operations go.
     docker: DockerRoute,
@@ -339,12 +360,11 @@ pub struct GatewayManager {
     /// On macOS: `Some(path)` to the gateway Lima instance's forwarded
     /// Docker socket.
     ///
-    /// Retained for the policy-plane call sites that still build their own
-    /// `docker` command — nft injection here, and the free functions in
-    /// `policy_distributor` and `dns_propagation` that take a
-    /// `&GatewayManager` and mirror its transport. Those are a separate
-    /// family with their own review; when they move onto typed ops this
-    /// field goes with them.
+    /// Retained only for the policy-plane sites named in the type-level
+    /// note above. Nothing else in this file may use it — a
+    /// container-lifecycle call that reaches for this field instead of
+    /// [`Self::docker`] is re-introducing the direct-socket path the seam
+    /// was built to remove.
     docker_socket: Option<PathBuf>,
 }
 

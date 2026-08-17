@@ -303,6 +303,20 @@ pub fn container_remove_argv(name: &str, force: RemoveForce) -> Vec<String> {
 /// read any field of the container's configuration, including its
 /// environment and mounts. Enumerating the templates keeps the read
 /// surface reviewable.
+///
+/// # Adding a variant is a security change
+///
+/// Every variant here is a field of the container's configuration the
+/// daemon can read out of the operator's VM. Nobody is going to replace
+/// this enum with a format string in one obvious commit — the way it stops
+/// bounding anything is one more variant at a time, each individually
+/// reasonable, until the set covers enough of the config that a free string
+/// would have been equivalent.
+///
+/// So: before adding one, say what the *caller* needs, not what template
+/// answers it, and check whether an existing variant already does. A
+/// variant that exists only because it was convenient at one call site is
+/// the sixth one this warning is written for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectFormat {
     /// `{{.State.Status}}` — the lifecycle state word.
@@ -477,8 +491,30 @@ pub fn gateway_container_run_argv(
 /// This is the enum that stops `docker exec` from being an argv
 /// pass-through. Each variant names an operation, not a command line; the
 /// command line is built here and nowhere else. Variants that carry data
-/// carry exactly the values that vary — a path, a URL, a component name —
-/// never a program name and never a shell string.
+/// carry exactly the values that vary — a path, a component name — never a
+/// program name and never a shell string.
+///
+/// # Adding a variant is a security change
+///
+/// Each variant is code the daemon can cause to run inside a container the
+/// operator owns, so the set is the answer to "what can a compromised
+/// daemon execute in there?". That answer is only useful while it is short.
+/// The failure mode is not somebody adding an argv pass-through — it is a
+/// steady drip of individually reasonable variants until the set is
+/// effectively open and the agent's validation has nothing left to refuse.
+///
+/// Two rules for the variant after this one:
+///
+/// - **Name the operation, not the command.** `SshdListening`, not
+///   `RunSs { args }`. If the variant's name reads like a command line, it
+///   is a pass-through wearing an enum.
+/// - **Carry only what varies.** A path or an identifier is a field; a
+///   program name, a flag list or a shell fragment is not. Anything that
+///   would let the caller change *what runs* rather than *what it runs on*
+///   belongs in this crate as a constant, next to the probes, or nowhere.
+///
+/// And whatever it carries, add the matching agent-side validation in the
+/// same change — a field nobody checks is a field the caller controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContainerCommand {
     /// `ss -tlnH ( sport = :22 )` — is sshd listening yet?
@@ -498,6 +534,12 @@ pub enum ContainerCommand {
 /// container (`hostname -i`); that shell string is written here, not
 /// supplied by the daemon, which is what keeps it off the "shell built
 /// from caller input" list.
+///
+/// This enum is reached through [`ContainerCommand::ComponentProbe`], so
+/// the warning on that type applies here too: a new component means a new
+/// probe body, and a probe body is code running inside the operator's
+/// container. Two of the five already contain a shell; a third should have
+/// to justify itself the same way these two do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayComponent {
     Envoy,
