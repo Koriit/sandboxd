@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use crate::atomic_listener_writer::{
 use sandbox_docker_argv::container::{
     ContainerCommand, GatewayComponent, InspectFlag, InspectFormat, RemoveForce,
 };
+use sandbox_docker_argv::gateway::{GatewayFile, StdinCommand};
 
 use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
@@ -324,52 +325,26 @@ pub const NFT_POLICY_ALLOW_UDP_SET: &str = "policy_allow_udp";
 /// container is granted `CAP_NET_ADMIN` and includes the `nft` binary so it
 /// can manage its own nftables rules without requiring host-level privileges.
 ///
-/// ## ⚠️ This type is half-migrated, deliberately — do not finish it
-///
-/// Its container-lifecycle and health-probe operations go through the typed
-/// Docker op seam ([`Self::docker`]). Its **policy-plane** operations — nft
-/// ruleset injection, the Envoy admin stats probe, and the free functions in
-/// `policy_distributor` and `dns_propagation` that take a `&GatewayManager`
-/// and mirror its transport — still build their own `docker` command from
-/// [`Self::docker_socket`].
-///
-/// That is not an unfinished refactor. The two halves were split by what
-/// breaks when they break: a lifecycle bug breaks a session, an
-/// egress-plane bug means traffic that should have been blocked was not.
-/// The second half is being moved separately so it can be reviewed as an
-/// egress-enforcement change on its own terms, rather than as a handful of
-/// diff hunks inside a lifecycle refactor where nobody would read them that
-/// way.
-///
-/// So if you are here because the file looks inconsistent: converting the
-/// remaining sites is not a tidy-up, it is the change that was deliberately
-/// separated out, and doing it here destroys the reviewability the split
-/// exists to create. When those sites move, [`Self::docker_socket`] goes
-/// with them and this note goes away.
-///
 /// ## Docker target selection
 ///
-/// On Linux, all `docker` invocations target the host Docker daemon
-/// ([`DockerRoute::Host`], `docker_socket: None`). On macOS the gateway
-/// containers run inside the `sandboxd-gateway` Lima VM; use
-/// [`Self::with_vm_route`], which sets both halves consistently.
+/// Every `docker` operation this type performs — container lifecycle,
+/// component probes, nftables injection and the policy-file writes and
+/// reads the free functions in `policy_distributor` and `dns_propagation`
+/// make on its behalf — goes through one [`DockerRoute`]. On Linux that
+/// route is [`DockerRoute::Host`] and `docker` addresses the host daemon
+/// with no `-H`. On macOS the gateway containers run inside a Lima VM and
+/// the route names the operator whose VM hosts them; the socket is derived
+/// by whichever side runs the command, never named by the op.
+///
+/// The one exception is [`Self::create_gateway`], which builds a host-only
+/// `docker run` argv and refuses a VM route — see its own note.
 pub struct GatewayManager {
-    /// Where this manager's container-lifecycle and probe operations go.
+    /// Where every one of this manager's docker operations goes.
     docker: DockerRoute,
-    /// On Linux: `None` (host Docker socket).
-    /// On macOS: `Some(path)` to the gateway Lima instance's forwarded
-    /// Docker socket.
-    ///
-    /// Retained only for the policy-plane sites named in the type-level
-    /// note above. Nothing else in this file may use it — a
-    /// container-lifecycle call that reaches for this field instead of
-    /// [`Self::docker`] is re-introducing the direct-socket path the seam
-    /// was built to remove.
-    docker_socket: Option<PathBuf>,
 }
 
 impl GatewayManager {
-    /// Create a new `GatewayManager` targeting the host Docker socket.
+    /// Create a new `GatewayManager` targeting the host Docker daemon.
     ///
     /// This is the production constructor on Linux (and macOS host Docker,
     /// if applicable). All docker commands go to the default Docker socket —
@@ -377,53 +352,27 @@ impl GatewayManager {
     pub fn new() -> Self {
         Self {
             docker: DockerRoute::Host,
-            docker_socket: None,
         }
     }
 
-    /// Create a `GatewayManager` that routes all docker commands through the
-    /// specified forwarded socket path.
+    /// Create a `GatewayManager` whose operations all take `docker`.
     ///
-    /// On macOS, gateway containers run inside the `sandboxd-gateway` Lima VM.
-    /// Every docker command (including `docker exec` for nft injection) must be
-    /// directed to the forwarded socket via `-H unix://<path>`. This constructor
-    /// wires that socket into every docker call the manager makes.
-    ///
-    /// Linux builds can call this (the field is non-cfg), but production Linux
-    /// code always uses [`Self::new`] (no forwarding needed).
-    pub fn with_vm_route(docker: DockerRoute, socket: PathBuf) -> Self {
-        Self {
-            docker,
-            docker_socket: Some(socket),
-        }
+    /// On macOS the gateway containers run inside the `sandboxd-gateway`
+    /// Lima VM, so the route is a [`DockerRoute::Vm`] naming the operator
+    /// whose VM that is.
+    pub fn with_route(docker: DockerRoute) -> Self {
+        Self { docker }
     }
 
-    /// The forwarded gateway-VM Docker socket this manager routes through,
-    /// or `None` on Linux (host Docker socket, no `-H` flag).
+    /// The route every operation on this manager takes.
     ///
-    /// Exposed so the policy/DNS free functions (which receive a
-    /// `&GatewayManager` rather than carrying their own socket) can mirror
-    /// the manager's transport when they shell out to `docker` directly.
-    /// On Linux this is always `None`, so those free functions emit no
-    /// `-H` flag and behave byte-for-byte as before.
-    pub fn docker_socket(&self) -> Option<&Path> {
-        self.docker_socket.as_deref()
-    }
-
-    /// Build a `docker` [`Command`] with the optional `-H unix://<socket>`
-    /// prefix pre-applied.
-    ///
-    /// All `docker` invocations in this impl go through this helper so
-    /// that macOS (forwarded socket) and Linux (host socket) behave
-    /// identically — the only difference is the presence or absence of
-    /// the `-H` flag. Linux callers see zero overhead: `None` means no
-    /// argument is prepended.
-    fn docker_cmd(&self) -> Command {
-        let mut cmd = Command::new("docker");
-        if let Some(sock) = &self.docker_socket {
-            cmd.args(["-H", &format!("unix://{}", sock.display())]);
-        }
-        cmd
+    /// Exposed so the policy/DNS free functions — which receive a
+    /// `&GatewayManager` rather than carrying a route of their own — reach
+    /// the same Docker daemon the manager's own nft injection does. There
+    /// is exactly one transport, so "mirror the manager's transport" is now
+    /// "use the manager's route" rather than a second thing to keep in step.
+    pub fn route(&self) -> &DockerRoute {
+        &self.docker
     }
 
     /// Run one typed Docker op on this manager's route.
@@ -721,9 +670,13 @@ impl GatewayManager {
 
         args.push(gateway_image_tag_for_version(env!("CARGO_PKG_VERSION")));
 
+        // Host route only — the refusal above has already established that,
+        // and the host route names no target, so this is a bare `docker`
+        // with the ambient environment left alone (the environment rule on
+        // `DockerRoute`).
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = run_with_timeout(
-            self.docker_cmd().args(&args_refs),
+            Command::new("docker").args(&args_refs),
             DOCKER_RUN_TIMEOUT,
             "docker run (gateway)",
         )
@@ -759,13 +712,14 @@ impl GatewayManager {
         // The entrypoint script waits for this file to appear before
         // launching Envoy, so the write must happen before Envoy
         // readiness is awaited below.
+        //
+        // Only the bootstrap is seeded here. The listener arrives through
+        // the host directory bind-mounted over `/etc/envoy/listeners`, which
+        // exists on this route and not on the VM one.
         {
-            use crate::policy::BOOTSTRAP_FILE_IN_CONTAINER;
-            use crate::policy_distributor::write_file_to_container;
-            let bootstrap = PolicyCompiler::compile_envoy_bootstrap();
-            if let Err(e) =
-                write_file_to_container(&container_name, BOOTSTRAP_FILE_IN_CONTAINER, &bootstrap)
-            {
+            use crate::policy_distributor::{envoy_bootstrap_artifact, write_gateway_file};
+            let (file, bootstrap) = envoy_bootstrap_artifact();
+            if let Err(e) = write_gateway_file(&self.docker, &container_name, file, &bootstrap) {
                 // Fatal: without the bootstrap Envoy cannot start.
                 return Err(SandboxError::Gateway(format!(
                     "failed to write Envoy bootstrap to {container_name}: {e}"
@@ -785,10 +739,11 @@ impl GatewayManager {
         // or before CoreDNS calls LoadFile), we ensure the first policy
         // load sees the correct content — no reload-timer race.
         if let Some(policy_content) = initial_dns_policy {
-            use crate::policy_distributor::write_file_to_container;
-            match write_file_to_container(
+            use crate::policy_distributor::write_gateway_file;
+            match write_gateway_file(
+                &self.docker,
                 &container_name,
-                "/etc/coredns/policy.conf",
+                GatewayFile::CorednsPolicy,
                 policy_content,
             ) {
                 Ok(()) => {
@@ -1104,24 +1059,22 @@ impl GatewayManager {
     ///     can call this without re-implementing the docker-exec
     ///     plumbing.
     ///
-    /// Implementation: `docker exec <gw> curl -sf
-    /// 'http://127.0.0.1:9901/stats?filter=^listener_manager\\.total_listeners_active$&format=text'`
-    /// and parse the `name: value` text output. Same transport used by
-    /// `DockerExecLdsProbe` (cf. `lds_ack.rs`) — the `&` in the URL must
-    /// reach Envoy as a real query-string separator, so the URL is
-    /// passed verbatim as one argv element rather than built via shell.
+    /// Implementation: [`ContainerCommand::EnvoyActiveListenerCount`], whose
+    /// URL is a constant of the argv crate — the `&` in it must reach Envoy
+    /// as a real query-string separator, so it travels as one argv element
+    /// and never through a shell.
     pub fn gateway_listener_active_count(&self, session_id: &SessionId) -> Option<u64> {
         let container_name = container_name(session_id);
-        let url = "http://127.0.0.1:9901/stats?\
-                   filter=^listener_manager\\.total_listeners_active$&\
-                   format=text";
-        let output = run_with_timeout(
-            self.docker_cmd()
-                .args(["exec", &container_name, "curl", "-sf", url]),
-            DOCKER_INSPECT_TIMEOUT,
-            "docker exec (envoy listener_active probe)",
-        )
-        .ok()?;
+        let output = self
+            .run_op(
+                DockerOp::ContainerExec {
+                    name: container_name,
+                    command: ContainerCommand::EnvoyActiveListenerCount,
+                },
+                DOCKER_INSPECT_TIMEOUT,
+                "docker exec (envoy listener_active probe)",
+            )
+            .ok()?;
         if !output.status.success() {
             return None;
         }
@@ -1241,8 +1194,7 @@ impl GatewayManager {
     /// This is the first ruleset applied, before any components are ready.
     /// It drops all inbound and forwarded traffic while allowing outbound.
     pub fn inject_deny_all(&self, session_id: &SessionId) -> Result<(), SandboxError> {
-        let ruleset = generate_deny_all_ruleset();
-        self.inject_nftables_ruleset(session_id, &ruleset, "deny-all")
+        self.inject_nftables_ruleset(session_id, &generate_deny_all_ruleset(), "deny-all")
     }
 
     /// Inject the DNAT nftables rules into the gateway container's network
@@ -1259,18 +1211,10 @@ impl GatewayManager {
         network_info: &NetworkInfo,
         container_ip: &str,
     ) -> Result<(), SandboxError> {
-        let ruleset = generate_dnat_ruleset(&network_info.subnet, container_ip);
-        self.inject_nftables_ruleset(session_id, &ruleset, "DNAT")?;
-
-        // Also update the forward chain to allow forwarding from the VM subnet.
-        let forward_rules = generate_forward_allow_ruleset(&network_info.subnet, container_ip);
-        self.inject_nftables_ruleset(session_id, &forward_rules, "forward-allow")?;
-
-        // Open the input chain for service ports (DNS, Envoy) from the VM
-        // subnet.  Without this, DNATted traffic is rejected by the deny-all
-        // input chain.
-        let input_rules = generate_input_allow_ruleset(&network_info.subnet);
-        self.inject_nftables_ruleset(session_id, &input_rules, "input-allow")
+        for (label, ruleset) in dnat_rulesets(network_info, container_ip) {
+            self.inject_nftables_ruleset(session_id, &ruleset, label)?;
+        }
+        Ok(())
     }
 
     /// Inject nftables rules into the gateway container's network namespace.
@@ -1311,18 +1255,7 @@ impl GatewayManager {
     /// leak traffic through the orphaned chain on the way to container
     /// stop).
     pub fn remove_dnat_rules(&self, session_id: &SessionId) -> Result<(), SandboxError> {
-        // `table inet X {}` + `delete table inet X` is the idempotent
-        // delete idiom: `add table` (what `table inet X {}` is shorthand
-        // for) is a no-op when the table exists, and the subsequent
-        // `delete table` always succeeds. Without the add-first line,
-        // tearing down a session whose policy never landed (so
-        // `sandbox_policy` was never created) would fail with
-        // "No such file or directory".
-        let ruleset = "table inet sandbox_dnat {}\n\
-                       table inet sandbox_policy {}\n\
-                       delete table inet sandbox_dnat\n\
-                       delete table inet sandbox_policy\n";
-        self.inject_nftables_ruleset(session_id, ruleset, "remove-DNAT")
+        self.inject_nftables_ruleset(session_id, TEARDOWN_RULESET, "remove-DNAT")
     }
 
     // -- Internal helpers ------------------------------------------------------
@@ -1370,70 +1303,53 @@ impl GatewayManager {
         Ok(ip)
     }
 
-    /// Inject an nftables ruleset into the container via `docker exec`.
+    /// The op that applies `ruleset` inside the session's gateway container.
+    ///
+    /// Factored out of [`Self::inject_nftables_ruleset`] so the identity
+    /// between a generator's output and the bytes that reach `nft` can be
+    /// asserted without running Docker. A ruleset that drifts on the way to
+    /// the kernel is an unenforced policy, so the property is pinned by a
+    /// test rather than by reading the code.
+    pub(crate) fn nft_apply_op(session_id: &SessionId, ruleset: &str) -> DockerOp {
+        DockerOp::ContainerExecStdin {
+            name: container_name(session_id),
+            command: StdinCommand::ApplyNftRuleset,
+            body: ruleset.to_string(),
+        }
+    }
+
+    /// Inject an nftables ruleset into the container.
+    ///
+    /// The ruleset is fed to `nft -f -` on the child's standard input. It
+    /// never appears in an argv and no shell sees it: `nft` is the only
+    /// parser between the generator and the kernel.
     fn inject_nftables_ruleset(
         &self,
         session_id: &SessionId,
         ruleset: &str,
         label: &str,
     ) -> Result<(), SandboxError> {
-        let container = container_name(session_id);
-
         debug!(
             session_id = %session_id,
-            container = %container,
+            container = %container_name(session_id),
             label = label,
             "injecting nftables ruleset via docker exec"
         );
 
-        let mut child = self
-            .docker_cmd()
-            .args(["exec", "-i", &container, "nft", "-f", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                SandboxError::Gateway(format!("failed to spawn {label} nftables injection: {e}"))
+        let output = self
+            .run_op(
+                Self::nft_apply_op(session_id, ruleset),
+                NFT_EXEC_TIMEOUT,
+                &format!("nftables {label} injection"),
+            )
+            .map_err(|e| match e {
+                SandboxError::Timeout { duration, .. } => SandboxError::Gateway(format!(
+                    "nftables {label} injection timed out after {duration}s"
+                )),
+                other => {
+                    SandboxError::Gateway(format!("{label} nftables injection failed: {other}"))
+                }
             })?;
-
-        // Write the ruleset to stdin, then close it.
-        {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(ruleset.as_bytes());
-            }
-            child.stdin.take();
-        }
-
-        // Wait with timeout to avoid unbounded hangs.
-        let deadline = Instant::now() + NFT_EXEC_TIMEOUT;
-        let output = loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    break child.wait_with_output().map_err(|e| {
-                        SandboxError::Gateway(format!(
-                            "failed to collect output from {label} nftables injection: {e}"
-                        ))
-                    })?;
-                }
-                Ok(None) if Instant::now() >= deadline => {
-                    warn!(label = label, "nftables injection timed out, killing");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(SandboxError::Gateway(format!(
-                        "nftables {label} injection timed out after {}s",
-                        NFT_EXEC_TIMEOUT.as_secs()
-                    )));
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(e) => {
-                    return Err(SandboxError::Gateway(format!(
-                        "failed to poll {label} nftables injection: {e}"
-                    )));
-                }
-            }
-        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1575,6 +1491,63 @@ impl Default for GatewayManager {
 pub fn container_name(session_id: &SessionId) -> String {
     format!("sandbox-gw-{session_id}")
 }
+
+// ---------------------------------------------------------------------------
+// Ruleset selection
+// ---------------------------------------------------------------------------
+
+/// The rulesets [`GatewayManager::inject_dnat`] applies, paired with the
+/// label each is reported under, in the order they are applied.
+///
+/// The order is the contract: DNAT first, then the forward chain that lets
+/// the redirected traffic through, then the input chain that admits it at
+/// the gateway's own ports. Applied out of order, an intermediate state
+/// admits traffic the next step was supposed to constrain.
+///
+/// Named rather than inlined so a test can assert which generator each step
+/// of the create flow is paired with. The pairing is what §3.4's table maps,
+/// and it is invisible from outside once the ops are running.
+fn dnat_rulesets(network_info: &NetworkInfo, container_ip: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "DNAT",
+            generate_dnat_ruleset(&network_info.subnet, container_ip),
+        ),
+        // The forward chain has to allow forwarding from the VM subnet, or
+        // the DNATted traffic is dropped on its way through.
+        (
+            "forward-allow",
+            generate_forward_allow_ruleset(&network_info.subnet, container_ip),
+        ),
+        // The input chain has to admit the service ports (DNS, Envoy) from
+        // the VM subnet, or DNATted traffic is rejected by the deny-all
+        // input chain.
+        (
+            "input-allow",
+            generate_input_allow_ruleset(&network_info.subnet),
+        ),
+    ]
+}
+
+/// The ruleset that removes both policy tables.
+///
+/// `sandbox_dnat` and `sandbox_policy` are managed as a pair —
+/// `sandbox_dnat` holds the conditional-DNAT rules and set declarations,
+/// `sandbox_policy` the gateway-egress output-chain allows. They come down
+/// in a single `nft` input so the gateway never briefly runs with only half
+/// the pair present, which could leak traffic through the orphaned chain on
+/// the way to container stop.
+///
+/// `table inet X {}` + `delete table inet X` is the idempotent delete
+/// idiom: `add table` (what `table inet X {}` is shorthand for) is a no-op
+/// when the table exists, and the subsequent `delete table` always
+/// succeeds. Without the add-first line, tearing down a session whose
+/// policy never landed — so `sandbox_policy` was never created — would fail
+/// with "No such file or directory".
+const TEARDOWN_RULESET: &str = "table inet sandbox_dnat {}\n\
+                                table inet sandbox_policy {}\n\
+                                delete table inet sandbox_dnat\n\
+                                delete table inet sandbox_policy\n";
 
 // ---------------------------------------------------------------------------
 // Component probes
@@ -1868,6 +1841,105 @@ table inet sandbox {{
 mod tests {
     use super::*;
 
+    // -- Artifact identity ---------------------------------------------------
+    //
+    // Each nftables ruleset has exactly one generator, and the bytes the
+    // container's `nft` parses must be that generator's output. A drifted
+    // body is an unenforced policy — an escape, a truncation or a
+    // transformation between the two would produce a ruleset that parses
+    // and does not enforce what was compiled. These assert the identity
+    // rather than reading the code that establishes it.
+
+    /// The body of the op the injection runs is the ruleset handed to it,
+    /// byte for byte. This is the general property; the four below name the
+    /// generator each production call site pairs with.
+    #[test]
+    fn the_nft_op_carries_its_ruleset_verbatim() {
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
+        // Newlines, quotes, comments and non-ASCII: everything an escaping
+        // bug would mangle.
+        let ruleset = "table inet sandbox_dnat {\n  # \"a\" — ünïcode\n  chain c {}\n}\n";
+        let op = GatewayManager::nft_apply_op(&session_id, ruleset);
+        assert_eq!(op.stdin_body(), Some(ruleset));
+        let argv = op.argv().expect("the nft op renders");
+        assert_eq!(
+            argv,
+            vec!["exec", "-i", "sandbox-gw-550e8400e29b", "nft", "-f", "-"]
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("sandbox_dnat")),
+            "the ruleset must not appear in the argv: {argv:?}"
+        );
+    }
+
+    /// Step 12 of the create flow, and the two rulesets applied alongside
+    /// it: each is the output of the generator §3.4's table names for it,
+    /// in the order the enforcement pipeline needs them.
+    #[test]
+    fn the_dnat_step_is_paired_with_its_generators() {
+        let network_info = NetworkInfo {
+            bridge_name: "sb-550e8400e29b".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
+            docker_network_name: "sandbox-net-550e8400e29b".to_string(),
+            vmnet_slot: None,
+            operator_uid: None,
+        };
+        let container_ip = "10.209.0.2";
+        let rulesets = dnat_rulesets(&network_info, container_ip);
+        let labels: Vec<&str> = rulesets.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, vec!["DNAT", "forward-allow", "input-allow"]);
+        assert_eq!(
+            rulesets[0].1,
+            generate_dnat_ruleset(&network_info.subnet, container_ip)
+        );
+        assert_eq!(
+            rulesets[1].1,
+            generate_forward_allow_ruleset(&network_info.subnet, container_ip)
+        );
+        assert_eq!(
+            rulesets[2].1,
+            generate_input_allow_ruleset(&network_info.subnet)
+        );
+
+        // …and each reaches `nft` unchanged.
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
+        for (_, ruleset) in &rulesets {
+            let op = GatewayManager::nft_apply_op(&session_id, ruleset);
+            assert_eq!(op.stdin_body(), Some(ruleset.as_str()));
+        }
+    }
+
+    /// Step 10: the deny-all base ruleset reaches `nft` as its generator
+    /// wrote it. This is the fail-closed floor — a body that differed here
+    /// would be a floor nobody wrote.
+    #[test]
+    fn the_deny_all_step_is_paired_with_its_generator() {
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
+        let expected = generate_deny_all_ruleset();
+        let op = GatewayManager::nft_apply_op(&session_id, &expected);
+        assert_eq!(op.stdin_body(), Some(expected.as_str()));
+        // The floor's identifying content, so a generator rewritten into
+        // something that no longer denies fails here rather than silently.
+        assert!(expected.contains("policy drop"), "{expected}");
+    }
+
+    /// The teardown pair comes down in one `nft` input so the gateway never
+    /// runs with half of it present.
+    #[test]
+    fn the_teardown_deletes_both_tables_in_one_input() {
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
+        let op = GatewayManager::nft_apply_op(&session_id, TEARDOWN_RULESET);
+        let carried = op.stdin_body().expect("teardown carries a body");
+        assert_eq!(carried, TEARDOWN_RULESET);
+        assert!(carried.contains("delete table inet sandbox_dnat"));
+        assert!(carried.contains("delete table inet sandbox_policy"));
+        // The idempotent add-first idiom: without it, tearing down a
+        // session whose policy never landed fails on the missing table.
+        assert!(carried.contains("table inet sandbox_policy {}"));
+    }
+
     // -- Route awareness ----------------------------------------------------
 
     /// `create_gateway`'s argv names host paths as bind-mount sources, so a
@@ -1876,16 +1948,13 @@ mod tests {
     /// can see.
     #[test]
     fn create_gateway_refuses_a_vm_route() {
-        let manager = GatewayManager::with_vm_route(
-            DockerRoute::Vm {
-                op_uid: 501,
-                executor: std::sync::Arc::new(crate::docker::LocalSocketDockerExecutor::new(
-                    "/nonexistent/gateway-docker.sock",
-                    "/nonexistent",
-                )),
-            },
-            PathBuf::from("/nonexistent/gateway-docker.sock"),
-        );
+        let manager = GatewayManager::with_route(DockerRoute::Vm {
+            op_uid: 501,
+            executor: std::sync::Arc::new(crate::docker::LocalSocketDockerExecutor::new(
+                "/nonexistent/gateway-docker.sock",
+                "/nonexistent",
+            )),
+        });
         let session_id = SessionId::parse("550e8400e29b").unwrap();
         let network_info = NetworkInfo {
             bridge_name: "sb-550e8400e29b".to_string(),
@@ -1908,8 +1977,8 @@ mod tests {
     /// The host manager keeps the host route — the Linux shape, unchanged.
     #[test]
     fn the_default_manager_takes_the_host_route() {
-        assert!(!GatewayManager::new().docker.is_vm());
-        assert!(GatewayManager::new().docker_socket().is_none());
+        assert!(!GatewayManager::new().route().is_vm());
+        assert!(GatewayManager::new().route().op_uid().is_none());
     }
 
     // -- Naming tests -------------------------------------------------------

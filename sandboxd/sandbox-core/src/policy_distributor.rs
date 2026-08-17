@@ -1,75 +1,25 @@
-use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
+
+use sandbox_docker_argv::container::ContainerCommand;
+use sandbox_docker_argv::gateway::{FileDelivery, GatewayFile, NftTable, StdinCommand};
 
 use crate::atomic_listener_writer::{
     AtomicListenerWriter, session_listener_host_path, write_listener_into_container,
 };
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
-use crate::policy::{BOOTSTRAP_FILE_IN_CONTAINER, CompiledPolicy, PolicyCompiler};
+use crate::policy::{CompiledPolicy, PolicyCompiler};
 use crate::session::SessionId;
 
-/// Build a `docker` [`Command`] with the optional forwarded-socket
-/// `-H unix://<sock>` prefix pre-applied.
+/// Wall-clock budget for a single policy-file write or read.
 ///
-/// The policy/DNS free functions receive the gateway's optional socket
-/// (read from the passed-in `GatewayManager` via
-/// [`GatewayManager::docker_socket`]) and shell out through this helper so
-/// their transport mirrors the manager's nft injection. On Linux the socket
-/// is always `None`, so no `-H` flag is prepended and behaviour is
-/// byte-for-byte identical to the prior bare `Command::new("docker")`.
-fn docker_with_socket(socket: Option<&Path>) -> Command {
-    let mut cmd = Command::new("docker");
-    if let Some(sock) = socket {
-        cmd.args(["-H", &format!("unix://{}", sock.display())]);
-    }
-    cmd
-}
-
-/// Build the `docker exec` argv that writes `content` (piped on stdin) to
-/// `path` inside `container`.
-///
-/// Mirrors [`gate_listener_exec_argv`](crate::dns_gate_bridge::gate_listener_exec_argv):
-/// the spawn function is `docker_with_socket(socket).args(build…)` so the
-/// argv shape is unit-testable without invoking Docker. The container path is
-/// single-quoted in the `sh -c 'cat > …'` so that a path containing shell
-/// metacharacters cannot break out of the redirection target.
-fn write_file_exec_argv(container: &str, path: &str) -> [String; 6] {
-    [
-        "exec".to_string(),
-        "-i".to_string(),
-        container.to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        format!("cat > '{path}'"),
-    ]
-}
-
-/// Build the `docker exec` argv that reads `path` from inside `container`.
-fn read_file_exec_argv(container: &str, path: &str) -> [String; 4] {
-    [
-        "exec".to_string(),
-        container.to_string(),
-        "cat".to_string(),
-        path.to_string(),
-    ]
-}
-
-/// Build the `docker exec` argv that lists the inet `table` from inside
-/// `container` via `nft list table`.
-fn list_nft_table_exec_argv(container: &str, table: &str) -> [String; 7] {
-    [
-        "exec".to_string(),
-        container.to_string(),
-        "nft".to_string(),
-        "list".to_string(),
-        "table".to_string(),
-        "inet".to_string(),
-        table.to_string(),
-    ]
-}
+/// The artifacts are a few KB and the transport is a local socket; a write
+/// that has not completed in this long is wedged rather than slow, and the
+/// distribution's rollback wants to start rather than wait.
+const POLICY_FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Distribution step tracking (for rollback)
@@ -129,11 +79,12 @@ impl PolicyDistributor {
         let container = gateway::container_name(session_id);
         let mut state = DistributionState::default();
 
-        // Transport: on Linux this is `None` (host Docker socket, no `-H`);
-        // on macOS it is the gateway Lima VM's forwarded socket so the
-        // `docker exec` file writes reach the in-VM gateway container. The
-        // nft injection already routes through `gateway` (socket-aware).
-        let socket = gateway.docker_socket();
+        // Transport: the manager's route. On Linux it addresses the host
+        // Docker daemon; on macOS it reaches the Docker daemon inside the
+        // gateway VM. The nft injection takes the same route, so the two
+        // halves of a distribution cannot end up talking to different
+        // daemons.
+        let route = gateway.route();
 
         info!(
             session_id = %session_id,
@@ -142,13 +93,13 @@ impl PolicyDistributor {
         );
 
         // Read previous configs for rollback (best-effort).
-        let previous = PreviousConfigs::read(session_id, socket);
+        let previous = PreviousConfigs::read(session_id, route);
 
         // Step 1: Write CoreDNS policy file.
-        if let Err(e) = write_file_to_container_on_socket(
-            socket,
+        if let Err(e) = write_gateway_file(
+            route,
             &container,
-            "/etc/coredns/policy.conf",
+            GatewayFile::CorednsPolicy,
             &compiled.coredns_config,
         ) {
             error!(
@@ -162,10 +113,10 @@ impl PolicyDistributor {
         debug!(session_id = %session_id, "CoreDNS policy written");
 
         // Step 2: Write mitmproxy policy JSON.
-        if let Err(e) = write_file_to_container_on_socket(
-            socket,
+        if let Err(e) = write_gateway_file(
+            route,
             &container,
-            "/tmp/mitmproxy/policy.json",
+            GatewayFile::MitmproxyPolicy,
             &compiled.mitmproxy_config,
         ) {
             error!(
@@ -220,10 +171,10 @@ impl PolicyDistributor {
         // rewritten on every distribution. The write is cheap (a few KB
         // via `docker exec ... > file`) and keeps rollback handling
         // uniform across all four components.
-        if let Err(e) = write_file_to_container_on_socket(
-            socket,
+        if let Err(e) = write_gateway_file(
+            route,
             &container,
-            BOOTSTRAP_FILE_IN_CONTAINER,
+            GatewayFile::EnvoyBootstrap,
             &compiled.envoy_bootstrap_config,
         ) {
             error!(
@@ -252,10 +203,10 @@ impl PolicyDistributor {
         //     in-container `mv` emits the same `IN_MOVED_TO` event.
         // Both paths enforce the "only filter_chains differ" invariant so
         // Envoy reloads via LDS without draining the listener.
-        let listener_write = if let Some(sock) = socket {
+        let listener_write = if route.is_vm() {
             write_listener_into_container(
                 session_id,
-                sock,
+                route,
                 &container,
                 &compiled.envoy_listener_config,
             )
@@ -300,7 +251,7 @@ impl PolicyDistributor {
         previous: &PreviousConfigs,
     ) {
         let container = gateway::container_name(session_id);
-        let socket = gateway.docker_socket();
+        let route = gateway.route();
 
         warn!(
             session_id = %session_id,
@@ -318,8 +269,8 @@ impl PolicyDistributor {
                 .envoy_listener
                 .clone()
                 .unwrap_or_else(PolicyCompiler::compile_initial_envoy_listener);
-            let restore_result = if let Some(sock) = socket {
-                write_listener_into_container(session_id, sock, &container, &restore_content)
+            let restore_result = if route.is_vm() {
+                write_listener_into_container(session_id, route, &container, &restore_content)
             } else {
                 let listener_path = session_listener_host_path(session_id);
                 AtomicListenerWriter::new(&listener_path)
@@ -338,12 +289,7 @@ impl PolicyDistributor {
 
         if state.envoy_bootstrap_written {
             if let Some(ref config) = previous.envoy_bootstrap {
-                let _ = write_file_to_container_on_socket(
-                    socket,
-                    &container,
-                    BOOTSTRAP_FILE_IN_CONTAINER,
-                    config,
-                );
+                let _ = write_gateway_file(route, &container, GatewayFile::EnvoyBootstrap, config);
             }
         }
 
@@ -387,23 +333,13 @@ impl PolicyDistributor {
 
         if state.mitmproxy_written {
             if let Some(ref config) = previous.mitmproxy {
-                let _ = write_file_to_container_on_socket(
-                    socket,
-                    &container,
-                    "/tmp/mitmproxy/policy.json",
-                    config,
-                );
+                let _ = write_gateway_file(route, &container, GatewayFile::MitmproxyPolicy, config);
             }
         }
 
         if state.coredns_written {
             if let Some(ref config) = previous.coredns {
-                let _ = write_file_to_container_on_socket(
-                    socket,
-                    &container,
-                    "/etc/coredns/policy.conf",
-                    config,
-                );
+                let _ = write_gateway_file(route, &container, GatewayFile::CorednsPolicy, config);
             }
         }
 
@@ -432,20 +368,15 @@ impl PreviousConfigs {
     /// Best-effort read of current configs from the container (and the
     /// host-side listener file on Linux / the in-process cache on macOS).
     ///
-    /// `socket` is the gateway's optional forwarded Docker socket: `None`
-    /// on Linux (host socket, no `-H`), `Some` on macOS (in-VM gateway
-    /// socket).
-    fn read(session_id: &SessionId, socket: Option<&Path>) -> Self {
+    /// `route` is the gateway manager's own route, so the snapshot is taken
+    /// from the same Docker daemon the forward writes go to.
+    fn read(session_id: &SessionId, route: &DockerRoute) -> Self {
         let container = gateway::container_name(session_id);
 
-        let coredns =
-            read_file_from_container_on_socket(socket, &container, "/etc/coredns/policy.conf").ok();
-        let mitmproxy =
-            read_file_from_container_on_socket(socket, &container, "/tmp/mitmproxy/policy.json")
-                .ok();
+        let coredns = read_gateway_file(route, &container, GatewayFile::CorednsPolicy).ok();
+        let mitmproxy = read_gateway_file(route, &container, GatewayFile::MitmproxyPolicy).ok();
         let envoy_bootstrap =
-            read_file_from_container_on_socket(socket, &container, BOOTSTRAP_FILE_IN_CONTAINER)
-                .ok();
+            read_gateway_file(route, &container, GatewayFile::EnvoyBootstrap).ok();
 
         // Snapshot the prior listener generation for rollback.
         //   - Linux: read the host-side bind-mounted file directly so
@@ -455,7 +386,7 @@ impl PreviousConfigs {
         //     delivered. Leaving this `None` is safe — a `None` prior on
         //     rollback just restores the deny-all initial listener, which
         //     is fail-closed.
-        let envoy_listener = if socket.is_some() {
+        let envoy_listener = if route.is_vm() {
             crate::atomic_listener_writer::cached_listener_pub(session_id)
         } else {
             let listener_path = session_listener_host_path(session_id);
@@ -463,7 +394,7 @@ impl PreviousConfigs {
         };
 
         // Reading current nftables state from the namespace.
-        let nftables = read_nftables_state_on_socket(session_id, socket).ok();
+        let nftables = read_nftables_state(session_id, route).ok();
 
         Self {
             coredns,
@@ -479,90 +410,134 @@ impl PreviousConfigs {
 // Container file I/O helpers
 // ---------------------------------------------------------------------------
 
-/// Write content to a file inside a Docker container (host Docker socket).
-///
-/// Thin wrapper over [`write_file_to_container_on_socket`] with no
-/// forwarded socket — the Linux behaviour, byte-for-byte unchanged
-/// (`docker exec sh -c 'cat > path'`, no `-H` flag). Retained as the
-/// public Linux entry point and for callers (e.g. `reapply_session_policy`'s
-/// empty-policy path) that target the host socket.
-pub fn write_file_to_container(
-    container: &str,
-    path: &str,
-    content: &str,
-) -> Result<(), SandboxError> {
-    write_file_to_container_on_socket(None, container, path, content)
+// ---------------------------------------------------------------------------
+// Seed artifacts
+// ---------------------------------------------------------------------------
+//
+// Two of the artifacts a gateway container is seeded with are generated
+// rather than supplied: the Envoy bootstrap and the deny-all initial
+// listener. The container's entrypoint blocks on both before it starts
+// Envoy, so what is written here decides whether the enforcement pipeline
+// comes up at all — and *what* is written has to be the compiler's output,
+// not a copy of it.
+//
+// Each pairing lives in one function so the artifact and its generator
+// cannot be separated at a call site, and so a test can assert the pairing
+// rather than re-deriving it.
+
+/// The Envoy static bootstrap and the compiler that produces it.
+pub fn envoy_bootstrap_artifact() -> (GatewayFile, String) {
+    (
+        GatewayFile::EnvoyBootstrap,
+        PolicyCompiler::compile_envoy_bootstrap(),
+    )
 }
 
-/// Write content to a file inside a Docker container, optionally routing
-/// through a forwarded gateway-VM Docker socket.
+/// The deny-all initial Envoy listener and the compiler that produces it.
 ///
-/// `socket = None` is the Linux path (host Docker socket, no `-H` flag);
-/// `socket = Some(path)` is the macOS path (in-VM gateway socket via
-/// `-H unix://<path>`). Uses `docker exec sh -c 'cat > path'` with the
-/// content piped to stdin.
-pub fn write_file_to_container_on_socket(
-    socket: Option<&Path>,
+/// Deny-all is the point: it unblocks the entrypoint without admitting
+/// anything, so the window between the container starting and the first
+/// policy landing is closed rather than open.
+pub fn envoy_initial_listener_artifact() -> (GatewayFile, String) {
+    (
+        GatewayFile::EnvoyListener,
+        PolicyCompiler::compile_initial_envoy_listener(),
+    )
+}
+
+/// Both Envoy artifacts, in the order the entrypoint needs them.
+///
+/// Used where the listener has to be delivered into the container as well
+/// as the bootstrap — that is, wherever there is no host directory
+/// bind-mounted over `/etc/envoy/listeners`.
+pub fn envoy_seed_artifacts() -> Vec<(GatewayFile, String)> {
+    vec![
+        envoy_bootstrap_artifact(),
+        envoy_initial_listener_artifact(),
+    ]
+}
+
+/// The op that delivers `content` as `file` inside `container`.
+///
+/// Factored out so the identity between a generator's output and the bytes
+/// the container receives can be asserted without running Docker: the op is
+/// what carries the artifact, so the op is what a test has to inspect.
+pub fn write_gateway_file_op(container: &str, file: GatewayFile, content: &str) -> DockerOp {
+    DockerOp::ContainerExecStdin {
+        name: container.to_string(),
+        command: StdinCommand::WriteGatewayFile {
+            file,
+            delivery: FileDelivery::Replace,
+        },
+        body: content.to_string(),
+    }
+}
+
+/// Write one of the enumerated gateway artifacts into `container`.
+///
+/// The content is piped to `cat` on the child's standard input; the
+/// destination path is a constant of the argv crate selected by `file`.
+/// Nothing the caller supplies reaches the shell — see the module note on
+/// [`sandbox_docker_argv::gateway`].
+pub fn write_gateway_file(
+    route: &DockerRoute,
     container: &str,
-    path: &str,
+    file: GatewayFile,
     content: &str,
 ) -> Result<(), SandboxError> {
-    use std::io::Write;
-
-    let mut child = docker_with_socket(socket)
-        .args(write_file_exec_argv(container, path))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    let label = format!("docker exec (write {})", file.as_str());
+    let output = route
+        .run(
+            write_gateway_file_op(container, file, content),
+            POLICY_FILE_TIMEOUT,
+            &label,
+        )
         .map_err(|e| {
-            SandboxError::Gateway(format!("failed to write {path} to {container}: {e}"))
-        })?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(content.as_bytes()).map_err(|e| {
             SandboxError::Gateway(format!(
-                "failed to pipe content to {path} in {container}: {e}"
+                "failed to write {} to {container}: {e}",
+                file.path()
             ))
         })?;
-    }
-    // Drop stdin to signal EOF.
-    child.stdin.take();
-
-    let output = child.wait_with_output().map_err(|e| {
-        SandboxError::Gateway(format!(
-            "failed to complete write of {path} to {container}: {e}"
-        ))
-    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SandboxError::Gateway(format!(
-            "write to {path} in {container} failed: {stderr}"
+            "write to {} in {container} failed: {stderr}",
+            file.path()
         )));
     }
 
     Ok(())
 }
 
-/// Read a file from inside a Docker container, optionally over a
-/// forwarded gateway-VM Docker socket (`None` on Linux → no `-H` flag).
-fn read_file_from_container_on_socket(
-    socket: Option<&Path>,
+/// Read one of the enumerated gateway artifacts back out of `container`.
+pub fn read_gateway_file(
+    route: &DockerRoute,
     container: &str,
-    path: &str,
+    file: GatewayFile,
 ) -> Result<String, SandboxError> {
-    let output = docker_with_socket(socket)
-        .args(read_file_exec_argv(container, path))
-        .output()
+    let label = format!("docker exec (read {})", file.as_str());
+    let output = route
+        .run(
+            DockerOp::ContainerExec {
+                name: container.to_string(),
+                command: ContainerCommand::ReadGatewayFile { file },
+            },
+            POLICY_FILE_TIMEOUT,
+            &label,
+        )
         .map_err(|e| {
-            SandboxError::Gateway(format!("failed to read {path} from {container}: {e}"))
+            SandboxError::Gateway(format!(
+                "failed to read {} from {container}: {e}",
+                file.path()
+            ))
         })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SandboxError::Gateway(format!(
-            "cat {path} in {container} failed: {stderr}"
+            "cat {} in {container} failed: {stderr}",
+            file.path()
         )));
     }
 
@@ -582,19 +557,28 @@ fn read_file_from_container_on_socket(
 /// covers both. Each table is listed separately; either may be absent
 /// (e.g. when no policy has ever been applied) — the listing for a
 /// missing table is silently omitted.
-fn read_nftables_state_on_socket(
+fn read_nftables_state(
     session_id: &SessionId,
-    socket: Option<&Path>,
+    route: &DockerRoute,
 ) -> Result<String, SandboxError> {
     let container = gateway::container_name(session_id);
     let mut combined = String::new();
 
-    for table in ["sandbox_dnat", "sandbox_policy"] {
-        let output = docker_with_socket(socket)
-            .args(list_nft_table_exec_argv(&container, table))
-            .output()
+    for table in NftTable::ALL {
+        let output = route
+            .run(
+                DockerOp::ContainerExec {
+                    name: container.clone(),
+                    command: ContainerCommand::ListNftTable { table: *table },
+                },
+                POLICY_FILE_TIMEOUT,
+                "docker exec (nft list table)",
+            )
             .map_err(|e| {
-                SandboxError::Gateway(format!("failed to list nftables table {table}: {e}"))
+                SandboxError::Gateway(format!(
+                    "failed to list nftables table {}: {e}",
+                    table.name()
+                ))
             })?;
 
         if output.status.success() {
@@ -612,159 +596,156 @@ fn read_nftables_state_on_socket(
 mod tests {
     use super::*;
 
-    /// Collect a built `Command`'s argv as borrowed `&str`s for assertions.
-    fn args_of(cmd: &Command) -> Vec<&str> {
-        cmd.get_args().map(|a| a.to_str().unwrap()).collect()
-    }
+    // -- The op the write travels in -----------------------------------------
 
-    // -- docker_with_socket: the -H prefix algebra ---------------------------
-
-    /// Linux transport (`socket = None`): the command is a bare `docker` with
-    /// no `-H` flag — the byte-for-byte-unchanged Linux invariant. A
-    /// regression that prepended `-H` on Linux would point every gateway
-    /// `docker exec` at a nonexistent forwarded socket.
+    /// The artifact reaches the container on stdin and the destination path
+    /// comes from the enum. Together those are why no daemon-supplied string
+    /// is in the shell body: the only caller-supplied values in the op are
+    /// the container name (an argv element) and the content (a byte stream).
     #[test]
-    fn docker_with_socket_none_emits_no_h_flag() {
-        let cmd = docker_with_socket(None);
-        assert_eq!(cmd.get_program().to_str().unwrap(), "docker");
-        let args = args_of(&cmd);
-        assert!(
-            !args.contains(&"-H"),
-            "Linux transport must never prepend -H: {args:?}"
+    fn a_policy_write_carries_its_content_on_stdin_and_its_path_in_the_enum() {
+        let op = write_gateway_file_op(
+            "sandbox-gw-abc123",
+            GatewayFile::CorednsPolicy,
+            "policy body\n",
         );
-        assert!(
-            args.is_empty(),
-            "None socket adds no leading args: {args:?}"
-        );
-    }
-
-    /// macOS transport (`socket = Some`): exactly `-H unix://<path>` is
-    /// prepended, in that order, before any subcommand the caller appends.
-    /// Docker requires the `-H` daemon flag to precede the subcommand, so the
-    /// ordering here is load-bearing, not cosmetic.
-    #[test]
-    fn docker_with_socket_some_prepends_h_unix_prefix() {
-        let sock = Path::new("/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock");
-        let cmd = docker_with_socket(Some(sock));
-        assert_eq!(cmd.get_program().to_str().unwrap(), "docker");
-        let args = args_of(&cmd);
+        assert_eq!(op.stdin_body(), Some("policy body\n"));
+        let argv = op.argv().expect("write op renders");
         assert_eq!(
-            args,
+            argv,
             vec![
-                "-H",
-                "unix:///var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock"
-            ],
-            "macOS transport must prepend exactly `-H unix://<path>`"
-        );
-    }
-
-    /// The `-H` prefix sits *before* any args the spawn site appends, so the
-    /// final argv parses as `docker -H unix://… exec …`, not
-    /// `docker exec -H …` (which Docker rejects).
-    #[test]
-    fn docker_with_socket_prefix_precedes_appended_subcommand() {
-        let sock = Path::new("/tmp/gw.sock");
-        let mut cmd = docker_with_socket(Some(sock));
-        cmd.args(["exec", "ctr", "true"]);
-        let args = args_of(&cmd);
-        assert_eq!(
-            args,
-            vec!["-H", "unix:///tmp/gw.sock", "exec", "ctr", "true"],
-            "the -H prefix must lead the subcommand: {args:?}"
-        );
-    }
-
-    // -- exec argv builders --------------------------------------------------
-
-    /// The file-write argv pipes `content` (on stdin) to `path` via
-    /// `sh -c 'cat > '\''path'\'''`. The container path is single-quoted so a
-    /// path containing shell metacharacters cannot break the redirection.
-    #[test]
-    fn write_file_exec_argv_single_quotes_the_target_path() {
-        let argv = write_file_exec_argv("sandbox-gw-abc123", "/etc/coredns/policy.conf");
-        assert_eq!(
-            argv,
-            [
-                "exec".to_string(),
-                "-i".to_string(),
-                "sandbox-gw-abc123".to_string(),
-                "sh".to_string(),
-                "-c".to_string(),
-                "cat > '/etc/coredns/policy.conf'".to_string(),
+                "exec",
+                "-i",
+                "sandbox-gw-abc123",
+                "sh",
+                "-c",
+                "mkdir -p '/etc/coredns' && cat > '/etc/coredns/policy.conf'",
             ]
         );
-    }
-
-    /// `-i` must be present: the write pipes content on stdin, so an exec
-    /// without an interactive stdin would silently truncate the policy file
-    /// to empty.
-    #[test]
-    fn write_file_exec_argv_keeps_interactive_stdin_flag() {
-        let argv = write_file_exec_argv("ctr", "/tmp/mitmproxy/policy.json");
         assert!(
-            argv.iter().any(|a| a == "-i"),
-            "the write exec must keep -i (stdin pipe): {argv:?}"
+            !argv.iter().any(|a| a.contains("policy body")),
+            "the artifact must never appear in the argv: {argv:?}"
         );
-        // The redirection target carries the exact path under single quotes.
-        assert_eq!(argv.last().unwrap(), "cat > '/tmp/mitmproxy/policy.json'");
     }
 
-    /// The file-read argv is `exec <container> cat <path>` — a plain
-    /// non-interactive read, no shell, no quoting (the path is the final
-    /// argv element, not interpolated into a shell string).
+    /// A body full of the characters that break naive command construction
+    /// changes nothing about the command line — it is not on the command
+    /// line. This is the property the whole write shape exists to give.
     #[test]
-    fn read_file_exec_argv_is_plain_cat() {
-        let argv = read_file_exec_argv("sandbox-gw-x", BOOTSTRAP_FILE_IN_CONTAINER);
+    fn a_hostile_body_does_not_reach_the_shell() {
+        let hostile = "'; rm -rf / #\n$(id)\n`id`\n\"quoted\" — ünïcode\n";
+        let benign = write_gateway_file_op("gw", GatewayFile::EnvoyBootstrap, "x")
+            .argv()
+            .expect("renders");
+        let op = write_gateway_file_op("gw", GatewayFile::EnvoyBootstrap, hostile);
+        assert_eq!(op.argv().expect("renders"), benign);
+        assert_eq!(op.stdin_body(), Some(hostile));
+    }
+
+    /// The read is a plain `cat` with no shell at all, so there is nothing
+    /// for a path to break out of even in principle.
+    #[test]
+    fn a_policy_read_invokes_no_shell() {
+        let op = DockerOp::ContainerExec {
+            name: "sandbox-gw-x".to_string(),
+            command: ContainerCommand::ReadGatewayFile {
+                file: GatewayFile::EnvoyBootstrap,
+            },
+        };
         assert_eq!(
-            argv,
-            [
-                "exec".to_string(),
-                "sandbox-gw-x".to_string(),
-                "cat".to_string(),
-                BOOTSTRAP_FILE_IN_CONTAINER.to_string(),
+            op.argv().expect("read op renders"),
+            vec![
+                "exec",
+                "sandbox-gw-x",
+                "cat",
+                "/etc/envoy/envoy-bootstrap.yaml"
             ]
         );
+        assert!(op.stdin_body().is_none());
     }
 
-    /// The nft-list argv targets the `inet` family for the named table, used
-    /// by the rollback snapshot to capture pre-apply ruleset state.
+    /// The rollback snapshot covers both tables — restoring one would leave
+    /// the gateway half-configured, with the concat sets and the chain that
+    /// keys on them out of step.
     #[test]
-    fn list_nft_table_exec_argv_targets_inet_family() {
-        let argv = list_nft_table_exec_argv("sandbox-gw-x", "sandbox_policy");
+    fn the_rollback_snapshot_names_both_policy_tables() {
+        let names: Vec<&str> = NftTable::ALL.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["sandbox_dnat", "sandbox_policy"]);
+    }
+
+    // -- Artifact identity ---------------------------------------------------
+
+    /// §3.4 step 6: the Envoy bootstrap written into the container is the
+    /// compiler's output, and it survives the trip to the write op intact.
+    /// A drifted bootstrap is a gateway whose Envoy either refuses to start
+    /// or starts pointed at the wrong listener directory.
+    #[test]
+    fn the_bootstrap_seed_is_its_compilers_output() {
+        let (file, content) = envoy_bootstrap_artifact();
+        assert!(matches!(file, GatewayFile::EnvoyBootstrap));
+        assert_eq!(content, PolicyCompiler::compile_envoy_bootstrap());
+
+        let op = write_gateway_file_op("sandbox-gw-abc123", file, &content);
         assert_eq!(
-            argv,
-            [
-                "exec".to_string(),
-                "sandbox-gw-x".to_string(),
-                "nft".to_string(),
-                "list".to_string(),
-                "table".to_string(),
-                "inet".to_string(),
-                "sandbox_policy".to_string(),
-            ]
+            op.stdin_body(),
+            Some(PolicyCompiler::compile_envoy_bootstrap().as_str()),
+            "the bytes the container receives must be the compiler's output"
         );
     }
 
-    /// The argv builders carry through whatever container name the caller
-    /// derives (`container_name(session_id)` → `sandbox-gw-<id>`); none of
-    /// them hardcode it.
+    /// §3.4 step 7: the seeded listener is the deny-all initial listener,
+    /// byte for byte. Seeding anything else would open the window this
+    /// artifact exists to close.
     #[test]
-    fn exec_argv_builders_use_caller_supplied_container() {
+    fn the_listener_seed_is_the_deny_all_initial_listener() {
+        let (file, content) = envoy_initial_listener_artifact();
+        assert!(matches!(file, GatewayFile::EnvoyListener));
+        assert_eq!(content, PolicyCompiler::compile_initial_envoy_listener());
+
+        let op = write_gateway_file_op("sandbox-gw-abc123", file, &content);
+        assert_eq!(
+            op.stdin_body(),
+            Some(PolicyCompiler::compile_initial_envoy_listener().as_str())
+        );
+    }
+
+    /// The entrypoint blocks on both, so both are seeded, in that order.
+    #[test]
+    fn both_envoy_artifacts_are_seeded_in_entrypoint_order() {
+        let seeds = envoy_seed_artifacts();
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0], envoy_bootstrap_artifact());
+        assert_eq!(seeds[1], envoy_initial_listener_artifact());
+    }
+
+    /// §3.4 step 8: the CoreDNS policy the distributor writes is the
+    /// compiled policy's, unchanged. This is the artifact that decides
+    /// which names resolve at all.
+    #[test]
+    fn the_coredns_write_carries_the_compiled_policy() {
+        let compiled = "example.com\nrewrite stop {\n  name exact \"a.b\" c.d\n}\n";
+        let op = write_gateway_file_op("sandbox-gw-abc123", GatewayFile::CorednsPolicy, compiled);
+        assert_eq!(op.stdin_body(), Some(compiled));
+        assert!(
+            op.argv()
+                .expect("renders")
+                .iter()
+                .any(|a| a.contains("/etc/coredns/policy.conf")),
+            "the write must name the file CoreDNS reads"
+        );
+    }
+
+    /// The container name is the caller's, derived from the session id, and
+    /// travels as its own argv element rather than as text in a command.
+    #[test]
+    fn the_write_op_carries_the_session_container() {
         let session = SessionId::parse("0123456789ab").unwrap();
         let container = gateway::container_name(&session);
         assert_eq!(container, "sandbox-gw-0123456789ab");
-        assert!(
-            write_file_exec_argv(&container, "/x").contains(&container),
-            "write argv must carry the session container"
-        );
-        assert!(
-            read_file_exec_argv(&container, "/x").contains(&container),
-            "read argv must carry the session container"
-        );
-        assert!(
-            list_nft_table_exec_argv(&container, "sandbox_dnat").contains(&container),
-            "nft-list argv must carry the session container"
-        );
+        let argv = write_gateway_file_op(&container, GatewayFile::MitmproxyPolicy, "{}")
+            .argv()
+            .expect("renders");
+        assert!(argv.contains(&container));
     }
 
     // -- DistributionState: rollback step-tracking ---------------------------

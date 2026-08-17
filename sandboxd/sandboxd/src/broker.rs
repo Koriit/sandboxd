@@ -2047,6 +2047,15 @@ fn docker_op_to_wire(op: &sandbox_core::docker::DockerOp) -> sandbox_agent_proto
             name: name.clone(),
             command: command.into(),
         },
+        Core::ContainerExecStdin {
+            name,
+            command,
+            body,
+        } => Wire::ContainerExecStdin {
+            name: name.clone(),
+            command: (*command).into(),
+            body: body.clone(),
+        },
         Core::HomeVolumeChown {
             session_id,
             image_tag,
@@ -2844,6 +2853,7 @@ mod tests {
             ContainerCommand, ContainerCreateSpec, GatewayComponent, InspectFlag, InspectFormat,
             RemoveForce, WorkspaceBindSpec,
         };
+        use sandbox_docker_argv::gateway::{FileDelivery, GatewayFile, StdinCommand};
         use sandbox_docker_argv::image::StagedImage;
         use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver, NetworkOption};
 
@@ -2971,7 +2981,36 @@ mod tests {
                     image: StagedImage::Lite,
                 },
                 DockerOp::DaemonInfo,
+                DockerOp::ContainerExecStdin {
+                    name: "sandbox-gw-abc123def456".to_string(),
+                    command: StdinCommand::WriteGatewayFile {
+                        file: GatewayFile::EnvoyListener,
+                        delivery: FileDelivery::AtomicRename,
+                    },
+                    body: hostile_artifact(),
+                },
             ]
+        }
+
+        /// An artifact carrying every character that breaks a naive
+        /// line-delimited channel or a naive command construction: the frame
+        /// delimiter itself, carriage returns, both quote styles, backslashes,
+        /// shell substitutions, a JSON-looking fragment and multi-byte UTF-8.
+        ///
+        /// Used as the body wherever a test needs a payload that fails if
+        /// anything between the generator and the container reinterprets it.
+        fn hostile_artifact() -> String {
+            [
+                "# newline-delimited channel, meet a newline",
+                "line two\r\nwith a carriage return",
+                r#"'single' "double" `backtick` \backslash"#,
+                "$(id) ${HOME} $HOME; rm -rf /",
+                r#"{"request_id": 99, "op": {"subcommand": "delete"}}"#,
+                "ünïcode — 日本語 — \u{1F512}",
+                "trailing newline follows",
+            ]
+            .join("\n")
+                + "\n"
         }
 
         /// The property the whole seam rests on: what the daemon means by an
@@ -2985,7 +3024,7 @@ mod tests {
         #[test]
         fn the_daemon_and_the_agent_render_the_same_argv_for_every_op() {
             let ops = every_op();
-            assert_eq!(ops.len(), 21, "every DockerOp variant must be covered here");
+            assert_eq!(ops.len(), 22, "every DockerOp variant must be covered here");
             for op in ops {
                 let daemon_argv = op.argv().expect("daemon renders");
                 let wire = docker_op_to_wire(&op);
@@ -3033,6 +3072,147 @@ mod tests {
                     !argv.iter().any(|a| a == "-H"),
                     "rendered argv names a target: {argv:?}"
                 );
+            }
+        }
+
+        // -- Framing ---------------------------------------------------------
+        //
+        // The egress-plane artifacts are multi-KB and contain newlines, and
+        // the channel they cross is newline-delimited JSON. Two things have
+        // to hold and neither is obvious from reading the writer: a frame
+        // carrying an artifact must contain exactly one newline, and the
+        // artifact must come back out of that frame unchanged.
+
+        /// One frame, one delimiter — with a body that contains the
+        /// delimiter, both quote styles, backslashes and multi-byte UTF-8.
+        ///
+        /// JSON string encoding is what makes this true: `serde_json` emits
+        /// `\n` for a newline rather than a literal `0x0A`, so the only raw
+        /// newline in the frame is the one the writer appends. A body cannot
+        /// end a frame early, and cannot inject a second frame — the
+        /// forged request embedded in the artifact stays inside the string.
+        #[test]
+        fn an_artifact_cannot_break_or_inject_a_frame() {
+            let op = DockerOp::ContainerExecStdin {
+                name: "sandbox-gw-abc123def456".to_string(),
+                command: StdinCommand::ApplyNftRuleset,
+                body: hostile_artifact(),
+            };
+            let request = sandbox_agent_protocol::BrokerRequest {
+                request_id: 7,
+                op: sandbox_agent_protocol::BrokerOp::Docker {
+                    op_uid: 501,
+                    op: docker_op_to_wire(&op),
+                },
+            };
+            // The frame, written exactly as the daemon writes it.
+            let frame = format!(
+                "{}\n",
+                serde_json::to_string(&request).expect("request serializes")
+            );
+            assert_eq!(
+                frame.matches('\n').count(),
+                1,
+                "the artifact's newlines must be escaped, not carried raw: {frame}"
+            );
+            assert!(
+                frame.ends_with('\n') && !frame[..frame.len() - 1].contains('\n'),
+                "the only newline must be the terminator"
+            );
+            // A reader splitting on the delimiter sees one frame, and the
+            // forged request inside the artifact is not one of them.
+            let frames: Vec<&str> = frame.trim_end_matches('\n').split('\n').collect();
+            assert_eq!(frames.len(), 1);
+        }
+
+        /// The artifact comes back out byte-identical after a full
+        /// serialize → frame → split → deserialize cycle. Escaping that is
+        /// merely *safe* is not enough: a policy that arrived escaped would
+        /// be a policy nobody wrote.
+        #[test]
+        fn an_artifact_survives_the_channel_byte_for_byte() {
+            let body = hostile_artifact();
+            for command in [
+                StdinCommand::ApplyNftRuleset,
+                StdinCommand::WriteGatewayFile {
+                    file: GatewayFile::CorednsPolicy,
+                    delivery: FileDelivery::Replace,
+                },
+            ] {
+                let request = sandbox_agent_protocol::BrokerRequest {
+                    request_id: 1,
+                    op: sandbox_agent_protocol::BrokerOp::Docker {
+                        op_uid: 501,
+                        op: docker_op_to_wire(&DockerOp::ContainerExecStdin {
+                            name: "sandbox-gw-abc123def456".to_string(),
+                            command,
+                            body: body.clone(),
+                        }),
+                    },
+                };
+                let frame = format!("{}\n", serde_json::to_string(&request).expect("serializes"));
+                let line = frame.trim_end_matches('\n');
+                let back: sandbox_agent_protocol::BrokerRequest =
+                    serde_json::from_str(line).expect("the agent parses the frame");
+                let sandbox_agent_protocol::BrokerOp::Docker { op, .. } = back.op else {
+                    panic!("round-tripped into a different op family");
+                };
+                let sandbox_agent_protocol::DockerOp::ContainerExecStdin {
+                    body: recovered, ..
+                } = op
+                else {
+                    panic!("round-tripped into a different docker op");
+                };
+                assert_eq!(recovered, body, "the artifact changed crossing the channel");
+            }
+        }
+
+        /// A multi-KB artifact — the real size class, not a short string —
+        /// crosses intact. Line-delimited readers with a buffer bound are
+        /// where this stops being true, so it is asserted rather than
+        /// assumed.
+        #[test]
+        fn a_multi_kb_artifact_crosses_intact() {
+            let body = hostile_artifact().repeat(400);
+            assert!(body.len() > 100_000, "the test body must be multi-KB");
+            let request = sandbox_agent_protocol::BrokerRequest {
+                request_id: 2,
+                op: sandbox_agent_protocol::BrokerOp::Docker {
+                    op_uid: 501,
+                    op: docker_op_to_wire(&DockerOp::ContainerExecStdin {
+                        name: "sandbox-gw-abc123def456".to_string(),
+                        command: StdinCommand::ApplyNftRuleset,
+                        body: body.clone(),
+                    }),
+                },
+            };
+            let frame = format!("{}\n", serde_json::to_string(&request).expect("serializes"));
+            assert_eq!(frame.matches('\n').count(), 1);
+            let back: sandbox_agent_protocol::BrokerRequest =
+                serde_json::from_str(frame.trim_end_matches('\n')).expect("parses");
+            let sandbox_agent_protocol::BrokerOp::Docker { op, .. } = back.op else {
+                panic!("wrong op family");
+            };
+            let sandbox_agent_protocol::DockerOp::ContainerExecStdin {
+                body: recovered, ..
+            } = op
+            else {
+                panic!("wrong docker op");
+            };
+            assert_eq!(recovered.len(), body.len());
+            assert_eq!(recovered, body);
+        }
+
+        /// The agent's validator accepts the ops the daemon actually sends
+        /// and refuses a write to the one file it may only read. The two
+        /// together are what makes the write allowlist a rule rather than a
+        /// convention.
+        #[test]
+        fn the_agent_validates_the_ops_the_daemon_sends() {
+            for op in every_op() {
+                let wire = docker_op_to_wire(&op);
+                sandbox_agent_protocol::validate_docker_op(&wire)
+                    .unwrap_or_else(|e| panic!("the agent refused a production op {op:?}: {e}"));
             }
         }
     }

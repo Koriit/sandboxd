@@ -525,6 +525,25 @@ pub enum ContainerCommand {
     GatewayHealthcheck,
     /// The readiness probe for one named gateway component.
     ComponentProbe { component: GatewayComponent },
+    /// Read one of the enumerated gateway policy files back out.
+    ///
+    /// `cat <path>`, with the path a constant of this crate — the read
+    /// counterpart of [`crate::gateway::StdinCommand::WriteGatewayFile`],
+    /// used to snapshot the prior generation before a policy apply so a
+    /// failure can be rolled back.
+    ReadGatewayFile { file: crate::gateway::GatewayFile },
+    /// List one of the two sandbox nftables tables.
+    ///
+    /// The other half of the rollback snapshot: the ruleset currently in
+    /// force, as `nft` prints it.
+    ListNftTable { table: crate::gateway::NftTable },
+    /// Read Envoy's active-listener gauge from its admin endpoint.
+    ///
+    /// The URL is a constant
+    /// ([`crate::gateway::ENVOY_ACTIVE_LISTENERS_STATS_URL`]) passed as one
+    /// argv element, so the `&` in its query string reaches Envoy rather
+    /// than a shell.
+    EnvoyActiveListenerCount,
 }
 
 /// The gateway container's five long-running components.
@@ -628,6 +647,21 @@ impl ContainerCommand {
             }
             ContainerCommand::GatewayHealthcheck => vec!["/healthcheck.sh".to_string()],
             ContainerCommand::ComponentProbe { component } => component.probe(),
+            ContainerCommand::ReadGatewayFile { file } => {
+                vec!["cat".to_string(), file.path().to_string()]
+            }
+            ContainerCommand::ListNftTable { table } => vec![
+                "nft".to_string(),
+                "list".to_string(),
+                "table".to_string(),
+                "inet".to_string(),
+                table.name().to_string(),
+            ],
+            ContainerCommand::EnvoyActiveListenerCount => vec![
+                "curl".to_string(),
+                "-sf".to_string(),
+                crate::gateway::ENVOY_ACTIVE_LISTENERS_STATS_URL.to_string(),
+            ],
         }
     }
 }
@@ -635,6 +669,18 @@ impl ContainerCommand {
 /// `docker exec <name> <command…>`.
 pub fn container_exec_argv(name: &str, command: &ContainerCommand) -> Vec<String> {
     let mut argv = vec!["exec".to_string(), name.to_string()];
+    argv.extend(command.argv());
+    argv
+}
+
+/// `docker exec -i <name> <command…>` — the stdin-fed form.
+///
+/// `-i` is what keeps the child's standard input attached to the pipe the
+/// caller writes the artifact to. Without it the exec runs with a closed
+/// stdin and `cat > file` truncates the policy file to empty — a failure
+/// that looks like a successful write.
+pub fn container_exec_stdin_argv(name: &str, command: crate::gateway::StdinCommand) -> Vec<String> {
+    let mut argv = vec!["exec".to_string(), "-i".to_string(), name.to_string()];
     argv.extend(command.argv());
     argv
 }
@@ -973,5 +1019,92 @@ mod tests {
     fn cpus_render_with_one_decimal() {
         assert_eq!(format_cpus(2.0), "2.0");
         assert_eq!(format_cpus(0.5), "0.5");
+    }
+
+    // -- Policy-plane exec shapes -------------------------------------------
+
+    #[test]
+    fn reading_a_gateway_file_is_a_plain_cat_of_a_constant_path() {
+        let argv = container_exec_argv(
+            "sandbox-gw-abc",
+            &ContainerCommand::ReadGatewayFile {
+                file: crate::gateway::GatewayFile::EnvoyBootstrap,
+            },
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "sandbox-gw-abc",
+                "cat",
+                "/etc/envoy/envoy-bootstrap.yaml"
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "sh"));
+    }
+
+    #[test]
+    fn listing_a_table_names_the_inet_family() {
+        let argv = container_exec_argv(
+            "sandbox-gw-abc",
+            &ContainerCommand::ListNftTable {
+                table: crate::gateway::NftTable::SandboxPolicy,
+            },
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "sandbox-gw-abc",
+                "nft",
+                "list",
+                "table",
+                "inet",
+                "sandbox_policy"
+            ]
+        );
+    }
+
+    /// The stats URL must survive as one argv element. Split across two, the
+    /// `&` would reach the container as a separate word and the probe would
+    /// read a different (or no) counter.
+    #[test]
+    fn the_envoy_stat_probe_passes_its_url_as_one_element() {
+        let argv = container_exec_argv(
+            "sandbox-gw-abc",
+            &ContainerCommand::EnvoyActiveListenerCount,
+        );
+        assert_eq!(argv.len(), 5);
+        assert_eq!(&argv[..4], &["exec", "sandbox-gw-abc", "curl", "-sf"]);
+        assert_eq!(argv[4], crate::gateway::ENVOY_ACTIVE_LISTENERS_STATS_URL);
+    }
+
+    /// `-i` is the difference between writing the artifact and truncating
+    /// the file to empty, so it is pinned separately from the command body.
+    #[test]
+    fn the_stdin_fed_exec_keeps_its_interactive_flag() {
+        let argv = container_exec_stdin_argv(
+            "sandbox-gw-abc",
+            crate::gateway::StdinCommand::ApplyNftRuleset,
+        );
+        assert_eq!(argv, vec!["exec", "-i", "sandbox-gw-abc", "nft", "-f", "-"]);
+    }
+
+    #[test]
+    fn the_stdin_fed_exec_carries_the_write_body_last() {
+        let command = crate::gateway::StdinCommand::WriteGatewayFile {
+            file: crate::gateway::GatewayFile::EnvoyListener,
+            delivery: crate::gateway::FileDelivery::AtomicRename,
+        };
+        let argv = container_exec_stdin_argv("sandbox-gw-abc", command);
+        assert_eq!(&argv[..5], &["exec", "-i", "sandbox-gw-abc", "sh", "-c"]);
+        assert_eq!(
+            argv[5],
+            crate::gateway::write_script(
+                crate::gateway::GatewayFile::EnvoyListener,
+                crate::gateway::FileDelivery::AtomicRename,
+            )
+        );
+        assert_eq!(argv.len(), 6);
     }
 }

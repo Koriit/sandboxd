@@ -566,14 +566,21 @@ impl CompiledPolicy {
 /// Written once per session by [`policy_distributor`](crate::policy_distributor)
 /// before Envoy starts. The bootstrap references the listener file at
 /// [`LISTENER_FILE_IN_CONTAINER`] via `dynamic_resources.lds_config`.
-pub const BOOTSTRAP_FILE_IN_CONTAINER: &str = "/etc/envoy/envoy-bootstrap.yaml";
+///
+/// Single-sourced from the argv crate, which both the daemon and the
+/// per-operator agent render the write command from — the path and the
+/// command that names it must not be able to drift apart.
+pub const BOOTSTRAP_FILE_IN_CONTAINER: &str =
+    sandbox_docker_argv::gateway::BOOTSTRAP_FILE_IN_CONTAINER;
 
 /// Absolute path inside the gateway container for the LDS-watched directory.
 ///
 /// Envoy's filesystem LDS subscription is pinned to this directory so that
 /// `MovedTo` inotify events produced by atomic renames trigger a listener
 /// reload. See Envoy upstream issue `#20474`.
-pub const LISTENER_DIR_IN_CONTAINER: &str = "/etc/envoy/listeners";
+///
+/// Single-sourced from the argv crate — see [`BOOTSTRAP_FILE_IN_CONTAINER`].
+pub const LISTENER_DIR_IN_CONTAINER: &str = sandbox_docker_argv::gateway::LISTENER_DIR_IN_CONTAINER;
 
 /// Basename of the LDS-watched listener file inside
 /// [`LISTENER_DIR_IN_CONTAINER`].
@@ -581,7 +588,10 @@ pub const LISTENER_FILE_NAME: &str = "listener.yaml";
 
 /// Absolute path inside the gateway container for the LDS-served listener
 /// file.
-pub const LISTENER_FILE_IN_CONTAINER: &str = "/etc/envoy/listeners/listener.yaml";
+///
+/// Single-sourced from the argv crate — see [`BOOTSTRAP_FILE_IN_CONTAINER`].
+pub const LISTENER_FILE_IN_CONTAINER: &str =
+    sandbox_docker_argv::gateway::LISTENER_FILE_IN_CONTAINER;
 
 /// Marker comment demarcating the start of the mutable filter-chains region
 /// inside a listener file. Used by the atomic listener-file writer to

@@ -745,6 +745,112 @@ pub fn validate_mount_path(field: &str, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Ceiling on the size of an artifact the daemon may write into a gateway
+/// container.
+///
+/// Far above anything the generators produce — the largest artifact is the
+/// Envoy listener, tens of KB with a full policy — so this is not a
+/// correctness bound on any real policy. It exists so a runaway generator
+/// on the other end of the socket cannot make the agent buffer an
+/// unbounded string, and so an oversized frame fails with a reason instead
+/// of as an allocation.
+pub const MAX_GATEWAY_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Characters that would be re-read by a shell if they appeared inside the
+/// single-quoted words of a `sh -c` body.
+const SHELL_UNSAFE: &[char] = &[
+    '\'', '"', '`', '$', ';', '&', '|', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?', '!', '#',
+    '~', '\\', '\n', '\r', '\t', ' ',
+];
+
+/// Check that the path an enumerated gateway file resolves to is safe to
+/// interpolate into the `sh -c` body that writes it.
+///
+/// # Why this exists when nothing here is caller-supplied
+///
+/// The write command's destination comes from an enum, so the daemon
+/// contributes a discriminant and never a path — that is the allowlist, and
+/// it is why the single quotes in the delivery script are legibility rather
+/// than a defence. What this function adds is that the allowlist's *entries*
+/// are checked, in the shipping build, on every op. A future variant whose
+/// path carried a quote or a `$` would otherwise silently make those quotes
+/// load-bearing, and the site this replaced made exactly that check with a
+/// `debug_assert!` — a guard that is compiled out of release, which is to
+/// say a guard that was not there.
+///
+/// The argv crate has a unit test asserting the same property over every
+/// variant. That test and this check answer different questions: the test
+/// says the set was correct when it was built, this says the agent refuses
+/// an entry that is not, including one reaching it from a daemon built from
+/// a different revision.
+pub fn validate_gateway_file_path(
+    file: sandbox_docker_argv::gateway::GatewayFile,
+) -> Result<(), String> {
+    for (label, value) in [
+        ("path", file.path()),
+        ("parent_dir", file.parent_dir()),
+        ("staging_path", file.staging_path()),
+    ] {
+        if !value.starts_with('/') || value.contains("..") {
+            return Err(format!(
+                "gateway file {}: {label} {value:?} is not a plain absolute path",
+                file.as_str()
+            ));
+        }
+        if let Some(ch) = value.chars().find(|c| SHELL_UNSAFE.contains(c)) {
+            return Err(format!(
+                "gateway file {}: {label} {value:?} contains {ch:?}, which a shell \
+                 would re-read",
+                file.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate one stdin-fed command and the artifact it carries.
+///
+/// Three things are checked, and only one of them is about the command:
+///
+/// - **The write allowlist.** A file the daemon may read is not thereby a
+///   file the daemon may write. `GatewayFile::writable` is the split, and
+///   this is where it is enforced.
+/// - **The destination path.** See [`validate_gateway_file_path`].
+/// - **The artifact's size.** The content itself is not otherwise
+///   inspected: it is policy, the daemon is the authority on what it says,
+///   and the process that reads it — `nft` or `cat` — is the one that
+///   decides whether it parses. An agent that second-guessed the ruleset
+///   would be re-implementing the policy compiler with less information.
+fn validate_stdin_command(
+    command: &crate::protocol::StdinCommand,
+    body: &str,
+) -> Result<(), String> {
+    use crate::protocol::StdinCommand;
+
+    if body.len() > MAX_GATEWAY_ARTIFACT_BYTES {
+        return Err(format!(
+            "stdin body is {} bytes, over the {MAX_GATEWAY_ARTIFACT_BYTES}-byte ceiling",
+            body.len()
+        ));
+    }
+
+    match command {
+        // The ruleset goes to `nft -f -`, which reads it as content. There
+        // is no command line to protect.
+        StdinCommand::ApplyNftRuleset => Ok(()),
+        StdinCommand::WriteGatewayFile { file, .. } => {
+            let file: sandbox_docker_argv::gateway::GatewayFile = (*file).into();
+            if !file.writable() {
+                return Err(format!(
+                    "gateway file {} is read-only; the daemon may read it but not write it",
+                    file.as_str()
+                ));
+            }
+            validate_gateway_file_path(file)
+        }
+    }
+}
+
 /// Re-validate every field of a [`crate::protocol::DockerOp`] before the
 /// agent builds any argv from it.
 ///
@@ -815,12 +921,36 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
         }
         DockerOp::ContainerExec { name, command } => {
             validate_docker_name("container", name)?;
-            // Only one command variant carries data. The others are
-            // constants of the argv crate and have nothing to validate —
-            // which is the point of enumerating them.
-            if let ContainerCommand::MakeDirectory { path } = command {
-                validate_path_arg("mkdir path", path)?;
+            match command {
+                // The one variant carrying a caller-supplied string.
+                ContainerCommand::MakeDirectory { path } => {
+                    validate_path_arg("mkdir path", path)?;
+                }
+                // A read whose path comes from the enum still has its
+                // resolved path checked: the read is a bare `cat` with no
+                // shell, but the same enum feeds the write, and a variant
+                // that is unfit to interpolate should be refused wherever
+                // it appears rather than only where it is dangerous.
+                ContainerCommand::ReadGatewayFile { file } => {
+                    validate_gateway_file_path((*file).into())?;
+                }
+                // The remaining variants are constants of the argv crate
+                // and have nothing to validate — which is the point of
+                // enumerating them.
+                ContainerCommand::SshdListening
+                | ContainerCommand::GatewayHealthcheck
+                | ContainerCommand::ComponentProbe { .. }
+                | ContainerCommand::ListNftTable { .. }
+                | ContainerCommand::EnvoyActiveListenerCount => {}
             }
+        }
+        DockerOp::ContainerExecStdin {
+            name,
+            command,
+            body,
+        } => {
+            validate_docker_name("container", name)?;
+            validate_stdin_command(command, body)?;
         }
         DockerOp::HomeVolumeChown {
             session_id,
@@ -1894,9 +2024,9 @@ user:
     mod docker {
         use super::super::*;
         use crate::protocol::{
-            ContainerCommand, ContainerCreateSpec, DockerOp, GatewayComponent, InspectFlag,
-            InspectFormat, NetworkCreateSpec, NetworkDriver, NetworkOption, RemoveForce,
-            StagedImage, WorkspaceBindSpec,
+            ContainerCommand, ContainerCreateSpec, DockerOp, FileDelivery, GatewayComponent,
+            GatewayFile, InspectFlag, InspectFormat, NetworkCreateSpec, NetworkDriver,
+            NetworkOption, NftTable, RemoveForce, StagedImage, StdinCommand, WorkspaceBindSpec,
         };
 
         fn create_spec() -> ContainerCreateSpec {
@@ -2022,6 +2152,14 @@ user:
                     image: StagedImage::Gateway,
                 },
                 DockerOp::DaemonInfo,
+                DockerOp::ContainerExecStdin {
+                    name: "sandbox-gw-abc123def456".to_string(),
+                    command: StdinCommand::WriteGatewayFile {
+                        file: GatewayFile::CorednsPolicy,
+                        delivery: FileDelivery::Replace,
+                    },
+                    body: "example.com\n".to_string(),
+                },
             ]
         }
 
@@ -2031,7 +2169,7 @@ user:
         #[test]
         fn every_well_formed_op_is_accepted() {
             let ops = every_op();
-            assert_eq!(ops.len(), 21, "every DockerOp variant must be covered here");
+            assert_eq!(ops.len(), 22, "every DockerOp variant must be covered here");
             for op in ops {
                 assert!(
                     validate_docker_op(&op).is_ok(),
@@ -2292,6 +2430,137 @@ user:
                 })
                 .is_ok()
             );
+        }
+
+        // -- Egress-plane writes ---------------------------------------------
+
+        fn write_op(file: GatewayFile, body: &str) -> DockerOp {
+            DockerOp::ContainerExecStdin {
+                name: "sandbox-gw-abc123def456".to_string(),
+                command: StdinCommand::WriteGatewayFile {
+                    file,
+                    delivery: FileDelivery::Replace,
+                },
+                body: body.to_string(),
+            }
+        }
+
+        /// Every writable artifact is writable, and the one file another
+        /// process owns is refused. Read access does not imply write access,
+        /// and this is where that stops being a convention.
+        #[test]
+        fn a_write_to_a_read_only_artifact_is_refused() {
+            for file in [
+                GatewayFile::CorednsPolicy,
+                GatewayFile::MitmproxyPolicy,
+                GatewayFile::MitmproxyCaKey,
+                GatewayFile::MitmproxyCaCert,
+                GatewayFile::EnvoyBootstrap,
+                GatewayFile::EnvoyListener,
+            ] {
+                assert!(
+                    validate_docker_op(&write_op(file, "x")).is_ok(),
+                    "{file:?} must be writable"
+                );
+            }
+            let err = validate_docker_op(&write_op(GatewayFile::CorednsResolved, "x"))
+                .expect_err("CoreDNS owns its resolved-address report");
+            assert!(err.contains("read-only"), "{err}");
+
+            // …and it is still readable, which is the point of the split.
+            assert!(
+                validate_docker_op(&DockerOp::ContainerExec {
+                    name: "sandbox-gw-abc123def456".to_string(),
+                    command: ContainerCommand::ReadGatewayFile {
+                        file: GatewayFile::CorednsResolved,
+                    },
+                })
+                .is_ok()
+            );
+        }
+
+        /// Every destination the write op can name is a plain absolute path
+        /// with nothing a shell would re-read. This is the check the
+        /// replaced site made with a `debug_assert!` — which is to say, not
+        /// in the build that ships.
+        #[test]
+        fn every_destination_survives_shell_interpolation() {
+            for file in sandbox_docker_argv::gateway::GatewayFile::ALL {
+                validate_gateway_file_path(*file)
+                    .unwrap_or_else(|e| panic!("{} is unfit to interpolate: {e}", file.as_str()));
+            }
+        }
+
+        /// The artifact itself is not second-guessed. A ruleset or a policy
+        /// file containing quotes, newlines, `$(…)` and non-ASCII is
+        /// ordinary content, and refusing it would break real policies while
+        /// protecting nothing — the body never reaches a shell.
+        #[test]
+        fn a_hostile_looking_artifact_is_still_valid_content() {
+            let body = "'; rm -rf / #\n$(id)\n`id`\n\"quoted\" — ünïcode\n";
+            assert!(validate_docker_op(&write_op(GatewayFile::CorednsPolicy, body)).is_ok());
+            assert!(
+                validate_docker_op(&DockerOp::ContainerExecStdin {
+                    name: "sandbox-gw-abc123def456".to_string(),
+                    command: StdinCommand::ApplyNftRuleset,
+                    body: body.to_string(),
+                })
+                .is_ok()
+            );
+        }
+
+        /// The size ceiling refuses with a reason rather than as an
+        /// allocation. It sits far above any artifact the generators
+        /// produce, so a real policy never meets it.
+        #[test]
+        fn an_oversized_artifact_is_refused_with_a_reason() {
+            let body = "x".repeat(MAX_GATEWAY_ARTIFACT_BYTES + 1);
+            let err = validate_docker_op(&write_op(GatewayFile::CorednsPolicy, &body))
+                .expect_err("an artifact over the ceiling must be refused");
+            assert!(err.contains("ceiling"), "{err}");
+
+            // A realistic multi-KB artifact is nowhere near it.
+            let realistic = "table inet sandbox_dnat { }\n".repeat(4_000);
+            assert!(realistic.len() > 100_000);
+            assert!(validate_docker_op(&write_op(GatewayFile::CorednsPolicy, &realistic)).is_ok());
+        }
+
+        /// The stdin-fed op names a container like every other op, and a
+        /// container name docker would read as a flag is refused there too.
+        #[test]
+        fn a_stdin_fed_op_still_validates_its_container() {
+            assert!(
+                validate_docker_op(&DockerOp::ContainerExecStdin {
+                    name: "--privileged".to_string(),
+                    command: StdinCommand::ApplyNftRuleset,
+                    body: "x".to_string(),
+                })
+                .is_err()
+            );
+        }
+
+        /// The three read commands carry enums and nothing else, so there is
+        /// nothing in them for a caller to control. Stated as a test so the
+        /// absence of validation is a recorded decision.
+        #[test]
+        fn the_policy_plane_reads_carry_nothing_to_reject() {
+            for command in [
+                ContainerCommand::ReadGatewayFile {
+                    file: GatewayFile::EnvoyBootstrap,
+                },
+                ContainerCommand::ListNftTable {
+                    table: NftTable::SandboxPolicy,
+                },
+                ContainerCommand::EnvoyActiveListenerCount,
+            ] {
+                assert!(
+                    validate_docker_op(&DockerOp::ContainerExec {
+                        name: "sandbox-gw-abc123def456".to_string(),
+                        command,
+                    })
+                    .is_ok()
+                );
+            }
         }
     }
 }

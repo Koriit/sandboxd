@@ -50,8 +50,8 @@ use sandbox_core::{
     WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest, WorkspaceOp, attach_vm_to_bridge,
     bind_gate_listener, detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules,
     hash_policy, load_users_config, mac_from_session_id, propagate_dns_changes,
-    read_resolved_json_on_socket, remove_gate_socket, serve_gate_listener, users_conf_path,
-    wait_for_lds_ack, write_file_to_container_on_socket,
+    read_resolved_json_on_route, remove_gate_socket, serve_gate_listener, users_conf_path,
+    wait_for_lds_ack, write_gateway_file,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -4235,10 +4235,9 @@ async fn macos_networking_status_for(
 /// Return a `GatewayManager` suitable for health probes against the given session.
 ///
 /// On Linux, returns the system-socket manager held in `AppState::gateway`
-/// (unchanged from existing behaviour). On macOS, constructs a forwarded-socket
-/// manager pointing at the gateway Lima VM's Docker socket so that probes route
-/// through the VM rather than the host's Docker daemon (which is the container
-/// backend's socket and has no knowledge of the Lima gateway containers).
+/// (unchanged from existing behaviour). On macOS, builds one on the VM route
+/// so that probes reach the Docker daemon inside the gateway VM rather than
+/// the host's (which has no knowledge of the Lima gateway containers).
 ///
 /// Centralising the platform branch here keeps `gateway_monitor` and
 /// `poll_and_emit_component_health` free of scattered `cfg!` blocks while
@@ -4246,15 +4245,11 @@ async fn macos_networking_status_for(
 fn gateway_for_probes(state: &AppState) -> Arc<GatewayManager> {
     #[cfg(target_os = "macos")]
     {
-        let sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         // The `return` is required so the compiler does not see the
         // `#[cfg(not(target_os = "macos"))]` expression below as unreachable on
         // macOS builds, while the Linux build only compiles the cfg(not) arm.
         #[allow(clippy::needless_return)]
-        return Arc::new(GatewayManager::with_vm_route(state.docker.clone(), sock));
+        return Arc::new(GatewayManager::with_route(state.docker.clone()));
     }
     #[cfg(not(target_os = "macos"))]
     Arc::clone(&state.gateway)
@@ -4264,33 +4259,35 @@ fn gateway_for_probes(state: &AppState) -> Arc<GatewayManager> {
 /// (policy apply, DNS propagation, the synchronous DNS gate) against the
 /// given session's gateway.
 ///
-/// Mirrors [`gateway_for_probes`]: on Linux returns the host-socket manager
-/// in `AppState::gateway` (byte-identical behaviour, `docker_socket: None`);
-/// on macOS constructs a forwarded-socket manager pointing at the gateway
-/// Lima VM's Docker socket. Threading this into the distributor/propagation
-/// loop/gate makes their `docker exec` file writes, nft injection, and
-/// in-container listener delivery reach the gateway container running inside
-/// the VM (a host `docker exec` reports `No such container`).
+/// Mirrors [`gateway_for_probes`] — the two are the same construction and
+/// differ only in which consumer asks. Threading this into the
+/// distributor / propagation loop / gate makes their policy-file writes, nft
+/// injection and in-container listener delivery reach the gateway container
+/// running inside the VM (a host `docker exec` reports `No such container`).
+/// Kept separate from [`gateway_for_probes`] because the two answer different
+/// questions and a future divergence belongs on one of them, not on a `bool`.
 fn gateway_for_policy(state: &AppState) -> Arc<GatewayManager> {
     #[cfg(target_os = "macos")]
     {
-        let sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         #[allow(clippy::needless_return)]
-        return Arc::new(GatewayManager::with_vm_route(state.docker.clone(), sock));
+        return Arc::new(GatewayManager::with_route(state.docker.clone()));
     }
     #[cfg(not(target_os = "macos"))]
     Arc::clone(&state.gateway)
 }
 
-/// Return the forwarded gateway-VM Docker socket for the policy/DNS probes
-/// that shell out to `docker` directly (the LDS-ack probe, `read_resolved_json`).
+/// Return the forwarded gateway-VM Docker socket for the one remaining probe
+/// that shells out to `docker` directly: the Envoy LDS-ack `/stats` poll in
+/// [`DockerExecLdsProbe`].
 ///
 /// `None` on Linux (host Docker socket, no `-H` flag — unchanged behaviour);
 /// `Some(path)` on macOS so the bare `docker exec` reaches the in-VM gateway
 /// container.
+///
+/// Every other policy-plane operation takes the gateway manager's typed
+/// route. This one is left on a socket because it is an async
+/// `tokio::process` poll on the same footing as the long-lived streams —
+/// it moves with them, not with the one-shot policy ops.
 fn policy_probe_socket(state: &AppState) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -4461,10 +4458,6 @@ async fn create_session_macos_lima(
     let rollback = {
         let state2 = state.clone();
         let pool2 = vmnet_pool.clone();
-        let sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         let route = state.docker.clone();
         let sid = session_id;
         let op_name = operator.name.clone();
@@ -4474,7 +4467,6 @@ async fn create_session_macos_lima(
         move |vm_created: bool| {
             let state2 = state2.clone();
             let pool2 = pool2.clone();
-            let sock2 = sock.clone();
             let route2 = route.clone();
             let op_name2 = op_name.clone();
             let base_dir2 = base_dir.clone();
@@ -4514,7 +4506,7 @@ async fn create_session_macos_lima(
                     }
                 }
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _ = teardown_macos_gateway(&sid, &route2, &sock2);
+                    let _ = teardown_macos_gateway(&sid, &route2);
                     let _ = pool2.release_lima_slot(&sid);
                     let _ = CaManager::remove_session_ca(&base_dir2, &sid);
                 })
@@ -4691,10 +4683,6 @@ async fn create_session_macos_lima(
     // Steps 5-9: setup gateway (macvlan + container + deny-all + health + DNAT).
     // Must complete before limactl start (egress happens-before invariant).
     {
-        let gateway_sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         let gateway_route = state.docker.clone();
         let ni = network_info.clone();
         let nic = nic_name.clone();
@@ -4713,7 +4701,6 @@ async fn create_session_macos_lima(
                 &ni,
                 &nic,
                 &gateway_route,
-                &gateway_sock,
                 &gateway_tag,
                 Some(&ca),
                 Some(&dns),
@@ -5567,14 +5554,12 @@ async fn create_session_macos_lite(
         let ca = ca_dir.clone();
         let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
         let sid = session_id;
-        let gateway_sock = gateway_docker_socket.clone();
         let gateway_route = state.docker.clone();
         match tokio::task::spawn_blocking(move || {
             setup_macos_lite_gateway(
                 &sid,
                 &ni,
                 &gateway_route,
-                &gateway_sock,
                 &gateway_tag,
                 Some(&ca),
                 Some(&dns),
@@ -5586,10 +5571,7 @@ async fn create_session_macos_lite(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 // Best-effort: stop gateway container (may not have started yet).
-                let gw = sandbox_core::GatewayManager::with_vm_route(
-                    state.docker.clone(),
-                    gateway_docker_socket.clone(),
-                );
+                let gw = sandbox_core::GatewayManager::with_route(state.docker.clone());
                 let _ = gw.stop_gateway(&session_id);
                 let runtime = runtime_for(&state, BackendKind::Container);
                 let _ = runtime.delete(&handle, operator.uid).await;
@@ -5636,10 +5618,7 @@ async fn create_session_macos_lite(
         .store
         .update_state(&session_id, &operator.name, SessionState::Running)
     {
-        let gw = sandbox_core::GatewayManager::with_vm_route(
-            state.docker.clone(),
-            gateway_docker_socket.clone(),
-        );
+        let gw = sandbox_core::GatewayManager::with_route(state.docker.clone());
         let _ = gw.stop_gateway(&session_id);
         let runtime = runtime_for(&state, BackendKind::Container);
         let _ = runtime.delete(&handle, operator.uid).await;
@@ -5674,10 +5653,7 @@ async fn create_session_macos_lite(
     // macro so the ordering cannot drift between blocks.
     macro_rules! lite_provision_teardown_and_return {
         ($resp:expr) => {{
-            let gw = sandbox_core::GatewayManager::with_vm_route(
-                state.docker.clone(),
-                gateway_docker_socket.clone(),
-            );
+            let gw = sandbox_core::GatewayManager::with_route(state.docker.clone());
             let _ = gw.stop_gateway(&session_id);
             let runtime = runtime_for(&state, BackendKind::Container);
             let _ = runtime.delete(&handle, operator.uid).await;
@@ -6368,19 +6344,14 @@ async fn start_session_macos_lima(
 
     let rollback = {
         let pool2 = vmnet_pool.clone();
-        let sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         let route = state.docker.clone();
         let sid = session_id;
         move || {
             let pool2 = pool2.clone();
-            let sock2 = sock.clone();
             let route2 = route.clone();
             async move {
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _ = teardown_macos_gateway(&sid, &route2, &sock2);
+                    let _ = teardown_macos_gateway(&sid, &route2);
                     let _ = pool2.release_lima_slot(&sid);
                 })
                 .await;
@@ -6466,10 +6437,6 @@ async fn start_session_macos_lima(
 
     // Steps 4-8: setup gateway (gateway-before-VM invariant).
     {
-        let gateway_sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         let gateway_route = state.docker.clone();
         let ni = network_info.clone();
         let nic = nic_name.clone();
@@ -6488,7 +6455,6 @@ async fn start_session_macos_lima(
                 &ni,
                 &nic,
                 &gateway_route,
-                &gateway_sock,
                 &gateway_tag,
                 Some(&ca),
                 dns.as_deref(),
@@ -7328,20 +7294,14 @@ async fn stop_session(
     #[cfg(target_os = "macos")]
     {
         if session.backend == BackendKind::Lima {
-            let gateway_docker_socket = state
-                .gateway_lima_manager
-                .gateway_docker_socket()
-                .to_path_buf();
             let sid = session.id;
             let vmnet_pool = state.vmnet_pools.clone();
             let teardown_route = state.docker.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 debug!(session_id = %sid, "tearing down macOS session networking");
-                if let Err(e) = sandbox_core::macos_session::teardown_macos_gateway(
-                    &sid,
-                    &teardown_route,
-                    &gateway_docker_socket,
-                ) {
+                if let Err(e) =
+                    sandbox_core::macos_session::teardown_macos_gateway(&sid, &teardown_route)
+                {
                     warn!(%sid, error = %e, "macOS gateway teardown failed (best-effort)");
                 }
                 if let Err(e) = vmnet_pool.release_lima_slot(&sid) {
@@ -7360,10 +7320,6 @@ async fn stop_session(
             // release happens on stop. Releasing on stop without re-claiming
             // on start would cause the pool count to drift downward with each
             // stop/start cycle, allowing over-admission.
-            let gateway_docker_socket = state
-                .gateway_lima_manager
-                .gateway_docker_socket()
-                .to_path_buf();
             let network = state.network.clone();
             let sid = session.id;
             let route = state.docker.clone();
@@ -7371,7 +7327,7 @@ async fn stop_session(
                 debug!(session_id = %sid, "tearing down lite container session networking (macOS)");
                 // Use the VM-routed gateway manager so stop_gateway targets
                 // the gateway VM's Docker daemon, not the host.
-                let gw = sandbox_core::GatewayManager::with_vm_route(route, gateway_docker_socket);
+                let gw = sandbox_core::GatewayManager::with_route(route);
                 if let Err(e) = gw.stop_gateway(&sid) {
                     warn!(%sid, error = %e, "failed to stop lite gateway (best-effort)");
                 }
@@ -7542,21 +7498,15 @@ async fn remove_session(
         {
             if session.backend == BackendKind::Lima {
                 // macOS Lima: tear down via the forwarded gateway socket + release the vmnet slot.
-                let gateway_docker_socket = state
-                    .gateway_lima_manager
-                    .gateway_docker_socket()
-                    .to_path_buf();
                 let sid = session.id;
                 let vmnet_pool = state.vmnet_pools.clone();
                 let base_dir = state.base_dir.clone();
                 let teardown_route = state.docker.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     debug!(session_id = %sid, "tearing down macOS session networking (full cleanup)");
-                    if let Err(e) = sandbox_core::macos_session::teardown_macos_gateway(
-                        &sid,
-                        &teardown_route,
-                        &gateway_docker_socket,
-                    ) {
+                    if let Err(e) =
+                        sandbox_core::macos_session::teardown_macos_gateway(&sid, &teardown_route)
+                    {
                         warn!(%sid, error = %e, "macOS gateway teardown failed (best-effort)");
                     }
                     if let Err(e) = vmnet_pool.release_lima_slot(&sid) {
@@ -7570,10 +7520,6 @@ async fn remove_session(
             } else {
                 // Container (lite) backend on macOS: tear down via forwarded
                 // gateway socket + release the session-count token.
-                let gateway_docker_socket = state
-                    .gateway_lima_manager
-                    .gateway_docker_socket()
-                    .to_path_buf();
                 let glm = state.gateway_lima_manager.clone();
                 let vmnet_pool = state.vmnet_pools.clone();
                 // A token is a count, so releasing one needs the operator
@@ -7591,10 +7537,7 @@ async fn remove_session(
                 let gw_route = state.docker.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     debug!(session_id = %sid, "tearing down lite container session networking (macOS, full cleanup)");
-                    let gw = sandbox_core::GatewayManager::with_vm_route(
-                        gw_route,
-                        gateway_docker_socket,
-                    );
+                    let gw = sandbox_core::GatewayManager::with_route(gw_route);
                     if let Err(e) = gw.stop_gateway(&sid) {
                         warn!(%sid, error = %e, "failed to stop lite gateway (best-effort)");
                     }
@@ -8933,9 +8876,9 @@ async fn dns_propagation_loop(
 
         // Read resolved.json from the gateway container.
         let sid = session_id;
-        let resolved_socket = probe_socket.clone();
+        let resolved_route = gateway.route().clone();
         let report = match tokio::task::spawn_blocking(move || {
-            read_resolved_json_on_socket(&sid, resolved_socket.as_deref())
+            read_resolved_json_on_route(&sid, &resolved_route)
         })
         .await
         {
@@ -9785,13 +9728,8 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
     // byte-identical on Linux.
     #[cfg(target_os = "macos")]
     {
-        let sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
-        let gw = Arc::new(sandbox_core::GatewayManager::with_vm_route(
+        let gw = Arc::new(sandbox_core::GatewayManager::with_route(
             state.docker.clone(),
-            sock.clone(),
         ));
         let route = state.docker.clone();
         let network = state.network.clone();
@@ -9871,19 +9809,16 @@ async fn reapply_session_policy(session_id: &SessionId, caller_username: &str, s
         }
     } else {
         // No policy stored — write the fail-closed empty policy so CoreDNS
-        // returns NXDOMAIN for every query until a policy is installed.
-        // Route through the forwarded gateway-VM socket on macOS (host
-        // socket / no `-H` on Linux) so the write reaches the in-VM gateway.
+        // returns NXDOMAIN for every query until a policy is installed. The
+        // route reaches the host Docker daemon on Linux and the gateway VM's
+        // on macOS, so the write lands where the gateway container is.
         let empty = CoreDnsConfig::empty_policy_file_content();
-        let empty_write = {
-            let socket = policy_probe_socket(state);
-            write_file_to_container_on_socket(
-                socket.as_deref(),
-                &container,
-                "/etc/coredns/policy.conf",
-                &empty,
-            )
-        };
+        let empty_write = write_gateway_file(
+            &state.docker,
+            &container,
+            sandbox_docker_argv::gateway::GatewayFile::CorednsPolicy,
+            &empty,
+        );
         match empty_write {
             Ok(()) => {
                 debug!(
@@ -9993,10 +9928,6 @@ async fn restore_session_networking(
         use sandbox_core::gateway::gateway_image_tag_for_daemon;
         use sandbox_core::macos_session::setup_macos_gateway;
 
-        let sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         // Resolve the NIC whose macvlan the restored gateway container parents
         // on. Unlike a fresh claim, this site has a durable record and must
         // keep using it — see `nic_from_record_or_map` for why the record wins
@@ -10017,7 +9948,6 @@ async fn restore_session_networking(
             state.users_conf_pool.cidr.prefix_len()
         );
         let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
-        let setup_sock = sock.clone();
         let setup_route = state.docker.clone();
         match tokio::task::spawn_blocking(move || {
             setup_macos_gateway(
@@ -10025,7 +9955,6 @@ async fn restore_session_networking(
                 &ni,
                 &nic_name,
                 &setup_route,
-                &setup_sock,
                 &gateway_tag,
                 Some(&ca),
                 dns.as_deref(),
@@ -10234,10 +10163,6 @@ async fn restore_session_networking_lite(
         use sandbox_core::gateway::gateway_image_tag_for_daemon;
         use sandbox_core::macos_session::setup_macos_lite_gateway;
 
-        let sock = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
         let sid = *session_id;
         let ni = network_info.clone();
         let ca = ca_dir.clone();
@@ -10254,7 +10179,6 @@ async fn restore_session_networking_lite(
                 &sid,
                 &ni,
                 &setup_route,
-                &sock,
                 &gateway_tag,
                 Some(&ca),
                 dns.as_deref(),
@@ -12130,11 +12054,6 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
         }
     };
 
-    let gateway_docker_socket = state
-        .gateway_lima_manager
-        .gateway_docker_socket()
-        .to_path_buf();
-
     // -------------------------------------------------------------------------
     // Step 6a: unconditional gateway-side cleanup.
     // -------------------------------------------------------------------------
@@ -12154,12 +12073,10 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
         let is_running = session.state == SessionState::Running;
         if !is_running {
             // Teardown gateway container + macvlan (idempotent).
-            let sock = gateway_docker_socket.clone();
             let route = state.docker.clone();
             let sid = session.id;
             let tear_result =
-                tokio::task::spawn_blocking(move || teardown_macos_gateway(&sid, &route, &sock))
-                    .await;
+                tokio::task::spawn_blocking(move || teardown_macos_gateway(&sid, &route)).await;
             match tear_result {
                 Ok(Ok(())) => {
                     cleaned_gw_6a += 1;
@@ -12729,10 +12646,6 @@ async fn gateway_monitor(state: Arc<AppState>) {
 
                         let sid = session.id;
                         let ni = network_info.clone();
-                        let sock = state
-                            .gateway_lima_manager
-                            .gateway_docker_socket()
-                            .to_path_buf();
                         // Refuse rather than re-create this session's gateway
                         // container on a guessed slot or interface: that would
                         // bring it back up on an L2 segment nothing chose for it,
@@ -12803,7 +12716,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
 
                         let recreate_route = state.docker.clone();
                         let recreate_result = tokio::task::spawn_blocking(move || {
-                            sandbox_core::teardown_macos_gateway(&sid, &recreate_route, &sock)?;
+                            sandbox_core::teardown_macos_gateway(&sid, &recreate_route)?;
                             let ca_opt = if ca_for_setup.join("cert.pem").exists() {
                                 Some(ca_for_setup.as_path())
                             } else {
@@ -12814,7 +12727,6 @@ async fn gateway_monitor(state: Arc<AppState>) {
                                 &ni,
                                 &nic_name,
                                 &recreate_route,
-                                &sock,
                                 &image_tag,
                                 ca_opt,
                                 init_dns_owned.as_deref(),
@@ -13036,7 +12948,6 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
             let pool = pool.clone();
             let state = Arc::clone(&state_per_session);
             async move {
-                let sock = mgr.gateway_docker_socket().to_path_buf();
                 // No guessed slot, no guessed NIC. A session recovered onto a
                 // default slot index or a made-up interface would come back on
                 // an L2 segment nothing chose for it; leaving it unrecovered
@@ -13089,7 +13000,7 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
                 let recover_route = state.docker.clone();
                 let join_result = tokio::task::spawn_blocking(move || {
                     let result = (|| -> Result<(), sandbox_core::error::SandboxError> {
-                        sandbox_core::teardown_macos_gateway(&sid, &recover_route, &sock)?;
+                        sandbox_core::teardown_macos_gateway(&sid, &recover_route)?;
                         let ca_opt = if ca_dir.join("cert.pem").exists() {
                             Some(ca_dir.as_path())
                         } else {
@@ -13100,7 +13011,6 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
                             &ni,
                             &nic_name,
                             &recover_route,
-                            &sock,
                             &image_tag,
                             ca_opt,
                             init_dns_owned.as_deref(),

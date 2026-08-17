@@ -35,6 +35,7 @@ use std::time::Duration;
 use sandbox_docker_argv::container::{
     ContainerCommand, ContainerCreateSpec, InspectFlag, InspectFormat, RemoveForce,
 };
+use sandbox_docker_argv::gateway::StdinCommand;
 use sandbox_docker_argv::image::StagedImage;
 use sandbox_docker_argv::network::NetworkCreateSpec;
 
@@ -85,6 +86,19 @@ pub enum DockerOp {
     ContainerExec {
         name: String,
         command: ContainerCommand,
+    },
+    /// Run one of the enumerated stdin-fed commands inside a container,
+    /// with `body` on its standard input.
+    ///
+    /// This is the shape the egress-plane artifacts travel in: an nftables
+    /// ruleset or a policy file is too large for an argv and contains
+    /// newlines, so it goes to the child's stdin. `command` is a closed
+    /// enum and `body` is data — the child reads it as content, never as a
+    /// command line.
+    ContainerExecStdin {
+        name: String,
+        command: StdinCommand,
+        body: String,
     },
     /// Run the one-shot init container that chowns a session's home volume.
     HomeVolumeChown {
@@ -188,6 +202,9 @@ impl DockerOp {
             DockerOp::ContainerExec { name, command } => {
                 container::container_exec_argv(name, command)
             }
+            DockerOp::ContainerExecStdin { name, command, .. } => {
+                container::container_exec_stdin_argv(name, *command)
+            }
             DockerOp::HomeVolumeChown {
                 session_id,
                 image_tag,
@@ -245,6 +262,18 @@ impl DockerOp {
     pub fn stdin_tarball(&self) -> Option<StagedImage> {
         match self {
             DockerOp::ImageLoad { image } => Some(*image),
+            _ => None,
+        }
+    }
+
+    /// The artifact this op writes to the child's standard input, if any.
+    ///
+    /// Distinct from [`Self::stdin_tarball`], which names a file the
+    /// executing side opens: this one is content the daemon supplied and
+    /// the op carries. Only the egress-plane writes have it.
+    pub fn stdin_body(&self) -> Option<&str> {
+        match self {
+            DockerOp::ContainerExecStdin { body, .. } => Some(body),
             _ => None,
         }
     }
@@ -460,7 +489,12 @@ fn run_docker_locally(
     }
     let argv = op.argv()?;
     let mut cmd = docker_command(socket, &argv);
-    crate::process::run_with_timeout(&mut cmd, timeout, label)
+    match op.stdin_body() {
+        Some(body) => {
+            crate::process::run_with_timeout_stdin(&mut cmd, body.as_bytes(), timeout, label)
+        }
+        None => crate::process::run_with_timeout(&mut cmd, timeout, label),
+    }
 }
 
 /// Stream a staged tarball into `docker load`.
@@ -596,6 +630,11 @@ mod tests {
                 name: "c".to_string(),
                 command: ContainerCommand::GatewayHealthcheck,
             },
+            DockerOp::ContainerExecStdin {
+                name: "c".to_string(),
+                command: StdinCommand::ApplyNftRuleset,
+                body: "table inet sandbox_dnat {}\n".to_string(),
+            },
             DockerOp::HomeVolumeChown {
                 session_id: "abc".to_string(),
                 image_tag: "img".to_string(),
@@ -648,7 +687,7 @@ mod tests {
         // Every variant of the enum is represented above. When a variant is
         // added this count fails first, which is the reminder to extend the
         // list rather than to bump the number.
-        assert_eq!(ops.len(), 21, "every DockerOp variant must be covered here");
+        assert_eq!(ops.len(), 22, "every DockerOp variant must be covered here");
         for op in ops {
             let argv = op.argv().expect("every op above renders");
             assert!(
@@ -657,6 +696,31 @@ mod tests {
             );
             assert!(!argv.is_empty(), "an op must render at least a subcommand");
         }
+    }
+
+    /// The two stdin channels are disjoint, and each op uses at most one:
+    /// a tarball is a file the executing side opens, a body is content the
+    /// op carries. An op claiming both would leave the executor choosing.
+    #[test]
+    fn an_op_streams_a_tarball_or_a_body_but_never_both() {
+        let write = DockerOp::ContainerExecStdin {
+            name: "sandbox-gw-abc".to_string(),
+            command: StdinCommand::WriteGatewayFile {
+                file: sandbox_docker_argv::gateway::GatewayFile::CorednsPolicy,
+                delivery: sandbox_docker_argv::gateway::FileDelivery::Replace,
+            },
+            body: "policy\n".to_string(),
+        };
+        assert_eq!(write.stdin_body(), Some("policy\n"));
+        assert!(write.stdin_tarball().is_none());
+
+        let load = DockerOp::ImageLoad {
+            image: StagedImage::Gateway,
+        };
+        assert!(load.stdin_body().is_none());
+        assert!(load.stdin_tarball().is_some());
+
+        assert!(DockerOp::DaemonInfo.stdin_body().is_none());
     }
 
     #[test]

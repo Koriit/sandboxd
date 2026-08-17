@@ -381,6 +381,31 @@ pub enum DockerOp {
         name: String,
         command: ContainerCommand,
     },
+    /// `docker exec -i` one of the enumerated stdin-fed commands inside a
+    /// container, with `body` on its standard input.
+    ///
+    /// This is the shape the egress-plane artifacts arrive in: an nftables
+    /// ruleset, an Envoy bootstrap or listener, a CoreDNS policy. They are
+    /// multi-KB and contain newlines, so they travel as a JSON string field
+    /// rather than in an argv.
+    ///
+    /// **Framing.** The channel is newline-delimited JSON and this field is
+    /// the largest thing that crosses it. It is safe because JSON string
+    /// encoding is what escapes the delimiter: `serde_json` emits `\n` for a
+    /// newline, `\"` for a quote, `\uXXXX` for the other control characters,
+    /// and multi-byte UTF-8 for the rest — none of which is a literal
+    /// `0x0A`. A frame therefore contains exactly one newline, the one the
+    /// writer appends. `body_is_escaped_by_the_json_encoding` pins that with
+    /// a body built to break it.
+    ///
+    /// **The body is data, not a command.** `command` decides what reads it,
+    /// and every variant reads it as content: `nft -f -` parses a ruleset,
+    /// `cat` writes bytes to a file. Nothing interprets it as a command line.
+    ContainerExecStdin {
+        name: String,
+        command: StdinCommand,
+        body: String,
+    },
     /// Run the one-shot init container that chowns a session's home volume.
     HomeVolumeChown {
         session_id: String,
@@ -488,6 +513,62 @@ pub enum ContainerCommand {
     GatewayHealthcheck,
     /// One named gateway component's readiness probe.
     ComponentProbe { component: GatewayComponent },
+    /// Read one of the enumerated gateway policy files back out.
+    ReadGatewayFile { file: GatewayFile },
+    /// List one of the two sandbox nftables tables.
+    ListNftTable { table: NftTable },
+    /// Read Envoy's active-listener gauge from its admin endpoint.
+    EnvoyActiveListenerCount,
+}
+
+/// The closed set of commands the daemon may feed a body to on stdin.
+///
+/// Adding a variant widens what a compromised daemon can write inside the
+/// operator's gateway container — see the warning on
+/// `sandbox_docker_argv::gateway::StdinCommand`, which this mirrors.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "stdin_command", rename_all = "snake_case")]
+pub enum StdinCommand {
+    /// `nft -f -` — apply an nftables ruleset read from stdin.
+    ApplyNftRuleset,
+    /// Deliver one gateway file, its content read from stdin.
+    WriteGatewayFile {
+        file: GatewayFile,
+        delivery: FileDelivery,
+    },
+}
+
+/// The gateway-container artifacts the daemon may name.
+///
+/// Each variant maps to a `&'static str` path in the argv crate; no path
+/// crosses the wire. Adding a variant is a security change — see the
+/// warning on `sandbox_docker_argv::gateway::GatewayFile`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayFile {
+    CorednsPolicy,
+    CorednsResolved,
+    MitmproxyPolicy,
+    MitmproxyCaKey,
+    MitmproxyCaCert,
+    EnvoyBootstrap,
+    EnvoyListener,
+}
+
+/// How a gateway file is put in place.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDelivery {
+    Replace,
+    AtomicRename,
+}
+
+/// The two `inet` nftables tables the gateway's policy plane manages.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NftTable {
+    SandboxDnat,
+    SandboxPolicy,
 }
 
 /// The gateway container's five long-running components.
@@ -664,6 +745,50 @@ impl From<&NetworkOption> for sandbox_docker_argv::network::NetworkOption {
     }
 }
 
+impl From<GatewayFile> for sandbox_docker_argv::gateway::GatewayFile {
+    fn from(value: GatewayFile) -> Self {
+        match value {
+            GatewayFile::CorednsPolicy => Self::CorednsPolicy,
+            GatewayFile::CorednsResolved => Self::CorednsResolved,
+            GatewayFile::MitmproxyPolicy => Self::MitmproxyPolicy,
+            GatewayFile::MitmproxyCaKey => Self::MitmproxyCaKey,
+            GatewayFile::MitmproxyCaCert => Self::MitmproxyCaCert,
+            GatewayFile::EnvoyBootstrap => Self::EnvoyBootstrap,
+            GatewayFile::EnvoyListener => Self::EnvoyListener,
+        }
+    }
+}
+
+impl From<FileDelivery> for sandbox_docker_argv::gateway::FileDelivery {
+    fn from(value: FileDelivery) -> Self {
+        match value {
+            FileDelivery::Replace => Self::Replace,
+            FileDelivery::AtomicRename => Self::AtomicRename,
+        }
+    }
+}
+
+impl From<NftTable> for sandbox_docker_argv::gateway::NftTable {
+    fn from(value: NftTable) -> Self {
+        match value {
+            NftTable::SandboxDnat => Self::SandboxDnat,
+            NftTable::SandboxPolicy => Self::SandboxPolicy,
+        }
+    }
+}
+
+impl From<StdinCommand> for sandbox_docker_argv::gateway::StdinCommand {
+    fn from(value: StdinCommand) -> Self {
+        match value {
+            StdinCommand::ApplyNftRuleset => Self::ApplyNftRuleset,
+            StdinCommand::WriteGatewayFile { file, delivery } => Self::WriteGatewayFile {
+                file: file.into(),
+                delivery: delivery.into(),
+            },
+        }
+    }
+}
+
 impl From<&ContainerCommand> for sandbox_docker_argv::container::ContainerCommand {
     fn from(value: &ContainerCommand) -> Self {
         match value {
@@ -673,6 +798,13 @@ impl From<&ContainerCommand> for sandbox_docker_argv::container::ContainerComman
             ContainerCommand::ComponentProbe { component } => Self::ComponentProbe {
                 component: (*component).into(),
             },
+            ContainerCommand::ReadGatewayFile { file } => Self::ReadGatewayFile {
+                file: (*file).into(),
+            },
+            ContainerCommand::ListNftTable { table } => Self::ListNftTable {
+                table: (*table).into(),
+            },
+            ContainerCommand::EnvoyActiveListenerCount => Self::EnvoyActiveListenerCount,
         }
     }
 }
@@ -804,6 +936,54 @@ impl From<&sandbox_docker_argv::network::NetworkOption> for NetworkOption {
     }
 }
 
+impl From<sandbox_docker_argv::gateway::GatewayFile> for GatewayFile {
+    fn from(value: sandbox_docker_argv::gateway::GatewayFile) -> Self {
+        use sandbox_docker_argv::gateway::GatewayFile as Src;
+        match value {
+            Src::CorednsPolicy => Self::CorednsPolicy,
+            Src::CorednsResolved => Self::CorednsResolved,
+            Src::MitmproxyPolicy => Self::MitmproxyPolicy,
+            Src::MitmproxyCaKey => Self::MitmproxyCaKey,
+            Src::MitmproxyCaCert => Self::MitmproxyCaCert,
+            Src::EnvoyBootstrap => Self::EnvoyBootstrap,
+            Src::EnvoyListener => Self::EnvoyListener,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::gateway::FileDelivery> for FileDelivery {
+    fn from(value: sandbox_docker_argv::gateway::FileDelivery) -> Self {
+        use sandbox_docker_argv::gateway::FileDelivery as Src;
+        match value {
+            Src::Replace => Self::Replace,
+            Src::AtomicRename => Self::AtomicRename,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::gateway::NftTable> for NftTable {
+    fn from(value: sandbox_docker_argv::gateway::NftTable) -> Self {
+        use sandbox_docker_argv::gateway::NftTable as Src;
+        match value {
+            Src::SandboxDnat => Self::SandboxDnat,
+            Src::SandboxPolicy => Self::SandboxPolicy,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::gateway::StdinCommand> for StdinCommand {
+    fn from(value: sandbox_docker_argv::gateway::StdinCommand) -> Self {
+        use sandbox_docker_argv::gateway::StdinCommand as Src;
+        match value {
+            Src::ApplyNftRuleset => Self::ApplyNftRuleset,
+            Src::WriteGatewayFile { file, delivery } => Self::WriteGatewayFile {
+                file: file.into(),
+                delivery: delivery.into(),
+            },
+        }
+    }
+}
+
 impl From<&sandbox_docker_argv::container::ContainerCommand> for ContainerCommand {
     fn from(value: &sandbox_docker_argv::container::ContainerCommand) -> Self {
         use sandbox_docker_argv::container::ContainerCommand as Src;
@@ -814,6 +994,13 @@ impl From<&sandbox_docker_argv::container::ContainerCommand> for ContainerComman
             Src::ComponentProbe { component } => Self::ComponentProbe {
                 component: (*component).into(),
             },
+            Src::ReadGatewayFile { file } => Self::ReadGatewayFile {
+                file: (*file).into(),
+            },
+            Src::ListNftTable { table } => Self::ListNftTable {
+                table: (*table).into(),
+            },
+            Src::EnvoyActiveListenerCount => Self::EnvoyActiveListenerCount,
         }
     }
 }
@@ -958,6 +1145,9 @@ pub fn docker_argv(op: &crate::protocol::DockerOp) -> Result<Vec<String>, String
         DockerOp::ContainerExec { name, command } => {
             let command: container::ContainerCommand = command.into();
             container::container_exec_argv(name, &command)
+        }
+        DockerOp::ContainerExecStdin { name, command, .. } => {
+            container::container_exec_stdin_argv(name, (*command).into())
         }
         DockerOp::HomeVolumeChown {
             session_id,

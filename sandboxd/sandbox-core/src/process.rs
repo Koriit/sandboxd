@@ -70,6 +70,86 @@ pub fn run_with_timeout(
     }
 }
 
+/// Run a [`Command`] with a timeout, feeding `body` to its standard input.
+///
+/// The stdin-fed sibling of [`run_with_timeout`], for the child processes
+/// that read their input rather than taking it in argv — `nft -f -` reading
+/// a ruleset, `cat` writing a policy file. `body` is written in full and the
+/// pipe is then closed, which is what the child reads as EOF.
+///
+/// # Why writing the whole body before reading output does not deadlock
+///
+/// The general hazard is real: a child that fills its stdout pipe while the
+/// parent is still writing stdin blocks, and so does the parent. It does not
+/// apply here because both readers this is used with consume stdin to EOF
+/// before producing anything, and what they produce is a short diagnostic —
+/// `nft` prints a parse error, `cat` prints nothing. Point this at a filter
+/// that streams its input to its output and the reasoning stops holding.
+pub fn run_with_timeout_stdin(
+    cmd: &mut Command,
+    body: &[u8],
+    timeout: Duration,
+    operation: &str,
+) -> Result<Output, SandboxError> {
+    use std::io::Write;
+
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| SandboxError::Internal(format!("failed to spawn {operation}: {e}")))?;
+
+    // Take the handle so the pipe is closed by the drop below rather than
+    // staying open on the child struct — a child waiting on EOF would never
+    // exit, and the timeout would report a hang whose cause is this parent.
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(body).and_then(|()| stdin.flush()),
+        None => Err(std::io::Error::other("child has no stdin pipe")),
+    };
+    if let Err(e) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(SandboxError::Internal(format!(
+            "failed to write stdin for {operation}: {e}"
+        )));
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child.wait_with_output().map_err(|e| {
+                    SandboxError::Internal(format!(
+                        "failed to collect output from {operation}: {e}"
+                    ))
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    warn!(
+                        operation = operation,
+                        timeout_secs = timeout.as_secs(),
+                        "process timed out, killing"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SandboxError::Timeout {
+                        operation: operation.to_string(),
+                        duration: timeout.as_secs(),
+                    });
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                return Err(SandboxError::Internal(format!(
+                    "failed to poll {operation}: {e}"
+                )));
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -129,6 +209,39 @@ mod tests {
 
         assert!(!output.status.success());
         assert_eq!(output.status.code(), Some(42));
+    }
+
+    /// A body containing newlines, quotes and non-ASCII must arrive at the
+    /// child byte-for-byte. This is the local half of the property the
+    /// broker channel has to hold too: nothing between the generator and
+    /// the process that parses the artifact may reinterpret it.
+    #[test]
+    fn run_with_timeout_stdin_delivers_the_body_verbatim() {
+        let body = "table inet sandbox_dnat {\n  # \"quoted\" — ünïcode\n}\n";
+        let output = run_with_timeout_stdin(
+            &mut Command::new("cat"),
+            body.as_bytes(),
+            Duration::from_secs(5),
+            "cat",
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), body);
+    }
+
+    /// The pipe must be closed after the write, or a child that reads to
+    /// EOF never exits and the caller sees a timeout it caused itself.
+    #[test]
+    fn run_with_timeout_stdin_closes_the_pipe_so_the_child_can_exit() {
+        let output = run_with_timeout_stdin(
+            Command::new("sh").args(["-c", "cat > /dev/null; echo done"]),
+            &b"x".repeat(200_000),
+            Duration::from_secs(10),
+            "drain",
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
     }
 
     #[test]

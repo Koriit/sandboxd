@@ -50,6 +50,7 @@
 use std::path::Path;
 
 pub mod container;
+pub mod gateway;
 pub mod image;
 pub mod network;
 pub mod volume;

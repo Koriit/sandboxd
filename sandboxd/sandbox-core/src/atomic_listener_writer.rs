@@ -63,12 +63,18 @@ use std::sync::Mutex;
 use tempfile::Builder as TempFileBuilder;
 use tracing::{debug, info};
 
+use sandbox_docker_argv::gateway::{FileDelivery, GatewayFile, StdinCommand};
+
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
-use crate::policy::{
-    FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, LISTENER_FILE_IN_CONTAINER,
-    LISTENER_FILE_NAME,
-};
+use crate::policy::{FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, LISTENER_FILE_NAME};
 use crate::session::SessionId;
+
+/// Wall-clock budget for delivering one listener generation into a
+/// container. The listener is a few tens of KB over a local socket; longer
+/// than this and the DNS-propagation tick that issued it is better off
+/// failing and retrying than blocking the next generation behind it.
+const LISTENER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Return the root directory on the host under which per-session listener
 /// directories live. `sandboxd` bind-mounts `${root}/<session-id>/` into
@@ -383,12 +389,10 @@ pub fn forget_cached_listener(session_id: &SessionId) {
 /// emits — only the *delivery* changes (host rename → in-container rename).
 pub fn write_listener_into_container(
     session_id: &SessionId,
-    gateway_docker_socket: &Path,
+    route: &DockerRoute,
     container: &str,
     new_content: &str,
 ) -> Result<(), SandboxError> {
-    use std::process::Stdio;
-
     validate_markers(new_content).map_err(|e| SandboxError::Gateway(e.to_string()))?;
 
     // Diff against the cached prior generation. A miss means "initial"
@@ -403,36 +407,20 @@ pub fn write_listener_into_container(
     // (watched) directory, then `mv -f` it onto the canonical path. The
     // rename within the tmpfs emits the `IN_MOVED_TO` event Envoy's LDS
     // watcher subscribes to. `mkdir -p` guards against the dir not yet
-    // existing (matches `write_file_to_gateway_container`). The argv is
-    // built by `macos_listener_exec_argv` so the rename form is exactly
-    // what the unit test asserts.
-    let argv = macos_listener_exec_argv(gateway_docker_socket, container);
-    let mut child = std::process::Command::new("docker")
-        .args(&argv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    // existing. All three paths in that body are constants of the argv
+    // crate, selected by `GatewayFile::EnvoyListener` — the listener
+    // content travels on stdin and never near the command line.
+    let output = route
+        .run(
+            listener_delivery_op(container, new_content),
+            LISTENER_WRITE_TIMEOUT,
+            "docker exec (in-container listener delivery)",
+        )
         .map_err(|e| {
             SandboxError::Gateway(format!(
-                "failed to spawn docker exec for in-container listener write to {container}: {e}"
+                "failed to deliver the Envoy listener into {container}: {e}"
             ))
         })?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(new_content.as_bytes()).map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to pipe listener content into {container}: {e}"
-            ))
-        })?;
-    }
-    child.stdin.take();
-
-    let output = child.wait_with_output().map_err(|e| {
-        SandboxError::Gateway(format!(
-            "failed to complete in-container listener write to {container}: {e}"
-        ))
-    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -452,30 +440,24 @@ pub fn write_listener_into_container(
     Ok(())
 }
 
-/// Build the argv (excluding the leading `docker`) for the macOS
-/// in-container listener delivery. Factored out so the write-temp + `mv -f`
-/// rename form can be asserted in unit tests without spawning a process.
+/// The op that delivers `content` as the LDS-served listener inside
+/// `container`.
+///
+/// Factored out so the write-temp + `mv -f` rename form, and the identity
+/// between the compiler's output and the bytes the container receives, can
+/// both be asserted without spawning a process.
 ///
 /// Linux never calls this — the host [`AtomicListenerWriter`] path is used
 /// instead — so it has no effect on Linux behaviour.
-pub fn macos_listener_exec_argv(gateway_docker_socket: &Path, container: &str) -> Vec<String> {
-    let listener = LISTENER_FILE_IN_CONTAINER;
-    let tmp = format!("{listener}.tmp");
-    let dir = Path::new(listener)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_string());
-    let sh_cmd = format!("mkdir -p {dir} && cat > '{tmp}' && mv -f '{tmp}' '{listener}'");
-    vec![
-        "-H".to_string(),
-        format!("unix://{}", gateway_docker_socket.display()),
-        "exec".to_string(),
-        "-i".to_string(),
-        container.to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        sh_cmd,
-    ]
+pub fn listener_delivery_op(container: &str, content: &str) -> DockerOp {
+    DockerOp::ContainerExecStdin {
+        name: container.to_string(),
+        command: StdinCommand::WriteGatewayFile {
+            file: GatewayFile::EnvoyListener,
+            delivery: FileDelivery::AtomicRename,
+        },
+        body: content.to_string(),
+    }
 }
 
 /// Check that `content` contains both filter-chains markers **exactly
@@ -722,26 +704,24 @@ mod tests {
     }
 
     #[test]
-    fn macos_listener_exec_argv_uses_write_temp_then_rename() {
+    fn listener_delivery_uses_write_temp_then_rename() {
         // The macOS in-container delivery MUST be write-temp + `mv -f`
         // (the validated mechanism that fires Envoy's LDS watcher),
-        // NOT an in-place `cat >` truncate (silently ignored). Pin the
-        // rename form and the forwarded-socket `-H` prefix.
-        let sock = PathBuf::from("/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gw.sock");
-        let argv = macos_listener_exec_argv(&sock, "sandbox-gw-deadbeef");
+        // NOT an in-place `cat >` truncate (silently ignored).
+        let op = listener_delivery_op("sandbox-gw-deadbeef", "listener body\n");
+        let argv = op.argv().expect("the delivery op renders");
 
-        // `-H unix://<sock>` must lead so the exec targets the forwarded
-        // in-VM Docker daemon, not the host one.
-        assert_eq!(argv[0], "-H");
+        // No `-H`: the target authority is added by whichever side runs the
+        // command, from a socket it owns. An op that named its own daemon
+        // would be a second channel for choosing the endpoint.
+        assert!(!argv.iter().any(|a| a == "-H" || a.starts_with("unix://")));
         assert_eq!(
-            argv[1],
-            "unix:///var/lib/sandboxd/501/501/lima/sandboxd-gateway/gw.sock"
+            &argv[..5],
+            &["exec", "-i", "sandbox-gw-deadbeef", "sh", "-c"]
         );
-        assert_eq!(&argv[2..6], &["exec", "-i", "sandbox-gw-deadbeef", "sh"]);
-        assert_eq!(argv[6], "-c");
 
-        let sh = &argv[7];
-        let listener = LISTENER_FILE_IN_CONTAINER;
+        let sh = &argv[5];
+        let listener = crate::policy::LISTENER_FILE_IN_CONTAINER;
         let tmp = format!("{listener}.tmp");
         // Rename form, in the watched dir, single shell round-trip.
         assert!(
@@ -763,6 +743,9 @@ mod tests {
             tmp.starts_with(crate::policy::LISTENER_DIR_IN_CONTAINER),
             "temp file must live in the watched listener dir; got: {tmp}"
         );
+        // The listener itself is a byte stream, not a command-line word.
+        assert_eq!(op.stdin_body(), Some("listener body\n"));
+        assert!(!sh.contains("listener body"));
     }
 
     #[test]

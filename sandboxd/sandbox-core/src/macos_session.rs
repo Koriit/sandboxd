@@ -17,8 +17,6 @@
 #[cfg(target_os = "macos")]
 use std::path::Path;
 #[cfg(target_os = "macos")]
-use std::process::Command;
-#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -26,12 +24,16 @@ use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
 use sandbox_docker_argv::container::RemoveForce;
+#[cfg(target_os = "macos")]
+use sandbox_docker_argv::gateway::GatewayFile;
 use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver, NetworkOption};
 
 use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 #[cfg(target_os = "macos")]
 use crate::network::NetworkInfo;
+#[cfg(target_os = "macos")]
+use crate::policy_distributor::{envoy_seed_artifacts, write_gateway_file};
 #[cfg(target_os = "macos")]
 use crate::session::SessionId;
 
@@ -78,45 +80,6 @@ const DOCKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DOCKER_RM_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
-// Environment helper
-// ---------------------------------------------------------------------------
-
-/// Build a `docker -H unix://<socket>` command targeting the gateway VM's
-/// forwarded Docker socket.
-///
-/// Clears the inherited environment and reconstructs only the vars the
-/// docker CLI needs (`PATH`, `HOME`), so `DOCKER_HOST` or another ambient
-/// override cannot redirect the command away from `-H`.
-///
-/// ⚠️ **One caller remains, deliberately.** Every container- and
-/// network-lifecycle operation in this module now goes through the typed
-/// Docker op seam; this helper survives for
-/// [`write_file_to_gateway_container`], which pipes a multi-KB file body
-/// into `docker exec … sh -c 'cat > path'`. That shape is part of the
-/// policy-plane family, which is being moved separately so it can be
-/// reviewed as an egress-enforcement change rather than as hunks inside a
-/// lifecycle refactor. Converting it here is not a tidy-up — it is the
-/// change that was separated out on purpose. Do not add a second caller;
-/// when that one moves, this helper goes with it.
-#[cfg(target_os = "macos")]
-fn gateway_docker_cmd(gateway_docker_socket: &Path) -> Command {
-    let socket_str = format!("unix://{}", gateway_docker_socket.display());
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        warn!("gateway_docker_cmd: HOME is unset; docker CLI may fail to locate its config dir");
-    }
-
-    let mut cmd = Command::new("docker");
-    cmd.env_clear()
-        .env("PATH", &path_value)
-        .env("HOME", home)
-        .args(["-H", &socket_str]);
-    cmd
-}
-
-// ---------------------------------------------------------------------------
 // setup_macos_gateway
 // ---------------------------------------------------------------------------
 
@@ -151,7 +114,6 @@ pub fn setup_macos_gateway(
     network_info: &NetworkInfo,
     nic_name: &str,
     docker: &DockerRoute,
-    gateway_docker_socket: &Path,
     gateway_image_tag: &str,
     ca_dir: Option<&Path>,
     initial_dns_policy: Option<&str>,
@@ -264,67 +226,42 @@ pub fn setup_macos_gateway(
     // throwaway CA the sandbox VM does not trust, so every intercepted HTTPS
     // flow fails certificate verification. Same write path as the lite
     // sibling — shared via `provision_mitmproxy_ca`.
-    provision_mitmproxy_ca(gateway_docker_socket, &container_name, ca_dir)?;
+    provision_mitmproxy_ca(docker, &container_name, ca_dir)?;
 
-    // Write the Envoy static bootstrap into the container (same as Linux path).
-    {
-        use crate::policy::{BOOTSTRAP_FILE_IN_CONTAINER, PolicyCompiler};
-        let bootstrap = PolicyCompiler::compile_envoy_bootstrap();
-        if let Err(e) = write_file_to_gateway_container(
-            gateway_docker_socket,
-            &container_name,
-            BOOTSTRAP_FILE_IN_CONTAINER,
-            &bootstrap,
-        ) {
+    // Seed both Envoy artifacts into the container.
+    //
+    // The gateway entrypoint blocks until the bootstrap file and the
+    // listener file both exist before it starts Envoy. On macOS the listener
+    // directory is not bind-mounted from the host (no host-path →
+    // gateway-VM-path bridge), so both are written into the container's
+    // tmpfs; the write op's delivery script creates the parent directory
+    // inline, so no separate mkdir step is needed.
+    //
+    // The initial listener is deny-all, which is what makes unblocking the
+    // entrypoint safe. Subsequent policy-driven listener replacements are
+    // distributed via `PolicyDistributor::distribute` using
+    // `write_listener_into_container` — the same content the Linux
+    // `AtomicListenerWriter` writes, delivered in-container instead.
+    for (file, content) in envoy_seed_artifacts() {
+        if let Err(e) = write_gateway_file(docker, &container_name, file, &content) {
             return Err(SandboxError::Gateway(format!(
-                "failed to write Envoy bootstrap to macOS gateway {container_name}: {e}"
+                "failed to write {} to macOS gateway {container_name}: {e}",
+                file.path()
             )));
         }
         debug!(
             session_id = %session_id,
-            "wrote Envoy static bootstrap to macOS gateway container"
-        );
-    }
-
-    // Seed the initial deny-all Envoy listener into the container.
-    //
-    // The gateway entrypoint blocks until both the bootstrap file (written
-    // above) and this listener file exist before it starts Envoy. On macOS
-    // the listener directory is not bind-mounted from the host (no host-path
-    // → gateway-VM-path bridge), so the file must be injected via `docker
-    // exec`. The `write_file_to_gateway_container` helper now creates the
-    // parent directory inline, so no separate mkdir step is needed.
-    //
-    // The initial deny-all listener unblocks Envoy at startup. Subsequent
-    // policy-driven listener replacements are distributed via
-    // `PolicyDistributor::distribute` using `write_listener_into_container`
-    // over the forwarded Docker socket — the same path as the Linux
-    // `AtomicListenerWriter` but tunnelled through the gateway-VM socket.
-    {
-        use crate::policy::{LISTENER_FILE_IN_CONTAINER, PolicyCompiler};
-        let listener = PolicyCompiler::compile_initial_envoy_listener();
-        if let Err(e) = write_file_to_gateway_container(
-            gateway_docker_socket,
-            &container_name,
-            LISTENER_FILE_IN_CONTAINER,
-            &listener,
-        ) {
-            return Err(SandboxError::Gateway(format!(
-                "failed to write initial Envoy listener to macOS gateway {container_name}: {e}"
-            )));
-        }
-        debug!(
-            session_id = %session_id,
-            "wrote initial deny-all Envoy listener to macOS gateway container"
+            artifact = file.as_str(),
+            "seeded Envoy artifact into macOS gateway container"
         );
     }
 
     // Write the initial DNS policy if provided.
     if let Some(policy_content) = initial_dns_policy {
-        if let Err(e) = write_file_to_gateway_container(
-            gateway_docker_socket,
+        if let Err(e) = write_gateway_file(
+            docker,
             &container_name,
-            "/etc/coredns/policy.conf",
+            GatewayFile::CorednsPolicy,
             policy_content,
         ) {
             warn!(
@@ -365,7 +302,7 @@ pub fn setup_macos_gateway(
     // daemon. Creating it once avoids redundant allocations.
     {
         use crate::gateway::GatewayManager;
-        let gm = GatewayManager::with_vm_route(docker.clone(), gateway_docker_socket.to_path_buf());
+        let gm = GatewayManager::with_route(docker.clone());
 
         // Step 9: Inject deny-all nftables into the gateway container.
         gm.inject_deny_all(session_id)?;
@@ -411,7 +348,6 @@ pub fn setup_macos_lite_gateway(
     session_id: &SessionId,
     network_info: &NetworkInfo,
     docker: &DockerRoute,
-    gateway_docker_socket: &Path,
     gateway_image_tag: &str,
     ca_dir: Option<&Path>,
     initial_dns_policy: Option<&str>,
@@ -466,46 +402,26 @@ pub fn setup_macos_lite_gateway(
     // per-session CA) does not recognize, so every intercepted HTTPS flow
     // fails certificate verification. Shared with the full-backend sibling
     // via `provision_mitmproxy_ca`.
-    provision_mitmproxy_ca(gateway_docker_socket, &container_name, ca_dir)?;
+    provision_mitmproxy_ca(docker, &container_name, ca_dir)?;
 
-    // Write the Envoy static bootstrap into the container.
-    {
-        use crate::policy::{BOOTSTRAP_FILE_IN_CONTAINER, PolicyCompiler};
-        let bootstrap = PolicyCompiler::compile_envoy_bootstrap();
-        if let Err(e) = write_file_to_gateway_container(
-            gateway_docker_socket,
-            &container_name,
-            BOOTSTRAP_FILE_IN_CONTAINER,
-            &bootstrap,
-        ) {
+    // Seed both Envoy artifacts into the container — same reasoning as the
+    // full-backend sibling: the entrypoint blocks on both, and the initial
+    // listener is deny-all.
+    for (file, content) in envoy_seed_artifacts() {
+        if let Err(e) = write_gateway_file(docker, &container_name, file, &content) {
             return Err(SandboxError::Gateway(format!(
-                "failed to write Envoy bootstrap to macOS lite gateway {container_name}: {e}"
-            )));
-        }
-    }
-
-    // Seed the initial deny-all Envoy listener.
-    {
-        use crate::policy::{LISTENER_FILE_IN_CONTAINER, PolicyCompiler};
-        let listener = PolicyCompiler::compile_initial_envoy_listener();
-        if let Err(e) = write_file_to_gateway_container(
-            gateway_docker_socket,
-            &container_name,
-            LISTENER_FILE_IN_CONTAINER,
-            &listener,
-        ) {
-            return Err(SandboxError::Gateway(format!(
-                "failed to write Envoy listener to macOS lite gateway {container_name}: {e}"
+                "failed to write {} to macOS lite gateway {container_name}: {e}",
+                file.path()
             )));
         }
     }
 
     // Write initial DNS policy if provided.
     if let Some(policy_content) = initial_dns_policy {
-        if let Err(e) = write_file_to_gateway_container(
-            gateway_docker_socket,
+        if let Err(e) = write_gateway_file(
+            docker,
             &container_name,
-            "/etc/coredns/policy.conf",
+            GatewayFile::CorednsPolicy,
             policy_content,
         ) {
             warn!(
@@ -545,7 +461,7 @@ pub fn setup_macos_lite_gateway(
     // Steps 9-11: Use GatewayManager over the forwarded socket for nft and health.
     {
         use crate::gateway::GatewayManager;
-        let gm = GatewayManager::with_vm_route(docker.clone(), gateway_docker_socket.to_path_buf());
+        let gm = GatewayManager::with_route(docker.clone());
         gm.inject_deny_all(session_id)?;
         gm.wait_for_components(session_id)?;
         gm.inject_dnat(session_id, network_info, &network_info.gateway_ip)?;
@@ -616,7 +532,6 @@ const MACOS_COREDNS_UPSTREAM: &str = "8.8.8.8 8.8.4.4 1.1.1.1";
 pub fn teardown_macos_gateway(
     session_id: &SessionId,
     docker: &DockerRoute,
-    gateway_docker_socket: &Path,
 ) -> Result<(), SandboxError> {
     let container_name = macos_gateway_container_name(session_id);
     let network_name = macos_docker_network_name(session_id);
@@ -631,7 +546,7 @@ pub fn teardown_macos_gateway(
     // Step 1: Flush DNAT rules (best-effort; container may already be gone).
     {
         use crate::gateway::GatewayManager;
-        let gm = GatewayManager::with_vm_route(docker.clone(), gateway_docker_socket.to_path_buf());
+        let gm = GatewayManager::with_route(docker.clone());
         if let Err(e) = gm.remove_dnat_rules(session_id) {
             warn!(
                 session_id = %session_id,
@@ -721,74 +636,8 @@ pub fn teardown_macos_gateway(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Write a file into a gateway container via `docker exec` over the
-/// forwarded socket.
-///
-/// Used by `setup_macos_gateway` to write the Envoy bootstrap and the
-/// initial DNS policy into the freshly-started container.
-#[cfg(target_os = "macos")]
-fn write_file_to_gateway_container(
-    gateway_docker_socket: &Path,
-    container_name: &str,
-    container_path: &str,
-    content: &str,
-) -> Result<(), SandboxError> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    // Use `mkdir -p` to ensure the parent directory exists before writing.
-    // The listener file lives under `/etc/envoy/listeners/` which is not
-    // created by the container image itself — the entrypoint only creates it
-    // as part of the Envoy start sequence, which is gated on this file
-    // already existing. Creating the parent inline here avoids the race.
-    let parent = std::path::Path::new(container_path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_string());
-    debug_assert!(
-        !parent.contains('\''),
-        "write_file_to_gateway_container: parent path contains single-quote: {parent}"
-    );
-    debug_assert!(
-        !container_path.contains('\''),
-        "write_file_to_gateway_container: container_path contains single-quote: {container_path}"
-    );
-    let sh_cmd = format!("mkdir -p '{parent}' && cat > '{container_path}'");
-
-    let mut child = gateway_docker_cmd(gateway_docker_socket)
-        .args(["exec", "-i", container_name, "sh", "-c", &sh_cmd])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to spawn write_file_to_gateway_container for {container_path}: {e}"
-            ))
-        })?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        let _ = stdin.write_all(content.as_bytes());
-    }
-    child.stdin.take();
-
-    let output = child.wait_with_output().map_err(|e| {
-        SandboxError::Gateway(format!(
-            "failed to wait for write_file_to_gateway_container {container_path}: {e}"
-        ))
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::Gateway(format!(
-            "write_file_to_gateway_container {container_path} failed: {stderr}"
-        )));
-    }
-    Ok(())
-}
-
 /// Read the per-session mitmproxy CA files from the host `ca_dir` and return
-/// the `(container_path, content)` pairs to write into the gateway container's
+/// the `(destination, content)` pairs to write into the gateway container's
 /// `/root/.mitmproxy` tmpfs.
 ///
 /// Two files mirror the Linux bind-mount layout (see `ca.rs`):
@@ -798,9 +647,9 @@ fn write_file_to_gateway_container(
 ///
 /// Factored out as a seam so the `setup_macos_lite_gateway` write step is unit-
 /// testable without spawning `docker exec`: a test populates a temp `ca_dir`
-/// and asserts the returned paths/contents.
+/// and asserts the returned destinations/contents.
 #[cfg(target_os = "macos")]
-fn mitmproxy_ca_writes(ca_dir: &Path) -> Result<Vec<(String, String)>, SandboxError> {
+fn mitmproxy_ca_writes(ca_dir: &Path) -> Result<Vec<(GatewayFile, String)>, SandboxError> {
     let ca_pem_src = ca_dir.join("mitmproxy-ca.pem");
     let ca_cert_src = ca_dir.join("mitmproxy-ca-cert.pem");
 
@@ -818,11 +667,8 @@ fn mitmproxy_ca_writes(ca_dir: &Path) -> Result<Vec<(String, String)>, SandboxEr
     })?;
 
     Ok(vec![
-        ("/root/.mitmproxy/mitmproxy-ca.pem".to_string(), ca_pem),
-        (
-            "/root/.mitmproxy/mitmproxy-ca-cert.pem".to_string(),
-            ca_cert,
-        ),
+        (GatewayFile::MitmproxyCaKey, ca_pem),
+        (GatewayFile::MitmproxyCaCert, ca_cert),
     ])
 }
 
@@ -843,23 +689,18 @@ fn mitmproxy_ca_writes(ca_dir: &Path) -> Result<Vec<(String, String)>, SandboxEr
 /// error (the gateway must never boot trusting an absent/empty CA).
 #[cfg(target_os = "macos")]
 fn provision_mitmproxy_ca(
-    gateway_docker_socket: &Path,
+    docker: &DockerRoute,
     container_name: &str,
     ca_dir: Option<&Path>,
 ) -> Result<(), SandboxError> {
     let Some(ca_dir) = ca_dir else {
         return Ok(());
     };
-    for (container_path, content) in mitmproxy_ca_writes(ca_dir)? {
-        if let Err(e) = write_file_to_gateway_container(
-            gateway_docker_socket,
-            container_name,
-            &container_path,
-            &content,
-        ) {
+    for (file, content) in mitmproxy_ca_writes(ca_dir)? {
+        if let Err(e) = write_gateway_file(docker, container_name, file, &content) {
             return Err(SandboxError::Gateway(format!(
-                "failed to write mitmproxy CA {container_path} to macOS gateway \
-                 {container_name}: {e}"
+                "failed to write mitmproxy CA {} to macOS gateway {container_name}: {e}",
+                file.path()
             )));
         }
     }
@@ -938,7 +779,7 @@ mod tests {
     // -- mitmproxy CA provisioning seam (hermetic) ---------------------------
 
     /// `mitmproxy_ca_writes` reads the two per-session CA files from the host
-    /// `ca_dir` and returns the `(container_path, content)` pairs that
+    /// `ca_dir` and returns the `(destination, content)` pairs that
     /// `setup_macos_lite_gateway` writes into the gateway container's
     /// `/root/.mitmproxy` tmpfs. Pins the canonical in-container paths and that
     /// each file's bytes round-trip — the contract that makes the sandbox
@@ -956,18 +797,14 @@ mod tests {
         assert_eq!(
             writes,
             vec![
-                (
-                    "/root/.mitmproxy/mitmproxy-ca.pem".to_string(),
-                    ca_pem.to_string()
-                ),
-                (
-                    "/root/.mitmproxy/mitmproxy-ca-cert.pem".to_string(),
-                    ca_cert.to_string()
-                ),
+                (GatewayFile::MitmproxyCaKey, ca_pem.to_string()),
+                (GatewayFile::MitmproxyCaCert, ca_cert.to_string()),
             ],
             "mitmproxy CA writes must target the two canonical tmpfs paths with \
              the host CA file contents verbatim",
         );
+        assert_eq!(writes[0].0.path(), "/root/.mitmproxy/mitmproxy-ca.pem");
+        assert_eq!(writes[1].0.path(), "/root/.mitmproxy/mitmproxy-ca-cert.pem");
     }
 
     /// A missing CA file is a hard error (the caller aborts create) — the
@@ -984,41 +821,50 @@ mod tests {
         );
     }
 
+    /// A route that cannot reach any Docker daemon, for asserting which
+    /// paths do and do not attempt an invocation.
+    #[cfg(target_os = "macos")]
+    fn unreachable_route() -> DockerRoute {
+        DockerRoute::Vm {
+            op_uid: TEST_OPERATOR_UID,
+            executor: std::sync::Arc::new(crate::docker::LocalSocketDockerExecutor::new(
+                "/nonexistent/gateway-docker.sock",
+                "/nonexistent",
+            )),
+        }
+    }
+
     /// `provision_mitmproxy_ca(None)` is a no-op: when no CA dir is supplied
-    /// the helper returns `Ok(())` without touching the socket.
+    /// the helper returns `Ok(())` without running any docker op.
     ///
-    /// The socket path is bogus on purpose. Any code path that reaches socket
-    /// I/O (the `write_file_to_gateway_container` call inside the `Some` branch)
-    /// would error and propagate via `?`, making the test fail — so an `Ok`
-    /// result proves the `None` branch short-circuited before any `docker exec`.
-    /// See `provision_mitmproxy_ca_with_complete_ca_reaches_socket` below for
-    /// the complementary assertion that the `Some`+complete-CA path DOES reach
-    /// the socket.
+    /// The route is unreachable on purpose. Any code path that reaches an
+    /// invocation would error and propagate via `?`, making the test fail —
+    /// so an `Ok` result proves the `None` branch short-circuited. See
+    /// `provision_mitmproxy_ca_with_complete_ca_runs_the_write` below for the
+    /// complementary assertion that the `Some`+complete-CA path DOES.
     #[cfg(target_os = "macos")]
     #[test]
     fn provision_mitmproxy_ca_none_is_noop() {
-        let bogus_sock = std::path::Path::new("/nonexistent/gateway-docker.sock");
         // unwrap() rather than is_ok(): if it errors, the message surfaces the cause.
-        provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", None)
+        provision_mitmproxy_ca(&unreachable_route(), "sandbox-gw-x", None)
             .expect("provision_mitmproxy_ca(None) must be a no-op Ok");
     }
 
-    /// `provision_mitmproxy_ca` with a complete CA dir DOES reach the socket:
-    /// a bogus socket path errors after the host-file reads succeed, proving
+    /// `provision_mitmproxy_ca` with a complete CA dir DOES run the write:
+    /// an unreachable route errors after the host-file reads succeed, proving
     /// the `None` test above is a genuine short-circuit check (not "always Ok").
     #[cfg(target_os = "macos")]
     #[test]
-    fn provision_mitmproxy_ca_with_complete_ca_reaches_socket() {
+    fn provision_mitmproxy_ca_with_complete_ca_runs_the_write() {
         let dir = tempfile::tempdir().unwrap();
         // Write both files that `mitmproxy_ca_writes` requires.
         std::fs::write(dir.path().join("mitmproxy-ca.pem"), "fake-key").unwrap();
         std::fs::write(dir.path().join("mitmproxy-ca-cert.pem"), "fake-cert").unwrap();
-        let bogus_sock = std::path::Path::new("/nonexistent/gateway-docker.sock");
-        // Host-file reads succeed; socket I/O is attempted and must fail.
-        let result = provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", Some(dir.path()));
+        // Host-file reads succeed; the docker op is attempted and must fail.
+        let result = provision_mitmproxy_ca(&unreachable_route(), "sandbox-gw-x", Some(dir.path()));
         assert!(
             result.is_err(),
-            "provision_mitmproxy_ca with a complete CA dir must error on a bogus socket"
+            "provision_mitmproxy_ca with a complete CA dir must error on an unreachable route"
         );
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -1027,19 +873,17 @@ mod tests {
         );
     }
 
-    /// A present-but-incomplete CA dir is a hard error before any socket I/O:
+    /// A present-but-incomplete CA dir is a hard error before any docker op:
     /// `provision_mitmproxy_ca` surfaces the `mitmproxy_ca_writes` read
     /// failure (missing cert-only file) rather than silently proceeding. The
-    /// error is produced reading the host CA files, so the bogus socket is
-    /// never contacted.
+    /// error is produced reading the host CA files, so no docker op runs.
     #[cfg(target_os = "macos")]
     #[test]
     fn provision_mitmproxy_ca_missing_file_errors() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("mitmproxy-ca.pem"), "x").unwrap();
-        let bogus_sock = std::path::Path::new("/nonexistent/gateway-docker.sock");
         assert!(
-            provision_mitmproxy_ca(bogus_sock, "sandbox-gw-x", Some(dir.path())).is_err(),
+            provision_mitmproxy_ca(&unreachable_route(), "sandbox-gw-x", Some(dir.path())).is_err(),
             "provision_mitmproxy_ca with an incomplete CA dir must error"
         );
     }

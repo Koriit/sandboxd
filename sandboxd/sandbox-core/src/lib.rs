@@ -79,8 +79,8 @@ pub use api::{
     WorkspaceModeDetailDto, WorkspaceOpDto, WorkspaceSecurityModelDto, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
-    AtomicListenerWriter, ListenerWriteError, forget_cached_listener, listener_host_root,
-    macos_listener_exec_argv, session_listener_host_dir, session_listener_host_path,
+    AtomicListenerWriter, ListenerWriteError, forget_cached_listener, listener_delivery_op,
+    listener_host_root, session_listener_host_dir, session_listener_host_path,
     write_listener_into_container,
 };
 pub use backend::{
@@ -106,7 +106,7 @@ pub use dns_gate_bridge::start_gate_bridge;
 pub use dns_propagation::{
     DnsCache, DnsCacheEntry, DnsChange, DnsChangeType, ResolvedMapping, ResolvedReport,
     generate_domain_ip_rules, propagate_dns_changes, read_resolved_json,
-    read_resolved_json_on_socket,
+    read_resolved_json_on_route,
 };
 pub use error::{ApiError, SandboxError};
 pub use events::{
@@ -170,9 +170,9 @@ pub use policy::{
     hash_policy,
 };
 pub use policy_distributor::{
-    PolicyDistributor, write_file_to_container, write_file_to_container_on_socket,
+    PolicyDistributor, read_gateway_file, write_gateway_file, write_gateway_file_op,
 };
-pub use process::run_with_timeout;
+pub use process::{run_with_timeout, run_with_timeout_stdin};
 pub use qmp::{QmpClient, mac_from_session_id};
 pub use session::{
     Session, SessionConfig, SessionId, SessionRootlessDocker, SessionState, WorkspaceMode,

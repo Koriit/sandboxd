@@ -410,19 +410,38 @@ async fn handle_docker(ctx: &RunContext, op: crate::protocol::DockerOp) -> Broke
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // `docker load` reads its tarball from stdin. The file is hundreds of
-    // megabytes, so it is streamed rather than carried in the op payload —
-    // and which file it is comes from the enum, resolved against the agent's
-    // own staging directory.
+    // Two ops feed the child's stdin, and they do it from different places.
+    //
+    // `docker load` reads a tarball that is hundreds of megabytes, so it is
+    // streamed from a file rather than carried in the op payload — and which
+    // file it is comes from the enum, resolved against the agent's own
+    // staging directory.
+    //
+    // The egress-plane writes carry their artifact in the op, because the
+    // artifact is what the daemon is asking to install. It is written to the
+    // pipe and the pipe is closed; the child (`nft -f -` or `cat`) reads it
+    // as content.
     let tarball = match &op {
         crate::protocol::DockerOp::ImageLoad { image } => {
             Some(staged_image_tarball(ctx, (*image).into()))
         }
         _ => None,
     };
+    let body = match &op {
+        crate::protocol::DockerOp::ContainerExecStdin { body, .. } => Some(body.clone()),
+        _ => None,
+    };
 
-    let output = match tarball {
-        None => {
+    let output = match (tarball, body) {
+        (Some(path), _) => match run_docker_load(cmd, &path).await {
+            Ok(o) => o,
+            Err(reason) => return BrokerResult::Rejected { reason },
+        },
+        (None, Some(body)) => match run_docker_with_stdin(cmd, body.as_bytes()).await {
+            Ok(o) => o,
+            Err(reason) => return BrokerResult::Rejected { reason },
+        },
+        (None, None) => {
             cmd.stdin(Stdio::null());
             match cmd.output().await {
                 Ok(o) => o,
@@ -433,10 +452,6 @@ async fn handle_docker(ctx: &RunContext, op: crate::protocol::DockerOp) -> Broke
                 }
             }
         }
-        Some(path) => match run_docker_load(cmd, &path).await {
-            Ok(o) => o,
-            Err(reason) => return BrokerResult::Rejected { reason },
-        },
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -455,6 +470,39 @@ async fn handle_docker(ctx: &RunContext, op: crate::protocol::DockerOp) -> Broke
             exit_code,
         }
     }
+}
+
+/// Write `body` to a prepared `docker exec -i` command's standard input,
+/// close the pipe, and collect the result.
+///
+/// The pipe must be closed after the write: `nft -f -` and `cat` both read
+/// to EOF, and an open write half would leave the child waiting forever on
+/// a parent that thinks it is done.
+async fn run_docker_with_stdin(
+    mut cmd: Command,
+    body: &[u8],
+) -> Result<std::process::Output, String> {
+    use tokio::io::AsyncWriteExt;
+
+    cmd.stdin(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to take docker stdin".to_string())?;
+    let written = stdin.write_all(body).await;
+    let flushed = stdin.flush().await;
+    drop(stdin);
+    if let Err(e) = written.and(flushed) {
+        let _ = child.kill().await;
+        return Err(format!("failed to write the artifact to docker stdin: {e}"));
+    }
+    child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("docker exec did not complete: {e}"))
 }
 
 /// Stream a staged tarball into a prepared `docker load` command.

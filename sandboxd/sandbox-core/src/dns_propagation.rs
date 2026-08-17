@@ -1,15 +1,17 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
-use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tracing::{debug, info};
 
+use sandbox_docker_argv::container::ContainerCommand;
+use sandbox_docker_argv::gateway::GatewayFile;
+
 use crate::atomic_listener_writer::{
     AtomicListenerWriter, session_listener_host_path, write_listener_into_container,
 };
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
 use crate::network::NetworkInfo;
@@ -17,6 +19,11 @@ use crate::policy::{
     AssuranceLevel, Destination, Policy, PolicyCompiler, render_two_table_ruleset,
 };
 use crate::session::SessionId;
+
+/// Wall-clock budget for one resolved.json read. The propagation loop
+/// polls every two seconds, so a read that outlives this is better
+/// abandoned than allowed to queue behind the next tick.
+const RESOLVED_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
 // Resolved.json types (matches CoreDNS plugin output)
@@ -287,28 +294,32 @@ pub enum DnsChangeType {
 /// Thin wrapper over [`read_resolved_json_on_socket`] with no forwarded
 /// socket — the Linux behaviour, byte-for-byte unchanged (no `-H` flag).
 pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, SandboxError> {
-    read_resolved_json_on_socket(session_id, None)
+    read_resolved_json_on_route(session_id, &DockerRoute::Host)
 }
 
-/// Read the resolved.json file from a gateway container via `docker exec`,
-/// optionally over a forwarded gateway-VM Docker socket.
+/// Read the resolved.json file from a gateway container.
 ///
-/// `socket = None` is the Linux path (host Docker socket, no `-H`);
-/// `socket = Some(path)` routes through the in-VM gateway socket so the
-/// read reaches the gateway container running inside the gateway Lima VM.
-pub fn read_resolved_json_on_socket(
+/// `route` is the gateway manager's own route, so the read lands on the
+/// same Docker daemon the propagation loop's writes do. The file is named
+/// by [`GatewayFile::CorednsResolved`], which is read-only: CoreDNS writes
+/// this one, the daemon only consumes it.
+pub fn read_resolved_json_on_route(
     session_id: &SessionId,
-    socket: Option<&Path>,
+    route: &DockerRoute,
 ) -> Result<ResolvedReport, SandboxError> {
     let container = gateway::container_name(session_id);
 
-    let mut cmd = Command::new("docker");
-    if let Some(sock) = socket {
-        cmd.args(["-H", &format!("unix://{}", sock.display())]);
-    }
-    let output = cmd
-        .args(["exec", &container, "cat", "/etc/coredns/resolved.json"])
-        .output()
+    let output = route
+        .run(
+            DockerOp::ContainerExec {
+                name: container.clone(),
+                command: ContainerCommand::ReadGatewayFile {
+                    file: GatewayFile::CorednsResolved,
+                },
+            },
+            RESOLVED_READ_TIMEOUT,
+            "docker exec (read resolved.json)",
+        )
         .map_err(|e| {
             SandboxError::Gateway(format!(
                 "failed to read resolved.json from {container}: {e}"
@@ -485,9 +496,9 @@ pub fn propagate_dns_changes(
         session_id = %session_id,
         "rewriting Envoy listener for DNS propagation"
     );
-    if let Some(sock) = gateway.docker_socket() {
+    if gateway.route().is_vm() {
         let container = gateway::container_name(session_id);
-        write_listener_into_container(session_id, sock, &container, &listener_yaml)
+        write_listener_into_container(session_id, gateway.route(), &container, &listener_yaml)
             .map_err(|e| SandboxError::Gateway(format!("listener rewrite failed: {e}")))?;
     } else {
         let listener_path = session_listener_host_path(session_id);
