@@ -989,6 +989,26 @@ pub fn vmnet_slot_socket_path(slot: u16) -> String {
     format!("{VMNET_SOCKET_DIR}/slot-{slot}.sock")
 }
 
+/// Recover the slot index from a vmnet slot socket path — the exact inverse of
+/// [`vmnet_slot_socket_path`].
+///
+/// The socket path is the authority on which L2 segment an interface is
+/// attached to, so anything that claims a `lima<n>` name for an entry can be
+/// checked against the socket it sits on rather than trusted. Returns `None`
+/// unless the path is byte-for-byte what `vmnet_slot_socket_path` would emit
+/// for the parsed index — which rejects a foreign directory and non-canonical
+/// spellings (`slot-04.sock`, `slot-+4.sock`) alike.
+#[cfg(target_os = "macos")]
+pub fn slot_from_vmnet_socket_path(path: &str) -> Option<u16> {
+    let file = std::path::Path::new(path).file_name()?.to_str()?;
+    let digits = file.strip_prefix("slot-")?.strip_suffix(".sock")?;
+    // Reject non-canonical spellings (`slot-04.sock`, `slot-+4.sock`) so the
+    // round-trip is exact in both directions: a path only parses back to the
+    // slot that would have generated it.
+    let slot: u16 = digits.parse().ok()?;
+    (vmnet_slot_socket_path(slot) == path).then_some(slot)
+}
+
 /// Derive the launchd daemon label for a given slot.
 #[cfg(target_os = "macos")]
 pub fn vmnet_slot_daemon_label(slot: u16) -> String {
@@ -2388,6 +2408,45 @@ mod tests {
                     "slot {slot}: plutil -lint failed on generated plist:\n{}\nplist content:\n{}",
                     String::from_utf8_lossy(&output.stderr),
                     plist
+                );
+            }
+        }
+
+        // -- slot ⇄ socket path round trip -----------------------------------
+
+        /// Every slot's socket path parses back to that slot, so the path can
+        /// be used to check a claimed interface name rather than trusted.
+        #[test]
+        fn slot_socket_path_round_trips_for_every_slot() {
+            for slot in 0u16..64 {
+                let path = vmnet_slot_socket_path(slot);
+                assert_eq!(
+                    slot_from_vmnet_socket_path(&path),
+                    Some(slot),
+                    "{path} must parse back to slot {slot}"
+                );
+            }
+        }
+
+        /// Anything that is not exactly a slot socket path parses to nothing —
+        /// including a non-canonical index and a path in another directory,
+        /// either of which would let a wrong entry pass a naive check.
+        #[test]
+        fn slot_socket_path_rejects_non_canonical_and_foreign_paths() {
+            for path in [
+                "/var/run/sandbox/vmnet/slot-04.sock",
+                "/var/run/sandbox/vmnet/slot-+4.sock",
+                "/var/run/sandbox/vmnet/slot-.sock",
+                "/var/run/sandbox/vmnet/slot-4.socket",
+                "/var/run/sandbox/vmnet/lima4.sock",
+                "/tmp/slot-4.sock",
+                "slot-4.sock",
+                "",
+            ] {
+                assert_eq!(
+                    slot_from_vmnet_socket_path(path),
+                    None,
+                    "{path} must not parse as a slot socket"
                 );
             }
         }

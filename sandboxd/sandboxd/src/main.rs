@@ -4359,14 +4359,30 @@ async fn create_session_macos_lima(
     };
 
     // Build NetworkInfo with the slot addresses.
-    let nic_name = {
-        let nic_map = state.gateway_lima_manager.nic_map();
-        nic_map
-            .and_then(|m| {
-                m.interface_for_slot(vmnet_slot.index)
-                    .map(|s| s.to_string())
+    //
+    // The slot was just claimed, so there is no durable record to fall back on
+    // and no fallback to make: an unverified slot means the gateway VM does not
+    // carry the interface this session's macvlan would be parented on. Refuse
+    // the create rather than invent a name.
+    let nic_name = match sandbox_core::nic_from_verified_map(
+        state.gateway_lima_manager.nic_map().as_ref(),
+        vmnet_slot.index,
+    ) {
+        Ok(name) => name,
+        Err(e) => {
+            let base_dir = state.base_dir.clone();
+            let sid = session_id;
+            let pool = vmnet_pool.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = pool.release_lima_slot(&sid);
+                let _ = CaManager::remove_session_ca(&base_dir, &sid);
             })
-            .unwrap_or_else(|| format!("lima{}", vmnet_slot.index))
+            .await;
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(e).into_response();
+        }
     };
     let docker_network_name = format!("sandbox-net-{session_id}");
     let network_info = NetworkInfo {
@@ -9878,28 +9894,16 @@ async fn restore_session_networking(
             .gateway_lima_manager
             .gateway_docker_socket()
             .to_path_buf();
-        // The slot NIC name is persisted as `network_info.bridge_name`
-        // (set to `lima<slot>` in `start_session_macos_lima`); fall back to
-        // the slot index if absent. `setup_macos_gateway` parents the
-        // macvlan on this NIC.
-        let nic_name = {
-            let slot_idx = network_info
-                .vmnet_slot
-                .as_ref()
-                .map(|s| s.index)
-                .unwrap_or(0u16);
-            state
-                .gateway_lima_manager
-                .nic_map()
-                .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
-                .unwrap_or_else(|| {
-                    if network_info.bridge_name.is_empty() {
-                        format!("lima{slot_idx}")
-                    } else {
-                        network_info.bridge_name.clone()
-                    }
-                })
-        };
+        // Resolve the NIC whose macvlan the restored gateway container parents
+        // on. Unlike a fresh claim, this site has a durable record and must
+        // keep using it — see `nic_from_record_or_map` for why the record wins
+        // and why an unpopulated map here is not a fault.
+        let slot_idx = sandbox_core::slot_for_persisted_session(&network_info)?;
+        let nic_name = sandbox_core::nic_from_record_or_map(
+            state.gateway_lima_manager.nic_map().as_ref(),
+            slot_idx,
+            &network_info.bridge_name,
+        )?;
         let sid = *session_id;
         let ni = network_info.clone();
         let ca = ca_dir.clone();
@@ -12802,6 +12806,7 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
     let store = Arc::clone(&state.store);
     let mgr_restart = Arc::clone(&state.gateway_lima_manager);
     let mgr_per_session = Arc::clone(&state.gateway_lima_manager);
+    let pool_slots = state.vmnet_pool.max_slots();
     let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     let pool = format!(
         "{}/{}",
@@ -12816,12 +12821,16 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
         Arc::clone(&state.networking_status),
         Arc::clone(&state.gateway_recovering),
         // restart_gateway: force-stop → start → wait for Docker readiness (blocking).
-        // Re-discover NICs and re-establish the egress bridge are performed
-        // inside `restart_instance_for_recovery`.
+        // Re-verifying the slot NICs and re-establishing the egress bridge are
+        // performed inside `restart_instance_for_recovery`. The slot set is read
+        // from the live pool at the moment of the call, never from a copy the
+        // manager holds.
         move || async move {
-            let result =
-                tokio::task::spawn_blocking(move || mgr_restart.restart_instance_for_recovery())
-                    .await;
+            let result = tokio::task::spawn_blocking(move || {
+                let slots: Vec<u16> = (0..pool_slots).collect();
+                mgr_restart.restart_instance_for_recovery(&slots)
+            })
+            .await;
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e.to_string()),
@@ -12841,15 +12850,16 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
             let state = Arc::clone(&state_per_session);
             async move {
                 let sock = mgr.gateway_docker_socket().to_path_buf();
-                let nic_name = {
-                    let slot_idx = network_info
-                        .vmnet_slot
-                        .as_ref()
-                        .map(|s| s.index)
-                        .unwrap_or(0u16);
-                    mgr.nic_map()
-                        .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
-                        .unwrap_or_else(|| format!("lima{slot_idx}"))
+                // No guessed slot, no guessed NIC. A session recovered onto a
+                // default slot index or a made-up interface would come back on
+                // an L2 segment nothing chose for it; leaving it unrecovered
+                // and visibly failed is the safer half of that trade.
+                let nic_name = match sandbox_core::slot_for_persisted_session(&network_info)
+                    .and_then(|slot| {
+                        sandbox_core::nic_from_verified_map(mgr.nic_map().as_ref(), slot)
+                    }) {
+                    Ok(name) => name,
+                    Err(e) => return (sid, owner, Err(e.to_string())),
                 };
 
                 // Determine initial DNS policy — fail-closed.
@@ -13542,20 +13552,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("macOS startup: step 4 — gateway Lima instance init");
         let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
 
-        // Temporary pool at config_n for the initial GatewayLimaManager constructor.
-        // This is replaced below with the effective-n pool after the resize decision.
-        let temp_pool = Arc::new(VmnetPool::new(config_n));
         let manager_arc = Arc::new(sandbox_core::GatewayLimaManager::new(
             daemon_lima_home,
             lima_registry.executor().clone(),
             daemon_uid,
-            &temp_pool,
         ));
-        drop(temp_pool); // temp_pool not used further; manager holds max_slots=config_n
+
+        // The slot set this daemon's gateway instance owns. Supplied on every
+        // call rather than held by the manager, so it can never be a stale copy
+        // of which L2 segments the VM is attached to.
+        let config_slots: Vec<u16> = (0..config_n).collect();
 
         {
             let mgr = manager_arc.clone();
-            let result = tokio::task::spawn_blocking(move || mgr.ensure_ready()).await;
+            let slots = config_slots.clone();
+            let result = tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots)).await;
             match result {
                 Ok(Ok(())) => {
                     info!("macOS startup step 4: gateway Lima instance ready");
@@ -13664,10 +13675,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // count — a failed resize is non-fatal (the existing hard-fail
                 // semantics cover only "no gateway at all").
                 let mgr = manager_arc.clone();
+                let slots = config_slots.clone();
                 let rebuild_result = tokio::task::spawn_blocking(move || {
                     mgr.force_stop_instance()?;
                     mgr.delete_instance()?;
-                    mgr.ensure_ready() // creates+starts at manager's max_slots=config_n, re-discovers
+                    mgr.ensure_ready(&slots) // creates+starts on config_slots, re-verifies
                 })
                 .await;
 
@@ -13695,8 +13707,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              attempting to recover the existing gateway"
                         );
                         let mgr2 = manager_arc.clone();
+                        let slots2 = config_slots.clone();
                         let recovery =
-                            tokio::task::spawn_blocking(move || mgr2.ensure_ready()).await;
+                            tokio::task::spawn_blocking(move || mgr2.ensure_ready(&slots2)).await;
                         match recovery {
                             Ok(Ok(())) => {
                                 let fallback_count = manager_arc

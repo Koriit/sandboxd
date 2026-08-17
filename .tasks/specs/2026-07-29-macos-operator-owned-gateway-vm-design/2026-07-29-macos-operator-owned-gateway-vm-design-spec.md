@@ -837,6 +837,27 @@ template validation instead of at NIC discovery), but it is **optional**: the ha
 mandated backstop either way. An earlier draft framed this as an unresolved either/or,
 which double-counted a decision fix 2 had already made.
 
+✅ **DECIDED 2026-08-17 — the backstop only; `MIN_LIMA_VERSION` stays at 1.2.0.** Fix 2's
+verification shipped, and `nic_verification_omits_slots_the_guest_does_not_carry` asserts
+exactly this hazard: given the offset range `{4,5,6,7}` and a guest reporting the
+positional `lima0..lima3` — which is precisely what a Lima that ignores `interface:`
+produces — nothing is mapped, all four slots are reported missing, and every session
+claiming one is refused at the claim site. So the silent wrong-segment outcome is
+unreachable whether or not the floor moves.
+
+**Why the optional half was declined rather than taken as belt-and-braces.** The floor is
+a claim about *which Lima versions honour the key*, and that fact is not established. The
+evidence is one version: the check ran on 2.1.2, and this host runs 2.1.2. Nothing here
+identifies the **first** version that honours `interface:`, so any new floor is either an
+over-restriction (pin 2.1.2, and every host on a working intermediate Lima is refused a
+gateway it could have run correctly) or an unverified guess at the boundary — the same
+species of claim-without-measurement this whole section exists to remove. `minimumLimaVersion`
+is enforced by Lima at instance creation, so the cost of getting it wrong lands on hosts
+that work today. Cheaper failure is not worth buying with a number nobody has measured.
+**Reversal is one constant and carries no design change**: if someone establishes the first
+honouring version, bump `MIN_LIMA_VERSION` to it and the backstop simply stops being the
+only line.
+
 #### Fix 1a — the generator must now guard the invariant itself
 
 The confirmation comes with an obligation. **Lima honours whatever name you ask for and
@@ -909,6 +930,25 @@ mapping from guest output. (That verification also covers the `MIN_LIMA_VERSION`
 above: an older Lima that ignored `interface:` fails the check instead of silently
 misplacing the session.)
 
+⚠️ **"Failing closed" is per slot, at the claim site — not per call, at `ensure_ready`.
+Recorded 2026-08-17 because the shorter phrasing above admits a reading that regresses a
+live path, and the reading is the plausible one.** Making a missing interface an `Err` out
+of the parser fails `ensure_ready`, and at startup `ensure_ready` failing is *the daemon
+refusing to boot*. That would make `decide_pool_resize`'s `WarnRunningSessions` and
+`RefuseNeedsPrivilegedRegen` arms unreachable — both exist for exactly the
+discovered < config_n case — so a host that starts today with a reduced pool would stop
+starting at all. The implemented shape instead: an unverified slot is **absent from the
+map** and named in `NicMap.missing_slots`; fix 4's hard error at the claim sites turns that
+absence into a refused session. The guest string can withhold an entry and can never name
+one, which is the property that mattered. `discovered_count` keeps its existing meaning —
+every `lima<n>` the guest reports, expected or not — because it is `decide_pool_resize`'s
+input and not a measure of the map.
+
+**This is not a weakening, and the spec's own words are the reason.** The consequence
+required two paragraphs up is "a **refused create** rather than a silently misplaced
+session" — a create refusal, which is what an absent map entry produces, not a startup
+refusal, which is what a parser-level `Err` would have produced.
+
 #### Fix 3 — take an explicit slot set in template generation
 
 Three `(0..max_slots)` loops in `generate_gateway_template` (`gateway_lima.rs:334-381`)
@@ -946,6 +986,17 @@ neither a constructor snapshot nor a pool reach-in: the manager stays ignorant o
 which keeps §1.5's hazard structurally impossible rather than merely discouraged. The cost
 is threading the argument through `ensure_ready` (`gateway_lima.rs:872`) and its three
 startup call sites — which the ownership phase touches anyway.
+
+✅ **SHIPPED 2026-08-17, and the threading reached one call the estimate above did not
+name.** `GatewayLimaManager::new` no longer takes a `&VmnetPool` at all and the `max_slots`
+field is gone, so "the manager stays ignorant of the pool" is now a fact about its type
+rather than a convention — there is no stored copy that *could* go stale. Beyond
+`create_instance` and `ensure_ready`'s three startup sites, **`restart_instance_for_recovery`
+also needed the set**: it re-runs NIC discovery after a crash restart, which under fix 2 is
+a verification against an expected slot set rather than a read of whatever the VM reports.
+Its caller (`recover_gateway_lima`) derives the set from the live pool at the moment of the
+call. The 15 `generate_gateway_template` call sites the paragraph above counts were exact:
+1 production + 14 in tests.
 
 #### Fix 4 — make the silent NIC-name fallback a hard error
 
@@ -1053,6 +1104,14 @@ It becomes real under either of two changes, one of which is this design:
 
 Hence fix 3 above, which resolves it by passing the set as an argument — so there is no
 stored copy to go stale. The justification is prevention.
+
+✅ **RESOLVED 2026-08-17, and the divergence described in this section no longer exists to
+diverge.** The code quoted at the top of §1.5 is gone: `GatewayLimaManager::new` takes no
+`&VmnetPool`, there is no `max_slots` field, and every call that needs a slot set takes one
+as an argument. `config_n` and `effective_n` still differ as *values* in the two arms named
+above — that was never the defect — but nothing copies either into the manager, so there is
+no second stored answer to drift from the first. **Read this section as a record of why the
+shape was chosen, not as a description of live state.**
 
 *(A sibling of the same kind, also out of scope: `start_instance` passes
 `memory_mb: 2048, cpus: 2` as literals at `gateway_lima.rs:1372-1373` rather than reading
@@ -3599,7 +3658,7 @@ enforces, with slot identity no longer positional.
 | `sandboxd/src/main.rs:4362-4370`, `:12811-12820` | replace the bare `unwrap_or_else(\|\| format!("lima{}", …))` with a hard error |
 | `sandboxd/src/main.rs:9884-9900` | **different site** — hard-error only when the persisted `bridge_name` is also empty (§1.4 fix 4) |
 | `sandboxd/src/main.rs:9884-9888`, `:12811-12816` | hard-error `unwrap_or(0u16)` on the **slot index** — the silent segment guess (§1.4 fix 4) |
-| `sandbox-core/src/gateway_lima.rs:99` | decide whether to bump `MIN_LIMA_VERSION` above 1.2.0, or add the runtime NIC-name assertion (§1.4 fix 1) |
+| `sandbox-core/src/gateway_lima.rs:99` | decide whether to bump `MIN_LIMA_VERSION` above 1.2.0, or add the runtime NIC-name assertion (§1.4 fix 1). ✅ **Decided 2026-08-17: the runtime assertion (fix 2's verification); the constant is unchanged.** Rationale at §1.4 fix 1 |
 | `sandboxd/src/main.rs:1339`, `:4337`, `:4960`, `:6237` | `AppState.vmnet_pool` becomes the uid-keyed registry, and the **three claim sites** — `claim_lima_slot` (create), `claim_lite_token` (lite create), `claim_lima_slot` (restart) — resolve the operator's pool. **This phase owns them**: they are what produce the 429/409 criteria below |
 | `sandboxd/src/main.rs:13402-13440` | `SANDBOX_MAX_MACOS_SESSIONS` — **unchanged**; it continues to govern the host total. The per-operator range read layers on top. (The earlier "reconcile with the per-operator range read" was not an instruction, and the constraint that this land here is withdrawn — see the decision trail.) |
 | `sandbox-core/src/error.rs:9` | **new structured `SandboxError` variant** for 429 — operator uid, in-use count, quota, with a `Display` impl (§2.2). The enum lives here, not in `sandboxd/src/error.rs` |

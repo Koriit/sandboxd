@@ -117,7 +117,8 @@ pub use gateway_lima::{
     NicMap, PoolResizeDecision, UBUNTU_NOBLE_ARM64_URL, VMNET_LAUNCH_DAEMONS_DIR,
     count_reachable_slot_sockets, count_vmnet_plists, decide_pool_resize,
     discover_nics_from_ip_json, generate_gateway_eth0_nft_policy, generate_gateway_template,
-    observe_vmnet_daemon_set,
+    nic_from_record_or_map, nic_from_verified_map, observe_vmnet_daemon_set,
+    slot_for_persisted_session, slot_interface_name,
 };
 pub use gateway_recovery::{
     GatewayRecoveringGuard, GatewayRecoveryDeps, run_bounded_recovery, run_gateway_recovery,
@@ -134,9 +135,10 @@ pub use lds_ack::{
 pub use lima::{
     BaseImageMeta, BaseImageStatus, DEFAULT_BASE_VM_NAME, GUEST_BINARY_PATH_OVERRIDE_ENV,
     LimaExecutor, LimaManager, LimaManagerRegistry, LimaOp, LimaReaperReport, LimaVmDecision,
-    PRODUCTION_GUEST_BINARY_PATH, SANDBOXD_STATE_ROOT, SetuidHelperExecutor, VmInfo, VmStatus,
-    decide_lima_vm, ensure_operator_lima_home, enumerate_operator_uids_from_fs, guest_agent_path,
-    operator_lima_home, reap_lima_orphans, vm_name,
+    MACOS_UNIX_PATH_MAX, PRODUCTION_GUEST_BINARY_PATH, SANDBOXD_STATE_ROOT, SetuidHelperExecutor,
+    VmInfo, VmStatus, decide_lima_vm, ensure_operator_lima_home, enumerate_operator_uids_from_fs,
+    guest_agent_path, instance_socket_path_fits, instance_ssh_socket_path, operator_lima_home,
+    reap_lima_orphans, vm_name,
 };
 pub use lite_macos::{
     DEFAULT_LITE_SHARED_ROOT, IN_VM_ROUTE_HELPER_PATH, LITE_SHARED_ROOT_ENV, SharedPathError,

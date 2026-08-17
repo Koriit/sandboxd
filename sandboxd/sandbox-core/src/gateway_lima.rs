@@ -26,14 +26,23 @@
 ///
 /// ## NIC discovery
 ///
-/// The gateway VM has N+1 NICs: `eth0` (management/slirp) and `lima0`..`limaN-1`
-/// (one per socket_vmnet pool slot). `discover_nics` runs
-/// `ip -json link show` inside the VM, selects `limaN` interfaces, orders them
-/// by numeric suffix, and builds the `slot_index → interface_name` map.
+/// The gateway VM has N+1 NICs: `eth0` (management/slirp) and one `lima<slot>`
+/// per socket_vmnet pool slot the instance was created with. The slot→interface
+/// map is **built by the daemon** from the slot set it rendered the template
+/// with, not read out of the guest: `generate_gateway_template` pins
+/// `interface: lima<slot>` on every `networks:` entry, so the daemon already
+/// knows the answer before it asks.
 ///
-/// If discovered NIC count ≠ `max_slots`, the mismatch is deferred to the
-/// `decide_pool_resize` handler in the bin-crate startup sequence. `ensure_ready`
-/// itself does not decide — it discovers and caches; the caller acts on the result.
+/// `discover_nics` runs `ip -json link show` inside the VM and uses the result
+/// **only to verify** that each expected interface is actually present. A slot
+/// whose interface is missing is left out of the map — it never acquires a
+/// guessed or positionally-derived name — and the claim sites refuse to start a
+/// session on it. The guest string can withhold an entry; it can never name one.
+///
+/// If discovered NIC count ≠ the requested slot count, the mismatch is deferred
+/// to the `decide_pool_resize` handler in the bin-crate startup sequence.
+/// `ensure_ready` itself does not decide — it discovers and caches; the caller
+/// acts on the result.
 ///
 /// ## Baseline `eth0` nft policy
 ///
@@ -72,8 +81,6 @@ use crate::error::SandboxError;
 use crate::gateway::gateway_image_tag_for_daemon;
 #[cfg(target_os = "macos")]
 use crate::lima::{LimaExecutor, LimaOp};
-#[cfg(target_os = "macos")]
-use crate::network::VmnetPool;
 #[cfg(target_os = "macos")]
 use crate::process::run_with_timeout;
 
@@ -227,19 +234,30 @@ pub const LITE_STAGE_ROOT: &str = "/tmp/sandbox-lite";
 // NIC map
 // ---------------------------------------------------------------------------
 
-/// Result of gateway NIC discovery: a mapping from pool slot index to the
-/// in-VM interface name for that slot (`lima0`, `lima1`, …).
+/// Result of gateway NIC verification: a mapping from pool slot index to the
+/// in-VM interface name for that slot.
 ///
-/// Slot 0 → `lima0`, slot 1 → `lima1`, etc. The map is keyed by slot index.
-/// The count of entries may differ from `max_slots` (see module-level note on
-/// non-fatal mismatch).
+/// Slot `n` → `lima<n>`, always — the name is [`slot_interface_name`] applied to
+/// the slot the daemon assigned, never a name lifted out of guest output. An
+/// entry is present only when the guest was observed to actually carry that
+/// interface; a slot whose interface is missing is **absent from the map**, and
+/// the claim sites turn that absence into a refused session rather than a guess.
+///
+/// The number of entries may therefore be smaller than the number of slots
+/// requested, and `discovered_count` may differ from both (see the module-level
+/// note on non-fatal mismatch).
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NicMap {
-    /// Maps slot index → in-VM interface name.
+    /// Maps slot index → in-VM interface name, for verified slots only.
     pub slot_to_iface: HashMap<u16, String>,
-    /// Number of NICs discovered (may differ from `max_slots`).
+    /// Number of `lima<n>` interfaces the guest reported, whether or not they
+    /// were expected. This is an observation of the VM's shape and feeds
+    /// `decide_pool_resize`; it is deliberately not the size of the map.
     pub discovered_count: usize,
+    /// Slots that were requested but whose interface the guest did not report.
+    /// Retained for diagnostics — the enforcement is the missing map entry.
+    pub missing_slots: Vec<u16>,
 }
 
 #[cfg(target_os = "macos")]
@@ -248,6 +266,132 @@ impl NicMap {
     pub fn interface_for_slot(&self, slot: u16) -> Option<&str> {
         self.slot_to_iface.get(&slot).map(|s| s.as_str())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slot identity: no guessed NIC, no guessed slot
+// ---------------------------------------------------------------------------
+//
+// The slot NIC is the macvlan parent — it decides which isolated L2 segment a
+// session's traffic lands on — and it is persisted as `NetworkInfo.bridge_name`,
+// so getting it wrong is durable rather than transient. The slot index is the
+// same decision one level up.
+//
+// Neither may be guessed. A guessed `lima<n>` is right only by coincidence, and
+// wrong silently: the session comes up, its traffic egresses, and it does so on
+// a segment nobody chose. Once the pool is partitioned per operator, the guess
+// can put a session on *another operator's* segment, past that operator's
+// egress policy, with nothing in the deny-event stream to show for it. Refusing
+// costs a session that was not going to be correctly isolated anyway.
+//
+// The three functions below are the whole policy, kept pure so the sites that
+// use them stay thin and the behaviour can be asserted without a live VM.
+
+/// Resolve a slot's gateway NIC from the verified map alone.
+///
+/// For sites with no durable record worth trusting: a fresh slot claim (create,
+/// and restarting a stopped session, both of which claim a *new* slot so the old
+/// `bridge_name` names the wrong one), and gateway recovery. A map miss is a
+/// refusal — there is nothing else to consult.
+#[cfg(target_os = "macos")]
+pub fn nic_from_verified_map(nic_map: Option<&NicMap>, slot: u16) -> Result<String, SandboxError> {
+    nic_map
+        .and_then(|m| m.interface_for_slot(slot))
+        .map(|s| s.to_string())
+        .ok_or_else(|| nic_map_miss_error(slot))
+}
+
+/// Resolve a restored session's gateway NIC, preferring its durable record.
+///
+/// `NetworkInfo.bridge_name` was written at create time from the verified map,
+/// and it is what the session's existing macvlan is *actually* parented on — so
+/// reading it is correct, not a lucky fallback. It also has to stay usable when
+/// the map is merely not populated yet: `nic_map()` returns `None` until
+/// `ensure_ready` completes, and refusing on that would break restore for a
+/// reason that is not a fault.
+///
+/// So the record wins; the map only fills a blank record. A disagreement is a
+/// refusal rather than a re-parent: moving a running session's macvlan to a
+/// different segment is a worse answer than declining to touch it.
+#[cfg(target_os = "macos")]
+pub fn nic_from_record_or_map(
+    nic_map: Option<&NicMap>,
+    slot: u16,
+    persisted_bridge_name: &str,
+) -> Result<String, SandboxError> {
+    let mapped = nic_map.and_then(|m| m.interface_for_slot(slot));
+    if persisted_bridge_name.is_empty() {
+        // No record to restore from — the map is the only authority left.
+        return mapped
+            .map(|s| s.to_string())
+            .ok_or_else(|| nic_map_miss_error(slot));
+    }
+    if let Some(mapped) = mapped
+        && mapped != persisted_bridge_name
+    {
+        return Err(SandboxError::Gateway(format!(
+            "session is recorded on gateway NIC `{persisted_bridge_name}` for vmnet slot \
+             {slot}, but the gateway VM now maps that slot to `{mapped}`. Refusing to \
+             re-parent a running session's macvlan onto a different L2 segment; stop the \
+             session and re-create it."
+        )));
+    }
+    Ok(persisted_bridge_name.to_string())
+}
+
+/// Resolve the slot a persisted session belongs to.
+///
+/// Defaulting a missing slot to 0 attaches the session to whichever segment slot
+/// 0 happens to be — under per-operator ranges, someone else's. That is a worse
+/// outcome than the NIC-name guess, and one level further up: a wrong NIC picks
+/// the wrong interface within a known slot, a wrong slot picks the wrong slot
+/// outright.
+#[cfg(target_os = "macos")]
+pub fn slot_for_persisted_session(
+    network_info: &crate::network::NetworkInfo,
+) -> Result<u16, SandboxError> {
+    network_info
+        .vmnet_slot
+        .as_ref()
+        .map(|s| s.index)
+        .ok_or_else(|| {
+            SandboxError::Gateway(
+                "session has no vmnet slot recorded in its network info; refusing to recover \
+                 it onto a default slot index, which would attach it to whichever L2 segment \
+                 slot 0 belongs to. Stop and re-create the session to claim a slot."
+                    .to_string(),
+            )
+        })
+}
+
+/// The gateway VM carries no verified interface for `slot`.
+///
+/// The map holds an entry only for slots whose pinned `lima<slot>` interface was
+/// observed in the gateway VM, so a miss means either the map is not yet
+/// populated or the VM does not have that NIC.
+#[cfg(target_os = "macos")]
+fn nic_map_miss_error(slot: u16) -> SandboxError {
+    SandboxError::Gateway(format!(
+        "no verified gateway NIC for vmnet slot {slot} (expected `{}` in the gateway VM). \
+         Refusing rather than parenting the session's macvlan on a guessed interface, which \
+         would place it on an unknown L2 segment. Check that the gateway Lima instance is up \
+         and was created with this slot: `limactl list` and \
+         `limactl shell {GATEWAY_INSTANCE_NAME} ip -json link show`.",
+        slot_interface_name(slot),
+    ))
+}
+
+/// The in-VM interface name that belongs to a pool slot.
+///
+/// Single source of truth for the `slot n ⇔ lima<n>` correspondence. The
+/// template generator pins it into every `networks:` entry, NIC verification
+/// looks for exactly this name, and §1.1a's agent-side validator re-derives it
+/// from the socket path. Lima honours whatever name it is given and never warns
+/// about a non-positional one, so this correspondence is ours to hold, not
+/// Lima's.
+#[cfg(target_os = "macos")]
+pub fn slot_interface_name(slot: u16) -> String {
+    format!("lima{slot}")
 }
 
 // ---------------------------------------------------------------------------
@@ -269,57 +413,121 @@ pub struct IpLinkEntry {
     pub ifindex: u32,
 }
 
-/// Parse the output of `ip -json link show` and extract the `limaN` interfaces.
+/// Build the slot→NIC map for `slots`, using `ip -json link show` output only
+/// to verify it.
 ///
-/// Selection rules:
-/// - Include interfaces whose name matches `^lima(\d+)$`.
-/// - Exclude `eth0` (management/slirp NIC) and any non-`lima` names.
-/// - Order by numeric suffix to produce the canonical slot→NIC mapping.
+/// **The mapping is not derived from the guest.** The daemon rendered the
+/// instance template with an explicit slot set and pinned
+/// `interface: lima<slot>` on each entry, so it already knows what every slot's
+/// interface is called; this function asserts that claim against the VM instead
+/// of asking the VM for the answer. That matters because after ownership flips
+/// the gateway VM is the operator's, and the map selects the macvlan parent —
+/// i.e. which L2 segment a session lands on. A parser that keyed off guest text
+/// would let the operator choose the segment.
 ///
-/// Returns `(slot_to_iface, discovered_count)`.
+/// Verification rules:
+/// - For each requested slot, the guest must report an interface named exactly
+///   [`slot_interface_name`]`(slot)`. Present → mapped. Absent → left out of the
+///   map and recorded in `missing_slots`.
+/// - `discovered_count` counts every `lima<n>` interface the guest reported,
+///   expected or not. It is an observation of the VM's shape for
+///   `decide_pool_resize`, not a measure of the map.
+/// - `eth0` and every other non-`lima<n>` name are ignored throughout.
+///
+/// A missing interface is deliberately **not** an error here. An unusable slot
+/// must refuse the session that claims it, which is what the absent map entry
+/// produces at the claim sites; making it an error instead would fail the whole
+/// of `ensure_ready`, and at startup that means the daemon refuses to boot —
+/// taking out `decide_pool_resize`'s reduced-pool arms, which exist precisely
+/// for the case where the VM has fewer NICs than the config asks for.
 ///
 /// This function is pure and has no I/O; it can be unit-tested by feeding
 /// representative JSON.
 #[cfg(target_os = "macos")]
-pub fn discover_nics_from_ip_json(json: &str) -> Result<NicMap, SandboxError> {
+pub fn discover_nics_from_ip_json(json: &str, slots: &[u16]) -> Result<NicMap, SandboxError> {
     let entries: Vec<IpLinkEntry> = serde_json::from_str(json).map_err(|e| {
         SandboxError::Internal(format!(
             "gateway NIC discovery: failed to parse `ip -json link` output: {e}"
         ))
     })?;
 
-    // Collect (numeric_suffix, name) pairs for limaN interfaces.
-    let mut lima_nics: Vec<(u16, String)> = Vec::new();
-    for entry in &entries {
-        if let Some(suffix) = entry.ifname.strip_prefix("lima") {
-            if let Ok(n) = suffix.parse::<u16>() {
-                lima_nics.push((n, entry.ifname.clone()));
-            }
+    // Names of every lima<n> interface the guest reports. Kept as names, not
+    // parsed suffixes, so `lima04` cannot stand in for `lima4`.
+    let observed: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| {
+            e.ifname
+                .strip_prefix("lima")
+                .is_some_and(|suffix| suffix.parse::<u16>().is_ok())
+        })
+        .map(|e| e.ifname.as_str())
+        .collect();
+    let discovered_count = observed.len();
+
+    let mut slot_to_iface: HashMap<u16, String> = HashMap::new();
+    let mut missing_slots: Vec<u16> = Vec::new();
+    for &slot in slots {
+        let expected = slot_interface_name(slot);
+        if observed.contains(expected.as_str()) {
+            slot_to_iface.insert(slot, expected);
+        } else {
+            missing_slots.push(slot);
         }
     }
 
-    // Sort by numeric suffix so slot 0 → lima0, slot 1 → lima1, etc.
-    lima_nics.sort_by_key(|(n, _)| *n);
-
-    let discovered_count = lima_nics.len();
-
-    // Build the slot_index → interface_name map: the nth entry (0-indexed) in
-    // the sorted list maps to slot n.
-    let slot_to_iface: HashMap<u16, String> = lima_nics
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (_, name))| (idx as u16, name))
-        .collect();
+    if !missing_slots.is_empty() {
+        warn!(
+            missing_slots = ?missing_slots,
+            discovered_count,
+            "gateway NIC verification: expected interfaces are absent from the gateway VM; \
+             sessions claiming these slots will be refused rather than parented on a \
+             guessed interface. A Lima older than the version that honours the per-entry \
+             `interface:` key produces exactly this."
+        );
+    }
 
     Ok(NicMap {
         slot_to_iface,
         discovered_count,
+        missing_slots,
     })
 }
 
 // ---------------------------------------------------------------------------
 // Template generation
 // ---------------------------------------------------------------------------
+
+/// Render one `networks:` entry, binding a slot's socket to its pinned in-VM
+/// interface name.
+///
+/// ```yaml
+///   - socket: /var/run/sandbox/vmnet/slot-6.sock
+///     interface: lima6
+/// ```
+///
+/// Both halves come from the same `slot`, and the guard re-derives the slot
+/// from the rendered socket path to confirm they still describe the same
+/// segment. That is the invariant Lima will not enforce for us: it accepts
+/// `interface: lima2` on `slot-7.sock` without a warning, and the result is a
+/// session silently parented on another slot's L2 segment.
+///
+/// The guard cannot fire on any input this function accepts — a `u16` always
+/// round-trips — which is the point: it is here so that a later edit that
+/// decouples the two halves stops being silent. §1.1a's agent-side validator
+/// makes the same check from outside the daemon's trust boundary, where a
+/// compromised daemon cannot skip it.
+#[cfg(target_os = "macos")]
+fn gateway_network_entry(slot: u16) -> String {
+    let socket = crate::network::vmnet_slot_socket_path(slot);
+    let interface = slot_interface_name(slot);
+    assert_eq!(
+        crate::network::slot_from_vmnet_socket_path(&socket),
+        Some(slot),
+        "gateway template: interface {interface} would be pinned onto socket {socket}, \
+         which does not belong to slot {slot}"
+    );
+    format!("  - socket: {socket}\n    interface: {interface}\n")
+}
 
 /// Generate the Lima YAML template for the `sandboxd-gateway` instance.
 ///
@@ -331,17 +539,31 @@ pub fn discover_nics_from_ip_json(json: &str) -> Result<NicMap, SandboxError> {
 /// - Provisioning scripts: docker.io install, eth0 MTU clamp, IPv6 disable on
 ///   limaN NICs, no-DHCP netplan for limaN NICs
 ///
-/// The `max_slots` parameter determines the number of `networks:` entries.
+/// `slots` is the set of pool slots this instance is to own — one `networks:`
+/// entry each, in the order given. It is an argument rather than manager state
+/// on purpose: a slot set is the set of L2 segments the VM lands on, and a
+/// stored copy that went stale would be a wrong set of segments rather than a
+/// wrong count. There is no copy to go stale.
 #[cfg(target_os = "macos")]
-pub fn generate_gateway_template(max_slots: u16) -> String {
-    // Build the networks section: one socket: entry per pool slot.
-    let networks_section = (0..max_slots)
-        .map(|slot| {
-            format!(
-                "  - socket: {}\n",
-                crate::network::vmnet_slot_socket_path(slot)
-            )
-        })
+pub fn generate_gateway_template(slots: &[u16]) -> String {
+    // Build the networks section: one entry per pool slot, each pinning the
+    // in-VM interface name.
+    //
+    // Without `interface:`, Lima names guest NICs by *array position* —
+    // a VM given slots {4,5,6,7} would call them lima0..lima3. The NIC name
+    // selects the macvlan parent, so positional naming on a non-contiguous
+    // range silently parents sessions on the wrong L2 segment. Pinning the
+    // name removes the coupling to position.
+    //
+    // Lima honours whatever name it is given and never warns about a
+    // non-positional one — `interface: lima2` on `slot-7.sock` validates
+    // clean. So the `lima<n>` ⇔ slot n correspondence is not something Lima
+    // enforces; it is this generator's to hold, which is why both halves of
+    // every entry are derived from the same `slot` binding below and checked
+    // against each other rather than written out twice.
+    let networks_section = slots
+        .iter()
+        .map(|&slot| gateway_network_entry(slot))
         .collect::<String>();
 
     // Build the 9p mounts stanza for the lite shared-workspace root.
@@ -366,20 +588,28 @@ pub fn generate_gateway_template(max_slots: u16) -> String {
     // the shell script, but column-0 content in a YAML block scalar terminates the
     // scalar and is parsed as YAML, causing a parse error. `printf` appended line
     // by line avoids the column-0 heredoc marker entirely.
-    let netplan_lima_entries = (0..max_slots)
-        .map(|slot| {
+    let netplan_lima_entries = slots
+        .iter()
+        .map(|&slot| {
             // Each NIC block: "    lima{n}:" (4-space indent under `ethernets:`)
             // followed by dhcp4/optional at 6-space indent. The \\n sequences
             // are the printf escape sequences for newlines inside the shell string.
+            let iface = slot_interface_name(slot);
             format!(
-                "      printf '    lima{slot}:\\n      dhcp4: no\\n      optional: true\\n' >> /etc/netplan/99-sandbox-vmnet.yaml\n"
+                "      printf '    {iface}:\\n      dhcp4: no\\n      optional: true\\n' >> /etc/netplan/99-sandbox-vmnet.yaml\n"
             )
         })
         .collect::<String>();
 
     // Build the sysctl disable-IPv6 lines for each limaN NIC.
-    let ipv6_disable_lines = (0..max_slots)
-        .map(|slot| format!("      sysctl -w net.ipv6.conf.lima{slot}.disable_ipv6=1\n"))
+    let ipv6_disable_lines = slots
+        .iter()
+        .map(|&slot| {
+            format!(
+                "      sysctl -w net.ipv6.conf.{}.disable_ipv6=1\n",
+                slot_interface_name(slot)
+            )
+        })
         .collect::<String>();
 
     // Derive the `memory:` suffix from the MiB constant so the VM spec and the
@@ -761,12 +991,12 @@ pub fn lite_stage_rm_argv(vm_dir: &str) -> Vec<String> {
 
 /// Manages the `sandboxd-gateway` Lima instance and its Docker infrastructure.
 ///
-/// Constructed once at daemon startup (macOS only) with a reference to the
-/// `VmnetPool` (for socket paths) and the `LimaExecutor` (for `limactl` ops
-/// via the daemon-uid degenerate path).
+/// Constructed once at daemon startup (macOS only) with the `LimaExecutor`
+/// (for `limactl` ops via the daemon-uid degenerate path). It holds no pool and
+/// no slot set — the slot set is an argument to the calls that need one.
 ///
 /// After `ensure_ready` completes successfully:
-/// - `nic_map()` returns the discovered slot→NIC mapping.
+/// - `nic_map()` returns the verified slot→NIC mapping.
 /// - The `sandboxd-egress` Docker bridge exists in the gateway VM.
 /// - The baseline `eth0` nft policy is in place.
 #[cfg(target_os = "macos")]
@@ -784,10 +1014,7 @@ pub struct GatewayLimaManager {
     /// Operator-execution seam for `limactl` ops (all go via daemon_uid).
     executor: Arc<dyn LimaExecutor>,
 
-    /// Number of pool slots (from `VmnetPool::max_slots`).
-    max_slots: u16,
-
-    /// Discovered slot→NIC map, populated after a successful `ensure_ready`.
+    /// Verified slot→NIC map, populated after a successful `ensure_ready`.
     nic_map: Mutex<Option<NicMap>>,
 }
 
@@ -802,23 +1029,25 @@ impl GatewayLimaManager {
     ///   `run_limactl_direct`).
     /// - `daemon_uid` — the daemon's own uid; passed as `op_uid` on every
     ///   `limactl` call so the executor takes the degenerate direct path.
-    /// - `pool` — the `VmnetPool` used to derive socket paths for the template.
+    ///
+    /// The manager holds **no** pool and no slot set. Which slots the gateway
+    /// instance owns is supplied per call, by the caller, from the assignment
+    /// that is live at that moment — see [`GatewayLimaManager::ensure_ready`].
+    /// A slot set copied in here would be a set of L2 segments cached at
+    /// construction, and the manager is never rebuilt.
     pub fn new(
         daemon_lima_home: PathBuf,
         executor: Arc<dyn LimaExecutor>,
         daemon_uid: u32,
-        pool: &VmnetPool,
     ) -> Self {
         let gateway_docker_socket = daemon_lima_home
             .join(GATEWAY_INSTANCE_NAME)
             .join("gateway-docker.sock");
-        let max_slots = pool.max_slots();
         Self {
             daemon_lima_home,
             gateway_docker_socket,
             daemon_uid,
             executor,
-            max_slots,
             nic_map: Mutex::new(None),
         }
     }
@@ -851,12 +1080,17 @@ impl GatewayLimaManager {
     /// 3. If stopped: `limactl start`.
     /// 4. If running: proceed.
     /// 5. Poll `docker -H <sock> info` until ready (300 s / 2 s on first boot).
-    /// 6. Discover slot→NIC map; cache it. Any mismatch with the configured pool
-    ///    size is handled by `decide_pool_resize` in the caller — this method
-    ///    does not decide; it only observes and caches.
+    /// 6. Verify the slot→NIC map; cache it. Any mismatch with the configured
+    ///    pool size is handled by `decide_pool_resize` in the caller — this
+    ///    method does not decide; it only observes and caches.
     /// 7. Ensure `sandboxd-egress` NAT bridge (idempotent).
     /// 8. Apply baseline `eth0` nft policy.
-    pub fn ensure_ready(&self) -> Result<(), SandboxError> {
+    ///
+    /// `slots` is the slot set the gateway instance is to own: the entries the
+    /// template gets when the instance is absent, and the interfaces NIC
+    /// verification requires when it is present. Callers pass the assignment
+    /// that is live at the moment of the call.
+    pub fn ensure_ready(&self, slots: &[u16]) -> Result<(), SandboxError> {
         let state = self.query_instance_state()?;
         info!(state = %state, "gateway Lima instance state at startup");
 
@@ -871,7 +1105,7 @@ impl GatewayLimaManager {
             }
             "None" => {
                 info!("gateway Lima instance absent; creating and starting it");
-                self.create_instance()?;
+                self.create_instance(slots)?;
                 self.start_instance()?;
             }
             other => {
@@ -899,18 +1133,20 @@ impl GatewayLimaManager {
         // let the session-create check catch the missing image later.
         self.load_gateway_image_if_needed();
 
-        // Step 4e: discover slot→NIC map and cache it.
+        // Step 4e: verify the slot→NIC map against the VM and cache it.
         //
-        // Discovery is purely mechanical — it reports what the VM has. Any
-        // mismatch between the discovered count and the configured pool size
-        // is handled by the pool-resize decision in the bin-crate startup
-        // sequence, which calls `decide_pool_resize` after `ensure_ready`
-        // returns. This method does not decide; it only observes and caches.
-        let nic_map = self.discover_nics()?;
+        // Verification is purely mechanical — it reports which of the expected
+        // interfaces the VM actually has. Any mismatch between the discovered
+        // count and the configured pool size is handled by the pool-resize
+        // decision in the bin-crate startup sequence, which calls
+        // `decide_pool_resize` after `ensure_ready` returns. This method does
+        // not decide; it only observes and caches.
+        let nic_map = self.discover_nics(slots)?;
         let discovered = nic_map.discovered_count;
         info!(
             nic_count = discovered,
-            "gateway Lima NIC discovery complete"
+            mapped = nic_map.slot_to_iface.len(),
+            "gateway Lima NIC verification complete"
         );
         {
             let mut guard = self.nic_map.lock().unwrap_or_else(|e| e.into_inner());
@@ -1284,8 +1520,11 @@ impl GatewayLimaManager {
     }
 
     /// Write the gateway template YAML to a file and run `limactl create`.
-    fn create_instance(&self) -> Result<(), SandboxError> {
-        let template_content = generate_gateway_template(self.max_slots);
+    ///
+    /// `slots` is the slot set the new instance owns — one pinned `networks:`
+    /// entry each.
+    fn create_instance(&self, slots: &[u16]) -> Result<(), SandboxError> {
+        let template_content = generate_gateway_template(slots);
 
         // Write the template to a sibling directory of LIMA_HOME — NOT inside
         // LIMA_HOME itself. If the template is written inside LIMA_HOME (e.g.
@@ -1480,8 +1719,11 @@ impl GatewayLimaManager {
         }
     }
 
-    /// Discover the slot→NIC map by running `ip -json link show` inside the VM.
-    fn discover_nics(&self) -> Result<NicMap, SandboxError> {
+    /// Verify the slot→NIC map by running `ip -json link show` inside the VM.
+    ///
+    /// The map itself is built from `slots`; the guest output is only checked
+    /// against it. See [`discover_nics_from_ip_json`].
+    fn discover_nics(&self, slots: &[u16]) -> Result<NicMap, SandboxError> {
         // Run `ip -json link show` inside the gateway VM.
         // We use a shell command via limactl shell.
         let output = self.run_gateway_shell("ip -json link show", GATEWAY_SHELL_TIMEOUT)?;
@@ -1494,7 +1736,7 @@ impl GatewayLimaManager {
         }
 
         let json = String::from_utf8_lossy(&output.stdout);
-        discover_nics_from_ip_json(&json)
+        discover_nics_from_ip_json(&json, slots)
     }
 
     /// Ensure the `sandboxd-egress` Docker bridge exists inside the gateway VM.
@@ -2202,13 +2444,18 @@ impl GatewayLimaManager {
     /// the 90-second recovery timeout surfaces a stuck restart quickly so the
     /// monitor's 10-second poll can re-attempt.
     ///
-    /// On success, re-discovers NICs and re-caches the NIC map, then
-    /// re-establishes the egress bridge and applies the baseline `eth0` nft
-    /// policy (all idempotent operations).
+    /// On success, re-verifies the slot→NIC map against `slots` and re-caches
+    /// it, then re-establishes the egress bridge and applies the baseline
+    /// `eth0` nft policy (all idempotent operations).
+    ///
+    /// This path never creates an instance, so `slots` is used only for
+    /// verification — a slot whose interface the restarted VM does not carry
+    /// drops out of the map, and the sessions on it are refused rather than
+    /// re-parented onto a guess.
     ///
     /// Callers must wrap this in `tokio::task::spawn_blocking` because it
     /// shells out to `limactl` and `docker`.
-    pub fn restart_instance_for_recovery(&self) -> Result<(), SandboxError> {
+    pub fn restart_instance_for_recovery(&self, slots: &[u16]) -> Result<(), SandboxError> {
         info!("gateway Lima recovery: force-stopping instance");
         self.force_stop_instance()?;
 
@@ -2253,9 +2500,9 @@ impl GatewayLimaManager {
             thread::sleep(DOCKER_READY_POLL_INTERVAL);
         }
 
-        // Re-discover NICs and re-cache the NIC map.
-        info!("gateway Lima recovery: re-discovering NICs");
-        let nic_map = self.discover_nics()?;
+        // Re-verify the slot→NIC map and re-cache it.
+        info!("gateway Lima recovery: re-verifying slot NICs");
+        let nic_map = self.discover_nics(slots)?;
         {
             let mut guard = self.nic_map.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(nic_map);
@@ -2500,26 +2747,83 @@ mod tests {
     {"ifindex":2,"ifname":"eth0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"link_type":"ether","address":"52:55:0a:00:02:0f","broadcast":"ff:ff:ff:ff:ff:ff"}
 ]"#;
 
+    /// Output from a VM holding the **offset** range `{4,5,6,7}` with the
+    /// per-entry `interface:` key honoured — the shape positional naming gets
+    /// wrong, and the reason this parser exists.
+    const IP_JSON_SLOTS_4_TO_7: &str = r#"[
+    {"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],"link_type":"loopback","address":"00:00:00:00:00:00","broadcast":"00:00:00:00:00:00"},
+    {"ifindex":2,"ifname":"eth0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"link_type":"ether","address":"52:55:0a:00:02:0f","broadcast":"ff:ff:ff:ff:ff:ff"},
+    {"ifindex":3,"ifname":"lima4","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"link_type":"ether","address":"52:55:0a:d1:80:20","broadcast":"ff:ff:ff:ff:ff:ff"},
+    {"ifindex":4,"ifname":"lima5","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"link_type":"ether","address":"52:55:0a:d1:80:28","broadcast":"ff:ff:ff:ff:ff:ff"},
+    {"ifindex":5,"ifname":"lima6","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"link_type":"ether","address":"52:55:0a:d1:80:30","broadcast":"ff:ff:ff:ff:ff:ff"},
+    {"ifindex":6,"ifname":"lima7","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"link_type":"ether","address":"52:55:0a:d1:80:38","broadcast":"ff:ff:ff:ff:ff:ff"}
+]"#;
+
     #[test]
     fn nic_discovery_3_slots() {
-        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS).unwrap();
+        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS, &[0, 1, 2]).unwrap();
         assert_eq!(map.discovered_count, 3);
         assert_eq!(map.slot_to_iface.get(&0), Some(&"lima0".to_string()));
         assert_eq!(map.slot_to_iface.get(&1), Some(&"lima1".to_string()));
         assert_eq!(map.slot_to_iface.get(&2), Some(&"lima2".to_string()));
         assert_eq!(map.slot_to_iface.get(&3), None);
+        assert!(map.missing_slots.is_empty());
     }
 
     #[test]
     fn nic_discovery_1_slot() {
-        let map = discover_nics_from_ip_json(IP_JSON_1_SLOT).unwrap();
+        let map = discover_nics_from_ip_json(IP_JSON_1_SLOT, &[0]).unwrap();
         assert_eq!(map.discovered_count, 1);
         assert_eq!(map.slot_to_iface.get(&0), Some(&"lima0".to_string()));
     }
 
+    /// An offset range maps to **its own** slot numbers. This is the whole
+    /// point of the change: the previous parser sorted by suffix and then keyed
+    /// by list position, so `lima4..lima7` came back as slots 0..3 — every
+    /// session on the VM one segment-set away from where it belonged.
+    #[test]
+    fn nic_discovery_offset_range_keys_by_slot_not_position() {
+        let map = discover_nics_from_ip_json(IP_JSON_SLOTS_4_TO_7, &[4, 5, 6, 7]).unwrap();
+        assert_eq!(map.discovered_count, 4);
+        assert_eq!(map.interface_for_slot(4), Some("lima4"));
+        assert_eq!(map.interface_for_slot(5), Some("lima5"));
+        assert_eq!(map.interface_for_slot(6), Some("lima6"));
+        assert_eq!(map.interface_for_slot(7), Some("lima7"));
+        // The positional reading would have put entries here.
+        for slot in 0u16..4 {
+            assert_eq!(
+                map.interface_for_slot(slot),
+                None,
+                "slot {slot} is not in this VM's range and must not be mapped"
+            );
+        }
+        assert!(map.missing_slots.is_empty());
+    }
+
+    /// Every mapped name is derived from the slot, never lifted from the guest
+    /// string — asserted over the whole map rather than at one entry.
+    #[test]
+    fn nic_map_names_are_derived_from_the_slot_for_every_entry() {
+        for slots in [&[0u16, 1, 2][..], &[4, 5, 6, 7][..]] {
+            let json = if slots[0] == 0 {
+                IP_JSON_3_SLOTS
+            } else {
+                IP_JSON_SLOTS_4_TO_7
+            };
+            let map = discover_nics_from_ip_json(json, slots).unwrap();
+            for (slot, iface) in &map.slot_to_iface {
+                assert_eq!(
+                    iface,
+                    &slot_interface_name(*slot),
+                    "slot {slot} mapped to {iface}, which is not its own interface name"
+                );
+            }
+        }
+    }
+
     #[test]
     fn nic_discovery_excludes_eth0() {
-        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS).unwrap();
+        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS, &[0, 1, 2]).unwrap();
         // eth0 must never appear as a slot NIC.
         for iface in map.slot_to_iface.values() {
             assert_ne!(iface, "eth0", "eth0 must never be mapped to a slot");
@@ -2530,32 +2834,235 @@ mod tests {
     fn nic_discovery_no_lima_nics() {
         // When no limaN NICs are present, we get an empty map (discovered_count 0).
         // This is the count-mismatch non-fatal case.
-        let map = discover_nics_from_ip_json(IP_JSON_NO_LIMA).unwrap();
+        let map = discover_nics_from_ip_json(IP_JSON_NO_LIMA, &[0, 1, 2]).unwrap();
         assert_eq!(map.discovered_count, 0);
         assert!(map.slot_to_iface.is_empty());
+        assert_eq!(map.missing_slots, vec![0, 1, 2]);
+    }
+
+    /// A slot the VM does not carry is **absent** from the map, not guessed
+    /// into it. This is the fail-closed half: the claim sites turn the absence
+    /// into a refused session.
+    ///
+    /// It is also the backstop for a Lima too old to honour the per-entry
+    /// `interface:` key — such a VM names an offset range positionally, so none
+    /// of the expected interfaces exist and every slot fails verification
+    /// rather than silently mapping to another slot's segment.
+    #[test]
+    fn nic_verification_omits_slots_the_guest_does_not_carry() {
+        // Requested {4,5,6,7}; an old Lima ignored `interface:` and named them
+        // positionally, so the guest reports lima0..lima3.
+        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS, &[4, 5, 6, 7]).unwrap();
+        assert!(
+            map.slot_to_iface.is_empty(),
+            "no expected interface is present, so nothing may be mapped"
+        );
+        assert_eq!(map.missing_slots, vec![4, 5, 6, 7]);
+        // The interfaces the guest *does* report are still counted — that count
+        // is what the pool-resize decision reads.
+        assert_eq!(map.discovered_count, 3);
+    }
+
+    /// A partially-provisioned VM maps what it can and withholds the rest.
+    #[test]
+    fn nic_verification_is_per_slot_not_all_or_nothing() {
+        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS, &[1, 2, 5]).unwrap();
+        assert_eq!(map.interface_for_slot(1), Some("lima1"));
+        assert_eq!(map.interface_for_slot(2), Some("lima2"));
+        assert_eq!(map.interface_for_slot(5), None);
+        assert_eq!(map.missing_slots, vec![5]);
+    }
+
+    /// A missing interface must not fail the whole verification: at startup
+    /// that would be the daemon refusing to boot, which would take out the
+    /// reduced-pool arms of `decide_pool_resize`. The refusal belongs at the
+    /// claim site, per session.
+    #[test]
+    fn nic_verification_missing_slot_is_not_an_error() {
+        assert!(discover_nics_from_ip_json(IP_JSON_NO_LIMA, &[0, 1]).is_ok());
+    }
+
+    /// A guest name that merely *parses* to the right number is not the right
+    /// name. `lima04` must not satisfy slot 4.
+    #[test]
+    fn nic_verification_rejects_non_canonical_guest_names() {
+        const IP_JSON_PADDED: &str = r#"[
+    {"ifindex":2,"ifname":"eth0","flags":[],"link_type":"ether","address":"52:55:0a:00:02:0f","broadcast":"ff:ff:ff:ff:ff:ff"},
+    {"ifindex":3,"ifname":"lima04","flags":[],"link_type":"ether","address":"52:55:0a:d1:80:20","broadcast":"ff:ff:ff:ff:ff:ff"}
+]"#;
+        let map = discover_nics_from_ip_json(IP_JSON_PADDED, &[4]).unwrap();
+        assert_eq!(map.interface_for_slot(4), None);
+        assert_eq!(map.missing_slots, vec![4]);
     }
 
     #[test]
     fn nic_discovery_count_mismatch_is_non_fatal() {
-        // 3 slots discovered but max_slots would be 8 in production — the
-        // function itself returns successfully; the caller (GatewayLimaManager)
-        // logs a warning. Verify parse succeeds.
-        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS).unwrap();
-        // The parse succeeds — caller decides what to do with the mismatch.
+        // 3 NICs present but 8 slots requested — the function itself returns
+        // successfully; the caller (GatewayLimaManager) logs a warning and the
+        // startup resize decision acts on the count.
+        let slots: Vec<u16> = (0..8).collect();
+        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS, &slots).unwrap();
         assert_eq!(map.discovered_count, 3);
+        assert_eq!(map.slot_to_iface.len(), 3);
     }
 
     #[test]
     fn nic_discovery_invalid_json() {
-        let result = discover_nics_from_ip_json("not json at all");
+        let result = discover_nics_from_ip_json("not json at all", &[0]);
         assert!(result.is_err());
     }
 
     // -- Template generation (pure, hermetic) ---------------------------------
 
+    /// The contiguous slot set of a single-operator pool of `n` slots — the
+    /// shape every host runs today.
+    fn slots(n: u16) -> Vec<u16> {
+        (0..n).collect()
+    }
+
+    /// Extract every `networks:` entry from a rendered template as
+    /// `(socket_path, interface_name)`.
+    ///
+    /// Reads the emitted YAML rather than re-deriving from the generator's
+    /// inputs, so an assertion over the result is a statement about what was
+    /// actually written to the file Lima consumes. Panics on a `- socket:`
+    /// entry with no `interface:` line, which is itself the invariant failing.
+    fn template_network_entries(tmpl: &str) -> Vec<(String, String)> {
+        let mut lines = tmpl.lines().peekable();
+        let mut entries = Vec::new();
+        while let Some(line) = lines.next() {
+            let Some(socket) = line.strip_prefix("  - socket: ") else {
+                continue;
+            };
+            let interface = lines
+                .peek()
+                .and_then(|next| next.strip_prefix("    interface: "))
+                .unwrap_or_else(|| {
+                    panic!("networks entry for {socket} has no `interface:` line following it")
+                });
+            entries.push((socket.to_string(), interface.to_string()));
+        }
+        entries
+    }
+
+    /// Every emitted entry pins `interface: lima<slot>` on that slot's socket —
+    /// asserted over **all** entries, and for an offset range as well as a
+    /// contiguous one.
+    ///
+    /// Lima names guest NICs by array position unless told otherwise, and it
+    /// accepts a wrong name without warning: `interface: lima2` on
+    /// `slot-7.sock` validates clean and puts the session on slot 7's segment
+    /// under slot 2's name. Nothing downstream would notice. The invariant is
+    /// checked here by parsing the socket path back to a slot number, so the
+    /// two halves of each entry are compared rather than co-derived.
+    #[test]
+    fn template_pins_interface_to_its_own_slot_for_every_entry() {
+        for slot_set in [slots(1), slots(4), slots(8), vec![4, 5, 6, 7], vec![2, 7]] {
+            let tmpl = generate_gateway_template(&slot_set);
+            let entries = template_network_entries(&tmpl);
+            assert_eq!(
+                entries.len(),
+                slot_set.len(),
+                "one networks entry per slot for {slot_set:?}"
+            );
+            for (socket, interface) in &entries {
+                let slot = crate::network::slot_from_vmnet_socket_path(socket)
+                    .unwrap_or_else(|| panic!("socket path {socket} does not name a slot"));
+                assert_eq!(
+                    interface,
+                    &format!("lima{slot}"),
+                    "entry on {socket} pins interface {interface}, which belongs to a \
+                     different slot — the session would land on the wrong L2 segment"
+                );
+            }
+            // And the entries cover exactly the requested slots, in order.
+            let emitted: Vec<u16> = entries
+                .iter()
+                .map(|(socket, _)| crate::network::slot_from_vmnet_socket_path(socket).unwrap())
+                .collect();
+            assert_eq!(emitted, slot_set);
+        }
+    }
+
+    /// An offset range renders its own slots throughout — sockets, netplan
+    /// stanzas and IPv6-disable lines alike — and never slot 0..n-1.
+    #[test]
+    fn template_offset_range_renders_its_own_slots() {
+        let tmpl = generate_gateway_template(&[4, 5, 6, 7]);
+
+        assert_eq!(
+            tmpl.matches("  - socket:").count(),
+            4,
+            "one socket entry per requested slot"
+        );
+        for slot in 4u16..8 {
+            assert!(
+                tmpl.contains(&crate::network::vmnet_slot_socket_path(slot)),
+                "template must reference slot {slot}'s socket"
+            );
+            assert!(
+                tmpl.contains(&format!("    interface: lima{slot}\n")),
+                "template must pin lima{slot}"
+            );
+            assert!(
+                tmpl.contains(&format!("printf '    lima{slot}:")),
+                "netplan must configure lima{slot}"
+            );
+            assert!(
+                tmpl.contains(&format!("net.ipv6.conf.lima{slot}.disable_ipv6=1")),
+                "IPv6 must be disabled on lima{slot}"
+            );
+        }
+        for slot in 0u16..4 {
+            assert!(
+                !tmpl.contains(&crate::network::vmnet_slot_socket_path(slot)),
+                "template must not reference slot {slot}, which this VM does not own"
+            );
+            assert!(
+                !tmpl.contains(&format!("    interface: lima{slot}\n")),
+                "template must not pin lima{slot}"
+            );
+            assert!(
+                !tmpl.contains(&format!("net.ipv6.conf.lima{slot}.disable_ipv6=1")),
+                "template must not configure lima{slot}"
+            );
+        }
+    }
+
+    /// The netplan and IPv6-disable stanzas cover exactly the same interfaces
+    /// as the `networks:` entries. A NIC configured in one and missing from the
+    /// other is a boot stall or a live IPv6 path on a segment we do not police.
+    #[test]
+    fn template_provisioning_covers_every_emitted_interface() {
+        for slot_set in [slots(3), vec![4, 5, 6, 7], vec![2, 7]] {
+            let tmpl = generate_gateway_template(&slot_set);
+            let entries = template_network_entries(&tmpl);
+            assert_eq!(
+                tmpl.matches("printf '    lima").count(),
+                entries.len(),
+                "netplan stanza count must equal the networks entry count for {slot_set:?}"
+            );
+            assert_eq!(
+                tmpl.matches("sysctl -w net.ipv6.conf.lima").count(),
+                entries.len(),
+                "IPv6-disable line count must equal the networks entry count for {slot_set:?}"
+            );
+            for (_, interface) in &entries {
+                assert!(
+                    tmpl.contains(&format!("printf '    {interface}:")),
+                    "{interface} has a networks entry but no netplan stanza"
+                );
+                assert!(
+                    tmpl.contains(&format!("net.ipv6.conf.{interface}.disable_ipv6=1")),
+                    "{interface} has a networks entry but no IPv6-disable line"
+                );
+            }
+        }
+    }
+
     #[test]
     fn template_contains_qemu_vmtype() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert!(
             tmpl.contains("vmType: \"qemu\""),
             "template must specify vmType qemu"
@@ -2569,7 +3076,7 @@ mod tests {
     /// the resource cap cannot silently drift apart.
     #[test]
     fn template_cpus_and_memory_match_published_constants() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert_eq!(GATEWAY_VM_CPUS, 2);
         assert_eq!(GATEWAY_VM_MEMORY_MB, 2048);
         assert!(
@@ -2584,25 +3091,25 @@ mod tests {
 
     #[test]
     fn template_contains_correct_socket_count() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         // Each slot produces one `- socket:` entry.
         let socket_count = tmpl.matches("  - socket:").count();
         assert_eq!(
             socket_count, 4,
-            "template must have exactly 4 socket entries for max_slots=4"
+            "template must have exactly 4 socket entries for a 4-slot set"
         );
 
-        let tmpl8 = generate_gateway_template(8);
+        let tmpl8 = generate_gateway_template(&slots(8));
         let socket_count8 = tmpl8.matches("  - socket:").count();
         assert_eq!(
             socket_count8, 8,
-            "template must have exactly 8 socket entries for max_slots=8"
+            "template must have exactly 8 socket entries for an 8-slot set"
         );
     }
 
     #[test]
     fn template_slot_socket_paths_match_vmnet_pool() {
-        let tmpl = generate_gateway_template(3);
+        let tmpl = generate_gateway_template(&slots(3));
         // Verify the socket paths match what VmnetPool::slot_socket_path returns.
         for slot in 0u16..3 {
             let expected = crate::network::vmnet_slot_socket_path(slot);
@@ -2615,7 +3122,7 @@ mod tests {
 
     #[test]
     fn template_has_forwarded_docker_socket() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert!(
             tmpl.contains("guestSocket: \"/var/run/docker.sock\""),
             "template must forward the guest Docker socket"
@@ -2628,7 +3135,7 @@ mod tests {
 
     #[test]
     fn template_has_docker_provision() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert!(
             tmpl.contains("apt-get install -y docker.io"),
             "template must provision docker.io"
@@ -2654,7 +3161,7 @@ mod tests {
 
     #[test]
     fn template_has_mtu_clamp() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert!(
             tmpl.contains("mtu: 1280"),
             "template must clamp eth0 MTU to 1280"
@@ -2663,7 +3170,7 @@ mod tests {
 
     #[test]
     fn template_has_no_dhcp_for_lima_nics() {
-        let tmpl = generate_gateway_template(3);
+        let tmpl = generate_gateway_template(&slots(3));
         assert!(
             tmpl.contains("dhcp4: no"),
             "template must disable DHCP on limaN NICs"
@@ -2676,7 +3183,7 @@ mod tests {
 
     #[test]
     fn template_has_minimum_lima_version() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert!(
             tmpl.contains(MIN_LIMA_VERSION),
             "template must specify minimumLimaVersion"
@@ -2685,7 +3192,7 @@ mod tests {
 
     #[test]
     fn template_has_ubuntu_noble_image() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert!(
             tmpl.contains(UBUNTU_NOBLE_ARM64_URL),
             "template must reference the Ubuntu 24.04 aarch64 cloud image"
@@ -2694,7 +3201,7 @@ mod tests {
 
     #[test]
     fn template_disables_containerd() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         assert!(
             tmpl.contains("system: false"),
             "template must disable containerd (system)"
@@ -2707,7 +3214,7 @@ mod tests {
 
     #[test]
     fn template_has_lite_shared_root_9p_mounts_stanza() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         // The template must include a mounts: block for lite shared: workspaces.
         assert!(
             tmpl.contains("mounts:"),
@@ -2743,7 +3250,7 @@ mod tests {
 
     #[test]
     fn template_has_route_helper_sudoers_provision() {
-        let tmpl = generate_gateway_template(4);
+        let tmpl = generate_gateway_template(&slots(4));
         // The sudoers entry must be scoped to exactly the route-helper binary path.
         assert!(
             tmpl.contains("/usr/local/libexec/sandboxd/sandbox-route-helper"),
@@ -2887,11 +3394,166 @@ mod tests {
 
     #[test]
     fn nic_map_interface_for_slot_accessor() {
-        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS).unwrap();
+        let map = discover_nics_from_ip_json(IP_JSON_3_SLOTS, &[0, 1, 2]).unwrap();
         assert_eq!(map.interface_for_slot(0), Some("lima0"));
         assert_eq!(map.interface_for_slot(1), Some("lima1"));
         assert_eq!(map.interface_for_slot(2), Some("lima2"));
         assert_eq!(map.interface_for_slot(3), None); // out of range
+    }
+
+    // -- Slot identity: refusals, not guesses ---------------------------------
+
+    /// A map covering `slots`, as a healthy gateway VM would produce.
+    fn verified_map(slots: &[u16]) -> NicMap {
+        NicMap {
+            slot_to_iface: slots.iter().map(|&s| (s, slot_interface_name(s))).collect(),
+            discovered_count: slots.len(),
+            missing_slots: Vec::new(),
+        }
+    }
+
+    fn network_info_with_slot(slot: Option<u16>, bridge_name: &str) -> crate::network::NetworkInfo {
+        crate::network::NetworkInfo {
+            bridge_name: bridge_name.to_string(),
+            subnet: "10.209.128.0/29".to_string(),
+            gateway_ip: "10.209.128.3".to_string(),
+            vm_ip: "10.209.128.4".to_string(),
+            docker_network_name: "sandbox-net-test".to_string(),
+            vmnet_slot: slot.map(|index| crate::network::VmnetSlot {
+                index,
+                daemon_label: crate::network::vmnet_slot_daemon_label(index),
+                socket_path: crate::network::vmnet_slot_socket_path(index),
+            }),
+        }
+    }
+
+    /// The create and recovery sites: a NIC-map miss is an error, never a
+    /// `lima<slot>` guess.
+    #[test]
+    fn nic_from_verified_map_refuses_a_miss() {
+        let map = verified_map(&[0, 1]);
+        assert_eq!(nic_from_verified_map(Some(&map), 1).unwrap(), "lima1");
+
+        // Slot outside the map — the VM has no verified interface for it.
+        let err = nic_from_verified_map(Some(&map), 5).unwrap_err();
+        assert!(
+            err.to_string().contains("no verified gateway NIC"),
+            "unexpected error: {err}"
+        );
+        // Map not populated at all.
+        assert!(nic_from_verified_map(None, 0).is_err());
+    }
+
+    /// The restart site keeps working from the durable record when the map is
+    /// unpopulated — this is the regression that hard-erroring all three sites
+    /// alike would have caused. `nic_map()` is `None` until `ensure_ready`
+    /// completes, which is not a fault and must not fail a restore.
+    #[test]
+    fn nic_from_record_survives_an_unpopulated_map() {
+        assert_eq!(
+            nic_from_record_or_map(None, 3, "lima3").unwrap(),
+            "lima3",
+            "an unpopulated map must not defeat a session's persisted NIC"
+        );
+        // Also when the map is populated but does not cover the slot.
+        let map = verified_map(&[0, 1]);
+        assert_eq!(
+            nic_from_record_or_map(Some(&map), 3, "lima3").unwrap(),
+            "lima3"
+        );
+    }
+
+    /// …but with no record either, there is nothing left to trust.
+    #[test]
+    fn nic_from_record_refuses_when_the_record_is_also_empty() {
+        let err = nic_from_record_or_map(None, 3, "").unwrap_err();
+        assert!(
+            err.to_string().contains("no verified gateway NIC"),
+            "unexpected error: {err}"
+        );
+        // A populated map fills a blank record rather than refusing.
+        let map = verified_map(&[3]);
+        assert_eq!(nic_from_record_or_map(Some(&map), 3, "").unwrap(), "lima3");
+    }
+
+    /// Record and map disagreeing is a refusal, not a re-parent: the running
+    /// session's macvlan is already attached to the recorded NIC.
+    #[test]
+    fn nic_from_record_refuses_a_disagreement() {
+        let map = verified_map(&[3]);
+        let err = nic_from_record_or_map(Some(&map), 3, "lima7").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lima7") && msg.contains("lima3"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("re-parent"), "unexpected error: {msg}");
+    }
+
+    /// The real silent guess: a session with no recorded slot defaulting to
+    /// index 0. Under per-operator ranges that is another operator's segment.
+    #[test]
+    fn slot_for_persisted_session_refuses_a_missing_slot() {
+        let ni = network_info_with_slot(Some(4), "lima4");
+        assert_eq!(slot_for_persisted_session(&ni).unwrap(), 4);
+
+        let ni = network_info_with_slot(None, "lima0");
+        let err = slot_for_persisted_session(&ni).unwrap_err();
+        assert!(
+            err.to_string().contains("no vmnet slot recorded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A session whose recorded slot is 0 is not the same thing as a session
+    /// with no recorded slot — the old default made them indistinguishable.
+    #[test]
+    fn slot_for_persisted_session_distinguishes_slot_zero_from_absent() {
+        assert_eq!(
+            slot_for_persisted_session(&network_info_with_slot(Some(0), "lima0")).unwrap(),
+            0
+        );
+        assert!(slot_for_persisted_session(&network_info_with_slot(None, "lima0")).is_err());
+    }
+
+    // -- LIMA_HOME path depth (§ UNIX_PATH_MAX) --------------------------------
+
+    /// The gateway instance's `ssh.sock` address fits in `sun_path`.
+    ///
+    /// Computed from the real path builders rather than eyeballed, so it stays
+    /// true when the state root, the nesting or the instance-name scheme
+    /// changes — which are the three things that consume the headroom. Lima
+    /// resolves symlinks before binding, so there is no way to spell around an
+    /// over-long path; the VM simply fails to start, with an error that does
+    /// not name path length as the cause.
+    #[test]
+    fn gateway_instance_socket_path_fits_unix_path_max() {
+        use crate::lima::{
+            MACOS_UNIX_PATH_MAX, SANDBOXD_STATE_ROOT, instance_socket_path_fits,
+            instance_ssh_socket_path, operator_lima_home_inner,
+        };
+
+        // Production shape (daemon is its own operator) plus a 5-digit-uid host,
+        // which is the widest realistic uid pair.
+        for (daemon_uid, op_uid) in [(309u32, 309u32), (309, 501), (12345, 98765)] {
+            let lima_home = operator_lima_home_inner(SANDBOXD_STATE_ROOT, daemon_uid, op_uid);
+            let sock = instance_ssh_socket_path(&lima_home, GATEWAY_INSTANCE_NAME);
+            let len = sock.as_os_str().len();
+            assert!(
+                instance_socket_path_fits(&lima_home, GATEWAY_INSTANCE_NAME),
+                "{} is {len} bytes; sun_path holds {MACOS_UNIX_PATH_MAX} including the \
+                 terminator, so the gateway VM would fail to start",
+                sock.display()
+            );
+            // A session VM's instance name is the longer of the two schemes in
+            // this tree; hold the bound for it too.
+            let session_instance = crate::lima::vm_name(&crate::session::SessionId::generate());
+            assert!(
+                instance_socket_path_fits(&lima_home, &session_instance),
+                "session instance {session_instance} under {} exceeds sun_path",
+                lima_home.display()
+            );
+        }
     }
 
     // -- Pool resize decision (pure, hermetic) ---------------------------------

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -194,8 +194,41 @@ pub const STATE_ROOT_OVERRIDE_ENV: &str = "SANDBOX_LIMA_HELPER_TEST_STATE_ROOT";
 ///   segment, isolating per-daemon state trees on the same host.
 /// - `op_uid`     — the human operator's uid; the second variable segment,
 ///   isolating per-operator Lima state within one daemon's tree.
-fn operator_lima_home_inner(root: &str, daemon_uid: u32, op_uid: u32) -> PathBuf {
+pub(crate) fn operator_lima_home_inner(root: &str, daemon_uid: u32, op_uid: u32) -> PathBuf {
     PathBuf::from(format!("{root}/{daemon_uid}/{op_uid}/lima"))
+}
+
+/// Maximum length of a Unix-domain socket address on macOS, **including** the
+/// NUL terminator (`sizeof(sockaddr_un.sun_path)`).
+///
+/// Linux allows 108; the tighter macOS bound is the one every path scheme in
+/// this tree has to clear, so it is the one stated here and the one asserted
+/// against.
+pub const MACOS_UNIX_PATH_MAX: usize = 104;
+
+/// Path of the SSH control socket Lima binds for an instance.
+///
+/// Lima binds `<instance-dir>/ssh.sock` and **resolves symlinks before
+/// binding**, so a shorter path spelled with a symlink does not shorten the
+/// address that reaches the kernel. Exceed [`MACOS_UNIX_PATH_MAX`] and the VM
+/// fails to start with an error that does not name path length as the cause.
+///
+/// Three things consume the headroom: a longer state root, another level of
+/// nesting under it, and a longer instance-name scheme. Do not add one without
+/// recomputing — [`instance_socket_path_fits`] is the computation.
+pub fn instance_ssh_socket_path(lima_home: &Path, instance: &str) -> PathBuf {
+    lima_home.join(instance).join("ssh.sock")
+}
+
+/// Whether an instance's SSH socket address fits in `sun_path`.
+///
+/// Strictly less than the bound: [`MACOS_UNIX_PATH_MAX`] counts the NUL
+/// terminator, so a path of exactly that many bytes does not fit.
+pub fn instance_socket_path_fits(lima_home: &Path, instance: &str) -> bool {
+    instance_ssh_socket_path(lima_home, instance)
+        .as_os_str()
+        .len()
+        < MACOS_UNIX_PATH_MAX
 }
 
 /// Return the LIMA_HOME path for the given operator uid.

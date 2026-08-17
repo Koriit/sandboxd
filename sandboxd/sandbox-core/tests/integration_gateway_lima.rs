@@ -31,7 +31,6 @@ mod tests {
         EGRESS_BRIDGE_NAME, GATEWAY_INSTANCE_NAME, GatewayLimaManager,
     };
     use sandbox_core::lima::{LimaExecutor, LimaOp, operator_lima_home};
-    use sandbox_core::network::VmnetPool;
     use sandbox_core::process::run_with_timeout;
 
     // ------------------------------------------------------------------
@@ -120,15 +119,24 @@ mod tests {
     }
 
     /// Construct a `GatewayLimaManager` backed by the direct limactl executor.
-    fn build_test_manager(pool: &VmnetPool) -> GatewayLimaManager {
+    ///
+    /// The manager carries no slot set — every call that needs one takes it as
+    /// an argument, so each test states the slots it is exercising at the call
+    /// site rather than inheriting them from construction.
+    fn build_test_manager() -> GatewayLimaManager {
         let daemon_uid = Uid::current().as_raw();
         let lima_home = operator_lima_home(daemon_uid);
         GatewayLimaManager::new(
             lima_home,
             Arc::new(DirectLimaExecutor { daemon_uid }),
             daemon_uid,
-            pool,
         )
+    }
+
+    /// The contiguous slot set a single-operator pool of `n` slots owns — what
+    /// the daemon passes to `ensure_ready` on this host's shape.
+    fn slots(n: u16) -> Vec<u16> {
+        (0..n).collect()
     }
 
     // ------------------------------------------------------------------
@@ -151,10 +159,12 @@ mod tests {
     fn integration_gateway_lima_ensure_ready_full_lifecycle() {
         const MAX_SLOTS: u16 = 2; // 2 slots keeps the test fast.
 
-        let pool = VmnetPool::new(MAX_SLOTS);
-        let manager = build_test_manager(&pool);
+        let manager = build_test_manager();
+        let slots = slots(MAX_SLOTS);
 
-        manager.ensure_ready().expect("gateway ensure_ready failed");
+        manager
+            .ensure_ready(&slots)
+            .expect("gateway ensure_ready failed");
 
         // Verify NIC map was populated.
         let nic_map = manager
@@ -220,7 +230,7 @@ mod tests {
         // Verify idempotency: a second ensure_ready (simulating daemon restart
         // against the still-running gateway VM) must not fail.
         manager
-            .ensure_ready()
+            .ensure_ready(&slots)
             .expect("second ensure_ready (daemon restart simulation) failed");
 
         // No teardown: leave the gateway VM running so subsequent integration
@@ -236,9 +246,9 @@ mod tests {
         // (which uses 2 slots for fast provisioning). NIC discovery asserts the
         // discovered count equals max_slots when the gateway has the right NICs.
         const MAX_SLOTS: u16 = 2;
-        let pool = VmnetPool::new(MAX_SLOTS);
-        let manager = build_test_manager(&pool);
-        manager.ensure_ready().expect("ensure_ready failed");
+        let manager = build_test_manager();
+        let slots = slots(MAX_SLOTS);
+        manager.ensure_ready(&slots).expect("ensure_ready failed");
 
         let nic_map = manager.nic_map().expect("NIC map should be populated");
         assert_eq!(
@@ -260,9 +270,9 @@ mod tests {
     /// and is accessible via the forwarded Docker socket.
     #[test]
     fn integration_gateway_lima_egress_bridge_accessible() {
-        let pool = VmnetPool::new(2);
-        let manager = build_test_manager(&pool);
-        manager.ensure_ready().expect("ensure_ready failed");
+        let manager = build_test_manager();
+        let slots = slots(2);
+        manager.ensure_ready(&slots).expect("ensure_ready failed");
 
         let socket_str = format!("unix://{}", manager.gateway_docker_socket().display());
         let output = std::process::Command::new("docker")
@@ -279,9 +289,9 @@ mod tests {
     /// and that the `sandboxd-gateway-eth0` table exists and has the expected chains.
     #[test]
     fn integration_gateway_lima_eth0_nft_policy_applied() {
-        let pool = VmnetPool::new(2);
-        let manager = build_test_manager(&pool);
-        manager.ensure_ready().expect("ensure_ready failed");
+        let manager = build_test_manager();
+        let slots = slots(2);
+        manager.ensure_ready(&slots).expect("ensure_ready failed");
 
         let daemon_uid = Uid::current().as_raw();
         let lima_home = operator_lima_home(daemon_uid);
@@ -356,31 +366,43 @@ mod tests {
     #[test]
     fn integration_gateway_lima_nic_count_mismatch_is_non_fatal() {
         // Pool expects 4 NICs but the gateway has only 2 — non-fatal.
-        let pool = VmnetPool::new(4);
-        let manager = build_test_manager(&pool);
+        let manager = build_test_manager();
+        let slots = slots(4);
 
         // ensure_ready should succeed even with the mismatch (logs a warning).
         manager
-            .ensure_ready()
+            .ensure_ready(&slots)
             .expect("ensure_ready should not fail on NIC count mismatch");
 
         let nic_map = manager.nic_map().expect("NIC map should be populated");
         assert_eq!(
             nic_map.discovered_count, 2,
-            "discovered_count should reflect actual NICs, not max_slots"
+            "discovered_count should reflect actual NICs, not the requested slot count"
         );
+        // The two slots the VM cannot serve are absent from the map rather than
+        // mapped to an invented name — the sessions that claim them are refused
+        // at the claim site instead of landing on an unknown segment.
+        assert_eq!(
+            nic_map.missing_slots,
+            vec![2, 3],
+            "slots without a verified interface must be reported missing"
+        );
+        assert_eq!(nic_map.interface_for_slot(2), None);
+        assert_eq!(nic_map.interface_for_slot(3), None);
     }
 
     /// Test that `ensure_ready` succeeds even if the gateway is already running
     /// (idempotent). Requires the gateway to be pre-started.
     #[test]
     fn integration_gateway_lima_ensure_ready_idempotent_when_running() {
-        let pool = VmnetPool::new(2);
-        let manager = build_test_manager(&pool);
+        let manager = build_test_manager();
+        let slots = slots(2);
 
-        manager.ensure_ready().expect("first ensure_ready failed");
         manager
-            .ensure_ready()
+            .ensure_ready(&slots)
+            .expect("first ensure_ready failed");
+        manager
+            .ensure_ready(&slots)
             .expect("second ensure_ready failed (idempotent)");
     }
 
@@ -414,12 +436,12 @@ mod tests {
     #[test]
     fn integration_gateway_lima_probe_docker_health_reflects_state() {
         const MAX_SLOTS: u16 = 2;
-        let pool = VmnetPool::new(MAX_SLOTS);
-        let manager = build_test_manager(&pool);
+        let manager = build_test_manager();
+        let slots = slots(MAX_SLOTS);
 
         // Ensure the gateway is up before probing.
         manager
-            .ensure_ready()
+            .ensure_ready(&slots)
             .expect("ensure_ready failed before probe test");
 
         // Healthy instance → probe must return Ok(true).
@@ -461,12 +483,12 @@ mod tests {
     /// without checking the current state; this test verifies that double-stop is safe.
     #[test]
     fn integration_gateway_lima_force_stop_is_idempotent() {
-        let pool = VmnetPool::new(2);
-        let manager = build_test_manager(&pool);
+        let manager = build_test_manager();
+        let slots = slots(2);
 
         // Ensure the gateway is running first so the first stop is meaningful.
         manager
-            .ensure_ready()
+            .ensure_ready(&slots)
             .expect("ensure_ready failed in idempotent stop test");
 
         // First stop.
@@ -501,12 +523,12 @@ mod tests {
     #[test]
     fn integration_gateway_lima_restart_for_recovery_restores_readiness_and_fabric() {
         const MAX_SLOTS: u16 = 2;
-        let pool = VmnetPool::new(MAX_SLOTS);
-        let manager = build_test_manager(&pool);
+        let manager = build_test_manager();
+        let slots = slots(MAX_SLOTS);
 
         // Bring the gateway up so we start from a known state.
         manager
-            .ensure_ready()
+            .ensure_ready(&slots)
             .expect("ensure_ready failed before recovery restart test");
 
         // Simulate a crash by force-stopping the instance.
@@ -525,7 +547,7 @@ mod tests {
 
         // Run the recovery method under test.
         manager
-            .restart_instance_for_recovery()
+            .restart_instance_for_recovery(&slots)
             .expect("restart_instance_for_recovery failed");
 
         // 3. instance_state() must now be "Running".
