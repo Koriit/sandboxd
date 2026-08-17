@@ -1408,6 +1408,11 @@ async fn classify_and_dispatch_connection(
         warn!(uid, frame = %trimmed, "broker: unknown first frame on authenticated connection; closing");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Control connection — pipelined op dispatch
+// ---------------------------------------------------------------------------
+
 /// One op the daemon has written to the agent and not yet resolved.
 struct InFlightOp {
     /// Where the result goes when the matching response arrives.
