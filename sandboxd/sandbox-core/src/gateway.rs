@@ -9,6 +9,11 @@ use tracing::{debug, info, warn};
 use crate::atomic_listener_writer::{
     AtomicListenerWriter, session_listener_host_dir, session_listener_host_path,
 };
+use sandbox_docker_argv::container::{
+    ContainerCommand, GatewayComponent, InspectFlag, InspectFormat, RemoveForce,
+};
+
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 use crate::events::{EVENTS_DIR_IN_CONTAINER, session_events_host_dir};
 use crate::network::NetworkInfo;
@@ -212,6 +217,11 @@ pub fn missing_gateway_image_hint(tag: &str) -> String {
 /// Maximum time to wait for individual component readiness.
 const COMPONENT_READY_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Wall-clock ceiling for a single component readiness probe. The loop
+/// re-probes until [`COMPONENT_READY_TIMEOUT`]; this bounds one attempt so a
+/// wedged probe cannot consume the whole budget in one go.
+const COMPONENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Interval between component readiness polls.
 const COMPONENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -219,6 +229,9 @@ const COMPONENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DOCKER_RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for `docker stop` when stopping the gateway container.
+/// Grace period handed to `docker stop` for the gateway container.
+const GATEWAY_STOP_GRACE_SECS: u32 = 10;
+
 const DOCKER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for `docker rm` when removing the gateway container.
@@ -320,12 +333,18 @@ pub const NFT_POLICY_ALLOW_UDP_SET: &str = "policy_allow_udp";
 /// via `-H unix://<path>`. Set `docker_socket: Some(path)` via
 /// [`Self::with_gateway_socket`] for macOS session managers.
 pub struct GatewayManager {
-    /// On Linux: `None` (use host Docker socket, no `-H` flag).
+    /// Where this manager's container-lifecycle and probe operations go.
+    docker: DockerRoute,
+    /// On Linux: `None` (host Docker socket).
     /// On macOS: `Some(path)` to the gateway Lima instance's forwarded
-    /// Docker socket. Injected as `-H unix://<path>` on every docker command.
+    /// Docker socket.
     ///
-    /// Linux behavior is byte-for-byte identical when this is `None` —
-    /// no `-H` flag is ever prepended.
+    /// Retained for the policy-plane call sites that still build their own
+    /// `docker` command — nft injection here, and the free functions in
+    /// `policy_distributor` and `dns_propagation` that take a
+    /// `&GatewayManager` and mirror its transport. Those are a separate
+    /// family with their own review; when they move onto typed ops this
+    /// field goes with them.
     docker_socket: Option<PathBuf>,
 }
 
@@ -337,6 +356,7 @@ impl GatewayManager {
     /// no `-H` flag is injected.
     pub fn new() -> Self {
         Self {
+            docker: DockerRoute::Host,
             docker_socket: None,
         }
     }
@@ -351,8 +371,9 @@ impl GatewayManager {
     ///
     /// Linux builds can call this (the field is non-cfg), but production Linux
     /// code always uses [`Self::new`] (no forwarding needed).
-    pub fn with_gateway_socket(socket: PathBuf) -> Self {
+    pub fn with_vm_route(docker: DockerRoute, socket: PathBuf) -> Self {
         Self {
+            docker,
             docker_socket: Some(socket),
         }
     }
@@ -385,6 +406,16 @@ impl GatewayManager {
         cmd
     }
 
+    /// Run one typed Docker op on this manager's route.
+    fn run_op(
+        &self,
+        op: DockerOp,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<std::process::Output, SandboxError> {
+        self.docker.run(op, timeout, label)
+    }
+
     // -- Container lifecycle ---------------------------------------------------
 
     /// Create and start the gateway container on the session's Docker network.
@@ -405,6 +436,14 @@ impl GatewayManager {
     /// `LoadFile` call inside CoreDNS sees the intended policy, eliminating
     /// the window where CoreDNS would serve NXDOMAIN for all queries while
     /// waiting for its reload timer to detect the file change.
+    ///
+    /// **Host route only.** The argv this builds names host paths — the
+    /// events directory, the mitmproxy CA files — as bind-mount sources. A
+    /// VM's Docker daemon resolves those against the VM's filesystem, where
+    /// they do not exist, so the container would come up with empty mounts
+    /// and no obvious symptom. macOS creates its gateway container through
+    /// `macos_session`, which has no host binds at all. The refusal below
+    /// enforces what was previously only true by call-site convention.
     pub fn create_gateway(
         &self,
         session_id: &SessionId,
@@ -413,6 +452,12 @@ impl GatewayManager {
         initial_dns_policy: Option<&str>,
         owner_pool: Option<&str>,
     ) -> Result<(), SandboxError> {
+        if self.docker.is_vm() {
+            return Err(SandboxError::Gateway(
+                "create_gateway builds host bind-mount sources and cannot target a VM's                  Docker daemon; the in-VM gateway container is created by                  macos_session::setup_macos_gateway"
+                    .to_string(),
+            ));
+        }
         let container_name = container_name(session_id);
 
         info!(
@@ -435,8 +480,11 @@ impl GatewayManager {
         // `docker rm -f` handles both running and stopped containers and
         // exits with an error only when the container does not exist, which
         // we intentionally ignore.
-        let rm_output = run_with_timeout(
-            self.docker_cmd().args(["rm", "--force", &container_name]),
+        let rm_output = self.run_op(
+            DockerOp::ContainerRemove {
+                name: container_name.clone(),
+                force: RemoveForce::Long,
+            },
             DOCKER_RM_TIMEOUT,
             "docker rm (pre-cleanup)",
         );
@@ -790,18 +838,22 @@ impl GatewayManager {
         }
 
         // Step 2: Stop the container.
-        let output = run_with_timeout(
-            self.docker_cmd()
-                .args(["stop", "--time", "10", &container_name]),
-            DOCKER_STOP_TIMEOUT,
-            "docker stop (gateway)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Gateway(format!("failed to run docker stop: {msg}"))
-            }
-            other => other,
-        })?;
+        let output = self
+            .run_op(
+                DockerOp::ContainerStop {
+                    name: container_name.clone(),
+                    grace_secs: GATEWAY_STOP_GRACE_SECS,
+                    long_flag: true,
+                },
+                DOCKER_STOP_TIMEOUT,
+                "docker stop (gateway)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Gateway(format!("failed to run docker stop: {msg}"))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -814,17 +866,21 @@ impl GatewayManager {
         }
 
         // Step 3: Remove the container.
-        let output = run_with_timeout(
-            self.docker_cmd().args(["rm", "--force", &container_name]),
-            DOCKER_RM_TIMEOUT,
-            "docker rm (gateway)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Gateway(format!("failed to run docker rm: {msg}"))
-            }
-            other => other,
-        })?;
+        let output = self
+            .run_op(
+                DockerOp::ContainerRemove {
+                    name: container_name.clone(),
+                    force: RemoveForce::Long,
+                },
+                DOCKER_RM_TIMEOUT,
+                "docker rm (gateway)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Gateway(format!("failed to run docker rm: {msg}"))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -950,18 +1006,22 @@ impl GatewayManager {
         let container_name = container_name(session_id);
 
         // First check if the container is running.
-        let output = run_with_timeout(
-            self.docker_cmd()
-                .args(["inspect", "--format", "{{.State.Running}}", &container_name]),
-            DOCKER_INSPECT_TIMEOUT,
-            "docker inspect (gateway status)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Gateway(format!("failed to run docker inspect: {msg}"))
-            }
-            other => other,
-        })?;
+        let output = self
+            .run_op(
+                DockerOp::ContainerInspect {
+                    name: container_name.clone(),
+                    format: InspectFormat::StateRunning,
+                    flag: InspectFlag::Long,
+                },
+                DOCKER_INSPECT_TIMEOUT,
+                "docker inspect (gateway status)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Gateway(format!("failed to run docker inspect: {msg}"))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             return Ok(GatewayStatus::NotRunning);
@@ -973,18 +1033,21 @@ impl GatewayManager {
         }
 
         // Run the healthcheck script.
-        let output = run_with_timeout(
-            self.docker_cmd()
-                .args(["exec", &container_name, "/healthcheck.sh"]),
-            DOCKER_INSPECT_TIMEOUT,
-            "docker exec (healthcheck)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Gateway(format!("failed to run healthcheck: {msg}"))
-            }
-            other => other,
-        })?;
+        let output = self
+            .run_op(
+                DockerOp::ContainerExec {
+                    name: container_name.clone(),
+                    command: ContainerCommand::GatewayHealthcheck,
+                },
+                DOCKER_INSPECT_TIMEOUT,
+                "docker exec (healthcheck)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Gateway(format!("failed to run healthcheck: {msg}"))
+                }
+                other => other,
+            })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -1063,9 +1126,12 @@ impl GatewayManager {
     pub fn container_status_str(&self, session_id: &SessionId) -> String {
         let container_name = container_name(session_id);
 
-        let output = run_with_timeout(
-            self.docker_cmd()
-                .args(["inspect", "--format", "{{.State.Status}}", &container_name]),
+        let output = self.run_op(
+            DockerOp::ContainerInspect {
+                name: container_name.clone(),
+                format: InspectFormat::StateStatus,
+                flag: InspectFlag::Long,
+            },
             DOCKER_INSPECT_TIMEOUT,
             "docker inspect (container status)",
         );
@@ -1099,13 +1165,12 @@ impl GatewayManager {
     pub fn container_health_status(&self, session_id: &SessionId) -> DockerHealth {
         let container_name = container_name(session_id);
 
-        let output = run_with_timeout(
-            self.docker_cmd().args([
-                "inspect",
-                "--format",
-                "{{.State.Health.Status}}",
-                &container_name,
-            ]),
+        let output = self.run_op(
+            DockerOp::ContainerInspect {
+                name: container_name.clone(),
+                format: InspectFormat::StateHealthStatus,
+                flag: InspectFlag::Long,
+            },
             DOCKER_INSPECT_TIMEOUT,
             "docker inspect (container health)",
         );
@@ -1130,18 +1195,17 @@ impl GatewayManager {
     pub fn component_health(&self, session_id: &SessionId, component: &str) -> String {
         let container_name = container_name(session_id);
 
-        let check_cmd: &[&str] = match component_probe(component) {
-            Some(cmd) => cmd,
-            None => return "unknown".to_string(),
+        let Some(component) = GatewayComponent::parse(component) else {
+            return "unknown".to_string();
         };
 
-        let mut args = vec!["exec", &container_name];
-        args.extend(check_cmd);
-
-        match run_with_timeout(
-            self.docker_cmd().args(&args),
+        match self.run_op(
+            DockerOp::ContainerExec {
+                name: container_name,
+                command: ContainerCommand::ComponentProbe { component },
+            },
             DOCKER_INSPECT_TIMEOUT,
-            &format!("docker exec ({component} health)"),
+            &format!("docker exec ({} health)", component.as_str()),
         ) {
             Ok(output) if output.status.success() => "healthy".to_string(),
             Ok(_) => "unhealthy".to_string(),
@@ -1250,24 +1314,24 @@ impl GatewayManager {
     pub fn container_ip(&self, session_id: &SessionId) -> Result<String, SandboxError> {
         let container_name = container_name(session_id);
 
-        let output = run_with_timeout(
-            self.docker_cmd().args([
-                "inspect",
-                "--format",
-                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-                &container_name,
-            ]),
-            CONTAINER_IP_TIMEOUT,
-            "docker inspect (container IP)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Gateway(format!(
-                    "failed to inspect container IP for {container_name}: {msg}"
-                ))
-            }
-            other => other,
-        })?;
+        let output = self
+            .run_op(
+                DockerOp::ContainerInspect {
+                    name: container_name.clone(),
+                    format: InspectFormat::NetworkIpAddress,
+                    flag: InspectFlag::Long,
+                },
+                CONTAINER_IP_TIMEOUT,
+                "docker inspect (container IP)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Gateway(format!(
+                        "failed to inspect container IP for {container_name}: {msg}"
+                    ))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1390,14 +1454,14 @@ impl GatewayManager {
         );
 
         for (component, log_name) in KNOWN_COMPONENTS {
-            let probe = component_probe(component).unwrap_or_else(|| {
-                // Unreachable: KNOWN_COMPONENTS and component_probe are
+            let component = GatewayComponent::parse(component).unwrap_or_else(|| {
+                // Unreachable: KNOWN_COMPONENTS and the component enum are
                 // kept in sync by the
                 // `component_probe_returns_some_for_every_known_component`
                 // unit test.
                 panic!("no probe command registered for known component {component:?}");
             });
-            self.wait_for_component(&container_name, log_name, probe, deadline)?;
+            self.wait_for_component(&container_name, log_name, component, deadline)?;
         }
 
         info!(
@@ -1414,7 +1478,7 @@ impl GatewayManager {
         &self,
         container_name: &str,
         component_name: &str,
-        check_cmd: &[&str],
+        component: GatewayComponent,
         deadline: Instant,
     ) -> Result<(), SandboxError> {
         debug!(
@@ -1429,12 +1493,20 @@ impl GatewayManager {
         let mut attempts: u32 = 0;
 
         while Instant::now() < deadline {
-            let mut args = vec!["exec", container_name];
-            args.extend(check_cmd);
-
-            let output = self.docker_cmd().args(&args).output().map_err(|e| {
-                SandboxError::Gateway(format!("failed to check {component_name} readiness: {e}"))
-            })?;
+            let output = self
+                .run_op(
+                    DockerOp::ContainerExec {
+                        name: container_name.to_string(),
+                        command: ContainerCommand::ComponentProbe { component },
+                    },
+                    COMPONENT_PROBE_TIMEOUT,
+                    "docker exec (component readiness)",
+                )
+                .map_err(|e| {
+                    SandboxError::Gateway(format!(
+                        "failed to check {component_name} readiness: {e}"
+                    ))
+                })?;
 
             attempts += 1;
 
@@ -1464,7 +1536,7 @@ impl GatewayManager {
                 .unwrap_or_else(|| "signal".into()),
             stdout = last_stdout,
             stderr = last_stderr,
-            probe = check_cmd,
+            probe = component.as_str(),
         )))
     }
 }
@@ -1521,23 +1593,8 @@ pub const KNOWN_COMPONENTS: &[(&str, &str)] = &[
 /// `route_localnet=1` is set, which the gateway container does not
 /// enable). The same pattern is used by the container's
 /// `healthcheck.sh` and `entrypoint.sh`.
-pub fn component_probe(component: &str) -> Option<&'static [&'static str]> {
-    match component {
-        "envoy" => Some(&["curl", "-sf", "http://127.0.0.1:9901/ready"]),
-        "coredns" => Some(&["curl", "-sf", "http://127.0.0.1:8180/health"]),
-        "mitmproxy" => Some(&["pgrep", "-x", "mitmdump"]),
-        "deny-logger" => Some(&[
-            "sh",
-            "-c",
-            "curl -sf \"http://$(hostname -i | awk '{print $1}'):10003/health\"",
-        ]),
-        "allow-logger" => Some(&[
-            "sh",
-            "-c",
-            "curl -sf \"http://$(hostname -i | awk '{print $1}'):10004/health\"",
-        ]),
-        _ => None,
-    }
+pub fn component_probe(component: &str) -> Option<Vec<String>> {
+    GatewayComponent::parse(component).map(GatewayComponent::probe)
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,6 +1848,50 @@ table inet sandbox {{
 mod tests {
     use super::*;
 
+    // -- Route awareness ----------------------------------------------------
+
+    /// `create_gateway`'s argv names host paths as bind-mount sources, so a
+    /// VM route would silently produce a container with empty mounts. The
+    /// refusal is what keeps that from being a call-site convention nobody
+    /// can see.
+    #[test]
+    fn create_gateway_refuses_a_vm_route() {
+        let manager = GatewayManager::with_vm_route(
+            DockerRoute::Vm {
+                op_uid: 501,
+                executor: std::sync::Arc::new(crate::docker::LocalSocketDockerExecutor::new(
+                    "/nonexistent/gateway-docker.sock",
+                    "/nonexistent",
+                )),
+            },
+            PathBuf::from("/nonexistent/gateway-docker.sock"),
+        );
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
+        let network_info = NetworkInfo {
+            bridge_name: "sb-550e8400e29b".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
+            docker_network_name: "sandbox-net-550e8400e29b".to_string(),
+            vmnet_slot: None,
+            operator_uid: None,
+        };
+        let err = manager
+            .create_gateway(&session_id, &network_info, None, None, None)
+            .expect_err("a VM route must be refused before any docker call");
+        assert!(
+            format!("{err}").contains("macos_session"),
+            "the refusal must point at what to use instead: {err}"
+        );
+    }
+
+    /// The host manager keeps the host route — the Linux shape, unchanged.
+    #[test]
+    fn the_default_manager_takes_the_host_route() {
+        assert!(!GatewayManager::new().docker.is_vm());
+        assert!(GatewayManager::new().docker_socket().is_none());
+    }
+
     // -- Naming tests -------------------------------------------------------
 
     #[test]
@@ -1840,7 +1941,7 @@ mod tests {
         // probe time; `docker exec` passes argv straight to execve and
         // does not interpret `$(...)` itself.
         assert_eq!(
-            probe.first().copied(),
+            probe.first().map(String::as_str),
             Some("sh"),
             "deny-logger probe must go through `sh -c` so hostname discovery \
              happens inside the gateway container, not on the host"
@@ -1866,7 +1967,7 @@ mod tests {
         let probe = component_probe("allow-logger").expect("allow-logger must be a known probe");
 
         assert_eq!(
-            probe.first().copied(),
+            probe.first().map(String::as_str),
             Some("sh"),
             "allow-logger probe must go through `sh -c` so hostname discovery \
              happens inside the gateway container, not on the host"

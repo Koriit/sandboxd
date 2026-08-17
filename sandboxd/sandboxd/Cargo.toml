@@ -78,6 +78,10 @@ uuid.workspace = true
 # Scoped to macOS because the broker channel does not exist on Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
 sandbox-agent = { path = "../sandbox-agent" }
+# The shared docker argv builders. The daemon already reaches them through
+# `sandbox-core`; the direct edge is what lets the broker's tests construct
+# op payloads and compare the daemon's rendering against the agent's.
+sandbox-docker-argv = { workspace = true }
 
 [features]
 # `test-env-override` — forwarded to `sandbox-core/test-env-override`.

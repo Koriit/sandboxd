@@ -363,6 +363,7 @@ async fn integration_container_local_create_and_push() {
     run_initial_push(
         BackendKind::Container,
         None,
+        None,
         &session_name,
         &host_arg,
         guest_arg,
@@ -430,6 +431,7 @@ async fn integration_local_gitignore_filter() {
         run_initial_push(
             BackendKind::Container,
             None,
+            None,
             &session_name,
             &host_arg,
             guest_arg,
@@ -471,6 +473,7 @@ async fn integration_local_gitignore_filter() {
         let session_name = format!("sandbox-{session_id}");
         run_initial_push(
             BackendKind::Container,
+            None,
             None,
             &session_name,
             &host_arg,
@@ -546,6 +549,7 @@ async fn integration_local_create_failure_tears_down() {
 
     let result = run_initial_push(
         BackendKind::Container,
+        None,
         None,
         &session_name,
         &host_arg,

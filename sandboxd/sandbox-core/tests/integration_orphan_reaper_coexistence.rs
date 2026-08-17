@@ -32,7 +32,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sandbox_core::Cidr4;
-use sandbox_core::backend::{CliDockerOps, reap_orphans};
+use sandbox_core::backend::{RoutedDockerOps, reap_orphans};
 use sandbox_core::session::SessionId;
 
 // ---------------------------------------------------------------------------
@@ -220,11 +220,11 @@ async fn integration_reaper_does_not_reap_neighbor_labelled_live_session() {
 
     // Run pool A's reaper with A's sid in the live set.
     let live_a: HashSet<SessionId> = [a_sid].into_iter().collect();
-    reap_orphans(&CliDockerOps, &live_a, &pool_a()).await;
+    reap_orphans(&RoutedDockerOps::host(), &live_a, &pool_a()).await;
 
     // Run pool B's reaper with B's sid in the live set.
     let live_b: HashSet<SessionId> = [b_sid].into_iter().collect();
-    reap_orphans(&CliDockerOps, &live_b, &pool_b()).await;
+    reap_orphans(&RoutedDockerOps::host(), &live_b, &pool_b()).await;
 
     // All resources must survive both passes.
     for (kind, name) in [
@@ -265,7 +265,7 @@ async fn integration_reaper_reaps_own_network_less_orphan() {
     assert!(docker_exists("volume", &vol));
 
     let live: HashSet<SessionId> = HashSet::new();
-    let report = reap_orphans(&CliDockerOps, &live, &pool_a()).await;
+    let report = reap_orphans(&RoutedDockerOps::host(), &live, &pool_a()).await;
 
     assert!(
         report.containers_reaped >= 1,
@@ -303,7 +303,7 @@ async fn integration_reaper_does_not_reap_neighbor_network_less_orphan() {
 
     // Run pool A's reaper. Pool B's resources must be invisible to it.
     let live: HashSet<SessionId> = HashSet::new();
-    let report = reap_orphans(&CliDockerOps, &live, &pool_a()).await;
+    let report = reap_orphans(&RoutedDockerOps::host(), &live, &pool_a()).await;
 
     // Pool A reaped 0 containers/volumes from its own label space.
     // Pool B's resources must still exist.

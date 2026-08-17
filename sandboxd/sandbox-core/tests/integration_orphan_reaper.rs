@@ -21,7 +21,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sandbox_core::Cidr4;
-use sandbox_core::backend::{CliDockerOps, reap_orphans};
+use sandbox_core::backend::{RoutedDockerOps, reap_orphans};
 use sandbox_core::session::SessionId;
 
 // ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ async fn integration_orphan_reaper_removes_orphans_and_preserves_live_resources(
     // Live set carries only `live_sid`; the reaper must reap the
     // `orphan_sid` tuple and leave the `live_sid` tuple intact.
     let live: HashSet<SessionId> = [live_sid].into_iter().collect();
-    let report = reap_orphans(&CliDockerOps, &live, &test_pool()).await;
+    let report = reap_orphans(&RoutedDockerOps::host(), &live, &test_pool()).await;
 
     // Counters: at least one of each.
     assert!(

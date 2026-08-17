@@ -52,6 +52,9 @@ use tokio::process::Command;
 use tracing::info;
 
 use crate::backend::BackendKind;
+use sandbox_docker_argv::container::ContainerCommand;
+
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 use crate::lima::{LimaExecutor, LimaOp};
 
@@ -297,6 +300,7 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
 /// skips the pre-mkdir entirely — byte-identical to the prior behaviour.
 pub async fn run_initial_push(
     backend: BackendKind,
+    docker: Option<&DockerRoute>,
     docker_socket: Option<&str>,
     session_name: &str,
     host_path: &str,
@@ -309,14 +313,14 @@ pub async fn run_initial_push(
     // directory over the transport, then run rsync without `--mkpath`. Linux
     // leaves `docker_socket` `None` and keeps the rsync-driven parent create.
     let use_mkpath = docker_socket.is_none();
-    if let Some(sock) = docker_socket {
-        // Container backend only: the forwarded socket addresses the in-VM
-        // Docker daemon, so `docker -H unix://<sock> exec <ctr> mkdir -p
-        // <guest>` materialises the destination root before rsync runs.
-        // The Lima backend never supplies a socket (it uses the helper-
-        // pivoted push), so this branch is container-only in practice.
+    if let Some(route) = docker {
+        // Container backend only: the route addresses the in-VM Docker
+        // daemon, so `docker exec <ctr> mkdir -p <guest>` materialises the
+        // destination root before rsync runs. The Lima backend never supplies
+        // a route (it uses the helper-pivoted push), so this branch is
+        // container-only in practice.
         if backend == BackendKind::Container {
-            premkdir_guest_dir_via_socket(sock, session_name, guest_path).await?;
+            premkdir_guest_dir(route.clone(), session_name, guest_path).await?;
         }
     }
 
@@ -422,74 +426,46 @@ pub async fn run_initial_push(
     )))
 }
 
-/// Build the `docker` argv that pre-creates the guest destination
-/// directory inside the in-VM container before the macOS-lite rsync push.
-///
-/// Pure function (no I/O) so the openrsync-safe shape is unit-testable
-/// without spawning `docker`. The returned `Vec<String>` is the full
-/// argument list following the program name `docker`:
-///
-/// ```text
-/// -H unix://<sock> exec <container> mkdir -p <guest>
-/// ```
-///
-/// `session_name` doubles as the container name (`sandbox-<id>`), matching
-/// the rsync remote spec the same call site builds. The guest path is
-/// passed verbatim — it is daemon-derived (not operator free-text on this
-/// path) and any trailing slash is harmless to `mkdir -p`.
-pub fn build_premkdir_argv(socket: &str, session_name: &str, guest_path: &str) -> Vec<String> {
-    vec![
-        "-H".to_string(),
-        format!("unix://{socket}"),
-        "exec".to_string(),
-        session_name.to_string(),
-        "mkdir".to_string(),
-        "-p".to_string(),
-        guest_path.to_string(),
-    ]
-}
-
-/// Timeout for the pre-rsync `mkdir -p` over the forwarded socket. A short
-/// ceiling: it is a single fast in-VM `docker exec`.
+/// Timeout for the pre-rsync `mkdir -p`. A short ceiling: it is a single
+/// fast in-VM `docker exec`.
 const PREMKDIR_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Create the guest destination directory inside the in-VM container over
-/// the forwarded Docker socket, before the macOS-lite rsync push.
+/// Create the guest destination directory inside the in-VM container before
+/// the macOS-lite rsync push.
 ///
 /// Apple openrsync (the host rsync on macOS) has no `--mkpath`, so the
-/// destination root must already exist when rsync starts. This runs
-/// `docker -H unix://<sock> exec <ctr> mkdir -p <guest>` against the
-/// gateway VM's Docker daemon. Non-zero exit is fatal (fail-closed: a
+/// destination root must already exist when rsync starts. `session_name`
+/// doubles as the container name (`sandbox-<id>`), matching the rsync remote
+/// spec the same call site builds. Non-zero exit is fatal (fail-closed: a
 /// missing destination would make the subsequent rsync fail with a less
 /// actionable error).
-async fn premkdir_guest_dir_via_socket(
-    socket: &str,
+async fn premkdir_guest_dir(
+    docker: DockerRoute,
     session_name: &str,
     guest_path: &str,
 ) -> Result<(), SandboxError> {
-    let argv = build_premkdir_argv(socket, session_name, guest_path);
     info!(
         session = %session_name,
         guest_path = %guest_path,
         "local-workspace rsync: pre-creating guest dir (openrsync, no --mkpath)"
     );
-    let fut = Command::new("docker")
-        .args(&argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(PREMKDIR_TIMEOUT, fut)
+    let op = DockerOp::ContainerExec {
+        name: session_name.to_string(),
+        command: ContainerCommand::MakeDirectory {
+            path: guest_path.to_string(),
+        },
+    };
+    let label = "docker exec mkdir -p (guest workspace dir)";
+    let output = tokio::task::spawn_blocking(move || docker.run(op, PREMKDIR_TIMEOUT, label))
         .await
-        .map_err(|_| SandboxError::Timeout {
-            operation: format!("docker exec mkdir -p (guest workspace dir {guest_path})"),
-            duration: PREMKDIR_TIMEOUT.as_secs(),
-        })?
-        .map_err(|e| {
-            SandboxError::Internal(format!(
-                "failed to spawn docker mkdir -p for local-workspace dest: {e}"
-            ))
+        .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))?
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Internal(format!(
+                    "failed to spawn docker mkdir -p for local-workspace dest: {msg}"
+                ))
+            }
+            other => other,
         })?;
     if output.status.success() {
         return Ok(());
@@ -873,23 +849,29 @@ mod tests {
         );
     }
 
-    /// macOS lite openrsync pre-mkdir argv: `docker -H unix://<sock> exec
-    /// <ctr> mkdir -p <guest>`. The container name is the `sandbox-<id>`
-    /// session name (same token the rsync remote spec uses), and the guest
-    /// path is passed verbatim. This is the up-front directory create that
-    /// replaces `--mkpath` on Apple openrsync.
+    /// macOS lite openrsync pre-mkdir: `docker exec <ctr> mkdir -p <guest>`.
+    /// The container name is the `sandbox-<id>` session name (the same token
+    /// the rsync remote spec uses) and the guest path is passed verbatim.
+    /// This is the up-front directory create that replaces `--mkpath` on
+    /// Apple openrsync.
+    ///
+    /// Which Docker daemon hears it is the route's decision, so the op names
+    /// no target — asserted here because the pre-mkdir reaching the host
+    /// instead of the VM would create a directory in the wrong filesystem and
+    /// then fail the push with a confusing error.
     #[test]
-    fn build_premkdir_argv_targets_in_vm_container() {
-        let argv = build_premkdir_argv(
-            "/var/lib/sandboxd/501/gateway-docker.sock",
-            "sandbox-mac1",
-            "/home/sandbox/workspace",
-        );
+    fn premkdir_op_targets_the_container_by_name_only() {
+        let argv = DockerOp::ContainerExec {
+            name: "sandbox-mac1".to_string(),
+            command: ContainerCommand::MakeDirectory {
+                path: "/home/sandbox/workspace".to_string(),
+            },
+        }
+        .argv()
+        .expect("pre-mkdir renders");
         assert_eq!(
             argv,
             vec![
-                "-H",
-                "unix:///var/lib/sandboxd/501/gateway-docker.sock",
                 "exec",
                 "sandbox-mac1",
                 "mkdir",
@@ -897,6 +879,7 @@ mod tests {
                 "/home/sandbox/workspace",
             ]
         );
+        assert!(!argv.iter().any(|a| a == "-H"));
     }
 
     /// The macOS-lite shape of `run_initial_push` (`docker_socket = Some`)

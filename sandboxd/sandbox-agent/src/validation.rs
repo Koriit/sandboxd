@@ -645,6 +645,286 @@ pub fn validate_qemu_wrapper(qemu_wrapper: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Docker op field validation
+// ---------------------------------------------------------------------------
+
+/// Docker object name (container, network, volume): Docker's own rule —
+/// starts alphanumeric, then alphanumerics plus `_`, `.`, `-`.
+static DOCKER_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,127}$").unwrap());
+
+/// Image reference: registry/name:tag or name:tag or a bare name.
+static IMAGE_REF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-/:@]{0,255}$").unwrap());
+
+/// Validate a Docker object name.
+///
+/// The charset is Docker's, not ours — a name outside it would be rejected
+/// by the daemon anyway, and accepting it here only moves the failure later.
+/// The leading-alphanumeric rule additionally rules out a name that would be
+/// read as a flag.
+pub fn validate_docker_name(field: &str, name: &str) -> Result<(), String> {
+    if !DOCKER_NAME_RE.is_match(name) {
+        return Err(format!(
+            "{field}: {name:?} is not a valid docker object name \
+             (must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{{0,127}}$)"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a `--filter name=<prefix>` value.
+///
+/// Same charset as a full name; a prefix is a name that happens to be short,
+/// and the leading-alphanumeric rule is what stops `--filter name=-foo` from
+/// turning into a flag.
+pub fn validate_docker_name_prefix(field: &str, prefix: &str) -> Result<(), String> {
+    validate_docker_name(field, prefix)
+}
+
+/// Validate an image reference (`name`, `name:tag`, `registry/name:tag`).
+pub fn validate_image_ref(field: &str, image: &str) -> Result<(), String> {
+    if !IMAGE_REF_RE.is_match(image) {
+        return Err(format!("{field}: {image:?} is not a valid image reference"));
+    }
+    Ok(())
+}
+
+/// Validate a dotted-quad IPv4 address.
+pub fn validate_ipv4(field: &str, value: &str) -> Result<(), String> {
+    let octets: Vec<&str> = value.split('.').collect();
+    if octets.len() != 4
+        || octets
+            .iter()
+            .any(|o| o.is_empty() || o.parse::<u8>().is_err())
+    {
+        return Err(format!(
+            "{field}: {value:?} is not a valid IPv4 dotted-quad"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a space-separated list of upstream resolver addresses.
+///
+/// This value lands in a `--env` assignment, so it must not be able to
+/// smuggle a second assignment: every token has to parse as an address and
+/// nothing else is admitted.
+pub fn validate_resolver_list(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field}: resolver list is empty"));
+    }
+    let mut seen = 0usize;
+    for token in value.split(' ') {
+        if token.is_empty() {
+            return Err(format!("{field}: {value:?} has an empty resolver entry"));
+        }
+        validate_ipv4(field, token)?;
+        seen += 1;
+    }
+    if seen > 8 {
+        return Err(format!("{field}: more than 8 resolvers in {value:?}"));
+    }
+    Ok(())
+}
+
+/// Validate a path that will be interpolated into a docker `--mount` option
+/// list.
+///
+/// Absolute, no `..` (via [`validate_path_arg`]), and additionally free of
+/// `,` and `=`: docker reads both as option-list syntax there, so a path
+/// containing either would add mount options nobody wrote.
+pub fn validate_mount_path(field: &str, path: &str) -> Result<(), String> {
+    validate_path_arg(field, path)?;
+    if let Some(ch) = path.chars().find(|c| matches!(c, ',' | '=')) {
+        return Err(format!(
+            "{field}: {path:?} contains {ch:?}, which docker reads as option-list \
+             syntax inside a --mount value"
+        ));
+    }
+    Ok(())
+}
+
+/// Re-validate every field of a [`crate::protocol::DockerOp`] before the
+/// agent builds any argv from it.
+///
+/// The daemon has validated these values too. That is not a reason to skip
+/// them here: the agent's whole job is to be the thing that still says no
+/// when the daemon has been persuaded to ask for something it should not.
+pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> {
+    use crate::protocol::{ContainerCommand, DockerOp};
+
+    match op {
+        DockerOp::ContainerCreate { spec } => {
+            validate_session_name(&spec.session_id)?;
+            validate_docker_name("docker_network", &spec.docker_network)?;
+            validate_ipv4("container_ip", &spec.container_ip)?;
+            validate_ipv4("gateway_ip", &spec.gateway_ip)?;
+            validate_image_ref("image_tag", &spec.image_tag)?;
+            validate_range("memory_mb", spec.memory_mb, 64, 1_048_576)?;
+            if !(spec.cpus.is_finite() && spec.cpus > 0.0 && spec.cpus <= 1024.0) {
+                return Err(format!("cpus: {} is not a usable cpu count", spec.cpus));
+            }
+            if let Some(pool) = &spec.owner_pool {
+                validate_cidr_owner("owner_pool", pool)?;
+            }
+            if let Some(bind) = &spec.workspace_bind {
+                validate_mount_path("workspace_bind.host_path", &bind.host_path)?;
+                validate_mount_path("workspace_bind.guest_path", &bind.guest_path)?;
+            }
+            if let Some(ca) = &spec.ca_host_path {
+                validate_mount_path("ca_host_path", ca)?;
+            }
+            if let Some(dir) = &spec.ssh_host_dir {
+                validate_mount_path("ssh_host_dir", dir)?;
+            }
+            if let Some(src) = &spec.guest_bind_source {
+                validate_mount_path("guest_bind_source", src)?;
+            }
+        }
+        DockerOp::ContainerStart { name }
+        | DockerOp::ContainerRestart { name }
+        | DockerOp::ContainerRemove { name, .. } => {
+            validate_docker_name("container", name)?;
+        }
+        DockerOp::ContainerStop {
+            name, grace_secs, ..
+        } => {
+            validate_docker_name("container", name)?;
+            validate_range("grace_secs", *grace_secs, 0, 3600)?;
+        }
+        DockerOp::ContainerInspect { name, .. } => {
+            validate_docker_name("container", name)?;
+        }
+        DockerOp::ContainerList {
+            name_prefix,
+            owner_pool,
+        }
+        | DockerOp::NetworkList {
+            name_prefix,
+            owner_pool,
+        }
+        | DockerOp::VolumeList {
+            name_prefix,
+            owner_pool,
+        } => {
+            validate_docker_name_prefix("name_prefix", name_prefix)?;
+            if let Some(pool) = owner_pool {
+                validate_cidr_owner("owner_pool", pool)?;
+            }
+        }
+        DockerOp::ContainerExec { name, command } => {
+            validate_docker_name("container", name)?;
+            // Only one command variant carries data. The others are
+            // constants of the argv crate and have nothing to validate —
+            // which is the point of enumerating them.
+            if let ContainerCommand::MakeDirectory { path } = command {
+                validate_path_arg("mkdir path", path)?;
+            }
+        }
+        DockerOp::HomeVolumeChown {
+            session_id,
+            image_tag,
+            operator_uid,
+            operator_gid,
+        } => {
+            validate_session_name(session_id)?;
+            validate_image_ref("image_tag", image_tag)?;
+            // uid 0 would hand the volume to root, which is the opposite of
+            // what this op exists to do.
+            validate_range("operator_uid", *operator_uid, 1, u32::MAX - 1)?;
+            validate_range("operator_gid", *operator_gid, 1, u32::MAX - 1)?;
+        }
+        DockerOp::GatewayContainerRun {
+            session_id,
+            image_tag,
+            network,
+            owner_pool,
+            coredns_upstream,
+        } => {
+            validate_session_name(session_id)?;
+            validate_image_ref("image_tag", image_tag)?;
+            validate_docker_name("network", network)?;
+            if let Some(pool) = owner_pool {
+                validate_cidr_owner("owner_pool", pool)?;
+            }
+            if let Some(upstream) = coredns_upstream {
+                validate_resolver_list("coredns_upstream", upstream)?;
+            }
+        }
+        DockerOp::NetworkCreate { spec } => {
+            validate_docker_name("network", &spec.name)?;
+            if let Some(subnet) = &spec.subnet {
+                validate_cidr_owner("subnet", subnet)?;
+            }
+            if let Some(gateway) = &spec.gateway {
+                validate_ipv4("gateway", gateway)?;
+            }
+            if let Some(session_id) = &spec.session_id {
+                validate_session_name(session_id)?;
+            }
+            if let Some(pool) = &spec.owner_pool {
+                validate_cidr_owner("owner_pool", pool)?;
+            }
+            for option in &spec.options {
+                validate_network_option(option)?;
+            }
+        }
+        DockerOp::NetworkRemove { name } | DockerOp::NetworkInspect { name } => {
+            validate_docker_name("network", name)?;
+        }
+        DockerOp::NetworkConnect {
+            network,
+            container,
+            ip,
+        } => {
+            validate_docker_name("network", network)?;
+            validate_docker_name("container", container)?;
+            if let Some(ip) = ip {
+                validate_ipv4("ip", ip)?;
+            }
+        }
+        DockerOp::VolumeCreate {
+            name,
+            session_id,
+            owner_pool,
+        } => {
+            validate_docker_name("volume", name)?;
+            if let Some(session_id) = session_id {
+                validate_session_name(session_id)?;
+            }
+            if let Some(pool) = owner_pool {
+                validate_cidr_owner("owner_pool", pool)?;
+            }
+        }
+        DockerOp::VolumeRemove { name } => {
+            validate_docker_name("volume", name)?;
+        }
+        DockerOp::ImageInspect { tag } => {
+            validate_image_ref("tag", tag)?;
+        }
+        // Nothing crosses the wire on these two: the tarball is named by an
+        // enum the agent resolves against its own staging directory, and
+        // `docker info` takes no arguments at all.
+        DockerOp::ImageLoad { .. } | DockerOp::DaemonInfo => {}
+    }
+    Ok(())
+}
+
+/// Validate one network `--opt` value.
+fn validate_network_option(option: &crate::protocol::NetworkOption) -> Result<(), String> {
+    use crate::protocol::NetworkOption;
+    match option {
+        NetworkOption::BridgeName { interface } => validate_bridge_name(interface),
+        // A boolean cannot carry anything but itself.
+        NetworkOption::BridgeMasquerade { .. } => Ok(()),
+        NetworkOption::MacvlanParent { parent } => validate_bridge_name(parent),
+        // A mode with one admissible value carries nothing to validate.
+        NetworkOption::MacvlanModePrivate => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — non-tautological, exercise the real validation functions
 // ---------------------------------------------------------------------------
 
@@ -1605,5 +1885,413 @@ user:
             "macOS template with 9p shared workspace must pass shape validation; error: {:?}",
             result.err()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Docker op validation
+    // -----------------------------------------------------------------------
+
+    mod docker {
+        use super::super::*;
+        use crate::protocol::{
+            ContainerCommand, ContainerCreateSpec, DockerOp, GatewayComponent, InspectFlag,
+            InspectFormat, NetworkCreateSpec, NetworkDriver, NetworkOption, RemoveForce,
+            StagedImage, WorkspaceBindSpec,
+        };
+
+        fn create_spec() -> ContainerCreateSpec {
+            ContainerCreateSpec {
+                session_id: "abc123def456".to_string(),
+                docker_network: "sandbox-net-abc123def456".to_string(),
+                container_ip: "10.209.0.3".to_string(),
+                gateway_ip: "10.209.0.2".to_string(),
+                image_tag: "sandboxd-lite:0.1.10".to_string(),
+                user_uid: 501,
+                user_gid: 20,
+                memory_mb: 2048,
+                cpus: 2.0,
+                owner_pool: Some("10.209.0.0/20".to_string()),
+                workspace_bind: None,
+                ca_host_path: None,
+                ssh_host_dir: None,
+                guest_bind_source: None,
+            }
+        }
+
+        fn network_spec() -> NetworkCreateSpec {
+            NetworkCreateSpec {
+                name: "sandbox-net-abc123def456".to_string(),
+                driver: NetworkDriver::Bridge,
+                subnet: Some("10.209.0.0/28".to_string()),
+                gateway: None,
+                session_id: Some("abc123def456".to_string()),
+                owner_pool: Some("10.209.0.0/20".to_string()),
+                options: vec![
+                    NetworkOption::BridgeName {
+                        interface: "sb-abc123def456".to_string(),
+                    },
+                    NetworkOption::BridgeMasquerade { enabled: false },
+                ],
+            }
+        }
+
+        /// Every op the daemon can send, in its well-formed shape. Held in one
+        /// list so the acceptance test and the count check read the same set.
+        fn every_op() -> Vec<DockerOp> {
+            vec![
+                DockerOp::ContainerCreate {
+                    spec: create_spec(),
+                },
+                DockerOp::ContainerStart {
+                    name: "sandbox-abc123def456".to_string(),
+                },
+                DockerOp::ContainerStop {
+                    name: "sandbox-abc123def456".to_string(),
+                    grace_secs: 10,
+                    long_flag: false,
+                },
+                DockerOp::ContainerRestart {
+                    name: "sandbox-abc123def456".to_string(),
+                },
+                DockerOp::ContainerRemove {
+                    name: "sandbox-abc123def456".to_string(),
+                    force: RemoveForce::Short,
+                },
+                DockerOp::ContainerInspect {
+                    name: "sandbox-abc123def456".to_string(),
+                    format: InspectFormat::StatePid,
+                    flag: InspectFlag::Short,
+                },
+                DockerOp::ContainerList {
+                    name_prefix: "sandbox-".to_string(),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                },
+                DockerOp::ContainerExec {
+                    name: "sandbox-abc123def456".to_string(),
+                    command: ContainerCommand::ComponentProbe {
+                        component: GatewayComponent::Envoy,
+                    },
+                },
+                DockerOp::HomeVolumeChown {
+                    session_id: "abc123def456".to_string(),
+                    image_tag: "sandboxd-lite:0.1.10".to_string(),
+                    operator_uid: 501,
+                    operator_gid: 20,
+                },
+                DockerOp::GatewayContainerRun {
+                    session_id: "abc123def456".to_string(),
+                    image_tag: "sandbox-gateway:0.1.10".to_string(),
+                    network: "sandboxd-egress".to_string(),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                    coredns_upstream: Some("8.8.8.8 1.1.1.1".to_string()),
+                },
+                DockerOp::NetworkCreate {
+                    spec: network_spec(),
+                },
+                DockerOp::NetworkRemove {
+                    name: "sandbox-net-abc123def456".to_string(),
+                },
+                DockerOp::NetworkInspect {
+                    name: "sandbox-net-abc123def456".to_string(),
+                },
+                DockerOp::NetworkConnect {
+                    network: "sandbox-net-abc123def456".to_string(),
+                    container: "sandbox-gw-abc123def456".to_string(),
+                    ip: Some("10.209.0.2".to_string()),
+                },
+                DockerOp::NetworkList {
+                    name_prefix: "sandbox-net-".to_string(),
+                    owner_pool: None,
+                },
+                DockerOp::VolumeCreate {
+                    name: "sandbox-home-abc123def456".to_string(),
+                    session_id: Some("abc123def456".to_string()),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                },
+                DockerOp::VolumeRemove {
+                    name: "sandbox-home-abc123def456".to_string(),
+                },
+                DockerOp::VolumeList {
+                    name_prefix: "sandbox-home-".to_string(),
+                    owner_pool: None,
+                },
+                DockerOp::ImageInspect {
+                    tag: "sandbox-gateway:0.1.10".to_string(),
+                },
+                DockerOp::ImageLoad {
+                    image: StagedImage::Gateway,
+                },
+                DockerOp::DaemonInfo,
+            ]
+        }
+
+        /// The whole op set, in its well-formed shape, is accepted. Written as
+        /// one list rather than 21 tests so a variant added without a
+        /// validation arm shows up as a missing entry here.
+        #[test]
+        fn every_well_formed_op_is_accepted() {
+            let ops = every_op();
+            assert_eq!(ops.len(), 21, "every DockerOp variant must be covered here");
+            for op in ops {
+                assert!(
+                    validate_docker_op(&op).is_ok(),
+                    "well-formed op rejected: {op:?} → {:?}",
+                    validate_docker_op(&op).err()
+                );
+            }
+        }
+
+        /// A name that starts with `-` would be read by docker as a flag, not
+        /// as an object name. Every op that names an object must refuse it —
+        /// checked across the whole family rather than at one call site,
+        /// because one unguarded arm is all it takes.
+        #[test]
+        fn no_op_accepts_a_name_that_docker_would_read_as_a_flag() {
+            let flaggy = "--privileged".to_string();
+            let ops = vec![
+                DockerOp::ContainerStart {
+                    name: flaggy.clone(),
+                },
+                DockerOp::ContainerRestart {
+                    name: flaggy.clone(),
+                },
+                DockerOp::ContainerRemove {
+                    name: flaggy.clone(),
+                    force: RemoveForce::Short,
+                },
+                DockerOp::ContainerStop {
+                    name: flaggy.clone(),
+                    grace_secs: 1,
+                    long_flag: false,
+                },
+                DockerOp::ContainerInspect {
+                    name: flaggy.clone(),
+                    format: InspectFormat::StatePid,
+                    flag: InspectFlag::Short,
+                },
+                DockerOp::ContainerExec {
+                    name: flaggy.clone(),
+                    command: ContainerCommand::GatewayHealthcheck,
+                },
+                DockerOp::NetworkRemove {
+                    name: flaggy.clone(),
+                },
+                DockerOp::NetworkInspect {
+                    name: flaggy.clone(),
+                },
+                DockerOp::NetworkConnect {
+                    network: flaggy.clone(),
+                    container: "sandbox-abc".to_string(),
+                    ip: None,
+                },
+                DockerOp::VolumeRemove {
+                    name: flaggy.clone(),
+                },
+                DockerOp::ContainerList {
+                    name_prefix: flaggy.clone(),
+                    owner_pool: None,
+                },
+                DockerOp::NetworkList {
+                    name_prefix: flaggy.clone(),
+                    owner_pool: None,
+                },
+                DockerOp::VolumeList {
+                    name_prefix: flaggy.clone(),
+                    owner_pool: None,
+                },
+            ];
+            for op in ops {
+                assert!(
+                    validate_docker_op(&op).is_err(),
+                    "a leading-dash name must be refused: {op:?}"
+                );
+            }
+        }
+
+        /// Docker reads `,` and `=` as option-list syntax inside a `--mount`
+        /// value, so a path containing either would add mount options nobody
+        /// wrote — `,bind-propagation=rshared` being the interesting one.
+        #[test]
+        fn create_refuses_option_list_syntax_in_every_mount_path() {
+            for bad in ["/tmp/a,bind-propagation=rshared", "/tmp/a=b"] {
+                let mut spec = create_spec();
+                spec.workspace_bind = Some(WorkspaceBindSpec {
+                    host_path: bad.to_string(),
+                    guest_path: "/home/sandbox/workspace".to_string(),
+                });
+                assert!(
+                    validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err(),
+                    "workspace host_path {bad:?} must be refused"
+                );
+
+                let mut spec = create_spec();
+                spec.ca_host_path = Some(bad.to_string());
+                assert!(
+                    validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err(),
+                    "ca_host_path {bad:?} must be refused"
+                );
+
+                let mut spec = create_spec();
+                spec.ssh_host_dir = Some(bad.to_string());
+                assert!(
+                    validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err(),
+                    "ssh_host_dir {bad:?} must be refused"
+                );
+            }
+        }
+
+        /// Every path in a create spec must be absolute and free of `..`. A
+        /// relative or traversing bind source is a mount of something other
+        /// than what the daemon meant.
+        #[test]
+        fn create_refuses_relative_and_traversing_paths() {
+            for bad in ["relative/path", "/var/lib/../../etc/shadow"] {
+                let mut spec = create_spec();
+                spec.ca_host_path = Some(bad.to_string());
+                assert!(
+                    validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err(),
+                    "ca_host_path {bad:?} must be refused"
+                );
+            }
+        }
+
+        /// `mkdir -p` runs inside the container, so its path is not confined
+        /// to the agent's own tree — but it must still be a path, not a
+        /// relative fragment or a traversal.
+        #[test]
+        fn exec_mkdir_requires_an_absolute_path_without_traversal() {
+            for bad in ["workspace", "/home/sandbox/../../etc"] {
+                let op = DockerOp::ContainerExec {
+                    name: "sandbox-abc123def456".to_string(),
+                    command: ContainerCommand::MakeDirectory {
+                        path: bad.to_string(),
+                    },
+                };
+                assert!(
+                    validate_docker_op(&op).is_err(),
+                    "mkdir path {bad:?} must be refused"
+                );
+            }
+        }
+
+        /// The resolver list lands in a `--env` assignment. Anything that is
+        /// not an address could smuggle a second assignment past the flag.
+        #[test]
+        fn gateway_run_refuses_a_resolver_list_that_is_not_addresses() {
+            for bad in [
+                "8.8.8.8 evil",
+                "8.8.8.8  1.1.1.1",
+                "",
+                "1.2.3.4 SANDBOX_OTHER=x",
+            ] {
+                let op = DockerOp::GatewayContainerRun {
+                    session_id: "abc123def456".to_string(),
+                    image_tag: "sandbox-gateway:0.1.10".to_string(),
+                    network: "sandboxd-egress".to_string(),
+                    owner_pool: None,
+                    coredns_upstream: Some(bad.to_string()),
+                };
+                assert!(
+                    validate_docker_op(&op).is_err(),
+                    "resolver list {bad:?} must be refused"
+                );
+            }
+        }
+
+        /// The owner-pool label is what the reaper filters on. A malformed
+        /// value would produce a label nothing matches, leaving the resource
+        /// unattributable to any daemon.
+        #[test]
+        fn owner_pool_must_be_a_cidr() {
+            let op = DockerOp::ContainerList {
+                name_prefix: "sandbox-".to_string(),
+                owner_pool: Some("not-a-cidr".to_string()),
+            };
+            assert!(validate_docker_op(&op).is_err());
+
+            let mut spec = create_spec();
+            spec.owner_pool = Some("10.209.0.0/33".to_string());
+            assert!(validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err());
+        }
+
+        /// The chown init container exists to hand the volume to the operator.
+        /// uid 0 would hand it to root, which is the opposite.
+        #[test]
+        fn home_volume_chown_refuses_uid_zero() {
+            let op = DockerOp::HomeVolumeChown {
+                session_id: "abc123def456".to_string(),
+                image_tag: "sandboxd-lite:0.1.10".to_string(),
+                operator_uid: 0,
+                operator_gid: 20,
+            };
+            assert!(validate_docker_op(&op).is_err());
+        }
+
+        /// Addresses are parsed, not pattern-matched: a value docker would
+        /// reject anyway should not reach it, and one that looks like an
+        /// address but is not must not pass.
+        #[test]
+        fn addresses_must_parse() {
+            for bad in ["10.209.0.256", "10.209.0", "not-an-ip", ""] {
+                let op = DockerOp::NetworkConnect {
+                    network: "sandbox-net-abc".to_string(),
+                    container: "sandbox-gw-abc".to_string(),
+                    ip: Some(bad.to_string()),
+                };
+                assert!(
+                    validate_docker_op(&op).is_err(),
+                    "address {bad:?} must be refused"
+                );
+            }
+        }
+
+        /// A bridge interface name is bounded at 15 characters by the kernel;
+        /// a longer one silently truncates and collides.
+        #[test]
+        fn network_options_are_validated() {
+            let mut spec = network_spec();
+            spec.options = vec![NetworkOption::BridgeName {
+                interface: "sb-this-name-is-far-too-long".to_string(),
+            }];
+            assert!(validate_docker_op(&DockerOp::NetworkCreate { spec }).is_err());
+
+            let mut spec = network_spec();
+            spec.options = vec![NetworkOption::MacvlanParent {
+                parent: "eth0; rm -rf /".to_string(),
+            }];
+            assert!(validate_docker_op(&DockerOp::NetworkCreate { spec }).is_err());
+        }
+
+        /// Resource ceilings are checked because a nonsense value is a
+        /// daemon-side bug worth surfacing as a rejection rather than as a
+        /// docker error minutes later.
+        #[test]
+        fn create_refuses_unusable_resource_ceilings() {
+            let mut spec = create_spec();
+            spec.cpus = 0.0;
+            assert!(validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err());
+
+            let mut spec = create_spec();
+            spec.cpus = f64::NAN;
+            assert!(validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err());
+
+            let mut spec = create_spec();
+            spec.memory_mb = 0;
+            assert!(validate_docker_op(&DockerOp::ContainerCreate { spec }).is_err());
+        }
+
+        /// The two ops that carry nothing are accepted unconditionally —
+        /// stated as a test so "it has no validation" is a recorded decision
+        /// rather than an omission.
+        #[test]
+        fn the_two_argument_free_ops_carry_nothing_to_reject() {
+            assert!(validate_docker_op(&DockerOp::DaemonInfo).is_ok());
+            assert!(
+                validate_docker_op(&DockerOp::ImageLoad {
+                    image: StagedImage::Lite
+                })
+                .is_ok()
+            );
+        }
     }
 }

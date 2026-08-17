@@ -35,8 +35,61 @@
 //! Pure functions from typed values to argv fragments, with no I/O, no process
 //! spawning and no policy. Anything that decides *whether* an invocation is
 //! allowed belongs on the agent side, next to the rest of its validation.
+//!
+//! # Why the inputs are enums rather than strings
+//!
+//! Several builders take a small enum where a string would have been the
+//! obvious choice — the `docker inspect` format template, the command run by
+//! `docker exec`, the tarball a `docker load` reads. Each of those is a place
+//! where a caller-supplied string would be a pass-through in disguise: a Go
+//! template can read any field of a container's configuration, an exec argv is
+//! arbitrary code inside the container, and a file path is arbitrary read
+//! access. Enumerating the values keeps the surface a reviewer can enumerate
+//! too, which is the property the whole broker op set rests on.
 
 use std::path::Path;
+
+pub mod container;
+pub mod image;
+pub mod network;
+pub mod volume;
+
+/// A refusal from an argv builder.
+///
+/// Builders are pure and cannot consult docker about what an escape would
+/// mean, so the few inputs that cannot be rendered unambiguously are refused
+/// with an operator-facing explanation rather than escaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerArgvError {
+    message: String,
+}
+
+impl DockerArgvError {
+    /// Construct a refusal carrying an operator-facing explanation.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// The operator-facing explanation.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Consume the error, yielding its message.
+    pub fn into_message(self) -> String {
+        self.message
+    }
+}
+
+impl std::fmt::Display for DockerArgvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DockerArgvError {}
 
 /// The `docker` executable name, as it appears in argv slot 0.
 ///

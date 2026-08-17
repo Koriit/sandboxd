@@ -11,6 +11,10 @@ pub mod dns_gate;
 /// accept-loop/pump runtime is macOS-only.
 pub mod dns_gate_bridge;
 pub mod dns_propagation;
+/// Typed Docker operations and the seam that executes them. Platform-neutral:
+/// the op set and its argv rendering are compiled and tested everywhere, and
+/// the Linux host-daemon route is one of the two variants it carries.
+pub mod docker;
 pub mod error;
 pub mod events;
 pub mod gateway;
@@ -79,13 +83,11 @@ pub use atomic_listener_writer::{
     macos_listener_exec_argv, session_listener_host_dir, session_listener_host_path,
     write_listener_into_container,
 };
-#[cfg(target_os = "macos")]
-pub use backend::CliDockerOpsWithSocket;
 pub use backend::{
-    AsyncReadWrite, BackendInfo, BackendKind, BackendSpecific, Capabilities, CliDockerOps,
-    ContainerNetwork, ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG, DockerOps,
-    EnsureImageOutcome, GuestTransport, IsolationLevel, LITE_FIRST_USE_WARNING,
-    LITE_IMAGE_REPOSITORY, LITE_TAG_OVERRIDE_ENV, LimaRuntime, LimaTransport, ReaperReport,
+    AsyncReadWrite, BackendInfo, BackendKind, BackendSpecific, Capabilities, ContainerNetwork,
+    ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG, DockerOps, EnsureImageOutcome,
+    GuestTransport, IsolationLevel, LITE_FIRST_USE_WARNING, LITE_IMAGE_REPOSITORY,
+    LITE_TAG_OVERRIDE_ENV, LimaRuntime, LimaTransport, ReaperReport, RoutedDockerOps,
     RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec,
     UnsupportedFeature, compute_default_resource_limits, ensure_image,
     lite_image_tag_for_daemon_probe, lite_image_tag_for_version, reap_orphans,
@@ -156,8 +158,8 @@ pub use lite_macos::{
 };
 #[cfg(target_os = "macos")]
 pub use macos_session::{
-    build_macos_gateway_docker_args, macos_docker_network_name, macos_gateway_container_name,
-    setup_macos_gateway, setup_macos_lite_gateway, teardown_macos_gateway,
+    macos_docker_network_name, macos_gateway_container_name, setup_macos_gateway,
+    setup_macos_lite_gateway, teardown_macos_gateway,
 };
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{

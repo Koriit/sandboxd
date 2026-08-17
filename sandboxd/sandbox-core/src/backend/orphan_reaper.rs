@@ -65,12 +65,13 @@
 //! `docker` exactly like the rest of the container backend.
 
 use std::collections::HashSet;
-#[cfg(target_os = "macos")]
-use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use sandbox_docker_argv::container::RemoveForce;
 use tracing::{info, warn};
 
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 use crate::lima::parse_session_id_from_name;
 use crate::session::SessionId;
@@ -79,6 +80,9 @@ use crate::users_conf::Cidr4;
 // ---------------------------------------------------------------------------
 // Naming-prefix constants
 // ---------------------------------------------------------------------------
+
+/// Prefix shared by every lite session container — `sandbox-{id}`
+const CONTAINER_PREFIX: &str = "sandbox-";
 
 /// Prefix shared by every per-session home volume — `sandbox-home-{id}`
 const HOME_VOLUME_PREFIX: &str = "sandbox-home-";
@@ -196,26 +200,54 @@ pub trait DockerOps: Send + Sync {
 // Production CLI implementation
 // ---------------------------------------------------------------------------
 
-/// Production [`DockerOps`] impl — shells out to the `docker` CLI via
-/// the same `run_docker_raw` plumbing the rest of the container backend
-/// uses.
-pub struct CliDockerOps;
+/// Production [`DockerOps`] impl, over whichever Docker daemon its route
+/// names.
+///
+/// # The two routes are not interchangeable, and that is the point
+///
+/// This type replaced two near-identical implementations that differed only
+/// in their funnel: one addressed the host `dockerd` with a bare `docker`,
+/// the other addressed a VM's daemon with `-H unix://<socket>` and a scrubbed
+/// environment. They were a standing invitation to drift — a fix applied to
+/// one and not the other would have been invisible.
+///
+/// Unifying the code did **not** unify the behaviour, because the difference
+/// between them is real:
+///
+/// - [`DockerRoute::Host`] must **not** name a target and must **not** scrub
+///   the environment. A rootless Docker install advertises its socket in
+///   `DOCKER_HOST`; taking that away points the reaper at nothing.
+/// - [`DockerRoute::Vm`] must do both. `-H` is the sole authority for which
+///   daemon is addressed, which it only is if nothing ambient can override
+///   it.
+///
+/// The distinction now lives in the type, where it is stated once and cannot
+/// be lost by editing one of two copies.
+pub struct RoutedDockerOps {
+    route: DockerRoute,
+}
+
+impl RoutedDockerOps {
+    /// Reap against the host's own Docker daemon — the Linux shape.
+    pub fn host() -> Self {
+        Self {
+            route: DockerRoute::Host,
+        }
+    }
+
+    /// Reap against the Docker daemon inside an operator's VM.
+    pub fn vm(route: DockerRoute) -> Self {
+        Self { route }
+    }
+}
 
 #[async_trait]
-impl DockerOps for CliDockerOps {
+impl DockerOps for RoutedDockerOps {
     async fn list_owned_containers(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
-        let label_filter = format!("label=sandboxd.owner={pool}");
-        let stdout = run_docker_raw(
-            &[
-                "ps",
-                "-a",
-                "--filter",
-                "name=sandbox-",
-                "--filter",
-                &label_filter,
-                "--format",
-                "{{.Names}}",
-            ],
+        let stdout = run_docker_op(
+            self.route.clone(),
+            OwnedListing::Containers,
+            pool.to_string(),
             "docker ps (orphan reaper)",
         )
         .await?;
@@ -223,18 +255,10 @@ impl DockerOps for CliDockerOps {
     }
 
     async fn list_owned_home_volumes(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
-        let label_filter = format!("label=sandboxd.owner={pool}");
-        let stdout = run_docker_raw(
-            &[
-                "volume",
-                "ls",
-                "--filter",
-                "name=sandbox-home-",
-                "--filter",
-                &label_filter,
-                "--format",
-                "{{.Name}}",
-            ],
+        let stdout = run_docker_op(
+            self.route.clone(),
+            OwnedListing::Volumes,
+            pool.to_string(),
             "docker volume ls (orphan reaper)",
         )
         .await?;
@@ -242,18 +266,10 @@ impl DockerOps for CliDockerOps {
     }
 
     async fn list_owned_networks(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
-        let label_filter = format!("label=sandboxd.owner={pool}");
-        let stdout = run_docker_raw(
-            &[
-                "network",
-                "ls",
-                "--filter",
-                "name=sandbox-net-",
-                "--filter",
-                &label_filter,
-                "--format",
-                "{{.Name}}",
-            ],
+        let stdout = run_docker_op(
+            self.route.clone(),
+            OwnedListing::Networks,
+            pool.to_string(),
             "docker network ls (orphan reaper)",
         )
         .await?;
@@ -264,7 +280,7 @@ impl DockerOps for CliDockerOps {
         // `docker rm -f` against a nonexistent container exits non-zero
         // with "No such container"; treat as success so re-runs after a
         // partial reap don't error.
-        match run_docker_raw(&["rm", "-f", name], "docker rm (orphan reaper)").await {
+        match run_removal(self.route.clone(), Removal::Container, name.to_string()).await {
             Ok(_) => Ok(()),
             Err(SandboxError::Gateway(msg)) if msg.contains("No such container") => Ok(()),
             Err(e) => Err(e),
@@ -272,7 +288,7 @@ impl DockerOps for CliDockerOps {
     }
 
     async fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
-        match run_docker_raw(&["volume", "rm", name], "docker volume rm (orphan reaper)").await {
+        match run_removal(self.route.clone(), Removal::Volume, name.to_string()).await {
             Ok(_) => Ok(()),
             Err(SandboxError::Gateway(msg))
                 if msg.contains("No such volume") || msg.contains("no such volume") =>
@@ -284,12 +300,7 @@ impl DockerOps for CliDockerOps {
     }
 
     async fn remove_network(&self, name: &str) -> Result<(), SandboxError> {
-        match run_docker_raw(
-            &["network", "rm", name],
-            "docker network rm (orphan reaper)",
-        )
-        .await
-        {
+        match run_removal(self.route.clone(), Removal::Network, name.to_string()).await {
             Ok(_) => Ok(()),
             Err(SandboxError::Gateway(msg))
                 if msg.contains("No such network") || msg.contains("network not found") =>
@@ -301,221 +312,108 @@ impl DockerOps for CliDockerOps {
     }
 }
 
-// ---------------------------------------------------------------------------
-// macOS: socket-scoped Docker ops for the gateway VM
-// ---------------------------------------------------------------------------
+/// Which resource kind a listing enumerates.
+#[derive(Debug, Clone, Copy)]
+enum OwnedListing {
+    Containers,
+    Volumes,
+    Networks,
+}
 
-/// Production [`DockerOps`] impl for macOS that routes every docker command
-/// through the gateway VM's forwarded Unix socket rather than the host
-/// `dockerd`. On production macOS there is no host Docker — the daemon,
-/// gateway, and lite containers all live inside the `sandboxd-gateway` Lima
-/// VM whose Docker is reachable only via the forwarded socket path.
-///
-/// The `-H unix://<socket>` flag is the sole authority for which Docker
-/// daemon is targeted; `env_clear` strips any ambient `DOCKER_HOST` or
-/// other Docker env vars that could redirect the command to a different
-/// daemon.
-#[cfg(target_os = "macos")]
-pub struct CliDockerOpsWithSocket(pub PathBuf);
-
-#[cfg(target_os = "macos")]
-#[async_trait]
-impl DockerOps for CliDockerOpsWithSocket {
-    async fn list_owned_containers(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
-        let label_filter = format!("label=sandboxd.owner={pool}");
-        let socket = self.0.clone();
-        let stdout = run_docker_raw_with_socket(
-            socket,
-            &[
-                "ps",
-                "-a",
-                "--filter",
-                "name=sandbox-",
-                "--filter",
-                &label_filter,
-                "--format",
-                "{{.Names}}",
-            ],
-            "docker ps (orphan reaper)",
-        )
-        .await?;
-        Ok(parse_one_per_line(&stdout))
-    }
-
-    async fn list_owned_home_volumes(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
-        let label_filter = format!("label=sandboxd.owner={pool}");
-        let socket = self.0.clone();
-        let stdout = run_docker_raw_with_socket(
-            socket,
-            &[
-                "volume",
-                "ls",
-                "--filter",
-                "name=sandbox-home-",
-                "--filter",
-                &label_filter,
-                "--format",
-                "{{.Name}}",
-            ],
-            "docker volume ls (orphan reaper)",
-        )
-        .await?;
-        Ok(parse_one_per_line(&stdout))
-    }
-
-    async fn list_owned_networks(&self, pool: &str) -> Result<Vec<String>, SandboxError> {
-        let label_filter = format!("label=sandboxd.owner={pool}");
-        let socket = self.0.clone();
-        let stdout = run_docker_raw_with_socket(
-            socket,
-            &[
-                "network",
-                "ls",
-                "--filter",
-                "name=sandbox-net-",
-                "--filter",
-                &label_filter,
-                "--format",
-                "{{.Name}}",
-            ],
-            "docker network ls (orphan reaper)",
-        )
-        .await?;
-        Ok(parse_one_per_line(&stdout))
-    }
-
-    async fn remove_container(&self, name: &str) -> Result<(), SandboxError> {
-        let socket = self.0.clone();
-        let name = name.to_string();
-        match run_docker_raw_with_socket(socket, &["rm", "-f", &name], "docker rm (orphan reaper)")
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(SandboxError::Gateway(msg)) if msg.contains("No such container") => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
-        let socket = self.0.clone();
-        let name = name.to_string();
-        match run_docker_raw_with_socket(
-            socket,
-            &["volume", "rm", &name],
-            "docker volume rm (orphan reaper)",
-        )
-        .await
-        {
-            Ok(_) => Ok(()),
-            Err(SandboxError::Gateway(msg))
-                if msg.contains("No such volume") || msg.contains("no such volume") =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn remove_network(&self, name: &str) -> Result<(), SandboxError> {
-        let socket = self.0.clone();
-        let name = name.to_string();
-        match run_docker_raw_with_socket(
-            socket,
-            &["network", "rm", &name],
-            "docker network rm (orphan reaper)",
-        )
-        .await
-        {
-            Ok(_) => Ok(()),
-            Err(SandboxError::Gateway(msg))
-                if msg.contains("No such network") || msg.contains("network not found") =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
+/// Which resource kind a removal targets.
+#[derive(Debug, Clone, Copy)]
+enum Removal {
+    Container,
+    Volume,
+    Network,
 }
 
 // ---------------------------------------------------------------------------
-// Docker CLI helpers
+// Docker op funnels
 // ---------------------------------------------------------------------------
 
-/// `docker <args>` with the standard 60s wall-clock timeout, targeting the
-/// gateway VM's forwarded socket. Passes `-H unix://<socket>` as the first
-/// arguments and clears the environment so no ambient `DOCKER_HOST` or
-/// other Docker env vars can redirect the command to a different daemon.
-#[cfg(target_os = "macos")]
-async fn run_docker_raw_with_socket(
-    socket: PathBuf,
-    args: &[&str],
+/// Wall-clock budget for one reaper docker op.
+const REAPER_OP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Enumerate one resource kind owned by `pool`, returning trimmed stdout.
+async fn run_docker_op(
+    route: DockerRoute,
+    listing: OwnedListing,
+    pool: String,
     operation: &'static str,
 ) -> Result<String, SandboxError> {
-    use std::time::Duration;
-
-    let socket_str = format!("unix://{}", socket.display());
-    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    let op = operation.to_string();
     tokio::task::spawn_blocking(move || {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
-        let home = std::env::var("HOME").unwrap_or_default();
-        let mut cmd = std::process::Command::new("docker");
-        // Isolate from ambient Docker env: env_clear strips DOCKER_HOST and
-        // other overrides; -H is the sole authority for the target daemon.
-        cmd.env_clear()
-            .env("PATH", &path_value)
-            .env("HOME", home)
-            .args(["-H", &socket_str]);
-        for arg in &owned {
-            cmd.arg(arg);
-        }
-        let output = crate::process::run_with_timeout(&mut cmd, Duration::from_secs(60), &op)
-            .map_err(|e| match e {
-                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                    SandboxError::Gateway(format!("failed to run {op}: {msg}"))
-                }
-                other => other,
-            })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(SandboxError::Gateway(format!("{op} failed: {stderr}")));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let op = match listing {
+            OwnedListing::Containers => DockerOp::ContainerList {
+                name_prefix: CONTAINER_PREFIX.to_string(),
+                owner_pool: Some(pool),
+            },
+            OwnedListing::Volumes => DockerOp::VolumeList {
+                name_prefix: HOME_VOLUME_PREFIX.to_string(),
+                owner_pool: Some(pool),
+            },
+            OwnedListing::Networks => DockerOp::NetworkList {
+                name_prefix: NETWORK_PREFIX.to_string(),
+                owner_pool: Some(pool),
+            },
+        };
+        captured_stdout(route.run(op, REAPER_OP_TIMEOUT, operation), operation)
     })
     .await
     .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))?
 }
 
-/// `docker <args>` with the standard 60s wall-clock timeout, returning
-/// trimmed stdout on success. Mirrors `container::run_docker` byte-for-
-/// byte but kept module-local so the reaper does not depend on
-/// `container.rs`'s internals.
-async fn run_docker_raw(args: &[&str], operation: &'static str) -> Result<String, SandboxError> {
-    use std::time::Duration;
-
-    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    let op = operation.to_string();
+/// Remove one resource, returning trimmed stdout.
+async fn run_removal(
+    route: DockerRoute,
+    removal: Removal,
+    name: String,
+) -> Result<String, SandboxError> {
     tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("docker");
-        for arg in &owned {
-            cmd.arg(arg);
-        }
-        let output = crate::process::run_with_timeout(&mut cmd, Duration::from_secs(60), &op)
-            .map_err(|e| match e {
-                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                    SandboxError::Gateway(format!("failed to run {op}: {msg}"))
-                }
-                other => other,
-            })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(SandboxError::Gateway(format!("{op} failed: {stderr}")));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let (op, operation) = match removal {
+            Removal::Container => (
+                DockerOp::ContainerRemove {
+                    name,
+                    force: RemoveForce::Short,
+                },
+                "docker rm (orphan reaper)",
+            ),
+            Removal::Volume => (
+                DockerOp::VolumeRemove { name },
+                "docker volume rm (orphan reaper)",
+            ),
+            Removal::Network => (
+                DockerOp::NetworkRemove { name },
+                "docker network rm (orphan reaper)",
+            ),
+        };
+        captured_stdout(route.run(op, REAPER_OP_TIMEOUT, operation), operation)
     })
     .await
     .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))?
+}
+
+/// Map a completed op onto trimmed stdout, preserving the reaper's error
+/// vocabulary — every failure surfaces as [`SandboxError::Gateway`] carrying
+/// the child's stderr, because the caller matches on that text to decide
+/// which "already gone" outcomes are successes.
+fn captured_stdout(
+    result: Result<std::process::Output, SandboxError>,
+    operation: &str,
+) -> Result<String, SandboxError> {
+    let output = result.map_err(|e| match e {
+        SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+            SandboxError::Gateway(format!("failed to run {operation}: {msg}"))
+        }
+        other => other,
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(SandboxError::Gateway(format!(
+            "{operation} failed: {stderr}"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Split docker's `{{.Names}}` / `{{.Name}}` output (one entry per
@@ -1122,16 +1020,99 @@ mod tests {
         assert!(parse_one_per_line("\n\n   \n").is_empty());
     }
 
-    // -- macOS socket-scoped DockerOps compile check -------------------------
+    // -- routed DockerOps ----------------------------------------------------
 
-    /// Compile-time check: `CliDockerOpsWithSocket` implements `DockerOps` on
-    /// macOS, so it can be passed to `reap_orphans` exactly like `CliDockerOps`.
-    /// If the impl is absent or signature-mismatched, the `_assert` function
-    /// below fails to compile.
-    #[cfg(target_os = "macos")]
+    /// Compile-time check: the production implementation satisfies the trait
+    /// `reap_orphans` is generic over. If the impl is absent or
+    /// signature-mismatched, this fails to compile.
     #[test]
-    fn cli_docker_ops_with_socket_satisfies_docker_ops_trait() {
+    fn routed_docker_ops_satisfies_the_docker_ops_trait() {
         fn _assert_docker_ops<T: DockerOps>() {}
-        _assert_docker_ops::<CliDockerOpsWithSocket>();
+        _assert_docker_ops::<RoutedDockerOps>();
+    }
+
+    /// The host route must stay the one that names no target and keeps its
+    /// ambient environment. It is not an oversight that it differs from the
+    /// VM route — a rootless Docker install publishes its socket through
+    /// `DOCKER_HOST`, so a scrub there would point the reaper at nothing.
+    #[test]
+    fn the_host_route_names_no_target() {
+        let ops = RoutedDockerOps::host();
+        assert!(
+            !ops.route.is_vm(),
+            "the host constructor must not produce a VM route"
+        );
+        assert_eq!(ops.route.op_uid(), None);
+    }
+
+    /// Every listing the reaper performs filters on the owner label. Losing
+    /// that filter would make a co-deployed daemon's resources visible to
+    /// this one's reap-list, which is the one failure this module must not
+    /// have.
+    #[test]
+    fn every_owned_listing_filters_on_the_owner_label() {
+        let pool = "10.209.0.0/20".to_string();
+        for (listing, prefix) in [
+            (OwnedListing::Containers, CONTAINER_PREFIX),
+            (OwnedListing::Volumes, HOME_VOLUME_PREFIX),
+            (OwnedListing::Networks, NETWORK_PREFIX),
+        ] {
+            let op = match listing {
+                OwnedListing::Containers => DockerOp::ContainerList {
+                    name_prefix: prefix.to_string(),
+                    owner_pool: Some(pool.clone()),
+                },
+                OwnedListing::Volumes => DockerOp::VolumeList {
+                    name_prefix: prefix.to_string(),
+                    owner_pool: Some(pool.clone()),
+                },
+                OwnedListing::Networks => DockerOp::NetworkList {
+                    name_prefix: prefix.to_string(),
+                    owner_pool: Some(pool.clone()),
+                },
+            };
+            let argv = op.argv().expect("listing renders");
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "--filter" && w[1] == "label=sandboxd.owner=10.209.0.0/20"),
+                "listing lost its owner filter: {argv:?}"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "--filter" && w[1] == format!("name={prefix}")),
+                "listing lost its name filter: {argv:?}"
+            );
+        }
+    }
+
+    /// Container removal is forced; volumes and networks are not. `docker rm`
+    /// without `-f` refuses a running container, which would leave the very
+    /// orphan the reaper exists to remove.
+    #[test]
+    fn only_container_removal_is_forced() {
+        let container = DockerOp::ContainerRemove {
+            name: "sandbox-abc".to_string(),
+            force: RemoveForce::Short,
+        }
+        .argv()
+        .expect("rm renders");
+        assert_eq!(container, vec!["rm", "-f", "sandbox-abc"]);
+
+        assert_eq!(
+            DockerOp::VolumeRemove {
+                name: "v".to_string()
+            }
+            .argv()
+            .expect("volume rm renders"),
+            vec!["volume", "rm", "v"]
+        );
+        assert_eq!(
+            DockerOp::NetworkRemove {
+                name: "n".to_string()
+            }
+            .argv()
+            .expect("network rm renders"),
+            vec!["network", "rm", "n"]
+        );
     }
 }

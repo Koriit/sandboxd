@@ -1950,6 +1950,7 @@ dependencies = [
  "rusqlite",
  "sandbox-agent",
  "sandbox-core",
+ "sandbox-docker-argv",
  "serde",
  "serde_json",
  "tempfile",

@@ -84,6 +84,23 @@ mod integration_macos_session_lifecycle {
             .join("gateway-docker.sock")
     }
 
+    /// The Docker route this suite drives: the gateway VM's forwarded socket,
+    /// run directly. That is what the test process has always done; the route
+    /// makes it explicit rather than implicit in a socket argument.
+    fn gateway_docker_route() -> sandbox_core::docker::DockerRoute {
+        let sock = gateway_docker_socket();
+        let staging = sock
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        sandbox_core::docker::DockerRoute::Vm {
+            op_uid: nix::unistd::Uid::current().as_raw(),
+            executor: std::sync::Arc::new(sandbox_core::docker::LocalSocketDockerExecutor::new(
+                sock, staging,
+            )),
+        }
+    }
+
     /// Run a `docker -H unix://<sock>` command against the gateway VM.
     fn docker_gateway(args: &[&str]) -> std::process::Output {
         let sock = gateway_docker_socket();
@@ -263,12 +280,17 @@ mod integration_macos_session_lifecycle {
             session_id: SessionId,
             pool: Arc<VmnetPool>,
             gateway_sock: PathBuf,
+            gateway_route: sandbox_core::docker::DockerRoute,
             lima_home: PathBuf,
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 // Best-effort teardown — ignore errors.
-                let _ = teardown_macos_gateway(&self.session_id, &self.gateway_sock);
+                let _ = teardown_macos_gateway(
+                    &self.session_id,
+                    &self.gateway_route,
+                    &self.gateway_sock,
+                );
                 let _ = self.pool.release_lima_slot(&self.session_id);
                 // limactl delete --force (best-effort)
                 let vm = vm_name(&self.session_id);
@@ -291,6 +313,7 @@ mod integration_macos_session_lifecycle {
             session_id,
             pool: Arc::clone(&pool),
             gateway_sock: sock.clone(),
+            gateway_route: gateway_docker_route(),
             lima_home: lima_home.clone(),
         };
 
@@ -324,6 +347,7 @@ mod integration_macos_session_lifecycle {
             &session_id,
             &network_info,
             &nic_name,
+            &gateway_docker_route(),
             &sock,
             &gateway_tag,
             None, // ca_dir (deferred to M20-S6+)
@@ -388,7 +412,8 @@ mod integration_macos_session_lifecycle {
         // --- Step 6: stop + teardown ---
         manager.stop_vm(&session_id).expect("limactl stop failed");
 
-        teardown_macos_gateway(&session_id, &sock).expect("teardown_macos_gateway failed");
+        teardown_macos_gateway(&session_id, &gateway_docker_route(), &sock)
+            .expect("teardown_macos_gateway failed");
 
         // --- Assert: slot released ---
         pool.release_lima_slot(&session_id)
@@ -479,6 +504,7 @@ mod integration_macos_session_lifecycle {
             &session_id,
             &network_info,
             &nic_name,
+            &gateway_docker_route(),
             &sock,
             &gateway_tag,
             None,
@@ -523,7 +549,8 @@ mod integration_macos_session_lifecycle {
         );
 
         // Teardown.
-        teardown_macos_gateway(&session_id, &sock).expect("teardown failed");
+        teardown_macos_gateway(&session_id, &gateway_docker_route(), &sock)
+            .expect("teardown failed");
         pool.release_lima_slot(&session_id).expect("release failed");
 
         // Container should be gone.
@@ -581,6 +608,7 @@ mod integration_macos_session_lifecycle {
             &session_id,
             &network_info,
             "nonexistent_nic_xyz", // this will cause the macvlan create to fail
+            &gateway_docker_route(),
             &sock,
             &gateway_tag,
             None,
@@ -594,7 +622,7 @@ mod integration_macos_session_lifecycle {
 
         // Rollback: teardown (idempotent — container/network may be partially created)
         // + release slot.
-        teardown_macos_gateway(&session_id, &sock)
+        teardown_macos_gateway(&session_id, &gateway_docker_route(), &sock)
             .expect("teardown idempotent after partial create");
         pool.release_lima_slot(&session_id).expect("release failed");
 

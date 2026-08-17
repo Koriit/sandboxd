@@ -25,11 +25,13 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
+use sandbox_docker_argv::container::RemoveForce;
+use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver, NetworkOption};
+
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 #[cfg(target_os = "macos")]
 use crate::network::NetworkInfo;
-#[cfg(target_os = "macos")]
-use crate::process::run_with_timeout;
 #[cfg(target_os = "macos")]
 use crate::session::SessionId;
 
@@ -138,6 +140,7 @@ pub fn setup_macos_gateway(
     session_id: &SessionId,
     network_info: &NetworkInfo,
     nic_name: &str,
+    docker: &DockerRoute,
     gateway_docker_socket: &Path,
     gateway_image_tag: &str,
     ca_dir: Option<&Path>,
@@ -169,29 +172,25 @@ pub fn setup_macos_gateway(
         // default-gateway field only (not used for routing by the VM).
         let ipam_gateway = compute_subnet_plus_one(&network_info.subnet)?;
 
-        let output = run_with_timeout(
-            gateway_docker_cmd(gateway_docker_socket).args([
-                "network",
-                "create",
-                "--driver",
-                "macvlan",
-                "--opt",
-                &format!("parent={nic_name}"),
-                // macvlan_mode=private: blocks macvlan-to-macvlan traffic on
-                // the same parent NIC. Defense-in-depth L2-isolation control:
-                // sessions normally use different parent NICs (different slots),
-                // but private mode prevents cross-session L2 traffic even if two
-                // sessions ended up sharing a parent (e.g., after slot reuse).
-                "--opt",
-                "macvlan_mode=private",
-                "--subnet",
-                &network_info.subnet,
-                "--gateway",
-                &ipam_gateway,
-                "--label",
-                &format!("sandbox.session_id={session_id}"),
-                &network_name,
-            ]),
+        // macvlan_mode=private blocks macvlan-to-macvlan traffic on the same
+        // parent NIC. Defence-in-depth L2 isolation: sessions normally use
+        // different parent NICs (different slots), but private mode prevents
+        // cross-session L2 traffic even if two sessions ended up sharing a
+        // parent (e.g. after slot reuse).
+        let spec = NetworkCreateSpec {
+            name: network_name.clone(),
+            driver: NetworkDriver::Macvlan,
+            subnet: Some(network_info.subnet.clone()),
+            gateway: Some(ipam_gateway),
+            session_id: Some(session_id.to_string()),
+            owner_pool: None,
+            options: vec![
+                NetworkOption::MacvlanParent(nic_name.to_string()),
+                NetworkOption::MacvlanModePrivate,
+            ],
+        };
+        let output = docker.run(
+            DockerOp::NetworkCreate { spec },
             DOCKER_NETWORK_TIMEOUT,
             "docker network create (macvlan)",
         )?;
@@ -215,8 +214,11 @@ pub fn setup_macos_gateway(
     // session IDs make true collisions impossible in steady state, but the
     // defensive removal costs nothing and protects edge cases (e.g., a test
     // replay with a fixed session ID).
-    let _ = run_with_timeout(
-        gateway_docker_cmd(gateway_docker_socket).args(["rm", "--force", &container_name]),
+    let _ = docker.run(
+        DockerOp::ContainerRemove {
+            name: container_name.clone(),
+            force: RemoveForce::Long,
+        },
         DOCKER_RM_TIMEOUT,
         "docker rm (macOS pre-cleanup)",
     );
@@ -229,10 +231,8 @@ pub fn setup_macos_gateway(
     // is never missing its default-route uplink, which would make health
     // checks fail before the macvlan attach completes.
     {
-        let run_args = build_macos_gateway_docker_args(session_id, gateway_image_tag, owner_pool);
-        let args_refs: Vec<&str> = run_args.iter().map(|s| s.as_str()).collect();
-        let output = run_with_timeout(
-            gateway_docker_cmd(gateway_docker_socket).args(&args_refs),
+        let output = docker.run(
+            gateway_container_run_op(session_id, gateway_image_tag, owner_pool),
             DOCKER_RUN_TIMEOUT,
             "docker run (macOS gateway)",
         )?;
@@ -327,15 +327,12 @@ pub fn setup_macos_gateway(
 
     // Step 8: Connect container to macvlan with static IP (gateway_ip = B+3).
     {
-        let output = run_with_timeout(
-            gateway_docker_cmd(gateway_docker_socket).args([
-                "network",
-                "connect",
-                "--ip",
-                &network_info.gateway_ip,
-                &network_name,
-                &container_name,
-            ]),
+        let output = docker.run(
+            DockerOp::NetworkConnect {
+                network: network_name.clone(),
+                container: container_name.clone(),
+                ip: Some(network_info.gateway_ip.clone()),
+            },
             DOCKER_CONNECT_TIMEOUT,
             "docker network connect (macvlan)",
         )?;
@@ -358,7 +355,7 @@ pub fn setup_macos_gateway(
     // daemon. Creating it once avoids redundant allocations.
     {
         use crate::gateway::GatewayManager;
-        let gm = GatewayManager::with_gateway_socket(gateway_docker_socket.to_path_buf());
+        let gm = GatewayManager::with_vm_route(docker.clone(), gateway_docker_socket.to_path_buf());
 
         // Step 9: Inject deny-all nftables into the gateway container.
         gm.inject_deny_all(session_id)?;
@@ -403,6 +400,7 @@ pub fn setup_macos_gateway(
 pub fn setup_macos_lite_gateway(
     session_id: &SessionId,
     network_info: &NetworkInfo,
+    docker: &DockerRoute,
     gateway_docker_socket: &Path,
     gateway_image_tag: &str,
     ca_dir: Option<&Path>,
@@ -423,18 +421,19 @@ pub fn setup_macos_lite_gateway(
     );
 
     // Pre-cleanup: remove any leftover container with the same name.
-    let _ = run_with_timeout(
-        gateway_docker_cmd(gateway_docker_socket).args(["rm", "--force", &container_name]),
+    let _ = docker.run(
+        DockerOp::ContainerRemove {
+            name: container_name.clone(),
+            force: RemoveForce::Long,
+        },
         DOCKER_RM_TIMEOUT,
         "docker rm (macOS lite pre-cleanup)",
     );
 
     // Step 7: Create gateway container on sandboxd-egress (upstream NIC).
     {
-        let run_args = build_macos_gateway_docker_args(session_id, gateway_image_tag, owner_pool);
-        let args_refs: Vec<&str> = run_args.iter().map(|s| s.as_str()).collect();
-        let output = run_with_timeout(
-            gateway_docker_cmd(gateway_docker_socket).args(&args_refs),
+        let output = docker.run(
+            gateway_container_run_op(session_id, gateway_image_tag, owner_pool),
             DOCKER_RUN_TIMEOUT,
             "docker run (macOS lite gateway)",
         )?;
@@ -510,15 +509,12 @@ pub fn setup_macos_lite_gateway(
     // Step 8: Connect container to the per-session bridge with static IP.
     // For the lite path the network is a plain bridge (not macvlan).
     {
-        let output = run_with_timeout(
-            gateway_docker_cmd(gateway_docker_socket).args([
-                "network",
-                "connect",
-                "--ip",
-                &network_info.gateway_ip,
-                &network_name,
-                &container_name,
-            ]),
+        let output = docker.run(
+            DockerOp::NetworkConnect {
+                network: network_name.clone(),
+                container: container_name.clone(),
+                ip: Some(network_info.gateway_ip.clone()),
+            },
             DOCKER_CONNECT_TIMEOUT,
             "docker network connect (lite bridge)",
         )?;
@@ -539,7 +535,7 @@ pub fn setup_macos_lite_gateway(
     // Steps 9-11: Use GatewayManager over the forwarded socket for nft and health.
     {
         use crate::gateway::GatewayManager;
-        let gm = GatewayManager::with_gateway_socket(gateway_docker_socket.to_path_buf());
+        let gm = GatewayManager::with_vm_route(docker.clone(), gateway_docker_socket.to_path_buf());
         gm.inject_deny_all(session_id)?;
         gm.wait_for_components(session_id)?;
         gm.inject_dnat(session_id, network_info, &network_info.gateway_ip)?;
@@ -553,87 +549,45 @@ pub fn setup_macos_lite_gateway(
     Ok(())
 }
 
-/// Build the `docker run` argument vector for a macOS gateway container.
+/// The `docker run` op for a session's gateway container inside the VM.
 ///
-/// Extracted from `setup_macos_gateway` so the hardening properties
-/// (no `--privileged`, `--read-only`, exactly one `--cap-add NET_ADMIN`,
-/// no host-path bind-mounts) can be asserted in unit tests without
-/// requiring a live Docker daemon.
+/// The hardening properties (no `--privileged`, `--read-only`, exactly one
+/// `--cap-add NET_ADMIN`, no host-path bind-mounts) live in the shared argv
+/// builder, where both sides of the broker channel render them from the same
+/// source.
 ///
-/// The returned `Vec<String>` is the complete argument list starting with
-/// `run`. Callers prepend `docker -H <socket>` and pass it to
-/// `run_with_timeout`.
+/// On macOS the listener and events host directories are deliberately not
+/// bind-mounted: the gateway VM has its own filesystem, so a bind from the
+/// macOS host would mount nothing. The initial deny-all Envoy listener is
+/// seeded by a separate write into the container's tmpfs, and dynamic LDS
+/// updates go the same way.
 #[cfg(target_os = "macos")]
-pub fn build_macos_gateway_docker_args(
+fn gateway_container_run_op(
     session_id: &SessionId,
     gateway_image_tag: &str,
     owner_pool: Option<&str>,
-) -> Vec<String> {
-    let container_name = macos_gateway_container_name(session_id);
-    let mut args = vec![
-        "run".to_string(),
-        "-d".to_string(),
-        "--name".to_string(),
-        container_name,
-        "--network".to_string(),
-        crate::gateway_lima::EGRESS_BRIDGE_NAME.to_string(),
-        "--read-only".to_string(),
-        "--cap-add".to_string(),
-        "NET_ADMIN".to_string(),
-        "--tmpfs".to_string(),
-        "/var/log:rw,noexec,nosuid".to_string(),
-        "--tmpfs".to_string(),
-        "/var/run:rw,noexec,nosuid".to_string(),
-        "--tmpfs".to_string(),
-        "/tmp:rw,exec,nosuid".to_string(),
-        "--tmpfs".to_string(),
-        "/root/.mitmproxy:rw".to_string(),
-        "--tmpfs".to_string(),
-        "/etc/coredns:rw,noexec,nosuid".to_string(),
-        "--tmpfs".to_string(),
-        "/etc/envoy:rw,noexec,nosuid".to_string(),
-        "--sysctl".to_string(),
-        "net.ipv4.ip_forward=1".to_string(),
-        "--sysctl".to_string(),
-        "net.ipv6.conf.all.forwarding=0".to_string(),
-        // CoreDNS upstream forwarder. On macOS the gateway container runs
-        // inside the gateway Lima VM, where Docker's embedded DNS at
-        // 127.0.0.11 (the Linux default the entrypoint bakes in) is a dead
-        // end: its own upstream, the VM's 127.0.0.53 systemd-resolved stub,
-        // does not answer, so an allowed domain SERVFAILs on the forward even
-        // though the DNS policy admits it. The VM reaches public resolvers
-        // directly over eth0 (port 53 is permitted by the gateway-VM egress
-        // firewall), so point CoreDNS there. Multiple resolvers give
-        // failover; the entrypoint renders them into the `forward .` line.
-        // This never weakens deny — a denied domain is answered NXDOMAIN
-        // before the forward runs — and does not touch the Linux path, which
-        // keeps the 127.0.0.11 default.
-        "--env".to_string(),
-        "SANDBOX_COREDNS_UPSTREAM=8.8.8.8 8.8.4.4 1.1.1.1".to_string(),
-        "--restart".to_string(),
-        "unless-stopped".to_string(),
-        "--label".to_string(),
-        format!("sandbox.session_id={session_id}"),
-    ];
-
-    if let Some(pool) = owner_pool {
-        args.push("--label".to_string());
-        args.push(format!("sandboxd.owner={pool}"));
+) -> DockerOp {
+    DockerOp::GatewayContainerRun {
+        session_id: session_id.to_string(),
+        image_tag: gateway_image_tag.to_string(),
+        network: crate::gateway_lima::EGRESS_BRIDGE_NAME.to_string(),
+        owner_pool: owner_pool.map(str::to_string),
+        // Inside the gateway VM, Docker's embedded resolver at 127.0.0.11 is
+        // a dead end: its own upstream (the VM's systemd-resolved stub) does
+        // not answer, so an allowed domain SERVFAILs on the forward even
+        // though DNS policy admits it. The VM reaches public resolvers
+        // directly over eth0. This never weakens deny — a denied domain is
+        // answered NXDOMAIN before the forward runs — and does not touch the
+        // Linux path, which keeps the 127.0.0.11 default.
+        coredns_upstream: Some(MACOS_COREDNS_UPSTREAM.to_string()),
     }
-
-    // On macOS the listener and events host directories are not bind-mounted
-    // into the gateway VM (the VM has its own filesystem). Bind-mounts from
-    // the macOS host are not available inside the gateway VM's container
-    // namespace.
-    //
-    // The initial deny-all Envoy listener is seeded via `docker exec` in
-    // `setup_macos_gateway` so that Envoy can start. Dynamic LDS listener
-    // updates use `AtomicListenerWriter` over the forwarded Docker socket
-    // (`write_listener_into_container`) — see `PolicyDistributor::distribute`.
-
-    args.push(gateway_image_tag.to_string());
-    args
 }
+
+/// Public resolvers CoreDNS forwards to inside the gateway VM. Multiple
+/// entries give failover; the entrypoint renders them into the `forward .`
+/// line.
+#[cfg(target_os = "macos")]
+const MACOS_COREDNS_UPSTREAM: &str = "8.8.8.8 8.8.4.4 1.1.1.1";
 
 // ---------------------------------------------------------------------------
 // teardown_macos_gateway
@@ -651,6 +605,7 @@ pub fn build_macos_gateway_docker_args(
 #[cfg(target_os = "macos")]
 pub fn teardown_macos_gateway(
     session_id: &SessionId,
+    docker: &DockerRoute,
     gateway_docker_socket: &Path,
 ) -> Result<(), SandboxError> {
     let container_name = macos_gateway_container_name(session_id);
@@ -666,7 +621,7 @@ pub fn teardown_macos_gateway(
     // Step 1: Flush DNAT rules (best-effort; container may already be gone).
     {
         use crate::gateway::GatewayManager;
-        let gm = GatewayManager::with_gateway_socket(gateway_docker_socket.to_path_buf());
+        let gm = GatewayManager::with_vm_route(docker.clone(), gateway_docker_socket.to_path_buf());
         if let Err(e) = gm.remove_dnat_rules(session_id) {
             warn!(
                 session_id = %session_id,
@@ -677,8 +632,11 @@ pub fn teardown_macos_gateway(
     }
 
     // Step 2: Remove the gateway container.
-    let rm_output = run_with_timeout(
-        gateway_docker_cmd(gateway_docker_socket).args(["rm", "-f", &container_name]),
+    let rm_output = docker.run(
+        DockerOp::ContainerRemove {
+            name: container_name.clone(),
+            force: RemoveForce::Short,
+        },
         DOCKER_RM_TIMEOUT,
         "docker rm (macOS gateway container)",
     );
@@ -706,8 +664,10 @@ pub fn teardown_macos_gateway(
     }
 
     // Step 3: Remove the macvlan network.
-    let rm_net = run_with_timeout(
-        gateway_docker_cmd(gateway_docker_socket).args(["network", "rm", &network_name]),
+    let rm_net = docker.run(
+        DockerOp::NetworkRemove {
+            name: network_name.clone(),
+        },
         DOCKER_NETWORK_TIMEOUT,
         "docker network rm (macvlan)",
     );
@@ -1210,8 +1170,9 @@ mod tests {
         //   gateway-container escape via the shared Docker socket would compromise
         //   all sessions at once).
         let id = SessionId::parse("aabbccddeeff").unwrap();
-        let args =
-            build_macos_gateway_docker_args(&id, "sandbox-gateway:test", Some("10.209.128.0/24"));
+        let args = gateway_container_run_op(&id, "sandbox-gateway:test", Some("10.209.128.0/24"))
+            .argv()
+            .expect("gateway run renders");
 
         // Must contain --read-only.
         assert!(
@@ -1269,7 +1230,9 @@ mod tests {
     #[test]
     fn test_macos_gateway_sets_coredns_upstream_to_public_resolvers() {
         let id = SessionId::parse("aabbccddeeff").unwrap();
-        let args = build_macos_gateway_docker_args(&id, "sandbox-gateway:test", None);
+        let args = gateway_container_run_op(&id, "sandbox-gateway:test", None)
+            .argv()
+            .expect("gateway run renders");
 
         // `--env` must be immediately followed by the SANDBOX_COREDNS_UPSTREAM
         // assignment; docker requires the KEY=VALUE to follow the flag.

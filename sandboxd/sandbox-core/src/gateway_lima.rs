@@ -76,6 +76,10 @@ use tracing::{info, warn};
 #[cfg(target_os = "macos")]
 use crate::backend::container::lite_image_tag_for_version;
 #[cfg(target_os = "macos")]
+use sandbox_docker_argv::image::StagedImage;
+use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver};
+
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 #[cfg(target_os = "macos")]
 use crate::gateway::gateway_image_tag_for_daemon;
@@ -164,6 +168,15 @@ const GATEWAY_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for Docker operations inside the gateway VM (bridge create, etc.).
 #[cfg(target_os = "macos")]
+/// Wall-clock ceiling for one `docker info` reachability probe. The callers
+/// poll until their own deadline; this bounds a single attempt.
+const DOCKER_INFO_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wall-clock ceiling for `docker load`. A multi-hundred-megabyte transfer
+/// into a VM's Docker daemon; generous enough not to abort a healthy load on
+/// a slow disk.
+const DOCKER_LOAD_TIMEOUT: Duration = Duration::from_secs(900);
+
 const DOCKER_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for nft injection via `nft -f -` on stdin inside the gateway VM.
@@ -920,30 +933,6 @@ fn apply_limactl_env(cmd: &mut Command, daemon_uid: u32) {
         .env("TERM", "dumb");
 }
 
-/// Apply minimal-reconstruction environment sanitization to a `docker` command.
-///
-/// Clears the inherited environment and reconstructs only a minimal `PATH`.
-/// The `-H unix://<socket>` flag (already in the caller's args) is the sole
-/// authority for which Docker daemon is targeted; stripping `DOCKER_HOST` and
-/// other Docker env vars (e.g. `DOCKER_CONFIG`, `DOCKER_TLS_VERIFY`) prevents
-/// any ambient override from redirecting the command to a different daemon.
-#[cfg(target_os = "macos")]
-fn apply_docker_env(cmd: &mut Command) {
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        tracing::warn!(
-            "apply_docker_env: HOME is unset; docker CLI may fail to locate its config directory"
-        );
-    }
-
-    // env_clear removes DOCKER_HOST and all other ambient overrides; then we
-    // reconstruct only the vars the docker CLI needs to locate its binary
-    // dependencies.
-    cmd.env_clear().env("PATH", &path_value).env("HOME", home);
-}
-
 // ---------------------------------------------------------------------------
 // Lite-session staging path + argv builders (pure, testable)
 // ---------------------------------------------------------------------------
@@ -1014,6 +1003,9 @@ pub struct GatewayLimaManager {
     /// Operator-execution seam for `limactl` ops (all go via daemon_uid).
     executor: Arc<dyn LimaExecutor>,
 
+    /// Where this manager's `docker` operations against the gateway VM go.
+    docker: DockerRoute,
+
     /// Verified slot→NIC map, populated after a successful `ensure_ready`.
     nic_map: Mutex<Option<NicMap>>,
 }
@@ -1038,6 +1030,7 @@ impl GatewayLimaManager {
     pub fn new(
         daemon_lima_home: PathBuf,
         executor: Arc<dyn LimaExecutor>,
+        docker: DockerRoute,
         daemon_uid: u32,
     ) -> Self {
         let gateway_docker_socket = daemon_lima_home
@@ -1048,6 +1041,7 @@ impl GatewayLimaManager {
             gateway_docker_socket,
             daemon_uid,
             executor,
+            docker,
             nic_map: Mutex::new(None),
         }
     }
@@ -1258,17 +1252,13 @@ impl GatewayLimaManager {
 
         // Check if the image is already loaded in the gateway VM's Docker daemon.
         let image_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
-        let inspect = {
-            let mut cmd = Command::new("docker");
-            apply_docker_env(&mut cmd);
-            cmd.args(["-H", &socket_str, "image", "inspect", &image_tag]);
-            run_with_timeout(
-                &mut cmd,
-                DOCKER_OP_TIMEOUT,
-                "docker image inspect (gateway)",
-            )
-        };
+        let inspect = self.docker.run(
+            DockerOp::ImageInspect {
+                tag: image_tag.clone(),
+            },
+            DOCKER_OP_TIMEOUT,
+            "docker image inspect (gateway)",
+        );
         match inspect {
             Ok(ref out) if out.status.success() => {
                 info!(tag = %image_tag, "gateway image already loaded in gateway VM");
@@ -1294,59 +1284,20 @@ impl GatewayLimaManager {
             "loading gateway image into gateway VM from tarball"
         );
 
-        let load_result = {
-            use std::io;
-            use std::process::Stdio;
-            let spawn_result = {
-                let mut cmd = Command::new("docker");
-                apply_docker_env(&mut cmd);
-                cmd.args(["-H", &socket_str, "load"])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-            };
-            let mut child = match spawn_result {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "failed to spawn docker load for gateway image");
-                    return;
-                }
-            };
-            // Take the stdin handle so we own it and can drop it to signal EOF.
-            let mut stdin = match child.stdin.take() {
-                Some(s) => s,
-                None => {
-                    warn!("docker load: failed to take stdin handle");
-                    let _ = child.kill();
-                    return;
-                }
-            };
-            let mut file = match std::fs::File::open(&tarball) {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(
-                        tarball = %tarball.display(),
-                        error = %e,
-                        "failed to open gateway image tarball for streaming"
-                    );
-                    let _ = child.kill();
-                    return;
-                }
-            };
-            if let Err(e) = io::copy(&mut file, &mut stdin) {
-                warn!(error = %e, "failed to stream tarball to docker load stdin");
-                let _ = child.kill();
+        // The tarball is streamed rather than carried in the op: which
+        // tarball is named by the op, and the side that runs `docker load`
+        // opens it in its own staging directory.
+        let load_result = match self.docker.run(
+            DockerOp::ImageLoad {
+                image: StagedImage::Gateway,
+            },
+            DOCKER_LOAD_TIMEOUT,
+            "docker load (gateway image)",
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(error = %e, "docker load for gateway image failed");
                 return;
-            }
-            // Drop stdin to close the pipe and signal EOF to docker load.
-            drop(stdin);
-            match child.wait_with_output() {
-                Ok(o) => o,
-                Err(e) => {
-                    warn!(error = %e, "docker load wait failed");
-                    return;
-                }
             }
         };
 
@@ -1389,15 +1340,14 @@ impl GatewayLimaManager {
         }
 
         let image_tag = lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
-
         // Idempotence check: skip if the image is already present.
-        let inspect = {
-            let mut cmd = Command::new("docker");
-            apply_docker_env(&mut cmd);
-            cmd.args(["-H", &socket_str, "image", "inspect", &image_tag]);
-            run_with_timeout(&mut cmd, DOCKER_OP_TIMEOUT, "docker image inspect (lite)")
-        };
+        let inspect = self.docker.run(
+            DockerOp::ImageInspect {
+                tag: image_tag.clone(),
+            },
+            DOCKER_OP_TIMEOUT,
+            "docker image inspect (lite)",
+        );
         match inspect {
             Ok(ref out) if out.status.success() => {
                 info!(tag = %image_tag, "lite image already loaded in gateway VM");
@@ -1419,49 +1369,13 @@ impl GatewayLimaManager {
             tag = %image_tag,
             "loading lite image into gateway VM from tarball"
         );
-        let load_result = {
-            use std::io;
-            use std::process::Stdio;
-            let mut child = {
-                let mut cmd = Command::new("docker");
-                apply_docker_env(&mut cmd);
-                cmd.args(["-H", &socket_str, "load"])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| {
-                        SandboxError::Internal(format!(
-                            "failed to spawn docker load for lite image: {e}"
-                        ))
-                    })?
-            };
-            // Take the stdin handle so we own it and can drop it to signal EOF.
-            let mut stdin = child.stdin.take().ok_or_else(|| {
-                let _ = child.kill();
-                SandboxError::Internal(
-                    "docker load (lite): failed to take stdin handle".to_string(),
-                )
-            })?;
-            let mut file = std::fs::File::open(&tarball).map_err(|e| {
-                let _ = child.kill();
-                SandboxError::Internal(format!(
-                    "failed to open lite image tarball {}: {e}",
-                    tarball.display()
-                ))
-            })?;
-            if let Err(e) = io::copy(&mut file, &mut stdin) {
-                let _ = child.kill();
-                return Err(SandboxError::Internal(format!(
-                    "failed to stream lite tarball to docker load stdin: {e}"
-                )));
-            }
-            // Drop stdin to close the pipe and signal EOF to docker load.
-            drop(stdin);
-            child.wait_with_output().map_err(|e| {
-                SandboxError::Internal(format!("docker load wait failed for lite image: {e}"))
-            })?
-        };
+        let load_result = self.docker.run(
+            DockerOp::ImageLoad {
+                image: StagedImage::Lite,
+            },
+            DOCKER_LOAD_TIMEOUT,
+            "docker load (lite image)",
+        )?;
 
         if load_result.status.success() {
             info!(tag = %image_tag, "lite image loaded into gateway VM");
@@ -1687,16 +1601,11 @@ impl GatewayLimaManager {
         // Phase 2: wait for the host-side forwarded socket to be accessible.
         // Lima's host agent establishes the SSH socket forward; it may retry a
         // few times after the in-VM Docker socket appears.
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
         loop {
-            let mut cmd = Command::new("docker");
-            apply_docker_env(&mut cmd);
-            cmd.args(["-H", &socket_str, "info"]);
-
-            let result = run_with_timeout(
-                &mut cmd,
-                Duration::from_secs(5),
-                "gateway: docker info probe via forwarded socket",
+            let result = self.docker.run(
+                DockerOp::DaemonInfo,
+                DOCKER_INFO_PROBE_TIMEOUT,
+                "gateway: docker info probe",
             );
 
             match result {
@@ -1744,22 +1653,21 @@ impl GatewayLimaManager {
     /// Uses `docker -H <socket> network create`; idempotent — tolerates the
     /// "network already exists" error and treats it as success.
     fn ensure_egress_bridge(&self) -> Result<(), SandboxError> {
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
+        let spec = NetworkCreateSpec {
+            name: EGRESS_BRIDGE_NAME.to_string(),
+            driver: NetworkDriver::Bridge,
+            subnet: None,
+            gateway: None,
+            session_id: None,
+            owner_pool: None,
+            options: Vec::new(),
+        };
 
-        let mut cmd = Command::new("docker");
-        apply_docker_env(&mut cmd);
-        cmd.args([
-            "-H",
-            &socket_str,
-            "network",
-            "create",
-            "--driver",
-            "bridge",
-            EGRESS_BRIDGE_NAME,
-        ]);
-
-        let output =
-            run_with_timeout(&mut cmd, DOCKER_OP_TIMEOUT, "gateway: create egress bridge")?;
+        let output = self.docker.run(
+            DockerOp::NetworkCreate { spec },
+            DOCKER_OP_TIMEOUT,
+            "gateway: create egress bridge",
+        )?;
 
         if output.status.success() {
             info!(
@@ -2213,15 +2121,10 @@ impl GatewayLimaManager {
     /// - `Err(_)` — unexpected internal error (e.g. `run_with_timeout` could
     ///   not spawn the child).
     pub fn probe_docker_health(&self) -> Result<bool, SandboxError> {
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
-        let mut cmd = Command::new("docker");
-        apply_docker_env(&mut cmd);
-        cmd.args(["-H", &socket_str, "info"]);
-
-        let result = run_with_timeout(
-            &mut cmd,
-            Duration::from_secs(5),
-            "gateway: docker info probe via forwarded socket",
+        let result = self.docker.run(
+            DockerOp::DaemonInfo,
+            DOCKER_INFO_PROBE_TIMEOUT,
+            "gateway: docker info probe",
         );
 
         match result {
@@ -2255,15 +2158,10 @@ impl GatewayLimaManager {
     /// the host Docker daemon.
     pub fn gateway_image_present_inside_lima(&self) -> Result<bool, SandboxError> {
         let tag = self.expected_gateway_image_tag();
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
-        let mut cmd = Command::new("docker");
-        apply_docker_env(&mut cmd);
-        cmd.args(["-H", &socket_str, "image", "inspect", &tag]);
-
-        let output = run_with_timeout(
-            &mut cmd,
+        let output = self.docker.run(
+            DockerOp::ImageInspect { tag: tag.clone() },
             DOCKER_OP_TIMEOUT,
-            "gateway: docker image inspect via forwarded socket",
+            "gateway: docker image inspect",
         )?;
         if output.status.success() {
             return Ok(true);
@@ -2289,15 +2187,10 @@ impl GatewayLimaManager {
     pub fn lite_image_present_inside_lima(&self) -> Result<bool, SandboxError> {
         use crate::backend::lite_image_tag_for_version;
         let tag = lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
-        let mut cmd = Command::new("docker");
-        apply_docker_env(&mut cmd);
-        cmd.args(["-H", &socket_str, "image", "inspect", &tag]);
-
-        let output = run_with_timeout(
-            &mut cmd,
+        let output = self.docker.run(
+            DockerOp::ImageInspect { tag: tag.clone() },
             DOCKER_OP_TIMEOUT,
-            "gateway: docker image inspect lite via forwarded socket",
+            "gateway: docker image inspect (lite)",
         )?;
         if output.status.success() {
             return Ok(true);
@@ -2465,7 +2358,6 @@ impl GatewayLimaManager {
         // Poll until the Docker daemon is reachable via the forwarded socket,
         // using the shorter recovery deadline rather than the first-boot one.
         let deadline = Instant::now() + GATEWAY_RECOVERY_READY_TIMEOUT;
-        let socket_str = format!("unix://{}", self.gateway_docker_socket.display());
 
         info!(
             socket = %self.gateway_docker_socket.display(),
@@ -2474,13 +2366,9 @@ impl GatewayLimaManager {
         );
 
         loop {
-            let mut cmd = Command::new("docker");
-            apply_docker_env(&mut cmd);
-            cmd.args(["-H", &socket_str, "info"]);
-
-            let result = run_with_timeout(
-                &mut cmd,
-                Duration::from_secs(5),
+            let result = self.docker.run(
+                DockerOp::DaemonInfo,
+                DOCKER_INFO_PROBE_TIMEOUT,
                 "gateway recovery: docker info probe",
             );
 

@@ -126,9 +126,20 @@ mod tests {
     fn build_test_manager() -> GatewayLimaManager {
         let daemon_uid = Uid::current().as_raw();
         let lima_home = operator_lima_home(daemon_uid);
+        let gateway_socket = lima_home
+            .join(sandbox_core::GATEWAY_INSTANCE_NAME)
+            .join("gateway-docker.sock");
+        let docker = sandbox_core::docker::DockerRoute::Vm {
+            op_uid: daemon_uid,
+            executor: Arc::new(sandbox_core::docker::LocalSocketDockerExecutor::new(
+                gateway_socket,
+                lima_home.clone(),
+            )),
+        };
         GatewayLimaManager::new(
             lima_home,
             Arc::new(DirectLimaExecutor { daemon_uid }),
+            docker,
             daemon_uid,
         )
     }

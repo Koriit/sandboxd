@@ -15,6 +15,15 @@
 #[cfg(target_os = "macos")]
 pub use protocol::{BridgePair, BrokerOp, BrokerRequest, BrokerResponse, BrokerResult};
 
+/// The Docker op set and the typed values it carries. Exported so the daemon
+/// can construct the same requests the agent validates.
+#[cfg(target_os = "macos")]
+pub use protocol::{
+    ContainerCommand, ContainerCreateSpec, DockerOp, GatewayComponent, InspectFlag, InspectFormat,
+    NetworkCreateSpec, NetworkDriver, NetworkOption, RemoveForce, StagedImage, WorkspaceBindSpec,
+    docker_argv,
+};
+
 #[cfg(target_os = "macos")]
 pub use protocol::{RESTRICT_MARKER_FILENAME, RESTRICT_ON_MARKER, STREAM_CONNECT_PREFIX};
 

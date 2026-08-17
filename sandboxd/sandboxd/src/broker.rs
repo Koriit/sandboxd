@@ -1906,7 +1906,19 @@ pub struct AgentBrokerExecutor {
     /// run `limactl` directly rather than routing through the broker.
     daemon_uid: u32,
     /// Monotonic counter for generating unique request IDs.
+    ///
+    /// Shared by every op family this executor carries. Two counters would
+    /// hand two concurrent ops the same id on one control connection, and
+    /// `request_id` is the only thing correlating a response to its request.
     next_request_id: std::sync::atomic::AtomicU64,
+    /// Executes Docker ops for the daemon's own uid.
+    ///
+    /// The degenerate case: while the gateway VM still belongs to the daemon
+    /// account, "run this as the operator" and "run this as yourself" are the
+    /// same instruction, and there is no agent to ask. Set on macOS at
+    /// startup; `None` leaves the Docker seam unusable rather than silently
+    /// falling back to a host Docker that does not exist there.
+    local_docker: Option<sandbox_core::docker::LocalSocketDockerExecutor>,
 }
 
 impl AgentBrokerExecutor {
@@ -1926,12 +1938,180 @@ impl AgentBrokerExecutor {
             pending_streams,
             daemon_uid,
             next_request_id: std::sync::atomic::AtomicU64::new(1),
+            local_docker: None,
         }
+    }
+
+    /// Wire the executor that runs Docker ops for the daemon's own uid.
+    ///
+    /// `socket` is the daemon's own gateway-VM Docker socket and
+    /// `staging_dir` is where its image tarballs live. Both are the daemon's
+    /// own paths — this is the "the daemon is the operator" case, not a way
+    /// to reach somebody else's VM.
+    pub fn with_local_docker(
+        mut self,
+        socket: impl Into<std::path::PathBuf>,
+        staging_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.local_docker = Some(sandbox_core::docker::LocalSocketDockerExecutor::new(
+            socket,
+            staging_dir,
+        ));
+        self
     }
 
     fn next_id(&self) -> u64 {
         self.next_request_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl sandbox_core::docker::DockerExecutor for AgentBrokerExecutor {
+    fn run(
+        &self,
+        op_uid: u32,
+        op: sandbox_core::docker::DockerOp,
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<std::process::Output, sandbox_core::error::SandboxError> {
+        use sandbox_core::error::SandboxError;
+
+        if op_uid == self.daemon_uid {
+            let Some(local) = self.local_docker.as_ref() else {
+                return Err(SandboxError::Internal(format!(
+                    "{label}: no local docker executor is wired for the daemon's own uid; \
+                     the daemon cannot run docker ops against its own gateway VM"
+                )));
+            };
+            return local.run(op_uid, op, timeout, label);
+        }
+
+        let request_id = self.next_id();
+        let request = sandbox_agent_protocol::BrokerRequest {
+            request_id,
+            op: sandbox_agent_protocol::BrokerOp::Docker {
+                op_uid,
+                op: docker_op_to_wire(&op),
+            },
+        };
+
+        let registry = self.registry.clone();
+        let handle = tokio::runtime::Handle::current();
+        let result = handle
+            .block_on(registry.send_op(op_uid, request))
+            .map_err(|e| SandboxError::Gateway(format!("{label}: {e}")))?;
+
+        broker_result_to_output(result, label)
+    }
+}
+
+/// Map the daemon's in-process Docker op onto its wire form.
+///
+/// Exhaustive by construction: a variant added to
+/// `sandbox_core::docker::DockerOp` without a wire counterpart fails to
+/// compile here, which is the property that keeps the two op sets one op set.
+fn docker_op_to_wire(op: &sandbox_core::docker::DockerOp) -> sandbox_agent_protocol::DockerOp {
+    use sandbox_agent_protocol::DockerOp as Wire;
+    use sandbox_core::docker::DockerOp as Core;
+
+    match op {
+        Core::ContainerCreate { spec } => Wire::ContainerCreate { spec: spec.into() },
+        Core::ContainerStart { name } => Wire::ContainerStart { name: name.clone() },
+        Core::ContainerStop {
+            name,
+            grace_secs,
+            long_flag,
+        } => Wire::ContainerStop {
+            name: name.clone(),
+            grace_secs: *grace_secs,
+            long_flag: *long_flag,
+        },
+        Core::ContainerRestart { name } => Wire::ContainerRestart { name: name.clone() },
+        Core::ContainerRemove { name, force } => Wire::ContainerRemove {
+            name: name.clone(),
+            force: (*force).into(),
+        },
+        Core::ContainerInspect { name, format, flag } => Wire::ContainerInspect {
+            name: name.clone(),
+            format: (*format).into(),
+            flag: (*flag).into(),
+        },
+        Core::ContainerList {
+            name_prefix,
+            owner_pool,
+        } => Wire::ContainerList {
+            name_prefix: name_prefix.clone(),
+            owner_pool: owner_pool.clone(),
+        },
+        Core::ContainerExec { name, command } => Wire::ContainerExec {
+            name: name.clone(),
+            command: command.into(),
+        },
+        Core::HomeVolumeChown {
+            session_id,
+            image_tag,
+            operator_uid,
+            operator_gid,
+        } => Wire::HomeVolumeChown {
+            session_id: session_id.clone(),
+            image_tag: image_tag.clone(),
+            operator_uid: *operator_uid,
+            operator_gid: *operator_gid,
+        },
+        Core::GatewayContainerRun {
+            session_id,
+            image_tag,
+            network,
+            owner_pool,
+            coredns_upstream,
+        } => Wire::GatewayContainerRun {
+            session_id: session_id.clone(),
+            image_tag: image_tag.clone(),
+            network: network.clone(),
+            owner_pool: owner_pool.clone(),
+            coredns_upstream: coredns_upstream.clone(),
+        },
+        Core::NetworkCreate { spec } => Wire::NetworkCreate { spec: spec.into() },
+        Core::NetworkRemove { name } => Wire::NetworkRemove { name: name.clone() },
+        Core::NetworkInspect { name } => Wire::NetworkInspect { name: name.clone() },
+        Core::NetworkConnect {
+            network,
+            container,
+            ip,
+        } => Wire::NetworkConnect {
+            network: network.clone(),
+            container: container.clone(),
+            ip: ip.clone(),
+        },
+        Core::NetworkList {
+            name_prefix,
+            owner_pool,
+        } => Wire::NetworkList {
+            name_prefix: name_prefix.clone(),
+            owner_pool: owner_pool.clone(),
+        },
+        Core::VolumeCreate {
+            name,
+            session_id,
+            owner_pool,
+        } => Wire::VolumeCreate {
+            name: name.clone(),
+            session_id: session_id.clone(),
+            owner_pool: owner_pool.clone(),
+        },
+        Core::VolumeRemove { name } => Wire::VolumeRemove { name: name.clone() },
+        Core::VolumeList {
+            name_prefix,
+            owner_pool,
+        } => Wire::VolumeList {
+            name_prefix: name_prefix.clone(),
+            owner_pool: owner_pool.clone(),
+        },
+        Core::ImageInspect { tag } => Wire::ImageInspect { tag: tag.clone() },
+        Core::ImageLoad { image } => Wire::ImageLoad {
+            image: (*image).into(),
+        },
+        Core::DaemonInfo => Wire::DaemonInfo,
     }
 }
 
@@ -2653,6 +2833,209 @@ async fn run_limactl_guest_socat_direct(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // -----------------------------------------------------------------------
+    // Docker op wire mapping
+    // -----------------------------------------------------------------------
+
+    mod docker_wire {
+        use super::super::docker_op_to_wire;
+        use sandbox_docker_argv::container::{
+            ContainerCommand, ContainerCreateSpec, GatewayComponent, InspectFlag, InspectFormat,
+            RemoveForce, WorkspaceBindSpec,
+        };
+        use sandbox_docker_argv::image::StagedImage;
+        use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver, NetworkOption};
+
+        use sandbox_core::docker::DockerOp;
+
+        fn create_spec() -> ContainerCreateSpec {
+            ContainerCreateSpec {
+                session_id: "abc123def456".to_string(),
+                docker_network: "sandbox-net-abc123def456".to_string(),
+                container_ip: "10.209.0.3".to_string(),
+                gateway_ip: "10.209.0.2".to_string(),
+                image_tag: "sandboxd-lite:0.1.10".to_string(),
+                user_uid: 501,
+                user_gid: 20,
+                memory_mb: 2048,
+                cpus: 1.5,
+                owner_pool: Some("10.209.0.0/20".to_string()),
+                workspace_bind: Some(WorkspaceBindSpec {
+                    host_path: "/Users/dev/project".to_string(),
+                    guest_path: "/home/sandbox/workspace".to_string(),
+                }),
+                ca_host_path: Some("/tmp/sandbox-lite/abc123def456/cert.pem".to_string()),
+                ssh_host_dir: Some("/tmp/sandbox-lite/abc123def456".to_string()),
+                guest_bind_source: Some("/usr/local/libexec/sandboxd/sandbox-guest".to_string()),
+            }
+        }
+
+        /// Every op, with every optional field populated — an op whose
+        /// `Some` arms are never exercised proves nothing about them.
+        fn every_op() -> Vec<DockerOp> {
+            vec![
+                DockerOp::ContainerCreate {
+                    spec: create_spec(),
+                },
+                DockerOp::ContainerStart {
+                    name: "sandbox-abc123def456".to_string(),
+                },
+                DockerOp::ContainerStop {
+                    name: "sandbox-abc123def456".to_string(),
+                    grace_secs: 10,
+                    long_flag: true,
+                },
+                DockerOp::ContainerRestart {
+                    name: "sandbox-abc123def456".to_string(),
+                },
+                DockerOp::ContainerRemove {
+                    name: "sandbox-abc123def456".to_string(),
+                    force: RemoveForce::Long,
+                },
+                DockerOp::ContainerInspect {
+                    name: "sandbox-abc123def456".to_string(),
+                    format: InspectFormat::NetworkIpAddress,
+                    flag: InspectFlag::Long,
+                },
+                DockerOp::ContainerList {
+                    name_prefix: "sandbox-".to_string(),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                },
+                DockerOp::ContainerExec {
+                    name: "sandbox-gw-abc123def456".to_string(),
+                    command: ContainerCommand::ComponentProbe {
+                        component: GatewayComponent::DenyLogger,
+                    },
+                },
+                DockerOp::HomeVolumeChown {
+                    session_id: "abc123def456".to_string(),
+                    image_tag: "sandboxd-lite:0.1.10".to_string(),
+                    operator_uid: 501,
+                    operator_gid: 20,
+                },
+                DockerOp::GatewayContainerRun {
+                    session_id: "abc123def456".to_string(),
+                    image_tag: "sandbox-gateway:0.1.10".to_string(),
+                    network: "sandboxd-egress".to_string(),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                    coredns_upstream: Some("8.8.8.8 1.1.1.1".to_string()),
+                },
+                DockerOp::NetworkCreate {
+                    spec: NetworkCreateSpec {
+                        name: "sandbox-net-abc123def456".to_string(),
+                        driver: NetworkDriver::Macvlan,
+                        subnet: Some("10.209.0.0/29".to_string()),
+                        gateway: Some("10.209.0.1".to_string()),
+                        session_id: Some("abc123def456".to_string()),
+                        owner_pool: Some("10.209.0.0/20".to_string()),
+                        options: vec![
+                            NetworkOption::MacvlanParent("lima0".to_string()),
+                            NetworkOption::MacvlanModePrivate,
+                            NetworkOption::BridgeName("sb-abc".to_string()),
+                            NetworkOption::BridgeMasquerade(false),
+                        ],
+                    },
+                },
+                DockerOp::NetworkRemove {
+                    name: "sandbox-net-abc123def456".to_string(),
+                },
+                DockerOp::NetworkInspect {
+                    name: "sandbox-net-abc123def456".to_string(),
+                },
+                DockerOp::NetworkConnect {
+                    network: "sandbox-net-abc123def456".to_string(),
+                    container: "sandbox-gw-abc123def456".to_string(),
+                    ip: Some("10.209.0.2".to_string()),
+                },
+                DockerOp::NetworkList {
+                    name_prefix: "sandbox-net-".to_string(),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                },
+                DockerOp::VolumeCreate {
+                    name: "sandbox-home-abc123def456".to_string(),
+                    session_id: Some("abc123def456".to_string()),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                },
+                DockerOp::VolumeRemove {
+                    name: "sandbox-home-abc123def456".to_string(),
+                },
+                DockerOp::VolumeList {
+                    name_prefix: "sandbox-home-".to_string(),
+                    owner_pool: Some("10.209.0.0/20".to_string()),
+                },
+                DockerOp::ImageInspect {
+                    tag: "sandbox-gateway:0.1.10".to_string(),
+                },
+                DockerOp::ImageLoad {
+                    image: StagedImage::Lite,
+                },
+                DockerOp::DaemonInfo,
+            ]
+        }
+
+        /// The property the whole seam rests on: what the daemon means by an
+        /// op and what the agent runs for it are the same command line.
+        ///
+        /// A mismatch would not fail loudly — it would run a *different*
+        /// docker command than the one the daemon's own tests pinned, on the
+        /// egress-enforcement path, and look like it worked. So the argv is
+        /// compared through the real mapping and the real renderers, over
+        /// every variant with every optional field populated.
+        #[test]
+        fn the_daemon_and_the_agent_render_the_same_argv_for_every_op() {
+            let ops = every_op();
+            assert_eq!(ops.len(), 21, "every DockerOp variant must be covered here");
+            for op in ops {
+                let daemon_argv = op.argv().expect("daemon renders");
+                let wire = docker_op_to_wire(&op);
+                let agent_argv =
+                    sandbox_agent_protocol::docker_argv(&wire).expect("agent renders the same op");
+                assert_eq!(
+                    daemon_argv, agent_argv,
+                    "daemon and agent disagree about {op:?}"
+                );
+            }
+        }
+
+        /// The wire form must survive the channel it crosses. Serialization is
+        /// where a field silently goes missing, and a missing `Option` field
+        /// deserializes as `None` rather than as an error.
+        #[test]
+        fn the_wire_form_survives_a_json_round_trip_for_every_op() {
+            for op in every_op() {
+                let wire = docker_op_to_wire(&op);
+                let json = serde_json::to_string(&wire).expect("wire op serializes");
+                let back: sandbox_agent_protocol::DockerOp =
+                    serde_json::from_str(&json).expect("wire op deserializes");
+                assert_eq!(
+                    sandbox_agent_protocol::docker_argv(&wire).expect("renders"),
+                    sandbox_agent_protocol::docker_argv(&back).expect("renders"),
+                    "a field was lost crossing the wire: {json}"
+                );
+            }
+        }
+
+        /// No op may name its own Docker daemon. The `-H` flag is added by
+        /// whichever side runs the command, from a socket it owns; an op that
+        /// carried one would let the sender choose which daemon to address.
+        #[test]
+        fn no_wire_op_carries_a_target_authority() {
+            for op in every_op() {
+                let wire = docker_op_to_wire(&op);
+                let json = serde_json::to_string(&wire).expect("serializes");
+                assert!(
+                    !json.contains("unix://"),
+                    "op payload names a socket: {json}"
+                );
+                let argv = sandbox_agent_protocol::docker_argv(&wire).expect("renders");
+                assert!(
+                    !argv.iter().any(|a| a == "-H"),
+                    "rendered argv names a target: {argv:?}"
+                );
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Authentication unit tests (no GUI session required)

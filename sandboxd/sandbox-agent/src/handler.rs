@@ -287,7 +287,180 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
             }
         }
         BrokerOp::RestrictOnVerify { op_uid: _, vm } => handle_restrict_on_verify(ctx, vm).await,
+        BrokerOp::Docker { op_uid: _, op } => handle_docker(ctx, op).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Docker ops
+// ---------------------------------------------------------------------------
+
+/// The Lima instance hosting the operator's gateway containers.
+///
+/// An agent-side constant, not a field on the op. The daemon says *what* to
+/// do; which Docker daemon it happens to is the agent's own business, and
+/// keeping it that way is what makes `-H unix://<own socket>` the sole
+/// target authority.
+const GATEWAY_VM_NAME: &str = "sandboxd-gateway";
+
+/// Filename of the gateway VM's forwarded Docker socket inside the instance
+/// directory. Mirrors the `hostSocket:` entry in the generated `lima.yaml`.
+const GATEWAY_DOCKER_SOCKET_FILENAME: &str = "gateway-docker.sock";
+
+/// The forwarded Docker socket for this agent's own gateway VM.
+///
+/// `{lima_home}/sandboxd-gateway/gateway-docker.sock` — inside the agent's
+/// own LIMA_HOME, which is what keeps the NON-FEATURES path rule true for
+/// the whole Docker op set.
+fn own_gateway_docker_socket(ctx: &RunContext) -> String {
+    format!(
+        "{}/{GATEWAY_VM_NAME}/{GATEWAY_DOCKER_SOCKET_FILENAME}",
+        ctx.lima_home
+    )
+}
+
+/// The staged image tarball for `image`, inside the agent's own LIMA_HOME.
+fn staged_image_tarball(
+    ctx: &RunContext,
+    image: sandbox_docker_argv::image::StagedImage,
+) -> String {
+    format!("{}/{}", ctx.lima_home, image.tarball_filename())
+}
+
+/// Environment for a `docker` invocation whose target is pinned by `-H`.
+///
+/// `env_clear` plus a reconstructed minimum. The scrub is the point: with
+/// `DOCKER_HOST` left in place, an ambient value could redirect the command
+/// to a daemon the agent did not choose, and `-H` would no longer be the
+/// sole authority for what is being addressed. `DOCKER_CONFIG` goes for the
+/// same reason — it selects credential helpers, which run as the operator.
+fn docker_env(op_home: &str) -> Vec<(String, String)> {
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let path_value = if inherited_path.is_empty() {
+        format!("{PATH_PREPEND}:/usr/bin:/bin")
+    } else {
+        format!("{PATH_PREPEND}:{inherited_path}")
+    };
+    vec![
+        ("PATH".to_string(), path_value),
+        ("HOME".to_string(), op_home.to_string()),
+    ]
+}
+
+/// Validate a Docker op, build its argv, and run it against this agent's own
+/// VM Docker socket.
+async fn handle_docker(ctx: &RunContext, op: crate::protocol::DockerOp) -> BrokerResult {
+    if let Err(reason) = validation::validate_docker_op(&op) {
+        warn!(reason, "docker op rejected: field validation");
+        return BrokerResult::Rejected { reason };
+    }
+
+    let argv = match crate::protocol::docker_argv(&op) {
+        Ok(argv) => argv,
+        Err(reason) => return BrokerResult::Rejected { reason },
+    };
+
+    let docker = match resolve_docker() {
+        Some(p) => p,
+        None => {
+            return BrokerResult::Rejected {
+                reason: format!("docker not found in candidate paths {DOCKER_CANDIDATES:?}"),
+            };
+        }
+    };
+
+    let socket = own_gateway_docker_socket(ctx);
+    let op_home = resolve_op_home(ctx.own_uid)
+        .await
+        .unwrap_or_else(|| "/nonexistent".to_string());
+
+    let mut cmd = Command::new(&docker);
+    cmd.env_clear();
+    for (k, v) in docker_env(&op_home) {
+        cmd.env(k, v);
+    }
+    cmd.args(sandbox_docker_argv::host_args(Some(std::path::Path::new(
+        &socket,
+    ))));
+    cmd.args(&argv);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // `docker load` reads its tarball from stdin. The file is hundreds of
+    // megabytes, so it is streamed rather than carried in the op payload —
+    // and which file it is comes from the enum, resolved against the agent's
+    // own staging directory.
+    let tarball = match &op {
+        crate::protocol::DockerOp::ImageLoad { image } => {
+            Some(staged_image_tarball(ctx, (*image).into()))
+        }
+        _ => None,
+    };
+
+    let output = match tarball {
+        None => {
+            cmd.stdin(Stdio::null());
+            match cmd.output().await {
+                Ok(o) => o,
+                Err(e) => {
+                    return BrokerResult::Rejected {
+                        reason: format!("failed to spawn docker: {e}"),
+                    };
+                }
+            }
+        }
+        Some(path) => match run_docker_load(cmd, &path).await {
+            Ok(o) => o,
+            Err(reason) => return BrokerResult::Rejected { reason },
+        },
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(1);
+    if output.status.success() {
+        BrokerResult::Ok {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    } else {
+        BrokerResult::Failed {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
+}
+
+/// Stream a staged tarball into a prepared `docker load` command.
+async fn run_docker_load(mut cmd: Command, tarball: &str) -> Result<std::process::Output, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::open(tarball)
+        .await
+        .map_err(|e| format!("failed to open staged image tarball {tarball}: {e}"))?;
+    cmd.stdin(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn docker load: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to take docker load stdin".to_string())?;
+    let copy = tokio::io::copy(&mut file, &mut stdin).await;
+    let flush = stdin.flush().await;
+    drop(stdin);
+    if let Err(e) = copy.map(|_| ()).or(flush) {
+        let _ = child.kill().await;
+        return Err(format!(
+            "failed to stream image tarball into docker load: {e}"
+        ));
+    }
+    child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("docker load did not complete: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1150,42 @@ fn resolve_rsync() -> Option<String> {
         let rc = unsafe { libc::access(c.as_ptr(), libc::X_OK) };
         if rc == 0 {
             return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Where `docker` may live on a macOS host.
+///
+/// Homebrew first (both architectures' prefixes), then the Docker Desktop
+/// symlink location. `/usr/bin` is not a candidate: nothing ships `docker`
+/// there on macOS, and listing it would only widen what a writable directory
+/// could shadow.
+const DOCKER_CANDIDATES: &[&str] = &[
+    "/opt/homebrew/bin/docker",
+    "/usr/local/bin/docker",
+    "/Applications/Docker.app/Contents/Resources/bin/docker",
+];
+
+/// Resolve the absolute path to `docker` from a fixed candidate list.
+///
+/// Deliberately **not** a `PATH` search. `PATH` is inherited from the
+/// LaunchAgent's environment, so a search there makes the binary the agent
+/// executes a function of something outside the agent's control — for a
+/// process whose entire purpose is to be the operator's trustworthy end of
+/// the channel, that is the wrong dependency to accept. This mirrors
+/// [`resolve_rsync`]; the `limactl` resolver takes the other approach and is
+/// not the precedent to follow here.
+fn resolve_docker() -> Option<String> {
+    for candidate in DOCKER_CANDIDATES {
+        let c = match std::ffi::CString::new(*candidate) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // SAFETY: c is a valid NUL-terminated C string.
+        let rc = unsafe { libc::access(c.as_ptr(), libc::X_OK) };
+        if rc == 0 {
+            return Some((*candidate).to_string());
         }
     }
     None

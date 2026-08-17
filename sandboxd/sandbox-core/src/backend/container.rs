@@ -78,11 +78,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::Command as TokioCommand;
 use tracing::{debug, info, warn};
 
+use sandbox_docker_argv::container::{
+    ContainerCreateSpec, InspectFlag, InspectFormat, RemoveForce, WorkspaceBindSpec,
+};
+
 use crate::backend::capabilities::{BackendKind, Capabilities, IsolationLevel};
 use crate::backend::spec::{BackendSpecific, SessionSpec};
 use crate::backend::{
     AsyncReadWrite, GuestTransport, RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime,
 };
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 use crate::guest::GUEST_AGENT_PORT;
 use crate::lima::guest_agent_path;
@@ -97,7 +102,12 @@ use enumset::EnumSet;
 /// Stop timeout passed to `docker stop -t`. Matches the "bounded
 /// timeout" requirement and gives in-container processes a reasonable
 /// window to flush before SIGKILL.
-const DOCKER_STOP_GRACE_SECS: u64 = 10;
+const DOCKER_STOP_GRACE_SECS: u32 = 10;
+
+/// Shorter grace period for the stop that precedes a guest-binary refresh.
+/// The container is being restarted immediately afterwards, so a long wait
+/// buys nothing.
+const REFRESH_STOP_GRACE_SECS: u32 = 5;
 
 /// Wall-clock timeout for individual `docker` subprocess invocations.
 /// Sized to absorb a busy Docker daemon without leaving the runtime
@@ -177,15 +187,6 @@ const LITE_DOCKERFILE: &str = include_str!("../../../images/lite/Dockerfile");
 /// `docker build` is the one Docker invocation routinely measured in
 /// minutes rather than seconds.
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Tmpfs flag values shared by the `/tmp` and `/run` mounts —
-/// `rw,nosuid,nodev` plus per-mount size. Centralised so the design
-/// audit trail stays grep-able from one place.
-const TMPFS_TMP_FLAGS: &str = "rw,nosuid,nodev,size=256m";
-const TMPFS_RUN_FLAGS: &str = "rw,nosuid,nodev,size=16m";
-
-/// Pids-limit ceiling — fork-bomb mitigation.
-const PIDS_LIMIT: u32 = 512;
 
 /// The uid baked into the lite image by `useradd --uid 1000 sandbox`.
 ///
@@ -383,14 +384,21 @@ pub struct ContainerRuntime {
     /// the libexec file, so the bind-mount source is always coherent
     /// without a daemon-side staging step.
     guest_bind_source: PathBuf,
-    /// macOS only: forwarded gateway-VM Docker socket. `None` on Linux
-    /// (host Docker daemon, unchanged). When `Some`, every `docker`
-    /// invocation emits `-H unix://<socket>` so all container operations
-    /// target the gateway Lima VM's Docker daemon rather than the host.
+    /// Where this runtime's `docker` operations go: the host daemon on
+    /// Linux, or a typed op seam into the operator's VM on macOS.
     ///
-    /// Linux behavior is byte-for-byte identical when `None` — no `-H`
-    /// flag is ever prepended. Use [`Self::is_macos`] to test.
-    docker_socket: Option<PathBuf>,
+    /// Linux behaviour is byte-for-byte identical to the pre-seam code —
+    /// [`DockerRoute::Host`] renders the same argv and inherits the same
+    /// environment. Use [`Self::is_macos`] to test which shape is in play.
+    docker: DockerRoute,
+    /// macOS only: the forwarded gateway-VM Docker socket, retained solely
+    /// for the long-lived `docker exec … socat` guest transport.
+    ///
+    /// That pump is not a request/response op — it is held open for the
+    /// lifetime of an SSH session and belongs to the brokered-stream work,
+    /// not to this op set. It keeps a socket path until then; nothing else
+    /// in this file uses it.
+    transport_socket: Option<PathBuf>,
     /// Pinned HOME / DOCKER_CONFIG root for the Docker client config dir.
     /// The Docker build client creates its config dir under `$HOME`; a
     /// daemon running as a system user with a non-writable HOME would abort
@@ -441,7 +449,8 @@ impl ContainerRuntime {
             user_uid,
             user_gid,
             guest_bind_source: guest_bind_source.into(),
-            docker_socket: None,
+            docker: DockerRoute::Host,
+            transport_socket: None,
             docker_home: PathBuf::from("/tmp"),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -465,14 +474,15 @@ impl ContainerRuntime {
     /// code always uses [`Self::new`] (host Docker daemon, no forwarding needed).
     // docker invocation takes the full container/exec context; bundling would not improve clarity
     #[allow(clippy::too_many_arguments)]
-    pub fn with_macos_socket(
+    pub fn with_vm_route(
         image_tag: impl Into<String>,
         default_memory_mb: u32,
         default_cpus: f64,
         user_uid: u32,
         user_gid: u32,
         guest_bind_source: impl Into<PathBuf>,
-        docker_socket: impl Into<PathBuf>,
+        docker: DockerRoute,
+        transport_socket: impl Into<PathBuf>,
         docker_home: impl Into<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -483,57 +493,28 @@ impl ContainerRuntime {
             user_uid,
             user_gid,
             guest_bind_source: guest_bind_source.into(),
-            docker_socket: Some(docker_socket.into()),
+            docker,
+            transport_socket: Some(transport_socket.into()),
             docker_home: docker_home.into(),
             sessions: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Return `true` when this runtime routes docker calls through a
-    /// forwarded gateway-VM socket (macOS). `false` on Linux (host daemon).
+    /// Return `true` when this runtime's containers live inside a VM
+    /// (macOS). `false` on Linux (host daemon).
     pub fn is_macos(&self) -> bool {
-        self.docker_socket.is_some()
+        self.docker.is_vm()
     }
 
-    /// The forwarded Docker socket path, if this is a macOS runtime.
-    pub fn docker_socket(&self) -> Option<&Path> {
-        self.docker_socket.as_deref()
+    /// The forwarded Docker socket retained for the guest transport, if this
+    /// is a macOS runtime.
+    pub fn transport_socket(&self) -> Option<&Path> {
+        self.transport_socket.as_deref()
     }
 
     /// The pinned `HOME` / `DOCKER_CONFIG` root for the Docker client.
     pub fn docker_home(&self) -> &Path {
         &self.docker_home
-    }
-
-    /// Build a `docker` [`std::process::Command`] with the optional
-    /// `-H unix://<socket>` prefix pre-applied.
-    ///
-    /// All blocking `docker` invocations in this runtime go through this
-    /// helper so that macOS (forwarded socket) and Linux (host socket)
-    /// behave identically from the caller's perspective — the only
-    /// difference is the presence or absence of the `-H` flag. Linux
-    /// callers see zero overhead: `None` means no argument is prepended.
-    pub fn docker_cmd(&self) -> std::process::Command {
-        let mut cmd = std::process::Command::new(sandbox_docker_argv::DOCKER_BIN);
-        cmd.args(sandbox_docker_argv::host_args(
-            self.docker_socket.as_deref(),
-        ));
-        cmd
-    }
-
-    /// Build a `docker` [`tokio::process::Command`] with the optional
-    /// `-H unix://<socket>` prefix pre-applied.
-    ///
-    /// Used for the long-lived async `docker exec … socat` transport
-    /// (the spawn_blocking carve-out in `ContainerTransport::connect`).
-    /// Mirrors [`Self::docker_cmd`] but returns a `TokioCommand` for
-    /// use in async contexts where blocking would stall the executor.
-    pub fn docker_cmd_async(&self) -> TokioCommand {
-        let mut cmd = TokioCommand::new(sandbox_docker_argv::DOCKER_BIN);
-        cmd.args(sandbox_docker_argv::host_args(
-            self.docker_socket.as_deref(),
-        ));
-        cmd
     }
 
     /// Return the host path the runtime bind-mounts read-only into
@@ -653,7 +634,7 @@ impl ContainerRuntime {
         // create` does not reject an over-large `--cpus`/`--memory`. Linux
         // (`docker_socket` is `None`) skips this entirely — byte-identical.
         #[cfg(target_os = "macos")]
-        let (memory_mb, cpus) = if self.docker_socket.is_some() {
+        let (memory_mb, cpus) = if self.is_macos() {
             clamp_to_gateway_vm(memory_mb, cpus)
         } else {
             (memory_mb, cpus)
@@ -732,26 +713,20 @@ pub(crate) fn effective_container_user(
     operator_identity.unwrap_or((fallback_uid, fallback_gid))
 }
 
-/// Compose the `docker create` argv for a container session.
+/// Compose the typed `docker create` specification for a container session.
 ///
-/// Pure function — no syscalls, no docker invocation. The runtime
-/// hands off the returned `Vec<String>` to `run_docker`.
+/// Pure function — no syscalls, no docker invocation. The runtime hands the
+/// returned spec to the Docker seam, which renders it to argv on whichever
+/// side actually runs the command.
 ///
-/// Fallible because the operator-supplied workspace paths are interpolated
-/// into a `--mount` option list; see the workspace-mount block below.
-///
-/// Argument order is part of the contract: the unit tests in
-/// `tests::container_run_argv_contains_guest_bind_mount` pin the
-/// expected `-v` mount string so a regression in the bind-mount
-/// source path, destination, or `:ro` mode flag surfaces immediately.
-///
-/// Trailing positional `image_tag` must come last so subsequent
-/// entrypoint args (none today) line up with docker's CLI grammar.
-#[allow(clippy::too_many_arguments)] // Each arg is a load-bearing slot
-// the daemon already holds; collapsing them into a struct would
-// duplicate ContainerRuntime's own field set without buying
-// readability.
-fn build_create_argv(
+/// The argv itself is built by `sandbox-docker-argv`, which is also where the
+/// refusal of docker option-list syntax in an operator-supplied workspace path
+/// lives — that check belongs next to the interpolation it protects, so it
+/// cannot be bypassed by a future caller assembling a spec by hand.
+#[allow(clippy::too_many_arguments)] // Each arg is a load-bearing slot the
+// daemon already holds; collapsing them into a struct would duplicate
+// ContainerRuntime's own field set without buying readability.
+fn build_create_spec(
     session_id: &SessionId,
     network: &ContainerNetwork,
     image_tag: &str,
@@ -761,232 +736,42 @@ fn build_create_argv(
     cpus: f64,
     guest_bind_source: &Path,
     skip_guest_bind: bool,
-) -> Result<Vec<String>, SandboxError> {
-    let container_name = format!("sandbox-{session_id}");
-    let home_volume = home_volume_name(session_id);
-    let user_arg = format!("{user_uid}:{user_gid}");
-    let memory_arg = format!("{memory_mb}m");
-    let cpus_arg = format_cpus(cpus);
-    let pids_arg = PIDS_LIMIT.to_string();
-    let dns_arg = network.gateway_ip.to_string();
-    let ip_arg = network.container_ip.to_string();
-    let session_label_arg = format!("sandbox.session_id={session_id}");
-    let home_mount = format!("type=volume,src={home_volume},dst=/home/sandbox");
-    let workspace_mount = network
-        .workspace_bind
-        .as_ref()
-        .map(|bind| {
-            // The bind target is the operator-resolved `guest_path`,
-            // unified with Lima's workspace mount. The home volume
-            // mounts at `/home/sandbox`; a bind whose `guest_path`
-            // lands anywhere under `/home/sandbox` shadows the volume's
-            // content at that subpath, which is the intended semantics
-            // (operator-supplied workspace files take precedence over
-            // the volume's empty contents).
-            //
-            // Both paths are operator-supplied and both are interpolated
-            // into a `--mount` value, which docker parses as a
-            // comma-separated list of `key=value` options. A `,` or `=`
-            // inside either path is therefore not data: it ends the option
-            // and starts another one that the daemon never wrote (for
-            // example a trailing `,bind-propagation=rshared`). Reject
-            // rather than escape — docker's option-list parser is the only
-            // authority on what an escape would mean, and this builder is a
-            // pure function with no way to consult it.
-            //
-            // `WorkspaceMode::parse_flag` already rejects these characters
-            // for every path that arrives over the wire, so this is the
-            // second of two independent checks rather than the only one.
-            // It is kept because the check that is co-located with the
-            // interpolation is the one that cannot be bypassed by a future
-            // caller that builds a `WorkspaceBind` directly.
-            for (label, path) in [
-                ("host_path", &bind.host_path),
-                ("guest_path", &bind.guest_path),
-            ] {
-                let rendered = path.to_string_lossy();
-                if let Some(ch) = rendered.chars().find(|c| matches!(c, ',' | '=')) {
-                    return Err(SandboxError::InvalidArgument(format!(
-                        "workspace {label} {rendered:?} contains {ch:?}, which docker reads \
-                         as option-list syntax in a `--mount` value rather than as part of \
-                         the path — a path containing it would silently add mount options \
-                         the daemon never wrote. What works instead: rename the directory \
-                         to a name without `,` or `=`, stage a copy at such a path and \
-                         point the workspace there, or for a git-backed project use \
-                         clone:<repo-url> / --repo, which never names a host path."
-                    )));
-                }
-            }
-            Ok(format!(
-                "type=bind,src={},dst={}",
-                bind.host_path.to_string_lossy(),
-                bind.guest_path.to_string_lossy(),
-            ))
-        })
-        .transpose()?;
-    let ca_args = build_ca_mount_args(network);
-    let ssh_args = build_ssh_mount_args(network);
-    // per-caller isolation — the installed
-    // `sandbox-guest` is bind-mounted read-only at the canonical
-    // in-container path so refresh becomes `docker restart` rather
-    // than a `docker cp` into the `--read-only` rootfs. One inode is
-    // shared across every live container session; the kernel page
-    // cache for the guest binary is shared too. The source is the
-    // FHS libexec install path; `sandbox update` atomically renames
-    // it so the bind-mount source is always coherent.
-    //
-    // When the runtime drives a forwarded gateway-VM Docker socket
-    // (macOS lite), the source is a macOS-host path that does not exist
-    // inside the gateway VM, so the bind cannot be applied. The lite
-    // image already bakes a version-matched `sandbox-guest` at the same
-    // in-container path (the image tag tracks the daemon version), so
-    // the overlay is skipped and the baked binary is used instead.
-    let guest_bind_mount = format!(
-        "{}:/usr/local/bin/sandbox-guest:ro",
-        guest_bind_source.to_string_lossy()
-    );
-
-    let mut args: Vec<String> = vec![
-        "create".to_string(),
-        "--name".to_string(),
-        container_name,
-        "--hostname".to_string(),
-        session_id.to_string(),
-        "--network".to_string(),
-        network.docker_network.clone(),
-        "--ip".to_string(),
-        ip_arg,
-        "--dns".to_string(),
-        dns_arg,
-        // Hardening — every flag in the documented contract applied
-        // verbatim, in table order.
-        "--read-only".to_string(),
-        "--tmpfs".to_string(),
-        format!("/tmp:{TMPFS_TMP_FLAGS}"),
-        "--tmpfs".to_string(),
-        format!("/run:{TMPFS_RUN_FLAGS}"),
-        "--security-opt".to_string(),
-        "no-new-privileges".to_string(),
-        "--security-opt".to_string(),
-        "seccomp=builtin".to_string(),
-        "--cap-drop".to_string(),
-        "ALL".to_string(),
-        // Lower the privileged-port floor inside the container netns so
-        // the in-image sshd can bind `127.0.0.1:22` as uid 1000 without
-        // CAP_NET_BIND_SERVICE. The sysctl is namespaced (net), applies
-        // only to this container, and works under `--cap-drop ALL +
-        // no-new-privileges` because no capability or privilege gain
-        // is involved on the sshd side — the kernel simply treats 22+
-        // as unprivileged for this netns. sshd is reachable only via
-        // the daemon-mediated `docker exec` byte mover (delivered in a
-        // later session); the container does not expose port 22 to
-        // the host.
-        "--sysctl".to_string(),
-        "net.ipv4.ip_unprivileged_port_start=22".to_string(),
-        "--user".to_string(),
-        user_arg,
-        "--pids-limit".to_string(),
-        pids_arg,
-        "--memory".to_string(),
-        memory_arg,
-        "--cpus".to_string(),
-        cpus_arg,
-        "--restart".to_string(),
-        "no".to_string(),
-        "--label".to_string(),
-        session_label_arg,
-    ];
-
-    // Stamp the daemon-pool owner label when the session was registered with
-    // a pool CIDR. Absent on legacy fixtures (pre-upgrade integration tests).
-    if let Some(pool) = &network.owner_pool {
-        args.push("--label".to_string());
-        args.push(format!("sandboxd.owner={pool}"));
+) -> ContainerCreateSpec {
+    ContainerCreateSpec {
+        session_id: session_id.to_string(),
+        docker_network: network.docker_network.clone(),
+        container_ip: network.container_ip.to_string(),
+        gateway_ip: network.gateway_ip.to_string(),
+        image_tag: image_tag.to_string(),
+        user_uid,
+        user_gid,
+        memory_mb,
+        cpus,
+        owner_pool: network.owner_pool.clone(),
+        workspace_bind: network
+            .workspace_bind
+            .as_ref()
+            .map(|bind| WorkspaceBindSpec {
+                host_path: bind.host_path.to_string_lossy().into_owned(),
+                guest_path: bind.guest_path.to_string_lossy().into_owned(),
+            }),
+        ca_host_path: network
+            .ca_host_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        ssh_host_dir: network
+            .ssh_host_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        // The bind-mount source is a host path. When the containers live
+        // inside a VM it does not exist there, so the overlay is skipped and
+        // the image-baked guest is used instead.
+        guest_bind_source: if skip_guest_bind {
+            None
+        } else {
+            Some(guest_bind_source.to_string_lossy().into_owned())
+        },
     }
-
-    args.extend(["--mount".to_string(), home_mount]);
-    if !skip_guest_bind {
-        // Bind-mount of the daemon-staged guest binary — read-only,
-        // overlays the in-image baked `/usr/local/bin/sandbox-guest`.
-        args.extend(["-v".to_string(), guest_bind_mount]);
-    }
-
-    if let Some(mount) = workspace_mount {
-        args.push("--mount".to_string());
-        args.push(mount);
-    }
-
-    args.extend(ca_args);
-    // Per-session SSH credential bind-mounts (authorized_keys +
-    // synthetic /etc/passwd and /etc/group). See
-    // [`build_ssh_mount_args`] and the field doc on
-    // [`ContainerNetwork::ssh_host_dir`] for the
-    // todo-#221 decision rationale: option (b) — overlay a synthetic
-    // passwd file so OpenSSH's getpwuid lookup succeeds under any
-    // daemon uid, without breaking the workspace bind-mount uid
-    // alignment contract.
-    args.extend(ssh_args);
-
-    // Trailing positional: image tag — must come last so subsequent
-    // entrypoint args (none here) line up with the docker CLI grammar.
-    args.push(image_tag.to_string());
-    Ok(args)
-}
-
-/// Compose the `docker restart` argv for the container backend's
-/// refresh path (per-caller isolation). Pure function
-/// so the unit test pins the load-bearing `restart` subcommand and
-/// rules out a regression that reintroduces the obsolete `docker
-/// cp` path.
-fn build_refresh_argv(container_name: &str) -> Vec<String> {
-    vec!["restart".to_string(), container_name.to_string()]
-}
-
-/// Compose the `docker run` argv for the one-shot home-volume chown init
-/// container.
-///
-/// Pure function — no syscalls, no docker invocation. The runtime hands
-/// the returned `Vec<String>` to `run_docker`.
-///
-/// The init container:
-/// - Uses `--rm` so Docker removes it immediately after it exits.
-/// - Runs as `--user 0:0` (root inside the container) so it can
-///   `chown -R` regardless of what the image's `USER` directive says.
-/// - Mounts the named home volume at `/home/sandbox`; this causes Docker
-///   to seed the fresh volume from the image's `/home/sandbox` before
-///   running the entrypoint.
-/// - Overrides the image entrypoint with `chown` and passes
-///   `-R <uid>:<gid> /home/sandbox` so the ownership persists in the
-///   named volume after the init container exits.
-///
-/// The chown persists in the named volume; the session container that
-/// mounts the same volume afterward sees operator-owned home contents.
-///
-/// Only called when `operator_uid != LITE_IMAGE_HOME_UID` — when the
-/// operator uid matches the image's baked uid the volume is already
-/// correctly owned and this function is never invoked.
-fn build_home_chown_argv(
-    session_id: &SessionId,
-    image_tag: &str,
-    operator_uid: u32,
-    operator_gid: u32,
-) -> Vec<String> {
-    let home_volume = home_volume_name(session_id);
-    let chown_arg = format!("{operator_uid}:{operator_gid}");
-    vec![
-        "run".to_string(),
-        "--rm".to_string(),
-        "--user".to_string(),
-        "0:0".to_string(),
-        "--mount".to_string(),
-        format!("type=volume,src={home_volume},dst=/home/sandbox"),
-        "--entrypoint".to_string(),
-        "chown".to_string(),
-        image_tag.to_string(),
-        "-R".to_string(),
-        chown_arg,
-        "/home/sandbox".to_string(),
-    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,7 +807,7 @@ impl SessionRuntime for ContainerRuntime {
         let (effective_uid, effective_gid) =
             effective_container_user(network.operator_identity, self.user_uid, self.user_gid);
 
-        let args = build_create_argv(
+        let create_spec = build_create_spec(
             session_id,
             &network,
             &self.image_tag,
@@ -1031,11 +816,11 @@ impl SessionRuntime for ContainerRuntime {
             memory_mb,
             cpus,
             &self.guest_bind_source,
-            // On macOS the runtime drives a forwarded gateway-VM Docker
-            // socket; the host-side guest binary path is absent in the VM,
-            // so skip the overlay and use the image-baked guest.
-            self.docker_socket.is_some(),
-        )?;
+            // On macOS the containers live inside the gateway VM; the
+            // host-side guest binary path is absent there, so skip the
+            // overlay and use the image-baked guest.
+            self.is_macos(),
+        );
 
         // Explicitly pre-create the home volume with ownership labels so the
         // orphan reaper can attribute it to this daemon even after the session
@@ -1047,21 +832,14 @@ impl SessionRuntime for ContainerRuntime {
         // already created by us in a prior create() call.
         {
             let volume_name = home_volume_name(session_id);
-            let mut vol_args: Vec<String> = vec![
-                "volume".to_string(),
-                "create".to_string(),
-                "--label".to_string(),
-                format!("sandbox.session_id={session_id}"),
-            ];
-            if let Some(pool) = &network.owner_pool {
-                vol_args.push("--label".to_string());
-                vol_args.push(format!("sandboxd.owner={pool}"));
-            }
-            vol_args.push(volume_name.clone());
             run_docker(
-                &vol_args,
+                self.docker.clone(),
+                DockerOp::VolumeCreate {
+                    name: volume_name.clone(),
+                    session_id: Some(session_id.to_string()),
+                    owner_pool: network.owner_pool.clone(),
+                },
                 "docker volume create (home volume pre-create)",
-                self.docker_socket.clone(),
             )
             .await?;
             debug!(
@@ -1103,12 +881,15 @@ impl SessionRuntime for ContainerRuntime {
                 "ContainerRuntime: running home-volume chown init container \
                  (operator uid {effective_uid} != image baked uid {LITE_IMAGE_HOME_UID})"
             );
-            let chown_args =
-                build_home_chown_argv(session_id, &self.image_tag, effective_uid, effective_gid);
             run_docker(
-                &chown_args,
+                self.docker.clone(),
+                DockerOp::HomeVolumeChown {
+                    session_id: session_id.to_string(),
+                    image_tag: self.image_tag.clone(),
+                    operator_uid: effective_uid,
+                    operator_gid: effective_gid,
+                },
                 "docker run (home chown init container)",
-                self.docker_socket.clone(),
             )
             .await?;
         }
@@ -1121,9 +902,9 @@ impl SessionRuntime for ContainerRuntime {
         );
 
         run_docker(
-            &args,
+            self.docker.clone(),
+            DockerOp::ContainerCreate { spec: create_spec },
             "docker create (container runtime)",
-            self.docker_socket.clone(),
         )
         .await?;
         Ok(RuntimeHandle::from_session_id(session_id))
@@ -1153,9 +934,11 @@ impl SessionRuntime for ContainerRuntime {
         let container_name = handle.as_str().to_string();
 
         run_docker(
-            &["start".to_string(), container_name.clone()],
+            self.docker.clone(),
+            DockerOp::ContainerStart {
+                name: container_name.clone(),
+            },
             "docker start (container runtime)",
-            self.docker_socket.clone(),
         )
         .await?;
 
@@ -1168,7 +951,7 @@ impl SessionRuntime for ContainerRuntime {
                         .to_string(),
                 )
             })?;
-            let pid = inspect_container_pid(&container_name, self.docker_socket.clone()).await?;
+            let pid = inspect_container_pid(&container_name, self.docker.clone()).await?;
             invoke_route_helper(helper, pid, network.gateway_ip, for_user).await?;
         } else {
             debug!(
@@ -1190,17 +973,15 @@ impl SessionRuntime for ContainerRuntime {
     /// case the redundant-stop path.
     async fn stop(&self, handle: &RuntimeHandle, _operator_uid: u32) -> Result<(), SandboxError> {
         let container_name = handle.as_str().to_string();
-        let args = [
-            "stop".to_string(),
-            "-t".to_string(),
-            DOCKER_STOP_GRACE_SECS.to_string(),
-            container_name,
-        ];
 
         match run_docker(
-            &args,
+            self.docker.clone(),
+            DockerOp::ContainerStop {
+                name: container_name,
+                grace_secs: DOCKER_STOP_GRACE_SECS,
+                long_flag: false,
+            },
             "docker stop (container runtime)",
-            self.docker_socket.clone(),
         )
         .await
         {
@@ -1232,11 +1013,13 @@ impl SessionRuntime for ContainerRuntime {
         let session_id = Self::session_id_from_handle(handle)?;
         let container_name = handle.as_str().to_string();
 
-        let rm_args = ["rm".to_string(), "-f".to_string(), container_name.clone()];
         match run_docker(
-            &rm_args,
+            self.docker.clone(),
+            DockerOp::ContainerRemove {
+                name: container_name.clone(),
+                force: RemoveForce::Short,
+            },
             "docker rm (container runtime)",
-            self.docker_socket.clone(),
         )
         .await
         {
@@ -1245,12 +1028,12 @@ impl SessionRuntime for ContainerRuntime {
             Err(other) => return Err(other),
         }
 
-        let volume = home_volume_name(&session_id);
-        let vol_args = ["volume".to_string(), "rm".to_string(), volume];
         match run_docker(
-            &vol_args,
+            self.docker.clone(),
+            DockerOp::VolumeRemove {
+                name: home_volume_name(&session_id),
+            },
             "docker volume rm (container runtime)",
-            self.docker_socket.clone(),
         )
         .await
         {
@@ -1270,17 +1053,15 @@ impl SessionRuntime for ContainerRuntime {
         _operator_uid: u32,
     ) -> Result<RuntimeStatus, SandboxError> {
         let container_name = handle.as_str().to_string();
-        let args = [
-            "inspect".to_string(),
-            "-f".to_string(),
-            "{{.State.Status}}".to_string(),
-            container_name,
-        ];
 
         match run_docker(
-            &args,
+            self.docker.clone(),
+            DockerOp::ContainerInspect {
+                name: container_name,
+                format: InspectFormat::StateStatus,
+                flag: InspectFlag::Short,
+            },
             "docker inspect (container status)",
-            self.docker_socket.clone(),
         )
         .await
         {
@@ -1310,7 +1091,7 @@ impl SessionRuntime for ContainerRuntime {
     ) -> Arc<dyn GuestTransport> {
         Arc::new(ContainerTransport {
             container_name: handle.as_str().to_string(),
-            docker_socket: self.docker_socket.clone(),
+            docker_socket: self.transport_socket.clone(),
         })
     }
 
@@ -1345,16 +1126,14 @@ impl SessionRuntime for ContainerRuntime {
         //    this method when `session.state == Stopped`, but a future
         //    caller (e.g. an admin re-running refresh against a hot
         //    container) should not trip on "container is running".
-        let stop_args = [
-            "stop".to_string(),
-            "-t".to_string(),
-            "5".to_string(),
-            container_name.clone(),
-        ];
         match run_docker(
-            &stop_args,
+            self.docker.clone(),
+            DockerOp::ContainerStop {
+                name: container_name.clone(),
+                grace_secs: REFRESH_STOP_GRACE_SECS,
+                long_flag: false,
+            },
             "docker stop (container refresh)",
-            self.docker_socket.clone(),
         )
         .await
         {
@@ -1373,11 +1152,12 @@ impl SessionRuntime for ContainerRuntime {
         //    `sandbox_core::guest_agent_path`); `sandbox update`
         //    atomically renames that file so the source is always
         //    current.
-        let restart_args = build_refresh_argv(&container_name);
         run_docker(
-            &restart_args,
+            self.docker.clone(),
+            DockerOp::ContainerRestart {
+                name: container_name.clone(),
+            },
             "docker restart (guest refresh)",
-            self.docker_socket.clone(),
         )
         .await?;
 
@@ -1508,14 +1288,7 @@ impl AsyncWrite for ContainerTransportStream {
 /// container backend the single source of truth for its own resource
 /// names.
 pub fn home_volume_name(session_id: &SessionId) -> String {
-    format!("sandbox-home-{session_id}")
-}
-
-/// Format the cpus knob as a one-decimal string (`2.0`, `0.5`) since
-/// the docker CLI accepts decimals and the documented contract
-/// pins one-decimal precision.
-fn format_cpus(cpus: f64) -> String {
-    format!("{cpus:.1}")
+    sandbox_docker_argv::container::home_volume_name(session_id.as_ref())
 }
 
 /// Stable in-container path of the per-session sandbox CA. Bind-mounted
@@ -1529,105 +1302,8 @@ fn format_cpus(cpus: f64) -> String {
 /// mirroring it. Lima sessions inject the CA into the system trust
 /// store via the guest agent rather than via a bind, so this path
 /// applies to the container backend only.
-pub const SANDBOX_CA_CONTAINER_PATH: &str = "/etc/ssl/certs/sandbox-ca.pem";
-
-/// HTTPS-client trust env var names that must point at the per-session
-/// CA file inside the container. Listed in the order `create()` emits
-/// them so the unit-test pin can assert positional ordering. The
-/// rationale for picking these four is documented on
-/// [`ContainerNetwork::ca_host_path`].
-const SANDBOX_CA_ENV_VARS: &[&str] = &[
-    "CURL_CA_BUNDLE",
-    "SSL_CERT_FILE",
-    "REQUESTS_CA_BUNDLE",
-    "NODE_EXTRA_CA_CERTS",
-];
-
-/// Render the `--mount` + `--env` arg slice that `create()` appends
-/// when a per-session CA bind-mount is wired. Returns an empty vec when
-/// `ca_host_path` is `None` so the caller can `args.extend(...)`
-/// unconditionally. Extracted as a pure helper so the unit test
-/// `container_runtime_create_includes_ca_mount_when_path_set` can pin
-/// the bind-mount string and env-var ordering without exec'ing
-/// `docker create`.
-///
-/// Per-session sandbox CA: bind-mounted read-only at a stable path
-/// inside the container, and surfaced through the four standard
-/// HTTPS-client trust env vars. See the field doc on
-/// [`ContainerNetwork::ca_host_path`] for the rationale (Lima's
-/// `update-ca-certificates`-based path is incompatible with the
-/// required `--read-only` rootfs).
-///
-/// `CURL_CA_BUNDLE` / `SSL_CERT_FILE` override the system bundle, which
-/// is the desired behaviour here: every request inside the container is
-/// intercepted by mitmproxy through Envoy, and the synthesized server
-/// cert is signed by the per-session CA. The system Ubuntu bundle is
-/// never the right answer for that traffic.
-/// Compose the per-session SSH credential bind-mount flags.
-///
-/// Returns three `--mount type=bind,...,readonly` argv pairs (six
-/// strings total) when [`ContainerNetwork::ssh_host_dir`] is `Some`,
-/// pointing at the three files the daemon staged under the per-session
-/// SSH directory:
-///
-/// * `<dir>/authorized_keys` → `/run/sandbox/authorized_keys` — read
-///   by the in-image sshd's `AuthorizedKeysFile` directive.
-/// * `<dir>/passwd` → `/etc/passwd` — synthetic one-entry passwd file
-///   resolving the daemon's runtime uid to the `sandbox` account so
-///   OpenSSH's `getpwuid(geteuid())` lookup succeeds even when the
-///   container runs under a uid that is not in the in-image passwd
-///   file (todo #221, decision (b) — see field doc on
-///   [`ContainerNetwork::ssh_host_dir`]).
-/// * `<dir>/group` → `/etc/group` — symmetric one-entry group file for
-///   sshd's `getgrgid` lookup.
-///
-/// All three are mounted `readonly`. Each individual `--mount
-/// type=bind` lands on top of the corresponding tmpfs / read-only
-/// rootfs entry; Docker resolves mount order so the per-file bind
-/// shadows the in-image content at exactly that path without
-/// re-introducing a writable surface.
-///
-/// `Vec::new()` when `ssh_host_dir` is `None` — pre-V007 sessions
-/// (or unit-test fixtures that omit the SSH wiring) still produce a
-/// valid `docker create` argv with the launch wrapper's best-effort
-/// sshd taking its existing failure path.
-fn build_ssh_mount_args(network: &ContainerNetwork) -> Vec<String> {
-    let Some(dir) = network.ssh_host_dir.as_ref() else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(6);
-    for (file_name, dst) in [
-        ("authorized_keys", "/run/sandbox/authorized_keys"),
-        ("passwd", "/etc/passwd"),
-        ("group", "/etc/group"),
-    ] {
-        let src = dir.join(file_name);
-        out.push("--mount".to_string());
-        out.push(format!(
-            "type=bind,src={},dst={dst},readonly",
-            src.to_string_lossy()
-        ));
-    }
-    out
-}
-
-fn build_ca_mount_args(network: &ContainerNetwork) -> Vec<String> {
-    let Some(ca_path) = network.ca_host_path.as_ref() else {
-        return Vec::new();
-    };
-    let mount = format!(
-        "type=bind,src={},dst={SANDBOX_CA_CONTAINER_PATH},readonly",
-        ca_path.to_string_lossy().into_owned()
-    );
-    let mut out = Vec::with_capacity(2 + SANDBOX_CA_ENV_VARS.len() * 2);
-    out.push("--mount".to_string());
-    out.push(mount);
-    for var in SANDBOX_CA_ENV_VARS {
-        out.push("--env".to_string());
-        out.push(format!("{var}={SANDBOX_CA_CONTAINER_PATH}"));
-    }
-    out
-}
+pub const SANDBOX_CA_CONTAINER_PATH: &str =
+    sandbox_docker_argv::container::SANDBOX_CA_CONTAINER_PATH;
 
 /// Map the trimmed stdout of `docker inspect -f '{{.State.Status}}' <name>`
 /// onto a [`RuntimeStatus`].
@@ -1647,41 +1323,35 @@ fn parse_docker_state_status(raw: &str) -> RuntimeStatus {
     }
 }
 
-/// Run `docker <args>` with [`run_with_timeout`] inside a
-/// `spawn_blocking` task (CLAUDE.md `spawn_blocking` discipline).
+/// Run one typed Docker op inside a `spawn_blocking` task (CLAUDE.md
+/// `spawn_blocking` discipline).
 ///
-/// On success returns the trimmed stdout — most callers want a
-/// trivial value (status line, container id) and trimming once here
-/// is cheaper than re-trimming at every call site.
+/// On success returns the trimmed stdout — most callers want a trivial value
+/// (status line, container id) and trimming once here is cheaper than
+/// re-trimming at every call site.
 ///
-/// `docker_socket` is `None` on Linux (host daemon, no `-H` flag) and
-/// `Some(path)` on macOS (forwarded gateway-VM socket). When `Some`,
-/// `-H unix://<path>` is prepended before `args`.
+/// The op says what to do; `route` says where. Neither the argv nor the
+/// target daemon is assembled here.
 async fn run_docker(
-    args: &[String],
+    route: DockerRoute,
+    op: DockerOp,
     operation: &'static str,
-    docker_socket: Option<PathBuf>,
 ) -> Result<String, SandboxError> {
-    let owned: Vec<String> = args.to_vec();
-    let op = operation.to_string();
     tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("docker");
-        if let Some(sock) = &docker_socket {
-            cmd.args(["-H", &format!("unix://{}", sock.display())]);
-        }
-        for arg in &owned {
-            cmd.arg(arg);
-        }
-        let output = run_with_timeout(&mut cmd, DOCKER_CMD_TIMEOUT, &op).map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Gateway(format!("failed to run {op}: {msg}"))
-            }
-            other => other,
-        })?;
+        let output = route
+            .run(op, DOCKER_CMD_TIMEOUT, operation)
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Gateway(format!("failed to run {operation}: {msg}"))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(SandboxError::Gateway(format!("{op} failed: {stderr}")));
+            return Err(SandboxError::Gateway(format!(
+                "{operation} failed: {stderr}"
+            )));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     })
@@ -1689,35 +1359,38 @@ async fn run_docker(
     .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))?
 }
 
-/// Public wrapper: inspect a container's PID via a forwarded Docker socket.
+/// Public wrapper: inspect a container's PID on a given Docker route.
 ///
 /// Used by the macOS lite path to get the in-VM PID of the sandbox container
 /// before invoking `sandbox-route-helper --vm-gateway-mode` inside the
 /// gateway Lima VM. The PID is meaningless on the macOS host; it is only
 /// valid as an argument to the in-VM helper.
-pub async fn inspect_container_pid_via_socket(
+pub async fn inspect_container_pid_on_route(
     container_name: &str,
-    docker_socket: Option<PathBuf>,
+    route: DockerRoute,
 ) -> Result<i32, SandboxError> {
-    inspect_container_pid(container_name, docker_socket).await
+    inspect_container_pid(container_name, route).await
 }
 
 /// `docker inspect -f '{{.State.Pid}}' <name>` → host-namespace pid (or
-/// in-VM pid when targeting a forwarded gateway socket on macOS).
+/// in-VM pid when the route targets a VM's Docker daemon).
 /// Returns the parsed integer; 0 (a stopped container's reported pid)
 /// surfaces as an error since spawning the helper against pid 0 makes
 /// no sense.
 async fn inspect_container_pid(
     container_name: &str,
-    docker_socket: Option<PathBuf>,
+    route: DockerRoute,
 ) -> Result<i32, SandboxError> {
-    let args = [
-        "inspect".to_string(),
-        "-f".to_string(),
-        "{{.State.Pid}}".to_string(),
-        container_name.to_string(),
-    ];
-    let stdout = run_docker(&args, "docker inspect (container pid)", docker_socket).await?;
+    let stdout = run_docker(
+        route,
+        DockerOp::ContainerInspect {
+            name: container_name.to_string(),
+            format: InspectFormat::StatePid,
+            flag: InspectFlag::Short,
+        },
+        "docker inspect (container pid)",
+    )
+    .await?;
     let pid: i32 = stdout.parse().map_err(|_| {
         SandboxError::Gateway(format!(
             "docker inspect returned non-integer pid for {container_name}: {stdout:?}"
@@ -2344,90 +2017,136 @@ mod tests {
         )
     }
 
+    /// A route that names a VM without being able to reach one. Unit tests
+    /// never run docker; what they assert is which shape the runtime takes,
+    /// and the executor is never invoked.
+    fn unreachable_vm_route() -> DockerRoute {
+        DockerRoute::Vm {
+            op_uid: 501,
+            executor: Arc::new(crate::docker::LocalSocketDockerExecutor::new(
+                "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
+                "/var/lib/sandboxd/501/501/lima",
+            )),
+        }
+    }
+
     fn test_runtime_macos() -> Arc<ContainerRuntime> {
-        ContainerRuntime::with_macos_socket(
+        ContainerRuntime::with_vm_route(
             DEFAULT_LITE_IMAGE_TAG,
             2048,
             2.0,
             1000,
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
+            unreachable_vm_route(),
             "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
             "/var/lib/sandboxd/501",
         )
     }
 
-    // -- ContainerRuntime macOS-awareness (D3) --------------------------------
+    // -- Argv shims -----------------------------------------------------------
+    //
+    // The runtime no longer builds argv itself: it names a typed op and the
+    // seam renders it. These shims keep the argv contracts below asserted
+    // through the seam rather than deleting them, so a regression in the
+    // rendering is still caught here and not only in the argv crate.
 
-    /// Linux runtime: is_macos() is false, docker_socket() is None, and
-    /// docker_cmd() emits no -H flag.
+    #[allow(clippy::too_many_arguments)]
+    fn build_create_argv(
+        session_id: &SessionId,
+        network: &ContainerNetwork,
+        image_tag: &str,
+        user_uid: u32,
+        user_gid: u32,
+        memory_mb: u32,
+        cpus: f64,
+        guest_bind_source: &Path,
+        skip_guest_bind: bool,
+    ) -> Result<Vec<String>, SandboxError> {
+        DockerOp::ContainerCreate {
+            spec: build_create_spec(
+                session_id,
+                network,
+                image_tag,
+                user_uid,
+                user_gid,
+                memory_mb,
+                cpus,
+                guest_bind_source,
+                skip_guest_bind,
+            ),
+        }
+        .argv()
+    }
+
+    fn build_home_chown_argv(
+        session_id: &SessionId,
+        image_tag: &str,
+        operator_uid: u32,
+        operator_gid: u32,
+    ) -> Vec<String> {
+        DockerOp::HomeVolumeChown {
+            session_id: session_id.to_string(),
+            image_tag: image_tag.to_string(),
+            operator_uid,
+            operator_gid,
+        }
+        .argv()
+        .expect("home-volume chown renders")
+    }
+
+    fn build_refresh_argv(container_name: &str) -> Vec<String> {
+        DockerOp::ContainerRestart {
+            name: container_name.to_string(),
+        }
+        .argv()
+        .expect("restart renders")
+    }
+
+    fn build_ssh_mount_args(network: &ContainerNetwork) -> Vec<String> {
+        sandbox_docker_argv::container::ssh_mount_args(
+            network
+                .ssh_host_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+        )
+    }
+
+    fn build_ca_mount_args(network: &ContainerNetwork) -> Vec<String> {
+        sandbox_docker_argv::container::ca_mount_args(
+            network
+                .ca_host_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+        )
+    }
+
+    use sandbox_docker_argv::container::{SANDBOX_CA_ENV_VARS, format_cpus};
+
+    // -- ContainerRuntime route-awareness -------------------------------------
+
+    /// Linux runtime: the host route, no VM, no retained transport socket.
     #[test]
     fn linux_runtime_is_not_macos() {
         let rt = test_runtime();
         assert!(!rt.is_macos());
-        assert!(rt.docker_socket().is_none());
+        assert!(rt.transport_socket().is_none());
     }
 
-    /// Linux runtime: docker_cmd() produces a bare `docker` command with
-    /// no -H argument.
-    #[test]
-    fn linux_runtime_docker_cmd_has_no_h_flag() {
-        let rt = test_runtime();
-        let cmd = rt.docker_cmd();
-        let program = cmd.get_program().to_str().unwrap();
-        assert_eq!(program, "docker");
-        let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
-        assert!(
-            !args.contains(&"-H"),
-            "Linux docker_cmd must not emit -H: {args:?}"
-        );
-    }
-
-    /// macOS runtime: is_macos() is true, docker_socket() returns the path.
+    /// macOS runtime: a VM route, and the transport socket retained for the
+    /// guest byte-pump.
     #[test]
     fn macos_runtime_is_macos() {
         let rt = test_runtime_macos();
         assert!(rt.is_macos());
         assert_eq!(
-            rt.docker_socket(),
+            rt.transport_socket(),
             Some(Path::new(
                 "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock"
             ))
         );
-    }
-
-    /// macOS runtime: docker_cmd() prepends -H unix://<socket> before any args.
-    #[test]
-    fn macos_runtime_docker_cmd_prepends_h_flag() {
-        let rt = test_runtime_macos();
-        let cmd = rt.docker_cmd();
-        let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
-        // First arg must be -H, second must be unix://<socket>.
-        assert_eq!(args.first(), Some(&"-H"), "first arg must be -H: {args:?}");
-        let h_val = args.get(1).expect("must have -H value");
-        assert!(
-            h_val.starts_with("unix://"),
-            "-H value must use unix:// scheme: {h_val}"
-        );
-        assert!(
-            h_val.contains("gateway-docker.sock"),
-            "-H value must contain the socket filename: {h_val}"
-        );
-    }
-
-    /// macOS runtime: docker_cmd_async() also prepends -H unix://<socket>.
-    #[test]
-    fn macos_runtime_docker_cmd_async_prepends_h_flag() {
-        let rt = test_runtime_macos();
-        let cmd = rt.docker_cmd_async();
-        let args: Vec<&str> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_str().unwrap())
-            .collect();
-        assert_eq!(args.first(), Some(&"-H"), "first arg must be -H: {args:?}");
-        let h_val = args.get(1).expect("must have -H value");
-        assert!(h_val.starts_with("unix://"));
     }
 
     /// macOS runtime: docker_home() returns the configured path.
@@ -2437,31 +2156,32 @@ mod tests {
         assert_eq!(rt.docker_home(), Path::new("/var/lib/sandboxd/501"));
     }
 
-    /// Linux runtime: with_macos_socket constructor is callable from Linux
-    /// (non-cfg), and the resulting runtime correctly reports is_macos().
+    /// The VM constructor is non-cfg, so it is callable (and testable) on
+    /// every platform.
     #[test]
-    fn with_macos_socket_constructor_callable_on_any_platform() {
-        let rt = ContainerRuntime::with_macos_socket(
+    fn vm_route_constructor_callable_on_any_platform() {
+        let rt = ContainerRuntime::with_vm_route(
             "sandboxd-lite:test",
             1024,
             1.0,
             500,
             500,
             "/tmp/guest",
+            unreachable_vm_route(),
             "/tmp/test.sock",
             "/tmp/home",
         );
         assert!(rt.is_macos());
-        assert_eq!(rt.docker_socket(), Some(Path::new("/tmp/test.sock")));
+        assert_eq!(rt.transport_socket(), Some(Path::new("/tmp/test.sock")));
         assert_eq!(rt.docker_home(), Path::new("/tmp/home"));
     }
 
-    /// Linux new() constructor: docker_socket is None (host daemon, unchanged).
+    /// Linux `new()` constructor: the host route, no retained socket.
     #[test]
-    fn new_constructor_has_no_socket() {
+    fn new_constructor_takes_the_host_route() {
         let rt = ContainerRuntime::new("sandboxd-lite:test", 1024, 1.0, 500, 500, "/tmp/guest");
         assert!(!rt.is_macos());
-        assert!(rt.docker_socket().is_none());
+        assert!(rt.transport_socket().is_none());
     }
 
     /// `kind()` reports the static `BackendKind::Container` constant —
@@ -3176,13 +2896,14 @@ mod tests {
             "memory ceiling must leave headroom below the VM's RAM"
         );
 
-        let rt = ContainerRuntime::with_macos_socket(
+        let rt = ContainerRuntime::with_vm_route(
             DEFAULT_LITE_IMAGE_TAG,
             16384, // host-sized default memory (16 GiB)
             8.0,   // host-sized default cpus (8 vCPU)
             1000,
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
+            unreachable_vm_route(),
             "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
             "/var/lib/sandboxd/501",
         );

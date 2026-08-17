@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver, NetworkOption};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
-use crate::process::run_with_timeout;
 use crate::session::SessionId;
 
 #[cfg(target_os = "macos")]
@@ -336,19 +336,18 @@ impl NetworkManager {
     /// `docker [-H unix://<socket>] network create --driver bridge`, and
     /// returns the resulting `NetworkInfo`.
     ///
-    /// `docker_socket` is `None` on Linux (host docker daemon, unchanged) and
-    /// `Some(path)` on macOS lite-mode (forwarded gateway-VM socket). When
-    /// `Some`, `-H unix://<path>` is prepended so the bridge is created inside
-    /// the gateway VM rather than on the macOS host.
+    /// `route` is [`DockerRoute::Host`] on Linux (host docker daemon,
+    /// unchanged) and [`DockerRoute::Vm`] on macOS lite-mode, where the
+    /// bridge belongs inside the gateway VM rather than on the macOS host.
     ///
     /// If Docker reports a subnet pool overlap (stale network from a previous
     /// daemon), the allocator advances to the next block and retries.
-    pub fn create_network_on_socket(
+    pub fn create_network_on_route(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<NetworkInfo, SandboxError> {
-        self.create_network_inner(session_id, docker_socket)
+        self.create_network_inner(session_id, route)
     }
 
     /// Create a Docker bridge network for the given session.
@@ -359,13 +358,13 @@ impl NetworkManager {
     /// If Docker reports a subnet pool overlap (stale network from a previous
     /// daemon), the allocator advances to the next block and retries.
     pub fn create_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
-        self.create_network_inner(session_id, None)
+        self.create_network_inner(session_id, &DockerRoute::Host)
     }
 
     fn create_network_inner(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<NetworkInfo, SandboxError> {
         // Check if the session already has a network.
         {
@@ -414,39 +413,27 @@ impl NetworkManager {
                 "creating Docker bridge network"
             );
 
-            let owner_label = format!("sandboxd.owner={}", self.owner_pool);
-            let mut cmd = Command::new("docker");
-            // When docker_socket is Some, direct the docker client to the
-            // forwarded gateway-VM socket (macOS lite-mode). On Linux / host
-            // docker, docker_socket is None and no -H flag is prepended.
-            if let Some(sock) = docker_socket {
-                cmd.args(["-H", &format!("unix://{}", sock.display())]);
-            }
-            cmd.args([
-                "network",
-                "create",
-                "--driver",
-                "bridge",
-                "--subnet",
-                &subnet,
-                "--label",
-                &format!("sandbox.session_id={session_id}"),
-                "--label",
-                &owner_label,
-                "--opt",
-                &format!("com.docker.network.bridge.name={bridge_name}"),
-                &docker_network_name,
-            ]);
-            let output =
-                run_with_timeout(&mut cmd, CREATE_NETWORK_TIMEOUT, "docker network create")
-                    .map_err(|e| match e {
-                        SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                            SandboxError::Network(format!(
-                                "failed to run docker network create: {msg}"
-                            ))
-                        }
-                        other => other,
-                    })?;
+            let spec = NetworkCreateSpec {
+                name: docker_network_name.clone(),
+                driver: NetworkDriver::Bridge,
+                subnet: Some(subnet.clone()),
+                gateway: None,
+                session_id: Some(session_id.to_string()),
+                owner_pool: Some(self.owner_pool.clone()),
+                options: vec![NetworkOption::BridgeName(bridge_name.clone())],
+            };
+            let output = route
+                .run(
+                    DockerOp::NetworkCreate { spec },
+                    CREATE_NETWORK_TIMEOUT,
+                    "docker network create",
+                )
+                .map_err(|e| match e {
+                    SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                        SandboxError::Network(format!("failed to run docker network create: {msg}"))
+                    }
+                    other => other,
+                })?;
 
             if output.status.success() {
                 let info = NetworkInfo {
@@ -518,27 +505,26 @@ impl NetworkManager {
 
     /// Delete the Docker bridge network for the given session (host daemon).
     pub fn delete_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
-        self.delete_network_inner(session_id, None)
+        self.delete_network_inner(session_id, &DockerRoute::Host)
     }
 
-    /// Socket-aware variant of [`delete_network`].
+    /// Route-aware variant of [`Self::delete_network`].
     ///
-    /// When `docker_socket` is `Some`, `-H unix://<path>` is prepended so the
-    /// bridge is removed from inside the gateway VM (macOS lite-mode). When
-    /// `None` this is byte-identical to [`delete_network`] and targets the
-    /// host Docker daemon. Mirrors [`create_network_on_socket`].
-    pub fn delete_network_on_socket(
+    /// A [`DockerRoute::Vm`] route removes the bridge from inside the gateway
+    /// VM (macOS lite-mode); [`DockerRoute::Host`] is byte-identical to
+    /// [`Self::delete_network`]. Mirrors [`Self::create_network_on_route`].
+    pub fn delete_network_on_route(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<(), SandboxError> {
-        self.delete_network_inner(session_id, docker_socket)
+        self.delete_network_inner(session_id, route)
     }
 
     fn delete_network_inner(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<(), SandboxError> {
         let (block_idx, info) = {
             let nets = self
@@ -556,19 +542,20 @@ impl NetworkManager {
             "deleting Docker bridge network"
         );
 
-        let argv = docker_network_rm_argv(docker_socket, &info.docker_network_name);
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let output = run_with_timeout(
-            Command::new("docker").args(&argv_refs),
-            DELETE_NETWORK_TIMEOUT,
-            "docker network rm",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Network(format!("failed to run docker network rm: {msg}"))
-            }
-            other => other,
-        })?;
+        let output = route
+            .run(
+                DockerOp::NetworkRemove {
+                    name: info.docker_network_name.clone(),
+                },
+                DELETE_NETWORK_TIMEOUT,
+                "docker network rm",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Network(format!("failed to run docker network rm: {msg}"))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -628,7 +615,7 @@ impl NetworkManager {
     /// sessions where the bridge lives inside the gateway VM, use
     /// `ensure_network_on_socket` with the forwarded socket path.
     pub fn ensure_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
-        self.ensure_network_inner(session_id, None)
+        self.ensure_network_inner(session_id, &DockerRoute::Host)
     }
 
     /// Socket-aware variant of `ensure_network`.
@@ -637,18 +624,18 @@ impl NetworkManager {
     /// forwarded socket (macOS lite-mode — the bridge lives inside the
     /// gateway VM). When `docker_socket` is `None` this is byte-identical
     /// to `ensure_network` and targets the host Docker daemon.
-    pub fn ensure_network_on_socket(
+    pub fn ensure_network_on_route(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<NetworkInfo, SandboxError> {
-        self.ensure_network_inner(session_id, docker_socket)
+        self.ensure_network_inner(session_id, route)
     }
 
     fn ensure_network_inner(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<NetworkInfo, SandboxError> {
         let info = {
             let nets = self
@@ -665,22 +652,20 @@ impl NetworkManager {
         };
 
         // Check if the Docker network already exists.
-        let mut check_cmd = Command::new("docker");
-        if let Some(sock) = docker_socket {
-            check_cmd.args(["-H", &format!("unix://{}", sock.display())]);
-        }
-        check_cmd.args(["network", "inspect", &info.docker_network_name]);
-        let check = run_with_timeout(
-            &mut check_cmd,
-            INSPECT_NETWORK_TIMEOUT,
-            "docker network inspect",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Network(format!("failed to run docker network inspect: {msg}"))
-            }
-            other => other,
-        })?;
+        let check = route
+            .run(
+                DockerOp::NetworkInspect {
+                    name: info.docker_network_name.clone(),
+                },
+                INSPECT_NETWORK_TIMEOUT,
+                "docker network inspect",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Network(format!("failed to run docker network inspect: {msg}"))
+                }
+                other => other,
+            })?;
 
         if check.status.success() {
             debug!(
@@ -700,34 +685,27 @@ impl NetworkManager {
             "recreating Docker bridge network"
         );
 
-        let mut create_cmd = Command::new("docker");
-        if let Some(sock) = docker_socket {
-            create_cmd.args(["-H", &format!("unix://{}", sock.display())]);
-        }
-        create_cmd.args([
-            "network",
-            "create",
-            "--driver",
-            "bridge",
-            "--subnet",
-            &info.subnet,
-            "--label",
-            &format!("sandbox.session_id={session_id}"),
-            "--opt",
-            &format!("com.docker.network.bridge.name={}", info.bridge_name),
-            &info.docker_network_name,
-        ]);
-        let output = run_with_timeout(
-            &mut create_cmd,
-            CREATE_NETWORK_TIMEOUT,
-            "docker network create (ensure)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Network(format!("failed to run docker network create: {msg}"))
-            }
-            other => other,
-        })?;
+        let spec = NetworkCreateSpec {
+            name: info.docker_network_name.clone(),
+            driver: NetworkDriver::Bridge,
+            subnet: Some(info.subnet.clone()),
+            gateway: None,
+            session_id: Some(session_id.to_string()),
+            owner_pool: None,
+            options: vec![NetworkOption::BridgeName(info.bridge_name.clone())],
+        };
+        let output = route
+            .run(
+                DockerOp::NetworkCreate { spec },
+                CREATE_NETWORK_TIMEOUT,
+                "docker network create (ensure)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Network(format!("failed to run docker network create: {msg}"))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -754,26 +732,26 @@ impl NetworkManager {
     ///
     /// If the Docker network does not exist, this is a no-op (returns Ok).
     pub fn remove_docker_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
-        self.remove_docker_network_inner(session_id, None)
+        self.remove_docker_network_inner(session_id, &DockerRoute::Host)
     }
 
-    /// Socket-aware variant of [`remove_docker_network`].
+    /// Route-aware variant of [`Self::remove_docker_network`].
     ///
-    /// When `docker_socket` is `Some`, `-H unix://<path>` is prepended so the
+    /// A [`DockerRoute::Vm`] route means the
     /// bridge is removed from inside the gateway VM (macOS lite-mode). When
     /// `None` this is byte-identical to [`remove_docker_network`].
-    pub fn remove_docker_network_on_socket(
+    pub fn remove_docker_network_on_route(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<(), SandboxError> {
-        self.remove_docker_network_inner(session_id, docker_socket)
+        self.remove_docker_network_inner(session_id, route)
     }
 
     fn remove_docker_network_inner(
         &self,
         session_id: &SessionId,
-        docker_socket: Option<&std::path::Path>,
+        route: &DockerRoute,
     ) -> Result<(), SandboxError> {
         let info = {
             let nets = self
@@ -798,19 +776,20 @@ impl NetworkManager {
             "removing Docker bridge network (keeping allocation)"
         );
 
-        let argv = docker_network_rm_argv(docker_socket, &info.docker_network_name);
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let output = run_with_timeout(
-            Command::new("docker").args(&argv_refs),
-            DELETE_NETWORK_TIMEOUT,
-            "docker network rm (remove)",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Network(format!("failed to run docker network rm: {msg}"))
-            }
-            other => other,
-        })?;
+        let output = route
+            .run(
+                DockerOp::NetworkRemove {
+                    name: info.docker_network_name.clone(),
+                },
+                DELETE_NETWORK_TIMEOUT,
+                "docker network rm (remove)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Network(format!("failed to run docker network rm: {msg}"))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -840,27 +819,6 @@ impl NetworkManager {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Build the argv for `docker [-H unix://<sock>] network rm <name>`.
-///
-/// Pure function so the socket-awareness (the `-H` prefix on macOS lite,
-/// absent on Linux/host docker) can be asserted without spawning a docker
-/// subprocess. Mirrors the inline arg construction in
-/// `create_network_inner` / `ensure_network_inner`.
-fn docker_network_rm_argv(
-    docker_socket: Option<&std::path::Path>,
-    network_name: &str,
-) -> Vec<String> {
-    let mut argv: Vec<String> = Vec::with_capacity(5);
-    if let Some(sock) = docker_socket {
-        argv.push("-H".to_string());
-        argv.push(format!("unix://{}", sock.display()));
-    }
-    argv.push("network".to_string());
-    argv.push("rm".to_string());
-    argv.push(network_name.to_string());
-    argv
-}
 
 /// Parse the base address from a CIDR string like `"10.209.0.16/28"`.
 fn parse_subnet_base(cidr: &str) -> Result<Ipv4Addr, SandboxError> {
@@ -1788,36 +1746,51 @@ impl std::fmt::Display for OwnershipAssertionError {
 mod tests {
     use super::*;
 
-    // -- docker network rm argv (socket-awareness) ---------------------------
+    // -- network ops -------------------------------------------------------
 
-    /// Linux / host docker: no `-H` flag — `docker network rm <name>`.
-    /// Pins the byte-identical Linux argv.
+    /// The removal op names the network and nothing else. Which Docker
+    /// daemon hears it is the route's decision, made where the socket
+    /// actually lives — a target named here would be a target the caller
+    /// could choose.
     #[test]
-    fn docker_network_rm_argv_no_socket_is_host_docker() {
-        let argv = docker_network_rm_argv(None, "sandbox-net-abc123");
+    fn network_removal_op_names_the_network_and_not_a_target() {
+        let argv = DockerOp::NetworkRemove {
+            name: "sandbox-net-abc123".to_string(),
+        }
+        .argv()
+        .expect("network rm renders");
         assert_eq!(argv, vec!["network", "rm", "sandbox-net-abc123"]);
-        assert!(
-            !argv.iter().any(|a| a == "-H"),
-            "host-docker argv must not carry -H: {argv:?}"
-        );
     }
 
-    /// macOS lite: a forwarded socket injects `-H unix://<sock>` ahead of the
-    /// `network rm` verb so the delete reaches the gateway VM's daemon, not
-    /// the host. Mirrors `create_network_on_socket`.
+    /// The per-session bridge carries both labels the orphan reaper filters
+    /// on: without the owner label a co-deployed daemon's listing would not
+    /// see the network, and it would survive every reap as an orphan nobody
+    /// claims.
     #[test]
-    fn docker_network_rm_argv_with_socket_prepends_host_flag() {
-        let sock = std::path::Path::new("/var/lib/sandboxd/501/gateway-docker.sock");
-        let argv = docker_network_rm_argv(Some(sock), "sandbox-net-def456");
-        assert_eq!(
-            argv,
-            vec![
-                "-H",
-                "unix:///var/lib/sandboxd/501/gateway-docker.sock",
-                "network",
-                "rm",
-                "sandbox-net-def456",
-            ]
+    fn per_session_bridge_carries_the_session_and_owner_labels() {
+        let spec = NetworkCreateSpec {
+            name: "sandbox-net-abc123".to_string(),
+            driver: NetworkDriver::Bridge,
+            subnet: Some("10.209.0.0/28".to_string()),
+            gateway: None,
+            session_id: Some("abc123".to_string()),
+            owner_pool: Some("10.209.0.0/20".to_string()),
+            options: vec![NetworkOption::BridgeName("sb-abc123".to_string())],
+        };
+        let argv = DockerOp::NetworkCreate { spec }
+            .argv()
+            .expect("network create renders");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--label" && w[1] == "sandbox.session_id=abc123")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--label" && w[1] == "sandboxd.owner=10.209.0.0/20")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--opt" && w[1] == "com.docker.network.bridge.name=sb-abc123")
         );
     }
 

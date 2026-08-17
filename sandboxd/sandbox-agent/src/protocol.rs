@@ -311,6 +311,536 @@ pub enum BrokerOp {
     ///
     /// Same own-uid + VM-name re-validation as every other op.
     RestrictOnVerify { op_uid: u32, vm: String },
+    /// Run one typed `docker` operation against the Docker daemon inside the
+    /// agent's own VM.
+    ///
+    /// The op set is grouped behind one variant rather than flattened into
+    /// this enum so that a reviewer asking "what can the daemon make my
+    /// Docker do?" reads exactly one enum, [`DockerOp`], rather than
+    /// picking twenty variants out of a list that also contains VM
+    /// lifecycle. The compile-time exhaustiveness that matters is preserved
+    /// one level down: the agent's docker dispatch matches [`DockerOp`]
+    /// exhaustively, so an unhandled variant does not build.
+    ///
+    /// **The daemon does not name the target daemon.** No socket path
+    /// crosses the wire on this op; the agent addresses its own VM's
+    /// forwarded socket, derived from its own LIMA_HOME. That is what keeps
+    /// `-H unix://<own socket>` the sole target authority and keeps every
+    /// path in this op set inside the agent's own subtree.
+    Docker { op_uid: u32, op: DockerOp },
+}
+
+// ---------------------------------------------------------------------------
+// Docker op set
+// ---------------------------------------------------------------------------
+
+/// The closed set of `docker` operations the daemon may request.
+///
+/// Read this enum as the answer to "what is the daemon allowed to do to the
+/// operator's Docker?". Every variant names an operation and carries only
+/// the values that vary. There is deliberately no variant carrying an argv,
+/// a shell string, a Go template or a filesystem path to read — each of
+/// those would be a pass-through in disguise, and one of them makes the
+/// agent's validation decorative.
+///
+/// The counterpart on the daemon side is `sandbox_core::docker::DockerOp`;
+/// both render their command line through the shared `sandbox-docker-argv`
+/// crate, so the two sides cannot disagree about what an op means.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "docker_op", rename_all = "snake_case")]
+pub enum DockerOp {
+    /// `docker create` a session container from its typed specification.
+    ContainerCreate { spec: ContainerCreateSpec },
+    /// `docker start <name>`.
+    ContainerStart { name: String },
+    /// `docker stop` with an explicit grace period.
+    ContainerStop {
+        name: String,
+        grace_secs: u32,
+        /// `--time` when true, `-t` when false. Two spellings are in
+        /// production use and both are pinned by tests.
+        long_flag: bool,
+    },
+    /// `docker restart <name>`.
+    ContainerRestart { name: String },
+    /// `docker rm [-f|--force] <name>`.
+    ContainerRemove { name: String, force: RemoveForce },
+    /// `docker inspect` one enumerated field of a container's state.
+    ContainerInspect {
+        name: String,
+        format: InspectFormat,
+        flag: InspectFlag,
+    },
+    /// `docker ps -a` filtered by name prefix and optional owner pool.
+    ContainerList {
+        name_prefix: String,
+        owner_pool: Option<String>,
+    },
+    /// `docker exec` one of the enumerated commands inside a container.
+    ContainerExec {
+        name: String,
+        command: ContainerCommand,
+    },
+    /// Run the one-shot init container that chowns a session's home volume.
+    HomeVolumeChown {
+        session_id: String,
+        image_tag: String,
+        operator_uid: u32,
+        operator_gid: u32,
+    },
+    /// `docker run` a session's gateway container.
+    GatewayContainerRun {
+        session_id: String,
+        image_tag: String,
+        network: String,
+        owner_pool: Option<String>,
+        coredns_upstream: Option<String>,
+    },
+    /// `docker network create` from a typed specification.
+    NetworkCreate { spec: NetworkCreateSpec },
+    /// `docker network rm <name>`.
+    NetworkRemove { name: String },
+    /// `docker network inspect <name>`.
+    NetworkInspect { name: String },
+    /// `docker network connect [--ip <addr>] <network> <container>`.
+    NetworkConnect {
+        network: String,
+        container: String,
+        ip: Option<String>,
+    },
+    /// `docker network ls` filtered by name prefix and optional owner pool.
+    NetworkList {
+        name_prefix: String,
+        owner_pool: Option<String>,
+    },
+    /// `docker volume create` with the session and owner labels.
+    VolumeCreate {
+        name: String,
+        session_id: Option<String>,
+        owner_pool: Option<String>,
+    },
+    /// `docker volume rm <name>`.
+    VolumeRemove { name: String },
+    /// `docker volume ls` filtered by name prefix and optional owner pool.
+    VolumeList {
+        name_prefix: String,
+        owner_pool: Option<String>,
+    },
+    /// `docker image inspect <tag>`.
+    ImageInspect { tag: String },
+    /// `docker load` one of the staged image tarballs.
+    ///
+    /// The tarball is named by the enum, not by a path: the agent resolves
+    /// the variant to a filename inside its own staging directory and
+    /// streams it. A path field here would be arbitrary read access granted
+    /// to whatever is on the other end of the socket.
+    ImageLoad { image: StagedImage },
+    /// `docker info` — does the target daemon answer?
+    DaemonInfo,
+}
+
+/// How `docker rm` spells its force flag.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoveForce {
+    No,
+    Short,
+    Long,
+}
+
+/// The enumerated `docker inspect --format` templates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectFormat {
+    StateStatus,
+    StateRunning,
+    StateHealthStatus,
+    StatePid,
+    NetworkIpAddress,
+}
+
+/// How `docker inspect` spells its format flag.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectFlag {
+    Short,
+    Long,
+}
+
+/// The enumerated commands the daemon may run inside a container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum ContainerCommand {
+    /// Is sshd listening on port 22 yet?
+    SshdListening,
+    /// Pre-create an rsync destination directory.
+    MakeDirectory { path: String },
+    /// The gateway image's aggregate health script.
+    GatewayHealthcheck,
+    /// One named gateway component's readiness probe.
+    ComponentProbe { component: GatewayComponent },
+}
+
+/// The gateway container's five long-running components.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayComponent {
+    Envoy,
+    Coredns,
+    Mitmproxy,
+    DenyLogger,
+    AllowLogger,
+}
+
+/// The image tarballs the daemon stages for loading into a VM.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagedImage {
+    Gateway,
+    Lite,
+}
+
+/// Docker network drivers the daemon creates networks with.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkDriver {
+    Bridge,
+    Macvlan,
+}
+
+/// The enumerated `--opt key=value` pairs a network may carry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "option", rename_all = "snake_case")]
+pub enum NetworkOption {
+    BridgeName { interface: String },
+    BridgeMasquerade { enabled: bool },
+    MacvlanParent { parent: String },
+    MacvlanModePrivate,
+}
+
+/// The operator-supplied workspace bind pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceBindSpec {
+    pub host_path: String,
+    pub guest_path: String,
+}
+
+/// Every typed value `docker create` needs for a session container.
+///
+/// Each field is re-validated by the agent before any argv is built; none
+/// of them is passed through to a shell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerCreateSpec {
+    pub session_id: String,
+    pub docker_network: String,
+    pub container_ip: String,
+    pub gateway_ip: String,
+    pub image_tag: String,
+    pub user_uid: u32,
+    pub user_gid: u32,
+    pub memory_mb: u32,
+    pub cpus: f64,
+    #[serde(default)]
+    pub owner_pool: Option<String>,
+    #[serde(default)]
+    pub workspace_bind: Option<WorkspaceBindSpec>,
+    #[serde(default)]
+    pub ca_host_path: Option<String>,
+    #[serde(default)]
+    pub ssh_host_dir: Option<String>,
+    #[serde(default)]
+    pub guest_bind_source: Option<String>,
+}
+
+/// Every typed value `docker network create` needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkCreateSpec {
+    pub name: String,
+    pub driver: NetworkDriver,
+    #[serde(default)]
+    pub subnet: Option<String>,
+    #[serde(default)]
+    pub gateway: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub owner_pool: Option<String>,
+    #[serde(default)]
+    pub options: Vec<NetworkOption>,
+}
+
+// ---------------------------------------------------------------------------
+// Wire → argv-crate conversions
+// ---------------------------------------------------------------------------
+//
+// The argv crate is deliberately serde-free (it is the leaf both the daemon
+// and the agent depend on, and keeping it dependency-free is the property
+// that lets it sit under both). These conversions are the seam: the wire
+// types carry serde, the argv types carry the rendering, and the mapping
+// between them is total.
+
+impl From<RemoveForce> for sandbox_docker_argv::container::RemoveForce {
+    fn from(value: RemoveForce) -> Self {
+        match value {
+            RemoveForce::No => Self::No,
+            RemoveForce::Short => Self::Short,
+            RemoveForce::Long => Self::Long,
+        }
+    }
+}
+
+impl From<InspectFormat> for sandbox_docker_argv::container::InspectFormat {
+    fn from(value: InspectFormat) -> Self {
+        match value {
+            InspectFormat::StateStatus => Self::StateStatus,
+            InspectFormat::StateRunning => Self::StateRunning,
+            InspectFormat::StateHealthStatus => Self::StateHealthStatus,
+            InspectFormat::StatePid => Self::StatePid,
+            InspectFormat::NetworkIpAddress => Self::NetworkIpAddress,
+        }
+    }
+}
+
+impl From<InspectFlag> for sandbox_docker_argv::container::InspectFlag {
+    fn from(value: InspectFlag) -> Self {
+        match value {
+            InspectFlag::Short => Self::Short,
+            InspectFlag::Long => Self::Long,
+        }
+    }
+}
+
+impl From<GatewayComponent> for sandbox_docker_argv::container::GatewayComponent {
+    fn from(value: GatewayComponent) -> Self {
+        match value {
+            GatewayComponent::Envoy => Self::Envoy,
+            GatewayComponent::Coredns => Self::Coredns,
+            GatewayComponent::Mitmproxy => Self::Mitmproxy,
+            GatewayComponent::DenyLogger => Self::DenyLogger,
+            GatewayComponent::AllowLogger => Self::AllowLogger,
+        }
+    }
+}
+
+impl From<StagedImage> for sandbox_docker_argv::image::StagedImage {
+    fn from(value: StagedImage) -> Self {
+        match value {
+            StagedImage::Gateway => Self::Gateway,
+            StagedImage::Lite => Self::Lite,
+        }
+    }
+}
+
+impl From<NetworkDriver> for sandbox_docker_argv::network::NetworkDriver {
+    fn from(value: NetworkDriver) -> Self {
+        match value {
+            NetworkDriver::Bridge => Self::Bridge,
+            NetworkDriver::Macvlan => Self::Macvlan,
+        }
+    }
+}
+
+impl From<&NetworkOption> for sandbox_docker_argv::network::NetworkOption {
+    fn from(value: &NetworkOption) -> Self {
+        match value {
+            NetworkOption::BridgeName { interface } => Self::BridgeName(interface.clone()),
+            NetworkOption::BridgeMasquerade { enabled } => Self::BridgeMasquerade(*enabled),
+            NetworkOption::MacvlanParent { parent } => Self::MacvlanParent(parent.clone()),
+            NetworkOption::MacvlanModePrivate => Self::MacvlanModePrivate,
+        }
+    }
+}
+
+impl From<&ContainerCommand> for sandbox_docker_argv::container::ContainerCommand {
+    fn from(value: &ContainerCommand) -> Self {
+        match value {
+            ContainerCommand::SshdListening => Self::SshdListening,
+            ContainerCommand::MakeDirectory { path } => Self::MakeDirectory { path: path.clone() },
+            ContainerCommand::GatewayHealthcheck => Self::GatewayHealthcheck,
+            ContainerCommand::ComponentProbe { component } => Self::ComponentProbe {
+                component: (*component).into(),
+            },
+        }
+    }
+}
+
+impl From<&ContainerCreateSpec> for sandbox_docker_argv::container::ContainerCreateSpec {
+    fn from(value: &ContainerCreateSpec) -> Self {
+        Self {
+            session_id: value.session_id.clone(),
+            docker_network: value.docker_network.clone(),
+            container_ip: value.container_ip.clone(),
+            gateway_ip: value.gateway_ip.clone(),
+            image_tag: value.image_tag.clone(),
+            user_uid: value.user_uid,
+            user_gid: value.user_gid,
+            memory_mb: value.memory_mb,
+            cpus: value.cpus,
+            owner_pool: value.owner_pool.clone(),
+            workspace_bind: value.workspace_bind.as_ref().map(|bind| {
+                sandbox_docker_argv::container::WorkspaceBindSpec {
+                    host_path: bind.host_path.clone(),
+                    guest_path: bind.guest_path.clone(),
+                }
+            }),
+            ca_host_path: value.ca_host_path.clone(),
+            ssh_host_dir: value.ssh_host_dir.clone(),
+            guest_bind_source: value.guest_bind_source.clone(),
+        }
+    }
+}
+
+impl From<&NetworkCreateSpec> for sandbox_docker_argv::network::NetworkCreateSpec {
+    fn from(value: &NetworkCreateSpec) -> Self {
+        Self {
+            name: value.name.clone(),
+            driver: value.driver.into(),
+            subnet: value.subnet.clone(),
+            gateway: value.gateway.clone(),
+            session_id: value.session_id.clone(),
+            owner_pool: value.owner_pool.clone(),
+            options: value.options.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+// The daemon builds its ops in the argv crate's vocabulary, so the mapping
+// runs the other way too. Both directions live here because the wire types
+// are this crate's — an impl on the daemon side would be an orphan.
+
+impl From<sandbox_docker_argv::container::RemoveForce> for RemoveForce {
+    fn from(value: sandbox_docker_argv::container::RemoveForce) -> Self {
+        use sandbox_docker_argv::container::RemoveForce as Src;
+        match value {
+            Src::No => Self::No,
+            Src::Short => Self::Short,
+            Src::Long => Self::Long,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::container::InspectFormat> for InspectFormat {
+    fn from(value: sandbox_docker_argv::container::InspectFormat) -> Self {
+        use sandbox_docker_argv::container::InspectFormat as Src;
+        match value {
+            Src::StateStatus => Self::StateStatus,
+            Src::StateRunning => Self::StateRunning,
+            Src::StateHealthStatus => Self::StateHealthStatus,
+            Src::StatePid => Self::StatePid,
+            Src::NetworkIpAddress => Self::NetworkIpAddress,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::container::InspectFlag> for InspectFlag {
+    fn from(value: sandbox_docker_argv::container::InspectFlag) -> Self {
+        use sandbox_docker_argv::container::InspectFlag as Src;
+        match value {
+            Src::Short => Self::Short,
+            Src::Long => Self::Long,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::container::GatewayComponent> for GatewayComponent {
+    fn from(value: sandbox_docker_argv::container::GatewayComponent) -> Self {
+        use sandbox_docker_argv::container::GatewayComponent as Src;
+        match value {
+            Src::Envoy => Self::Envoy,
+            Src::Coredns => Self::Coredns,
+            Src::Mitmproxy => Self::Mitmproxy,
+            Src::DenyLogger => Self::DenyLogger,
+            Src::AllowLogger => Self::AllowLogger,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::image::StagedImage> for StagedImage {
+    fn from(value: sandbox_docker_argv::image::StagedImage) -> Self {
+        use sandbox_docker_argv::image::StagedImage as Src;
+        match value {
+            Src::Gateway => Self::Gateway,
+            Src::Lite => Self::Lite,
+        }
+    }
+}
+
+impl From<sandbox_docker_argv::network::NetworkDriver> for NetworkDriver {
+    fn from(value: sandbox_docker_argv::network::NetworkDriver) -> Self {
+        use sandbox_docker_argv::network::NetworkDriver as Src;
+        match value {
+            Src::Bridge => Self::Bridge,
+            Src::Macvlan => Self::Macvlan,
+        }
+    }
+}
+
+impl From<&sandbox_docker_argv::network::NetworkOption> for NetworkOption {
+    fn from(value: &sandbox_docker_argv::network::NetworkOption) -> Self {
+        use sandbox_docker_argv::network::NetworkOption as Src;
+        match value {
+            Src::BridgeName(interface) => Self::BridgeName {
+                interface: interface.clone(),
+            },
+            Src::BridgeMasquerade(enabled) => Self::BridgeMasquerade { enabled: *enabled },
+            Src::MacvlanParent(parent) => Self::MacvlanParent {
+                parent: parent.clone(),
+            },
+            Src::MacvlanModePrivate => Self::MacvlanModePrivate,
+        }
+    }
+}
+
+impl From<&sandbox_docker_argv::container::ContainerCommand> for ContainerCommand {
+    fn from(value: &sandbox_docker_argv::container::ContainerCommand) -> Self {
+        use sandbox_docker_argv::container::ContainerCommand as Src;
+        match value {
+            Src::SshdListening => Self::SshdListening,
+            Src::MakeDirectory { path } => Self::MakeDirectory { path: path.clone() },
+            Src::GatewayHealthcheck => Self::GatewayHealthcheck,
+            Src::ComponentProbe { component } => Self::ComponentProbe {
+                component: (*component).into(),
+            },
+        }
+    }
+}
+
+impl From<&sandbox_docker_argv::container::ContainerCreateSpec> for ContainerCreateSpec {
+    fn from(value: &sandbox_docker_argv::container::ContainerCreateSpec) -> Self {
+        Self {
+            session_id: value.session_id.clone(),
+            docker_network: value.docker_network.clone(),
+            container_ip: value.container_ip.clone(),
+            gateway_ip: value.gateway_ip.clone(),
+            image_tag: value.image_tag.clone(),
+            user_uid: value.user_uid,
+            user_gid: value.user_gid,
+            memory_mb: value.memory_mb,
+            cpus: value.cpus,
+            owner_pool: value.owner_pool.clone(),
+            workspace_bind: value.workspace_bind.as_ref().map(|bind| WorkspaceBindSpec {
+                host_path: bind.host_path.clone(),
+                guest_path: bind.guest_path.clone(),
+            }),
+            ca_host_path: value.ca_host_path.clone(),
+            ssh_host_dir: value.ssh_host_dir.clone(),
+            guest_bind_source: value.guest_bind_source.clone(),
+        }
+    }
+}
+
+impl From<&sandbox_docker_argv::network::NetworkCreateSpec> for NetworkCreateSpec {
+    fn from(value: &sandbox_docker_argv::network::NetworkCreateSpec) -> Self {
+        Self {
+            name: value.name.clone(),
+            driver: value.driver.into(),
+            subnet: value.subnet.clone(),
+            gateway: value.gateway.clone(),
+            session_id: value.session_id.clone(),
+            owner_pool: value.owner_pool.clone(),
+            options: value.options.iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// Bridge NIC pair (bridge_name + vm_mac). Both fields are validated
@@ -339,7 +869,8 @@ impl BrokerOp {
             | BrokerOp::RunRsync { op_uid, .. }
             | BrokerOp::ReadOwnerMarker { op_uid, .. }
             | BrokerOp::GuestSocat { op_uid, .. }
-            | BrokerOp::RestrictOnVerify { op_uid, .. } => *op_uid,
+            | BrokerOp::RestrictOnVerify { op_uid, .. }
+            | BrokerOp::Docker { op_uid, .. } => *op_uid,
         }
     }
 }
@@ -373,3 +904,95 @@ pub const RESTRICT_MARKER_FILENAME: &str = "sandboxd-restrict-marker";
 /// Substring that must be present in the restrict marker file contents for the
 /// `RestrictOnVerify` check to pass.
 pub const RESTRICT_ON_MARKER: &str = "restrict=on";
+
+/// Render a wire op's argv through the shared builders.
+///
+/// The conversion into the argv crate's own types is where the wire
+/// vocabulary stops and the command-line vocabulary begins; both sides of
+/// the channel cross it through the same functions, so neither can hold a
+/// different idea of what an op means.
+pub fn docker_argv(op: &crate::protocol::DockerOp) -> Result<Vec<String>, String> {
+    use sandbox_docker_argv::{container, image, network, volume};
+
+    let argv = match op {
+        DockerOp::ContainerCreate { spec } => {
+            let spec: container::ContainerCreateSpec = spec.into();
+            container::container_create_argv(&spec).map_err(|e| e.into_message())?
+        }
+        DockerOp::ContainerStart { name } => container::container_start_argv(name),
+        DockerOp::ContainerStop {
+            name,
+            grace_secs,
+            long_flag,
+        } => {
+            if *long_flag {
+                container::container_stop_long_argv(name, *grace_secs)
+            } else {
+                container::container_stop_argv(name, *grace_secs)
+            }
+        }
+        DockerOp::ContainerRestart { name } => container::container_restart_argv(name),
+        DockerOp::ContainerRemove { name, force } => {
+            container::container_remove_argv(name, (*force).into())
+        }
+        DockerOp::ContainerInspect { name, format, flag } => {
+            container::container_inspect_argv(name, (*format).into(), (*flag).into())
+        }
+        DockerOp::ContainerList {
+            name_prefix,
+            owner_pool,
+        } => container::container_list_argv(name_prefix, owner_pool.as_deref()),
+        DockerOp::ContainerExec { name, command } => {
+            let command: container::ContainerCommand = command.into();
+            container::container_exec_argv(name, &command)
+        }
+        DockerOp::HomeVolumeChown {
+            session_id,
+            image_tag,
+            operator_uid,
+            operator_gid,
+        } => container::home_chown_run_argv(session_id, image_tag, *operator_uid, *operator_gid),
+        DockerOp::GatewayContainerRun {
+            session_id,
+            image_tag,
+            network: net,
+            owner_pool,
+            coredns_upstream,
+        } => container::gateway_container_run_argv(
+            session_id,
+            image_tag,
+            net,
+            owner_pool.as_deref(),
+            coredns_upstream.as_deref(),
+        ),
+        DockerOp::NetworkCreate { spec } => {
+            let spec: network::NetworkCreateSpec = spec.into();
+            network::network_create_argv(&spec)
+        }
+        DockerOp::NetworkRemove { name } => network::network_remove_argv(name),
+        DockerOp::NetworkInspect { name } => network::network_inspect_argv(name),
+        DockerOp::NetworkConnect {
+            network: net,
+            container: ctr,
+            ip,
+        } => network::network_connect_argv(net, ctr, ip.as_deref()),
+        DockerOp::NetworkList {
+            name_prefix,
+            owner_pool,
+        } => network::network_list_argv(name_prefix, owner_pool.as_deref()),
+        DockerOp::VolumeCreate {
+            name,
+            session_id,
+            owner_pool,
+        } => volume::volume_create_argv(name, session_id.as_deref(), owner_pool.as_deref()),
+        DockerOp::VolumeRemove { name } => volume::volume_remove_argv(name),
+        DockerOp::VolumeList {
+            name_prefix,
+            owner_pool,
+        } => volume::volume_list_argv(name_prefix, owner_pool.as_deref()),
+        DockerOp::ImageInspect { tag } => image::image_inspect_argv(tag),
+        DockerOp::ImageLoad { .. } => image::image_load_argv(),
+        DockerOp::DaemonInfo => image::daemon_info_argv(),
+    };
+    Ok(argv)
+}
