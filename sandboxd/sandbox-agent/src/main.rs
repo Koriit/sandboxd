@@ -32,7 +32,9 @@
 //!
 //! The broker channel carries newline-delimited JSON frames:
 //! - **One-shot ops**: daemon writes `BrokerRequest\n`, agent processes and
-//!   writes `BrokerResponse\n`. Request/response is strictly sequential.
+//!   writes `BrokerResponse\n`. The channel is pipelined — several ops may be
+//!   outstanding at once, and each response is matched to its request by
+//!   `request_id`, never by arrival order.
 //! - **GuestSocat (multiplexed)**: daemon writes `BrokerRequest { op:
 //!   GuestSocat { stream_token: Some(token) } }\n` on the **control**
 //!   connection. Agent replies `BrokerResponse { result: StreamReady }\n`
@@ -41,9 +43,11 @@
 //!   before beginning the raw byte-pump. The daemon correlates the stream
 //!   connection to the pending op by token. Control connection stays alive
 //!   and can immediately serve the next op.
-//! - **Heartbeat**: daemon may send `PING\n` (plain text, not JSON) and
-//!   expects `PONG\n` in reply. This coexists with the op framing because
-//!   ops are sequential and heartbeats are sent between ops.
+//! - **Heartbeat**: either side may send `PING\n` (plain text, not JSON) and
+//!   expects `PONG\n` in reply. A heartbeat can land at any point, including
+//!   between a request and its response; every reader classifies each frame
+//!   before interpreting it, rather than assuming the next frame is the one
+//!   it is waiting for.
 //!
 //! # Security invariants (enforce at every code-path, do not relax)
 //!
@@ -476,13 +480,25 @@ mod imp {
     /// answering any daemon→agent `PING` with `PONG`). The op task writes its
     /// `BrokerResponse` when it completes.
     ///
+    /// # Concurrent ops
+    ///
+    /// The daemon pipelines: several ops may be outstanding at once, so several
+    /// op tasks may be running here at once. Two things make that safe.
+    ///
     /// The control-connection write half is shared between the `select!` loop and
-    /// the spawned op task via `Arc<Mutex<…>>`. Every write acquires the lock for
-    /// the duration of a single complete frame, so heartbeat, PONG, and response
-    /// frames never interleave on the wire. The daemon serializes control-plane
-    /// ops (one request in flight, response awaited before the next is sent — see
-    /// the protocol doc-comment), so at most one op task runs at a time and op
-    /// responses cannot be reordered.
+    /// every spawned op task via `Arc<Mutex<…>>`. Each write acquires the lock for
+    /// the duration of a complete frame — the JSON body *and* its terminating
+    /// newline — so heartbeat, PONG and response frames never interleave on the
+    /// wire no matter how many tasks are writing.
+    ///
+    /// Op responses may be *reordered* relative to the requests that produced
+    /// them, because each op task writes when its own op finishes. That is
+    /// expected: `request_id` is what correlates a response to its request, and
+    /// the daemon relies on nothing else.
+    ///
+    /// The handlers themselves are safe to run concurrently. What was examined
+    /// to establish that, and which invariants each surface depends on, is
+    /// recorded in `docs/internal/agent-handler-concurrency-audit.md`.
     async fn run_protocol_loop(stream: tokio::net::UnixStream, own_uid: u32, run_ctx: &RunContext) {
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -609,10 +625,15 @@ mod imp {
                                 // The agent will reconnect after the stream ends.
                                 //
                                 // Recover the owned write half from the shared Arc/Mutex so it
-                                // can be reunited with the reader half. The legacy GuestSocat op
-                                // consumes the connection; no spawned op task or heartbeat write
-                                // is in flight against this Arc on this path (the daemon sends one
-                                // op at a time), so the Arc holds the single strong reference here.
+                                // can be reunited with the reader half. This requires the Arc to
+                                // hold the single strong reference, which is only true when no op
+                                // task is running — and with a pipelining daemon that is no longer
+                                // guaranteed. A daemon new enough to pipeline always sends a
+                                // stream_token and never reaches this path; one old enough to
+                                // reach it sends one op at a time. The `Err` arm below covers the
+                                // combination that should not occur: the connection closes and the
+                                // agent reconnects, which is the same recovery the legacy path
+                                // already performs after every stream.
                                 let writer_half = match Arc::try_unwrap(writer) {
                                     Ok(m) => m.into_inner(),
                                     Err(_) => {

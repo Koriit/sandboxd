@@ -23,6 +23,17 @@
 //!
 //! The daemon-set `QEMU_SYSTEM_*` and `SANDBOX_QEMU_*` env vars for the
 //! qemu-wrapper are injected here for the `Start` and `Create` ops.
+//!
+//! # Concurrency
+//!
+//! Handlers run concurrently: the daemon pipelines ops, and each one is
+//! dispatched on its own task. A new handler must not assume it is the only
+//! one running. Two constraints in particular are not obvious from the code —
+//! the process-wide `umask` this module relies on, and the fact that the
+//! runtime is single-threaded, so blocking it stalls every other op and the
+//! heartbeat. Both, and the invariants the existing handlers depend on, are
+//! written up in `docs/internal/agent-handler-concurrency-audit.md`; read it
+//! before adding a handler that touches shared state.
 
 use std::process::Stdio;
 
@@ -100,9 +111,22 @@ fn build_env(lima_home: &str, op_home: &str, extra: &[(&str, &str)]) -> Vec<(Str
     env
 }
 
-/// Resolve the operator's home directory via `getpwuid_r`.
-/// Returns `None` if the uid cannot be resolved.
-fn resolve_op_home(op_uid: u32) -> Option<String> {
+/// Resolve the operator's home directory via `getpwuid_r`, off the runtime.
+///
+/// `getpwuid_r` is a Directory Services lookup: on a directory-backed account
+/// it can block for as long as the directory takes to answer. The agent's
+/// runtime is single-threaded, so blocking it stalls the heartbeat and every
+/// concurrently-running op — not just the caller. `spawn_blocking` moves the
+/// call to the blocking pool, which a current-thread runtime still has.
+async fn resolve_op_home(op_uid: u32) -> Option<String> {
+    tokio::task::spawn_blocking(move || resolve_op_home_blocking(op_uid))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The blocking body of [`resolve_op_home`].
+fn resolve_op_home_blocking(op_uid: u32) -> Option<String> {
     let bufsize = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
     let bufsize = if bufsize <= 0 { 1024 } else { bufsize as usize };
     let mut buf = vec![0i8; bufsize];
@@ -285,7 +309,9 @@ async fn run_limactl(ctx: &RunContext, argv: &[&str], extra_env: &[(&str, &str)]
         }
     };
 
-    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let op_home = resolve_op_home(ctx.own_uid)
+        .await
+        .unwrap_or_else(|| "/nonexistent".to_string());
     let env = build_env(&ctx.lima_home, &op_home, extra_env);
 
     let mut cmd = Command::new(&limactl);
@@ -346,7 +372,9 @@ async fn run_limactl_steps(ctx: &RunContext, steps: &[Vec<&str>]) -> Result<(), 
         }
     };
 
-    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let op_home = resolve_op_home(ctx.own_uid)
+        .await
+        .unwrap_or_else(|| "/nonexistent".to_string());
     let env = build_env(&ctx.lima_home, &op_home, &[]);
 
     for (i, step) in steps.iter().enumerate() {
@@ -852,10 +880,15 @@ async fn handle_run_rsync(
         return BrokerResult::Rejected { reason };
     }
 
+    // The container transport is built from the shared argv crate so it stays
+    // identical to the one the daemon builds for the same op. No forwarded
+    // socket is carried on this op today, so the fragment resolves to the
+    // host-daemon form; when a socket field arrives the `Some` arm here and the
+    // daemon's are the same function.
     let transport = if backend == "lima" {
-        "limactl shell"
+        "limactl shell".to_string()
     } else {
-        "docker exec -i"
+        sandbox_docker_argv::exec_rsh_transport(None)
     };
 
     // Ensure trailing slash for rsync source/destination.
@@ -886,12 +919,14 @@ async fn handle_run_rsync(
         rsync_args.push("--filter=:- .gitignore".to_string());
     }
     rsync_args.push("-e".to_string());
-    rsync_args.push(transport.to_string());
+    rsync_args.push(transport);
     rsync_args.push("--mkpath".to_string());
     rsync_args.push(src);
     rsync_args.push(dst);
 
-    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let op_home = resolve_op_home(ctx.own_uid)
+        .await
+        .unwrap_or_else(|| "/nonexistent".to_string());
     let env = build_env(&ctx.lima_home, &op_home, &[]);
 
     let mut cmd = Command::new(&rsync_path);
@@ -1171,7 +1206,27 @@ async fn handle_restrict_on_verify(ctx: &RunContext, vm: String) -> BrokerResult
     //   - QMP unavailable (socket missing / connect failed) → fall through to marker.
     //   - QMP reachable + restrict=on → RestrictConfirmed.
     //   - QMP reachable + restrict NOT on → RestrictNotConfirmed (hard, no marker fallback).
-    match query_restrict_on_via_qmp(&ctx.lima_home, &vm) {
+    // Off the runtime: the QMP exchange is synchronous socket I/O with read and
+    // write timeouts measured in seconds. The agent's runtime is
+    // single-threaded, so running it inline stalls the heartbeat and every
+    // concurrently-running op for the duration.
+    let qmp_lima_home = ctx.lima_home.clone();
+    let qmp_vm = vm.clone();
+    let qmp_outcome =
+        tokio::task::spawn_blocking(move || query_restrict_on_via_qmp(&qmp_lima_home, &qmp_vm))
+            .await;
+    let qmp_outcome = match qmp_outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The blocking task panicked or was cancelled. Neither is a
+            // restrict=off finding, so fall back to the marker file rather
+            // than failing the session on an inconclusive check.
+            warn!(vm, error = %e, "QMP query task did not complete; falling back to marker");
+            Ok(None)
+        }
+    };
+
+    match qmp_outcome {
         Ok(Some(netdev_token)) => {
             info!(vm, "restrict=on confirmed via QMP query-netdev");
             return BrokerResult::RestrictConfirmed { vm, netdev_token };
@@ -1323,7 +1378,9 @@ where
         }
     };
 
-    let op_home = resolve_op_home(ctx.own_uid).unwrap_or_else(|| "/nonexistent".to_string());
+    let op_home = resolve_op_home(ctx.own_uid)
+        .await
+        .unwrap_or_else(|| "/nonexistent".to_string());
     let env = build_env(&ctx.lima_home, &op_home, &[]);
 
     // Spawn `limactl shell <vm> -- socat - TCP:127.0.0.1:5123` with async
