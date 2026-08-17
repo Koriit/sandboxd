@@ -941,7 +941,7 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
                 | ContainerCommand::GatewayHealthcheck
                 | ContainerCommand::ComponentProbe { .. }
                 | ContainerCommand::ListNftTable { .. }
-                | ContainerCommand::EnvoyActiveListenerCount => {}
+                | ContainerCommand::EnvoyStat { .. } => {}
             }
         }
         DockerOp::ContainerExecStdin {
@@ -2024,9 +2024,10 @@ user:
     mod docker {
         use super::super::*;
         use crate::protocol::{
-            ContainerCommand, ContainerCreateSpec, DockerOp, FileDelivery, GatewayComponent,
-            GatewayFile, InspectFlag, InspectFormat, NetworkCreateSpec, NetworkDriver,
-            NetworkOption, NftTable, RemoveForce, StagedImage, StdinCommand, WorkspaceBindSpec,
+            ContainerCommand, ContainerCreateSpec, DockerOp, EnvoyStat, FileDelivery,
+            GatewayComponent, GatewayFile, InspectFlag, InspectFormat, NetworkCreateSpec,
+            NetworkDriver, NetworkOption, NftTable, RemoveForce, StagedImage, StdinCommand,
+            WorkspaceBindSpec,
         };
 
         fn create_spec() -> ContainerCreateSpec {
@@ -2065,8 +2066,15 @@ user:
             }
         }
 
-        /// Every op the daemon can send, in its well-formed shape. Held in one
-        /// list so the acceptance test and the count check read the same set.
+        /// Every op the daemon can send, in its well-formed shape, with
+        /// realistic field values.
+        ///
+        /// This is the mirror of `broker.rs`'s `docker_wire::every_op`, which
+        /// holds the same set on the sending side. Keeping the acceptance
+        /// check here — rather than importing this validator into the daemon's
+        /// target — is what stops the whole validation suite from running
+        /// twice. The two lists are held in step by the count assertion below,
+        /// which is the same number on both sides.
         fn every_op() -> Vec<DockerOp> {
             vec![
                 DockerOp::ContainerCreate {
@@ -2551,7 +2559,12 @@ user:
                 ContainerCommand::ListNftTable {
                     table: NftTable::SandboxPolicy,
                 },
-                ContainerCommand::EnvoyActiveListenerCount,
+                ContainerCommand::EnvoyStat {
+                    stat: EnvoyStat::LdsCounters,
+                },
+                ContainerCommand::EnvoyStat {
+                    stat: EnvoyStat::ActiveListeners,
+                },
             ] {
                 assert!(
                     validate_docker_op(&DockerOp::ContainerExec {

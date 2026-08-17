@@ -517,8 +517,20 @@ pub enum ContainerCommand {
     ReadGatewayFile { file: GatewayFile },
     /// List one of the two sandbox nftables tables.
     ListNftTable { table: NftTable },
-    /// Read Envoy's active-listener gauge from its admin endpoint.
-    EnvoyActiveListenerCount,
+    /// Read one of the enumerated Envoy admin statistics.
+    EnvoyStat { stat: EnvoyStat },
+}
+
+/// The Envoy admin `/stats` queries the daemon may run.
+///
+/// Envoy's `filter` parameter is a regex, so a free-form filter would read
+/// whatever it liked out of the admin surface — see the warning on
+/// `sandbox_docker_argv::gateway::EnvoyStat`, which this mirrors.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvoyStat {
+    ActiveListeners,
+    LdsCounters,
 }
 
 /// The closed set of commands the daemon may feed a body to on stdin.
@@ -768,6 +780,15 @@ impl From<FileDelivery> for sandbox_docker_argv::gateway::FileDelivery {
     }
 }
 
+impl From<EnvoyStat> for sandbox_docker_argv::gateway::EnvoyStat {
+    fn from(value: EnvoyStat) -> Self {
+        match value {
+            EnvoyStat::ActiveListeners => Self::ActiveListeners,
+            EnvoyStat::LdsCounters => Self::LdsCounters,
+        }
+    }
+}
+
 impl From<NftTable> for sandbox_docker_argv::gateway::NftTable {
     fn from(value: NftTable) -> Self {
         match value {
@@ -804,7 +825,9 @@ impl From<&ContainerCommand> for sandbox_docker_argv::container::ContainerComman
             ContainerCommand::ListNftTable { table } => Self::ListNftTable {
                 table: (*table).into(),
             },
-            ContainerCommand::EnvoyActiveListenerCount => Self::EnvoyActiveListenerCount,
+            ContainerCommand::EnvoyStat { stat } => Self::EnvoyStat {
+                stat: (*stat).into(),
+            },
         }
     }
 }
@@ -961,6 +984,16 @@ impl From<sandbox_docker_argv::gateway::FileDelivery> for FileDelivery {
     }
 }
 
+impl From<sandbox_docker_argv::gateway::EnvoyStat> for EnvoyStat {
+    fn from(value: sandbox_docker_argv::gateway::EnvoyStat) -> Self {
+        use sandbox_docker_argv::gateway::EnvoyStat as Src;
+        match value {
+            Src::ActiveListeners => Self::ActiveListeners,
+            Src::LdsCounters => Self::LdsCounters,
+        }
+    }
+}
+
 impl From<sandbox_docker_argv::gateway::NftTable> for NftTable {
     fn from(value: sandbox_docker_argv::gateway::NftTable) -> Self {
         use sandbox_docker_argv::gateway::NftTable as Src;
@@ -1000,7 +1033,9 @@ impl From<&sandbox_docker_argv::container::ContainerCommand> for ContainerComman
             Src::ListNftTable { table } => Self::ListNftTable {
                 table: (*table).into(),
             },
-            Src::EnvoyActiveListenerCount => Self::EnvoyActiveListenerCount,
+            Src::EnvoyStat { stat } => Self::EnvoyStat {
+                stat: (*stat).into(),
+            },
         }
     }
 }

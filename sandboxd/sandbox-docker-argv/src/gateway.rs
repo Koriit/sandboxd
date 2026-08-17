@@ -62,14 +62,67 @@ pub const MITMPROXY_CA_KEY_IN_CONTAINER: &str = "/root/.mitmproxy/mitmproxy-ca.p
 /// Absolute path of the per-session mitmproxy CA certificate.
 pub const MITMPROXY_CA_CERT_IN_CONTAINER: &str = "/root/.mitmproxy/mitmproxy-ca-cert.pem";
 
-/// Envoy admin `/stats` URL for the active-listener gauge.
+// ---------------------------------------------------------------------------
+// EnvoyStat
+// ---------------------------------------------------------------------------
+
+/// The closed set of Envoy admin `/stats` queries the daemon may run.
 ///
-/// One argv element, never a shell word: the `&` separating the query
-/// parameters has to reach Envoy as a separator rather than being read as a
-/// background operator.
-pub const ENVOY_ACTIVE_LISTENERS_STATS_URL: &str = "http://127.0.0.1:9901/stats?\
-     filter=^listener_manager\\.total_listeners_active$&\
-     format=text";
+/// Envoy's `/stats` endpoint takes a **regex** in its `filter` parameter, so a
+/// caller-supplied filter reads whatever it likes out of the admin surface —
+/// cluster membership, upstream addresses, TLS counters. That is the same
+/// hazard `InspectFormat` exists for, one endpoint over.
+///
+/// # Adding a variant is a security change
+///
+/// Each variant is a slice of the admin surface the daemon can read out of a
+/// container terminating TLS for a whole session. Name the question, not the
+/// filter — `LdsCounters`, not `ListenerManagerRegex` — and check whether an
+/// existing variant already answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvoyStat {
+    /// `listener_manager.total_listeners_active` — is Envoy serving a
+    /// listener at all?
+    ActiveListeners,
+    /// The three `listener_manager.lds.update_*` counters, read together so
+    /// one round trip attributes an LDS update as accepted or rejected.
+    LdsCounters,
+}
+
+impl EnvoyStat {
+    /// Both queries, for exhaustive iteration in tests.
+    pub const ALL: &'static [EnvoyStat] = &[EnvoyStat::ActiveListeners, EnvoyStat::LdsCounters];
+
+    /// The admin `/stats` URL this query reads.
+    ///
+    /// One argv element, never a shell word: the `&` separating the query
+    /// parameters has to reach Envoy as a separator rather than being read
+    /// as a background operator. Both filters are anchored (`^…$`) so a
+    /// query cannot widen into the neighbouring counter families.
+    pub fn url(self) -> &'static str {
+        match self {
+            EnvoyStat::ActiveListeners => {
+                "http://127.0.0.1:9901/stats?\
+                 filter=^listener_manager\\.total_listeners_active$&\
+                 format=text"
+            }
+            EnvoyStat::LdsCounters => {
+                "http://127.0.0.1:9901/stats?\
+                 filter=^listener_manager\\.lds\\.\
+                 (update_attempt|update_success|update_rejected)$&\
+                 format=text"
+            }
+        }
+    }
+
+    /// A stable label for logs and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnvoyStat::ActiveListeners => "active-listeners",
+            EnvoyStat::LdsCounters => "lds-counters",
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GatewayFile
@@ -511,13 +564,27 @@ mod tests {
         assert_eq!(NftTable::ALL.len(), 2);
     }
 
-    /// The stats URL is one argv element on purpose: the `&` separates two
+    /// Each stats URL is one argv element on purpose: the `&` separates two
     /// query parameters for Envoy, and a shell would read it as a job-control
-    /// operator.
+    /// operator. Both filters are anchored, so neither can widen into a
+    /// neighbouring counter family.
     #[test]
-    fn the_stats_url_is_a_single_query_string() {
-        assert!(ENVOY_ACTIVE_LISTENERS_STATS_URL.contains("filter=^listener_manager"));
-        assert!(ENVOY_ACTIVE_LISTENERS_STATS_URL.contains("&format=text"));
-        assert!(!ENVOY_ACTIVE_LISTENERS_STATS_URL.contains(' '));
+    fn every_stats_url_is_a_single_anchored_query_string() {
+        for stat in EnvoyStat::ALL {
+            let url = stat.url();
+            assert!(!url.contains(' '), "{}: {url}", stat.as_str());
+            assert!(url.contains("filter=^listener_manager"), "{url}");
+            assert!(url.contains("$&format=text"), "{url}");
+        }
+        assert!(
+            EnvoyStat::ActiveListeners
+                .url()
+                .contains("total_listeners_active")
+        );
+        assert!(EnvoyStat::LdsCounters.url().contains("update_rejected"));
+        assert_ne!(
+            EnvoyStat::ActiveListeners.url(),
+            EnvoyStat::LdsCounters.url()
+        );
     }
 }

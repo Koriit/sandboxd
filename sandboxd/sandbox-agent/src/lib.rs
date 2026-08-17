@@ -19,31 +19,32 @@ pub use protocol::{BridgePair, BrokerOp, BrokerRequest, BrokerResponse, BrokerRe
 /// can construct the same requests the agent validates.
 #[cfg(target_os = "macos")]
 pub use protocol::{
-    ContainerCommand, ContainerCreateSpec, DockerOp, FileDelivery, GatewayComponent, GatewayFile,
-    InspectFlag, InspectFormat, NetworkCreateSpec, NetworkDriver, NetworkOption, NftTable,
-    RemoveForce, StagedImage, StdinCommand, WorkspaceBindSpec, docker_argv,
+    ContainerCommand, ContainerCreateSpec, DockerOp, EnvoyStat, FileDelivery, GatewayComponent,
+    GatewayFile, InspectFlag, InspectFormat, NetworkCreateSpec, NetworkDriver, NetworkOption,
+    NftTable, RemoveForce, StagedImage, StdinCommand, WorkspaceBindSpec, docker_argv,
 };
 
 #[cfg(target_os = "macos")]
 pub use protocol::{RESTRICT_MARKER_FILENAME, RESTRICT_ON_MARKER, STREAM_CONNECT_PREFIX};
 
-/// The agent's own Docker-op validator, exported so the daemon side can
-/// assert that every op it constructs is one the agent accepts.
-///
-/// **This is not a pre-check the agent then trusts.** The agent calls this
-/// itself, on every op, from `handle_docker` — that call is the control.
-/// Exporting it lets a test on the sending side notice at build time that
-/// the two halves have drifted, instead of a production op being refused by
-/// an agent nobody could ask.
-#[cfg(target_os = "macos")]
-pub use validation::{MAX_GATEWAY_ARTIFACT_BYTES, validate_docker_op};
-
 #[cfg(target_os = "macos")]
 mod protocol;
 
-// The binary target compiles its own copy of this module and uses all of
-// it; the library target needs only the Docker validator above. The rest is
-// dead here by construction, not by neglect.
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-mod validation;
+// `validation` is deliberately NOT compiled into this library target, even
+// though exporting `validate_docker_op` from here would let the daemon's
+// tests assert that every op it builds is one the agent accepts.
+//
+// The binary target already declares its own `mod validation`, so adding a
+// second declaration here compiles the module twice — and runs its ~90 unit
+// tests twice, once per target. That inflates the workspace test count by a
+// figure unrelated to any test anybody wrote, which is how a baseline stops
+// being comparable across revisions. It was measured, not theorised: adding
+// it took `make test` from 2325 to 2418 without a single new assertion.
+//
+// The cross-check that export was for lives on the agent side instead, in
+// `validation`'s own tests, where the op list it validates sits next to the
+// list `broker.rs` sends; the two are held in step by a shared count
+// assertion. Making the binary consume this library's modules rather than
+// recompiling them would give back the export for free, but that is a
+// restructuring of the agent crate and does not belong to a change about
+// the egress plane.

@@ -537,13 +537,12 @@ pub enum ContainerCommand {
     /// The other half of the rollback snapshot: the ruleset currently in
     /// force, as `nft` prints it.
     ListNftTable { table: crate::gateway::NftTable },
-    /// Read Envoy's active-listener gauge from its admin endpoint.
+    /// Read one of the enumerated Envoy admin statistics.
     ///
-    /// The URL is a constant
-    /// ([`crate::gateway::ENVOY_ACTIVE_LISTENERS_STATS_URL`]) passed as one
+    /// The URL is a constant of [`crate::gateway::EnvoyStat`] passed as one
     /// argv element, so the `&` in its query string reaches Envoy rather
     /// than a shell.
-    EnvoyActiveListenerCount,
+    EnvoyStat { stat: crate::gateway::EnvoyStat },
 }
 
 /// The gateway container's five long-running components.
@@ -657,10 +656,10 @@ impl ContainerCommand {
                 "inet".to_string(),
                 table.name().to_string(),
             ],
-            ContainerCommand::EnvoyActiveListenerCount => vec![
+            ContainerCommand::EnvoyStat { stat } => vec![
                 "curl".to_string(),
                 "-sf".to_string(),
-                crate::gateway::ENVOY_ACTIVE_LISTENERS_STATS_URL.to_string(),
+                stat.url().to_string(),
             ],
         }
     }
@@ -1069,14 +1068,16 @@ mod tests {
     /// `&` would reach the container as a separate word and the probe would
     /// read a different (or no) counter.
     #[test]
-    fn the_envoy_stat_probe_passes_its_url_as_one_element() {
-        let argv = container_exec_argv(
-            "sandbox-gw-abc",
-            &ContainerCommand::EnvoyActiveListenerCount,
-        );
-        assert_eq!(argv.len(), 5);
-        assert_eq!(&argv[..4], &["exec", "sandbox-gw-abc", "curl", "-sf"]);
-        assert_eq!(argv[4], crate::gateway::ENVOY_ACTIVE_LISTENERS_STATS_URL);
+    fn every_envoy_stat_probe_passes_its_url_as_one_element() {
+        for stat in crate::gateway::EnvoyStat::ALL {
+            let argv = container_exec_argv(
+                "sandbox-gw-abc",
+                &ContainerCommand::EnvoyStat { stat: *stat },
+            );
+            assert_eq!(argv.len(), 5, "{argv:?}");
+            assert_eq!(&argv[..4], &["exec", "sandbox-gw-abc", "curl", "-sf"]);
+            assert_eq!(argv[4], stat.url());
+        }
     }
 
     /// `-i` is the difference between writing the artifact and truncating

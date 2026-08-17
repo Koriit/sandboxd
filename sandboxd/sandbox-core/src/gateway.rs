@@ -12,7 +12,7 @@ use crate::atomic_listener_writer::{
 use sandbox_docker_argv::container::{
     ContainerCommand, GatewayComponent, InspectFlag, InspectFormat, RemoveForce,
 };
-use sandbox_docker_argv::gateway::{GatewayFile, StdinCommand};
+use sandbox_docker_argv::gateway::{EnvoyStat, GatewayFile, StdinCommand};
 
 use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
@@ -1059,17 +1059,19 @@ impl GatewayManager {
     ///     can call this without re-implementing the docker-exec
     ///     plumbing.
     ///
-    /// Implementation: [`ContainerCommand::EnvoyActiveListenerCount`], whose
-    /// URL is a constant of the argv crate — the `&` in it must reach Envoy
-    /// as a real query-string separator, so it travels as one argv element
-    /// and never through a shell.
+    /// Implementation: the enumerated [`EnvoyStat::ActiveListeners`] query,
+    /// whose URL is a constant of the argv crate — the `&` in it must reach
+    /// Envoy as a real query-string separator, so it travels as one argv
+    /// element and never through a shell.
     pub fn gateway_listener_active_count(&self, session_id: &SessionId) -> Option<u64> {
         let container_name = container_name(session_id);
         let output = self
             .run_op(
                 DockerOp::ContainerExec {
                     name: container_name,
-                    command: ContainerCommand::EnvoyActiveListenerCount,
+                    command: ContainerCommand::EnvoyStat {
+                        stat: EnvoyStat::ActiveListeners,
+                    },
                 },
                 DOCKER_INSPECT_TIMEOUT,
                 "docker exec (envoy listener_active probe)",

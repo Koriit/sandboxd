@@ -65,9 +65,12 @@
 //! return canned counters to exercise the success / reject /
 //! timeout paths hermetically without a real Envoy.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
+use sandbox_docker_argv::container::ContainerCommand;
+use sandbox_docker_argv::gateway::EnvoyStat;
+
+use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
 use crate::gateway::container_name;
 use crate::session::SessionId;
@@ -131,73 +134,79 @@ pub trait LdsStatsProbe: Send + Sync {
 /// once every 100ms at most.
 pub struct DockerExecLdsProbe {
     container: String,
-    /// Forwarded gateway-VM Docker socket, or `None` for the host socket.
-    /// On Linux this is always `None`, so no `-H` flag is emitted and the
-    /// `docker exec` behaves byte-for-byte as before. On macOS the probe
-    /// must target the in-VM gateway socket or `docker exec` reports
-    /// `No such container`.
-    docker_socket: Option<PathBuf>,
+    /// Where the probe's `docker exec` goes. The host daemon on Linux; the
+    /// Docker daemon inside the gateway VM on macOS, where a host `docker
+    /// exec` would report `No such container`.
+    route: DockerRoute,
 }
 
 impl DockerExecLdsProbe {
     /// Build a probe for the gateway container of `session_id` targeting
-    /// the host Docker socket (no `-H` flag) — the Linux path.
+    /// the host Docker daemon — the Linux path.
     pub fn new(session_id: &SessionId) -> Self {
-        Self {
-            container: container_name(session_id),
-            docker_socket: None,
-        }
+        Self::on_route(session_id, DockerRoute::Host)
     }
 
-    /// Build a probe for the gateway container of `session_id`, optionally
-    /// routing through a forwarded gateway-VM Docker socket.
+    /// Build a probe for the gateway container of `session_id` on `route`.
     ///
-    /// `socket = None` is identical to [`Self::new`] (host socket). On
-    /// macOS, pass `Some(path)` so the Envoy-admin `docker exec curl`
-    /// reaches the gateway container running inside the gateway Lima VM.
-    pub fn new_with_socket(session_id: &SessionId, socket: Option<PathBuf>) -> Self {
+    /// Callers pass the gateway manager's own route so the probe reads the
+    /// counters of the Envoy the listener writes went to.
+    pub fn on_route(session_id: &SessionId, route: DockerRoute) -> Self {
         Self {
             container: container_name(session_id),
-            docker_socket: socket,
+            route,
         }
     }
 }
+
+/// Wall-clock budget for one `/stats` read.
+///
+/// `wait_for_lds_ack` polls on a short interval against its own deadline, so
+/// a probe that outlives this is better abandoned than left to queue behind
+/// the next poll. A transient failure is already treated as "keep polling".
+const LDS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl LdsStatsProbe for DockerExecLdsProbe {
     fn fetch_counters(
         &self,
     ) -> impl std::future::Future<Output = Result<LdsCounters, SandboxError>> + Send {
         let container = self.container.clone();
-        let docker_socket = self.docker_socket.clone();
+        let route = self.route.clone();
         async move {
-            // Single round-trip pulls all three counters via Envoy's
-            // regex-based `/stats` filter. Anchoring on `$` prevents
-            // matching the broader `lds.update_attempt_*` family.
-            // The shell is invoked with `sh -c` because the `&` in
-            // the URL must reach Envoy as a real query-string
-            // separator, not be interpreted as a shell background
-            // operator (the integration-test helper at
-            // `tests/gateway_integration.rs:421` documents the same
-            // quoting issue).
+            // One round trip pulls all three counters through the enumerated
+            // `LdsCounters` query, whose anchored filter is a constant of the
+            // argv crate — the `&` in it reaches Envoy as a query-string
+            // separator because it travels as one argv element and never
+            // through a shell.
             //
             // Note: we rely on Envoy's text format: `name: value`.
-            let url = "http://127.0.0.1:9901/stats?\
-                       filter=^listener_manager\\.lds\\.\
-                       (update_attempt|update_success|update_rejected)$&\
-                       format=text";
-            let mut cmd = tokio::process::Command::new("docker");
-            if let Some(sock) = &docker_socket {
-                cmd.args(["-H", &format!("unix://{}", sock.display())]);
-            }
-            let output = cmd
-                .args(["exec", &container, "curl", "-sf", url])
-                .output()
-                .await
-                .map_err(|e| {
-                    SandboxError::Gateway(format!(
-                        "failed to exec curl in {container} for LDS stats: {e}"
-                    ))
-                })?;
+            //
+            // `spawn_blocking` because the op seam is one-shot and blocking
+            // (the project's `std::process::Command` convention). This is a
+            // poll, not a pump: each call is a single exec that returns, and
+            // the loop belongs to `wait_for_lds_ack`, so it is not the
+            // long-lived shape the async-I/O carve-out is about.
+            let op = DockerOp::ContainerExec {
+                name: container.clone(),
+                command: ContainerCommand::EnvoyStat {
+                    stat: EnvoyStat::LdsCounters,
+                },
+            };
+            let probe_container = container.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                route.run(op, LDS_PROBE_TIMEOUT, "docker exec (Envoy LDS stats)")
+            })
+            .await
+            .map_err(|e| {
+                SandboxError::Gateway(format!(
+                    "LDS stats probe for {probe_container} did not complete: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                SandboxError::Gateway(format!(
+                    "failed to exec curl in {container} for LDS stats: {e}"
+                ))
+            })?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(SandboxError::Gateway(format!(
@@ -542,5 +551,47 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, LdsAckOutcome::TimedOut);
+    }
+
+    /// The production probe reads its counters through the enumerated
+    /// query, on the caller's route, with no `-H` in the op and no shell.
+    /// The URL has to survive as one argv element — split in two, the `&`
+    /// would reach the container as a separate word and the probe would
+    /// read a different counter set or none.
+    #[test]
+    fn the_production_probe_reads_the_enumerated_lds_query() {
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
+        let op = DockerOp::ContainerExec {
+            name: container_name(&session_id),
+            command: ContainerCommand::EnvoyStat {
+                stat: EnvoyStat::LdsCounters,
+            },
+        };
+        let argv = op.argv().expect("the stats op renders");
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "sandbox-gw-550e8400e29b",
+                "curl",
+                "-sf",
+                EnvoyStat::LdsCounters.url(),
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "sh" || a == "-H"));
+        // The query must name all three counters the delta attribution
+        // needs; losing one silently turns Accepted into TimedOut.
+        for counter in ["update_attempt", "update_success", "update_rejected"] {
+            assert!(EnvoyStat::LdsCounters.url().contains(counter));
+        }
+    }
+
+    /// The host constructor keeps the host route — the Linux shape.
+    #[test]
+    fn the_default_probe_takes_the_host_route() {
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
+        let probe = DockerExecLdsProbe::new(&session_id);
+        assert!(!probe.route.is_vm());
+        assert_eq!(probe.container, "sandbox-gw-550e8400e29b");
     }
 }

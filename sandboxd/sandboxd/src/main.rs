@@ -4276,36 +4276,6 @@ fn gateway_for_policy(state: &AppState) -> Arc<GatewayManager> {
     Arc::clone(&state.gateway)
 }
 
-/// Return the forwarded gateway-VM Docker socket for the one remaining probe
-/// that shells out to `docker` directly: the Envoy LDS-ack `/stats` poll in
-/// [`DockerExecLdsProbe`].
-///
-/// `None` on Linux (host Docker socket, no `-H` flag — unchanged behaviour);
-/// `Some(path)` on macOS so the bare `docker exec` reaches the in-VM gateway
-/// container.
-///
-/// Every other policy-plane operation takes the gateway manager's typed
-/// route. This one is left on a socket because it is an async
-/// `tokio::process` poll on the same footing as the long-lived streams —
-/// it moves with them, not with the one-shot policy ops.
-fn policy_probe_socket(state: &AppState) -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        #[allow(clippy::needless_return)]
-        return Some(
-            state
-                .gateway_lima_manager
-                .gateway_docker_socket()
-                .to_path_buf(),
-        );
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state;
-        None
-    }
-}
-
 // ---------------------------------------------------------------------------
 // macOS Lima session lifecycle helpers
 // ---------------------------------------------------------------------------
@@ -8356,7 +8326,6 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     // it routes the loop's listener rewrite + nft injection through the
     // forwarded gateway-VM socket so they reach the in-VM gateway container.
     let gateway = gateway_for_policy(state);
-    let probe_socket = policy_probe_socket(state);
     let propagation_states = Arc::clone(&state.propagation_states);
     let event_bus = state.event_bus.clone();
 
@@ -8388,7 +8357,6 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
         dns_propagation_loop(
             sid,
             gateway,
-            probe_socket,
             network_info,
             session_policies,
             propagation_states,
@@ -8521,7 +8489,6 @@ async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
         // `propagate_dns_changes` (listener rewrite + nft) reaches the
         // in-VM gateway container.
         gateway: gateway_for_policy(state),
-        docker_socket: policy_probe_socket(state),
         session_policies: Arc::clone(&state.session_policies),
         dns_cache: cache,
         network_info,
@@ -8654,9 +8621,6 @@ async fn cancel_dns_gate_listener(session_id: &SessionId, state: &AppState) {
 struct DaemonGateService {
     session_id: SessionId,
     gateway: Arc<GatewayManager>,
-    /// Forwarded gateway-VM Docker socket for the bare-`docker` LDS-ack
-    /// probe. `None` on Linux (host socket), `Some` on macOS.
-    docker_socket: Option<std::path::PathBuf>,
     session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
     dns_cache: Arc<Mutex<DnsCache>>,
     network_info: NetworkInfo,
@@ -8706,8 +8670,7 @@ impl GateService for DaemonGateService {
         }
 
         // (3) Pre-snapshot Envoy LDS counters before the rewrite.
-        let probe =
-            DockerExecLdsProbe::new_with_socket(&self.session_id, self.docker_socket.clone());
+        let probe = DockerExecLdsProbe::on_route(&self.session_id, self.gateway.route().clone());
         let pre_counters = match probe.fetch_counters().await {
             Ok(c) => Some(c),
             Err(e) => {
@@ -8840,10 +8803,6 @@ impl GateService for DaemonGateService {
 async fn dns_propagation_loop(
     session_id: SessionId,
     gateway: Arc<GatewayManager>,
-    // Forwarded gateway-VM Docker socket for the bare-`docker` probes
-    // (`read_resolved_json`, the LDS-ack probe). `None` on Linux (host
-    // socket, no `-H`); `Some` on macOS so those reach the in-VM gateway.
-    probe_socket: Option<std::path::PathBuf>,
     network_info: sandbox_core::NetworkInfo,
     session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
     propagation_states: Arc<PropagationStates>,
@@ -8958,7 +8917,7 @@ async fn dns_propagation_loop(
         // observed at <250ms in the integration test. Empty
         // (stable_cache) cycles skip both rewrite and ack-wait —
         // there is no rewrite to ack.
-        let probe = DockerExecLdsProbe::new_with_socket(&session_id, probe_socket.clone());
+        let probe = DockerExecLdsProbe::on_route(&session_id, gateway.route().clone());
         let lds_ack_deadline = Duration::from_secs(5);
         let lds_poll_interval = Duration::from_millis(100);
         let propagate_ok = if stable_cache {

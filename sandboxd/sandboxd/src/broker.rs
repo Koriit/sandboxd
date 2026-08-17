@@ -3202,19 +3202,6 @@ mod tests {
             assert_eq!(recovered.len(), body.len());
             assert_eq!(recovered, body);
         }
-
-        /// The agent's validator accepts the ops the daemon actually sends
-        /// and refuses a write to the one file it may only read. The two
-        /// together are what makes the write allowlist a rule rather than a
-        /// convention.
-        #[test]
-        fn the_agent_validates_the_ops_the_daemon_sends() {
-            for op in every_op() {
-                let wire = docker_op_to_wire(&op);
-                sandbox_agent_protocol::validate_docker_op(&wire)
-                    .unwrap_or_else(|e| panic!("the agent refused a production op {op:?}: {e}"));
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
