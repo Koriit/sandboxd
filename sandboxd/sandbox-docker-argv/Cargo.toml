@@ -1,0 +1,13 @@
+[package]
+name = "sandbox-docker-argv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Intentionally empty. This crate is a leaf: it must be depended on by both
+# `sandbox-core` and `sandbox-agent`, and `sandbox-agent` deliberately carries
+# no `sandbox-core` dependency (see the crate-level docs in src/lib.rs). Adding
+# a dependency here widens the agent's trust base, so any addition needs the
+# same review a new agent dependency would get.
+[dependencies]

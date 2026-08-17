@@ -181,20 +181,15 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
         Some(t) => t.to_string(),
         None => match opts.backend {
             BackendKind::Lima => LIMACTL_SHELL_TOKEN.to_string(),
-            // `-i` forwards stdin into the container so rsync can speak
-            // its binary protocol both ways. No `-t` — a TTY would line-
-            // buffer and corrupt the wire format. Mirrors
-            // `plan_sync_command`.
-            //
             // On macOS lite the container runs inside the gateway VM, so the
             // `docker exec` must target the forwarded socket; otherwise rsync
             // hits the host docker daemon and finds no such container. Linux
-            // leaves `docker_socket` `None` — the token stays the historical
-            // `docker exec -i`.
-            BackendKind::Container => match opts.docker_socket.as_deref() {
-                Some(sock) => format!("docker -H unix://{sock} exec -i"),
-                None => "docker exec -i".to_string(),
-            },
+            // leaves `docker_socket` `None` — the transport stays the
+            // historical `docker exec -i`. The agent builds the same string on
+            // the macOS brokered path, so the shape is single-sourced.
+            BackendKind::Container => sandbox_docker_argv::exec_rsh_transport(
+                opts.docker_socket.as_deref().map(std::path::Path::new),
+            ),
         },
     };
 

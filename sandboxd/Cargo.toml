@@ -4,6 +4,7 @@ members = [
     "sandbox-agent",
     "sandbox-cli",
     "sandbox-core",
+    "sandbox-docker-argv",
     "sandbox-event-emitter",
     "sandbox-nft-allow-logger",
     "sandbox-nft-deny-logger",
@@ -62,3 +63,7 @@ time = "0.3"
 
 # Internal crates
 sandbox-core = { path = "sandbox-core" }
+# Zero-dependency leaf crate holding the `docker` argv fragments both
+# `sandbox-core` and `sandbox-agent` build. It is a separate crate precisely so
+# neither of those two has to depend on the other — see its crate docs.
+sandbox-docker-argv = { path = "sandbox-docker-argv" }

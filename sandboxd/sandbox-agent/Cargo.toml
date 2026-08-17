@@ -50,6 +50,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # regex: VM-name and path validation on the agent side, mirroring the lima-helper.
 regex = "1"
+# sandbox-docker-argv: the `docker` argv fragments the agent builds are the same
+# ones the daemon builds, so they come from one zero-dependency leaf crate
+# rather than being formatted independently on each side. It is NOT
+# `sandbox-core`: the agent's freedom from that dependency is the property the
+# leaf crate exists to preserve (see its crate docs). Scoped to macOS with the
+# rest of the agent's real dependencies — the Linux build is an inert stub.
+sandbox-docker-argv = { workspace = true }
 # serde_yaml: structural YAML parsing for lima.yaml shape validation. String-
 # based line matching cannot reliably detect flow-style, quoted keys, or
 # anchors/aliases — all reachable via a YAML serializer in a buggy daemon.

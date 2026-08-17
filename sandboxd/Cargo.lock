@@ -1770,6 +1770,7 @@ version = "0.1.10"
 dependencies = [
  "libc",
  "regex",
+ "sandbox-docker-argv",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1820,6 +1821,7 @@ dependencies = [
  "refinery",
  "ring",
  "rusqlite",
+ "sandbox-docker-argv",
  "schemars",
  "semver",
  "serde",
@@ -1833,6 +1835,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "sandbox-docker-argv"
+version = "0.1.10"
 
 [[package]]
 name = "sandbox-event-emitter"

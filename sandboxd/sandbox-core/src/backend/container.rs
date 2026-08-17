@@ -514,10 +514,10 @@ impl ContainerRuntime {
     /// difference is the presence or absence of the `-H` flag. Linux
     /// callers see zero overhead: `None` means no argument is prepended.
     pub fn docker_cmd(&self) -> std::process::Command {
-        let mut cmd = std::process::Command::new("docker");
-        if let Some(sock) = &self.docker_socket {
-            cmd.args(["-H", &format!("unix://{}", sock.display())]);
-        }
+        let mut cmd = std::process::Command::new(sandbox_docker_argv::DOCKER_BIN);
+        cmd.args(sandbox_docker_argv::host_args(
+            self.docker_socket.as_deref(),
+        ));
         cmd
     }
 
@@ -529,10 +529,10 @@ impl ContainerRuntime {
     /// Mirrors [`Self::docker_cmd`] but returns a `TokioCommand` for
     /// use in async contexts where blocking would stall the executor.
     pub fn docker_cmd_async(&self) -> TokioCommand {
-        let mut cmd = TokioCommand::new("docker");
-        if let Some(sock) = &self.docker_socket {
-            cmd.args(["-H", &format!("unix://{}", sock.display())]);
-        }
+        let mut cmd = TokioCommand::new(sandbox_docker_argv::DOCKER_BIN);
+        cmd.args(sandbox_docker_argv::host_args(
+            self.docker_socket.as_deref(),
+        ));
         cmd
     }
 
