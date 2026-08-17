@@ -1060,6 +1060,30 @@ Silently guessing an L2 parent interface — or an L2 *segment* — in the egres
 should not have a fallback: the guess is only ever right by coincidence, and the failure
 mode is silent misplacement rather than a refused create.
 
+⚠️ **There are five sites, not three. Found 2026-08-17 while implementing this fix; the
+two extra ones are named here because "three sites" is what a reader would otherwise check
+against.** The sweep was `format!("lima{`, `unwrap_or(0u16)` and `interface_for_slot` over
+`sandboxd/src/main.rs`, which is exhaustive for this shape. The three above, plus:
+
+- **`main.rs:6249-6255` — the `start_session` handler (restarting a *stopped* session).**
+  A bare guess of the identical shape. Structurally it is the **create** site, not the
+  restart site: it claims a **fresh** slot, so the persisted `bridge_name` names the
+  *previous* slot and falling back to it would be actively wrong. Hard-errored like create.
+  This is the site §4 phase 1's claim-site row calls "`claim_lima_slot` (restart)" at
+  `:6237` — the two rows use "restart" for two different functions, which is the most
+  likely reason it was missed.
+- **`main.rs:12574-12581` — the per-session gateway monitor's recovery path.** Same shape
+  as the `recover_gateway_lima` site this section does name — it re-creates one session's
+  gateway container from persisted `NetworkInfo` — carrying both the bare NIC guess and the
+  `unwrap_or(0u16)`. It sits in a `continue`-on-error monitor loop, so the refusal is
+  log-and-skip rather than a returned `Err`; that still fails closed, because no gateway
+  container comes up on a guessed segment.
+
+**Read the site count as a property of `main.rs` at a moment, not as a fact about the
+design.** The two additions were not a change of position — fix 4's closing sentence
+already asked for exactly this — but leaving them would have shipped the defect this
+section exists to remove at two live sites while recording it as closed.
+
 ### 1.5 The `config_n` / `effective_n` divergence — prevention, not repair
 
 **Be precise about this one; it is easy to overstate.**
@@ -3656,6 +3680,7 @@ enforces, with slot identity no longer positional.
 | `sandbox-core/src/gateway_lima.rs:1286`, `:872` | `create_instance(&self, slots: &[u16])` — slot set passed as an argument (§1.4 fix 3); threads through `ensure_ready` |
 | 15 call sites | `generate_gateway_template` — 1 production + 14 in tests across 13 test functions (§1.4 fix 3) |
 | `sandboxd/src/main.rs:4362-4370`, `:12811-12820` | replace the bare `unwrap_or_else(\|\| format!("lima{}", …))` with a hard error |
+| `sandboxd/src/main.rs:6249-6255`, `:12574-12581` | **two further sites of the same shape, added 2026-08-17** — the `start_session` fresh-claim guess and the per-session gateway monitor's. See §1.4 fix 4's five-sites note |
 | `sandboxd/src/main.rs:9884-9900` | **different site** — hard-error only when the persisted `bridge_name` is also empty (§1.4 fix 4) |
 | `sandboxd/src/main.rs:9884-9888`, `:12811-12816` | hard-error `unwrap_or(0u16)` on the **slot index** — the silent segment guess (§1.4 fix 4) |
 | `sandbox-core/src/gateway_lima.rs:99` | decide whether to bump `MIN_LIMA_VERSION` above 1.2.0, or add the runtime NIC-name assertion (§1.4 fix 1). ✅ **Decided 2026-08-17: the runtime assertion (fix 2's verification); the constant is unchanged.** Rationale at §1.4 fix 1 |

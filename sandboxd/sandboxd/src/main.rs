@@ -6261,14 +6261,20 @@ async fn start_session_macos_lima(
         }
     };
 
-    let nic_name = {
-        let nic_map = state.gateway_lima_manager.nic_map();
-        nic_map
-            .and_then(|m| {
-                m.interface_for_slot(vmnet_slot.index)
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| format!("lima{}", vmnet_slot.index))
+    // The slot above is freshly claimed, so the session's previous
+    // `bridge_name` names a *different* slot and is not a fallback — this site
+    // resolves like create, from the verified map alone.
+    let nic_name = match sandbox_core::nic_from_verified_map(
+        state.gateway_lima_manager.nic_map().as_ref(),
+        vmnet_slot.index,
+    ) {
+        Ok(name) => name,
+        Err(e) => {
+            let pool = vmnet_pool.clone();
+            let sid = session_id;
+            let _ = tokio::task::spawn_blocking(move || pool.release_lima_slot(&sid)).await;
+            return error_response(e).into_response();
+        }
     };
     let docker_network_name = format!("sandbox-net-{session_id}");
     let network_info = NetworkInfo {
@@ -12575,13 +12581,31 @@ async fn gateway_monitor(state: Arc<AppState>) {
                             .gateway_lima_manager
                             .gateway_docker_socket()
                             .to_path_buf();
-                        let nic_name = {
-                            let slot_idx = ni.vmnet_slot.as_ref().map(|s| s.index).unwrap_or(0u16);
-                            state
-                                .gateway_lima_manager
-                                .nic_map()
-                                .and_then(|m| m.interface_for_slot(slot_idx).map(|s| s.to_string()))
-                                .unwrap_or_else(|| format!("lima{slot_idx}"))
+                        // Refuse rather than re-create this session's gateway
+                        // container on a guessed slot or interface. Skipping
+                        // leaves the session's gateway down and visibly
+                        // unhealthy; guessing would bring it back up on an L2
+                        // segment nothing chose for it, which is the outcome
+                        // this monitor exists to prevent, not to cause.
+                        let nic_name = match sandbox_core::slot_for_persisted_session(&ni).and_then(
+                            |slot| {
+                                sandbox_core::nic_from_verified_map(
+                                    state.gateway_lima_manager.nic_map().as_ref(),
+                                    slot,
+                                )
+                            },
+                        ) {
+                            Ok(name) => name,
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "gateway monitor: cannot resolve the session's slot NIC; \
+                                     skipping recovery rather than re-creating its gateway on a \
+                                     guessed L2 segment"
+                                );
+                                continue;
+                            }
                         };
                         let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!(
                             "CARGO_PKG_VERSION"
