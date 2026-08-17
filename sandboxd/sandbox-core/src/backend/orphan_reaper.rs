@@ -212,17 +212,16 @@ pub trait DockerOps: Send + Sync {
 /// one and not the other would have been invisible.
 ///
 /// Unifying the code did **not** unify the behaviour, because the difference
-/// between them is real:
+/// between them is real: a route that names its target scrubs the
+/// environment, and a route that does not name a target inherits it. For the
+/// reaper specifically, scrubbing the host route would point it at a daemon
+/// the operator never configured — it would enumerate an empty host and
+/// silently reap nothing, which is a reaper that appears to work.
 ///
-/// - [`DockerRoute::Host`] must **not** name a target and must **not** scrub
-///   the environment. A rootless Docker install advertises its socket in
-///   `DOCKER_HOST`; taking that away points the reaper at nothing.
-/// - [`DockerRoute::Vm`] must do both. `-H` is the sole authority for which
-///   daemon is addressed, which it only is if nothing ambient can override
-///   it.
-///
-/// The distinction now lives in the type, where it is stated once and cannot
-/// be lost by editing one of two copies.
+/// The rule, both of its failure directions, and why opting out of env
+/// hygiene is acceptable on the host route are stated once on
+/// [`DockerRoute`]. They are not restated here, because a second copy is a
+/// copy that can drift — which is the failure this type was created to end.
 pub struct RoutedDockerOps {
     route: DockerRoute,
 }
@@ -1033,8 +1032,10 @@ mod tests {
 
     /// The host route must stay the one that names no target and keeps its
     /// ambient environment. It is not an oversight that it differs from the
-    /// VM route — a rootless Docker install publishes its socket through
-    /// `DOCKER_HOST`, so a scrub there would point the reaper at nothing.
+    /// VM route: scrubbing here would point the reaper at a daemon the
+    /// operator never configured, and it would then enumerate an empty host
+    /// and reap nothing while reporting success. See the environment rule on
+    /// `DockerRoute`.
     #[test]
     fn the_host_route_names_no_target() {
         let ops = RoutedDockerOps::host();

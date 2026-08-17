@@ -20,12 +20,13 @@
 //! # How a call site chooses
 //!
 //! A call site holds a [`DockerRoute`], not a socket path. `Host` is the
-//! Linux shape and runs `docker` locally with the ambient environment left
-//! alone — that matters, because a rootless Docker install puts its socket in
-//! `DOCKER_HOST` and scrubbing the environment would break it. `Vm` carries
-//! the operator uid and an executor; whether that executor runs `docker`
-//! itself (the daemon is the operator) or forwards the op to the operator's
-//! agent is the executor's business, not the call site's.
+//! Linux shape and runs `docker` locally, with the ambient environment left
+//! alone. `Vm` carries the operator uid and an executor; whether that
+//! executor runs `docker` itself (the daemon is the operator) or forwards the
+//! op to the operator's agent is the executor's business, not the call site's.
+//!
+//! The two routes treat the environment differently on purpose — see the
+//! environment rule on [`DockerRoute`] before changing either.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -267,17 +268,54 @@ pub trait DockerExecutor: Send + Sync {
 }
 
 /// Where a call site's `docker` operations go.
+///
+/// # The environment rule
+///
+/// **A route that names its target scrubs the environment. A route that does
+/// not name a target inherits it.** The two variants below sit on opposite
+/// sides of that rule, and the asymmetry is the rule working, not an
+/// inconsistency in it.
+///
+/// Environment scrubbing exists for exactly one purpose here: to stop
+/// anything ambient from overriding `-H`. That is worth doing only where
+/// `-H` is load-bearing.
+///
+/// Getting it wrong in either direction has a specific consequence:
+///
+/// - **Scrub [`Self::Host`]** and the daemon stops addressing the Docker
+///   the operator actually configured. Concretely, the rootless probe in
+///   `container_rootless_probe` — which exists to *detect* rootless Docker
+///   and refuse it — would fail to reach a rootless daemon at all and
+///   report "Docker daemon unreachable" instead of the accurate
+///   "rootless is unsupported"; the orphan reaper would enumerate an empty
+///   host and silently reap nothing.
+/// - **Fail to scrub [`Self::Vm`]** and the ambient environment becomes a
+///   second channel for choosing the endpoint — one that bypasses the
+///   socket-derivation invariant without touching the op set at all.
 #[derive(Clone)]
 pub enum DockerRoute {
-    /// The host's own Docker daemon.
+    /// The host's own Docker daemon: no `-H`, and — deliberately — no
+    /// environment scrubbing.
     ///
-    /// No `-H` flag, and — deliberately — no environment scrubbing. A
-    /// rootless Docker install advertises its socket through `DOCKER_HOST`,
-    /// so clearing the environment here would point the daemon at a socket
-    /// that does not exist. This is the variant that is *supposed* to inherit
-    /// its target from its surroundings.
+    /// This is the variant that is *supposed* to take its target from its
+    /// surroundings: with no `-H`, the environment is how the client is told
+    /// which daemon to talk to, and a rootless install says so through
+    /// `DOCKER_HOST`.
+    ///
+    /// **Why opting out of a hardening measure is acceptable here.** This
+    /// route runs in the daemon's own context, against the daemon's own
+    /// Docker — no uid pivot, no other account's endpoint. The environment it
+    /// inherits is the one the daemon's own launcher set, so it is not a
+    /// privilege boundary: anyone who can write it can already run code as
+    /// the daemon, and scrubbing it would take nothing away from them. The
+    /// scrub on the other route is not optional for the same reason in
+    /// reverse — there, `-H` names a Docker daemon belonging to a *different*
+    /// account, and it is the only thing that says which.
     Host,
     /// A Docker daemon inside a VM, reached through the typed op seam.
+    ///
+    /// Invocations on this route name their target with `-H` and run with a
+    /// scrubbed environment, per the rule on this enum.
     Vm {
         /// The operator whose VM hosts the daemon.
         op_uid: u32,
@@ -379,8 +417,10 @@ impl DockerExecutor for LocalSocketDockerExecutor {
 /// `DOCKER_HOST`, `DOCKER_CONFIG`, `DOCKER_TLS_VERIFY` and everything else,
 /// and only what the client needs to find its own dependencies is put back.
 ///
-/// The host-daemon route deliberately does **not** get this treatment — see
-/// [`DockerRoute::Host`].
+/// This is applied **only** where a target is named. The host-daemon route
+/// deliberately does not get it, and that asymmetry is deliberate — the rule
+/// and its consequences are on [`DockerRoute`]. Do not "fix" the
+/// inconsistency by applying this uniformly.
 fn apply_pinned_target_env(cmd: &mut std::process::Command) {
     let current_path = std::env::var("PATH").unwrap_or_default();
     let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
@@ -668,6 +708,57 @@ mod tests {
             .map(|a| a.to_str().unwrap_or_default())
             .collect();
         assert_eq!(args, vec!["info"]);
+    }
+
+    /// The environment rule, in both directions, as a test rather than only
+    /// as a paragraph.
+    ///
+    /// `Command` exposes no accessor for the clear flag, so this asserts the
+    /// observable consequence instead: the host route overrides nothing, and
+    /// the pinned route rebuilds exactly the two variables the client needs.
+    /// That is the right thing to pin anyway — "make these consistent" is a
+    /// plausible-looking edit in either direction, and applying the scrub
+    /// uniformly would give the host case the same rebuilt pair, which fails
+    /// here.
+    ///
+    /// Both directions break something: scrubbing the host route loses the
+    /// Docker the operator configured; not scrubbing the pinned route lets
+    /// the environment override `-H`.
+    #[test]
+    fn only_a_named_target_rebuilds_its_environment() {
+        let argv = DockerOp::DaemonInfo.argv().expect("info renders");
+
+        let host = docker_command(None, &argv);
+        let host_overrides: Vec<String> = host
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            host_overrides.is_empty(),
+            "the host route must inherit its environment untouched; scrubbing \
+             it would point the daemon at a Docker the operator never \
+             configured. Got overrides: {host_overrides:?}"
+        );
+
+        let pinned = docker_command(Some(Path::new("/run/gw.sock")), &argv);
+        let mut pinned_overrides: Vec<String> = pinned
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        pinned_overrides.sort();
+        assert_eq!(
+            pinned_overrides,
+            vec!["HOME".to_string(), "PATH".to_string()],
+            "a route that names its target must rebuild only what the client \
+             needs to find its own dependencies — anything else is a channel \
+             for overriding -H"
+        );
+        for redirector in ["DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_TLS_VERIFY"] {
+            assert!(
+                !pinned_overrides.iter().any(|k| k == redirector),
+                "{redirector} must not be reinstated after the scrub"
+            );
+        }
     }
 
     #[test]
