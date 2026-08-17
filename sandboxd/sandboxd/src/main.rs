@@ -12582,14 +12582,22 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         // The instance-recovery path already draws this line —
                         // `sessions_to_recover` filters to Lima — and this loop is
                         // the one that did not.
-                        if session.backend != sandbox_core::BackendKind::Lima {
-                            debug!(
-                                session_id = %session.id,
-                                backend = ?session.backend,
-                                "gateway monitor: session is not on the full backend; \
-                                 the macvlan re-create path does not apply to it"
-                            );
-                            continue;
+                        //
+                        // Matched exhaustively rather than tested with `!=`: excluding
+                        // a session that *should* be recovered is the same class of
+                        // defect as recovering one onto a guessed segment, just in the
+                        // other direction. A future backend must fail the build here
+                        // and be classified deliberately, not fall into the skip.
+                        match session.backend {
+                            sandbox_core::BackendKind::Lima => {}
+                            sandbox_core::BackendKind::Container => {
+                                debug!(
+                                    session_id = %session.id,
+                                    "gateway monitor: lite session; the macvlan re-create \
+                                     path does not apply to it"
+                                );
+                                continue;
+                            }
                         }
 
                         let sid = session.id;
