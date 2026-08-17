@@ -12575,6 +12575,23 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     // the host Docker daemon.
                     #[cfg(target_os = "macos")]
                     {
+                        // This arm re-creates a *full-backend* gateway: a macvlan
+                        // parented on the session's slot NIC. Lite sessions have no
+                        // vmnet slot and their gateway attaches to a bridge via
+                        // `setup_macos_lite_gateway`, so they have no business here.
+                        // The instance-recovery path already draws this line —
+                        // `sessions_to_recover` filters to Lima — and this loop is
+                        // the one that did not.
+                        if session.backend != sandbox_core::BackendKind::Lima {
+                            debug!(
+                                session_id = %session.id,
+                                backend = ?session.backend,
+                                "gateway monitor: session is not on the full backend; \
+                                 the macvlan re-create path does not apply to it"
+                            );
+                            continue;
+                        }
+
                         let sid = session.id;
                         let ni = network_info.clone();
                         let sock = state
@@ -12582,31 +12599,38 @@ async fn gateway_monitor(state: Arc<AppState>) {
                             .gateway_docker_socket()
                             .to_path_buf();
                         // Refuse rather than re-create this session's gateway
-                        // container on a guessed slot or interface. Skipping
-                        // leaves the session's gateway down and visibly
-                        // unhealthy; guessing would bring it back up on an L2
-                        // segment nothing chose for it, which is the outcome
-                        // this monitor exists to prevent, not to cause.
-                        let nic_name = match sandbox_core::slot_for_persisted_session(&ni).and_then(
-                            |slot| {
+                        // container on a guessed slot or interface: that would
+                        // bring it back up on an L2 segment nothing chose for it,
+                        // which is the outcome this monitor exists to prevent.
+                        //
+                        // Unlike the re-create failure below, this skip does not
+                        // clear itself on the next tick — the NIC map only changes
+                        // when the gateway VM is restarted — so failing closed here
+                        // would otherwise be failing closed *and silent*. Tag the
+                        // session Degraded so the condition reaches the operator on
+                        // the wire, not only the log.
+                        let nic_name =
+                            match sandbox_core::slot_for_persisted_session(&ni).and_then(|slot| {
                                 sandbox_core::nic_from_verified_map(
                                     state.gateway_lima_manager.nic_map().as_ref(),
                                     slot,
                                 )
-                            },
-                        ) {
-                            Ok(name) => name,
-                            Err(e) => {
-                                warn!(
-                                    session_id = %session.id,
-                                    error = %e,
-                                    "gateway monitor: cannot resolve the session's slot NIC; \
-                                     skipping recovery rather than re-creating its gateway on a \
-                                     guessed L2 segment"
-                                );
-                                continue;
-                            }
-                        };
+                            }) {
+                                Ok(name) => name,
+                                Err(e) => {
+                                    error!(
+                                        session_id = %session.id,
+                                        error = %e,
+                                        "gateway monitor: cannot resolve the session's slot NIC; \
+                                         leaving its gateway down rather than re-creating it on a \
+                                         guessed L2 segment. The session is marked Degraded and \
+                                         stays that way until the gateway VM is recovered."
+                                    );
+                                    let mut map = state.networking_status.lock().await;
+                                    map.insert(session.id, NetworkingStatus::Degraded);
+                                    continue;
+                                }
+                            };
                         let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!(
                             "CARGO_PKG_VERSION"
                         ));

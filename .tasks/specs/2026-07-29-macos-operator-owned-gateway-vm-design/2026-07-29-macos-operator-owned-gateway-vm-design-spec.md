@@ -947,7 +947,17 @@ input and not a measure of the map.
 **This is not a weakening, and the spec's own words are the reason.** The consequence
 required two paragraphs up is "a **refused create** rather than a silently misplaced
 session" — a create refusal, which is what an absent map entry produces, not a startup
-refusal, which is what a parser-level `Err` would have produced.
+refusal, which is what a parser-level `Err` would have produced. The safety property fix 2
+exists for is untouched and is what makes the weaker-looking level airtight: the map is
+built from the assigned slot set, so **the guest string can only ever withhold an entry,
+never name one** — operator-controlled input cannot manufacture a mapping no matter what it
+reports.
+
+**Recorded as an amendment, not a correction.** "Failing closed on any mismatch" was written
+before there was an implementation to place it in, and it is right about the property; this
+note fixes only *where* the refusal lands. It is written down because the stricter reading
+is the natural one, and a later reader who re-derives it would trade a silent availability
+regression for a safety property that is already held elsewhere.
 
 #### Fix 3 — take an explicit slot set in template generation
 
@@ -1078,11 +1088,38 @@ against.** The sweep was `format!("lima{`, `unwrap_or(0u16)` and `interface_for_
   `unwrap_or(0u16)`. It sits in a `continue`-on-error monitor loop, so the refusal is
   log-and-skip rather than a returned `Err`; that still fails closed, because no gateway
   container comes up on a guessed segment.
+  - **Fail-closed and silent is a bad pairing, so this skip is made observable.** Unlike
+    the re-create failure in the next arm, it does **not** clear itself on the next 10-second
+    tick: the NIC map only changes when the gateway VM is restarted, so the loop would skip
+    the same session indefinitely. The refusal therefore logs at `error` with the cause and
+    the session id **and** tags the session `NetworkingStatus::Degraded`, which
+    `macos_networking_status_for` already surfaces per session on the wire. No new reporting
+    mechanism: `Degraded` is the same value `run_gateway_recovery` leaves a session in when
+    its instance restart fails, and the same lifecycle clears it — a later successful
+    recovery removes the entry (absent ≡ Healthy), a failed one marks the session `Error`.
+  - ⚠️ **This site also reached sessions it never should have, and the refusal exposed it.**
+    The loop iterates every Running session with no backend filter, and lite and full-backend
+    gateway containers share the name `sandbox-gw-<sid>` — so an unhealthy *lite* gateway
+    entered this arm and was "recovered" by `setup_macos_gateway`, the **macvlan** setup,
+    on a guessed `lima0`. Lite gateways attach to a bridge via `setup_macos_lite_gateway`
+    and their sessions carry no `vmnet_slot` at all (`main.rs`'s own comment: *"Lite sessions
+    have no vmnet_slot"*). Left alone, every lite session would now take the slot refusal and
+    be told to re-create itself, which is a true refusal with a false diagnosis. The arm is
+    therefore guarded on `BackendKind::Lima`, matching the filter `sessions_to_recover`
+    already applies on the instance-recovery path — this loop was the one that lacked it.
+    **State the consequence plainly: macOS lite sessions get no per-session gateway
+    re-create from this monitor.** They previously got one that was wrong in two independent
+    ways, so this removes a defect rather than a working capability, but it is a behaviour
+    change and not merely a message change. A correct lite re-create is not in this section's
+    scope and is not claimed.
 
 **Read the site count as a property of `main.rs` at a moment, not as a fact about the
 design.** The two additions were not a change of position — fix 4's closing sentence
 already asked for exactly this — but leaving them would have shipped the defect this
-section exists to remove at two live sites while recording it as closed.
+section exists to remove at two live sites while recording it as closed. **This is an
+amendment, not a correction:** the three-site text was accurate against the set that had
+been measured when it was written, and the sweep that found five is recorded above so the
+next reader checks against the sweep rather than against the count.
 
 ### 1.5 The `config_n` / `effective_n` divergence — prevention, not repair
 
