@@ -40,6 +40,7 @@ state they share:
 | Workspace sync | run rsync |
 | Boot verification | restrict-on verify (QMP + wrapper marker) |
 | Streaming | guest socat byte-pump |
+| Docker ops | container / network / volume / image lifecycle; the stdin-fed egress-plane writes |
 | Connection-level | control-connection writer, request/response framing, run context |
 
 Along the three axes concurrency actually breaks things:
@@ -185,6 +186,51 @@ overlooked. The line drawn in finding 1 is deliberate: work whose duration is
 governed by a *timeout in seconds* or by a *directory service* goes to the
 blocking pool; a local file read does not.
 
+### 7. The Docker op handler — no agent-side shared state, and one rule about stdin
+
+The Docker handler arrived after this audit was first written and is examined
+here on the same three axes.
+
+**Process-global state: none.** The handler builds a `Command`, clears *its*
+environment and reconstructs `PATH` and `HOME` on the child. That mutates the
+child's environment, not the agent's, so two handlers preparing invocations at
+the same time cannot see each other's. The one process-global read is `PATH`,
+which finding 5 already establishes is read-only after startup. The Docker
+socket is derived from the per-op run context, which is cloned rather than
+shared, so no two ops can disagree about it and none can change what another
+sees.
+
+**Filesystem staging paths: none on the agent.** The egress-plane writes put
+their artifact inside a *container*, and the path they write is a constant. The
+only agent-side path in the family is the staged image tarball, which is opened
+read-only. Nothing here writes a temp file on the agent, so finding 3's
+"per-op suffix" rule has nothing to apply to.
+
+**Colliding working sets: two, both safe, and for different reasons.**
+
+- **Two writes to the same file in one container.** The listener — the one
+  artifact rewritten repeatedly while a session runs, by the DNS-propagation
+  loop — is delivered by write-to-staging plus rename, so a reader sees one
+  generation or the other and never a mixture. That property exists for Envoy's
+  LDS watcher and it happens to be the right answer here too. The other writes
+  are `Replace`, which would interleave if two ran at once; they do not, because
+  each is issued from an awaited step of a single distribution.
+- **Two `nft -f -` applications in one netns.** `nft` applies an input as one
+  transaction, so concurrent applications produce one ruleset or the other,
+  never half of each. This is the property the egress plane already depends on
+  for a single application and it extends to concurrent ones.
+
+**One change, and it is about the runtime, not about sharing.** The artifact
+goes to the child on a pipe, and a pipe fills. Writing it with a synchronous
+`write_all` would block the agent's *only* runtime thread until the child
+drained it — finding 1's failure, reached by a new route, and reached by a
+handler whose payload can be megabytes rather than milliseconds. The write is
+therefore `tokio`'s async `write_all` on an async child pipe: it yields while
+the pipe is full instead of holding the thread. **The constraint on future
+work:** a stdin-fed op must keep its write async. It is the one place in this
+family where the obvious synchronous call is the wrong one, and it does not
+look wrong.
+
 ---
 
 ## Summary
@@ -197,3 +243,4 @@ blocking pool; a local file read does not.
 | 4 | Shared download cache, QMP socket | Unchanged — safe under current call patterns; one property deliberately not verified, and why |
 | 5 | Connection writer, ids, per-op context, statics, environment | Unchanged — verified correct under concurrent writers |
 | 6 | Small synchronous file I/O | Unchanged — examined and accepted, with the rule that distinguishes it from finding 1 |
+| 7 | Docker ops, including the stdin-fed egress-plane writes | No shared agent-side state; the stdin write is async so a full pipe cannot stall the runtime |
