@@ -39,7 +39,7 @@ state they share:
 | In-VM installation | install guest agent |
 | Workspace sync | run rsync |
 | Boot verification | restrict-on verify (QMP + wrapper marker) |
-| Streaming | guest socat byte-pump |
+| Streaming | guest socat byte-pump; the three Docker streams (guest agent, sshd, DNS-policy gate) |
 | Docker ops | container / network / volume / image lifecycle; the stdin-fed egress-plane writes |
 | Connection-level | control-connection writer, request/response framing, run context |
 
@@ -231,6 +231,45 @@ work:** a stdin-fed op must keep its write async. It is the one place in this
 family where the obvious synchronous call is the wrong one, and it does not
 look wrong.
 
+### 8. The Docker stream handler — concurrency is the normal case here
+
+The three long-lived Docker streams — the guest-agent transport, the SSH
+proxy's pump, and the DNS-policy gate bridge — arrived after this audit was
+first written and are examined here on the same three axes. Unlike the
+one-shot families, several of these run at once as a matter of course rather
+than as a matter of pipelining: a session has a guest transport and an SSH
+session open together, and the gate bridge opens one stream per DNS query.
+
+**Process-global state: none.** The handler builds a `Command`, clears *its*
+environment and reconstructs `PATH` and `HOME` on the child, exactly as the
+one-shot Docker handler does. The socket is derived from the per-op run
+context, which is cloned rather than shared.
+
+**Filesystem staging paths: none.** Nothing is written; the handler splices
+two byte streams.
+
+**Colliding working sets: one, and it is a property of the op rather than of
+the agent.** Two gate streams into the same container would both try to
+`socat UNIX-LISTEN` on one path, and `unlink-early` means the second would
+take the socket out from under the first rather than fail to bind. Nothing on
+the agent prevents that, and nothing should: the daemon's accept loop arms
+exactly one listener per session and re-arms only after the previous round
+trip finishes. **The invariant is daemon-side**, in the same sense as
+finding 3's in-guest staging path, and it is recorded here because a future
+caller that decided to parallelise the gate for throughput would break the
+gate rather than speed it up. The other two destinations connect rather than
+listen and have no such constraint — many concurrent guest-agent or sshd
+streams into one container are fine.
+
+**Runtime blocking: the reason this handler must not be "fixed".** The child
+is held open for the life of the stream, which for the sshd destination is a
+whole SSH session. The agent runs on a current-thread runtime, so a
+synchronous pump here would stall the heartbeat and every other op for hours,
+not merely its own caller — finding 1's failure at its worst. The handler
+uses `tokio::process::Command` with async pipes and is named in `CLAUDE.md`'s
+async-I/O carve-out as one of the sites a `spawn_blocking` sweep must leave
+alone.
+
 ---
 
 ## Summary
@@ -244,3 +283,4 @@ look wrong.
 | 5 | Connection writer, ids, per-op context, statics, environment | Unchanged — verified correct under concurrent writers |
 | 6 | Small synchronous file I/O | Unchanged — examined and accepted, with the rule that distinguishes it from finding 1 |
 | 7 | Docker ops, including the stdin-fed egress-plane writes | No shared agent-side state; the stdin write is async so a full pipe cannot stall the runtime |
+| 8 | The three long-lived Docker streams | No shared agent-side state; one-listener-per-gate is a daemon-side invariant; the pump must stay async or it stalls the whole runtime |
