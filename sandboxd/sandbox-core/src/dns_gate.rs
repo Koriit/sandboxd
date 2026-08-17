@@ -53,7 +53,12 @@ pub const DNS_GATE_SOCKET_FILENAME: &str = "dns-gate.sock";
 /// onto the container's `/var/log/gateway/events/` via
 /// [`crate::events::EVENTS_DIR_IN_CONTAINER`]; the socket file lives
 /// alongside the JSONL producers.
-pub const DNS_GATE_SOCKET_IN_CONTAINER: &str = "/var/log/gateway/events/dns-gate.sock";
+/// Declared in `sandbox-docker-argv` rather than here, because both the
+/// daemon and the operator's agent render the `socat UNIX-LISTEN` address
+/// from it and a second declaration is how the two sides come to disagree
+/// about where the gate listener lands. Re-exported so no call site had to
+/// move.
+pub use sandbox_docker_argv::stream::DNS_GATE_SOCKET_IN_CONTAINER;
 
 /// Default deadline a CoreDNS plugin pulls when issuing a gate
 /// request. The daemon honours this; if the plugin sets a shorter

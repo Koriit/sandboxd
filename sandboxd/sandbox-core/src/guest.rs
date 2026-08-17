@@ -32,7 +32,11 @@ use crate::store::SessionStore;
 // ---------------------------------------------------------------------------
 
 /// Port the guest agent listens on inside the VM.
-pub const GUEST_AGENT_PORT: u16 = 5123;
+/// Declared in `sandbox-docker-argv` rather than here: both the daemon and
+/// the operator's agent render the `socat` address that reaches this port,
+/// and one declaration is what keeps the two sides from disagreeing about
+/// where the guest transport lands. Re-exported so no call site had to move.
+pub use sandbox_docker_argv::stream::GUEST_AGENT_PORT;
 
 /// Maximum message size (1 MB).
 pub const MAX_MESSAGE_SIZE: u32 = 1_048_576;
