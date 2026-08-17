@@ -535,6 +535,46 @@ mod tests {
         }
     }
 
+    /// An op that puts a payload on stdin must never run a `sudo` that could
+    /// prompt.
+    ///
+    /// The two facts are only dangerous together, which is why the invariant
+    /// is stated over the pair rather than over either one. `sudo` reads a
+    /// password from **the command's stdin**, and for an op carrying a body
+    /// that stdin is the payload — so an interactive `sudo` does not hang
+    /// waiting for a human, it silently consumes the payload as a credential
+    /// attempt and fails. For the one op in this set that carries a body, the
+    /// payload is the egress baseline.
+    ///
+    /// Asserted across the whole op set, not at the one site that has the
+    /// combination today: the failure reappears the moment someone adds a
+    /// stdin-carrying op without knowing why `-n` is on the existing one, and
+    /// that is exactly the person this test is for. `all_ops()` carries a
+    /// count assertion, so a new variant cannot dodge it by being absent
+    /// either.
+    #[test]
+    fn an_op_that_carries_a_payload_on_stdin_never_runs_a_sudo_that_could_prompt() {
+        for op in all_ops() {
+            if op.stdin_body().is_none() {
+                continue;
+            }
+            let steps = op
+                .shell_steps()
+                .expect("an op carrying a stdin body is a command, not a transfer");
+            for step in steps {
+                if step.first().map(String::as_str) != Some("sudo") {
+                    continue;
+                }
+                assert_eq!(
+                    step.get(1).map(String::as_str),
+                    Some("-n"),
+                    "{op:?} carries a stdin body and renders {step:?}, whose sudo may \
+                     prompt — it would read the payload as the password"
+                );
+            }
+        }
+    }
+
     /// The ruleset reaches the op unmodified. It is policy: a transformation
     /// anywhere between the generator and `nft` is a policy change nobody
     /// wrote.
