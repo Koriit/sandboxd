@@ -925,6 +925,11 @@ fn compute_subnet_plus_one(subnet_cidr: &str) -> Result<String, SandboxError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stand-in operator uid for pool tests. The pool does not interpret
+    /// it — it records the uid with the claim and names it in the
+    /// exhaustion error — so any value above the system-uid floor does.
+    const TEST_OPERATOR_UID: u32 = 501;
     #[cfg(target_os = "macos")]
     use super::*;
 
@@ -1077,7 +1082,7 @@ mod tests {
         use crate::network::VmnetPool;
         let pool = VmnetPool::new(4);
         let id = SessionId::parse("aabbccddeeff").unwrap();
-        let (slot, _subnet, _gw, _vm) = pool.claim_lima_slot(&id).unwrap();
+        let (slot, _subnet, _gw, _vm) = pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
         assert!(pool.allocated_slot_indices().contains(&slot.index));
         pool.release_lima_slot(&id).unwrap();
         // After release, pool is empty.
@@ -1096,10 +1101,10 @@ mod tests {
         let id0 = SessionId::parse("000000000000").unwrap();
         let id1 = SessionId::parse("111111111111").unwrap();
         let id2 = SessionId::parse("222222222222").unwrap();
-        pool.claim_lima_slot(&id0).unwrap();
-        pool.claim_lima_slot(&id1).unwrap();
+        pool.claim_lima_slot(&id0, TEST_OPERATOR_UID).unwrap();
+        pool.claim_lima_slot(&id1, TEST_OPERATOR_UID).unwrap();
         // Third claim must fail.
-        let result = pool.claim_lima_slot(&id2);
+        let result = pool.claim_lima_slot(&id2, TEST_OPERATOR_UID);
         assert!(
             result.is_err(),
             "claiming beyond max_slots must fail with an error"
@@ -1117,10 +1122,11 @@ mod tests {
         use crate::network::{NetworkInfo, VmnetPool, VmnetSlot};
         let pool = VmnetPool::new(4);
         let id = SessionId::parse("aabbccddeeff").unwrap();
-        let (slot, subnet_cidr, gw, vm) = pool.claim_lima_slot(&id).unwrap();
+        let (slot, subnet_cidr, gw, vm) = pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
 
         // Simulate partial create: set_lima_network_info was called.
         let info = NetworkInfo {
+            operator_uid: None,
             bridge_name: format!("lima{}", slot.index),
             subnet: subnet_cidr,
             gateway_ip: gw.to_string(),
@@ -1148,6 +1154,7 @@ mod tests {
     fn test_vmnet_slot_json_roundtrip() {
         use crate::network::{NetworkInfo, VmnetSlot};
         let info = NetworkInfo {
+            operator_uid: None,
             bridge_name: "lima2".to_string(),
             subnet: "10.209.128.16/29".to_string(),
             gateway_ip: "10.209.128.19".to_string(),

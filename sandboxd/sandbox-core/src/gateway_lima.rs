@@ -3414,6 +3414,7 @@ mod tests {
 
     fn network_info_with_slot(slot: Option<u16>, bridge_name: &str) -> crate::network::NetworkInfo {
         crate::network::NetworkInfo {
+            operator_uid: None,
             bridge_name: bridge_name.to_string(),
             subnet: "10.209.128.0/29".to_string(),
             gateway_ip: "10.209.128.3".to_string(),

@@ -1327,16 +1327,20 @@ struct AppState {
     /// shows the actually-resolved pool rather than expecting the
     /// operator to grep journald.
     users_conf_pool: sandbox_core::users_conf::SubnetEntry,
-    /// macOS only: socket_vmnet NIC slot pool. Tracks which pool slots
-    /// are in use by running Lima sessions and enforces the concurrent-
-    /// session cap. Constructed at startup from the `max_macos_sessions`
-    /// config value; restored from persisted `NetworkInfo` on daemon restart.
+    /// macOS only: socket_vmnet NIC slot pools, one per operator.
     ///
-    /// Never accessed on Linux (the field is cfg-gated). The Lima create/start
-    /// handlers call `claim_lima_slot` and `release_lima_slot`; stop/rm call
-    /// `release_lima_slot` after `teardown_macos_gateway`.
+    /// Tracks which slots are in use by running Lima sessions and enforces
+    /// each operator's concurrent-session quota. The partition is derived at
+    /// startup from the root-owned state enrollment writes; on a host nobody
+    /// has enrolled — which is every host that has not been migrated — there
+    /// is one pool of every slot, shared, exactly as before.
+    ///
+    /// Never accessed on Linux (the field is cfg-gated). The Lima
+    /// create/start handlers resolve the requesting operator's pool and call
+    /// `claim_lima_slot`; stop/rm release through the registry after
+    /// `teardown_macos_gateway`.
     #[cfg(target_os = "macos")]
-    vmnet_pool: Arc<sandbox_core::network::VmnetPool>,
+    vmnet_pools: Arc<sandbox_core::vmnet_pool_registry::VmnetPoolRegistry>,
     /// macOS only: gateway Lima instance manager. Manages the
     /// `sandboxd-gateway` Lima VM that hosts all per-session gateway
     /// containers. After `ensure_ready` succeeds at startup, exposes
@@ -1714,6 +1718,22 @@ fn resolve_uid_to_name(uid: u32) -> Option<String> {
         Ok(Some(user)) => Some(user.name),
         Ok(None) => None,
         Err(_) => None,
+    }
+}
+
+/// Resolve a username to a uid via `getpwnam_r`.
+///
+/// The inverse of [`resolve_uid_to_name`], and the fallback route restore
+/// takes for a session record written before the operator uid was persisted
+/// alongside it. `None` when the account no longer exists or the directory
+/// cannot answer — which restore treats as "decline", never as "guess".
+#[cfg(target_os = "macos")]
+fn resolve_name_to_uid(name: &str) -> Option<u32> {
+    use nix::unistd::User;
+
+    match User::from_name(name) {
+        Ok(Some(user)) => Some(user.uid.as_raw()),
+        Ok(None) | Err(_) => None,
     }
 }
 
@@ -4329,12 +4349,33 @@ async fn create_session_macos_lima(
         }
     };
 
-    // Step 2: claim a vmnet slot from the pool.
-    let vmnet_pool = state.vmnet_pool.clone();
+    // Step 2: claim a vmnet slot from this operator's pool.
+    //
+    // Resolving the pool can itself fail — with a 409 when no slot range is
+    // assigned to this operator and none is left shared. That is a different
+    // condition from the 429 the claim below raises, and the two must stay
+    // distinguishable: one is a configuration fault an administrator has to
+    // fix, the other clears the moment a session stops.
+    let vmnet_pool = match state.vmnet_pools.pool_for(operator.uid) {
+        Ok(pool) => pool,
+        Err(e) => {
+            let base_dir = state.base_dir.clone();
+            let sid = session_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = CaManager::remove_session_ca(&base_dir, &sid);
+            })
+            .await;
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(e).into_response();
+        }
+    };
     let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = {
         let pool = vmnet_pool.clone();
         let sid = session_id;
-        match tokio::task::spawn_blocking(move || pool.claim_lima_slot(&sid)).await {
+        let op_uid = operator.uid;
+        match tokio::task::spawn_blocking(move || pool.claim_lima_slot(&sid, op_uid)).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 let base_dir = state.base_dir.clone();
@@ -4386,6 +4427,9 @@ async fn create_session_macos_lima(
     };
     let docker_network_name = format!("sandbox-net-{session_id}");
     let network_info = NetworkInfo {
+        // Persisted so a restart routes this claim back to the same pool
+        // without having to re-resolve a username against the directory.
+        operator_uid: Some(operator.uid),
         bridge_name: nic_name.clone(),
         subnet: subnet_cidr,
         gateway_ip: gateway_ip.to_string(),
@@ -4938,7 +4982,20 @@ async fn create_session_macos_lite(
     };
     use sandbox_core::macos_session::setup_macos_lite_gateway;
 
-    let vmnet_pool = state.vmnet_pool.clone();
+    // Resolve this operator's pool up front. Failing here is the 409 shape
+    // — no slot range assigned and nothing left shared — which is distinct
+    // from the 429 the token claim below raises when the operator's own
+    // share is full. A lite session holds no NIC slot but does hold a token
+    // against that share.
+    let vmnet_pool = match state.vmnet_pools.pool_for(operator.uid) {
+        Ok(pool) => pool,
+        Err(e) => {
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
+            return error_response(e).into_response();
+        }
+    };
     let gateway_docker_socket = state
         .gateway_lima_manager
         .gateway_docker_socket()
@@ -4973,7 +5030,8 @@ async fn create_session_macos_lite(
     // Step 1: claim a session-count token (no NIC slot).
     {
         let pool = vmnet_pool.clone();
-        match tokio::task::spawn_blocking(move || pool.claim_lite_token()).await {
+        let op_uid = operator.uid;
+        match tokio::task::spawn_blocking(move || pool.claim_lite_token(op_uid)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 let _ = state
@@ -6245,13 +6303,20 @@ async fn start_session_macos_lima(
     use sandbox_core::macos_session::{setup_macos_gateway, teardown_macos_gateway};
 
     let session_id = session.id;
-    let vmnet_pool = state.vmnet_pool.clone();
+    // A restart re-claims from the operator's pool, so a range reassigned
+    // while the session was stopped takes effect here rather than silently
+    // handing back the old slot.
+    let vmnet_pool = match state.vmnet_pools.pool_for(operator.uid) {
+        Ok(pool) => pool,
+        Err(e) => return error_response(e).into_response(),
+    };
 
     // Step 1: claim a fresh slot (slots are non-sticky across stop/start).
     let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = {
         let pool = vmnet_pool.clone();
         let sid = session_id;
-        match tokio::task::spawn_blocking(move || pool.claim_lima_slot(&sid)).await {
+        let op_uid = operator.uid;
+        match tokio::task::spawn_blocking(move || pool.claim_lima_slot(&sid, op_uid)).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => return error_response(e).into_response(),
             Err(e) => {
@@ -6278,6 +6343,7 @@ async fn start_session_macos_lima(
     };
     let docker_network_name = format!("sandbox-net-{session_id}");
     let network_info = NetworkInfo {
+        operator_uid: Some(operator.uid),
         bridge_name: nic_name.clone(),
         subnet: subnet_cidr,
         gateway_ip: gateway_ip.to_string(),
@@ -7249,7 +7315,7 @@ async fn stop_session(
                 .gateway_docker_socket()
                 .to_path_buf();
             let sid = session.id;
-            let vmnet_pool = state.vmnet_pool.clone();
+            let vmnet_pool = state.vmnet_pools.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 debug!(session_id = %sid, "tearing down macOS session networking");
                 if let Err(e) = sandbox_core::macos_session::teardown_macos_gateway(
@@ -7460,7 +7526,7 @@ async fn remove_session(
                     .gateway_docker_socket()
                     .to_path_buf();
                 let sid = session.id;
-                let vmnet_pool = state.vmnet_pool.clone();
+                let vmnet_pool = state.vmnet_pools.clone();
                 let base_dir = state.base_dir.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     debug!(session_id = %sid, "tearing down macOS session networking (full cleanup)");
@@ -7486,7 +7552,11 @@ async fn remove_session(
                     .gateway_docker_socket()
                     .to_path_buf();
                 let glm = state.gateway_lima_manager.clone();
-                let vmnet_pool = state.vmnet_pool.clone();
+                let vmnet_pool = state.vmnet_pools.clone();
+                // A token is a count, so releasing one needs the operator
+                // whose quota it came out of. Session access is owner-scoped,
+                // so the requester is that operator.
+                let op_uid = operator.uid;
                 let network = state.network.clone();
                 let base_dir = state.base_dir.clone();
                 let sid = session.id;
@@ -7514,7 +7584,7 @@ async fn remove_session(
                     // container dies with `docker rm`; this reclaims the staged
                     // (non-secret) bytes from the gateway VM's /tmp.
                     glm.cleanup_lite_session_files(sid.as_str());
-                    if let Err(e) = vmnet_pool.release_lite_token() {
+                    if let Err(e) = vmnet_pool.release_lite_token(op_uid) {
                         warn!(%sid, error = %e, "lite token release failed (best-effort)");
                     }
                 })
@@ -11157,16 +11227,21 @@ async fn diagnostics_handler(
         .unwrap_or_else(|_| "error".to_string());
         fields.push(("gateway_lima_state", serde_json::json!(gateway_lima_state)));
 
-        // vmnet slot pool: configured size + currently-claimed count.
-        // Claimed slots that no live session owns are leaks — surface
-        // both the claimed count and the leaked-slot indices so doctor's
-        // vmnet-pool row can flag leaks. The pool's in-memory claim map
-        // (`claimed_slot_sessions`) is the slot→session source of truth;
-        // a slot whose owning session id is not in the live session store
-        // is a leak.
-        let pool_size = state.vmnet_pool.max_slots();
-        let claimed = state.vmnet_pool.allocated_slot_indices();
-        let claimed_pairs = state.vmnet_pool.claimed_slot_sessions();
+        // vmnet slot pool: host size + currently-claimed count across every
+        // operator's pool. Claimed slots that no live session owns are leaks
+        // — surface both the claimed count and the leaked-slot indices so
+        // doctor's vmnet-pool row can flag leaks. The pools' in-memory claim
+        // maps (`claimed_slot_sessions`) are the slot→session source of
+        // truth; a slot whose owning session id is not in the live session
+        // store is a leak.
+        //
+        // The size reported is the *host* pool, not any one operator's
+        // share: this row describes the machine, and a share is only
+        // meaningful next to the operator it belongs to — which the
+        // per-slot assignment rows below carry.
+        let pool_size = state.vmnet_pools.host_slots();
+        let claimed = state.vmnet_pools.allocated_slot_indices();
+        let claimed_pairs = state.vmnet_pools.claimed_slot_sessions();
         let live_ids: std::collections::HashSet<SessionId> = state
             .store
             .list_sessions_unfiltered()
@@ -11176,13 +11251,55 @@ async fn diagnostics_handler(
             .collect();
         let mut leaked: Vec<u16> = claimed_pairs
             .iter()
-            .filter(|(_, sid)| !live_ids.contains(sid))
-            .map(|(slot, _)| *slot)
+            .filter(|claim| !live_ids.contains(&claim.session_id))
+            .map(|claim| claim.slot)
             .collect();
         leaked.sort_unstable();
         leaked.dedup();
         fields.push(("vmnet_pool_size", serde_json::json!(pool_size)));
         fields.push(("vmnet_pool_claimed", serde_json::json!(claimed.len())));
+
+        // Which operator each slot's capacity belongs to, one line per slot,
+        // plus whatever the derivation warned about (chiefly: this install
+        // has not been migrated, so the slots stay shared).
+        fields.push((
+            "vmnet_slot_assignment",
+            serde_json::json!(state.vmnet_pools.assignment().describe()),
+        ));
+        fields.push((
+            "vmnet_assignment_warnings",
+            serde_json::json!(state.vmnet_pools.assignment().warnings()),
+        ));
+
+        // Claims restore refused to re-register. The claimed-slot list above
+        // reports slots that *are* held and so cannot show these: a declined
+        // claim is the inverse condition, and it needs its own list or it is
+        // invisible. Each line names the session, the slot it held and why
+        // it could not be routed — the capacity is real and still consumed
+        // by a running VM, so an administrator has to act on it.
+        let declined: Vec<String> = state
+            .vmnet_pools
+            .declined_restores()
+            .iter()
+            .map(|d| d.describe())
+            .collect();
+        fields.push(("vmnet_declined_restores", serde_json::json!(declined)));
+
+        // Who holds which slots, for the administrator reading a 409 that
+        // deliberately does not name them.
+        let claimed_by_operator: Vec<String> = claimed_pairs
+            .iter()
+            .map(|claim| {
+                format!(
+                    "slot {} → session {} (operator uid {})",
+                    claim.slot, claim.session_id, claim.operator_uid
+                )
+            })
+            .collect();
+        fields.push((
+            "vmnet_claimed_by_operator",
+            serde_json::json!(claimed_by_operator),
+        ));
         fields.push(("vmnet_pool_leaked_slots", serde_json::json!(leaked)));
 
         // Gateway image inside the gateway Lima instance (forwarded
@@ -11954,7 +12071,7 @@ async fn reconcile_operator_vms(
                     .store
                     .update_state_reconcile(&session.id, dead_vm_state);
                 // Release the slot (gateway side was cleaned in 6a above or is a no-op here).
-                let _ = state.vmnet_pool.release_lima_slot(&session.id);
+                let _ = state.vmnet_pools.release_lima_slot(&session.id);
                 errored += 1;
             }
         }
@@ -12045,7 +12162,7 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
             // Release slot if this session held one.
             if let Ok(Some(info)) = state.store.get_network_info_unfiltered(&session.id) {
                 if info.vmnet_slot.is_some() {
-                    match state.vmnet_pool.release_lima_slot(&session.id) {
+                    match state.vmnet_pools.release_lima_slot(&session.id) {
                         Ok(()) => {
                             released_6a += 1;
                             debug!(
@@ -12149,13 +12266,22 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
 /// Release those so the pool is clean.
 ///
 /// **Pool-state restore (step 7):** for genuinely running sessions, mark their
-/// slot as claimed in the pool so the pool's in-memory accounting reflects
-/// current usage.
+/// slot as claimed in their operator's pool so the in-memory accounting
+/// reflects current usage.
+///
+/// Routing a persisted session to a pool is the one part of restore that is
+/// new. It goes by the operator uid on the record; a record written before
+/// that field existed falls back to resolving its owner name. When neither
+/// answers, the claim is declined and listed in `/diagnostics` rather than
+/// guessed — a guess would put a running VM's slot on the wrong operator's
+/// ledger, and a silent drop would leave the pool believing a slot that is
+/// genuinely in use is free.
 ///
 /// This runs after `reconcile_macos` so that 6a/6b have already corrected
 /// session states before we decide which sessions are truly running.
 #[cfg(target_os = "macos")]
 async fn restore_macos_pool_state(state: &AppState) {
+    use sandbox_core::vmnet_pool_registry::{RestoreEntry, RestoreKind};
     use sandbox_core::{BackendKind, SessionState};
 
     let sessions = match state.store.list_sessions_unfiltered() {
@@ -12166,58 +12292,67 @@ async fn restore_macos_pool_state(state: &AppState) {
         }
     };
 
-    // Collect (session_id, NetworkInfo) for sessions that have a vmnet_slot.
-    let mut running_infos: Vec<(sandbox_core::SessionId, sandbox_core::NetworkInfo)> = Vec::new();
+    let mut entries: Vec<RestoreEntry> = Vec::new();
     let mut leaked_sessions: Vec<sandbox_core::SessionId> = Vec::new();
-    // Count running lite (container-backend) sessions to restore lite tokens.
-    let mut running_lite_count: u32 = 0;
 
     for session in &sessions {
+        // Read the network info only where it is consulted: for Lima
+        // sessions, and for the running lite sessions whose operator uid it
+        // is the only record of.
+        let running_lite =
+            session.backend == BackendKind::Container && session.state == SessionState::Running;
+        if session.backend != BackendKind::Lima && !running_lite {
+            continue;
+        }
+        let info = match state.store.get_network_info_unfiltered(&session.id) {
+            Ok(Some(i)) => Some(i),
+            Ok(None) | Err(_) => None,
+        };
         if session.backend == BackendKind::Lima {
-            let info = match state.store.get_network_info_unfiltered(&session.id) {
-                Ok(Some(i)) => i,
-                Ok(None) | Err(_) => continue,
-            };
+            let Some(info) = info else { continue };
             if info.vmnet_slot.is_none() {
                 continue;
             }
             match session.state {
-                SessionState::Running => {
-                    running_infos.push((session.id, info));
-                }
+                SessionState::Running => entries.push(RestoreEntry {
+                    session_id: session.id,
+                    owner_username: session.owner_username.clone(),
+                    operator_uid: info.operator_uid,
+                    kind: RestoreKind::Slot(Box::new(info)),
+                }),
                 _ => {
                     // Non-running session holds a slot — leak candidate.
                     leaked_sessions.push(session.id);
-                    let _ = state.vmnet_pool.release_lima_slot(&session.id);
+                    let _ = state.vmnet_pools.release_lima_slot(&session.id);
                 }
             }
-        } else if session.backend == BackendKind::Container {
-            // Lite sessions hold a session-count token but no NIC slot.
-            // restore_from_infos does not count them, so we track them here
-            // and call restore_lite_tokens below to keep the cap honest.
-            if session.state == SessionState::Running {
-                running_lite_count += 1;
-            }
+        } else {
+            // Lite sessions hold a session-count token but no NIC slot, so
+            // nothing about a slot index can tell us whose quota it came
+            // out of — the persisted uid, or the owner name, is the only
+            // route.
+            entries.push(RestoreEntry {
+                session_id: session.id,
+                owner_username: session.owner_username.clone(),
+                operator_uid: info.and_then(|i| i.operator_uid),
+                kind: RestoreKind::Token,
+            });
         }
     }
 
-    // Step 7: restore pool state from running Lima sessions.
-    if !running_infos.is_empty() {
-        let pool = state.vmnet_pool.clone();
-        let infos_for_restore = running_infos.clone();
+    if !entries.is_empty() {
+        let pools = state.vmnet_pools.clone();
         let result =
-            tokio::task::spawn_blocking(move || pool.restore_from_infos(&infos_for_restore)).await;
+            tokio::task::spawn_blocking(move || pools.restore(&entries, &resolve_name_to_uid))
+                .await;
         match result {
-            Ok(Ok(())) => {
+            Ok(outcome) => {
                 info!(
-                    count = running_infos.len(),
-                    "macOS startup step 7: pool state restored from running Lima sessions"
-                );
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    error = %e,
-                    "macOS startup step 7: pool restore error (non-fatal; pool may be over-allocated)"
+                    slots = outcome.slots,
+                    tokens = outcome.tokens,
+                    declined = outcome.declined,
+                    leaked_released = leaked_sessions.len(),
+                    "macOS startup step 7: pool state restored"
                 );
             }
             Err(e) => {
@@ -12227,42 +12362,12 @@ async fn restore_macos_pool_state(state: &AppState) {
                 );
             }
         }
+    } else {
+        info!(
+            leaked_released = leaked_sessions.len(),
+            "macOS pool restore complete: nothing to restore"
+        );
     }
-
-    // Restore lite session-count tokens. Without this the cap under-counts
-    // after a daemon restart until running lite sessions are explicitly stopped.
-    if running_lite_count > 0 {
-        let pool = state.vmnet_pool.clone();
-        let n = running_lite_count;
-        let result = tokio::task::spawn_blocking(move || pool.restore_lite_tokens(n)).await;
-        match result {
-            Ok(Ok(())) => {
-                info!(
-                    count = running_lite_count,
-                    "macOS startup: lite session-count tokens restored"
-                );
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    error = %e,
-                    "macOS startup: lite token restore error (non-fatal; pool may under-count)"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "macOS startup: lite token restore task panicked (non-fatal)"
-                );
-            }
-        }
-    }
-
-    info!(
-        running_lima_restored = running_infos.len(),
-        running_lite_restored = running_lite_count,
-        leaked_released = leaked_sessions.len(),
-        "macOS pool restore complete"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -12862,7 +12967,9 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
     let store = Arc::clone(&state.store);
     let mgr_restart = Arc::clone(&state.gateway_lima_manager);
     let mgr_per_session = Arc::clone(&state.gateway_lima_manager);
-    let pool_slots = state.vmnet_pool.max_slots();
+    // The gateway VM carries a NIC on every slot on the host, not on one
+    // operator's share — recovery must rebuild all of them.
+    let pool_slots = state.vmnet_pools.host_slots();
     let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     let pool = format!(
         "{}/{}",
@@ -13423,12 +13530,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The Linux startup path is unchanged. Any change that accidentally
     // touches Linux behaviour should be flagged and reviewed separately.
     #[cfg(target_os = "macos")]
-    let (vmnet_pool, gateway_lima_manager): (
-        Arc<sandbox_core::network::VmnetPool>,
+    let (vmnet_pools, gateway_lima_manager): (
+        Arc<sandbox_core::vmnet_pool_registry::VmnetPoolRegistry>,
         Arc<sandbox_core::GatewayLimaManager>,
     ) = {
         use sandbox_core::network::{
-            STAGED_SOCKET_VMNET_PATH, VMNET_SOCKET_DIR, VmnetPool, assert_root_exec_ancestry,
+            STAGED_SOCKET_VMNET_PATH, VMNET_SOCKET_DIR, assert_root_exec_ancestry,
             vmnet_slot_socket_path,
         };
         use sandbox_core::{
@@ -13813,16 +13920,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // ---------------------------------------------------------------------------
-        // Step 3: socket_vmnet pool init — sized from effective_n so the pool
-        // never hands out slot indices beyond the NICs that actually exist.
+        // Step 3: socket_vmnet pool init — sized from effective_n so no pool
+        // hands out slot indices beyond the NICs that actually exist, then
+        // partitioned by the range each operator was enrolled with.
+        //
+        // The derivation reads Directory Services and stats the slot sockets,
+        // so it runs on a blocking task. It cannot fail the startup: a host
+        // whose sockets are all still on the shared group — every host that
+        // has not been migrated — derives one shared pool of every slot and
+        // behaves exactly as it did before.
         // ---------------------------------------------------------------------------
         info!(
             effective_n,
             "macOS startup: step 3 — pool init (slot→socket-path map)"
         );
-        let pool = Arc::new(VmnetPool::new(effective_n));
+        let assignment = tokio::task::spawn_blocking(move || {
+            sandbox_core::vmnet_assignment::derive_slot_assignment(
+                &sandbox_core::vmnet_assignment::HostSlotDirectory,
+                effective_n,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| {
+            // A probe fault is a bug, not a host state, and refusing every
+            // session over one would take down a host that was working.
+            // Fall back to the pre-migration model and say so loudly.
+            error!(error = %e, "vmnet slot-assignment probe panicked");
+            sandbox_core::vmnet_assignment::SlotAssignment::all_legacy(
+                effective_n,
+                "the probe task panicked",
+            )
+        });
+        for warning in assignment.warnings() {
+            warn!("{warning}");
+        }
+        // Severity follows the state, so lost capacity does not read like a
+        // routine startup line. Two operators sharing one slot group is the
+        // isolation defect the partition exists to remove, in miniature, and
+        // is the one that must be impossible to scroll past.
+        {
+            use sandbox_core::vmnet_assignment::{SlotState, Unassignable};
+            for (line, state) in assignment.describe().iter().zip(assignment.states()) {
+                match state {
+                    SlotState::Unassignable(Unassignable::MultipleOperators { .. }) => {
+                        error!("macOS startup: {line}")
+                    }
+                    SlotState::Unassignable(_) => warn!("macOS startup: {line}"),
+                    _ => info!("macOS startup: {line}"),
+                }
+            }
+        }
+        let pools = Arc::new(sandbox_core::vmnet_pool_registry::VmnetPoolRegistry::new(
+            assignment,
+        ));
 
-        (pool, manager_arc)
+        (pools, manager_arc)
     };
 
     // Build the Lima runtime backed by the registry and register it in
@@ -14175,7 +14327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon_user: daemon_user_resolved,
         users_conf_pool: users_conf_pool_entry,
         #[cfg(target_os = "macos")]
-        vmnet_pool,
+        vmnet_pools,
         #[cfg(target_os = "macos")]
         gateway_lima_manager,
         #[cfg(target_os = "macos")]

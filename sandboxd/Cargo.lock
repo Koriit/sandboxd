@@ -1813,6 +1813,7 @@ dependencies = [
  "base64",
  "chrono",
  "enumset",
+ "libc",
  "nix",
  "notify",
  "rcgen",

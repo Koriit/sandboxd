@@ -76,6 +76,30 @@ pub struct NetworkInfo {
     /// deserialize cleanly with `None`.
     #[serde(default)]
     pub vmnet_slot: Option<VmnetSlot>,
+    /// The operator uid this session's slot (or session-count token)
+    /// belongs to.
+    ///
+    /// macOS only in practice; `None` on Linux rows. Restore needs it to
+    /// route a persisted session back into the right operator's pool, and
+    /// nothing else on the record answers that question:
+    /// `Session.owner_username` is a *name*, and a name has to be resolved
+    /// against a directory that may have changed underneath it.
+    ///
+    /// Not derived from the slot index, though the slot does imply a range
+    /// and a range does imply an operator. That derivation is wrong twice
+    /// over: lite sessions claim a token and no slot at all, so it would
+    /// cover only half the sessions; and it would misattribute an old
+    /// session the moment a slot changed hands, silently and with no way
+    /// to notice. An explicit field covers both backends and cannot be
+    /// quietly wrong.
+    ///
+    /// `Option` + `#[serde(default)]` per `CLAUDE.md`'s blob-field rules:
+    /// a row written before this field existed deserializes with `None`,
+    /// and a row written with it deserializes on a daemon that predates it
+    /// (serde ignores unknown fields), so a rollback loses the routing hint
+    /// rather than the record.
+    #[serde(default)]
+    pub operator_uid: Option<u32>,
 }
 
 /// Identity of a socket_vmnet slot claimed by a running macOS Lima session.
@@ -432,6 +456,9 @@ impl NetworkManager {
                     vm_ip: vm_ip.to_string(),
                     docker_network_name: docker_network_name.clone(),
                     vmnet_slot: None,
+                    // Linux: the per-operator vmnet partition is a macOS
+                    // concept and this allocator is not part of it.
+                    operator_uid: None,
                 };
 
                 // Track the network.
@@ -1191,42 +1218,131 @@ pub fn generate_vmnet_plist(slot: u16) -> Result<String, SandboxError> {
 ///
 /// This is the macOS counterpart to Linux's [`SubnetAllocator`]/
 /// [`NetworkManager`] and follows the same locking pattern.
+///
+/// # One pool per operator
+///
+/// A pool owns a *range* — the slot indices it may hand out — rather than a
+/// count. On a host with a single operator that range is the whole pool and
+/// the behaviour is byte-for-byte what it always was. On a partitioned host
+/// there are several pools behind
+/// [`VmnetPoolRegistry`](crate::vmnet_pool_registry::VmnetPoolRegistry), each
+/// seeded with a disjoint range, and `session_count` becomes that operator's
+/// quota rather than a host-wide cap. Nothing about claim/release changes:
+/// there is simply more than one pool.
 #[cfg(target_os = "macos")]
 pub struct VmnetPool {
-    /// Claimed NIC slot indices (0..max_slots-1).
+    /// Claimed NIC slot indices. Always a subset of [`Self::range`].
     allocated_slots: Mutex<HashSet<u16>>,
     /// In-use session-count tokens.
     session_count: Mutex<u32>,
-    /// Maximum slots (= max concurrent sessions; from `max_macos_sessions`).
-    max_slots: u16,
-    /// Maps session_id → (slot_index, Option<NetworkInfo>) for sessions that
-    /// hold a NIC slot (Lima sessions). The entry is inserted at `claim_lima_slot`
-    /// time with `None` and upgraded to `Some(info)` by `set_lima_network_info`.
-    /// This two-phase write ensures that a partial-create rollback via
-    /// `release_lima_slot` always finds the entry and can free the slot, even
-    /// if the caller never reached `set_lima_network_info`. Lite sessions are
-    /// tracked only via `session_count`.
-    networks: Mutex<HashMap<SessionId, (u16, Option<NetworkInfo>)>>,
+    /// The slot indices this pool may hand out, sorted and deduplicated.
+    ///
+    /// A range is a set rather than a `lo..hi` pair because enrollment
+    /// accepts a discontiguous assignment (`0-3,6`), and a pool that
+    /// silently filled the hole would hand out a slot on someone else's
+    /// L2 segment.
+    range: Vec<u16>,
+    /// Slots in the host pool, across every operator.
+    ///
+    /// Not used for admission — [`Self::range`] decides that. It exists so
+    /// the exhaustion error can tell "your share is full" from "the host is
+    /// full", which have different remediations.
+    host_slots: u16,
+    /// Maps session_id → the slot claim for sessions that hold a NIC slot
+    /// (Lima sessions). The entry is inserted at `claim_lima_slot` time with
+    /// `info: None` and upgraded by `set_lima_network_info`. This two-phase
+    /// write ensures that a partial-create rollback via `release_lima_slot`
+    /// always finds the entry and can free the slot, even if the caller never
+    /// reached `set_lima_network_info`. Lite sessions are tracked only via
+    /// `session_count`.
+    networks: Mutex<HashMap<SessionId, SlotClaim>>,
+}
+
+/// One session's hold on a NIC slot.
+#[cfg(target_os = "macos")]
+struct SlotClaim {
+    /// The claimed slot index.
+    slot: u16,
+    /// The operator the claim belongs to. Recorded at claim time rather
+    /// than read off the `NetworkInfo`, because during the placeholder
+    /// window there is no `NetworkInfo` yet — and that window is exactly
+    /// when a leaked slot most needs attributing.
+    operator_uid: u32,
+    /// `None` until `set_lima_network_info` upgrades the placeholder.
+    info: Option<NetworkInfo>,
+}
+
+/// A slot the pool believes is claimed, with the operator it belongs to.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedSlot {
+    /// The claimed slot index.
+    pub slot: u16,
+    /// The session holding it.
+    pub session_id: SessionId,
+    /// The operator the claiming session belongs to.
+    pub operator_uid: u32,
 }
 
 #[cfg(target_os = "macos")]
 impl VmnetPool {
-    /// Create a new pool with `max_slots` slots (= max concurrent sessions).
+    /// Create a pool over the contiguous range `0..max_slots`.
     ///
-    /// Call this once at daemon startup. `max_slots` comes from the
-    /// `max_macos_sessions` config value (default 8).
+    /// The un-partitioned shape: one operator, the whole pool. `max_slots`
+    /// comes from the `max_macos_sessions` config value (default 8).
     pub fn new(max_slots: u16) -> Self {
+        Self::with_range(&(0..max_slots).collect::<Vec<u16>>(), max_slots)
+    }
+
+    /// Create a pool over an explicit set of slot indices.
+    ///
+    /// The range is sorted and deduplicated; a duplicate in the caller's
+    /// slice would otherwise inflate the quota without adding capacity.
+    /// `host_slots` is the size of the whole host pool — see
+    /// [`Self::host_slots`].
+    pub fn with_range(range: &[u16], host_slots: u16) -> Self {
+        let mut range = range.to_vec();
+        range.sort_unstable();
+        range.dedup();
         Self {
             allocated_slots: Mutex::new(HashSet::new()),
             session_count: Mutex::new(0),
-            max_slots,
+            range,
+            host_slots,
             networks: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Maximum number of concurrent sessions (= number of NIC slots).
+    /// Slots in the host pool, across every operator.
+    pub fn host_slots(&self) -> u16 {
+        self.host_slots
+    }
+
+    /// Build the exhaustion error for this pool's operator.
+    ///
+    /// One place, three callers — the two claim paths and the lite token
+    /// path — where the message used to exist as three copies free to drift.
+    fn exhausted(&self, operator_uid: u32, in_use: u32) -> SandboxError {
+        SandboxError::SessionQuotaExhausted {
+            operator_uid,
+            in_use,
+            quota: self.max_slots(),
+            host_slots: self.host_slots,
+        }
+    }
+
+    /// Maximum number of concurrent sessions for this pool's operator —
+    /// the size of its range.
+    ///
+    /// Identical to the constructor argument for a `new(n)` pool, which is
+    /// what every un-partitioned host has.
     pub fn max_slots(&self) -> u16 {
-        self.max_slots
+        self.range.len() as u16
+    }
+
+    /// The slot indices this pool may hand out, sorted.
+    pub fn range(&self) -> &[u16] {
+        &self.range
     }
 
     /// Claim a NIC slot and a session-count token for a Lima session.
@@ -1239,15 +1355,17 @@ impl VmnetPool {
     /// `release_lima_slot` always finds the entry and frees the slot, even
     /// if the caller fails before calling `set_lima_network_info`.
     ///
-    /// Fails with a descriptive error if the pool is exhausted:
+    /// `operator_uid` is the operator the session belongs to; it is recorded
+    /// with the claim so a leaked slot can be attributed even before
+    /// `set_lima_network_info` runs, and it is what the exhaustion error
+    /// names.
     ///
-    /// ```text
-    /// max concurrent sessions reached (N running).
-    /// To increase the limit, set max_macos_sessions in config and restart sandboxd.
-    /// ```
+    /// Fails with [`SandboxError::SessionQuotaExhausted`] (429) when every
+    /// slot in this operator's range is in use.
     pub fn claim_lima_slot(
         &self,
         session_id: &SessionId,
+        operator_uid: u32,
     ) -> Result<(VmnetSlot, String, Ipv4Addr, Ipv4Addr), SandboxError> {
         let mut slots = self
             .allocated_slots
@@ -1263,28 +1381,32 @@ impl VmnetPool {
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let running = *count;
-        if running >= self.max_slots as u32 {
-            return Err(SandboxError::Network(format!(
-                "max concurrent sessions reached ({running} running).\n\
-                 To increase the limit, set max_macos_sessions in config and restart sandboxd."
-            )));
+        if running >= self.max_slots() as u32 {
+            return Err(self.exhausted(operator_uid, running));
         }
 
-        // Find the lowest free slot index.
-        let slot_idx = (0..self.max_slots)
+        // Find the lowest free slot *within this operator's range*. The
+        // count cap above normally makes this unreachable; it stays as the
+        // structural guarantee that a pool cannot hand out an index it does
+        // not own, whatever the count says.
+        let slot_idx = *self
+            .range
+            .iter()
             .find(|i| !slots.contains(i))
-            .ok_or_else(|| {
-                SandboxError::Network(format!(
-                    "max concurrent sessions reached ({running} running).\n\
-                     To increase the limit, set max_macos_sessions in config and restart sandboxd."
-                ))
-            })?;
+            .ok_or_else(|| self.exhausted(operator_uid, running))?;
 
         slots.insert(slot_idx);
         *count += 1;
         // Insert a placeholder now so release_lima_slot can always find this
         // entry. The placeholder is upgraded to Some(info) by set_lima_network_info.
-        nets.insert(*session_id, (slot_idx, None));
+        nets.insert(
+            *session_id,
+            SlotClaim {
+                slot: slot_idx,
+                operator_uid,
+                info: None,
+            },
+        );
 
         drop(nets);
         drop(slots);
@@ -1302,19 +1424,20 @@ impl VmnetPool {
 
     /// Claim only a session-count token for a lite (container) session.
     ///
-    /// Lite sessions use an in-VM Docker bridge and consume no NIC slot.
-    /// Fails if the session-count cap is reached.
-    pub fn claim_lite_token(&self) -> Result<(), SandboxError> {
+    /// Lite sessions use an in-VM Docker bridge and consume no NIC slot,
+    /// but they do count against the operator's quota — which is why the
+    /// quota cannot be derived from slot indices alone.
+    ///
+    /// Fails with [`SandboxError::SessionQuotaExhausted`] (429) when the
+    /// operator's quota is reached.
+    pub fn claim_lite_token(&self, operator_uid: u32) -> Result<(), SandboxError> {
         let mut count = self
             .session_count
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
         let running = *count;
-        if running >= self.max_slots as u32 {
-            return Err(SandboxError::Network(format!(
-                "max concurrent sessions reached ({running} running).\n\
-                 To increase the limit, set max_macos_sessions in config and restart sandboxd."
-            )));
+        if running >= self.max_slots() as u32 {
+            return Err(self.exhausted(operator_uid, running));
         }
         *count += 1;
         Ok(())
@@ -1341,14 +1464,14 @@ impl VmnetPool {
         match nets.get_mut(session_id) {
             Some(entry) => {
                 // Sanity check: slot index should match what was claimed.
-                if entry.0 != slot_idx {
+                if entry.slot != slot_idx {
                     return Err(SandboxError::Internal(format!(
                         "slot index mismatch for session {session_id}: \
                          claimed {}, got {}",
-                        entry.0, slot_idx
+                        entry.slot, slot_idx
                     )));
                 }
-                entry.1 = Some(info);
+                entry.info = Some(info);
                 Ok(())
             }
             None => Err(SandboxError::Internal(format!(
@@ -1369,7 +1492,7 @@ impl VmnetPool {
                 .networks
                 .lock()
                 .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
-            nets.remove(session_id).map(|(idx, _)| idx)
+            nets.remove(session_id).map(|claim| claim.slot)
         };
 
         if let Some(idx) = slot_idx {
@@ -1414,17 +1537,24 @@ impl VmnetPool {
             .networks
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
-        Ok(nets.get(session_id).and_then(|(_, info)| info.clone()))
+        Ok(nets.get(session_id).and_then(|claim| claim.info.clone()))
     }
 
     /// Rebuild pool state from existing `NetworkInfo` entries at daemon startup.
     ///
     /// For each session whose `NetworkInfo` contains a `vmnet_slot`, marks
     /// that slot as allocated and increments the session count. Call this
-    /// after loading sessions from the store.
+    /// after loading sessions from the store, with the entries already
+    /// sharded to this pool's operator.
+    ///
+    /// The bounds check is the same one it always was, narrowed from "inside
+    /// the pool" to "inside this operator's range": a persisted claim on a
+    /// slot this pool does not own is refused rather than absorbed, because
+    /// absorbing it would put two operators on one L2 segment.
     pub fn restore_from_infos(
         &self,
         entries: &[(SessionId, NetworkInfo)],
+        operator_uid: u32,
     ) -> Result<(), SandboxError> {
         let mut slots = self
             .allocated_slots
@@ -1442,17 +1572,24 @@ impl VmnetPool {
         for (session_id, info) in entries {
             if let Some(vs) = &info.vmnet_slot {
                 let idx = vs.index;
-                if idx >= self.max_slots {
+                if !self.range.contains(&idx) {
                     return Err(SandboxError::Network(format!(
-                        "slot index {idx} from session {session_id} out of range \
-                         (max_slots={})",
-                        self.max_slots
+                        "slot index {idx} from session {session_id} is outside the \
+                         range assigned to operator uid {operator_uid} ({:?})",
+                        self.range
                     )));
                 }
                 slots.insert(idx);
                 *count += 1;
                 // Restored sessions have full NetworkInfo; store as Some.
-                nets.insert(*session_id, (idx, Some(info.clone())));
+                nets.insert(
+                    *session_id,
+                    SlotClaim {
+                        slot: idx,
+                        operator_uid,
+                        info: Some(info.clone()),
+                    },
+                );
             }
         }
         Ok(())
@@ -1500,20 +1637,28 @@ impl VmnetPool {
             .unwrap_or_default()
     }
 
-    /// Return the `(slot_index, session_id)` pairs for every slot the pool
-    /// currently believes is claimed.
+    /// Return every slot the pool currently believes is claimed, with the
+    /// session and the operator holding it.
     ///
     /// The map is the in-memory source of truth for which session owns which
     /// slot (seeded from persisted `NetworkInfo` at startup, mutated on
     /// claim/release). Cross-referencing the returned session ids against the
     /// live session store surfaces leaked slots — a slot still claimed by a
     /// session that no longer exists.
-    pub fn claimed_slot_sessions(&self) -> Vec<(u16, SessionId)> {
+    ///
+    /// The operator dimension is carried on the claim rather than inferred
+    /// from which pool the claim came out of: operators without an assigned
+    /// range share one pool, so the pool alone cannot answer who holds what.
+    pub fn claimed_slot_sessions(&self) -> Vec<ClaimedSlot> {
         self.networks
             .lock()
             .map(|nets| {
                 nets.iter()
-                    .map(|(sid, (slot_idx, _))| (*slot_idx, *sid))
+                    .map(|(sid, claim)| ClaimedSlot {
+                        slot: claim.slot,
+                        session_id: *sid,
+                        operator_uid: claim.operator_uid,
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1841,6 +1986,7 @@ mod tests {
         let docker_network_name = format!("sandbox-net-{session_id}");
 
         let info = NetworkInfo {
+            operator_uid: None,
             bridge_name: bridge_name.clone(),
             subnet: format!("{subnet_base}/28"),
             gateway_ip: gateway_ip.to_string(),
@@ -1873,6 +2019,7 @@ mod tests {
     #[test]
     fn test_network_info_serialization() {
         let info = NetworkInfo {
+            operator_uid: None,
             bridge_name: "sb-550e8400-e2".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
@@ -1891,6 +2038,67 @@ mod tests {
         assert_eq!(deserialized.docker_network_name, info.docker_network_name);
     }
 
+    /// Upgrade direction: a `network_info` blob written before
+    /// `operator_uid` existed still deserializes, with the field absent
+    /// rather than the record rejected.
+    #[test]
+    fn a_record_written_before_operator_uid_still_deserializes() {
+        let older = r#"{
+            "bridge_name": "lima3",
+            "subnet": "10.209.128.24/29",
+            "gateway_ip": "10.209.128.27",
+            "vm_ip": "10.209.128.28",
+            "docker_network_name": "sandbox-net-aabbccddeeff"
+        }"#;
+
+        let info: NetworkInfo =
+            serde_json::from_str(older).expect("an older row must still load, not fail the daemon");
+
+        assert_eq!(info.operator_uid, None);
+        assert_eq!(info.vmnet_slot, None);
+        assert_eq!(info.bridge_name, "lima3");
+    }
+
+    /// Rollback direction: a blob written *with* `operator_uid` must still
+    /// load on a daemon that predates the field. Pinned by deserializing
+    /// into a struct shaped like the older one — if `NetworkInfo` ever grew
+    /// `deny_unknown_fields`, a downgrade would start rejecting every row
+    /// this daemon wrote, and only a test in this shape would catch it.
+    #[test]
+    fn a_record_written_with_operator_uid_survives_a_rollback() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct NetworkInfoBeforeOperatorUid {
+            bridge_name: String,
+            subnet: String,
+            gateway_ip: String,
+            vm_ip: String,
+            docker_network_name: String,
+            #[serde(default)]
+            vmnet_slot: Option<VmnetSlot>,
+        }
+
+        let current = NetworkInfo {
+            operator_uid: Some(501),
+            bridge_name: "lima3".to_string(),
+            subnet: "10.209.128.24/29".to_string(),
+            gateway_ip: "10.209.128.27".to_string(),
+            vm_ip: "10.209.128.28".to_string(),
+            docker_network_name: "sandbox-net-aabbccddeeff".to_string(),
+            vmnet_slot: None,
+        };
+        let json = serde_json::to_string(&current).unwrap();
+        assert!(
+            json.contains("operator_uid"),
+            "the field must actually be on the wire, or the rollback assertion \
+             below proves nothing"
+        );
+
+        let older: NetworkInfoBeforeOperatorUid = serde_json::from_str(&json)
+            .expect("a daemon that predates the field must still read this row");
+        assert_eq!(older.bridge_name, "lima3");
+    }
+
     #[test]
     fn test_restore_from_infos() {
         let mgr = NetworkManager::new(
@@ -1904,6 +2112,7 @@ mod tests {
         let id2 = SessionId::generate();
 
         let info1 = NetworkInfo {
+            operator_uid: None,
             bridge_name: "sb-aaaaaaaaaaa".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
@@ -1913,6 +2122,7 @@ mod tests {
         };
 
         let info2 = NetworkInfo {
+            operator_uid: None,
             bridge_name: "sb-bbbbbbbbbbb".to_string(),
             subnet: "10.209.0.32/28".to_string(),
             gateway_ip: "10.209.0.34".to_string(),
@@ -1991,6 +2201,7 @@ mod tests {
             socket_path: "/var/run/sandbox/vmnet/slot-3.sock".to_string(),
         };
         let info = NetworkInfo {
+            operator_uid: None,
             bridge_name: "lima3".to_string(),
             subnet: "10.209.128.24/29".to_string(),
             gateway_ip: "10.209.128.27".to_string(),
@@ -2032,6 +2243,11 @@ mod tests {
     mod macos_tests {
         use super::*;
         use tempfile::TempDir;
+
+        /// A stand-in operator uid for pool tests. The pool does not interpret
+        /// it — it records the uid with the claim and names it in the
+        /// exhaustion error — so any value above the system-uid floor does.
+        const TEST_OPERATOR_UID: u32 = 501;
 
         // -- /29 address role computation ------------------------------------
 
@@ -2457,7 +2673,9 @@ mod tests {
         fn test_vmnet_pool_claim_lima_slot() {
             let pool = VmnetPool::new(4);
             let session_id = SessionId::generate();
-            let (slot, subnet, gw, vm) = pool.claim_lima_slot(&session_id).unwrap();
+            let (slot, subnet, gw, vm) = pool
+                .claim_lima_slot(&session_id, TEST_OPERATOR_UID)
+                .unwrap();
 
             assert_eq!(slot.index, 0);
             assert_eq!(slot.daemon_label, "io.sandboxd.vmnet.0");
@@ -2473,8 +2691,8 @@ mod tests {
             let pool = VmnetPool::new(4);
             let id0 = SessionId::generate();
             let id1 = SessionId::generate();
-            let (s0, _, _, _) = pool.claim_lima_slot(&id0).unwrap();
-            let (s1, _, _, _) = pool.claim_lima_slot(&id1).unwrap();
+            let (s0, _, _, _) = pool.claim_lima_slot(&id0, TEST_OPERATOR_UID).unwrap();
+            let (s1, _, _, _) = pool.claim_lima_slot(&id1, TEST_OPERATOR_UID).unwrap();
 
             assert_eq!(s0.index, 0);
             assert_eq!(s1.index, 1);
@@ -2488,11 +2706,12 @@ mod tests {
             let id1 = SessionId::generate();
             let id2 = SessionId::generate();
 
-            let (s0, _, _, _) = pool.claim_lima_slot(&id0).unwrap();
-            let _ = pool.claim_lima_slot(&id1).unwrap();
+            let (s0, _, _, _) = pool.claim_lima_slot(&id0, TEST_OPERATOR_UID).unwrap();
+            let _ = pool.claim_lima_slot(&id1, TEST_OPERATOR_UID).unwrap();
 
             // Populate the full NetworkInfo (optional step after claim).
             let info = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
                 gateway_ip: "10.209.128.3".to_string(),
@@ -2510,7 +2729,7 @@ mod tests {
             assert_eq!(pool.running_session_count(), 1);
 
             // Next claim should reuse slot 0.
-            let (s2, _, _, _) = pool.claim_lima_slot(&id2).unwrap();
+            let (s2, _, _, _) = pool.claim_lima_slot(&id2, TEST_OPERATOR_UID).unwrap();
             assert_eq!(s2.index, 0);
         }
 
@@ -2519,8 +2738,9 @@ mod tests {
             let pool = VmnetPool::new(4);
             let id = SessionId::generate();
 
-            let (s0, _, _, _) = pool.claim_lima_slot(&id).unwrap();
+            let (s0, _, _, _) = pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
             let info = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
                 gateway_ip: "10.209.128.3".to_string(),
@@ -2549,7 +2769,7 @@ mod tests {
             let pool = VmnetPool::new(4);
             let id = SessionId::generate();
 
-            let (s0, _, _, _) = pool.claim_lima_slot(&id).unwrap();
+            let (s0, _, _, _) = pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
             assert_eq!(pool.running_session_count(), 1);
             assert!(pool.allocated_slot_indices().contains(&s0.index));
 
@@ -2566,7 +2786,7 @@ mod tests {
 
             // The freed slot must be reclaimable.
             let id2 = SessionId::generate();
-            let (s2, _, _, _) = pool.claim_lima_slot(&id2).unwrap();
+            let (s2, _, _, _) = pool.claim_lima_slot(&id2, TEST_OPERATOR_UID).unwrap();
             assert_eq!(s2.index, s0.index, "freed slot must be reused");
         }
 
@@ -2576,7 +2796,7 @@ mod tests {
             let pool = VmnetPool::new(4);
             let id = SessionId::generate();
 
-            pool.claim_lima_slot(&id).unwrap();
+            pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
             pool.release_lima_slot(&id).unwrap(); // first release — frees slot
             pool.release_lima_slot(&id).unwrap(); // second release — must be no-op
 
@@ -2591,7 +2811,7 @@ mod tests {
 
             // Claim a lite token — should succeed and increment session count
             // but NOT allocate any slot.
-            pool.claim_lite_token().unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
             assert_eq!(pool.running_session_count(), 1);
             assert!(
                 pool.allocated_slot_indices().is_empty(),
@@ -2606,10 +2826,10 @@ mod tests {
             let ids: Vec<SessionId> = (0..3).map(|_| SessionId::generate()).collect();
 
             for id in &ids {
-                pool.claim_lima_slot(id).unwrap();
+                pool.claim_lima_slot(id, TEST_OPERATOR_UID).unwrap();
             }
-            pool.claim_lite_token().unwrap();
-            pool.claim_lite_token().unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
 
             assert_eq!(pool.running_session_count(), 5);
             assert_eq!(
@@ -2628,12 +2848,33 @@ mod tests {
             let id1 = SessionId::generate();
             let id2 = SessionId::generate();
 
-            pool.claim_lima_slot(&id0).unwrap();
-            pool.claim_lima_slot(&id1).unwrap();
+            pool.claim_lima_slot(&id0, TEST_OPERATOR_UID).unwrap();
+            pool.claim_lima_slot(&id1, TEST_OPERATOR_UID).unwrap();
 
-            let result = pool.claim_lima_slot(&id2);
-            assert!(result.is_err());
-            let err = result.unwrap_err().to_string();
+            let result = pool.claim_lima_slot(&id2, TEST_OPERATOR_UID);
+            // Structured, not a pre-formatted string: the numbers are fields
+            // and the text is rendered from `Display` in one place. Three
+            // sites raise this condition, and as three copies of a literal
+            // they were free to drift apart.
+            match result {
+                Err(SandboxError::SessionQuotaExhausted {
+                    operator_uid,
+                    in_use,
+                    quota,
+                    host_slots,
+                }) => {
+                    assert_eq!(operator_uid, TEST_OPERATOR_UID);
+                    assert_eq!(in_use, 2);
+                    assert_eq!(quota, 2);
+                    assert_eq!(host_slots, 2);
+                }
+                other => panic!("exhaustion must be the structured quota variant, got {other:?}"),
+            }
+
+            let err = pool
+                .claim_lima_slot(&id2, TEST_OPERATOR_UID)
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains("max concurrent sessions reached"),
                 "exhaustion error must mention 'max concurrent sessions reached': {err}"
@@ -2647,9 +2888,9 @@ mod tests {
         #[test]
         fn test_pool_exhaustion_lite_token() {
             let pool = VmnetPool::new(1);
-            pool.claim_lite_token().unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
 
-            let result = pool.claim_lite_token();
+            let result = pool.claim_lite_token(TEST_OPERATOR_UID);
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("max concurrent sessions reached"));
@@ -2665,7 +2906,7 @@ mod tests {
         fn lite_token_retained_across_stop_start_no_drift() {
             // Claim a lite token (simulate create).
             let pool = VmnetPool::new(2);
-            pool.claim_lite_token().unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
             assert_eq!(pool.running_session_count(), 1);
 
             // Stop does NOT release the token — the session is paused, not gone.
@@ -2678,11 +2919,11 @@ mod tests {
 
             // Start also does NOT re-claim — the token was never released.
             // Verify the pool cap is still enforced (the held token blocks a new one).
-            pool.claim_lite_token().unwrap(); // second session, still under cap=2
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap(); // second session, still under cap=2
             assert_eq!(pool.running_session_count(), 2);
 
             // Third claim must fail — cap enforced by the retained first token.
-            let result = pool.claim_lite_token();
+            let result = pool.claim_lite_token(TEST_OPERATOR_UID);
             assert!(
                 result.is_err(),
                 "cap must be enforced by the retained stopped-session token"
@@ -2699,7 +2940,7 @@ mod tests {
             // Verify that a single claim → stop (no release) → remove (release)
             // cycle results in exactly one net release: count goes 1 → 0.
             let pool = VmnetPool::new(4);
-            pool.claim_lite_token().unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
             assert_eq!(pool.running_session_count(), 1);
 
             // stop: no release
@@ -2708,7 +2949,7 @@ mod tests {
             assert_eq!(pool.running_session_count(), 0);
 
             // A new session can now be created — the slot is free.
-            pool.claim_lite_token().unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
             assert_eq!(pool.running_session_count(), 1);
         }
 
@@ -2721,6 +2962,7 @@ mod tests {
             let id1 = SessionId::generate();
 
             let info0 = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
                 gateway_ip: "10.209.128.3".to_string(),
@@ -2733,6 +2975,7 @@ mod tests {
                 }),
             };
             let info1 = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima2".to_string(),
                 subnet: "10.209.128.16/29".to_string(),
                 gateway_ip: "10.209.128.19".to_string(),
@@ -2745,7 +2988,7 @@ mod tests {
                 }),
             };
 
-            pool.restore_from_infos(&[(id0, info0), (id1, info1)])
+            pool.restore_from_infos(&[(id0, info0), (id1, info1)], TEST_OPERATOR_UID)
                 .unwrap();
 
             assert_eq!(pool.running_session_count(), 2);
@@ -2763,6 +3006,7 @@ mod tests {
             let id = SessionId::generate();
 
             let info = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "sb-test".to_string(),
                 subnet: "10.209.0.0/28".to_string(),
                 gateway_ip: "10.209.0.2".to_string(),
@@ -2771,7 +3015,8 @@ mod tests {
                 vmnet_slot: None,
             };
 
-            pool.restore_from_infos(&[(id, info)]).unwrap();
+            pool.restore_from_infos(&[(id, info)], TEST_OPERATOR_UID)
+                .unwrap();
             assert_eq!(pool.running_session_count(), 0);
             assert!(pool.allocated_slot_indices().is_empty());
         }
@@ -2812,6 +3057,7 @@ mod tests {
             let id1 = SessionId::generate();
 
             let info0 = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
                 gateway_ip: "10.209.128.3".to_string(),
@@ -2824,6 +3070,7 @@ mod tests {
                 }),
             };
             let info1 = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima2".to_string(),
                 subnet: "10.209.128.16/29".to_string(),
                 gateway_ip: "10.209.128.19".to_string(),
@@ -2837,7 +3084,7 @@ mod tests {
             };
 
             // Restore 2 Lima slots.
-            pool.restore_from_infos(&[(id0, info0), (id1, info1)])
+            pool.restore_from_infos(&[(id0, info0), (id1, info1)], TEST_OPERATOR_UID)
                 .unwrap();
             // Then restore 3 lite tokens.
             pool.restore_lite_tokens(3).unwrap();
@@ -2864,11 +3111,11 @@ mod tests {
             assert_eq!(pool.running_session_count(), 3);
 
             // One more lite token must succeed (total = 4, cap = 4).
-            pool.claim_lite_token().unwrap();
+            pool.claim_lite_token(TEST_OPERATOR_UID).unwrap();
             assert_eq!(pool.running_session_count(), 4);
 
             // Another lite token must fail (cap exhausted).
-            let result = pool.claim_lite_token();
+            let result = pool.claim_lite_token(TEST_OPERATOR_UID);
             assert!(result.is_err(), "must fail when cap is reached");
             let err = result.unwrap_err().to_string();
             assert!(
@@ -2884,6 +3131,7 @@ mod tests {
             let pool = VmnetPool::new(4);
             let id = SessionId::generate();
             let info = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
                 gateway_ip: "10.209.128.3".to_string(),
@@ -2895,7 +3143,8 @@ mod tests {
                     socket_path: "/var/run/sandbox/vmnet/slot-0.sock".to_string(),
                 }),
             };
-            pool.restore_from_infos(&[(id, info)]).unwrap();
+            pool.restore_from_infos(&[(id, info)], TEST_OPERATOR_UID)
+                .unwrap();
             // restore_from_infos still counts the session AND marks the slot.
             assert_eq!(pool.running_session_count(), 1);
             assert!(pool.allocated_slot_indices().contains(&0));
@@ -2920,8 +3169,9 @@ mod tests {
             let id = SessionId::generate();
 
             // claim_lima_slot simulates what create did at runtime.
-            let (slot, subnet, gw, vm) = pool.claim_lima_slot(&id).unwrap();
+            let (slot, subnet, gw, vm) = pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
             let info = NetworkInfo {
+                operator_uid: None,
                 bridge_name: format!("lima{}", slot.index),
                 subnet,
                 gateway_ip: gw.to_string(),
@@ -2955,8 +3205,8 @@ mod tests {
             let id0 = SessionId::generate();
             let id1 = SessionId::generate();
 
-            let (slot0, _, _, _) = pool.claim_lima_slot(&id0).unwrap();
-            let (slot1, _, _, _) = pool.claim_lima_slot(&id1).unwrap();
+            let (slot0, _, _, _) = pool.claim_lima_slot(&id0, TEST_OPERATOR_UID).unwrap();
+            let (slot1, _, _, _) = pool.claim_lima_slot(&id1, TEST_OPERATOR_UID).unwrap();
 
             assert_eq!(pool.running_session_count(), 2);
 
@@ -2987,6 +3237,7 @@ mod tests {
 
             // Construct two NetworkInfo entries (as if loaded from DB).
             let info_running = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
                 gateway_ip: "10.209.128.3".to_string(),
@@ -3003,6 +3254,7 @@ mod tests {
             // restore_from_infos (the daemon releases the slot for stopped sessions
             // first and only restores running-session infos).
             let _info_stopped = NetworkInfo {
+                operator_uid: None,
                 bridge_name: "lima1".to_string(),
                 subnet: "10.209.128.8/29".to_string(),
                 gateway_ip: "10.209.128.11".to_string(),
@@ -3016,7 +3268,7 @@ mod tests {
             };
 
             // Only pass the running session to restore_from_infos.
-            pool.restore_from_infos(&[(id_running, info_running)])
+            pool.restore_from_infos(&[(id_running, info_running)], TEST_OPERATOR_UID)
                 .unwrap();
 
             assert_eq!(
@@ -3043,7 +3295,7 @@ mod tests {
             // containing "networks.yaml" in its name.
             let pool = VmnetPool::new(4);
             let id = SessionId::generate();
-            pool.claim_lima_slot(&id).unwrap();
+            pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
             // If the previous call wrote networks.yaml anywhere, the test
             // environment would surface it. We assert none of the socket paths
             // contain "networks.yaml".

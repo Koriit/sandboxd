@@ -28,6 +28,13 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+# `getgrouplist(3)` is absent on Apple targets in nix 0.29, and it is the
+# only membership lookup that sees an account whose *primary* gid is the
+# group — which the daemon account's own record is. macOS-only because the
+# call's signature differs from Linux's and nothing off macOS needs it.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

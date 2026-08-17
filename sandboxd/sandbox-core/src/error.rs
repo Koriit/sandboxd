@@ -110,6 +110,84 @@ pub enum SandboxError {
     /// `error_response` helper.
     #[error("{0}")]
     Conflict(String),
+
+    /// Every slot in the requesting operator's share of the macOS vmnet
+    /// pool is already in use.
+    ///
+    /// A capacity ceiling, not a configuration fault: stopping a session
+    /// frees a slot and the next request succeeds. Distinct from
+    /// [`SandboxError::Conflict`], which is what a request gets when the
+    /// operator has no share at all — no amount of waiting fixes that one,
+    /// so the two must not share a status code.
+    ///
+    /// Structured rather than string-wrapped. The same condition is raised
+    /// from three sites inside `VmnetPool` (both slot-claim paths and the
+    /// lite token path), and it used to be three byte-identical copies of a
+    /// message free to drift apart. Carrying the numbers as fields and
+    /// rendering from `Display` leaves exactly one copy of the text.
+    ///
+    /// `host_slots` is carried alongside `quota` so the rendering can tell
+    /// the two exhaustion stories apart: an operator who owns the whole
+    /// pool is told the *host* is full and pointed at the privileged
+    /// pool-regeneration step, while an operator holding a share is told
+    /// their *share* is full — for whom raising `max_macos_sessions` would
+    /// do nothing at all.
+    ///
+    /// HTTP mapping: `429 Too Many Requests`.
+    #[error(
+        "{}",
+        render_session_quota_exhausted(*operator_uid, *in_use, *quota, *host_slots)
+    )]
+    SessionQuotaExhausted {
+        /// The operator whose share is full.
+        operator_uid: u32,
+        /// Sessions this operator is currently running.
+        in_use: u32,
+        /// Slots assigned to this operator — the binding limit.
+        quota: u16,
+        /// Slots in the host pool, across every operator.
+        host_slots: u16,
+    },
+}
+
+/// Render the operator-facing text for
+/// [`SandboxError::SessionQuotaExhausted`].
+///
+/// Split out of the `#[error(...)]` attribute because the message branches:
+/// "your share is full" and "the host is full" have different remediations
+/// and telling an operator the wrong one sends them to a config knob that
+/// cannot help them.
+fn render_session_quota_exhausted(
+    operator_uid: u32,
+    in_use: u32,
+    quota: u16,
+    host_slots: u16,
+) -> String {
+    if quota >= host_slots {
+        // This operator holds the whole pool, so the host total is the
+        // binding limit. `max_macos_sessions` cannot exceed the number of
+        // provisioned slot sockets, so pointing at it here would be a
+        // dead end — the pool itself has to grow, and only the installer
+        // can regenerate the root-owned plists that define it.
+        format!(
+            "max concurrent sessions reached: {in_use} running, and all {host_slots} \
+             vmnet slots on this host are assigned to you.\n\
+             Stop a session to free a slot. Raising max_macos_sessions will not help: \
+             it cannot exceed the number of provisioned slots. Growing the pool means \
+             regenerating the root-owned vmnet plists, which is privileged installer \
+             work — re-run scripts/install.sh on this host."
+        )
+    } else {
+        format!(
+            "max concurrent sessions reached for operator uid {operator_uid}: \
+             {in_use} running against a share of {quota} vmnet slots.\n\
+             Your share is the binding limit, not the host — this host has \
+             {host_slots} slots in total. Stop one of your own sessions to free a \
+             slot, or ask an administrator to enroll uid {operator_uid} with a larger \
+             slot range. Raising max_macos_sessions has no effect on a per-operator \
+             share."
+        )
+    }
 }
 
 /// Map a [`UsersConfigError`] into [`SandboxError::InvalidArgument`].

@@ -63,6 +63,11 @@ mod integration_macos_session_lifecycle {
     use sandbox_core::test_support::direct_executor::DirectLimaExecutor;
     use sandbox_core::{NetworkInfo, SessionConfig};
 
+    /// A stand-in operator uid for pool tests. The pool does not interpret
+    /// it — it records the uid with the claim and names it in the
+    /// exhaustion error — so any value above the system-uid floor does.
+    const TEST_OPERATOR_UID: u32 = 501;
+
     // ---------------------------------------------------------------------------
     // Shared helpers
     // ---------------------------------------------------------------------------
@@ -237,12 +242,13 @@ mod integration_macos_session_lifecycle {
 
         // --- Step 1: claim a vmnet slot ---
         let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = pool
-            .claim_lima_slot(&session_id)
+            .claim_lima_slot(&session_id, TEST_OPERATOR_UID)
             .expect("claim_lima_slot failed");
         let slot_idx = vmnet_slot.index;
         let nic_name = format!("lima{slot_idx}");
 
         let network_info = sandbox_core::NetworkInfo {
+            operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: nic_name.clone(),
             subnet: subnet_cidr.clone(),
             gateway_ip: gateway_ip.to_string(),
@@ -452,12 +458,14 @@ mod integration_macos_session_lifecycle {
         let pool = Arc::new(VmnetPool::new(8));
         let session_id = SessionId::generate();
 
-        let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) =
-            pool.claim_lima_slot(&session_id).expect("claim failed");
+        let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = pool
+            .claim_lima_slot(&session_id, TEST_OPERATOR_UID)
+            .expect("claim failed");
         let _slot_idx = vmnet_slot.index; // slot_idx used only to drive slot claim; nic_name derived from slot
         let nic_name = format!("lima{}", vmnet_slot.index);
 
         let network_info = sandbox_core::NetworkInfo {
+            operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: nic_name.clone(),
             subnet: subnet_cidr,
             gateway_ip: gateway_ip.to_string(),
@@ -552,11 +560,13 @@ mod integration_macos_session_lifecycle {
         let pool = Arc::new(VmnetPool::new(8));
         let session_id = SessionId::generate();
 
-        let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) =
-            pool.claim_lima_slot(&session_id).expect("claim failed");
+        let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = pool
+            .claim_lima_slot(&session_id, TEST_OPERATOR_UID)
+            .expect("claim failed");
         let _slot_idx = vmnet_slot.index; // not used after claim; slot released via release_lima_slot
 
         let network_info = sandbox_core::NetworkInfo {
+            operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: "nonexistent_nic_xyz".to_string(),
             subnet: subnet_cidr,
             gateway_ip: gateway_ip.to_string(),
@@ -628,15 +638,19 @@ mod integration_macos_session_lifecycle {
         let sid2 = SessionId::generate();
 
         // Claim two slots.
-        let (slot1, _, _, _) = pool.claim_lima_slot(&sid1).expect("claim slot 1 failed");
-        let (slot2, _, _, _) = pool.claim_lima_slot(&sid2).expect("claim slot 2 failed");
+        let (slot1, _, _, _) = pool
+            .claim_lima_slot(&sid1, TEST_OPERATOR_UID)
+            .expect("claim slot 1 failed");
+        let (slot2, _, _, _) = pool
+            .claim_lima_slot(&sid2, TEST_OPERATOR_UID)
+            .expect("claim slot 2 failed");
         assert_ne!(slot1.index, slot2.index, "slots must be distinct");
         assert_eq!(pool.running_session_count(), 2);
 
         // Pool exhausted (max=2).
         let sid3 = SessionId::generate();
         assert!(
-            pool.claim_lima_slot(&sid3).is_err(),
+            pool.claim_lima_slot(&sid3, TEST_OPERATOR_UID).is_err(),
             "pool must be exhausted"
         );
 
@@ -647,7 +661,7 @@ mod integration_macos_session_lifecycle {
 
         // Slot 1's index is now free; next claim must get it.
         let (slot1b, _, _, _) = pool
-            .claim_lima_slot(&sid1)
+            .claim_lima_slot(&sid1, TEST_OPERATOR_UID)
             .expect("re-claim after release failed");
         assert_eq!(slot1b.index, slot1.index, "released slot must be reused");
         assert_eq!(pool.running_session_count(), 2);
@@ -691,8 +705,9 @@ mod integration_macos_session_lifecycle {
         let session_id = SessionId::generate();
 
         // Simulate a persisted macOS Lima NetworkInfo row with a vmnet slot.
-        let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) =
-            pool.claim_lima_slot(&session_id).expect("claim failed");
+        let (vmnet_slot, subnet_cidr, gateway_ip, vm_ip) = pool
+            .claim_lima_slot(&session_id, TEST_OPERATOR_UID)
+            .expect("claim failed");
         assert_eq!(pool.running_session_count(), 1);
 
         // Release the in-memory claim so we can restore it.
@@ -700,6 +715,7 @@ mod integration_macos_session_lifecycle {
         assert_eq!(pool.running_session_count(), 0);
 
         let info = NetworkInfo {
+            operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: format!("lima{}", vmnet_slot.index),
             subnet: subnet_cidr,
             gateway_ip: gateway_ip.to_string(),
@@ -709,7 +725,7 @@ mod integration_macos_session_lifecycle {
         };
 
         // `VmnetPool::restore_from_infos` must accept the slot row without error.
-        pool.restore_from_infos(&[(session_id, info)])
+        pool.restore_from_infos(&[(session_id, info)], TEST_OPERATOR_UID)
             .expect("restore_from_infos must not fail for a vmnet-slot row");
 
         // The pool's in-memory count must reflect the restored slot.
@@ -728,7 +744,7 @@ mod integration_macos_session_lifecycle {
         // A new claim on a distinct session must skip the already-restored slot.
         let sid2 = SessionId::generate();
         let (slot2, _, _, _) = pool
-            .claim_lima_slot(&sid2)
+            .claim_lima_slot(&sid2, TEST_OPERATOR_UID)
             .expect("claim after restore failed");
         assert_ne!(
             slot2.index, vmnet_slot.index,
@@ -787,8 +803,9 @@ mod integration_macos_session_lifecycle {
         let session_id = SessionId::generate();
 
         // Step 1: claim a slot (mirrors the create path).
-        let (vmnet_slot, _subnet_cidr, _gateway_ip, _vm_ip) =
-            pool.claim_lima_slot(&session_id).expect("claim failed");
+        let (vmnet_slot, _subnet_cidr, _gateway_ip, _vm_ip) = pool
+            .claim_lima_slot(&session_id, TEST_OPERATOR_UID)
+            .expect("claim failed");
         let slot_idx = vmnet_slot.index;
 
         // Step 2: create the VM using the same registry setup as the full lifecycle test.
@@ -892,11 +909,14 @@ mod integration_macos_session_lifecycle {
 
         // --- Step 1: claim a slot for a session (simulates session create) ---
         let sid_dead = SessionId::generate();
-        let (slot, subnet, gw, vm) = pool.claim_lima_slot(&sid_dead).expect("claim failed");
+        let (slot, subnet, gw, vm) = pool
+            .claim_lima_slot(&sid_dead, TEST_OPERATOR_UID)
+            .expect("claim failed");
         let slot_idx = slot.index;
 
         // Record the full NetworkInfo so the pool tracks the mapping.
         let info = NetworkInfo {
+            operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: format!("lima{slot_idx}"),
             subnet: subnet.clone(),
             gateway_ip: gw.to_string(),
@@ -916,7 +936,7 @@ mod integration_macos_session_lifecycle {
         // --- Step 2: claim a second slot to prove the pool is at capacity ---
         let sid_live = SessionId::generate();
         let (_slot_live, _, _, _) = pool
-            .claim_lima_slot(&sid_live)
+            .claim_lima_slot(&sid_live, TEST_OPERATOR_UID)
             .expect("second claim failed");
         assert_eq!(
             pool.running_session_count(),
@@ -927,7 +947,7 @@ mod integration_macos_session_lifecycle {
         // Pool exhausted (max=2); a third claim must fail.
         let sid_extra = SessionId::generate();
         assert!(
-            pool.claim_lima_slot(&sid_extra).is_err(),
+            pool.claim_lima_slot(&sid_extra, TEST_OPERATOR_UID).is_err(),
             "pool must be exhausted at max_slots=2"
         );
 
@@ -953,7 +973,7 @@ mod integration_macos_session_lifecycle {
         // --- Step 4: the freed slot must be reusable for a new session ---
         let sid_new = SessionId::generate();
         let (slot_new, _, _, _) = pool
-            .claim_lima_slot(&sid_new)
+            .claim_lima_slot(&sid_new, TEST_OPERATOR_UID)
             .expect("new claim after reconcile reclaim must succeed");
         assert_eq!(
             slot_new.index, slot_idx,
@@ -991,13 +1011,14 @@ mod integration_macos_session_lifecycle {
         // Simulate a persisted Running session (claim its slot).
         let sid_running = SessionId::generate();
         let (slot_r, subnet_r, gw_r, vm_r) = pool
-            .claim_lima_slot(&sid_running)
+            .claim_lima_slot(&sid_running, TEST_OPERATOR_UID)
             .expect("claim running failed");
 
         // Simulate a persisted dead session (claim a different slot).
         let sid_dead = SessionId::generate();
-        let (slot_d, subnet_d, gw_d, vm_d) =
-            pool.claim_lima_slot(&sid_dead).expect("claim dead failed");
+        let (slot_d, subnet_d, gw_d, vm_d) = pool
+            .claim_lima_slot(&sid_dead, TEST_OPERATOR_UID)
+            .expect("claim dead failed");
 
         // Both claimed up front.
         assert_eq!(pool.running_session_count(), 2);
@@ -1016,6 +1037,7 @@ mod integration_macos_session_lifecycle {
         // Step 7: restore_from_infos is called only for confirmed-Running sessions.
         // The dead session's info is excluded — only the running session is restored.
         let info_running = NetworkInfo {
+            operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: format!("lima{}", slot_r.index),
             subnet: subnet_r,
             gateway_ip: gw_r.to_string(),
@@ -1023,7 +1045,7 @@ mod integration_macos_session_lifecycle {
             docker_network_name: macos_docker_network_name(&sid_running),
             vmnet_slot: Some(slot_r.clone()),
         };
-        pool.restore_from_infos(&[(sid_running, info_running)])
+        pool.restore_from_infos(&[(sid_running, info_running)], TEST_OPERATOR_UID)
             .expect("restore_from_infos must succeed");
 
         // Only the running session's slot must be allocated.
@@ -1044,7 +1066,7 @@ mod integration_macos_session_lifecycle {
         // The dead session's slot is free — a new session can claim it.
         let sid_new = SessionId::generate();
         let (slot_new, _, _, _) = pool
-            .claim_lima_slot(&sid_new)
+            .claim_lima_slot(&sid_new, TEST_OPERATOR_UID)
             .expect("new claim on freed dead slot must succeed");
         assert_eq!(
             slot_new.index, slot_d.index,

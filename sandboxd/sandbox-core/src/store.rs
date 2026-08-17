@@ -2991,6 +2991,7 @@ mod tests {
 
         // Set network info.
         let net_info = crate::network::NetworkInfo {
+            operator_uid: None,
             bridge_name: "sb-test123456".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
@@ -3021,6 +3022,7 @@ mod tests {
         let (store, _dir) = test_store();
 
         let net_info = crate::network::NetworkInfo {
+            operator_uid: None,
             bridge_name: "sb-test".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
@@ -3075,6 +3077,7 @@ mod tests {
 
         // Set network info on s1 and s2, leave s3 without.
         let info1 = crate::network::NetworkInfo {
+            operator_uid: None,
             bridge_name: "sb-aaa".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
@@ -3083,6 +3086,7 @@ mod tests {
             vmnet_slot: None,
         };
         let info2 = crate::network::NetworkInfo {
+            operator_uid: None,
             bridge_name: "sb-bbb".to_string(),
             subnet: "10.209.0.16/28".to_string(),
             gateway_ip: "10.209.0.18".to_string(),

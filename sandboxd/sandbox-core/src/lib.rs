@@ -50,6 +50,15 @@ pub mod store;
 pub mod test_support;
 pub mod users_conf;
 pub mod vm_network;
+/// Which operator each macOS vmnet slot's capacity belongs to, derived from
+/// the root-owned state enrollment writes. The classification is
+/// platform-neutral so its host shapes can be exercised anywhere; only the
+/// live `dscl`/`getgrouplist` reader is macOS-gated, inside the module.
+pub mod vmnet_assignment;
+/// Per-operator `VmnetPool` instances behind a uid-keyed registry.
+/// macOS only — `VmnetPool` is.
+#[cfg(target_os = "macos")]
+pub mod vmnet_pool_registry;
 pub mod workspace_lock;
 pub mod workspace_rsync;
 

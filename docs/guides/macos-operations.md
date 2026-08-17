@@ -234,6 +234,12 @@ A single-operator host gets the whole pool and behaves exactly as it does today
 — same 8 concurrent sessions, same slot indices, same segments. Partitioning is
 opt-in: 8 slots across 2 operators caps each at 4.
 
+The daemon *does* honour the assignment from here on, even though the sockets
+have not moved: a slot recorded against an operator's group is theirs, and a
+slot no group records is still shared. So enrolling a second operator with
+`--slots 4-7` does reduce the first operator's concurrency to the four slots
+left over, before anything about socket permissions changes.
+
 ### De-enrolling an operator
 
 **Reclaiming a range without revoking the departing operator's membership
@@ -320,6 +326,100 @@ carrying the legacy shared group is treated as an unmigrated install: the daemon
 falls back to current behaviour and warns, naming the migration, rather than
 refusing. Every host that exists today is in that state, so refusing would be a
 total outage with no upgrade path.
+
+### What the daemon does with the assignment
+
+At startup the daemon reads the assignment back rather than storing a copy of
+it: for each slot it stats the socket, resolves the group, and asks
+`getgrouplist(3)` which enrolled operators are in it. It keeps one slot pool
+per operator, each over that operator's range, plus **one shared pool** for
+every slot still on the legacy group — shared, because that is what
+single-pool behaviour was, and giving each operator a private pool over the
+same indices would let two of them land on one segment.
+
+The result is visible in `GET /diagnostics`:
+
+| Field | What it holds |
+|---|---|
+| `vmnet_pool_size` | slots on the host, across every operator |
+| `vmnet_pool_claimed` | slots claimed right now, across every pool |
+| `vmnet_slot_assignment` | one line per slot: assigned to whom, legacy, or why unassignable |
+| `vmnet_assignment_warnings` | the unmigrated-install notice, chiefly |
+| `vmnet_claimed_by_operator` | slot → session → operator uid |
+| `vmnet_declined_restores` | claims restore refused to re-register (see below) |
+
+Membership is resolved with `getgrouplist(3)` rather than by reading a group's
+member list, because a member list omits any account whose *primary* gid is the
+group — which the daemon account's own record is. Service accounts
+(`_sandboxd`, `_sandboxd-test`) are excluded from the operator count by an
+explicit list, not by an underscore prefix; they are in these groups by design
+and counting them would make every correctly-enrolled group look contested.
+
+Enrollment takes effect at the next daemon start. There is no lazy claiming
+and no rebalancing on a running daemon.
+
+### Two failure shapes, and why they are different
+
+Partitioning produces two client-visible failures that are easy to confuse.
+They have different causes, different remedies, and deliberately different
+status codes — returning one code for both would tell an operator to retry
+something retrying can never fix.
+
+**`429 Too Many Requests` — your share is full.** Every slot in this
+operator's range is in use. A capacity ceiling: stopping one of their own
+sessions clears it. The message states the in-use count against the share and,
+when the operator holds the whole pool, points at the privileged
+pool-regeneration step instead — raising `max_macos_sessions` cannot lift
+either case, because it cannot exceed the number of provisioned slot sockets.
+
+```
+max concurrent sessions reached for operator uid 528: 4 running against a
+share of 4 vmnet slots.
+```
+
+Remedy: `sandbox session stop <name>`, or enroll the operator with a larger
+range (which needs a daemon restart, and slots that some other operator does
+not already hold).
+
+**`409 Conflict` — you have no share at all.** No slot range is assigned to
+this operator *and* nothing is left shared, because the whole pool is assigned
+elsewhere. A configuration conflict: no amount of waiting changes it, and an
+administrator has to act.
+
+```
+no vmnet slot range is assigned to operator uid 501. This host's pool has 8
+slots; none are assigned to you and none are still shared.
+```
+
+Remedy: `sudo scripts/darwin-operator-group.sh enroll --operator <name>
+--slots <range>`, then restart the daemon.
+
+⚠️ **The 409 body does not name who holds the pool, and must not be changed to.**
+Any enrolled operator can provoke this error, so naming the holders would hand
+each of them the roster of sandboxd users on a shared machine. The holders are
+in the daemon log and in `/diagnostics` → `vmnet_slot_assignment`, where the
+audience is the administrator who can act on it.
+
+### Sessions the daemon declines to restore
+
+A restart routes each running session back into its owner's pool using the
+operator uid persisted with the session. A session created by an older daemon
+does not carry one, so its owner name is resolved instead — and when *that*
+fails (the account was removed or renamed), the daemon **declines the claim**
+rather than guessing at a pool. Guessing would put a running VM's slot on
+another operator's ledger.
+
+A declined claim is real capacity that is still consumed by a running VM but
+that no pool is tracking, so it is surfaced rather than dropped:
+
+```bash
+curl --unix-socket /var/run/sandbox/sandboxd.sock \
+  http://localhost/diagnostics | python3 -m json.tool | grep -A5 declined
+```
+
+Each line names the session, the slot it held and why it could not be routed.
+Remedy: stop the session (`sandbox session stop <id>`), which releases the
+slot for real, or restore the account the session was created under.
 
 ### Preconditions this does not cover
 
