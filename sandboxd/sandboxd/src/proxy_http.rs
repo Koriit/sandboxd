@@ -9,11 +9,14 @@
 //!
 //! ## Per-backend transport
 //!
-//! * **Container** — spawn `docker exec -i <ctr> socat - TCP:127.0.0.1:22`
-//!   as a `tokio::process::Command` child with async stdio. Same byte
-//!   mover the cross-user sshd integration test (`tests/
-//!   integration_lite_image_sshd_cross_user.rs`) used as a
-//!   `ProxyCommand`, now lifted into the daemon.
+//! * **Container** — open `docker exec -i <ctr> socat - TCP:127.0.0.1:22`
+//!   through the session's [`sandbox_core::docker::DockerRoute`]. On Linux
+//!   the route spawns that child in-process with async stdio, which is the
+//!   same byte mover the cross-user sshd integration test (`tests/
+//!   integration_lite_image_sshd_cross_user.rs`) used as a `ProxyCommand`;
+//!   on macOS it names the operator whose VM the container lives in, and
+//!   once that VM is theirs the `docker exec` runs in their agent and the
+//!   daemon holds a socket to it.
 //! * **Lima** — discover the host-side TCP port Lima forwards to the
 //!   in-VM sshd's port 22 via `limactl list --json`'s `sshLocalPort`
 //!   field, then open a `tokio::net::TcpStream` to
@@ -24,16 +27,26 @@
 //! ## Async-I/O carve-out
 //!
 //! The project convention (per `CLAUDE.md`) is to wrap
-//! `std::process::Command` calls in `spawn_blocking`. The container
-//! byte pump deliberately departs from that convention: a long-lived
-//! `docker exec`/`socat` byte pipe held inside a `spawn_blocking` task
-//! would occupy a blocking-task slot for the entire SSH session
-//! (potentially hours for an IDE) and deadlock the executor under
-//! load. The carve-out is restricted to **this file**'s container path
-//! and the proxy handler itself; one-shot probes (e.g. `limactl list`)
-//! continue to use `spawn_blocking`. A future drive-by sweep that
-//! tries to "add `spawn_blocking` everywhere" must leave this site
-//! alone — see Spec § Architecture → Async I/O note for the rationale.
+//! `std::process::Command` calls in `spawn_blocking`. The long-lived byte
+//! pumps deliberately depart from that convention: a `docker exec`/`socat`
+//! byte pipe held inside a `spawn_blocking` task would occupy a
+//! blocking-task slot for the entire SSH session (potentially hours for an
+//! IDE) and deadlock the executor under load. One-shot probes (e.g.
+//! `limactl list`) continue to use `spawn_blocking`, including the one this
+//! file's Lima path makes.
+//!
+//! **This comment is the canonical statement of the rationale, and the
+//! exception is wider than this file.** Three streams share it: this
+//! proxy's, the guest-agent transport
+//! (`sandbox_core::backend::container::ContainerTransport`), and the
+//! DNS-policy gate bridge (`sandbox_core::dns_gate_bridge`) — which opens
+//! one per DNS query on the egress-allow path. All three now go through
+//! `DockerRoute::open_stream`, so the site that actually spawns the child is
+//! `sandbox_core::docker::open_stream_locally` on the local path and the
+//! agent's `handle_docker_stream` on the brokered one. Both carry a pointer
+//! back here. A future drive-by sweep that tries to "add `spawn_blocking`
+//! everywhere" must leave all of them alone — see also Spec § Architecture
+//! → Async I/O note.
 //!
 //! ## No SSH-protocol parsing
 //!
@@ -42,7 +55,6 @@
 //! and channel multiplexing happen end-to-end between the operator's
 //! SSH client and the in-session sshd.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
@@ -53,7 +65,6 @@ use sandbox_core::backend::BackendKind;
 use sandbox_core::{LimaManagerRegistry, SandboxError, Session, SessionId, SessionStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process::Command as TokioCommand;
 use tracing::{debug, error, info, warn};
 
 /// WebSocket close codes the daemon uses to signal structured failure
@@ -85,11 +96,12 @@ pub mod close_codes {
 pub struct ProxyState {
     pub store: Arc<SessionStore>,
     pub lima_registry: Arc<LimaManagerRegistry>,
-    /// Forwarded gateway-VM Docker socket for the container path on macOS
-    /// lite. `Some` on macOS (the sandbox container runs inside the gateway
-    /// VM, so `docker exec` must target the forwarded socket), `None` on Linux
-    /// (host docker daemon — the proxy `docker exec` argv stays byte-identical).
-    pub docker_socket: Option<std::path::PathBuf>,
+    /// Where the container path's `docker exec` goes: the host daemon on
+    /// Linux (argv byte-identical to the historical shape), or the VM whose
+    /// operator owns the container on macOS. The proxy never holds a socket
+    /// path of its own — the route decides whether the child is spawned here
+    /// or asked for over the broker channel.
+    pub docker: sandbox_core::docker::DockerRoute,
 }
 
 /// Entry point for `GET /sessions/{id}/proxy`.
@@ -146,13 +158,13 @@ pub async fn handle_proxy(
     // The upgrade closure may not borrow state captures (it outlives
     // the handler future), so hand it owned clones.
     let lima_registry_for_upgrade = Arc::clone(&state.lima_registry);
-    let docker_socket_for_upgrade = state.docker_socket.clone();
+    let docker_for_upgrade = state.docker.clone();
     Ok(ws.on_upgrade(move |socket| async move {
         run_proxy(
             socket,
             session,
             lima_registry_for_upgrade,
-            docker_socket_for_upgrade,
+            docker_for_upgrade,
         )
         .await;
     }))
@@ -185,12 +197,12 @@ async fn run_proxy(
     socket: WebSocket,
     session: Session,
     lima_registry: Arc<LimaManagerRegistry>,
-    docker_socket: Option<std::path::PathBuf>,
+    docker: sandbox_core::docker::DockerRoute,
 ) {
     let session_id = session.id;
     match session.backend {
         BackendKind::Container => {
-            if let Err(e) = pump_container(socket, &session_id, docker_socket.as_deref()).await {
+            if let Err(e) = pump_container(socket, &session_id, &docker).await {
                 warn!(
                     session = %session_id,
                     error = %e,
@@ -244,79 +256,44 @@ async fn run_proxy(
     }
 }
 
-/// Build the argv for the container SSH-proxy byte pump:
-/// `[-H unix://<sock>] exec -i <name> socat - TCP:127.0.0.1:22`.
+/// Container path: open `docker exec -i <name> socat - TCP:127.0.0.1:22`
+/// on the session's route, then ferry bytes between the WebSocket halves
+/// and the stream. Same byte mover the cross-user sshd integration test
+/// used as a `ProxyCommand`.
 ///
-/// Pure function so the socket-awareness (the `-H` prefix on macOS lite,
-/// absent on Linux/host docker) can be asserted without spawning a process.
-/// On macOS the sandbox container runs inside the gateway VM, so the proxy
-/// `docker exec` must target the forwarded socket; on Linux `docker_socket`
-/// is `None` and the argv is byte-identical to the historical shape.
-fn container_proxy_exec_argv(
-    docker_socket: Option<&std::path::Path>,
-    container_name: &str,
-) -> Vec<String> {
-    let mut argv: Vec<String> = Vec::with_capacity(8);
-    if let Some(sock) = docker_socket {
-        argv.push("-H".to_string());
-        argv.push(format!("unix://{}", sock.display()));
-    }
-    argv.push("exec".to_string());
-    argv.push("-i".to_string());
-    argv.push(container_name.to_string());
-    argv.push("socat".to_string());
-    argv.push("-".to_string());
-    argv.push("TCP:127.0.0.1:22".to_string());
-    argv
-}
-
-/// Container path: spawn `docker exec -i <name> socat -
-/// TCP:127.0.0.1:22` with async pipes, then ferry bytes between the
-/// WebSocket halves and the child's stdio. Same byte mover the
-/// cross-user sshd integration test used as a `ProxyCommand`.
+/// # ASYNC-I/O CARVE-OUT
+///
+/// The stream this opens is held for the whole SSH session — hours under
+/// VS Code Remote-SSH or JetBrains Gateway — so neither the open nor the
+/// pump is wrapped in `spawn_blocking`; a blocking-task slot occupied for
+/// that long deadlocks the executor under load. The spawn itself has moved
+/// behind `DockerRoute::open_stream`, which carries the same note at the
+/// site that now makes the child. See this module's header for the full
+/// rationale, and `CLAUDE.md` § Async-I/O carve-out.
 async fn pump_container(
     socket: WebSocket,
     session_id: &SessionId,
-    docker_socket: Option<&std::path::Path>,
+    docker: &sandbox_core::docker::DockerRoute,
 ) -> Result<(), SandboxError> {
     let container_name = format!("sandbox-{session_id}");
 
-    // ASYNC-I/O CARVE-OUT (cross-user CLI access spec § Architecture
-    // → Async I/O note): `tokio::process::Command` with async pipes is
-    // **mandatory** here. A `std::process::Command` wrapped in
-    // `spawn_blocking` would occupy a blocking-task slot for the
-    // entire SSH session — long-running IDE connections (VS Code
-    // Remote-SSH, JetBrains Gateway) hold this open for hours.
-    // Project-wide `spawn_blocking` convention does NOT apply to
-    // long-lived byte pumps. Do not "fix" this site by wrapping it.
-    let mut command = TokioCommand::new("docker");
-    let argv = container_proxy_exec_argv(docker_socket, &container_name);
-    command
-        .args(&argv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    debug!(container = %container_name, "spawning docker exec socat for proxy");
-    let mut child = match command.spawn() {
+    debug!(container = %container_name, "opening the brokered sshd stream for proxy");
+    let conn = match docker
+        .open_stream(sandbox_core::docker::DockerStream::Sshd {
+            container: container_name.clone(),
+        })
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
-            let msg = format!("failed to spawn docker exec for {container_name}: {e}");
+            let msg = format!("failed to open the sshd stream for {container_name}: {e}");
             close_with_code(socket, close_codes::BACKEND_UNAVAILABLE, &msg).await;
-            return Err(SandboxError::Gateway(msg));
+            return Err(e);
         }
     };
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| SandboxError::Internal("docker exec child has no stdin".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| SandboxError::Internal("docker exec child has no stdout".into()))?;
-    let stderr = child.stderr.take();
+    let (stdout, stdin) = tokio::io::split(conn.io);
+    let child = conn.exit;
 
     // Drive the byte pump. On an early/unexpected backend exit (backend
     // EOF while the WebSocket is still open), `bidirectional_ferry`
@@ -326,14 +303,16 @@ async fn pump_container(
     // `FerryOutcome::ClientClosed` and we leave the socket alone.
     let ferry_outcome = bidirectional_ferry(socket, stdin, stdout).await;
 
-    // Capture exit status + any stderr produced before close.
-    let exit_status = child.wait().await.ok();
-    let stderr_bytes = if let Some(mut s) = stderr {
-        let mut buf = Vec::with_capacity(256);
-        let _ = AsyncReadExt::read_to_end(&mut s, &mut buf).await;
-        buf
-    } else {
-        Vec::new()
+    // Capture exit status + any stderr produced before close — but only
+    // when this process ran the child. On the brokered path the child is
+    // the operator agent's, so there is no exit code to read and the
+    // stream closing is the whole of what the daemon observes. That is a
+    // diagnostic difference, not a behavioural one: an absent status is
+    // treated below as "no reason to claim an error", which is the same
+    // branch the Lima path has always taken for its TCP stream.
+    let (exit_status, stderr_bytes) = match child {
+        Some(c) => c.wait().await,
+        None => (None, Vec::new()),
     };
 
     match ferry_outcome {
@@ -786,11 +765,16 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    /// Linux / host docker: the proxy `docker exec` argv carries no `-H`
-    /// flag. Pins the byte-identical Linux argv.
+    /// Linux / host docker: the proxy's stream argv carries no `-H` flag.
+    /// Pins the byte-identical Linux argv through the shared builder the
+    /// route now uses, so a change to it fails here rather than in a live
+    /// SSH session.
     #[test]
-    fn container_proxy_exec_argv_no_socket_is_host_docker() {
-        let argv = container_proxy_exec_argv(None, "sandbox-abc123");
+    fn proxy_stream_argv_without_a_socket_is_host_docker() {
+        let argv = sandbox_core::docker::DockerStream::Sshd {
+            container: "sandbox-abc123".to_string(),
+        }
+        .argv(None);
         assert_eq!(
             argv,
             vec![
@@ -808,13 +792,18 @@ mod tests {
         );
     }
 
-    /// macOS lite: a forwarded socket injects `-H unix://<sock>` ahead of the
-    /// `exec` verb so the SSH proxy reaches the container inside the gateway
-    /// VM, not the host docker daemon.
+    /// macOS lite: a socket injects `-H unix://<sock>` ahead of the `exec`
+    /// verb so the SSH proxy reaches the container inside the gateway VM,
+    /// not the host docker daemon. The socket belongs to whoever runs the
+    /// invocation — the daemon's own on the local path, the agent's own on
+    /// the brokered one — and never crosses the channel.
     #[test]
-    fn container_proxy_exec_argv_with_socket_prepends_host_flag() {
+    fn proxy_stream_argv_with_a_socket_pins_the_target_authority() {
         let sock = std::path::Path::new("/var/lib/sandboxd/501/gateway-docker.sock");
-        let argv = container_proxy_exec_argv(Some(sock), "sandbox-def456");
+        let argv = sandbox_core::docker::DockerStream::Sshd {
+            container: "sandbox-def456".to_string(),
+        }
+        .argv(Some(sock));
         assert_eq!(
             argv,
             vec![

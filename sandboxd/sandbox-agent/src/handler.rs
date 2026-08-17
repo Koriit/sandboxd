@@ -286,6 +286,13 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
                 reason: "GuestSocat must use the streaming dispatch path".to_string(),
             }
         }
+        BrokerOp::DockerStream { .. } => {
+            // Stream-class: dispatched via `handle_docker_stream` on a
+            // dedicated stream connection, never answered inline.
+            BrokerResult::Rejected {
+                reason: "DockerStream must use the streaming dispatch path".to_string(),
+            }
+        }
         BrokerOp::RestrictOnVerify { op_uid: _, vm } => handle_restrict_on_verify(ctx, vm).await,
         BrokerOp::Docker { op_uid: _, op } => handle_docker(ctx, op).await,
     }
@@ -1125,15 +1132,9 @@ async fn handle_run_rsync(
         return BrokerResult::Rejected { reason };
     }
 
-    // The container transport is built from the shared argv crate so it stays
-    // identical to the one the daemon builds for the same op. No forwarded
-    // socket is carried on this op today, so the fragment resolves to the
-    // host-daemon form; when a socket field arrives the `Some` arm here and the
-    // daemon's are the same function.
-    let transport = if backend == "lima" {
-        "limactl shell".to_string()
-    } else {
-        sandbox_docker_argv::exec_rsh_transport(None)
+    let transport = match rsync_transport(ctx, &backend) {
+        Ok(t) => t,
+        Err(reason) => return BrokerResult::Rejected { reason },
     };
 
     // Ensure trailing slash for rsync source/destination.
@@ -1209,6 +1210,42 @@ async fn handle_run_rsync(
             exit_code,
         }
     }
+}
+
+/// Build the rsync remote-shell (`-e`) transport for a backend, and check it
+/// against the argv rsync will actually build from it.
+///
+/// Two things make this worth its own function rather than three lines
+/// inline.
+///
+/// **The socket is derived, not carried.** The container transport names a
+/// Docker daemon, and rsync `execvp`s this word list without a shell, so
+/// whatever names a daemon in it is the sole authority for which one the
+/// transfer reaches. That is exactly the property `own_gateway_docker_socket`
+/// exists to hold for the one-shot Docker ops, and it holds here for the same
+/// reason: the container the daemon wants to sync into lives in *this*
+/// agent's VM, so a host-daemon transport would find no such container and a
+/// daemon-supplied one would be a redirect.
+///
+/// **The `-e` value is the one fragment that stops being an argv.** rsync
+/// re-parses it into words itself, and the two rsync implementations in play
+/// — GNU rsync on Linux, openrsync on macOS — do not agree about every input.
+/// `rsh_split` accepts only what both parse identically, so refusing here is
+/// refusing to run a transfer whose command line is not the one intended.
+fn rsync_transport(ctx: &RunContext, backend: &str) -> Result<String, String> {
+    // Built from the shared argv crate so it stays identical to the one the
+    // daemon builds for the same op.
+    let transport = if backend == "lima" {
+        "limactl shell".to_string()
+    } else {
+        let socket = own_gateway_docker_socket(ctx);
+        sandbox_docker_argv::exec_rsh_transport(Some(std::path::Path::new(&socket)))
+    };
+
+    sandbox_docker_argv::rsh_split(&transport)
+        .map_err(|e| format!("rsync remote-shell transport is not safely re-parsable: {e}"))?;
+
+    Ok(transport)
 }
 
 /// Resolve the absolute path to `rsync` (fixed candidates, no PATH lookup).
@@ -1695,25 +1732,137 @@ where
         stream.write_all(b"\n").await?;
     }
 
-    // After StreamOpen, the connection is a raw byte-pump. Split the broker
-    // stream and the child stdio into two async copy tasks.
+    pump_broker_stream(child, child_stdin, child_stdout, stream, "GuestSocat").await;
+    info!(vm, "GuestSocat stream closed");
+    Ok(())
+}
+
+/// Open a [`crate::protocol::BrokerOp::DockerStream`] op.
+///
+/// Splices the broker stream connection bidirectionally to
+/// `docker -H unix://<own socket> exec -i <container> socat - <address>`,
+/// where the address comes from the op's discriminant and the socket from
+/// this agent's own LIMA_HOME.
+///
+/// Unlike [`handle_guest_socat`] there is no single-connection legacy form to
+/// support, so nothing is ever written to the stream as framed JSON: the
+/// caller has already acknowledged on the control connection, and this
+/// connection is raw bytes from its first one. A rejection therefore closes
+/// the stream without pumping, which is what the daemon observes.
+///
+/// The `own_uid` gate has already been checked before this is called;
+/// re-checking it here is belt-and-suspenders.
+pub async fn handle_docker_stream<S>(
+    ctx: &RunContext,
+    op: crate::protocol::DockerStreamOp,
+    op_uid: u32,
+    stream: S,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let label = op.target().label();
+
+    if op_uid != ctx.own_uid {
+        warn!(
+            label,
+            op_uid,
+            own_uid = ctx.own_uid,
+            "docker stream rejected: op_uid is not this agent's uid"
+        );
+        return Ok(());
+    }
+
+    if let Err(reason) = validation::validate_docker_stream_op(&op) {
+        warn!(label, reason, "docker stream rejected: field validation");
+        return Ok(());
+    }
+
+    let docker = match resolve_docker() {
+        Some(p) => p,
+        None => {
+            warn!(
+                label,
+                "docker stream rejected: docker not found in candidate paths {DOCKER_CANDIDATES:?}"
+            );
+            return Ok(());
+        }
+    };
+
+    let socket = own_gateway_docker_socket(ctx);
+    let argv = crate::protocol::docker_stream_argv(&op, Some(std::path::Path::new(&socket)));
+    let op_home = resolve_op_home(ctx.own_uid)
+        .await
+        .unwrap_or_else(|| "/nonexistent".to_string());
+
+    // ASYNC-I/O CARVE-OUT: `tokio::process::Command` with async pipes is
+    // mandatory here — this child is held open for the whole life of the
+    // stream, which for the sshd target is an entire SSH session. A
+    // synchronous spawn parked on the blocking pool would hold one of its
+    // slots for that long, and the agent's runtime is current-thread, so a
+    // synchronous *pump* would stall the heartbeat outright. Do not wrap
+    // this site.
+    let mut child = match Command::new(&docker)
+        .args(&argv)
+        .env_clear()
+        .envs(docker_env(&op_home))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(label, error = %e, "docker stream rejected: spawn failed");
+            return Ok(());
+        }
+    };
+
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("docker exec child has no stdin"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("docker exec child has no stdout"))?;
+
+    pump_broker_stream(child, child_stdin, child_stdout, stream, label).await;
+    info!(label, container = op.container(), "docker stream closed");
+    Ok(())
+}
+
+/// Copy bytes both ways between a broker stream connection and a child's
+/// stdio until either side ends, then reap the child.
+///
+/// Shared by every stream-class op: the transports differ (`limactl shell`
+/// versus `docker exec`) and the pump does not.
+async fn pump_broker_stream<S>(
+    mut child: tokio::process::Child,
+    child_stdin: tokio::process::ChildStdin,
+    child_stdout: tokio::process::ChildStdout,
+    stream: S,
+    label: &str,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut broker_reader, mut broker_writer) = tokio::io::split(stream);
     let (mut child_reader, mut child_writer) = (child_stdout, child_stdin);
 
     let broker_to_child = tokio::io::copy(&mut broker_reader, &mut child_writer);
     let child_to_broker = tokio::io::copy(&mut child_reader, &mut broker_writer);
 
-    // Run both halves concurrently. When either direction EOF's or errors,
+    // Run both halves concurrently. When either direction EOFs or errors,
     // the select! drops the other — the child process is then reaped.
     tokio::select! {
         result = broker_to_child => {
             if let Err(e) = result {
-                warn!(vm, error = %e, "broker→child copy error in GuestSocat");
+                warn!(label, error = %e, "broker→child copy error on a brokered stream");
             }
         }
         result = child_to_broker => {
             if let Err(e) = result {
-                warn!(vm, error = %e, "child→broker copy error in GuestSocat");
+                warn!(label, error = %e, "child→broker copy error on a brokered stream");
             }
         }
     }
@@ -1723,9 +1872,6 @@ where
     // exited.
     let _ = child.kill().await;
     let _ = child.wait().await;
-
-    info!(vm, "GuestSocat stream closed");
-    Ok(())
 }
 
 // Bring BrokerResponse into scope for the GuestSocat handler above.
@@ -2672,5 +2818,99 @@ mod tests {
                 "base build must set unrestricted_slirp_for_provisioning=false on Linux"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // rsync remote-shell transport
+    // -----------------------------------------------------------------------
+
+    /// The container transport names **this agent's own** Docker socket,
+    /// derived from its own LIMA_HOME. The daemon does not supply it, and
+    /// must not be able to: rsync execs the transport's word list directly,
+    /// so whatever names a Docker daemon in it is the sole authority for
+    /// which one the transfer reaches — and the container being synced into
+    /// lives in this agent's VM, not on any host daemon.
+    #[test]
+    fn the_container_rsync_transport_names_the_agents_own_socket() {
+        let ctx = ctx(501);
+        let transport = rsync_transport(&ctx, "container").expect("container transport");
+        assert_eq!(
+            transport,
+            format!(
+                "docker -H unix://{}/sandboxd-gateway/gateway-docker.sock exec -i",
+                ctx.lima_home
+            )
+        );
+    }
+
+    /// The Lima transport is unchanged and carries no socket.
+    #[test]
+    fn the_lima_rsync_transport_is_limactl_shell() {
+        let transport = rsync_transport(&ctx(501), "lima").expect("lima transport");
+        assert_eq!(transport, "limactl shell");
+    }
+
+    /// Both transports survive rsync's own re-parse, reconstructing the argv
+    /// intended. This is the assertion the shell-string shape needs: the `-e`
+    /// value is split by rsync and handed to `execvp`, so what matters is
+    /// what rsync's splitter makes of it, not what a shell would.
+    #[test]
+    fn both_rsync_transports_reparse_into_the_intended_argv() {
+        let ctx = ctx(501);
+        assert_eq!(
+            sandbox_docker_argv::rsh_split(&rsync_transport(&ctx, "lima").expect("lima"))
+                .expect("re-parsable"),
+            vec!["limactl", "shell"]
+        );
+        assert_eq!(
+            sandbox_docker_argv::rsh_split(&rsync_transport(&ctx, "container").expect("container"))
+                .expect("re-parsable"),
+            vec![
+                "docker".to_string(),
+                "-H".to_string(),
+                format!(
+                    "unix://{}/sandboxd-gateway/gateway-docker.sock",
+                    ctx.lima_home
+                ),
+                "exec".to_string(),
+                "-i".to_string(),
+            ]
+        );
+    }
+
+    /// A LIMA_HOME that would not survive the re-parse is refused rather
+    /// than transferred against a truncated target. The agent's own home is
+    /// constructed from numeric uids so this cannot happen today; the test
+    /// exists because "cannot happen today" is a property of the caller, not
+    /// of this function.
+    #[test]
+    fn a_lima_home_that_would_not_reparse_is_refused() {
+        let ctx = RunContext {
+            own_uid: 501,
+            lima_home: "/var/lib/sandbox d/501/lima".to_string(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
+        };
+        // A space keeps re-parsing but splits the URL, so the transport that
+        // comes out is not the one intended — pinned here as the shape a
+        // future caller has to watch for.
+        let transport = rsync_transport(&ctx, "container").expect("a space still parses");
+        let words = sandbox_docker_argv::rsh_split(&transport).expect("re-parsable");
+        assert!(
+            words.len() > 5,
+            "a space in LIMA_HOME splits the target authority: {words:?}"
+        );
+
+        // A quote does not survive at all, and is refused outright.
+        let ctx = RunContext {
+            own_uid: 501,
+            lima_home: "/var/lib/sandbox'd/501/lima".to_string(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
+        };
+        let err =
+            rsync_transport(&ctx, "container").expect_err("an unterminated quote must be refused");
+        assert!(
+            err.contains("not safely re-parsable"),
+            "the refusal must say why; got {err}"
+        );
     }
 }

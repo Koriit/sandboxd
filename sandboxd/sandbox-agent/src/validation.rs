@@ -851,6 +851,19 @@ fn validate_stdin_command(
     }
 }
 
+/// Re-validate a [`crate::protocol::DockerStreamOp`] before the agent opens
+/// a byte pipe into a container.
+///
+/// There is exactly one field to check, and that is the point of the op's
+/// shape: the destination inside the container is a discriminant the agent
+/// turns into a `socat` address from its own constants, and the Docker daemon
+/// is the agent's own socket, so neither is a value that could be wrong. What
+/// the daemon does supply is the container name, and a name that is not a
+/// name is how `docker exec` gets an extra flag.
+pub fn validate_docker_stream_op(op: &crate::protocol::DockerStreamOp) -> Result<(), String> {
+    validate_docker_name("container", op.container())
+}
+
 /// Re-validate every field of a [`crate::protocol::DockerOp`] before the
 /// agent builds any argv from it.
 ///
@@ -2574,6 +2587,119 @@ user:
                     .is_ok()
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Docker stream ops
+    // -----------------------------------------------------------------------
+
+    mod docker_stream_ops {
+        use super::*;
+        use crate::protocol::DockerStreamOp;
+
+        fn every_stream(container: &str) -> [DockerStreamOp; 3] {
+            [
+                DockerStreamOp::GuestAgent {
+                    container: container.to_string(),
+                },
+                DockerStreamOp::Sshd {
+                    container: container.to_string(),
+                },
+                DockerStreamOp::DnsGate {
+                    container: container.to_string(),
+                },
+            ]
+        }
+
+        /// A real container name is accepted on every destination.
+        #[test]
+        fn a_valid_container_name_is_accepted_for_every_destination() {
+            for op in every_stream("sandbox-abc123def456") {
+                assert!(
+                    validate_docker_stream_op(&op).is_ok(),
+                    "{op:?} must be accepted"
+                );
+            }
+        }
+
+        /// The container name is the only value the daemon supplies on these
+        /// ops, so it is the only thing that can be wrong — and a name that
+        /// is not a name is how `docker exec` acquires an extra flag. Every
+        /// destination re-validates it; none is exempt because it "only"
+        /// listens.
+        #[test]
+        fn a_container_name_that_is_not_a_name_is_refused_on_every_destination() {
+            for bad in [
+                "-H",
+                "--privileged",
+                "sandbox abc",
+                "sandbox;rm -rf /",
+                "",
+                "sandbox/abc",
+            ] {
+                for op in every_stream(bad) {
+                    let err = validate_docker_stream_op(&op)
+                        .expect_err("a non-name container must be refused");
+                    assert!(
+                        err.contains("container"),
+                        "the refusal must name the field; got {err}"
+                    );
+                }
+            }
+        }
+
+        /// The destination is a discriminant, not a value: nothing the daemon
+        /// sends can change where a stream lands, so validation has nothing
+        /// to check there. Pinned by asserting the rendered address comes out
+        /// of the enum rather than out of the op's fields.
+        #[test]
+        fn the_destination_comes_from_the_discriminant_and_not_from_the_payload() {
+            let addresses: Vec<String> = every_stream("sandbox-abc123def456")
+                .iter()
+                .map(|op| op.target().socat_address())
+                .collect();
+            assert_eq!(
+                addresses,
+                vec![
+                    "TCP:127.0.0.1:5123".to_string(),
+                    "TCP:127.0.0.1:22".to_string(),
+                    "UNIX-LISTEN:/var/log/gateway/events/dns-gate.sock,unlink-early".to_string(),
+                ]
+            );
+        }
+
+        /// The gate listener must never be forked on the agent side either:
+        /// `,fork` would multiplex concurrent gate connections onto one stdio
+        /// stream and corrupt the per-query request/ack framing, on the
+        /// egress-allow decision path.
+        #[test]
+        fn the_agent_rendered_gate_listener_is_never_forked() {
+            let argv = crate::protocol::docker_stream_argv(
+                &DockerStreamOp::DnsGate {
+                    container: "sandbox-gw-x".to_string(),
+                },
+                Some(std::path::Path::new(
+                    "/lima/sandboxd-gateway/gateway-docker.sock",
+                )),
+            );
+            assert!(
+                !argv.iter().any(|a| a.contains("fork")),
+                "the gate listener must not fork; got {argv:?}"
+            );
+            assert_eq!(
+                argv,
+                vec![
+                    "-H",
+                    "unix:///lima/sandboxd-gateway/gateway-docker.sock",
+                    "exec",
+                    "-i",
+                    "sandbox-gw-x",
+                    "socat",
+                    "-",
+                    "UNIX-LISTEN:/var/log/gateway/events/dns-gate.sock,unlink-early",
+                ]
+            );
         }
     }
 }

@@ -95,18 +95,33 @@
 //! What is explicitly *not* assumed is response ordering: responses may arrive
 //! in any order and are matched by `request_id` alone.
 //!
-//! The `GuestSocat` streaming op is multiplexed so the control connection is
-//! never consumed. The daemon mints a single-use correlation token, sends
-//! `GuestSocat { stream_token: Some(token) }` on the control connection, and
-//! registers the op as in-flight like any other — it does **not** sit on the
-//! control loop waiting for `StreamReady`. When that response arrives it is
-//! routed by `request_id` and the waiting caller is released. The agent then
-//! opens a *separate* stream connection and sends `STREAM_CONNECT:<token>\n`;
-//! the broker matches it to the pending entry in the
-//! [`PendingStreamRegistry`], enforces `token.expected_uid == peer uid`, and
-//! hands the raw stream back to the caller via
-//! [`AgentRegistry::take_stream_for_guest_socat`]. The control connection stays
-//! live and can immediately serve the next op — no reconnect gap.
+//! ## Stream-class ops are multiplexed; the control connection is not consumed
+//!
+//! Two op families open a long-lived byte pump rather than answering: the
+//! Lima guest transport (`GuestSocat`) and the three Docker streams
+//! (`DockerStream` — guest agent, sshd, and the DNS-policy gate). Which ops
+//! those are is defined once, by `BrokerOp::stream_token_slot`; nothing here
+//! keeps its own list.
+//!
+//! The daemon mints a single-use correlation token, embeds it in the request,
+//! and registers the op as in-flight like any other — it does **not** sit on
+//! the control loop waiting for `StreamReady`. When that response arrives it
+//! is routed by `request_id` and the waiting caller is released. The agent
+//! then opens a *separate* stream connection and sends
+//! `STREAM_CONNECT:<token>\n`; the broker matches it to the pending entry in
+//! the [`PendingStreamRegistry`], enforces `token.expected_uid == peer uid`,
+//! and hands the raw stream back to the caller via
+//! [`AgentRegistry::take_stream`]. The control connection stays live and can
+//! immediately serve the next op — no reconnect gap.
+//!
+//! **The in-flight slot is held for the acknowledgement, not for the
+//! stream.** A stream open is removed from the in-flight map the moment its
+//! `StreamReady` frame arrives; the wait for the agent's stream connection
+//! happens in the calling task, against [`PendingStreamRegistry`], and
+//! occupies no slot. That is what lets the DNS-gate bridge open one stream
+//! per DNS query without the open rate consuming [`MAX_IN_FLIGHT_OPS`] — a
+//! slot is occupied for one control round trip, not for the life of a gate
+//! round trip, and certainly not for the life of an SSH session.
 //!
 //! An agent that acknowledges a stream open slowly, or never, therefore costs
 //! that one op and nothing else: the op fails at its own deadline, and every
@@ -173,20 +188,22 @@ fn generate_stream_token() -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Embed a `stream_token` into a `GuestSocat` `BrokerRequest`.
+/// Embed a `stream_token` into a stream-class `BrokerRequest`.
 ///
-/// Returns `Err` if the request is not a `GuestSocat` op (programming error).
-fn embed_guest_socat_token(
-    mut request: BrokerRequest,
-    token: String,
-) -> Result<BrokerRequest, String> {
-    match &mut request.op {
-        sandbox_agent_protocol::BrokerOp::GuestSocat { stream_token, .. } => {
-            *stream_token = Some(token);
+/// Which ops are stream-class is not decided here: `stream_token_slot` on the
+/// protocol enum is the single definition, and its match is exhaustive, so a
+/// new op cannot be added without someone saying which side of the line it
+/// falls on. This function only fills the slot, and refuses a request that
+/// has none — a programming error, since the caller asked for a stream.
+fn embed_stream_token(mut request: BrokerRequest, token: String) -> Result<BrokerRequest, String> {
+    match request.op.stream_token_slot() {
+        Some(slot) => {
+            *slot = Some(token);
             Ok(request)
         }
-        other => Err(format!(
-            "embed_guest_socat_token called with non-GuestSocat op: {other:?}"
+        None => Err(format!(
+            "a stream was requested for `{}`, which is not a stream-class op",
+            request.op.label()
         )),
     }
 }
@@ -613,16 +630,16 @@ pub fn authenticate_peer(stream: &UnixStream) -> AuthOutcome {
 /// A unit of work the daemon sends to a checked-in agent over the broker
 /// channel.
 ///
-/// `OneShot` covers all ops except `GuestSocat`: the connection task writes
+/// `OneShot` covers every op that is not stream-class: the connection task writes
 /// the request, records it as in-flight under its `request_id`, and delivers
 /// the `BrokerResult` through the `reply` oneshot when the matching response
 /// arrives. It does not wait for that response before taking the next work
 /// item.
 ///
-/// `TakeStream` is the multiplexed `GuestSocat` path:
+/// `TakeStream` is the multiplexed stream-class path:
 ///   1. The caller generates a cryptographically random token and registers a
 ///      pending stream entry before queueing the work item.
-///   2. The connection task writes `GuestSocat { stream_token: Some(token) }`
+///   2. The connection task writes the op with its `stream_token` embedded
 ///      and records the op as in-flight — like a `OneShot`, and just as
 ///      briefly. The control connection is neither consumed nor blocked.
 ///   3. When `StreamReady { token }` arrives it is routed by `request_id` and
@@ -641,7 +658,7 @@ pub enum PendingRequest {
         request: BrokerRequest,
         reply: tokio::sync::oneshot::Sender<BrokerResult>,
     },
-    /// Open a multiplexed `GuestSocat` stream: send the request with its
+    /// Open a multiplexed stream: send the request with its
     /// correlation token, then signal `ack_tx` when `StreamReady` is routed
     /// back, so the caller can proceed to await the incoming stream
     /// connection.
@@ -818,12 +835,12 @@ impl AgentRegistry {
         })
     }
 
-    /// Open a multiplexed `GuestSocat` stream via the agent registered for `uid`.
+    /// Open a multiplexed stream-class op via the agent registered for `uid`.
     ///
     /// Multiplexed protocol:
     ///   1. Generates a cryptographically random 256-bit token.
     ///   2. Registers a pending stream entry in `pending_streams`.
-    ///   3. Queues `GuestSocat { stream_token: Some(token) }` for the agent's
+    ///   3. Queues the token-bearing request for the agent's
     ///      control connection (which is neither consumed nor blocked by it).
     ///   4. Awaits the `StreamReady { token }` acknowledgement, which the
     ///      connection task routes back by `request_id`. The wait happens
@@ -837,7 +854,7 @@ impl AgentRegistry {
     ///
     /// Returns `Err` if no agent is checked in, if the stream handoff fails,
     /// or if either wait times out.
-    pub async fn take_stream_for_guest_socat(
+    pub async fn take_stream(
         &self,
         uid: u32,
         request: BrokerRequest,
@@ -864,8 +881,8 @@ impl AgentRegistry {
             }
         };
 
-        // Build the GuestSocat request with the token embedded.
-        let request_with_token = embed_guest_socat_token(request, token.clone())?;
+        // Build the request with the token embedded.
+        let request_with_token = embed_stream_token(request, token.clone())?;
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         tx.send(PendingRequest::TakeStream {
@@ -894,14 +911,12 @@ impl AgentRegistry {
             Ok(Ok(())) => {}
             Ok(Err(reason)) => {
                 pending_streams.remove(&token).await;
-                return Err(format!(
-                    "GuestSocat StreamReady error for uid {uid}: {reason}"
-                ));
+                return Err(format!("stream open failed for uid {uid}: {reason}"));
             }
             Err(_) => {
                 pending_streams.remove(&token).await;
                 return Err(format!(
-                    "session agent for {} dropped before confirming GuestSocat stream — \
+                    "session agent for {} dropped before confirming the stream — \
                      the operator may have logged out",
                     uid_display(uid)
                 ));
@@ -921,13 +936,13 @@ impl AgentRegistry {
             Ok(Err(_)) => {
                 // PendingStreamRegistry entry was dropped (shouldn't happen in normal flow).
                 return Err(format!(
-                    "GuestSocat pending stream entry dropped before stream arrived for uid {uid}"
+                    "pending stream entry dropped before the stream arrived for uid {uid}"
                 ));
             }
             Err(_) => {
                 pending_streams.remove(&token).await;
                 return Err(format!(
-                    "GuestSocat stream connection timed out for uid {uid} — \
+                    "stream connection timed out for uid {uid} — \
                      the agent did not connect within {PENDING_STREAM_TIMEOUT:?}"
                 ));
             }
@@ -945,7 +960,7 @@ impl AgentRegistry {
 /// `STREAM_CONNECT:<token>` before giving up on a pending stream.
 const PENDING_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Registry of pending per-GuestSocat stream connections waiting to be matched
+/// Registry of pending per-stream connections waiting to be matched
 /// by an incoming `STREAM_CONNECT:<token>` frame.
 ///
 /// # Security
@@ -1097,7 +1112,7 @@ pub fn bind_broker_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
 ///    The broker registers the uid in the `AgentRegistry` and spawns a
 ///    `drive_agent_connection_outer` task to handle op dispatch.
 ///
-/// 2. **Stream connections** (multiplexed GuestSocat) — send
+/// 2. **Stream connections** (multiplexed stream-class ops) — send
 ///    `STREAM_CONNECT:<token>\n` as their first frame. The broker looks up the
 ///    token in the `PendingStreamRegistry`, verifies the peer uid matches
 ///    `expected_uid`, and delivers the `UnixStream` to the waiting caller via
@@ -1352,7 +1367,7 @@ async fn classify_and_dispatch_connection(
         )
         .await;
     } else if let Some(token) = trimmed.strip_prefix(STREAM_CONNECT_PREFIX) {
-        // Stream connection for a multiplexed GuestSocat op.
+        // Stream connection for a multiplexed stream-class op.
         //
         // Authentication for this connection type is: (1) the kernel `0660`
         // DAC filter already enforced sandbox-group membership at connect time;
@@ -1362,7 +1377,7 @@ async fn classify_and_dispatch_connection(
         // was itself `getgrouplist`-verified when the control connection checked
         // in, so group enrollment is guaranteed without a redundant per-stream
         // `getgrouplist` lookup. Match the token and verify uid == expected_uid.
-        info!(uid, "broker: stream connection received for GuestSocat");
+        info!(uid, "broker: stream connection received");
 
         match pending_streams.claim(token, uid).await {
             Ok(stream_tx) => {
@@ -1387,10 +1402,7 @@ async fn classify_and_dispatch_connection(
                                 })
                             };
                         let _ = stream_tx.send(boxed);
-                        info!(
-                            uid,
-                            "broker: stream connection delivered to GuestSocat caller"
-                        );
+                        info!(uid, "broker: stream connection delivered to its caller");
                     }
                     Err(_) => {
                         warn!(uid, "broker: failed to reunite stream connection halves");
@@ -1542,7 +1554,7 @@ fn expire_in_flight(
 ///
 /// This is the outer entry point spawned per accepted control connection. It
 /// handles all protocol traffic including heartbeats, one-shot ops, and the
-/// multiplexed `TakeStream` (GuestSocat) path.
+/// multiplexed `TakeStream` (stream-class) path.
 ///
 /// # Shape of the loop
 ///
@@ -1556,14 +1568,14 @@ fn expire_in_flight(
 /// the connection, and every other op on it, down with it.
 ///
 /// For `TakeStream` specifically:
-///   1. Writes `GuestSocat { stream_token: Some(token) }` on the control
+///   1. Writes the token-bearing stream-class request on the control
 ///      connection and records the op as in-flight with a deadline.
 ///   2. Routes `StreamReady { token }` back to the caller by `request_id`
 ///      when it arrives.
 ///   3. The *caller* awaits the agent's dedicated stream connection via
 ///      `pending_streams`; the connection task is not involved.
 ///
-/// The control connection is NEVER consumed by a GuestSocat op.
+/// The control connection is NEVER consumed by a stream-class op.
 ///
 /// # Liveness
 ///
@@ -1847,19 +1859,16 @@ fn deliver_response(uid: u32, request_id: u64, result: BrokerResult, reply: InFl
             BrokerResult::StreamReady { .. } => {
                 info!(
                     uid,
-                    request_id, "GuestSocat StreamReady received; awaiting the stream connection"
+                    request_id, "StreamReady received; awaiting the stream connection"
                 );
                 let _ = ack_tx.send(Ok(()));
             }
             BrokerResult::Rejected { reason } => {
-                warn!(
-                    uid,
-                    request_id, reason, "GuestSocat request rejected by agent"
-                );
+                warn!(uid, request_id, reason, "stream open rejected by agent");
                 let _ = ack_tx.send(Err(format!("agent rejected: {reason}")));
             }
             other => {
-                warn!(uid, request_id, result = ?other, "unexpected GuestSocat response");
+                warn!(uid, request_id, result = ?other, "unexpected stream-open response");
                 let _ = ack_tx.send(Err(format!("unexpected response: {other:?}")));
             }
         },
@@ -1900,7 +1909,7 @@ fn deliver_response(uid: u32, request_id: u64, result: BrokerResult, reply: InFl
 pub struct AgentBrokerExecutor {
     /// Registry of checked-in per-operator agents.
     registry: AgentRegistry,
-    /// Registry of pending per-GuestSocat stream connections.
+    /// Registry of pending per-stream connections.
     pending_streams: PendingStreamRegistry,
     /// The daemon's own uid (from `getuid()` at startup). Ops for this uid
     /// run `limactl` directly rather than routing through the broker.
@@ -1966,6 +1975,7 @@ impl AgentBrokerExecutor {
     }
 }
 
+#[async_trait]
 impl sandbox_core::docker::DockerExecutor for AgentBrokerExecutor {
     fn run(
         &self,
@@ -2002,6 +2012,93 @@ impl sandbox_core::docker::DockerExecutor for AgentBrokerExecutor {
             .map_err(|e| SandboxError::Gateway(format!("{label}: {e}")))?;
 
         broker_result_to_output(result, label)
+    }
+
+    /// Open one of the three long-lived Docker streams as `op_uid`.
+    ///
+    /// The daemon's own uid runs the `docker exec` in-process against its own
+    /// gateway VM's socket — the degenerate case where "act as the operator"
+    /// and "act as yourself" coincide. Any other uid goes to that operator's
+    /// agent as a stream-class op: the token round trip occupies one in-flight
+    /// slot for one control round trip, then the agent opens the byte
+    /// connection and the slot is already free.
+    ///
+    /// The stream open is carried by the pipelined lane rather than serialized
+    /// behind it. That is what makes it viable for the DNS-gate bridge, which
+    /// opens one per DNS query on the egress-allow path: an open queued behind
+    /// a `limactl start` would put the gate's latency at the mercy of whatever
+    /// else the operator happened to be doing.
+    async fn open_stream(
+        &self,
+        op_uid: u32,
+        stream: sandbox_core::docker::DockerStream,
+    ) -> Result<sandbox_core::docker::DockerStreamConn, sandbox_core::error::SandboxError> {
+        use sandbox_core::error::SandboxError;
+
+        if op_uid == self.daemon_uid {
+            let Some(local) = self.local_docker.as_ref() else {
+                return Err(SandboxError::Internal(
+                    "no local docker executor is wired for the daemon's own uid; the daemon \
+                     cannot open a stream into its own gateway VM"
+                        .to_string(),
+                ));
+            };
+            return local.open_stream(op_uid, stream).await;
+        }
+
+        let label = stream.target().label();
+        let request = sandbox_agent_protocol::BrokerRequest {
+            request_id: self.next_id(),
+            op: sandbox_agent_protocol::BrokerOp::DockerStream {
+                op_uid,
+                stream: docker_stream_to_wire(&stream),
+                // `take_stream` mints the token and embeds it through
+                // `embed_stream_token` before the request goes on the wire.
+                stream_token: None,
+            },
+        };
+
+        let io = self
+            .registry
+            .take_stream(op_uid, request, &self.pending_streams)
+            .await
+            .map_err(|e| {
+                SandboxError::Gateway(format!(
+                    "{label} stream for uid {op_uid} container {}: {e}",
+                    stream.container()
+                ))
+            })?;
+
+        Ok(sandbox_core::docker::DockerStreamConn {
+            io,
+            // The child belongs to the operator's agent. The daemon sees the
+            // stream close and nothing more, which is why every caller treats
+            // `None` as "no diagnosis available" rather than as "clean".
+            exit: None,
+        })
+    }
+}
+
+/// Map the daemon's in-process stream op onto its wire form.
+///
+/// Exhaustive by construction, like [`docker_op_to_wire`]: a destination
+/// added on one side without the other fails to compile here.
+fn docker_stream_to_wire(
+    stream: &sandbox_core::docker::DockerStream,
+) -> sandbox_agent_protocol::DockerStreamOp {
+    use sandbox_agent_protocol::DockerStreamOp as Wire;
+    use sandbox_core::docker::DockerStream as Core;
+
+    match stream {
+        Core::GuestAgent { container } => Wire::GuestAgent {
+            container: container.clone(),
+        },
+        Core::Sshd { container } => Wire::Sshd {
+            container: container.clone(),
+        },
+        Core::DnsGate { container } => Wire::DnsGate {
+            container: container.clone(),
+        },
     }
 }
 
@@ -2186,19 +2283,19 @@ impl sandbox_core::lima::LimaExecutor for AgentBrokerExecutor {
             op: sandbox_agent_protocol::BrokerOp::GuestSocat {
                 op_uid,
                 vm: vm.to_string(),
-                // stream_token is None here; take_stream_for_guest_socat will
-                // embed the generated token via embed_guest_socat_token before
+                // stream_token is None here; take_stream will
+                // embed the generated token via embed_stream_token before
                 // sending the request to the agent.
                 stream_token: None,
             },
         };
 
-        // `take_stream_for_guest_socat` returns a Box<dyn AsyncReadWrite> for the
+        // `take_stream` returns a Box<dyn AsyncReadWrite> for the
         // dedicated stream connection opened by the agent for this GuestSocat op.
         // The control connection is not consumed; the agent continues to serve
         // subsequent ops after the stream closes.
         self.registry
-            .take_stream_for_guest_socat(op_uid, request, &self.pending_streams)
+            .take_stream(op_uid, request, &self.pending_streams)
             .await
             .map_err(|e| SandboxError::Lima(format!("guest_socat for uid {op_uid} vm {vm}: {e}")))
     }
@@ -2732,7 +2829,7 @@ impl tokio::io::AsyncWrite for DirectSocatStream {
     }
 }
 
-/// A brokered `GuestSocat` stream with a recoverable read prefix.
+/// A brokered stream with a recoverable read prefix.
 ///
 /// When a BufReader reads past `StreamOpen\n` in the same kernel-buffer fill,
 /// the extra bytes are captured before `into_inner()` discards them. This type
@@ -3458,7 +3555,7 @@ mod tests {
         );
     }
 
-    /// Verify that `take_stream_for_guest_socat` returns the not-running error
+    /// Verify that `take_stream` returns the not-running error
     /// when no agent is registered for the uid.
     #[tokio::test]
     async fn take_stream_fails_when_no_agent_registered() {
@@ -3473,9 +3570,7 @@ mod tests {
                 stream_token: None,
             },
         };
-        let result = registry
-            .take_stream_for_guest_socat(9999, request, &pending_streams)
-            .await;
+        let result = registry.take_stream(9999, request, &pending_streams).await;
         // `unwrap_err` requires Debug on the Ok variant, but Box<dyn AsyncReadWrite>
         // is not Debug. Use manual err extraction instead.
         assert!(
@@ -3523,6 +3618,350 @@ mod tests {
         (agent_side, registry, pending_streams)
     }
 
+    // -----------------------------------------------------------------------
+    // Stream-token plumbing, generalised beyond one op class
+    // -----------------------------------------------------------------------
+
+    /// A stream-class op that is not `GuestSocat` gets its token embedded by
+    /// the same function. The plumbing is keyed on
+    /// `BrokerOp::stream_token_slot`, not on a variant list this file keeps.
+    #[test]
+    fn embed_stream_token_fills_any_stream_class_slot() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest, DockerStreamOp};
+
+        for op in [
+            BrokerOp::GuestSocat {
+                op_uid: 501,
+                vm: "sandbox-x".to_string(),
+                stream_token: None,
+            },
+            BrokerOp::DockerStream {
+                op_uid: 501,
+                stream: DockerStreamOp::DnsGate {
+                    container: "sandbox-gw-x".to_string(),
+                },
+                stream_token: None,
+            },
+        ] {
+            let label = op.label();
+            let mut with_token =
+                embed_stream_token(BrokerRequest { request_id: 1, op }, "deadbeef".to_string())
+                    .unwrap_or_else(|e| panic!("{label} must accept a stream token: {e}"));
+            assert_eq!(
+                with_token.op.stream_token_slot().and_then(|s| s.clone()),
+                Some("deadbeef".to_string()),
+                "{label} must carry the embedded token"
+            );
+        }
+    }
+
+    /// Asking for a stream on an op that has no token slot is a daemon bug,
+    /// and is refused with the op named rather than silently sending a
+    /// request no stream connection can ever be correlated to.
+    #[test]
+    fn embed_stream_token_refuses_a_one_shot_op() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest};
+        let err = embed_stream_token(
+            BrokerRequest {
+                request_id: 1,
+                op: BrokerOp::ListJson { op_uid: 501 },
+            },
+            "deadbeef".to_string(),
+        )
+        .expect_err("a one-shot op must not accept a stream token");
+        assert!(
+            err.contains("list-json") && err.contains("not a stream-class op"),
+            "the refusal must name the op; got {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream-open capacity: the DNS-gate open rate against the in-flight cap
+    // -----------------------------------------------------------------------
+
+    /// Read one newline-delimited frame the daemon wrote to the agent.
+    async fn next_frame<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        what: &str,
+    ) -> Option<String> {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await {
+            Ok(Ok(0)) | Err(_) => None,
+            Ok(Ok(_)) => Some(line),
+            Ok(Err(e)) => panic!("read error while waiting for {what}: {e}"),
+        }
+    }
+
+    /// Queue a one-shot op that the fake agent will never answer, so it sits
+    /// in the daemon's in-flight map.
+    fn queue_unanswered_op(registry: &AgentRegistry, uid: u32, request_id: u64) {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest};
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            let _ = reg
+                .send_op(
+                    uid,
+                    BrokerRequest {
+                        request_id,
+                        op: BrokerOp::ListJson { op_uid: uid },
+                    },
+                )
+                .await;
+        });
+    }
+
+    /// **A stream open is carried by the pipelined lane, not serialized
+    /// behind it.**
+    ///
+    /// This is the property the DNS-gate bridge depends on: it opens one
+    /// stream per DNS query, on the egress-allow path, over a control
+    /// connection that also carries the operator's whole container control
+    /// plane. If an open queued behind whatever else that operator happened
+    /// to be doing — a `limactl start`, an image load — the gate's latency
+    /// would be at the mercy of it, and every query arriving in the meantime
+    /// would resolve to an address nothing had allowed out.
+    ///
+    /// Several one-shot ops are left outstanding and unanswered, then a
+    /// stream open is issued. It must reach the wire without any of them
+    /// answering first.
+    #[tokio::test]
+    async fn a_stream_open_is_not_serialized_behind_unanswered_ops() {
+        use sandbox_agent_protocol::{BrokerOp, BrokerRequest, DockerStreamOp};
+        use tokio::io::BufReader;
+
+        const UID: u32 = 4243;
+
+        let (agent_side, registry, pending_streams) =
+            spawn_control_connection(UID, Duration::from_secs(10)).await;
+        let (agent_read, _agent_write) = agent_side.into_split();
+        let mut agent_read = BufReader::new(agent_read);
+
+        for request_id in 1..=5 {
+            queue_unanswered_op(&registry, UID, request_id);
+        }
+        for i in 0..5 {
+            let frame = next_frame(&mut agent_read, "a queued one-shot op")
+                .await
+                .unwrap_or_else(|| panic!("one-shot op {i} must reach the wire"));
+            assert!(
+                frame.contains("list_json"),
+                "expected a one-shot op frame, got {frame}"
+            );
+        }
+
+        // Now the stream open, with five ops still outstanding.
+        let reg = registry.clone();
+        let pend = pending_streams.clone();
+        tokio::spawn(async move {
+            let _ = reg
+                .take_stream(
+                    UID,
+                    BrokerRequest {
+                        request_id: 99,
+                        op: BrokerOp::DockerStream {
+                            op_uid: UID,
+                            stream: DockerStreamOp::DnsGate {
+                                container: "sandbox-gw-x".to_string(),
+                            },
+                            stream_token: None,
+                        },
+                    },
+                    &pend,
+                )
+                .await;
+        });
+
+        let frame = next_frame(&mut agent_read, "the stream open")
+            .await
+            .expect("the stream open must reach the wire while other ops are outstanding");
+        assert!(
+            frame.contains("docker_stream") && frame.contains("dns_gate"),
+            "expected the gate stream open, got {frame}"
+        );
+    }
+
+    /// **A stream open holds its in-flight slot for the acknowledgement, not
+    /// for the stream.**
+    ///
+    /// This is the arithmetic behind the DNS-gate open rate: a slot is
+    /// occupied for one control round trip, not for the life of a gate
+    /// round trip — otherwise a handful of concurrent sessions would consume
+    /// [`MAX_IN_FLIGHT_OPS`] with streams that are merely open.
+    ///
+    /// Asserted by counting: after `StreamReady` arrives — and before the
+    /// agent opens the stream connection, so the caller is still waiting —
+    /// a full `MAX_IN_FLIGHT_OPS` further ops must all reach the wire. If
+    /// the open still held a slot, only `MAX_IN_FLIGHT_OPS - 1` would.
+    #[tokio::test]
+    async fn a_stream_open_releases_its_slot_at_stream_ready() {
+        use sandbox_agent_protocol::{
+            BrokerOp, BrokerRequest, BrokerResponse, BrokerResult, DockerStreamOp,
+        };
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        const UID: u32 = 4244;
+
+        let (agent_side, registry, pending_streams) =
+            spawn_control_connection(UID, Duration::from_secs(10)).await;
+        let (agent_read, mut agent_write) = agent_side.into_split();
+        let mut agent_read = BufReader::new(agent_read);
+
+        let reg = registry.clone();
+        let pend = pending_streams.clone();
+        let daemon_task = tokio::spawn(async move {
+            reg.take_stream(
+                UID,
+                BrokerRequest {
+                    request_id: 1,
+                    op: BrokerOp::DockerStream {
+                        op_uid: UID,
+                        stream: DockerStreamOp::DnsGate {
+                            container: "sandbox-gw-x".to_string(),
+                        },
+                        stream_token: None,
+                    },
+                },
+                &pend,
+            )
+            .await
+        });
+
+        let frame = next_frame(&mut agent_read, "the stream open")
+            .await
+            .expect("the stream open must reach the wire");
+        let request: BrokerRequest =
+            serde_json::from_str(frame.trim()).expect("the frame is a BrokerRequest");
+        let token = match request.op {
+            BrokerOp::DockerStream {
+                stream_token: Some(t),
+                ..
+            } => t,
+            other => panic!("expected a token-bearing DockerStream, got {other:?}"),
+        };
+
+        // Acknowledge, but never open the stream connection: the caller is
+        // now parked on `PendingStreamRegistry`, which holds no slot.
+        let ack = serde_json::to_string(&BrokerResponse {
+            request_id: request.request_id,
+            result: BrokerResult::StreamReady { token },
+        })
+        .expect("serialize StreamReady");
+        agent_write.write_all(ack.as_bytes()).await.unwrap();
+        agent_write.write_all(b"\n").await.unwrap();
+
+        // A full cap's worth of further ops must all dispatch.
+        for request_id in 100..(100 + MAX_IN_FLIGHT_OPS as u64) {
+            queue_unanswered_op(&registry, UID, request_id);
+        }
+        for i in 0..MAX_IN_FLIGHT_OPS {
+            assert!(
+                next_frame(&mut agent_read, "a post-ack one-shot op")
+                    .await
+                    .is_some(),
+                "op {i} of {MAX_IN_FLIGHT_OPS} must dispatch — a stream open that has \
+                 been acknowledged must not still be holding a slot"
+            );
+        }
+
+        daemon_task.abort();
+    }
+
+    /// **At the in-flight cap a stream open waits; it is never answered
+    /// without one.**
+    ///
+    /// The exhaustion question for the DNS-gate bridge is which way it
+    /// fails, and this pins it: a gate open issued at the cap does not reach
+    /// the agent and does not return a stream. The bridge therefore arms no
+    /// in-container listener, CoreDNS's dial fails, the plugin fails open on
+    /// the DNS answer, the daemon injects nothing, and the address stays
+    /// denied. There is no branch in which the daemon proceeds as though the
+    /// gate had answered — which is what an egress bypass would look like.
+    ///
+    /// The second half asserts it is backpressure and not a wedge: answering
+    /// one outstanding op frees the slot and the open goes out.
+    #[tokio::test]
+    async fn at_the_in_flight_cap_a_stream_open_waits_rather_than_proceeding() {
+        use sandbox_agent_protocol::{
+            BrokerOp, BrokerRequest, BrokerResponse, BrokerResult, DockerStreamOp,
+        };
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        const UID: u32 = 4245;
+
+        let (agent_side, registry, pending_streams) =
+            spawn_control_connection(UID, Duration::from_secs(30)).await;
+        let (agent_read, mut agent_write) = agent_side.into_split();
+        let mut agent_read = BufReader::new(agent_read);
+
+        // Fill the in-flight map to the cap with ops the agent never answers.
+        for request_id in 1..=(MAX_IN_FLIGHT_OPS as u64) {
+            queue_unanswered_op(&registry, UID, request_id);
+        }
+        for i in 0..MAX_IN_FLIGHT_OPS {
+            assert!(
+                next_frame(&mut agent_read, "a cap-filling op")
+                    .await
+                    .is_some(),
+                "op {i} must dispatch before the cap is reached"
+            );
+        }
+
+        let reg = registry.clone();
+        let pend = pending_streams.clone();
+        let open_task = tokio::spawn(async move {
+            reg.take_stream(
+                UID,
+                BrokerRequest {
+                    request_id: 500,
+                    op: BrokerOp::DockerStream {
+                        op_uid: UID,
+                        stream: DockerStreamOp::DnsGate {
+                            container: "sandbox-gw-x".to_string(),
+                        },
+                        stream_token: None,
+                    },
+                },
+                &pend,
+            )
+            .await
+        });
+
+        assert!(
+            next_frame(&mut agent_read, "a stream open that should be held")
+                .await
+                .is_none(),
+            "at the cap, a stream open must not reach the agent — it waits, and \
+             an unarmed gate listener is what keeps the query's address denied"
+        );
+        assert!(
+            !open_task.is_finished(),
+            "the open must still be waiting, not answered without a stream"
+        );
+
+        // Free one slot: the open is backpressured, not wedged.
+        let done = serde_json::to_string(&BrokerResponse {
+            request_id: 1,
+            result: BrokerResult::Ok {
+                stdout: "[]".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        })
+        .expect("serialize response");
+        agent_write.write_all(done.as_bytes()).await.unwrap();
+        agent_write.write_all(b"\n").await.unwrap();
+
+        let frame = next_frame(&mut agent_read, "the released stream open")
+            .await
+            .expect("the stream open must dispatch once a slot frees");
+        assert!(
+            frame.contains("dns_gate"),
+            "expected the gate stream open, got {frame}"
+        );
+
+        open_task.abort();
+    }
+
     /// A heartbeat `PING` landing between the `GuestSocat` request and the
     /// agent's `StreamReady` must be absorbed, not parsed as the response.
     ///
@@ -3555,7 +3994,7 @@ mod tests {
                     stream_token: None,
                 },
             };
-            reg.take_stream_for_guest_socat(UID, request, &pend).await
+            reg.take_stream(UID, request, &pend).await
         });
 
         // Agent side: read the request and recover the correlation token.
@@ -3603,7 +4042,7 @@ mod tests {
         // The stream must be delivered to the caller...
         let delivered = tokio::time::timeout(Duration::from_secs(10), daemon_task)
             .await
-            .expect("take_stream_for_guest_socat must not hang")
+            .expect("take_stream must not hang")
             .expect("the daemon task must not panic");
         if let Err(e) = delivered {
             panic!("GuestSocat stream must be delivered despite the in-window PING; got: {e}");
@@ -3656,7 +4095,7 @@ mod tests {
                     stream_token: None,
                 },
             };
-            reg.take_stream_for_guest_socat(UID, request, &pend).await
+            reg.take_stream(UID, request, &pend).await
         });
 
         let mut line = String::new();
@@ -3936,7 +4375,7 @@ mod tests {
                         stream_token: None,
                     },
                 };
-                reg.take_stream_for_guest_socat(UID, request, &pend).await
+                reg.take_stream(UID, request, &pend).await
             })
         };
         let opened = next_request(&mut agent_read, "stream open").await;
@@ -4051,7 +4490,7 @@ mod tests {
     /// - The fake agent responds with StreamReady on the control connection.
     /// - The fake agent opens a separate stream connection, sends
     ///   STREAM_CONNECT:<token>, and sends raw payload bytes.
-    /// - The daemon receives the raw stream from take_stream_for_guest_socat.
+    /// - The daemon receives the raw stream from take_stream.
     /// - The control connection remains live after GuestSocat completes (the
     ///   fake agent can still receive ops on it).
     ///
@@ -4113,12 +4552,12 @@ mod tests {
             op: BrokerOp::GuestSocat {
                 op_uid: own_uid,
                 vm: "test-vm".to_string(),
-                stream_token: None, // take_stream_for_guest_socat will embed the token
+                stream_token: None, // take_stream will embed the token
             },
         };
         let daemon_task = tokio::spawn(async move {
             registry_clone
-                .take_stream_for_guest_socat(own_uid, request, &pending_clone)
+                .take_stream(own_uid, request, &pending_clone)
                 .await
         });
 
@@ -4285,7 +4724,7 @@ mod tests {
         };
         let daemon_task = tokio::spawn(async move {
             registry_clone
-                .take_stream_for_guest_socat(own_uid, request, &pending_clone)
+                .take_stream(own_uid, request, &pending_clone)
                 .await
         });
 
@@ -4476,7 +4915,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(registry.is_registered(own_uid).await);
 
-        // Start take_stream_for_guest_socat (registers a pending stream with a token).
+        // Start take_stream (registers a pending stream with a token).
         let registry_clone = registry.clone();
         let pending_clone = pending_streams.clone();
         let request = BrokerRequest {
@@ -4489,7 +4928,7 @@ mod tests {
         };
         let daemon_task = tokio::spawn(async move {
             registry_clone
-                .take_stream_for_guest_socat(own_uid, request, &pending_clone)
+                .take_stream(own_uid, request, &pending_clone)
                 .await
         });
 
@@ -5746,7 +6185,7 @@ mod tests {
         };
         let daemon_task = tokio::spawn(async move {
             reg_clone
-                .take_stream_for_guest_socat(own_uid, socat_request, &pending_clone)
+                .take_stream(own_uid, socat_request, &pending_clone)
                 .await
         });
 
@@ -5867,7 +6306,7 @@ mod tests {
         let pending_clone = pending.clone();
         let daemon_task = tokio::spawn(async move {
             reg_clone
-                .take_stream_for_guest_socat(own_uid, request, &pending_clone)
+                .take_stream(own_uid, request, &pending_clone)
                 .await
         });
 
@@ -5920,7 +6359,7 @@ mod tests {
             .await
             .expect("run_one_socat: daemon task timeout")
             .expect("run_one_socat: daemon task join")
-            .expect("run_one_socat: take_stream_for_guest_socat must succeed");
+            .expect("run_one_socat: take_stream must succeed");
         drop(stream_conn);
         result
     }

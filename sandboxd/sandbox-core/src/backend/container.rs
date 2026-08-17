@@ -69,13 +69,11 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::process::Command as TokioCommand;
 use tracing::{debug, info, warn};
 
 use sandbox_docker_argv::container::{
@@ -87,9 +85,8 @@ use crate::backend::spec::{BackendSpecific, SessionSpec};
 use crate::backend::{
     AsyncReadWrite, GuestTransport, RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime,
 };
-use crate::docker::{DockerOp, DockerRoute};
+use crate::docker::{DockerOp, DockerRoute, DockerStream, LocalStreamChild};
 use crate::error::SandboxError;
-use crate::guest::GUEST_AGENT_PORT;
 use crate::lima::guest_agent_path;
 use crate::process::run_with_timeout;
 use crate::session::SessionId;
@@ -391,14 +388,6 @@ pub struct ContainerRuntime {
     /// [`DockerRoute::Host`] renders the same argv and inherits the same
     /// environment. Use [`Self::is_macos`] to test which shape is in play.
     docker: DockerRoute,
-    /// macOS only: the forwarded gateway-VM Docker socket, retained solely
-    /// for the long-lived `docker exec … socat` guest transport.
-    ///
-    /// That pump is not a request/response op — it is held open for the
-    /// lifetime of an SSH session and belongs to the brokered-stream work,
-    /// not to this op set. It keeps a socket path until then; nothing else
-    /// in this file uses it.
-    transport_socket: Option<PathBuf>,
     /// Pinned HOME / DOCKER_CONFIG root for the Docker client config dir.
     /// The Docker build client creates its config dir under `$HOME`; a
     /// daemon running as a system user with a non-writable HOME would abort
@@ -450,7 +439,6 @@ impl ContainerRuntime {
             user_gid,
             guest_bind_source: guest_bind_source.into(),
             docker: DockerRoute::Host,
-            transport_socket: None,
             docker_home: PathBuf::from("/tmp"),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -482,7 +470,6 @@ impl ContainerRuntime {
         user_gid: u32,
         guest_bind_source: impl Into<PathBuf>,
         docker: DockerRoute,
-        transport_socket: impl Into<PathBuf>,
         docker_home: impl Into<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -494,7 +481,6 @@ impl ContainerRuntime {
             user_gid,
             guest_bind_source: guest_bind_source.into(),
             docker,
-            transport_socket: Some(transport_socket.into()),
             docker_home: docker_home.into(),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -504,12 +490,6 @@ impl ContainerRuntime {
     /// (macOS). `false` on Linux (host daemon).
     pub fn is_macos(&self) -> bool {
         self.docker.is_vm()
-    }
-
-    /// The forwarded Docker socket retained for the guest transport, if this
-    /// is a macOS runtime.
-    pub fn transport_socket(&self) -> Option<&Path> {
-        self.transport_socket.as_deref()
     }
 
     /// The pinned `HOME` / `DOCKER_CONFIG` root for the Docker client.
@@ -1091,7 +1071,7 @@ impl SessionRuntime for ContainerRuntime {
     ) -> Arc<dyn GuestTransport> {
         Arc::new(ContainerTransport {
             container_name: handle.as_str().to_string(),
-            docker_socket: self.transport_socket.clone(),
+            docker: self.docker.clone(),
         })
     }
 
@@ -1170,76 +1150,52 @@ impl SessionRuntime for ContainerRuntime {
 // ---------------------------------------------------------------------------
 
 /// [`GuestTransport`] over `docker exec <container> socat -
-/// TCP:127.0.0.1:5123` — same pattern as Lima's `limactl shell <vm> -- socat -
-/// TCP:127.0.0.1:5123` exactly. The `sandbox-guest` agent binds TCP on
-/// `127.0.0.1:5123` inside the container; reaching it via `docker exec`
-/// is the dual of Lima reaching it via `limactl shell` and works
+/// TCP:127.0.0.1:5123` — the dual of Lima's `limactl shell <vm> -- socat -
+/// TCP:127.0.0.1:5123`. The `sandbox-guest` agent binds TCP on
+/// `127.0.0.1:5123` inside the container; reaching it via `docker exec` works
 /// regardless of the container's external network configuration.
 ///
-/// On macOS the `docker_socket` field carries the forwarded gateway-VM socket
-/// path; the transport prepends `-H unix://<path>` to every `docker exec`
-/// so the long-lived socat byte pump targets the gateway VM's Docker daemon.
-/// Linux leaves `docker_socket: None` — no `-H` flag is emitted (host daemon,
-/// unchanged). This is the spawn_blocking carve-out site: the pump is held
-/// open for the entire SSH session so it uses `TokioCommand` (async pipes),
-/// NOT `spawn_blocking`. See the Async-I/O carve-out doc-comment in
-/// `sandboxd/src/proxy_http.rs` for the full rationale.
+/// The stream goes through the [`DockerRoute`], not through a socket path
+/// this type holds. On Linux the route runs `docker` in-process against the
+/// host daemon and the argv is byte-identical to the historical one; on macOS
+/// it names the operator whose VM the container lives in, and once that VM is
+/// the operator's the stream is opened by their agent instead. Either way the
+/// pump is a long-lived child and never wrapped in `spawn_blocking` — see the
+/// Async-I/O carve-out doc-comment in `sandboxd/src/proxy_http.rs`.
 pub struct ContainerTransport {
     container_name: String,
-    /// macOS only: forwarded gateway-VM Docker socket. `None` on Linux.
-    docker_socket: Option<PathBuf>,
+    docker: DockerRoute,
 }
 
 #[async_trait]
 impl GuestTransport for ContainerTransport {
     async fn connect(&self) -> Result<Box<dyn AsyncReadWrite + Send + Unpin>, SandboxError> {
-        debug!(container = %self.container_name, "opening docker exec socat transport");
+        debug!(container = %self.container_name, "opening the brokered guest-agent stream");
 
-        let mut command = TokioCommand::new("docker");
-        // Inject `-H unix://<socket>` when routing through the gateway VM.
-        if let Some(sock) = &self.docker_socket {
-            command.args(["-H", &format!("unix://{}", sock.display())]);
-        }
-        command
-            .args([
-                "exec",
-                "-i",
-                &self.container_name,
-                "socat",
-                "-",
-                &format!("TCP:127.0.0.1:{GUEST_AGENT_PORT}"),
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = command.spawn().map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to spawn docker exec socat for {}: {e}",
-                self.container_name
-            ))
-        })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdin of docker exec socat".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdout of docker exec socat".into())
-        })?;
+        let conn = self
+            .docker
+            .open_stream(DockerStream::GuestAgent {
+                container: self.container_name.clone(),
+            })
+            .await?;
 
         Ok(Box::new(ContainerTransportStream {
-            stdin,
-            stdout,
-            _child: child,
+            io: conn.io,
+            _child: conn.exit,
         }))
     }
 }
 
+/// The guest transport's stream, holding the local child (when there is one)
+/// for exactly as long as the bytes.
+///
+/// This is the call site that wants the child bundled in: nothing here reads
+/// an exit status, and a guest request that ends must reap its `docker exec`
+/// rather than leave it behind. `kill_on_drop` does that when this struct is
+/// dropped.
 struct ContainerTransportStream {
-    stdin: tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
-    _child: tokio::process::Child,
+    io: Box<dyn AsyncReadWrite + Send + Unpin>,
+    _child: Option<LocalStreamChild>,
 }
 
 impl AsyncRead for ContainerTransportStream {
@@ -1248,7 +1204,7 @@ impl AsyncRead for ContainerTransportStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdout).poll_read(cx, buf)
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
     }
 }
 
@@ -1258,21 +1214,21 @@ impl AsyncWrite for ContainerTransportStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.stdin).poll_write(cx, buf)
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdin).poll_flush(cx)
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdin).poll_shutdown(cx)
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -2039,7 +1995,6 @@ mod tests {
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
             unreachable_vm_route(),
-            "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
             "/var/lib/sandboxd/501",
         )
     }
@@ -2127,26 +2082,19 @@ mod tests {
 
     // -- ContainerRuntime route-awareness -------------------------------------
 
-    /// Linux runtime: the host route, no VM, no retained transport socket.
+    /// Linux runtime: the host route, no VM.
     #[test]
     fn linux_runtime_is_not_macos() {
         let rt = test_runtime();
         assert!(!rt.is_macos());
-        assert!(rt.transport_socket().is_none());
     }
 
-    /// macOS runtime: a VM route, and the transport socket retained for the
-    /// guest byte-pump.
+    /// macOS runtime: a VM route. The guest transport takes the same route,
+    /// so there is no second socket path on the runtime to disagree with it.
     #[test]
     fn macos_runtime_is_macos() {
         let rt = test_runtime_macos();
         assert!(rt.is_macos());
-        assert_eq!(
-            rt.transport_socket(),
-            Some(Path::new(
-                "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock"
-            ))
-        );
     }
 
     /// macOS runtime: docker_home() returns the configured path.
@@ -2168,20 +2116,17 @@ mod tests {
             500,
             "/tmp/guest",
             unreachable_vm_route(),
-            "/tmp/test.sock",
             "/tmp/home",
         );
         assert!(rt.is_macos());
-        assert_eq!(rt.transport_socket(), Some(Path::new("/tmp/test.sock")));
         assert_eq!(rt.docker_home(), Path::new("/tmp/home"));
     }
 
-    /// Linux `new()` constructor: the host route, no retained socket.
+    /// Linux `new()` constructor: the host route.
     #[test]
     fn new_constructor_takes_the_host_route() {
         let rt = ContainerRuntime::new("sandboxd-lite:test", 1024, 1.0, 500, 500, "/tmp/guest");
         assert!(!rt.is_macos());
-        assert!(rt.transport_socket().is_none());
     }
 
     /// `kind()` reports the static `BackendKind::Container` constant —
@@ -2904,7 +2849,6 @@ mod tests {
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
             unreachable_vm_route(),
-            "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
             "/var/lib/sandboxd/501",
         );
 

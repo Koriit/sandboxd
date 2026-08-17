@@ -452,8 +452,8 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
     let proxy_state = Arc::new(ProxyState {
         store,
         lima_registry,
-        // Linux test environment: host docker daemon, no forwarded socket.
-        docker_socket: None,
+        // Linux test environment: the host docker daemon, reached in-process.
+        docker: sandbox_core::docker::DockerRoute::Host,
     });
     let app = build_router(proxy_state, operator.to_string());
 

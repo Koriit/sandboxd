@@ -689,6 +689,72 @@ mod tests {
         );
     }
 
+    /// **The `-e` value survives rsync's own re-parse.**
+    ///
+    /// It is the one fragment in this argv that is a string rsync splits
+    /// again rather than a word it passes through, and the splitter is
+    /// rsync's, not a shell's — the words go straight to `execvp`. The
+    /// assertion therefore runs the built value through `rsh_split`, which
+    /// models only what GNU rsync and openrsync agree on, and checks the
+    /// argv that comes back out is the invocation intended.
+    ///
+    /// Both transports are covered: a mangled `-e` on the Lima side would
+    /// be as broken as on the container side, and the Lima one has never
+    /// been checked.
+    #[test]
+    fn the_remote_shell_transport_reparses_into_the_intended_argv() {
+        let cases: [(BackendKind, Option<&str>, Vec<&str>); 4] = [
+            (BackendKind::Lima, None, vec!["limactl", "shell"]),
+            (BackendKind::Container, None, vec!["docker", "exec", "-i"]),
+            (
+                BackendKind::Container,
+                Some("/var/lib/sandboxd/501/sandboxd-gateway/gateway-docker.sock"),
+                vec![
+                    "docker",
+                    "-H",
+                    "unix:///var/lib/sandboxd/501/sandboxd-gateway/gateway-docker.sock",
+                    "exec",
+                    "-i",
+                ],
+            ),
+            (
+                BackendKind::Container,
+                Some("/var/lib/sandboxd/280/502/lima/sandboxd-gateway/gateway-docker.sock"),
+                vec![
+                    "docker",
+                    "-H",
+                    "unix:///var/lib/sandboxd/280/502/lima/sandboxd-gateway/gateway-docker.sock",
+                    "exec",
+                    "-i",
+                ],
+            ),
+        ];
+
+        for (backend, socket, expected) in cases {
+            let mut opts = push_opts(
+                backend,
+                "sandbox-x",
+                "/srv/proj",
+                "/home/sandbox/workspace",
+                false,
+            );
+            opts.docker_socket = socket.map(str::to_string);
+            let argv = build_workspace_rsync_argv(&opts);
+            let e_index = argv
+                .iter()
+                .position(|a| a == "-e")
+                .expect("the argv carries a remote-shell transport");
+            let transport = &argv[e_index + 1];
+            let words = sandbox_docker_argv::rsh_split(transport).unwrap_or_else(|e| {
+                panic!("{backend:?}/{socket:?} transport must survive rsync's re-parse: {e}")
+            });
+            assert_eq!(
+                words, expected,
+                "{backend:?}/{socket:?} must re-parse into the intended argv"
+            );
+        }
+    }
+
     /// Linux / host docker: with `docker_socket = None` the container
     /// transport stays the historical `docker exec -i` (no `-H`). Pins the
     /// byte-identical Linux argv.

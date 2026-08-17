@@ -8537,11 +8537,10 @@ async fn start_dns_gate_bridge(session_id: &SessionId, state: &AppState) {
             }
         }
 
-        let gateway_docker_socket = state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf();
-        let handle = sandbox_core::start_gate_bridge(*session_id, gateway_docker_socket);
+        // The bridge's `docker exec` goes on the same route as every other
+        // Docker operation, so it follows the gateway VM's ownership without
+        // this call site changing.
+        let handle = sandbox_core::start_gate_bridge(*session_id, state.docker.clone());
         let mut handles = state.dns_gate_bridge_handles.lock().await;
         handles.insert(*session_id, handle);
         info!(
@@ -10545,22 +10544,14 @@ async fn get_proxy(
     Path(id): Path<String>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // On macOS the sandbox container runs inside the gateway VM, so the proxy's
-    // `docker exec` byte pump must target the forwarded socket. Linux leaves
-    // this `None` (host docker daemon — argv unchanged).
-    #[cfg(target_os = "macos")]
-    let proxy_docker_socket = Some(
-        state
-            .gateway_lima_manager
-            .gateway_docker_socket()
-            .to_path_buf(),
-    );
-    #[cfg(not(target_os = "macos"))]
-    let proxy_docker_socket: Option<std::path::PathBuf> = None;
+    // The proxy's `docker exec` byte pump takes the same route as every
+    // other Docker operation: the host daemon on Linux, the operator's VM on
+    // macOS. It holds no socket path of its own, so it cannot disagree with
+    // the route about which Docker daemon the session's container lives in.
     let proxy_state = Arc::new(sandboxd::proxy_http::ProxyState {
         store: Arc::clone(&state.store),
         lima_registry: Arc::clone(state.lima_runtime.registry()),
-        docker_socket: proxy_docker_socket,
+        docker: state.docker.clone(),
     });
     match sandboxd::proxy_http::handle_proxy(proxy_state, operator.name, id, ws).await {
         Ok(resp) => resp.into_response(),
@@ -13957,20 +13948,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // base_dir serves as the docker_home so the docker build client can write its
     // config dir to a writable daemon-owned path.
     #[cfg(target_os = "macos")]
-    let container_runtime = {
-        let gateway_sock = gateway_lima_manager.gateway_docker_socket().to_path_buf();
-        ContainerRuntime::with_vm_route(
-            lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
-            default_memory_mb,
-            default_cpus,
-            container_uid,
-            container_gid,
-            &guest_bind_source,
-            docker_route.clone(),
-            gateway_sock,
-            base_dir.clone(),
-        )
-    };
+    let container_runtime = ContainerRuntime::with_vm_route(
+        lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
+        default_memory_mb,
+        default_cpus,
+        container_uid,
+        container_gid,
+        &guest_bind_source,
+        docker_route.clone(),
+        base_dir.clone(),
+    );
     #[cfg(not(target_os = "macos"))]
     let container_runtime = ContainerRuntime::new(
         lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),

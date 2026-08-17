@@ -35,14 +35,19 @@
 //!   writes `BrokerResponse\n`. The channel is pipelined — several ops may be
 //!   outstanding at once, and each response is matched to its request by
 //!   `request_id`, never by arrival order.
-//! - **GuestSocat (multiplexed)**: daemon writes `BrokerRequest { op:
-//!   GuestSocat { stream_token: Some(token) } }\n` on the **control**
-//!   connection. Agent replies `BrokerResponse { result: StreamReady }\n`
-//!   on the same control connection (which is NOT consumed), then opens a
-//!   **separate** stream connection and sends `STREAM_CONNECT:<token>\n`
-//!   before beginning the raw byte-pump. The daemon correlates the stream
-//!   connection to the pending op by token. Control connection stays alive
-//!   and can immediately serve the next op.
+//! - **Stream-class ops (multiplexed)**: `GuestSocat`, which reaches the
+//!   guest agent in a Lima VM, and `DockerStream`, which reaches the guest
+//!   agent, the sshd, or the DNS-policy gate inside a container. Which ops
+//!   these are is defined once by `BrokerOp::stream_token_slot`; the loop
+//!   keeps no list of its own. The daemon writes the request with
+//!   `stream_token: Some(token)` on the **control** connection; the agent
+//!   replies `BrokerResponse { result: StreamReady }\n` on that same
+//!   connection (which is NOT consumed), then opens a **separate** stream
+//!   connection, sends `STREAM_CONNECT:<token>\n`, and begins the raw
+//!   byte-pump. The daemon correlates the stream connection to the pending
+//!   op by token. The control connection stays alive and can immediately
+//!   serve the next op — which matters most for the gate stream, since the
+//!   daemon opens one of those per DNS query.
 //! - **Heartbeat**: either side may send `PING\n` (plain text, not JSON) and
 //!   expects `PONG\n` in reply. A heartbeat can land at any point, including
 //!   between a request and its response; every reader classifies each frame
@@ -58,9 +63,15 @@
 //! - Non-enrolled operators exit cleanly; no respawn loop.
 //! - Every op field is validated (VM name, paths, numeric ranges) before
 //!   any limactl invocation. See the `validation` module.
-//! - GuestSocat uses a distinct framing (StreamOpen + raw bytes) from
-//!   one-shot request/response (JSON frames only). The two must not be
-//!   confused.
+//! - Stream-class ops use a distinct framing (raw bytes on a dedicated
+//!   connection) from one-shot request/response (JSON frames only). The two
+//!   must not be confused.
+//! - A stream's destination is never a value the daemon supplies. The
+//!   container is, and is re-validated as a docker name; the endpoint inside
+//!   it is a discriminant the agent renders from its own constants, and the
+//!   Docker daemon is the agent's own socket derived from its own LIMA_HOME.
+//!   A byte pipe is the whole of what these ops do, so a caller-chosen
+//!   destination would leave the closed op set bounding nothing.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -572,9 +583,18 @@ mod imp {
 
                     let request_id = request.request_id;
 
-                    if let BrokerOp::GuestSocat { op_uid, vm, stream_token } = request.op {
-                        match stream_token {
-                            Some(token) => {
+                    // Stream-class ops are the ones with a `stream_token`
+                    // slot — `BrokerOp::stream_token_slot` is the single
+                    // definition of which those are, so a new stream op
+                    // cannot arrive here and be silently answered inline.
+                    // The outer `Some` says stream-class; the inner one says
+                    // the daemon supplied a correlation token.
+                    let mut op = request.op;
+                    let stream_token = op.stream_token_slot().map(Option::take);
+
+                    if let Some(stream_token) = stream_token {
+                        match (stream_token, op) {
+                            (Some(token), stream_op) => {
                                 // Multiplexed path: respond StreamReady on the control
                                 // connection, open a separate stream connection for the
                                 // byte-pump. The control connection stays alive.
@@ -610,8 +630,7 @@ mod imp {
                                     run_stream_connection(
                                         socket_for_stream,
                                         run_ctx_clone,
-                                        vm,
-                                        op_uid,
+                                        stream_op,
                                         request_id,
                                         token,
                                     )
@@ -620,7 +639,29 @@ mod imp {
                                 // Control connection continues — do not exit.
                                 continue;
                             }
-                            None => {
+                            (None, BrokerOp::DockerStream { .. }) => {
+                                // No single-connection legacy form exists for
+                                // this op, so a missing token is a daemon bug
+                                // rather than an older peer. Refuse it as one
+                                // op; the connection is not the problem.
+                                let response = BrokerResponse {
+                                    request_id,
+                                    result: BrokerResult::Rejected {
+                                        reason: "DockerStream requires a stream_token".to_string(),
+                                    },
+                                };
+                                if let Ok(json) = serde_json::to_string(&response) {
+                                    let mut w = writer.lock().await;
+                                    if w.write_all(json.as_bytes()).await.is_err()
+                                        || w.write_all(b"\n").await.is_err()
+                                    {
+                                        warn!(uid = own_uid, "rejection write failed; closing connection");
+                                        return;
+                                    }
+                                }
+                                continue;
+                            }
+                            (None, BrokerOp::GuestSocat { op_uid, vm, .. }) => {
                                 // Legacy path: consume the control connection for the byte-pump.
                                 // The agent will reconnect after the stream ends.
                                 //
@@ -652,6 +693,15 @@ mod imp {
                                 let _ = handler::handle_guest_socat(run_ctx, vm, op_uid, request_id, true, stream).await;
                                 return;
                             }
+                            (None, other) => {
+                                // Unreachable: `stream_token_slot` returned a
+                                // slot, so `other` is one of the two variants
+                                // above. Handled rather than `unreachable!`d —
+                                // a panic here would take the operator's whole
+                                // control connection down over a wire frame.
+                                warn!(uid = own_uid, op = other.label(), "stream-class op with no token handler; ignoring");
+                                continue;
+                            }
                         }
                     } else {
                         // One-shot op: dispatch on a spawned task so the select! loop keeps
@@ -664,7 +714,6 @@ mod imp {
                             broker_socket: run_ctx.broker_socket.clone(),
                         };
                         let writer_for_op = Arc::clone(&writer);
-                        let op = request.op;
                         tokio::spawn(async move {
                             let result = handler::dispatch_op(&run_ctx_clone, op).await;
                             let response = BrokerResponse { request_id, result };
@@ -690,7 +739,7 @@ mod imp {
         }
     }
 
-    /// Open a dedicated stream connection to the broker for a `GuestSocat` op.
+    /// Open a dedicated stream connection to the broker for a stream-class op.
     ///
     /// The stream connection goes through the full authentication path (peer-cred,
     /// group membership, and uid gate) independently of the control connection.
@@ -698,13 +747,14 @@ mod imp {
     /// so the daemon can correlate this connection to the pending op.
     ///
     /// This function is spawned as a task by `run_protocol_loop` when the daemon
-    /// sends a `GuestSocat` with a `stream_token`. It runs concurrently with the
-    /// control connection's protocol loop.
+    /// sends a stream-class op with a `stream_token`. It runs concurrently with
+    /// the control connection's protocol loop, and with every other stream:
+    /// the DNS-gate bridge opens one of these per DNS query, so this path is
+    /// on the egress-allow critical path as well as the SSH one.
     async fn run_stream_connection(
         socket_path: std::path::PathBuf,
         run_ctx: RunContext,
-        vm: String,
-        op_uid: u32,
+        op: BrokerOp,
         request_id: u64,
         token: String,
     ) {
@@ -713,7 +763,8 @@ mod imp {
 
         info!(
             uid = run_ctx.own_uid,
-            vm, "opening stream connection for GuestSocat"
+            op = op.label(),
+            "opening stream connection"
         );
 
         let stream = match UnixStream::connect(&socket_path).await {
@@ -746,11 +797,31 @@ mod imp {
             }
         };
 
-        // Run the byte-pump on the dedicated stream connection.
-        // write_stream_open=false: the stream connection is a raw byte-pump;
-        // the StreamReady acknowledgement already went on the control connection.
-        let _ = handler::handle_guest_socat(&run_ctx, vm, op_uid, request_id, false, stream).await;
-        info!(uid = run_ctx.own_uid, "stream connection GuestSocat ended");
+        // Run the byte-pump on the dedicated stream connection. Each op family
+        // has its own transport; neither writes a framing header here, because
+        // the StreamReady acknowledgement already went on the control
+        // connection and this connection is raw bytes from its first one.
+        let label = op.label();
+        match op {
+            BrokerOp::GuestSocat { op_uid, vm, .. } => {
+                let _ =
+                    handler::handle_guest_socat(&run_ctx, vm, op_uid, request_id, false, stream)
+                        .await;
+            }
+            BrokerOp::DockerStream {
+                op_uid, stream: s, ..
+            } => {
+                let _ = handler::handle_docker_stream(&run_ctx, s, op_uid, stream).await;
+            }
+            other => {
+                warn!(
+                    uid = run_ctx.own_uid,
+                    op = other.label(),
+                    "stream connection opened for a non-stream op; closing"
+                );
+            }
+        }
+        info!(uid = run_ctx.own_uid, op = label, "stream connection ended");
     }
 
     // ---------------------------------------------------------------------------

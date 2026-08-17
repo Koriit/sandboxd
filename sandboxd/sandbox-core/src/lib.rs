@@ -100,7 +100,6 @@ pub use dns_gate::{
     GateRequest, GateRequestKind, GateService, GateServiceOutcome, GateStatus, bind_gate_listener,
     dns_gate_socket_host_path, log_serviced, remove_gate_socket, send_request, serve_gate_listener,
 };
-pub use dns_gate_bridge::gate_listener_exec_argv;
 #[cfg(target_os = "macos")]
 pub use dns_gate_bridge::start_gate_bridge;
 pub use dns_propagation::{

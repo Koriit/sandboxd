@@ -59,10 +59,30 @@
 //! such as create-then-start is sequential because the caller awaits each
 //! response before issuing the next request.
 //!
-//! ## Streaming (`GuestSocat`)
+//! ## Streaming (the stream-class ops)
 //!
-//! `GuestSocat` opens a long-lived bidirectional byte-pump to the in-VM guest
-//! agent. Its framing is distinct from one-shot request/response:
+//! Two op variants are stream-class rather than request/response:
+//! [`BrokerOp::GuestSocat`], which reaches the guest agent inside a Lima VM,
+//! and [`BrokerOp::DockerStream`], which reaches an endpoint inside one of the
+//! operator's containers. Both open a long-lived bidirectional byte pump, and
+//! both carry a `stream_token`; [`BrokerOp::stream_token_slot`] is the single
+//! place that says which variants those are.
+//!
+//! The multiplexed framing, which is the one the daemon uses:
+//!
+//! ```text
+//! daemon → agent (control): JSON(BrokerRequest { op: <stream op with token> })\n
+//! agent  → daemon (control): JSON(BrokerResponse::StreamReady { token })\n
+//! agent  → daemon (NEW connection): STREAM_CONNECT:<token>\n
+//! [bidirectional raw byte stream on that connection until either side closes]
+//! ```
+//!
+//! The control connection is never consumed and is not blocked for the
+//! duration: the stream open is one op like any other and resolves when its
+//! `StreamReady` arrives.
+//!
+//! The legacy single-connection framing survives for `GuestSocat` only, and
+//! only for agents predating the multiplexed protocol:
 //!
 //! ```text
 //! daemon → agent: JSON(BrokerRequest { op: GuestSocat { vm } })\n
@@ -70,16 +90,12 @@
 //! [bidirectional raw byte stream until either side closes]
 //! ```
 //!
-//! After `StreamOpen`, the stream carries raw bytes — the agent splices its
+//! After `StreamOpen` the connection carries raw bytes — the agent splices its
 //! stdin/stdout to `limactl shell <vm> -- socat - TCP:127.0.0.1:5123` and
 //! copies between the broker connection and the socat process until either end
 //! closes. There is no further framing; the agent and daemon each close their
-//! half of the stream to signal EOF to the other.
-//!
-//! The daemon treats `StreamOpen` as the signal to begin raw-byte I/O; any
-//! further `BrokerResponse` JSON on the stream after `StreamOpen` would be a
-//! protocol error (the agent must not write any more framed data after sending
-//! `StreamOpen`).
+//! half of the stream to signal EOF to the other. Any further `BrokerResponse`
+//! JSON after `StreamOpen` would be a protocol error.
 //!
 //! # Relationship to `LimaOp<'a>` in `sandbox-core`
 //!
@@ -311,6 +327,31 @@ pub enum BrokerOp {
     ///
     /// Same own-uid + VM-name re-validation as every other op.
     RestrictOnVerify { op_uid: u32, vm: String },
+    /// Open a long-lived byte stream to an endpoint inside one of the
+    /// containers on the agent's own Docker daemon.
+    ///
+    /// Same multiplexed shape as [`BrokerOp::GuestSocat`] — the daemon embeds
+    /// a `stream_token`, the agent answers `StreamReady` on the control
+    /// connection and opens a separate connection for the bytes. What differs
+    /// is the transport underneath: `docker exec … socat` against the agent's
+    /// own VM rather than `limactl shell`.
+    ///
+    /// **The daemon does not name the endpoint or the Docker daemon.**
+    /// [`DockerStreamOp`] is a closed enum of three destinations, each of
+    /// which renders its `socat` address from constants in
+    /// `sandbox-docker-argv`; the socket is the agent's own, derived from its
+    /// own LIMA_HOME. A stream is a raw byte pipe into a container, so a
+    /// caller-chosen address would be the whole of what these ops can do.
+    DockerStream {
+        op_uid: u32,
+        stream: DockerStreamOp,
+        /// Correlation token for the multiplexed stream connection. Always
+        /// `Some` in production: unlike `GuestSocat` this op has no
+        /// single-connection legacy form, so an agent that receives it
+        /// without a token rejects it rather than falling back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_token: Option<String>,
+    },
     /// Run one typed `docker` operation against the Docker daemon inside the
     /// agent's own VM.
     ///
@@ -328,6 +369,55 @@ pub enum BrokerOp {
     /// `-H unix://<own socket>` the sole target authority and keeps every
     /// path in this op set inside the agent's own subtree.
     Docker { op_uid: u32, op: DockerOp },
+}
+
+// ---------------------------------------------------------------------------
+// Docker stream set
+// ---------------------------------------------------------------------------
+
+/// The closed set of long-lived byte streams the daemon may open into one of
+/// the operator's containers.
+///
+/// Read this enum as the answer to "what can the daemon make my Docker pipe
+/// bytes to?". Each variant names a destination whose address is a constant
+/// in `sandbox-docker-argv`; the only value that varies is which container.
+/// There is deliberately no variant carrying a port, a socket path or a
+/// `socat` address — a stream *is* a raw byte pipe, so a caller-chosen
+/// destination would make this op set unbounded no matter how many variants
+/// it had.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "stream_op", rename_all = "snake_case")]
+pub enum DockerStreamOp {
+    /// The in-session `sandbox-guest` agent. Carries sandboxd's structured
+    /// guest protocol; the daemon opens one per guest request.
+    GuestAgent { container: String },
+    /// The in-session `sshd`, for the proxy WebSocket. Held open for a whole
+    /// SSH session — hours, under a remote-development client.
+    Sshd { container: String },
+    /// The gateway container's DNS-policy gate socket. One per DNS query,
+    /// on the egress-allow decision path.
+    DnsGate { container: String },
+}
+
+impl DockerStreamOp {
+    /// The container this stream enters.
+    pub fn container(&self) -> &str {
+        match self {
+            DockerStreamOp::GuestAgent { container }
+            | DockerStreamOp::Sshd { container }
+            | DockerStreamOp::DnsGate { container } => container,
+        }
+    }
+
+    /// The in-container endpoint this stream reaches.
+    pub fn target(&self) -> sandbox_docker_argv::stream::StreamTarget {
+        use sandbox_docker_argv::stream::StreamTarget;
+        match self {
+            DockerStreamOp::GuestAgent { .. } => StreamTarget::GuestAgent,
+            DockerStreamOp::Sshd { .. } => StreamTarget::Sshd,
+            DockerStreamOp::DnsGate { .. } => StreamTarget::DnsGate,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,16 +1195,71 @@ impl BrokerOp {
             | BrokerOp::ReadOwnerMarker { op_uid, .. }
             | BrokerOp::GuestSocat { op_uid, .. }
             | BrokerOp::RestrictOnVerify { op_uid, .. }
+            | BrokerOp::DockerStream { op_uid, .. }
             | BrokerOp::Docker { op_uid, .. } => *op_uid,
+        }
+    }
+
+    /// The op's `stream_token` field, for the ops that have one.
+    ///
+    /// This is the single definition of "stream-class op" that both sides of
+    /// the channel work from. The daemon uses it to embed a freshly-minted
+    /// correlation token before the request goes on the wire, and to refuse a
+    /// stream open for an op that has nowhere to put one; the agent uses it
+    /// to decide whether a request opens a stream or answers inline.
+    ///
+    /// The match is exhaustive on purpose. A new op variant does not compile
+    /// until someone says which of the two it is, which is the only cheap
+    /// moment to notice that a stream op has been added without its token
+    /// plumbing — a stream that carries no token cannot be correlated to the
+    /// connection the agent opens for it, and would hang instead of failing.
+    pub fn stream_token_slot(&mut self) -> Option<&mut Option<String>> {
+        match self {
+            BrokerOp::GuestSocat { stream_token, .. }
+            | BrokerOp::DockerStream { stream_token, .. } => Some(stream_token),
+            BrokerOp::Create { .. }
+            | BrokerOp::Start { .. }
+            | BrokerOp::Stop { .. }
+            | BrokerOp::Delete { .. }
+            | BrokerOp::Clone { .. }
+            | BrokerOp::ListJson { .. }
+            | BrokerOp::InstallGuestAgent { .. }
+            | BrokerOp::ReadUserKey { .. }
+            | BrokerOp::RunRsync { .. }
+            | BrokerOp::ReadOwnerMarker { .. }
+            | BrokerOp::RestrictOnVerify { .. }
+            | BrokerOp::Docker { .. } => None,
+        }
+    }
+
+    /// A short label naming the op family, for log lines and refusals that
+    /// should not carry the whole payload.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BrokerOp::Create { .. } => "create",
+            BrokerOp::Start { .. } => "start",
+            BrokerOp::Stop { .. } => "stop",
+            BrokerOp::Delete { .. } => "delete",
+            BrokerOp::Clone { .. } => "clone",
+            BrokerOp::ListJson { .. } => "list-json",
+            BrokerOp::InstallGuestAgent { .. } => "install-guest-agent",
+            BrokerOp::ReadUserKey { .. } => "read-user-key",
+            BrokerOp::RunRsync { .. } => "run-rsync",
+            BrokerOp::ReadOwnerMarker { .. } => "read-owner-marker",
+            BrokerOp::GuestSocat { .. } => "guest-socat",
+            BrokerOp::RestrictOnVerify { .. } => "restrict-on-verify",
+            BrokerOp::DockerStream { .. } => "docker-stream",
+            BrokerOp::Docker { .. } => "docker",
         }
     }
 }
 
 /// Prefix of the stream-connection identification frame.
 ///
-/// When an agent opens a dedicated stream connection for a `GuestSocat` op
-/// it sends this prefix immediately after the CHECKIN/auth phase, followed
-/// by the correlation token and a newline:
+/// When an agent opens a dedicated stream connection for a stream-class op
+/// (see [`BrokerOp::stream_token_slot`]) it sends this prefix immediately
+/// after the CHECKIN/auth phase, followed by the correlation token and a
+/// newline:
 ///
 /// ```text
 /// STREAM_CONNECT:<hex-token>\n
@@ -1146,6 +1291,16 @@ pub const RESTRICT_ON_MARKER: &str = "restrict=on";
 /// vocabulary stops and the command-line vocabulary begins; both sides of
 /// the channel cross it through the same functions, so neither can hold a
 /// different idea of what an op means.
+/// Render a stream op's `docker exec` argv through the shared builder.
+///
+/// `socket` is supplied by whoever is about to run the invocation — the
+/// agent's own forwarded socket. It is not a field on the op and never
+/// crosses the channel; see `own_gateway_docker_socket` in the agent's
+/// handler for why that distinction is the whole point.
+pub fn docker_stream_argv(op: &DockerStreamOp, socket: Option<&std::path::Path>) -> Vec<String> {
+    sandbox_docker_argv::stream::stream_exec_argv(socket, op.container(), op.target())
+}
+
 pub fn docker_argv(op: &crate::protocol::DockerOp) -> Result<Vec<String>, String> {
     use sandbox_docker_argv::{container, image, network, volume};
 

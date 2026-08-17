@@ -899,6 +899,12 @@ pub enum LimaOp<'a> {
 ///   bidirectional byte pump for the duration of an SSH session. This path
 ///   MUST NOT use `spawn_blocking` (see the async-I/O carve-out in
 ///   `CLAUDE.md`); `guest_socat` is therefore `async`.
+///
+/// The same split exists on the Docker side, and the streams there are the
+/// other three in the carve-out: [`crate::docker::DockerExecutor::run`] is
+/// one-shot and blocking, [`crate::docker::DockerExecutor::open_stream`] is
+/// long-lived and async. This one stays `limactl`-shaped because its
+/// transport is `limactl shell`, not `docker exec`.
 #[async_trait]
 pub trait LimaExecutor: Send + Sync {
     /// Run a one-shot helper operation and return the captured output.

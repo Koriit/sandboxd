@@ -281,10 +281,11 @@ impl DockerOp {
 
 /// Runs typed Docker operations somewhere the caller cannot reach directly.
 ///
-/// One-shot and blocking, matching [`crate::lima::LimaExecutor::run`]: the
-/// caller wraps it in `spawn_blocking`. There is no streaming method — the
-/// long-lived Docker streams are a separate concern with their own lifetime
-/// rules (see the async-I/O carve-out in `CLAUDE.md`).
+/// [`DockerExecutor::run`] is one-shot and blocking, matching
+/// [`crate::lima::LimaExecutor::run`]: the caller wraps it in
+/// `spawn_blocking`. [`DockerExecutor::open_stream`] is the opposite in every
+/// respect and deliberately so — see its own documentation.
+#[async_trait::async_trait]
 pub trait DockerExecutor: Send + Sync {
     /// Run one op as `op_uid` and return the captured output.
     fn run(
@@ -294,6 +295,127 @@ pub trait DockerExecutor: Send + Sync {
         timeout: Duration,
         label: &str,
     ) -> Result<std::process::Output, SandboxError>;
+
+    /// Open one long-lived byte stream into a container as `op_uid`.
+    ///
+    /// # Why this one is async and has no timeout
+    ///
+    /// It is the async-I/O carve-out in trait form (`CLAUDE.md` § Async-I/O
+    /// carve-out). The three streams this opens are held for as long as the
+    /// thing at the far end lasts: an SSH session under a remote-development
+    /// client runs for hours. A `spawn_blocking` wrapper would hold a
+    /// blocking-task slot for that whole time and deadlock the executor under
+    /// load, which is why `run`'s convention explicitly does not extend here.
+    ///
+    /// It takes no `timeout` for the same reason. A wall-clock budget on a
+    /// stream would be a budget on the session inside it, and there is no
+    /// value that is both long enough for a working SSH connection and short
+    /// enough to catch anything. What *is* bounded is the **open**: the
+    /// brokered implementation fails if the agent does not acknowledge within
+    /// the control connection's per-op deadline, or does not connect back
+    /// within the pending-stream timeout, and both of those fail the one op
+    /// rather than the connection.
+    async fn open_stream(
+        &self,
+        op_uid: u32,
+        stream: DockerStream,
+    ) -> Result<DockerStreamConn, SandboxError>;
+}
+
+/// The closed set of long-lived byte streams the daemon may open into a
+/// container.
+///
+/// The in-process counterpart of the broker protocol's `DockerStreamOp`,
+/// mapped by an exhaustive match for the same reason [`DockerOp`] is. There
+/// is no variant carrying a port or a socket path: a stream is a raw byte
+/// pipe, so the destination is the entire authority, and the three that exist
+/// are the three the product has.
+#[derive(Debug, Clone)]
+pub enum DockerStream {
+    /// The in-session `sandbox-guest` agent — sandboxd's structured guest
+    /// protocol, one stream per guest request.
+    GuestAgent { container: String },
+    /// The in-session `sshd` behind the proxy WebSocket — one stream per SSH
+    /// session, held open for its whole duration.
+    Sshd { container: String },
+    /// The gateway container's DNS-policy gate socket — one stream per DNS
+    /// query, on the egress-allow decision path.
+    DnsGate { container: String },
+}
+
+impl DockerStream {
+    /// The container this stream enters.
+    pub fn container(&self) -> &str {
+        match self {
+            DockerStream::GuestAgent { container }
+            | DockerStream::Sshd { container }
+            | DockerStream::DnsGate { container } => container,
+        }
+    }
+
+    /// The in-container endpoint this stream reaches.
+    pub fn target(&self) -> sandbox_docker_argv::stream::StreamTarget {
+        use sandbox_docker_argv::stream::StreamTarget;
+        match self {
+            DockerStream::GuestAgent { .. } => StreamTarget::GuestAgent,
+            DockerStream::Sshd { .. } => StreamTarget::Sshd,
+            DockerStream::DnsGate { .. } => StreamTarget::DnsGate,
+        }
+    }
+
+    /// The `docker` arguments that open this stream against `socket`.
+    pub fn argv(&self, socket: Option<&Path>) -> Vec<String> {
+        sandbox_docker_argv::stream::stream_exec_argv(socket, self.container(), self.target())
+    }
+}
+
+/// An open long-lived stream, and — when this process ran the child itself —
+/// the means to find out how it ended.
+///
+/// The two halves are separate because they have different lifetimes at
+/// different call sites. The SSH proxy hands the bytes to a ferry that
+/// consumes them and then wants the child's exit status to choose a WebSocket
+/// close code; the guest transport wants the child kept alive for exactly as
+/// long as the bytes are and no longer. Bundling the child into the byte
+/// stream would serve the second and make the first impossible.
+pub struct DockerStreamConn {
+    /// The bytes. Dropping this alone does not reap the child — [`Self::exit`]
+    /// owns it, and is `kill_on_drop`.
+    pub io: Box<dyn crate::backend::AsyncReadWrite + Send + Unpin>,
+    /// Present only when the stream is a child of *this* process. The
+    /// brokered path leaves it `None`: the child belongs to the operator's
+    /// agent, and the stream closing is the whole of what the daemon
+    /// observes. A caller that reports on it must therefore treat `None` as
+    /// "no diagnosis available", not as "clean".
+    pub exit: Option<LocalStreamChild>,
+}
+
+/// The child process behind a locally-spawned [`DockerStreamConn`].
+///
+/// Held by the caller across the byte pump so the child stays alive for it
+/// (`kill_on_drop` reaps it when the caller lets go) and so the caller can
+/// ask how it ended afterwards.
+pub struct LocalStreamChild {
+    child: tokio::process::Child,
+    stderr: Option<tokio::process::ChildStderr>,
+}
+
+impl LocalStreamChild {
+    /// Reap the child and return its exit status and whatever it wrote to
+    /// stderr.
+    ///
+    /// Callers interpret the pair themselves: what a non-zero exit means
+    /// differs between a proxy session that ended and a gate listener whose
+    /// container went away.
+    pub async fn wait(mut self) -> (Option<std::process::ExitStatus>, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let status = self.child.wait().await.ok();
+        let mut buf = Vec::new();
+        if let Some(mut err) = self.stderr.take() {
+            let _ = err.read_to_end(&mut buf).await;
+        }
+        (status, buf)
+    }
 }
 
 /// Where a call site's `docker` operations go.
@@ -380,6 +502,22 @@ impl DockerRoute {
         }
     }
 
+    /// Open one long-lived byte stream on this route.
+    ///
+    /// Async and un-budgeted, unlike [`Self::run`] — see
+    /// [`DockerExecutor::open_stream`] for why both of those are deliberate,
+    /// and `CLAUDE.md` § Async-I/O carve-out for the convention it departs
+    /// from.
+    pub async fn open_stream(
+        &self,
+        stream: DockerStream,
+    ) -> Result<DockerStreamConn, SandboxError> {
+        match self {
+            DockerRoute::Host => open_stream_locally(None, stream).await,
+            DockerRoute::Vm { op_uid, executor } => executor.open_stream(*op_uid, stream).await,
+        }
+    }
+
     /// Whether this route targets a VM rather than the host daemon.
     pub fn is_vm(&self) -> bool {
         matches!(self, DockerRoute::Vm { .. })
@@ -422,6 +560,7 @@ impl LocalSocketDockerExecutor {
     }
 }
 
+#[async_trait::async_trait]
 impl DockerExecutor for LocalSocketDockerExecutor {
     fn run(
         &self,
@@ -435,6 +574,119 @@ impl DockerExecutor for LocalSocketDockerExecutor {
             return run_docker_load_locally(Some(&self.socket), &tarball, label);
         }
         run_docker_locally(Some(&self.socket), op, timeout, label)
+    }
+
+    async fn open_stream(
+        &self,
+        _op_uid: u32,
+        stream: DockerStream,
+    ) -> Result<DockerStreamConn, SandboxError> {
+        open_stream_locally(Some(&self.socket), stream).await
+    }
+}
+
+/// Spawn one long-lived `docker exec … socat` child in this process and hand
+/// back its stdio as a stream.
+///
+/// **ASYNC-I/O CARVE-OUT.** `tokio::process::Command` with async pipes is
+/// mandatory here and the project's `spawn_blocking` convention does not
+/// apply: this child is held open for the life of the stream — an entire SSH
+/// session for the `Sshd` target — so a blocking-task slot occupied for its
+/// duration would deadlock the executor under load. See the carve-out
+/// doc-comment in `sandboxd/src/proxy_http.rs` for the full rationale, and
+/// `CLAUDE.md` § Async-I/O carve-out. Do not wrap this site.
+async fn open_stream_locally(
+    socket: Option<&Path>,
+    stream: DockerStream,
+) -> Result<DockerStreamConn, SandboxError> {
+    use std::process::Stdio;
+
+    let argv = stream.argv(socket);
+    let mut command = tokio::process::Command::new(sandbox_docker_argv::DOCKER_BIN);
+    // Same environment rule as the one-shot route: a named target scrubs, an
+    // unnamed one inherits. `-H` is the sole authority for which Docker daemon
+    // a stream lands in, so nothing ambient may redirect it.
+    if socket.is_some() {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        command
+            .env_clear()
+            .env(
+                "PATH",
+                format!("/opt/homebrew/bin:/usr/local/bin:{current_path}"),
+            )
+            .env("HOME", std::env::var("HOME").unwrap_or_default());
+    }
+    command
+        .args(&argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(|e| {
+        SandboxError::Gateway(format!(
+            "failed to spawn the {} stream for {}: {e}",
+            stream.target().label(),
+            stream.container()
+        ))
+    })?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| SandboxError::Internal("docker exec child has no stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SandboxError::Internal("docker exec child has no stdout".into()))?;
+    let stderr = child.stderr.take();
+
+    Ok(DockerStreamConn {
+        io: Box::new(ChildStdio { stdin, stdout }),
+        exit: Some(LocalStreamChild { child, stderr }),
+    })
+}
+
+/// A child's stdin/stdout presented as one bidirectional stream.
+///
+/// Deliberately does **not** own the child: [`DockerStreamConn::exit`] does,
+/// so a caller that wants the exit status can hold it across the byte pump.
+struct ChildStdio {
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+}
+
+impl tokio::io::AsyncRead for ChildStdio {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ChildStdio {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_shutdown(cx)
     }
 }
 

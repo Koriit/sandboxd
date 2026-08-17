@@ -24,6 +24,13 @@ pub use protocol::{
     NftTable, RemoveForce, StagedImage, StdinCommand, WorkspaceBindSpec, docker_argv,
 };
 
+/// The stream-class op set — the long-lived byte pumps into a container.
+/// Exported for the same reason as the Docker op set: the daemon builds the
+/// requests the agent validates, and one definition is what keeps the two
+/// sides from disagreeing about what a stream reaches.
+#[cfg(target_os = "macos")]
+pub use protocol::{DockerStreamOp, docker_stream_argv};
+
 #[cfg(target_os = "macos")]
 pub use protocol::{RESTRICT_MARKER_FILENAME, RESTRICT_ON_MARKER, STREAM_CONNECT_PREFIX};
 
