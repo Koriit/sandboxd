@@ -3707,7 +3707,7 @@ enforces, with slot identity no longer positional.
 |---|---|
 | `scripts/install.sh` enrollment path (`:2679`) | **§1.6** — create the per-operator group and add its members (**operator + daemon account**). The slot sockets stay on the legacy group until phase 4 |
 | `Makefile` `setup-darwin-vmnet-plists`; `scripts/install.sh` plist + enrollment path (`:2679`) | **§1.6** — create the per-operator group and assign the slot range at enrollment; **and specify de-enrollment in the same change**, revoking group membership *before* a range may be reassigned |
-| new, daemon-side | **§1.3** — derive each operator's range by `stat`-ing `/var/run/sandbox/vmnet/slot-N.sock`, reading its gid and resolving members. No config file. Defined behaviour for zero-member and multi-member groups (both: slot unassignable) |
+| new, daemon-side | **§1.3** — derive each operator's range by `stat`-ing `/var/run/sandbox/vmnet/slot-N.sock`, reading its gid and resolving members. No config file. Defined behaviour for zero-member and multi-member groups (both: slot unassignable). **⚠️ This row describes the phase-4 end state — see the amendment below** |
 | `sandbox-core/src/network.rs` (`NetworkInfo`) | **§2.1** — new `operator_uid: Option<u32>` with `#[serde(default)]`; `restore_from_infos` shards by it, falling back to `owner_username` and declining the claim if that fails |
 | `sandboxd/src/main.rs:11156-11157` | diagnostics gains a declined-restore list alongside the claimed-slot one (§2.1) |
 | `sandbox-core/src/network.rs:1090-1421` | `VmnetPool` unchanged in shape; range-scoped `claim_lima_slot` scan (`:1169-1170`), quota-scoped cap checks (`:1161`, `:1208`), range-aware `restore_from_infos` (`:1320`), operator dimension on `claimed_slot_sessions` (`:1406`) |
@@ -3726,6 +3726,49 @@ enforces, with slot identity no longer positional.
 | `sandbox-core/src/error.rs:9` | **new structured `SandboxError` variant** for 429 — operator uid, in-use count, quota, with a `Display` impl (§2.2). The enum lives here, not in `sandboxd/src/error.rs` |
 | `sandboxd/src/error.rs:57-79` | new arm in `error_response`; reuse existing `Conflict → 409` (`:69`) for range-unavailable |
 | `sandbox-core/src/network.rs:1161-1176`, `:1208-1213` | rewrite the exhaustion message (§2.2 condition 1) |
+
+#### ⚠️ Amendment — the derivation row describes the phase-4 end state, not phase 1
+
+**The "derive each operator's range by `stat`-ing the slot socket and reading its
+gid" row above is a one-line summary written before there was an implementation
+to place it in. Read alone it is wrong for the phase it sits in, and §1.3
+governs.**
+
+§1.3's *How the daemon learns a range* splits the two concerns explicitly:
+**assignment** — which slots are an operator's — comes from the **per-operator
+group's membership** from phase 1 onward, while the **socket gid** is
+**enforcement**, and only from phase 4. §1.3's own ⚠️ already states that
+"derive it from the socket gid" is true only from phase 4 and that stating it
+for phase 1 produced a total outage. Where a summary row and the detailed
+section disagree, the detailed section is the authority.
+
+**The decisive evidence is what the summary reading produces on a real host.**
+Through phases 1–3 every slot socket still carries the legacy shared group by
+design (§1.6 — moving them earlier would stop the only gateway VM there is). So
+a daemon that read *only* the socket gid would return the **legacy** answer for
+**every slot on every host**, including slots enrolled to an operator moments
+earlier. That fails this phase's own acceptance criterion — *"an operator
+enrolled with a slot range gets exactly that range"* — and makes the enrollment
+work that records the range unobservable to the only thing that consumes it.
+
+**"No config file" is intact and is not what this amendment relaxes.** The
+recorded range lives in the per-operator group record as a native Directory
+Services attribute (`SandboxdSlots`), written by privileged enrollment and
+root-owned. It is not a file the daemon maintains, and §1.3 already names both
+sources — the group's membership and the socket's gid — as *"root-owned and
+operator-unwritable, which is the property §2.1 demands"*. The prohibition is on
+an operator-writable input to a security-relevant allocation, and neither source
+is one.
+
+**What the implementation does, and why it needs no change at phase 4.** It
+unions the two: a slot is claimed by a per-operator group when that group
+records it *or* when the socket's gid resolves to it. Through phases 1–3 the
+recorded range answers and the gid contributes nothing; from phase 4 the two
+agree, exactly as §1.3 says, and the gid answers as well. A disagreement between
+them resolves as §1.3's multi-operator row — refused, both named — rather than
+one silently overriding the other. The phase-4 socket migration therefore
+changes no daemon-side derivation code: this row stops being the *only* source
+rather than becoming one.
 
 **Acceptance criteria.**
 

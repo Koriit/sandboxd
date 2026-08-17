@@ -831,9 +831,23 @@ mod tests {
         ));
     }
 
-    /// Operators sharing the pre-migration remainder share one ledger, so a
-    /// claim by one is visible to the other — which is what stops them
-    /// landing on the same segment.
+    /// Unassigned operators must share **one** ledger, not get a pool each.
+    ///
+    /// This is the part of the fallback that is not obvious, and the part
+    /// someone will eventually try to "fix" for symmetry — every other
+    /// operator has a pool of their own, so why not these. Because a private
+    /// pool per operator over the *same* indices has no way to know the other
+    /// pool handed out slot 0 a moment ago. Both would hand it out, both VMs
+    /// would attach to segment 0, and the two operators would be peers on one
+    /// L2 segment — each able to be believed as the other's next hop. That is
+    /// the isolation failure this whole partition exists to remove, produced
+    /// by the code meant to preserve the status quo.
+    ///
+    /// The single pre-migration pool could not produce it: one ledger,
+    /// serialised claims. So "fall back to current behaviour" means one
+    /// shared pool, and a pool each is not a symmetrical variant of it — it
+    /// is a different and worse thing. If you are here to split this, that is
+    /// what you would be turning back on.
     #[test]
     fn unassigned_operators_share_one_remainder_ledger() {
         let registry = Host::unmigrated(4)
@@ -843,7 +857,11 @@ mod tests {
 
         let a = registry.pool_for(UNENROLLED_UID).unwrap();
         let b = registry.pool_for(502).unwrap();
-        assert!(Arc::ptr_eq(&a, &b));
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "two operators with no assigned range were given separate pools \
+             over the same slot indices"
+        );
 
         let first = a
             .claim_lima_slot(&SessionId::generate(), UNENROLLED_UID)
@@ -855,7 +873,11 @@ mod tests {
             .unwrap()
             .0
             .index;
-        assert_ne!(first, second);
+        assert_ne!(
+            first, second,
+            "two operators were handed slot {first} — they are now peers on one \
+             L2 segment, which the single pre-migration pool could not produce"
+        );
 
         // And the host-wide view attributes each claim to its own operator.
         let claims = registry.claimed_slot_sessions();
