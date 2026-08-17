@@ -46,9 +46,18 @@
 //! agent → daemon: JSON(BrokerResponse)\n
 //! ```
 //!
-//! Both sides write a single newline-terminated JSON object and then wait for
-//! the peer's reply. The stream is not pipelined — a new request is sent only
-//! after the previous response has been received.
+//! Each side writes a single newline-terminated JSON object per message.
+//!
+//! The channel is **pipelined**: the daemon may have several requests
+//! outstanding at once and does not wait for one response before sending the
+//! next request. `request_id` is what correlates them, and responses may come
+//! back in any order — the agent answers each op when that op finishes, which
+//! for a mix of fast and slow ops is not the order they arrived in. Neither
+//! side may infer anything from response order.
+//!
+//! Ordering where it is needed comes from the caller: a dependent sequence
+//! such as create-then-start is sequential because the caller awaits each
+//! response before issuing the next request.
 //!
 //! ## Streaming (`GuestSocat`)
 //!
@@ -95,10 +104,11 @@ use serde::{Deserialize, Serialize};
 /// A single request from the daemon to the agent.
 ///
 /// Serialized as `{"request_id": <u64>, "op": <BrokerOp>}\n` (newline-delimited JSON).
-/// The `request_id` is an opaque monotonic counter chosen by the daemon; the
-/// agent echoes it in the matching `BrokerResponse` so the daemon can correlate
-/// responses if the channel ever carries concurrent one-shots (currently it does
-/// not, but the id is included for forward-compatibility and debugging).
+/// The `request_id` is an opaque monotonic counter chosen by the daemon. The
+/// agent must echo it in the matching `BrokerResponse`: it is the only thing
+/// that correlates a response to its request, and the channel carries
+/// concurrent ops. A response whose id the daemon is not waiting for is
+/// discarded.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrokerRequest {
     /// Monotonic request identifier, echoed in the response.

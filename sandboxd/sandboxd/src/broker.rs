@@ -75,20 +75,42 @@
 //! path. When the `AgentBrokerExecutor` needs to run a `limactl` op for a
 //! given operator uid, it calls [`AgentRegistry::send_op`], which places a
 //! [`PendingRequest`] into that agent's request channel. The
-//! `drive_agent_connection` task reads from that channel and serializes the
-//! `BrokerRequest` over the wire, then awaits the matching `BrokerResponse`
-//! and delivers the result back through a per-request oneshot.
+//! `drive_agent_connection` task reads from that channel and writes the
+//! `BrokerRequest` to the wire, then delivers the matching `BrokerResponse`
+//! back through a per-request oneshot.
+//!
+//! ## Ops are pipelined; the connection is never blocked on one of them
+//!
+//! Requests are correlated by `request_id`, so several may be outstanding at
+//! once (up to [`MAX_IN_FLIGHT_OPS`]). Two properties follow, and both matter:
+//!
+//! - **Independent ops for one operator run concurrently.** One slow op no
+//!   longer delays every other op for the same operator behind it.
+//! - **A dependent sequence still runs in order.** Ordering comes from the
+//!   caller: `create` then `start` is sequential because the caller awaits
+//!   `create`'s response before issuing `start`. Pipelining adds concurrency
+//!   only *between* calls that were already independent, and requests are
+//!   still written to the wire in the order they were queued.
+//!
+//! What is explicitly *not* assumed is response ordering: responses may arrive
+//! in any order and are matched by `request_id` alone.
 //!
 //! The `GuestSocat` streaming op is multiplexed so the control connection is
 //! never consumed. The daemon mints a single-use correlation token, sends
 //! `GuestSocat { stream_token: Some(token) }` on the control connection, and
-//! awaits `StreamReady { token }` from the agent (also on the control
-//! connection). The agent then opens a *separate* stream connection and sends
-//! `STREAM_CONNECT:<token>\n`; the broker matches it to the pending entry in
-//! the [`PendingStreamRegistry`], enforces `token.expected_uid == peer uid`,
-//! and hands the raw stream back to the caller via
+//! registers the op as in-flight like any other — it does **not** sit on the
+//! control loop waiting for `StreamReady`. When that response arrives it is
+//! routed by `request_id` and the waiting caller is released. The agent then
+//! opens a *separate* stream connection and sends `STREAM_CONNECT:<token>\n`;
+//! the broker matches it to the pending entry in the
+//! [`PendingStreamRegistry`], enforces `token.expected_uid == peer uid`, and
+//! hands the raw stream back to the caller via
 //! [`AgentRegistry::take_stream_for_guest_socat`]. The control connection stays
 //! live and can immediately serve the next op — no reconnect gap.
+//!
+//! An agent that acknowledges a stream open slowly, or never, therefore costs
+//! that one op and nothing else: the op fails at its own deadline, and every
+//! other in-flight and queued op for that operator is untouched.
 //!
 //! # Testability
 //!
@@ -202,11 +224,28 @@ pub fn test_set_heartbeat_ms(ms: u64) {
     THREAD_HEARTBEAT_MS.with(|c| c.set(Some(ms)));
 }
 
-/// Capacity of the per-agent request channel. Bounded at a small value
-/// because the protocol is strictly sequential: one request in flight at a
-/// time. A backlog of 4 absorbs any burst of same-uid concurrent calls
-/// without risk of blocking the caller long enough to matter.
+/// Capacity of the per-agent request channel — the queue *in front of* the
+/// connection task, distinct from the number of ops actually on the wire
+/// ([`MAX_IN_FLIGHT_OPS`]). Small on purpose: the in-flight cap is the real
+/// bound, and a deep queue here would only add latency that the caller cannot
+/// observe or cancel. A caller that finds the queue full waits in `send`,
+/// which is ordinary backpressure.
 const REQUEST_CHANNEL_CAPACITY: usize = 4;
+
+/// Maximum number of ops the daemon keeps outstanding on one control
+/// connection at a time.
+///
+/// The cap exists so a burst of callers cannot grow the in-flight map without
+/// bound; when it is reached the connection task simply stops taking new work
+/// off the request channel, and the backpressure propagates to callers. It is
+/// not a fairness or scheduling knob — every outstanding op is independent
+/// work the daemon has already decided to do.
+///
+/// Sized against the surface that rides this lane: the container control plane
+/// issues a handful of ops per session action, and the DNS-gate bridge opens
+/// one stream per query. Sixteen absorbs both without a queue forming in the
+/// common case.
+const MAX_IN_FLIGHT_OPS: usize = 16;
 
 /// The sandboxd group name — the enrollment gate on macOS.
 ///
@@ -574,35 +613,41 @@ pub fn authenticate_peer(stream: &UnixStream) -> AuthOutcome {
 /// A unit of work the daemon sends to a checked-in agent over the broker
 /// channel.
 ///
-/// `OneShot` covers all ops except `GuestSocat`: the daemon serializes the
-/// request, writes it to the agent, reads the JSON response, and delivers
-/// the `BrokerResult` back through the `reply` oneshot.
+/// `OneShot` covers all ops except `GuestSocat`: the connection task writes
+/// the request, records it as in-flight under its `request_id`, and delivers
+/// the `BrokerResult` through the `reply` oneshot when the matching response
+/// arrives. It does not wait for that response before taking the next work
+/// item.
 ///
 /// `TakeStream` is the multiplexed `GuestSocat` path:
-///   1. The connection task generates a cryptographically random token.
-///   2. It sends `GuestSocat { stream_token: Some(token) }` on the control
-///      connection and registers a pending stream entry.
-///   3. It reads `StreamReady { token }` from the agent on the control
-///      connection (control connection is NOT consumed).
-///   4. It awaits the agent's dedicated stream connection, which arrives
-///      through the `PendingStreamRegistry` when the agent connects with
-///      `STREAM_CONNECT:<token>\n`.
+///   1. The caller generates a cryptographically random token and registers a
+///      pending stream entry before queueing the work item.
+///   2. The connection task writes `GuestSocat { stream_token: Some(token) }`
+///      and records the op as in-flight — like a `OneShot`, and just as
+///      briefly. The control connection is neither consumed nor blocked.
+///   3. When `StreamReady { token }` arrives it is routed by `request_id` and
+///      fires `ack_tx`, releasing the caller.
+///   4. The caller awaits the agent's dedicated stream connection, which
+///      arrives through the `PendingStreamRegistry` when the agent connects
+///      with `STREAM_CONNECT:<token>\n`.
 ///   5. The stream (with any buffered prefix bytes prepended) is delivered to
 ///      the caller via `stream_tx` as a boxed `AsyncReadWrite`.
 ///
-/// The control connection remains live throughout; the agent reconnect gap
-/// that caused B7 is eliminated.
+/// The control connection remains live throughout, and an agent that is slow
+/// to acknowledge step 3 delays only its own op.
 pub enum PendingRequest {
     /// A one-shot op: serialize, send, await response, deliver via `reply`.
     OneShot {
         request: BrokerRequest,
         reply: tokio::sync::oneshot::Sender<BrokerResult>,
     },
-    /// Open a multiplexed `GuestSocat` stream: send request with correlation
-    /// token, await `StreamReady` on the control connection, then signal `ack_tx`
-    /// so the caller can proceed to await the incoming stream connection.
+    /// Open a multiplexed `GuestSocat` stream: send the request with its
+    /// correlation token, then signal `ack_tx` when `StreamReady` is routed
+    /// back, so the caller can proceed to await the incoming stream
+    /// connection.
     ///
-    /// The control connection continues serving further ops after `StreamReady`.
+    /// The control connection continues serving further ops for the whole of
+    /// that window, not merely after it.
     TakeStream {
         request: BrokerRequest,
         /// Fired once `StreamReady` is received (or with `Err` on protocol failure).
@@ -778,16 +823,20 @@ impl AgentRegistry {
     /// Multiplexed protocol:
     ///   1. Generates a cryptographically random 256-bit token.
     ///   2. Registers a pending stream entry in `pending_streams`.
-    ///   3. Sends `GuestSocat { stream_token: Some(token) }` to the agent on
-    ///      the control connection (control connection is NOT consumed).
-    ///   4. Awaits `StreamReady { token }` from the agent on the control connection.
+    ///   3. Queues `GuestSocat { stream_token: Some(token) }` for the agent's
+    ///      control connection (which is neither consumed nor blocked by it).
+    ///   4. Awaits the `StreamReady { token }` acknowledgement, which the
+    ///      connection task routes back by `request_id`. The wait happens
+    ///      here, in the calling task — the control connection goes on
+    ///      serving other ops throughout, and an agent that never
+    ///      acknowledges fails this op alone, at its own deadline.
     ///   5. Awaits the agent's dedicated stream connection (arrives via
     ///      `PendingStreamRegistry` when the agent connects with
     ///      `STREAM_CONNECT:<token>\n`).
     ///   6. Returns the stream (with any buffered prefix preserved) as `AsyncReadWrite`.
     ///
     /// Returns `Err` if no agent is checked in, if the stream handoff fails,
-    /// or if the pending stream times out.
+    /// or if either wait times out.
     pub async fn take_stream_for_guest_socat(
         &self,
         uid: u32,
@@ -834,9 +883,13 @@ impl AgentRegistry {
             agent_not_running_error(uid)
         })?;
 
-        // Await StreamReady acknowledgement from the control-connection task.
-        // The task fires ack_tx after the agent sends `StreamReady` on the control
-        // connection. If the agent or connection drops, ack_rx gets a RecvError.
+        // Await the StreamReady acknowledgement. The connection task fires
+        // ack_tx when the agent's `StreamReady` is routed back by request_id,
+        // or with an error if the agent rejects the op or lets its budget
+        // expire. If the agent or connection drops, ack_rx gets a RecvError.
+        // The wait is bounded by the connection task's per-op deadline, so it
+        // resolves either way — this is the calling task, not the control
+        // loop, and nothing else is queued behind it.
         match ack_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(reason)) => {
@@ -1355,6 +1408,130 @@ async fn classify_and_dispatch_connection(
         warn!(uid, frame = %trimmed, "broker: unknown first frame on authenticated connection; closing");
     }
 }
+/// One op the daemon has written to the agent and not yet resolved.
+struct InFlightOp {
+    /// Where the result goes when the matching response arrives.
+    reply: InFlightReply,
+    /// Absolute deadline after which the op is abandoned, or `None` for ops
+    /// the daemon does not time out.
+    ///
+    /// One-shots carry `None` deliberately: a `limactl create`/`start` legitimately
+    /// runs for minutes, the agent keeps the connection alive with heartbeats
+    /// throughout, and the daemon has no better estimate of how long the op
+    /// should take than the caller that issued it. Stream opens carry a
+    /// deadline because a stream open is an acknowledgement, not work — an
+    /// agent that has not acknowledged within the budget is not going to.
+    deadline: Option<tokio::time::Instant>,
+}
+
+/// The waiting side of an in-flight op.
+enum InFlightReply {
+    /// A one-shot op: the `BrokerResult` goes straight to the caller.
+    OneShot(tokio::sync::oneshot::Sender<BrokerResult>),
+    /// A multiplexed stream open: the caller is waiting to hear that the agent
+    /// acknowledged, so it can go on to await the stream connection itself.
+    StreamOpen(tokio::sync::oneshot::Sender<Result<(), String>>),
+}
+
+impl InFlightReply {
+    /// Deliver a failure to whichever kind of waiter this is.
+    fn fail(self, reason: String) {
+        match self {
+            InFlightReply::OneShot(tx) => {
+                let _ = tx.send(BrokerResult::Rejected { reason });
+            }
+            InFlightReply::StreamOpen(tx) => {
+                let _ = tx.send(Err(reason));
+            }
+        }
+    }
+}
+
+/// A frame read from the agent, or the reason there will not be another one.
+enum AgentEvent {
+    /// One complete newline-delimited frame, newline included.
+    Frame(String),
+    /// The agent closed its end.
+    Eof,
+    /// The read failed.
+    ReadError(String),
+}
+
+/// Read newline-delimited frames from the agent and forward them on a channel.
+///
+/// The read lives in its own task rather than in the connection task's
+/// `select!` for one reason: `read_line` is not cancellation-safe, and the
+/// connection task's `select!` has other branches that can win the race. A
+/// cancelled `read_line` can lose a partially-read frame, which on a
+/// newline-delimited JSON channel means the *next* frame is a fragment. That
+/// race was survivable when the loop only raced reads against a request
+/// channel it stopped polling whenever an op was outstanding; with ops
+/// pipelined, the request branch is live continuously and the race would be
+/// permanent. `mpsc::Receiver::recv` is cancellation-safe, so moving the read
+/// here makes the whole `select!` safe by construction.
+///
+/// The task ends when the agent closes, when a read fails, or when the
+/// connection task drops the receiver — and is aborted outright if the
+/// connection task exits while it is parked in `read_line`.
+fn spawn_frame_reader(
+    reader: tokio::net::unix::OwnedReadHalf,
+    tx: tokio::sync::mpsc::Sender<AgentEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf_reader = BufReader::new(reader);
+        loop {
+            let mut line = String::new();
+            let event = match buf_reader.read_line(&mut line).await {
+                Ok(0) => AgentEvent::Eof,
+                Ok(_) => AgentEvent::Frame(line),
+                Err(e) => AgentEvent::ReadError(e.to_string()),
+            };
+            let terminal = !matches!(event, AgentEvent::Frame(_));
+            if tx.send(event).await.is_err() || terminal {
+                return;
+            }
+        }
+    })
+}
+
+/// Fail every in-flight op whose deadline has passed, and report when the
+/// earliest remaining deadline falls due.
+fn expire_in_flight(
+    uid: u32,
+    inflight: &mut HashMap<u64, InFlightOp>,
+    now: tokio::time::Instant,
+    budget: Duration,
+) -> Option<tokio::time::Instant> {
+    let expired: Vec<u64> = inflight
+        .iter()
+        .filter(|(_, op)| op.deadline.is_some_and(|d| d <= now))
+        .map(|(id, _)| *id)
+        .collect();
+    for request_id in expired {
+        if let Some(op) = inflight.remove(&request_id) {
+            warn!(
+                uid,
+                request_id,
+                budget_secs = budget.as_secs(),
+                "op exceeded its deadline; failing that op — \
+                 the control connection and every other op are unaffected"
+            );
+            // Phrased for whoever is waiting: only stream opens carry a
+            // deadline today, but the wording follows the reply kind so a
+            // future deadline on another op shape cannot make it wrong.
+            let reason = match &op.reply {
+                InFlightReply::StreamOpen(_) => format!(
+                    "the session agent did not acknowledge the stream open within {budget:?}"
+                ),
+                InFlightReply::OneShot(_) => {
+                    format!("the session agent did not answer within {budget:?}")
+                }
+            };
+            op.reply.fail(reason);
+        }
+    }
+    inflight.values().filter_map(|op| op.deadline).min()
+}
 
 /// Drive a single authenticated agent control connection.
 ///
@@ -1362,13 +1539,33 @@ async fn classify_and_dispatch_connection(
 /// handles all protocol traffic including heartbeats, one-shot ops, and the
 /// multiplexed `TakeStream` (GuestSocat) path.
 ///
-/// For `TakeStream`:
-///   1. Sends `GuestSocat { stream_token: Some(token) }` on the control connection.
-///   2. Awaits `StreamReady { token }` from the agent on the control connection.
-///   3. Awaits the agent's dedicated stream connection via `pending_streams`.
-///   4. Delivers the stream to the `stream_tx` caller.
+/// # Shape of the loop
+///
+/// Every iteration does at most one of three things: dispatch a queued work
+/// item, handle one frame from the agent, or notice that something timed out.
+/// None of them waits on the agent. An op is written, recorded in the
+/// in-flight map under its `request_id`, and left there; the loop goes
+/// straight back to serving the connection. That is what lets independent ops
+/// for one operator run concurrently, and it is what stops a slow or wedged
+/// op — including a stream open the agent never acknowledges — from taking
+/// the connection, and every other op on it, down with it.
+///
+/// For `TakeStream` specifically:
+///   1. Writes `GuestSocat { stream_token: Some(token) }` on the control
+///      connection and records the op as in-flight with a deadline.
+///   2. Routes `StreamReady { token }` back to the caller by `request_id`
+///      when it arrives.
+///   3. The *caller* awaits the agent's dedicated stream connection via
+///      `pending_streams`; the connection task is not involved.
 ///
 /// The control connection is NEVER consumed by a GuestSocat op.
+///
+/// # Liveness
+///
+/// The agent is expected to produce a frame — a heartbeat if nothing else —
+/// within `heartbeat`. The timer runs from the last frame *received*, so a
+/// silent agent is dropped even while the daemon is busy writing requests to
+/// it.
 async fn drive_agent_connection_outer(
     uid: u32,
     generation: u64,
@@ -1379,178 +1576,150 @@ async fn drive_agent_connection_outer(
     heartbeat: Duration,
 ) {
     let (reader_half, writer_half) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader_half);
     let mut writer = writer_half;
-    let mut line = String::new();
     let mut evict_rx = evict_rx;
-    // Carries `(expected_request_id, reply_sender)` while a one-shot is in flight.
-    // The request_id is echoed by the agent and validated on response to catch
-    // protocol version skew or buggy agent implementations.
-    let mut outstanding: Option<(u64, tokio::sync::oneshot::Sender<BrokerResult>)> = None;
+
+    // Depth is irrelevant to correctness — the reader task blocks on `send`
+    // when the connection task is behind, which is exactly the backpressure a
+    // socket would apply anyway.
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+    let reader_task = spawn_frame_reader(reader_half, frame_tx);
+
+    // Ops written to the agent and not yet resolved, keyed by `request_id`.
+    let mut inflight: HashMap<u64, InFlightOp> = HashMap::new();
+    // When the agent last proved it was alive.
+    let mut last_frame_at = tokio::time::Instant::now();
 
     'outer: loop {
-        line.clear();
+        let now = tokio::time::Instant::now();
+        let next_op_deadline = expire_in_flight(uid, &mut inflight, now, heartbeat);
+        let liveness_deadline = last_frame_at + heartbeat;
+        let wake_at = match next_op_deadline {
+            Some(d) => d.min(liveness_deadline),
+            None => liveness_deadline,
+        };
 
-        if outstanding.is_none() {
-            tokio::select! {
-                _ = &mut evict_rx => {
-                    info!(uid, "agent connection evicted by newer check-in; closing");
+        tokio::select! {
+            _ = &mut evict_rx => {
+                info!(uid, "agent connection evicted by newer check-in; closing");
+                break 'outer;
+            }
+
+            // Stop taking new work at the in-flight cap; the queue in front of
+            // this branch, and then the caller, absorb the rest.
+            maybe_req = req_rx.recv(), if inflight.len() < MAX_IN_FLIGHT_OPS => {
+                let Some(pending) = maybe_req else {
+                    info!(uid, "request channel closed; exiting connection task");
+                    break 'outer;
+                };
+
+                // Both arms follow the same shape: serialize, write, record.
+                // A serialization failure is the daemon's own bug about one op
+                // and fails only that op; a write failure means the connection
+                // is gone and ends the task.
+                //
+                // The write itself is still awaited here, so an agent that
+                // stops reading its socket entirely can stall dispatch for as
+                // long as its receive buffer stays full. That is unchanged
+                // from before ops were pipelined and is a different failure
+                // from a slow *response*: it means the agent is no longer
+                // servicing its connection at all.
+                let (request, reply): (BrokerRequest, InFlightReply) = match pending {
+                    PendingRequest::OneShot { request, reply } =>
+                        (request, InFlightReply::OneShot(reply)),
+                    PendingRequest::TakeStream { request, ack_tx } =>
+                        (request, InFlightReply::StreamOpen(ack_tx)),
+                };
+                let request_id = request.request_id;
+                // A stream open is an acknowledgement, not work: budget it. The
+                // budget matches the heartbeat interval, which is what bounded
+                // this wait before it moved off the loop — the timing envelope
+                // is unchanged; what changed is that exhausting it now costs
+                // one op instead of the connection.
+                let deadline = matches!(reply, InFlightReply::StreamOpen(_))
+                    .then(|| tokio::time::Instant::now() + heartbeat);
+
+                let json = match serde_json::to_string(&request) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        warn!(uid, request_id, error = %e, "failed to serialize BrokerRequest");
+                        reply.fail(format!("internal: serialize error: {e}"));
+                        continue 'outer;
+                    }
+                };
+                if writer.write_all(json.as_bytes()).await.is_err()
+                    || writer.write_all(b"\n").await.is_err()
+                {
+                    warn!(uid, request_id, "write error sending BrokerRequest; closing");
+                    reply.fail("broker connection write error".to_string());
                     break 'outer;
                 }
 
-                maybe_req = req_rx.recv() => {
-                    let Some(pending) = maybe_req else {
-                        info!(uid, "request channel closed; exiting connection task");
-                        break 'outer;
-                    };
-                    match pending {
-                        PendingRequest::TakeStream { request, ack_tx } => {
-                            // Multiplexed GuestSocat path:
-                            // 1. Send the GuestSocat request (with token) on the control connection.
-                            // 2. Await StreamReady from the agent on the control connection.
-                            // 3. Fire ack_tx to unblock the caller.
-                            // 4. Continue the control loop — do NOT consume this connection.
-                            let json = match serde_json::to_string(&request) {
-                                Ok(j) => j,
-                                Err(e) => {
-                                    warn!(uid, error = %e, "failed to serialize GuestSocat request");
-                                    let _ = ack_tx.send(Err(format!("serialize error: {e}")));
-                                    break 'outer;
-                                }
-                            };
-                            if writer.write_all(json.as_bytes()).await.is_err()
-                                || writer.write_all(b"\n").await.is_err()
-                            {
-                                warn!(uid, "write error sending GuestSocat request; closing");
-                                let _ = ack_tx.send(Err("write error on control connection".to_string()));
-                                break 'outer;
-                            }
-
-                            // Read StreamReady (or Rejected) from the agent.
-                            //
-                            // The agent's heartbeat runs on its own timer and is
-                            // written unconditionally, so a `PING` can arrive in
-                            // the window between the request above and the reply.
-                            // Absorb control frames and keep waiting rather than
-                            // feeding them to the response parser.
-                            //
-                            // The budget is an absolute deadline computed once,
-                            // not a per-read timeout: a chatty or hostile agent
-                            // must not be able to extend the wait indefinitely by
-                            // emitting frames. Total time spent here is bounded by
-                            // `heartbeat` regardless of how many frames arrive.
-                            let deadline = tokio::time::Instant::now() + heartbeat;
-                            let response: BrokerResponse = loop {
-                                line.clear();
-                                let read_result = tokio::time::timeout_at(
-                                    deadline,
-                                    buf_reader.read_line(&mut line),
-                                )
-                                .await;
-
-                                match read_result {
-                                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => {
-                                        warn!(uid, "no StreamReady from agent; closing connection");
-                                        let _ = ack_tx.send(Err("no StreamReady received from agent".to_string()));
-                                        break 'outer;
-                                    }
-                                    Ok(Ok(_)) => {}
-                                }
-
-                                let trimmed = line.trim_end_matches(['\n', '\r']);
-                                match classify_agent_frame(trimmed) {
-                                    AgentFrame::Ping => {
-                                        if let Err(e) = writer.write_all(b"PONG\n").await {
-                                            warn!(uid, error = %e, "failed to write PONG while awaiting StreamReady; closing");
-                                            let _ = ack_tx.send(Err("write error on control connection".to_string()));
-                                            break 'outer;
-                                        }
-                                    }
-                                    AgentFrame::Pong | AgentFrame::CheckIn => {}
-                                    AgentFrame::Unknown => {
-                                        if !trimmed.is_empty() {
-                                            warn!(uid, frame = %trimmed, "unexpected frame while awaiting StreamReady; ignoring");
-                                        }
-                                    }
-                                    AgentFrame::Response(response) => break response,
-                                    AgentFrame::MalformedResponse(e) => {
-                                        warn!(uid, error = %e, "failed to parse GuestSocat response; closing");
-                                        let _ = ack_tx.send(Err(format!("parse error: {e}")));
-                                        break 'outer;
-                                    }
-                                }
-                            };
-
-                            match response.result {
-                                BrokerResult::StreamReady { .. } => {
-                                    // Agent acknowledged; it will open the stream connection shortly.
-                                    // Signal the caller to proceed to await the stream.
-                                    let _ = ack_tx.send(Ok(()));
-                                    info!(uid, "GuestSocat StreamReady received; control connection continues");
-                                    // Fall through to continue 'outer — control connection stays alive.
-                                }
-                                BrokerResult::Rejected { ref reason } => {
-                                    let reason = reason.clone();
-                                    warn!(uid, reason, "GuestSocat request rejected by agent");
-                                    let _ = ack_tx.send(Err(format!("agent rejected: {reason}")));
-                                    // Don't break — a rejected GuestSocat is not a protocol error.
-                                    // The control connection remains valid.
-                                }
-                                other => {
-                                    warn!(uid, result = ?other, "unexpected GuestSocat response; closing");
-                                    let _ = ack_tx.send(Err(format!("unexpected response: {other:?}")));
-                                    break 'outer;
-                                }
-                            }
-                        }
-
-                        PendingRequest::OneShot { request, reply } => {
-                            let request_id = request.request_id;
-                            let json = match serde_json::to_string(&request) {
-                                Ok(j) => j,
-                                Err(e) => {
-                                    warn!(uid, error = %e, "failed to serialize BrokerRequest");
-                                    let _ = reply.send(BrokerResult::Rejected {
-                                        reason: format!("internal: serialize error: {e}"),
-                                    });
-                                    continue 'outer;
-                                }
-                            };
-                            if writer.write_all(json.as_bytes()).await.is_err()
-                                || writer.write_all(b"\n").await.is_err()
-                            {
-                                warn!(uid, "write error sending BrokerRequest; closing");
-                                let _ = reply.send(BrokerResult::Rejected {
-                                    reason: "broker connection write error".to_string(),
-                                });
-                                break 'outer;
-                            }
-                            outstanding = Some((request_id, reply));
-                        }
-                    }
-                }
-
-                result = tokio::time::timeout(heartbeat, buf_reader.read_line(&mut line)) => {
-                    if !process_agent_line(uid, result, &line, &mut writer, &mut outstanding).await {
-                        break 'outer;
-                    }
+                if let Some(displaced) = inflight.insert(request_id, InFlightOp { reply, deadline }) {
+                    // request_ids come from a monotonic counter, so this is a
+                    // daemon bug rather than anything the agent can cause.
+                    warn!(uid, request_id, "request_id reused while still in flight; failing the older op");
+                    displaced.reply.fail(
+                        "internal: request_id reused by the daemon while the op was in flight".to_string(),
+                    );
                 }
             }
-        } else {
-            // A one-shot request is in flight — wait only for the agent response or eviction.
-            tokio::select! {
-                _ = &mut evict_rx => {
-                    info!(uid, "agent connection evicted while awaiting response; closing");
-                    break 'outer;
-                }
-                result = tokio::time::timeout(heartbeat, buf_reader.read_line(&mut line)) => {
-                    if !process_agent_line(uid, result, &line, &mut writer, &mut outstanding).await {
+
+            event = tokio::time::timeout_at(wake_at, frame_rx.recv()) => {
+                match event {
+                    Err(_elapsed) => {
+                        if tokio::time::Instant::now() >= liveness_deadline {
+                            warn!(
+                                uid,
+                                timeout_secs = heartbeat.as_secs(),
+                                in_flight = inflight.len(),
+                                "no heartbeat received within timeout; dropping dead agent"
+                            );
+                            break 'outer;
+                        }
+                        // An op deadline came due first; the next iteration
+                        // expires it and keeps the connection.
+                        continue 'outer;
+                    }
+                    Ok(None) => {
+                        info!(uid, "agent frame reader ended; closing connection");
                         break 'outer;
+                    }
+                    Ok(Some(AgentEvent::Eof)) => {
+                        info!(uid, "agent connection closed cleanly");
+                        break 'outer;
+                    }
+                    Ok(Some(AgentEvent::ReadError(e))) => {
+                        warn!(uid, error = %e, "read error on broker connection; dropping");
+                        break 'outer;
+                    }
+                    Ok(Some(AgentEvent::Frame(line))) => {
+                        last_frame_at = tokio::time::Instant::now();
+                        if !process_agent_frame(uid, &line, &mut writer, &mut inflight).await {
+                            break 'outer;
+                        }
                     }
                 }
             }
         }
     }
+
+    // Aborting is what closes the read half: the reader task is parked in
+    // `read_line` and would otherwise hold the fd open until the agent
+    // noticed our write half was gone.
+    reader_task.abort();
+
+    // Dropping the map drops every waiting sender, which each caller sees as
+    // "the agent dropped before responding" — the same outcome as before,
+    // now reported for however many ops were outstanding.
+    if !inflight.is_empty() {
+        warn!(
+            uid,
+            in_flight = inflight.len(),
+            "control connection ended with ops outstanding; failing them"
+        );
+    }
+    drop(inflight);
 
     registry.remove(uid, generation).await;
     info!(uid, "agent connection task exited");
@@ -1595,84 +1764,100 @@ fn classify_agent_frame(trimmed: &str) -> AgentFrame {
     }
 }
 
-/// Process a line read from the agent on the broker connection.
+/// Handle one frame read from the agent on the broker connection.
 ///
 /// Returns `true` to continue the outer loop, `false` to break.
-async fn process_agent_line(
+///
+/// # Why a stray response no longer closes the connection
+///
+/// Correlation is by `request_id` against the in-flight map, so a response
+/// carrying an id the daemon is not waiting for cannot be delivered to
+/// anybody — that much is unchanged, and it is the property that matters.
+/// What changed is the reaction: it is logged and dropped rather than closing
+/// the connection. With ops pipelined, closing would punish every *other*
+/// op the operator has in flight for one stray frame, and an id the daemon
+/// has already abandoned (a stream open that hit its deadline, whose response
+/// then arrives late) is now a reachable, legitimate cause of one.
+async fn process_agent_frame(
     uid: u32,
-    result: Result<std::io::Result<usize>, tokio::time::error::Elapsed>,
     line: &str,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
-    outstanding: &mut Option<(u64, tokio::sync::oneshot::Sender<BrokerResult>)>,
+    inflight: &mut HashMap<u64, InFlightOp>,
 ) -> bool {
-    match result {
-        Err(_elapsed) => {
-            warn!(
-                uid,
-                timeout_secs = heartbeat_timeout().as_secs(),
-                "no heartbeat received within timeout; dropping dead agent"
-            );
-            false
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    match classify_agent_frame(trimmed) {
+        AgentFrame::CheckIn => {
+            info!(uid, "agent check-in frame received");
+            true
         }
-        Ok(Ok(0)) => {
-            info!(uid, "agent connection closed cleanly");
-            false
+        AgentFrame::Ping => {
+            if let Err(e) = writer.write_all(b"PONG\n").await {
+                warn!(uid, error = %e, "failed to write PONG; dropping connection");
+                return false;
+            }
+            true
         }
-        Ok(Ok(_)) => {
-            let trimmed = line.trim_end_matches(['\n', '\r']);
-            match classify_agent_frame(trimmed) {
-                AgentFrame::CheckIn => {
-                    info!(uid, "agent check-in frame received");
-                    true
-                }
-                AgentFrame::Ping => {
-                    if let Err(e) = writer.write_all(b"PONG\n").await {
-                        warn!(uid, error = %e, "failed to write PONG; dropping connection");
-                        return false;
-                    }
-                    true
-                }
-                AgentFrame::Pong => true,
-                AgentFrame::Response(response) => {
-                    if let Some((expected_id, reply_tx)) = outstanding.take() {
-                        if response.request_id != expected_id {
-                            warn!(
-                                uid,
-                                expected = expected_id,
-                                got = response.request_id,
-                                "BrokerResponse request_id mismatch; \
-                                 closing connection (agent protocol error)"
-                            );
-                            // Drop reply_tx without sending — the caller
-                            // gets a RecvError mapped to "agent dropped".
-                            return false;
-                        }
-                        let _ = reply_tx.send(response.result);
-                    } else {
-                        warn!(
-                            uid,
-                            request_id = response.request_id,
-                            "received unsolicited BrokerResponse; ignoring"
-                        );
-                    }
-                    true
-                }
-                AgentFrame::MalformedResponse(e) => {
-                    warn!(uid, error = %e, frame = %trimmed, "failed to parse BrokerResponse");
-                    true
-                }
-                AgentFrame::Unknown => {
-                    if !trimmed.is_empty() {
-                        warn!(uid, frame = %trimmed, "unexpected frame on broker channel; ignoring");
-                    }
-                    true
+        AgentFrame::Pong => true,
+        AgentFrame::Response(response) => {
+            let request_id = response.request_id;
+            match inflight.remove(&request_id) {
+                Some(op) => deliver_response(uid, request_id, response.result, op.reply),
+                None => {
+                    warn!(
+                        uid,
+                        request_id,
+                        "BrokerResponse for an op that is not in flight; ignoring \
+                         (late, duplicate, or an agent protocol error)"
+                    );
                 }
             }
+            true
         }
-        Ok(Err(e)) => {
-            warn!(uid, error = %e, "read error on broker connection; dropping");
-            false
+        AgentFrame::MalformedResponse(e) => {
+            warn!(uid, error = %e, frame = %trimmed, "failed to parse BrokerResponse");
+            true
         }
+        AgentFrame::Unknown => {
+            if !trimmed.is_empty() {
+                warn!(uid, frame = %trimmed, "unexpected frame on broker channel; ignoring");
+            }
+            true
+        }
+    }
+}
+
+/// Hand one `BrokerResult` to the op that was waiting for it.
+///
+/// A one-shot takes any result verbatim — including `Failed` and `Rejected`,
+/// which are outcomes the caller interprets, not transport errors. A stream
+/// open only accepts `StreamReady`: anything else means no stream is coming,
+/// so the op fails and the caller stops waiting. Neither case affects the
+/// connection.
+fn deliver_response(uid: u32, request_id: u64, result: BrokerResult, reply: InFlightReply) {
+    match reply {
+        InFlightReply::OneShot(tx) => {
+            let _ = tx.send(result);
+        }
+        InFlightReply::StreamOpen(ack_tx) => match result {
+            BrokerResult::StreamReady { .. } => {
+                info!(
+                    uid,
+                    request_id, "GuestSocat StreamReady received; awaiting the stream connection"
+                );
+                let _ = ack_tx.send(Ok(()));
+            }
+            BrokerResult::Rejected { reason } => {
+                warn!(
+                    uid,
+                    request_id, reason, "GuestSocat request rejected by agent"
+                );
+                let _ = ack_tx.send(Err(format!("agent rejected: {reason}")));
+            }
+            other => {
+                warn!(uid, request_id, result = ?other, "unexpected GuestSocat response");
+                let _ = ack_tx.send(Err(format!("unexpected response: {other:?}")));
+            }
+        },
     }
 }
 
@@ -2955,6 +3140,327 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Pipelining: concurrency between independent ops, order within a
+    // dependent sequence, and the cost of an op that never answers
+    // -----------------------------------------------------------------------
+
+    /// Read the next `BrokerRequest` the daemon writes, skipping the control
+    /// frames (`PONG`) that share the connection.
+    async fn next_request(
+        agent_read: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        what: &str,
+    ) -> sandbox_agent_protocol::BrokerRequest {
+        use tokio::io::AsyncBufReadExt;
+
+        loop {
+            let mut line = String::new();
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), agent_read.read_line(&mut line))
+                    .await
+                    .unwrap_or_else(|_| panic!("{what}: request must reach the agent"))
+                    .unwrap_or_else(|e| panic!("{what}: control connection must be readable: {e}"));
+            assert_ne!(read, 0, "{what}: the daemon closed the control connection");
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            return serde_json::from_str(trimmed)
+                .unwrap_or_else(|e| panic!("{what}: unparsable request {trimmed:?}: {e}"));
+        }
+    }
+
+    /// The agent side's write half, shared the way the real agent shares its
+    /// own: a heartbeat task and the op-answering path both write through one
+    /// lock, so frames never interleave mid-write.
+    type SharedAgentWriter = Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>;
+
+    /// Write one `BrokerResponse` frame from the agent side.
+    async fn write_response(
+        agent_write: &SharedAgentWriter,
+        request_id: u64,
+        result: BrokerResult,
+    ) {
+        use tokio::io::AsyncWriteExt;
+
+        let encoded = serde_json::to_string(&BrokerResponse { request_id, result }).unwrap();
+        let mut w = agent_write.lock().await;
+        w.write_all(encoded.as_bytes()).await.unwrap();
+        w.write_all(b"\n").await.unwrap();
+    }
+
+    fn list_json_op(uid: u32, request_id: u64) -> sandbox_agent_protocol::BrokerRequest {
+        sandbox_agent_protocol::BrokerRequest {
+            request_id,
+            op: sandbox_agent_protocol::BrokerOp::ListJson { op_uid: uid },
+        }
+    }
+
+    fn ok_result(stdout: &str) -> BrokerResult {
+        BrokerResult::Ok {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        }
+    }
+
+    /// Two independent ops for one operator must be on the wire together.
+    ///
+    /// The agent here answers nothing until it has read *both* requests, so
+    /// the test cannot pass unless the daemon dispatched the second without
+    /// waiting for the first — the definition of pipelining, and the property
+    /// the brokered control plane needs when a session action costs many ops.
+    /// It then answers in reverse order, because response order carries no
+    /// meaning: each caller must receive its own op's result.
+    #[tokio::test]
+    async fn independent_ops_for_one_operator_complete_concurrently() {
+        const UID: u32 = 4244;
+
+        let (agent_side, registry, _pending) =
+            spawn_control_connection(UID, Duration::from_secs(10)).await;
+        let (agent_read, agent_write) = agent_side.into_split();
+        let agent_write: SharedAgentWriter = Arc::new(Mutex::new(agent_write));
+        let mut agent_read = tokio::io::BufReader::new(agent_read);
+
+        let first = {
+            let reg = registry.clone();
+            tokio::spawn(async move { reg.send_op(UID, list_json_op(UID, 1)).await })
+        };
+        let second = {
+            let reg = registry.clone();
+            tokio::spawn(async move { reg.send_op(UID, list_json_op(UID, 2)).await })
+        };
+
+        // Both requests reach the agent before either is answered. The two
+        // callers race to enqueue, so identify them by id rather than order.
+        let a = next_request(&mut agent_read, "first request").await;
+        let b = next_request(&mut agent_read, "second request").await;
+        let mut ids = [a.request_id, b.request_id];
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [1, 2],
+            "both independent ops must be in flight at once, not queued behind one another"
+        );
+
+        // Answer out of order; correlation is by request_id alone.
+        write_response(&agent_write, 2, ok_result("second")).await;
+        write_response(&agent_write, 1, ok_result("first")).await;
+
+        for (task, expected, label) in [(first, "first", "op 1"), (second, "second", "op 2")] {
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap_or_else(|_| panic!("{label} must complete"))
+                .expect("caller task must not panic")
+                .unwrap_or_else(|e| panic!("{label} must succeed: {e}"));
+            match result {
+                BrokerResult::Ok { stdout, .. } => assert_eq!(
+                    stdout, expected,
+                    "{label} must receive its own result, not another op's"
+                ),
+                other => panic!("{label}: expected Ok, got {other:?}"),
+            }
+        }
+    }
+
+    /// A dependent sequence still runs in order — because the caller awaits.
+    ///
+    /// Pipelining adds concurrency only between calls that were already
+    /// independent. A caller that issues `create` and then `start` awaits the
+    /// first response before issuing the second, so the second request is not
+    /// even written until the first has been answered. This test asserts that
+    /// directly: nothing arrives on the wire during the gap.
+    #[tokio::test]
+    async fn dependent_sequence_still_completes_in_order() {
+        use tokio::io::AsyncBufReadExt;
+
+        const UID: u32 = 4245;
+
+        let (agent_side, registry, _pending) =
+            spawn_control_connection(UID, Duration::from_secs(10)).await;
+        let (agent_read, agent_write) = agent_side.into_split();
+        let agent_write: SharedAgentWriter = Arc::new(Mutex::new(agent_write));
+        let mut agent_read = tokio::io::BufReader::new(agent_read);
+
+        let caller = {
+            let reg = registry.clone();
+            tokio::spawn(async move {
+                let first = reg.send_op(UID, list_json_op(UID, 1)).await?;
+                // The dependency: the second op is only issued once the first
+                // has answered.
+                let second = reg.send_op(UID, list_json_op(UID, 2)).await?;
+                Ok::<_, String>((first, second))
+            })
+        };
+
+        let first = next_request(&mut agent_read, "first request").await;
+        assert_eq!(first.request_id, 1, "the first op must be sent first");
+
+        // While the first op is unanswered, the second must not appear.
+        let mut idle = String::new();
+        let quiet =
+            tokio::time::timeout(Duration::from_millis(300), agent_read.read_line(&mut idle)).await;
+        assert!(
+            quiet.is_err(),
+            "the dependent second op must not be sent before the first is answered; \
+             got {idle:?}"
+        );
+
+        write_response(&agent_write, 1, ok_result("first")).await;
+
+        let second = next_request(&mut agent_read, "second request").await;
+        assert_eq!(
+            second.request_id, 2,
+            "the second op must follow the first, in order"
+        );
+        write_response(&agent_write, 2, ok_result("second")).await;
+
+        let (a, b) = tokio::time::timeout(Duration::from_secs(5), caller)
+            .await
+            .expect("the sequence must complete")
+            .expect("caller task must not panic")
+            .expect("both ops must succeed");
+        match (a, b) {
+            (BrokerResult::Ok { stdout: a, .. }, BrokerResult::Ok { stdout: b, .. }) => {
+                assert_eq!((a.as_str(), b.as_str()), ("first", "second"));
+            }
+            other => panic!("expected two Ok results, got {other:?}"),
+        }
+    }
+
+    /// A stream open the agent never acknowledges costs that op and nothing
+    /// else.
+    ///
+    /// This is the wedge the multiplexed stream path used to have: the open
+    /// was awaited inline on the control loop, so until it timed out no other
+    /// op for that operator was dispatched, and when it did time out the loop
+    /// closed the connection — failing every op in flight and every op queued.
+    /// The lane now carries an entire container control plane plus one stream
+    /// open per DNS query, so the blast radius mattered more than the wait.
+    ///
+    /// Asserted here: an ordinary op dispatches and completes *while* the
+    /// stream open is outstanding, the stream open fails on its own deadline,
+    /// and the connection is still registered and still serving afterwards.
+    #[tokio::test]
+    async fn a_wedged_stream_open_does_not_fail_other_ops() {
+        const UID: u32 = 4246;
+        const BUDGET: Duration = Duration::from_millis(400);
+
+        let (agent_side, registry, pending_streams) = spawn_control_connection(UID, BUDGET).await;
+        let (agent_read, agent_write) = agent_side.into_split();
+        let agent_write: SharedAgentWriter = Arc::new(Mutex::new(agent_write));
+        let mut agent_read = tokio::io::BufReader::new(agent_read);
+
+        // Keep the connection's liveness timer fed for the whole test, as a
+        // real agent does. Without it the connection would be dropped as dead
+        // rather than surviving the wedged op, and the test would prove
+        // nothing — so the heartbeat must outlive the assertions, not stop
+        // just before them.
+        let pinger = {
+            let agent_write = Arc::clone(&agent_write);
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if agent_write.lock().await.write_all(b"PING\n").await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+
+        // The op that wedges: requested, acknowledged never.
+        let stream_task = {
+            let reg = registry.clone();
+            let pend = pending_streams.clone();
+            tokio::spawn(async move {
+                let request = sandbox_agent_protocol::BrokerRequest {
+                    request_id: 1,
+                    op: sandbox_agent_protocol::BrokerOp::GuestSocat {
+                        op_uid: UID,
+                        vm: "sandbox-test".to_string(),
+                        stream_token: None,
+                    },
+                };
+                reg.take_stream_for_guest_socat(UID, request, &pend).await
+            })
+        };
+        let opened = next_request(&mut agent_read, "stream open").await;
+        assert_eq!(opened.request_id, 1);
+
+        // An ordinary op, issued while the stream open is outstanding, must
+        // reach the agent — the loop is not parked on the stream open.
+        let started = tokio::time::Instant::now();
+        let one_shot = {
+            let reg = registry.clone();
+            tokio::spawn(async move { reg.send_op(UID, list_json_op(UID, 2)).await })
+        };
+        let queued = next_request(&mut agent_read, "op behind the wedged stream open").await;
+        assert_eq!(
+            queued.request_id, 2,
+            "an op issued while a stream open is outstanding must still be dispatched"
+        );
+        // Dispatched *while* it is outstanding — not after it expires. Waiting
+        // out the budget and then proceeding would satisfy the assertion above
+        // while leaving every queued op stalled for the whole wait, which is
+        // the behaviour this test exists to rule out.
+        assert!(
+            !stream_task.is_finished() && started.elapsed() < BUDGET / 2,
+            "the op must be dispatched while the stream open is still outstanding, \
+             not once its budget has expired; waited {:?} of a {BUDGET:?} budget",
+            started.elapsed()
+        );
+
+        write_response(&agent_write, 2, ok_result("served")).await;
+
+        let served = tokio::time::timeout(Duration::from_secs(5), one_shot)
+            .await
+            .expect("the ordinary op must complete")
+            .expect("caller task must not panic")
+            .expect("the ordinary op must not be failed by the wedged stream open");
+        match served {
+            BrokerResult::Ok { stdout, .. } => assert_eq!(stdout, "served"),
+            other => panic!("expected the op's own Ok result, got {other:?}"),
+        }
+
+        // The wedged op fails on its own deadline...
+        let wedged = tokio::time::timeout(Duration::from_secs(5), stream_task)
+            .await
+            .expect("the stream open must be bounded by its deadline")
+            .expect("caller task must not panic");
+        assert!(
+            wedged.is_err(),
+            "an unacknowledged stream open must not yield a stream"
+        );
+
+        // ...and the operator's connection is still there, still serving.
+        assert!(
+            registry.is_registered(UID).await,
+            "a wedged stream open must not tear down the operator's control connection"
+        );
+        let after = {
+            let reg = registry.clone();
+            tokio::spawn(async move { reg.send_op(UID, list_json_op(UID, 3)).await })
+        };
+        let next = next_request(&mut agent_read, "op after the wedge expired").await;
+        assert_eq!(
+            next.request_id, 3,
+            "the connection must keep dispatching after a stream open expires"
+        );
+        write_response(&agent_write, 3, ok_result("after")).await;
+        let after = tokio::time::timeout(Duration::from_secs(5), after)
+            .await
+            .expect("the following op must complete")
+            .expect("caller task must not panic")
+            .expect("the following op must succeed");
+        match after {
+            BrokerResult::Ok { stdout, .. } => assert_eq!(stdout, "after"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        pinger.abort();
+    }
+
+    // -----------------------------------------------------------------------
     // Socket bind tests
     // -----------------------------------------------------------------------
 
@@ -3636,15 +4142,19 @@ mod tests {
         }
     }
 
-    /// Verify that the connection is closed when the agent echoes a mismatched
-    /// request_id in its response.
+    /// A response carrying a request_id nobody is waiting for is discarded —
+    /// it reaches no caller, and it does not cost the connection.
     ///
-    /// A buggy or protocol-version-skewed agent that sends back a different
-    /// request_id should cause the connection task to close the connection,
-    /// not silently deliver the response to the caller.
+    /// A buggy or protocol-version-skewed agent must never have its answer
+    /// delivered to the wrong op; that is the property. Tearing the connection
+    /// down was how an earlier, strictly-sequential loop enforced it, and that
+    /// reaction does not survive pipelining: several of the operator's ops are
+    /// legitimately in flight, and an id the daemon has already abandoned is a
+    /// reachable cause of a stray frame. So the frame is dropped, the op stays
+    /// pending, and the connection goes on to answer it properly.
     #[cfg(feature = "test-env-override")]
     #[tokio::test]
-    async fn integration_request_id_mismatch_closes_connection() {
+    async fn integration_stray_request_id_is_discarded_without_closing_the_connection() {
         use sandbox_agent_protocol::{BrokerOp, BrokerRequest, BrokerResponse, BrokerResult};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -3698,11 +4208,11 @@ mod tests {
             .expect("agent request timeout")
             .expect("agent request read");
 
-        // Reply with request_id=0 (wrong — expected 99).
+        // Reply with request_id=0 (stray — the op in flight is 99).
         let bad_response = BrokerResponse {
             request_id: 0,
             result: BrokerResult::Ok {
-                stdout: "[]".to_string(),
+                stdout: "stray".to_string(),
                 stderr: String::new(),
                 exit_code: 0,
             },
@@ -3711,25 +4221,44 @@ mod tests {
         agent_writer.write_all(bad_json.as_bytes()).await.unwrap();
         agent_writer.write_all(b"\n").await.unwrap();
 
-        // The daemon task must receive an error (connection closed after
-        // the mismatch is detected), not the bogus Ok result.
+        // The stray frame must reach no caller: op 99 is still waiting.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !daemon_task.is_finished(),
+            "a response for an id nobody is waiting for must not complete another op"
+        );
+        assert!(
+            registry.is_registered(own_uid).await,
+            "a stray frame must not tear down the operator's control connection"
+        );
+
+        // ...and the connection is still usable: the real response completes
+        // the op that was pending all along.
+        let good_response = BrokerResponse {
+            request_id: 99,
+            result: BrokerResult::Ok {
+                stdout: "[]".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        };
+        let good_json = serde_json::to_string(&good_response).unwrap();
+        agent_writer.write_all(good_json.as_bytes()).await.unwrap();
+        agent_writer.write_all(b"\n").await.unwrap();
+
         let result = tokio::time::timeout(Duration::from_secs(5), daemon_task)
             .await
             .expect("daemon task timeout")
-            .expect("daemon task join");
+            .expect("daemon task join")
+            .expect("the correctly-correlated response must be delivered");
 
-        assert!(
-            result.is_err(),
-            "request_id mismatch must cause send_op to return Err, not Ok; got {result:?}"
-        );
-        let msg = result.unwrap_err();
-        // The error message may say "dropped" (connection closed) or "not running".
-        // Either is correct — the important property is that the bogus response
-        // was NOT delivered to the caller.
-        assert!(
-            msg.contains("dropped") || msg.contains("not running"),
-            "error must indicate connection closed or agent not running; got: {msg}"
-        );
+        match result {
+            BrokerResult::Ok { stdout, .. } => assert_eq!(
+                stdout, "[]",
+                "the caller must receive its own op's result, never the stray one"
+            ),
+            other => panic!("expected the op's own Ok result, got {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var(TEST_SANDBOX_GROUP_ENV);
