@@ -1057,6 +1057,29 @@ if [ -n "\$_all_ops" ]; then
     done
 fi
 
+# Per-operator vmnet slot groups, created by enrollment alongside the shared
+# group. Left behind they are worse than untidy: a later install finds a group
+# that already exists, skips creating it, and inherits whatever slot range the
+# stale record still names. Members are revoked before the group goes, in the
+# same order enrollment reversal requires everywhere else — revoke first, then
+# release the range.
+for _osg in \$(dscl . -list /Groups 2>/dev/null | grep '^_sandboxd-op-' || true); do
+    _osg_members=\$(dscl . -read "/Groups/\$_osg" GroupMembership 2>/dev/null \
+        | sed 's/^[^ ]*:[[:space:]]*//' | tr ' ' '\n' | awk 'NF' || true)
+    if [ -n "\$_osg_members" ]; then
+        printf '%s\n' "\$_osg_members" | while IFS= read -r _osg_op; do
+            [ -n "\$_osg_op" ] || continue
+            dseditgroup -o edit -d "\$_osg_op" -t user "\$_osg" >> "\$_LOG" 2>&1 || true
+        done
+    fi
+    dscl . -delete "/Groups/\$_osg" >> "\$_LOG" 2>&1 && _og_rc=0 || _og_rc=\$?
+    if [ "\$_og_rc" -eq 0 ]; then
+        _log "step=operator_slot_group_delete group=\$_osg action=remove"
+    else
+        _log "step=operator_slot_group_delete group=\$_osg action=fail rc=\$_og_rc"
+    fi
+done
+
 if dscl . -read /Groups/_sandboxd >/dev/null 2>&1; then
     dseditgroup -o delete _sandboxd >> "\$_LOG" 2>&1 && _gd_rc=0 || _gd_rc=\$?
     if [ "\$_gd_rc" -eq 0 ]; then

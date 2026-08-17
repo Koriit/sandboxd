@@ -165,6 +165,56 @@ def test_install_macos_fresh_then_doctor_passes(
         f"/var/run/sandbox/vmnet not _sandboxd:_sandboxd 0750: {dirstat.stdout!r}"
     )
 
+    # ---------------- per-operator vmnet slot group ----------------
+    #
+    # Every slot socket carries one group today and every operator is enrolled
+    # in it, so on a multi-operator host any of them can attach to any other's
+    # isolated segment. Enrollment therefore also creates a group scoped to
+    # this operator alone and records the slots they own.
+    #
+    # Asserted against the group the install actually created, via
+    # dseditgroup -o checkmember — not by reading the script, and not against
+    # Apple's reserved _sandbox (gid 60) or the shared _sandboxd group, neither
+    # of which would demonstrate anything about the partition.
+    op_group = "_sandboxd-op-admin"
+    assert vm.shell(f"dseditgroup -o checkmember -m admin {op_group}").returncode == 0, (
+        f"operator 'admin' is not a member of its own slot group {op_group}"
+    )
+    # The daemon account is in every per-operator group by design: the gateway
+    # VM runs as the daemon uid and holds a NIC on every slot, so a daemon
+    # outside one operator's group would fail limactl start at the first socket
+    # entry and no macOS session of any operator could be created or recovered.
+    assert vm.shell(f"dseditgroup -o checkmember -m _sandboxd {op_group}").returncode == 0, (
+        f"the daemon account is not a member of {op_group} — every operator's "
+        f"sessions break, not only the daemon's own"
+    )
+    # The per-operator group is a SECOND group. The shared one gates the daemon
+    # socket and owns the 0750 socket directory, so operators stay in it.
+    assert vm.shell("dseditgroup -o checkmember -m admin _sandboxd").returncode == 0, (
+        "operator 'admin' was moved out of the shared _sandboxd group; it is the "
+        "daemon-socket enrollment gate and the socket directory's owner"
+    )
+    assert vm.shell("dseditgroup -o checkmember -m admin _sandbox").returncode != 0, (
+        "operator 'admin' was enrolled in Apple's reserved _sandbox group (gid 60)"
+    )
+    # A single-operator install keeps the whole pool — partitioning a pool
+    # nobody else uses would be a straight concurrency regression.
+    slots = vm.shell(f"dscl . -read /Groups/{op_group} SandboxdSlots", check=True).stdout
+    assert slots.strip().endswith(f"0-{EXPECTED_VMNET_SLOTS - 1}"), (
+        f"expected the single operator to hold the whole pool, got: {slots!r}"
+    )
+    # Enforcement is not this phase's: the sockets keep the shared group until
+    # VM ownership moves, because until then the daemon's own gateway VM has to
+    # keep opening every slot.
+    for slot in range(EXPECTED_VMNET_SLOTS):
+        sock_grp = vm.shell(
+            f"sudo stat -f '%Sg' /var/run/sandbox/vmnet/slot-{slot}.sock", check=True
+        ).stdout.strip()
+        assert sock_grp == "_sandboxd", (
+            f"slot-{slot}.sock moved onto {sock_grp!r}; the socket group must stay "
+            f"shared until the gateway VM is operator-owned"
+        )
+
     # ---------------- users.conf created ----------------
     assert vm.shell("sudo test -f /etc/sandboxd/users.conf && echo OK").stdout.strip() == "OK", (
         "/etc/sandboxd/users.conf not created on the Darwin path"

@@ -1,7 +1,7 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-lf test-e2e-container test-e2e-matrix test-e2e-linux test-e2e-macos test-linux test-install-e2e test-install-e2e-lf test-install-e2e-quick gateway-image gateway-image-multiarch lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod install-agent-test setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
-	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-sandboxd-user setup-darwin-operator-group-membership \
+	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-sandboxd-user setup-darwin-operator-group-membership setup-darwin-operator-slot-group \
 	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
 	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image \
 	stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test \
@@ -744,7 +744,7 @@ endif
 endif
 
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
+setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-operator-slot-group setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -2113,6 +2113,50 @@ setup-darwin-operator-group-membership: setup-darwin-sandboxd-group
 	    exit 1; \
 	  }; \
 	  echo "$(GREEN)✓ added '$$USER' to group '$$_acct' — re-login required for the change to take effect in the current shell$(RESET)"; \
+	fi
+
+# setup-darwin-operator-slot-group — create the invoking developer's ($USER)
+# per-operator vmnet slot group and record the slot range they own.
+#
+# Every slot socket is guarded by one group and every operator is enrolled in
+# it, so on a host with two or more operators any of them can attach to any
+# other's isolated segment and become the next hop for that operator's sandbox
+# traffic. The per-operator group is what makes the partition real.
+#
+# This step does NOT move a socket or rewrite a plist. Until VM ownership moves
+# to the operator, the daemon's own gateway VM holds a NIC on every slot and
+# must keep opening all of them; pointing the sockets at per-operator groups now
+# would stop the only gateway VM there is. What lands here is the assignment and
+# the audit surface, not the kernel's access decision — so every host whose
+# sockets still carry the shared group keeps working exactly as it does today.
+#
+# A dev host has one operator, who therefore gets the whole pool: partitioning a
+# pool nobody else is using would be a straight concurrency regression. Enrolling
+# a second operator is deliberate, privileged work with an explicit range —
+# scripts/darwin-operator-group.sh, which is also where de-enrollment lives.
+#
+# Idempotence: the script's own; a second run is an all-skip no-op and takes no
+# sudo path it did not need.
+#
+# Depends on: setup-darwin-sandboxd-user (the daemon account joins the group)
+#             and setup-darwin-vmnet-plists (the pool size is read from them).
+setup-darwin-operator-slot-group: setup-darwin-sandboxd-user setup-darwin-vmnet-plists
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ already configured: setup-darwin-operator-slot-group skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	  $(call no_operator_identity,setup-darwin-operator-slot-group); \
+	fi
+	@_grp="_sandboxd-op-$$USER"; \
+	if dseditgroup -o checkmember -m "$$USER" "$$_grp" >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: operator '$$USER' is in slot group '$$_grp'$(RESET)"; \
+	else \
+	  echo "[sudo] scripts/darwin-operator-group.sh enroll --operator $$USER  (creates $$_grp; moves no socket)"; \
+	  sudo -k ./scripts/darwin-operator-group.sh enroll --operator "$$USER" || { \
+	    echo "ERROR: enrollment failed for operator '$$USER'."; \
+	    exit 1; \
+	  }; \
 	fi
 
 # setup-darwin-sandboxd-test-group — create the `_sandboxd-test` system group

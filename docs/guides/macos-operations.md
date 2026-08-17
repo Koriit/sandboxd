@@ -175,6 +175,167 @@ Step 5 is the part that matters. A repair that skips it has verified only that
 the plists were written, which is precisely the check that let the original
 failure through.
 
+## Per-operator vmnet slot groups
+
+A slot socket is the *entire* admission control for its L2 segment. Anything
+that can `connect(2)` to `slot-N.sock` becomes a peer on segment N — no VM and
+no cooperation from sandboxd required — and the sandbox VM on that segment
+points its default route at the gateway container's IP, so an ordinary
+same-segment peer can be believed as that next hop.
+
+That matters because the group in `--socket-group` is the whole check. With one
+group for every slot and every operator enrolled in it, **any enrolled operator
+can reach any other operator's segment**: the victim's traffic can be made to
+leave through the attacker's uplink instead of their gateway container, their
+egress policy is void and their TLS is terminated by the attacker, and the
+victim's session, the daemon and the deny-event stream all keep looking normal.
+Single-operator hosts are unaffected in practice.
+
+Enrollment therefore creates a group scoped to one operator and records the
+slots that operator owns:
+
+```bash
+# The whole pool, for the only operator on the host:
+sudo scripts/darwin-operator-group.sh enroll --operator alice
+
+# A second operator, with an explicit disjoint range:
+sudo scripts/darwin-operator-group.sh enroll --operator bob --slots 4-7
+
+sudo scripts/darwin-operator-group.sh status
+```
+
+`make setup-dev-env` runs the first form for `$USER`; `scripts/install.sh` runs
+it for the installing operator. Both are idempotent — a second run is a no-op.
+
+### What is assigned, and what is not yet enforced
+
+⚠️ **The slot sockets still carry the shared group, so this assignment is an
+audit surface and not an access control.** The daemon's own gateway VM is
+created and started as the daemon uid and holds a NIC on **every** slot, so
+until VM ownership moves to the operator, pointing the sockets at per-operator
+groups would stop the only gateway VM there is. Group creation and range
+assignment ship first because they depend on nothing else and make who-owns-what
+readable immediately; the socket switch ships with ownership.
+
+Two memberships are deliberate and must not be "tidied up":
+
+- **The daemon account is in every per-operator group.** It has to be — the
+  gateway VM holds a NIC on every slot, so a daemon outside one operator's group
+  fails `limactl start` at the first `socket:` entry, and then no macOS session
+  of *any* operator can be created or recovered. This is not a weakening: the
+  daemon is the principal operators are isolated around, not from.
+- **Operators stay in the shared `_sandboxd` group.** It gates the daemon socket
+  itself, and it owns `/var/run/sandbox/vmnet` (0750) — an operator outside it
+  cannot traverse to a slot socket whatever group the socket carries. The
+  per-operator group is a *second* group; enrollment adds one rather than moving
+  anybody out of the other.
+
+A single-operator host gets the whole pool and behaves exactly as it does today
+— same 8 concurrent sessions, same slot indices, same segments. Partitioning is
+opt-in: 8 slots across 2 operators caps each at 4.
+
+### De-enrolling an operator
+
+**Reclaiming a range without revoking the departing operator's membership
+recreates the defect exactly.** The new owner is given the slots, the old owner
+keeps group membership and therefore socket access, and *nothing detects it* —
+the plists look right and the daemon's derived mapping names the new owner. So
+revocation strictly precedes reassignment, and the tooling enforces that rather
+than trusting the order: a range still recorded against another operator's group
+cannot be handed out.
+
+```bash
+sudo scripts/darwin-operator-group.sh deenroll --operator bob
+
+# Reclaim the range but leave bob an operator of this host:
+sudo scripts/darwin-operator-group.sh deenroll --operator bob --keep-daemon-access
+```
+
+The command stops the operator's VMs, revokes their membership, verifies no live
+process still holds a slot socket, and only then releases the range.
+
+⚠️ **Revocation does not reach credentials already held**, which is why the
+residue check is part of the sequence rather than an afterthought. Membership is
+checked at `connect(2)`, not continuously: a detached QEMU keeps the fd it
+already opened and stays on the segment, and a live login session keeps the
+supplementary groups it was granted at login until the operator logs out.
+
+If that check fails the command **stops before releasing the range**, and exits
+5. The group is then left with no operator member, which makes its slots
+unassignable — the half-done state surfaces as **lost capacity**, which is loud,
+rather than as shared access, which is silent. That is the behaviour to
+preserve; do not resolve a group with two operator members by picking the newer
+one. Stop the process, have the operator log out, and re-run the command — the
+sequence is resumable.
+
+Nothing deletes a departed operator's gateway VM. Stopping it is part of
+de-enrollment; removing it is a deliberate administrative act, because automatic
+deletion of a VM that may hold running sessions is its own hazard:
+
+```bash
+sudo -u bob env LIMA_HOME=/var/lib/sandboxd/<daemon-uid>/<bob-uid>/lima \
+    limactl delete --force <instance>
+```
+
+### Costs of the mechanism, stated plainly
+
+- **Changing an operator's quota is privileged installer work.** There is no
+  automatic rebalancing, no lazy claiming, and no bouncing of an existing
+  operator's VM to make room — the same class of operation as growing the pool,
+  which the daemon already refuses and routes to the installer.
+- **Three things must stay in step** once the sockets move: the plist's group,
+  that group's membership, and whatever the daemon reads to learn the range.
+- **The plist generator gains an operator dimension**, in a codebase where a
+  plist/account mismatch is already known to fail *silently until the next
+  boot*. `make setup-darwin-vmnet-plists` and the `install.sh` plist path both
+  change; treat any edit there with the caution the pool-repair procedure above
+  describes.
+- **Create the group before any plist names it.** `socket_vmnet` given a
+  `--socket-group` that does not resolve exits 1 at bind, before
+  `vmnet.framework` initializes, with **no fallback to a default group** — so a
+  mis-ordered enrollment fails closed rather than widening a segment. On this
+  plist shape "fails closed" means at the *next boot*: the pre-exec preamble is
+  an `&&` chain and the job carries `KeepAlive`, so the symptom is a retry loop
+  in the launchd log. The failed run leaves a stale `root:wheel` socket at the
+  path with no listener — "path exists, nothing serves it" rather than "job
+  missing". A corrected retry over that stale path succeeds; no manual socket
+  cleanup is needed.
+
+### The migration window
+
+**Regenerating a plist does not take effect until reboot or an explicit reload**
+— the same deferred-failure shape as the pool-repair procedure above. So a new
+daemon can run against old sockets for an unbounded period. The upgrade sequence
+is therefore:
+
+1. **Regenerate** the slot plists with their per-operator groups.
+2. **Reload** the pool jobs so the running argv matches what is on disk
+   (`make setup-darwin-vmnet-daemons`, then `scripts/darwin-vmnet-drift.sh` per
+   slot to confirm — "loaded" is not "up to date").
+3. **Split membership**: enroll each operator into their own group.
+4. **Start the new daemon.**
+
+The in-between state is survivable rather than an outage because a slot still
+carrying the legacy shared group is treated as an unmigrated install: the daemon
+falls back to current behaviour and warns, naming the migration, rather than
+refusing. Every host that exists today is in that state, so refusing would be a
+total outage with no upgrade path.
+
+### Preconditions this does not cover
+
+- **Operators must not be able to become root**, as in any multi-user isolation
+  model. A root-capable operator can start their own `socket_vmnet` on any
+  segment identifier and bypass the socket permissions entirely.
+- **`net.inet.ip.forwarding` must be `0`.** The host holds an interface on every
+  segment (`bridge100`–`bridge107`), so at `1` all of them become mutually
+  routable *through the host* — no socket, group or plist involved, and nothing
+  here changes that. Unlike the root precondition this is one command away and is
+  flipped by ordinary features such as Internet Sharing, so check it:
+  `sysctl net.inet.ip.forwarding`.
+- **An operator can still misconfigure a VM on their own slots.** The boundary
+  this restores is *between* operators, not between an operator and their own
+  sessions.
+
 ## Disk usage and APFS accounting
 
 sandboxd stores sandbox VM disk images under the daemon's LIMA_HOME. On APFS

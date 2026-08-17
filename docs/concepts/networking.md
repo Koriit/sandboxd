@@ -298,7 +298,7 @@ socket_vmnet --vmnet-mode=host \
   /var/run/sandbox/vmnet/slot-<n>.sock
 ```
 
-The `--vmnet-network-identifier` is a deterministic UUID derived from a sandboxd namespace UUID and the slot index. A unique identifier places each slot on its own isolated vmnet network — verified hardware-confirmed: same-subnet ARP across identifiers fails, so inter-slot L2 leakage is absent. `--vmnet-mode=host` means the segment has no NAT to the internet. `--socket-group=_sandboxd` restricts socket access to the daemon and enrolled operators.
+The `--vmnet-network-identifier` is a deterministic UUID derived from a sandboxd namespace UUID and the slot index. A unique identifier places each slot on its own isolated vmnet network — verified hardware-confirmed: same-subnet ARP across identifiers fails, so inter-slot L2 leakage is absent. `--vmnet-mode=host` means the segment has no NAT to the internet. `--socket-group=_sandboxd` restricts socket access to the daemon and enrolled operators. Because that is one group across every slot, it does not partition the pool *between* operators: enrollment additionally creates a per-operator group recording which slots each operator owns, but the sockets still carry the shared group, so today that assignment is an audit surface rather than the kernel's access decision. See [Per-operator vmnet slot groups](../guides/macos-operations.md#per-operator-vmnet-slot-groups).
 
 The gateway Lima instance pre-attaches all N NICs at instance-creation time, one per slot, because Lima fixes a VM's `networks:` NIC set at creation and has no supported way to add NICs later. Each entry is an unmanaged `socket:` attach in the VM's `lima.yaml`:
 

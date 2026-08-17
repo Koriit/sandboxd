@@ -402,12 +402,38 @@ def check_three_way(rust: dict, make: dict, sh: dict) -> int:
     print("=== Account created by the installer ===")
     created = sh["created_accounts"]
     print(f"     {INSTALL_SH} creates: {', '.join(created) if created else '(none)'}")
-    expected_created = ["$_sandboxd_acct"]
-    if created != expected_created:
+    # The daemon account is the one the plists name, so it is required. The
+    # per-operator slot group is a different record with a different purpose —
+    # no plist names it yet, and it is allowed rather than expected because a
+    # host may be installed for no operator at all.
+    #
+    # What the check is really about is the *spelling*: every record must be
+    # created through a variable. A literal is how the account the installer
+    # created and the account the plists named came apart in the first place,
+    # and that failure did not surface until the next boot.
+    literals = [c for c in created if not c.startswith("$")]
+    unknown = [c for c in created if c not in ("$_sandboxd_acct", "$_osg")]
+    if literals:
         print(
-            f"FAIL: expected {INSTALL_SH} to create exactly {expected_created} via dscl, "
-            f"found {created}. The installer must create the same account its plists "
-            "name — spelling it as a literal is how the two came apart before.",
+            f"FAIL: {INSTALL_SH} creates dscl records from literals: {literals}. "
+            "Every record must be spelled with the variable the rest of the script "
+            "uses — a literal is how the created account and the account the plists "
+            "name came apart before, and it did not surface until the next boot.",
+            file=sys.stderr,
+        )
+        failures += 1
+    elif "$_sandboxd_acct" not in created:
+        print(
+            f"FAIL: {INSTALL_SH} no longer creates '$_sandboxd_acct' via dscl. "
+            "The installer must create the same account its plists name.",
+            file=sys.stderr,
+        )
+        failures += 1
+    elif unknown:
+        print(
+            f"FAIL: {INSTALL_SH} creates unrecognized dscl records: {unknown}. "
+            "Add them here deliberately — an installer quietly gaining identities "
+            "is what this check exists to notice.",
             file=sys.stderr,
         )
         failures += 1

@@ -222,6 +222,18 @@ def test_uninstall_macos_purge_removes_user_group_and_state(
         "--purge-state left the _sandboxd group"
     )
 
+    # ---------------- per-operator slot groups removed ----------------
+    #
+    # Left behind, a stale _sandboxd-op-* group is worse than untidy: the next
+    # install finds a group that already exists, skips creating it, and
+    # inherits whatever slot range the stale record still names.
+    leftover = vm.shell(
+        "dscl . -list /Groups | grep '^_sandboxd-op-' || true", timeout=15
+    ).stdout.strip()
+    assert leftover == "", (
+        f"--purge-state left per-operator slot groups behind: {leftover!r}"
+    )
+
     # ---------------- members-first ordering (from the step trace) ----------------
     # uninstall.sh's purge-user-group step strips operators from the group,
     # then deletes the group, then deletes the user. Verify the log records

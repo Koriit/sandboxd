@@ -57,6 +57,9 @@ def test_install_macos_double_run_no_duplicate_identities_or_jobs(
     )
     uid_pre = int(vm.shell("id -u _sandboxd", check=True).stdout.strip())
     gid_pre = int(vm.shell("id -g _sandboxd", check=True).stdout.strip())
+    slots_pre = vm.shell(
+        "dscl . -read /Groups/_sandboxd-op-admin SandboxdSlots", check=True
+    ).stdout.strip()
 
     # Truncate the install log so the second run's records are isolated.
     vm.shell("sudo truncate -s 0 /var/log/sandbox-install.log 2>/dev/null || true")
@@ -86,6 +89,34 @@ def test_install_macos_double_run_no_duplicate_identities_or_jobs(
     assert uid_post == uid_pre and gid_post == gid_pre, (
         f"_sandboxd uid/gid changed across re-install: "
         f"pre=({uid_pre},{gid_pre}) post=({uid_post},{gid_post})"
+    )
+
+    # ---------------- per-operator slot group not duplicated or widened ----------------
+    #
+    # A second install must not create a second group, and must not quietly
+    # restore a deliberately narrowed range to the whole pool — re-running the
+    # installer is not an occasion to hand an operator slots someone took away.
+    op_group_rows = vm.shell(
+        "dscl . -list /Groups | grep -cx _sandboxd-op-admin", timeout=15
+    ).stdout.strip()
+    assert op_group_rows == "1", (
+        f"expected exactly one _sandboxd-op-admin group after the second install, "
+        f"got {op_group_rows!r}"
+    )
+    slots_post = vm.shell(
+        "dscl . -read /Groups/_sandboxd-op-admin SandboxdSlots", check=True
+    ).stdout.strip()
+    assert slots_post == slots_pre, (
+        f"the operator's slot range changed across a re-install: "
+        f"pre={slots_pre!r} post={slots_post!r}"
+    )
+    # Membership is still exactly the operator plus the daemon account — the
+    # add is idempotent rather than appending a duplicate entry.
+    members = vm.shell(
+        "dscl . -read /Groups/_sandboxd-op-admin GroupMembership", check=True
+    ).stdout.split(":", 1)[-1].split()
+    assert sorted(members) == ["_sandboxd", "admin"], (
+        f"unexpected _sandboxd-op-admin membership after re-install: {members!r}"
     )
 
     # ---------------- binaries still present ----------------

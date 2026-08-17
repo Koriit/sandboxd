@@ -191,9 +191,77 @@ fn checker_rejects_an_installer_that_creates_a_different_account() {
         describe(&output)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Attribution, asserted by naming the offending record rather than by
+    // matching a phrase — the point is that the report identifies *which*
+    // account went wrong, which a reader can act on, not that it is worded
+    // any particular way.
     assert!(
-        stderr.contains("to create exactly"),
-        "expected the failure to be attributed to the created account.\n{}",
+        stderr.contains("_sandbox") && stderr.contains("literal"),
+        "expected the failure to name the literal account install.sh now creates.\n{}",
+        describe(&output)
+    );
+}
+
+/// Creating a *second* account is not automatically wrong — enrollment adds a
+/// per-operator vmnet slot group alongside the daemon account — but a record
+/// the checker was never told about is. An installer that quietly gains an
+/// identity is exactly what this inventory exists to notice.
+#[test]
+fn checker_rejects_an_installer_that_creates_an_unregistered_record() {
+    let tmp = perturbed_repo(&[(
+        "scripts/install.sh",
+        "/Groups/\\$_osg",
+        "/Groups/\\$_surprise",
+    )]);
+
+    let output = run_checker(tmp.path());
+    assert!(
+        !output.status.success(),
+        "install.sh now creates a dscl record nothing knows about, and the checker \
+         passed anyway.\n{}",
+        describe(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("_surprise"),
+        "expected the failure to name the unrecognized record.\n{}",
+        describe(&output)
+    );
+}
+
+/// The daemon account is the one the plists name, so its creation is required
+/// rather than merely permitted. Dropping it while keeping a well-spelled
+/// per-operator group must still fail.
+#[test]
+fn checker_rejects_an_installer_that_stops_creating_the_daemon_account() {
+    // Both record forms have to move, and every reference to each: the
+    // installer creates the daemon account as a user *and* a group, and the
+    // attribute writes are `dscl . -create` too. Leaving any one behind keeps
+    // the daemon account in the checker's inventory and proves nothing.
+    let tmp = perturbed_repo(&[
+        (
+            "scripts/install.sh",
+            "/Users/\\$_sandboxd_acct",
+            "/Users/\\$_osg",
+        ),
+        (
+            "scripts/install.sh",
+            "/Groups/\\$_sandboxd_acct",
+            "/Groups/\\$_osg",
+        ),
+    ]);
+
+    let output = run_checker(tmp.path());
+    assert!(
+        !output.status.success(),
+        "install.sh no longer creates the account its plists name, and the checker \
+         passed anyway.\n{}",
+        describe(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("_sandboxd_acct"),
+        "expected the failure to name the missing daemon account.\n{}",
         describe(&output)
     );
 }

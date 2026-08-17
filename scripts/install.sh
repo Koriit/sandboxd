@@ -174,6 +174,7 @@ PLAN_SANDBOX_USER=""          # create | skip
 PLAN_SANDBOX_UID_EXISTING=""  # uid of existing sandbox user (or empty)
 PLAN_GROUPS_ADD=""            # space-separated list of groups to add sandbox to
 PLAN_OPERATOR_ADD=""          # add | skip | skip-no-operator
+PLAN_OPERATOR_SLOT_GROUP=""   # create | skip | skip-no-operator  (macOS only)
 PLAN_ROUTE_HELPER_CAPS=""     # set | skip
 PLAN_LIMA_HELPER_CAPS=""      # set | skip
 PLAN_BRIDGE_HELPER_SETUID=""  # set | skip
@@ -193,6 +194,11 @@ PLAN_LIMA_HELPER_PATH="/usr/local/libexec/sandboxd/sandbox-lima-helper"
 PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
 PLAN_LIMA_CAPS_STR="cap_setuid+ep"
 PLAN_USERS_CONF_PATH="/etc/sandboxd/users.conf"
+# Resolved in compute_plan (macOS): the per-operator vmnet socket group and the
+# slot range enrollment assigns it. A fresh single-operator install gets the
+# whole pool, so its concurrency is exactly what it is today.
+PLAN_OPERATOR_SLOT_GROUP_NAME=""
+PLAN_OPERATOR_SLOT_RANGE=""
 PLAN_UNIT_DST="/etc/systemd/system/sandboxd.service"
 PLAN_USERS_CONF_CONTENT=""
 PLAN_BRIDGE_CONF_APPEND=""
@@ -1597,6 +1603,46 @@ _compute_plan_darwin() {
         PLAN_OPERATOR_ADD="add"
     fi
 
+    # ---- per-operator vmnet socket group ----
+    #
+    # Every slot socket is guarded by one group today, and every operator is
+    # enrolled in it — so on a host with two or more operators, any of them can
+    # attach to any other's isolated segment and become the next hop for that
+    # operator's sandbox traffic. Enrollment therefore also creates a group
+    # scoped to this operator alone and records the slot range they own.
+    #
+    # This install does NOT point the slot plists at that group. Until VM
+    # ownership moves to the operator, the daemon's own gateway VM holds a NIC
+    # on every slot and must keep opening all of them; switching the sockets now
+    # would stop the only gateway VM there is. What lands here is the assignment
+    # and the audit surface, not the kernel's access decision.
+    PLAN_OPERATOR_SLOT_GROUP_NAME=""
+    PLAN_OPERATOR_SLOT_RANGE=""
+    if [ -z "$OPERATOR_NAME" ] || ! dscl . -read "/Users/$OPERATOR_NAME" >/dev/null 2>&1; then
+        PLAN_OPERATOR_SLOT_GROUP="skip-no-operator"
+    else
+        PLAN_OPERATOR_SLOT_GROUP_NAME="_sandboxd-op-$OPERATOR_NAME"
+        _osg_slots="${DARWIN_VMNET_SLOTS:-8}"
+        PLAN_OPERATOR_SLOT_RANGE="0-$((_osg_slots - 1))"
+        if dscl . -read "/Groups/$PLAN_OPERATOR_SLOT_GROUP_NAME" >/dev/null 2>&1; then
+            # An existing group already carries an assignment. Re-running the
+            # installer must not silently widen a deliberately narrowed range
+            # back to the whole pool, so the existing one is preserved.
+            PLAN_OPERATOR_SLOT_GROUP="skip"
+            # An absent attribute is reported as absent, never as the whole
+            # pool. `dscl -read` prints "No such key" and still exits 0, so the
+            # text is the only signal — and showing the default here would
+            # present a range nobody assigned as though it were recorded.
+            _osg_existing=$(dscl . -read "/Groups/$PLAN_OPERATOR_SLOT_GROUP_NAME" SandboxdSlots 2>/dev/null || true)
+            case "$_osg_existing" in
+                "No such key"*|"") PLAN_OPERATOR_SLOT_RANGE="" ;;
+                *) PLAN_OPERATOR_SLOT_RANGE=$(printf '%s' "$_osg_existing" | sed 's/^[^ ]*:[[:space:]]*//') ;;
+            esac
+        else
+            PLAN_OPERATOR_SLOT_GROUP="create"
+        fi
+    fi
+
     # macOS has no file capabilities (setcap/getcap); mark Linux-only steps skipped.
     PLAN_ROUTE_HELPER_CAPS="skip"
     PLAN_LIMA_HELPER_CAPS="skip"
@@ -1718,6 +1764,12 @@ _compute_plan_linux() {
     else
         PLAN_OPERATOR_ADD="add"
     fi
+
+    # Per-operator vmnet socket groups are a macOS mechanism — there is no
+    # socket_vmnet pool on Linux, so there is nothing to partition.
+    PLAN_OPERATOR_SLOT_GROUP="skip-no-operator"
+    PLAN_OPERATOR_SLOT_GROUP_NAME=""
+    PLAN_OPERATOR_SLOT_RANGE=""
 
     # ---- route-helper capabilities ----
     expected_route_caps="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
@@ -1891,6 +1943,17 @@ _render_plan_darwin() {
         emit "    ${GREEN}+ operator '$OPERATOR_NAME' already in group '_sandboxd' — skip${RESET}"
     else
         emit "    ${YELLOW}! no operator to add to _sandboxd group (running as root or no effective user)${RESET}"
+    fi
+    if [ "$PLAN_OPERATOR_SLOT_GROUP" = "create" ]; then
+        emit "    ${YELLOW}+ create vmnet slot group '$PLAN_OPERATOR_SLOT_GROUP_NAME' (slots $PLAN_OPERATOR_SLOT_RANGE)${RESET}"
+        emit "      dseditgroup -o edit -a $OPERATOR_NAME -t user $PLAN_OPERATOR_SLOT_GROUP_NAME"
+        emit "      dseditgroup -o edit -a _sandboxd -t user $PLAN_OPERATOR_SLOT_GROUP_NAME"
+        emit "      the slot sockets keep their current group — this assignment is not yet enforced"
+    elif [ "$PLAN_OPERATOR_SLOT_GROUP" = "skip" ] && [ -n "$PLAN_OPERATOR_SLOT_RANGE" ]; then
+        emit "    ${GREEN}+ vmnet slot group '$PLAN_OPERATOR_SLOT_GROUP_NAME' exists (slots $PLAN_OPERATOR_SLOT_RANGE) — skip${RESET}"
+    elif [ "$PLAN_OPERATOR_SLOT_GROUP" = "skip" ]; then
+        emit "    ${YELLOW}! vmnet slot group '$PLAN_OPERATOR_SLOT_GROUP_NAME' exists but records no slot range${RESET}"
+        emit "      its slots are unassignable until one is assigned; this install does not guess one"
     fi
     emit ""
 
@@ -2498,6 +2561,9 @@ PLAN_SANDBOX_USER='$(_sq "$PLAN_SANDBOX_USER")'
 PLAN_SANDBOX_UID_EXISTING='$(_sq "$PLAN_SANDBOX_UID_EXISTING")'
 PLAN_GROUPS_ADD='$(_sq "$PLAN_GROUPS_ADD")'
 PLAN_OPERATOR_ADD='$(_sq "$PLAN_OPERATOR_ADD")'
+PLAN_OPERATOR_SLOT_GROUP='$(_sq "$PLAN_OPERATOR_SLOT_GROUP")'
+PLAN_OPERATOR_SLOT_GROUP_NAME='$(_sq "$PLAN_OPERATOR_SLOT_GROUP_NAME")'
+PLAN_OPERATOR_SLOT_RANGE='$(_sq "$PLAN_OPERATOR_SLOT_RANGE")'
 PLAN_ROUTE_HELPER_CAPS='$(_sq "$PLAN_ROUTE_HELPER_CAPS")'
 PLAN_LIMA_HELPER_CAPS='$(_sq "$PLAN_LIMA_HELPER_CAPS")'
 PLAN_BRIDGE_HELPER_SETUID='$(_sq "$PLAN_BRIDGE_HELPER_SETUID")'
@@ -2695,6 +2761,54 @@ if [ "\$OS" = "darwin" ]; then
         _log "step=operator_add operator=\$_OPERATOR action=add status=ok"
     else
         _log "step=operator_add action=\$PLAN_OPERATOR_ADD status=ok"
+    fi
+
+    # ---- per-operator vmnet socket group ----
+    #
+    # A slot socket is the entire admission control for its L2 segment, and
+    # every slot carries the same group with every operator in it — so any
+    # enrolled operator can join any other's segment and be believed as their
+    # next hop, voiding the victim's egress policy with nothing in the daemon
+    # or the deny-event stream showing it. The per-operator group is what makes
+    # the partition real: one group per operator, naming the slots they own.
+    #
+    # Ordering is a requirement, not a detail: the group and its members exist
+    # before anything names it. socket_vmnet given a --socket-group that does
+    # not resolve exits 1 at bind, before vmnet.framework initializes and with
+    # no fallback to a default group, so a plist written ahead of its group
+    # takes the slot down at the next boot. Failing closed is the right
+    # direction, and creating first is what keeps it from being reached at all.
+    #
+    # The operator is added to this group IN ADDITION to _sandboxd, never
+    # instead of it. That group gates the daemon socket and owns the 0750
+    # socket directory; an operator outside it cannot traverse to a slot socket
+    # whatever group the socket itself carries.
+    if [ "\$PLAN_OPERATOR_SLOT_GROUP" = "create" ] && [ -n "\$_OPERATOR" ]; then
+        _osg="\$PLAN_OPERATOR_SLOT_GROUP_NAME"
+        _osg_gid=\$(dscl . -list /Groups PrimaryGroupID | awk '{print \$2}' | sort -n | awk 'BEGIN{gid=300} {if (\$1==gid){gid++}; if (gid==60){gid++}} END{print gid}')
+        dscl . -create "/Groups/\$_osg" >> "\$_LOG" 2>&1 \\
+            || { _log "step=operator_slot_group action=create-fail status=fail"; _step_fail; }
+        dscl . -create "/Groups/\$_osg" PrimaryGroupID "\$_osg_gid" >> "\$_LOG" 2>&1 || true
+        dscl . -create "/Groups/\$_osg" RealName "sandboxd vmnet slots for \$_OPERATOR" >> "\$_LOG" 2>&1 || true
+        dseditgroup -o edit -a "\$_OPERATOR" -t user "\$_osg" >> "\$_LOG" 2>&1 \\
+            || { _log "step=operator_slot_group action=add-operator-fail status=fail"; _step_fail; }
+        # The daemon account joins every per-operator group. This is not a hole:
+        # the daemon is the principal operators are isolated around, not from.
+        # It is also mandatory — the gateway VM runs as the daemon uid and holds
+        # a NIC on every slot, so a daemon outside one operator's group fails
+        # limactl start at the first socket entry, and no macOS session of ANY
+        # operator can be created or recovered.
+        dseditgroup -o edit -a "\$_sandboxd_acct" -t user "\$_osg" >> "\$_LOG" 2>&1 \\
+            || { _log "step=operator_slot_group action=add-daemon-fail status=fail"; _step_fail; }
+        # The range last: it names the group, so it is written only once the
+        # group and its members exist.
+        dscl . -create "/Groups/\$_osg" SandboxdSlots "\$PLAN_OPERATOR_SLOT_RANGE" >> "\$_LOG" 2>&1 \\
+            || { _log "step=operator_slot_group action=record-range-fail status=fail"; _step_fail; }
+        dseditgroup -o checkmember -m "\$_OPERATOR" "\$_osg" >> "\$_LOG" 2>&1 \\
+            || { _log "step=operator_slot_group action=verify-fail status=fail"; _step_fail; }
+        _log "step=operator_slot_group group=\$_osg gid=\$_osg_gid slots=\$PLAN_OPERATOR_SLOT_RANGE action=create status=ok"
+    else
+        _log "step=operator_slot_group action=\$PLAN_OPERATOR_SLOT_GROUP status=ok"
     fi
 else
     if [ "\$PLAN_OPERATOR_ADD" = "add" ] && [ -n "\$_OPERATOR" ]; then
