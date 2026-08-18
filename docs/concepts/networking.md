@@ -346,9 +346,11 @@ The gateway container has two NICs, serving opposite directions:
 | NIC | Type | IP | Role |
 | --- | ---- | --- | ---- |
 | VM-facing | `macvlan(private)` child of `limaN` | `B+3` | Receives traffic from the sandbox VM; nftables DNAT intercepts it |
-| Upstream egress | NIC on the shared `sandboxd-egress` Docker bridge | DHCP from bridge | Default route out; re-originated upstream traffic exits here → gateway VM `eth0` → host → internet |
+| Upstream egress | NIC on the shared `sandboxd-egress` Docker bridge | DHCP from bridge | The intended way out: re-originated upstream traffic exits here → gateway VM `eth0` → host → internet |
 
 `macvlan(private)` mode prevents macvlan-to-parent and macvlan-to-macvlan traffic — the gateway cannot egress over the VM-facing NIC, and two gateway containers on the same parent cannot reach each other at L2. The upstream egress NIC is on the shared `sandboxd-egress` NAT-masqueraded bridge, which the daemon creates once at gateway init. That bridge is the inside (trusted-infra) side only — no sandbox VM ever touches it.
+
+**Which NIC actually carries the default route is a Docker decision, and it does not always land where the table says.** The gateway container is started on `sandboxd-egress` and the session-side network is attached to it afterwards; attaching a network to a running container re-runs Docker's default-gateway election, which has been measured to move the default route onto the newly attached NIC. On the **lite** path the session-side attachment therefore declines that election explicitly (a gateway priority below Docker's default), so the route out stays on `sandboxd-egress` — which the lite path depends on, since its session bridge no longer masquerades. On the **full** (macvlan) path no such priority is set, and the election has been measured to put the default route on the VM-facing macvlan NIC — over which `macvlan(private)` blocks egress. Read the row above as the topology's intent; on the full backend it is not yet what Docker is doing.
 
 The end-to-end path:
 

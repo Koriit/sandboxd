@@ -821,13 +821,19 @@ class TestLiteMacosBypassResistance:
             # past it where nothing can send back an RST or an ICMP error.
             # Measured on the gateway VM's Docker — masquerade on: exit 0 in
             # 94 ms; masquerade off: exit 28 at 8010 ms. So the block reads
-            # as a timeout, and a timeout on its own is the weakest evidence
-            # there is. This test therefore does not rest on the exit code
-            # at all. What carries it is the three-way bracket: the same
-            # container reached the same URL moments before, reaches it
-            # again moments after, and — in this very state — still resolves
-            # names through the gateway. A curl exit-code set would have
-            # been the weaker check, not the stronger one.
+            # as a timeout.
+            #
+            # A timeout on its own would NOT have been acceptable here, and
+            # this test would be worthless if that were all it had: a hang
+            # is indistinguishable from a wrong address, a container that
+            # never started, or a request never issued. What makes it
+            # evidence is the pairing — the same request, over the same
+            # path, from the same container, succeeding in the state either
+            # side of this one, and the container demonstrably still talking
+            # to the gateway *while* it hangs. The only variable across
+            # those states is the thing under test. That is why the controls
+            # above and below are assertions and not diagnostics: if either
+            # of them fails, this one must not be allowed to pass.
             bypass_rc, bypass_ms = _timed_curl(
                 name, self.PROBE_URL, self.PROBE_MAX_TIME_S
             )

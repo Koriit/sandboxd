@@ -149,6 +149,17 @@ const NEVER_DEFAULT_GATEWAY_PRIORITY: i32 = -100;
 /// [`NetworkOption::MacvlanModePrivate`] is nullary: the project has one
 /// reason to touch this knob, and naming the intent keeps every other value
 /// out of the op.
+///
+/// # If the flag is not supported
+///
+/// `--gw-priority` is verified working on Docker 29.1.3, and documented as
+/// introduced in Docker 28; no lower bound has been measured, so none is
+/// claimed. What has been measured is the failure: given an unsupported
+/// flag, `docker network connect` exits 125, prints `unknown flag`, and
+/// **does not attach the container** — so a Docker too old for this fails
+/// the connect, which the caller treats as a hard error and fails the
+/// create. The failure mode is a refused session, never a session on a
+/// network wired differently from what was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointGatewayPriority {
     /// Docker's default — this endpoint takes part in the election

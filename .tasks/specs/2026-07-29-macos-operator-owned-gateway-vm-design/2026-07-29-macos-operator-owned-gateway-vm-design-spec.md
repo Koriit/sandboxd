@@ -1930,9 +1930,31 @@ So today allowed egress leaves via the *session bridge's* masquerade, not via
 `sandboxd-egress` as `docs/concepts/networking.md:341` describes; and with masquerade off
 the gateway container itself measured **exit 28**. Attaching with a gateway priority below
 Docker's default keeps its route on the uplink and restores egress (**exit 0 in 69 ms**),
-and is now part of the change. Untested here, and stated as an observation rather than a
-claim: the full backend's macvlan leg is attached the same way, and `macvlan_mode=private`
-blocks egress over it.
+and is now part of the change.
+
+**The same election happens on the macvlan leg — measured, and deliberately left alone.**
+Replicating the full backend's wiring (gateway on `sandboxd-egress`, then
+`docker network connect --ip` a `macvlan_mode=private` network on a slot NIC) moves the
+default route the same way — `via 172.18.0.1 dev eth0` → `via 10.250.97.1 dev eth1` — and
+the container then cannot reach the internet: **exit 7 after 3078 ms**, the ARP failure
+private mode produces. So `docs/concepts/networking.md`'s *"Upstream egress … Default route
+out"* row does not describe the full backend as it stands; the doc is corrected to say what
+is true per path. **This is recorded as a measurement and nothing more.** The full backend's
+catalogued egress failures are a *guest*-side missing default route
+(`docs/internal/macos-e2e-baseline.md` §1, measured), which is a different defect in a
+different place; no claim is made here that this explains them, and nothing on that path was
+changed. It is a lead for whoever owns that defect, not a finding about it.
+
+**On the flag's version requirement, stated to its evidence.** `--gw-priority` is
+**verified working on Docker 29.1.3** (the gateway VM's). It is documented as introduced in
+Docker 28; **the lower bound is not measured here**, so no floor is asserted. What *is*
+measured is the failure mode, which matters more: `docker network connect` given an
+unsupported flag exits **125**, prints `unknown flag`, and **does not attach the container**
+(inspect after the failed call lists only the networks it already had). The daemon treats a
+non-zero connect as a hard error and the create path tears the session down
+(`macos_session.rs`, the `!output.status.success()` branch; `main.rs` step 11's error arm) —
+so an older in-VM Docker yields a **refused create**, never a session on a silently
+mis-wired network. The CLI half is measured; the daemon half is a code read.
 
 ### 2.6 Two singletons that must become per-operator
 
@@ -2852,6 +2874,53 @@ a true property. Give it a discriminating signature there — with the route via
 deny-logger is out of the path, so there is no connect-then-RST; the honest signature is
 that the connection is **refused or unreachable**, and a *timeout* (28) must not be accepted
 as a pass, for the same reason it is not accepted in assertion 1.
+
+##### ⚠️ AMENDED 2026-08-18 — the required signature is unreachable by this means. Measured
+
+The paragraph above was written before anyone had measured the post-change topology. It
+had to guess what removing the NAT would look like from inside the probe, and the guess is
+wrong — not by a margin, but in kind. Measured on the gateway VM's own Docker (29.1.3),
+with the argv the change emits, three runs of the same probe:
+
+| topology | result |
+|---|---|
+| masquerade **on** (before the change) | **exit 0 in 94 ms** — the bypass, open |
+| masquerade **off** (the change) | **exit 28 at 8010 ms** — closed |
+| masquerade off **+ a REJECT scoped to the session bridge** | **exit 7 in 3 ms** |
+
+**Why the required signature cannot appear.** `DOCKER-FORWARD` counts the probe's SYNs
+(**5**, one per retry) as **ACCEPTed**: removing the NAT does not stop the packet, it only
+stops the translation, so the SYN still leaves the VM — now with a source address nothing
+upstream can route a reply to. It dies past the VM, where there is no host holding the port
+to refuse it and no router with a reason to send an ICMP error. A refusal has to be *sent
+by something*, and this means removes the last thing on the path that could send one.
+Row 3 shows the signature is achievable, but only by adding something that refuses.
+
+**So the clause is amended, not waived: a timeout is acceptable here — and only here —
+when it is paired with a control that discriminates.** What made a bare timeout
+unacceptable is that it is indistinguishable from a broken test: a wrong address, a
+container that never started, a request never issued. That ambiguity is removed more
+strongly by a bracket than by any exit-code set. The durable test must therefore, on the
+same container and the same URL:
+
+1. reach the URL through the helper-installed gateway route **before** the mutation,
+2. still resolve names through the gateway **while** the bypass route is installed — the
+   resolver is on-link and does not travel the default route, so an answer proves the
+   container's networking is alive *in the failing state*, not merely before and after it,
+3. fail to reach the URL in that state, and
+4. reach it again once the gateway route is restored.
+
+**The assertion must fail if either control leg does not succeed.** Without that, a
+comprehensively broken fixture passes both halves and the bracket becomes decoration.
+
+**The deferred REJECT (row 3) improves the signal, not the guarantee.** The bypass is
+closed either way; what a refusal buys is that an in-container process gets an immediate
+error instead of an eight-second hang, which is a diagnosability difference worth having.
+It is deferred because it is per-session filter machinery outside the container netns on
+both platforms, with its own teardown, landing on the route helper's authorization
+surface — a session of work, not a clause. **Do not read the deferral as an open bypass.**
+
+Landed as `TestLiteMacosBypassResistance` in `tests/e2e/test_lite_macos.py`.
 
 - **This is still the only test of *topological* control rather than *policy* control**, and
   it is the lite analogue of the spec-mandated full-backend regression
@@ -3928,18 +3997,36 @@ ops and share the serialization concern in §2.5.
 - [ ] Any `sh -c` path built from daemon-supplied input is validated agent-side against an
       allowlist. Watch `policy_distributor.rs:39-48` (no escaping of embedded quotes) and
       `macos_session.rs:786` (guarded only by a `debug_assert!`, compiled out in release).
-- [ ] The pre-route window fails closed: a container whose route helper has not yet run
-      **cannot** reach the internet (§2.5). Assert it directly.
-- [ ] **Bypass resistance now holds and is asserted** (§3.6 assertion 4, moved here): with
+- [x] The pre-route window fails closed: a container whose route helper has not yet run
+      **cannot** reach the internet (§2.5). Assert it directly. **Asserted by the same test
+      as the criterion below, and that is not a shortcut**: a default route pointing at the
+      bridge *is* the pre-route state — Docker's own route, unmodified — so the test rebuilds
+      it on a running session rather than racing a window too short and too early to sample.
+- [x] **Bypass resistance now holds and is asserted** (§3.6 assertion 4, moved here): with
       masquerade disabled, a probe whose default route points at the Docker bridge instead of
-      the gateway container **cannot** reach the internet. Assert the route installed first,
-      and do **not** accept a timeout as a pass — the honest signature is refused or
-      unreachable. This is the property phase 0 could only record.
-- [ ] **The Linux lite path is confirmed not to depend on bridge masquerade** before the
+      the gateway container **cannot** reach the internet. Assert the route installed first.
+      This is the property phase 0 could only record.
+      - ⚠️ **The "do not accept a timeout" half of this criterion is amended** — see §3.6
+        assertion 4 → *⚠️ AMENDED 2026-08-18*, which carries the measurement. Removing the
+        NAT cannot produce a refusal, because it removes the last thing on the path capable
+        of sending one; the packet still leaves the VM (measured on the forwarding counter)
+        and dies where nothing can answer. A timeout is accepted **only** when bracketed by
+        controls that discriminate it from a broken fixture, and the assertion must fail if
+        a control leg does not succeed. Do not restore the clause on the reasonable-sounding
+        grounds that a refusal is the better signature: it is, and it is a separate session.
+- [x] **The Linux lite path is confirmed not to depend on bridge masquerade** before the
       change ships — `network.rs:401-415` is shared code and `docker_socket` is `None` on
       Linux, so the same argv runs there. The check: create a Linux lite session with
       masquerade disabled on its network and confirm egress still works through the gateway.
       `make test-e2e-container` passing is not that check.
+      - **Checked, and it came back negative: the Linux path *does* depend on it**, so the
+        option is set only for bridges created on the in-VM route. See §2.5 → *✅ DONE*. This
+        is the instruction above choosing its branch, and it is why the criterion insisted no
+        suite discharges it: a green macOS suite would never have surfaced a Linux-only
+        dependency. **Bounds, stated rather than implied:** no Linux lite *session* was
+        created — the check ran on real Linux Docker (the gateway VM's) with the emitted
+        argv, and the single-NIC shape of the Linux gateway container is a code read
+        (`gateway.rs:566-574`), not a running-session measurement.
 - [ ] **Pipelining by `request_id` is implemented** (§2.5): independent ops for one
       operator complete concurrently rather than strictly serially, and a dependent
       sequence (create → start) still completes in order because the caller awaits each
