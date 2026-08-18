@@ -53,6 +53,16 @@ The session contract does not change with the backend. Across both lite and Lima
 
 In other words: lite changes the substrate underneath the guest, not the contract you have with the daemon. Switching a script from Lima to lite typically only requires adding `--lite` to the `sandbox create` call.
 
+## Egress on macOS lite: the bridge is not a way out
+
+On macOS, a lite session's per-session Docker bridge is created **without** Docker's default masquerade. The practical consequences, in order of how likely you are to meet them:
+
+- **There is exactly one route out of a lite session: the gateway container.** Traffic sent anywhere else — most obviously to the bridge's own `.1` address — goes nowhere, and the caller sees a timeout rather than a refusal. Nothing on that path can send back an error, so an 8-second hang with no response is what "there was no route" looks like from inside the session.
+- **A session that has just started is already closed.** Between the container starting and the daemon installing its default route there is a brief window in which Docker's own route is still in place. With the NAT removed, that window carries no egress at all rather than unfiltered egress.
+- **Nothing about applying policy changes.** Allowed traffic is addressed to the gateway container on the same bridge, which never consults the NAT, and the gateway reaches the internet over its own separate uplink.
+
+This is a macOS-lite property. On Linux the same bridge keeps Docker's masquerade, because there the gateway container's only NIC is on that bridge and its own upstream traffic depends on it.
+
 ## Shared workspaces on macOS
 
 On macOS, the lite and Lima backends expose `shared:` workspaces through different access paths, and that difference affects which directories you can use.

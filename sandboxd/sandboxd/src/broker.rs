@@ -2308,10 +2308,12 @@ fn docker_op_to_wire(op: &sandbox_core::docker::DockerOp) -> sandbox_agent_proto
             network,
             container,
             ip,
+            gateway_priority,
         } => Wire::NetworkConnect {
             network: network.clone(),
             container: container.clone(),
             ip: ip.clone(),
+            gateway_priority: (*gateway_priority).into(),
         },
         Core::NetworkList {
             name_prefix,
@@ -3226,7 +3228,9 @@ mod tests {
         };
         use sandbox_docker_argv::gateway::{FileDelivery, GatewayFile, StdinCommand};
         use sandbox_docker_argv::image::StagedImage;
-        use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver, NetworkOption};
+        use sandbox_docker_argv::network::{
+            EndpointGatewayPriority, NetworkCreateSpec, NetworkDriver, NetworkOption,
+        };
 
         use sandbox_core::docker::DockerOp;
 
@@ -3328,6 +3332,7 @@ mod tests {
                     network: "sandbox-net-abc123def456".to_string(),
                     container: "sandbox-gw-abc123def456".to_string(),
                     ip: Some("10.209.0.2".to_string()),
+                    gateway_priority: EndpointGatewayPriority::NeverDefaultGateway,
                 },
                 DockerOp::NetworkList {
                     name_prefix: "sandbox-net-".to_string(),
@@ -3424,6 +3429,25 @@ mod tests {
                     "a field was lost crossing the wire: {json}"
                 );
             }
+        }
+
+        /// A daemon that predates the gateway-priority field does not send
+        /// it, and the agent must read its absence as Docker's own
+        /// behaviour rather than refusing the op — the rollback direction of
+        /// the wire-compatibility rule.
+        #[test]
+        fn a_connect_payload_without_the_gateway_priority_field_still_renders() {
+            let json = r#"{"docker_op":"network_connect",
+                 "network":"sandbox-net-abc123def456",
+                 "container":"sandbox-gw-abc123def456",
+                 "ip":"10.209.0.2"}"#;
+            let op: sandbox_agent_protocol::DockerOp =
+                serde_json::from_str(json).expect("an older daemon's payload deserializes");
+            let argv = sandbox_agent_protocol::docker_argv(&op).expect("renders");
+            assert!(
+                !argv.iter().any(|a| a == "--gw-priority"),
+                "an absent field must render as Docker's default, got: {argv:?}"
+            );
         }
 
         /// No op may name its own Docker daemon. The `-H` flag is added by
