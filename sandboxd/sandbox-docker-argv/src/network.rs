@@ -158,8 +158,10 @@ const NEVER_DEFAULT_GATEWAY_PRIORITY: i32 = -100;
 /// flag, `docker network connect` exits 125, prints `unknown flag`, and
 /// **does not attach the container** — so a Docker too old for this fails
 /// the connect, which the caller treats as a hard error and fails the
-/// create. The failure mode is a refused session, never a session on a
-/// network wired differently from what was asked for.
+/// create (asserted in `macos_session`'s
+/// `session_bridge_attach_declines_the_default_route_and_a_refusal_fails_the_setup`).
+/// The failure mode is a refused session, never a session on a network
+/// wired differently from what was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointGatewayPriority {
     /// Docker's default — this endpoint takes part in the election

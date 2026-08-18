@@ -1947,14 +1947,29 @@ changed. It is a lead for whoever owns that defect, not a finding about it.
 
 **On the flag's version requirement, stated to its evidence.** `--gw-priority` is
 **verified working on Docker 29.1.3** (the gateway VM's). It is documented as introduced in
-Docker 28; **the lower bound is not measured here**, so no floor is asserted. What *is*
-measured is the failure mode, which matters more: `docker network connect` given an
-unsupported flag exits **125**, prints `unknown flag`, and **does not attach the container**
-(inspect after the failed call lists only the networks it already had). The daemon treats a
-non-zero connect as a hard error and the create path tears the session down
-(`macos_session.rs`, the `!output.status.success()` branch; `main.rs` step 11's error arm) —
-so an older in-VM Docker yields a **refused create**, never a session on a silently
-mis-wired network. The CLI half is measured; the daemon half is a code read.
+Docker 28; **the lower bound is not measured here**, so no floor is asserted. What makes an
+unmeasured floor safe to leave unmeasured is the failure mode, and that is measured in two
+halves — with what remains reasoned marked as such.
+
+1. **Docker's side — measured, by analogue.** `docker network connect` given an
+   unsupported flag exits **125**, prints `unknown flag`, and **does not attach the
+   container** (inspect after the failed call lists only the networks it already had).
+   Flags are parsed client-side, so this is the same path an older CLI takes for
+   `--gw-priority` — but it was produced with a deliberately nonexistent flag on a *new*
+   CLI. **No older Docker was run.**
+2. **The daemon's side — measured, hermetically.** `macos_session::tests::`
+   `session_bridge_attach_declines_the_default_route_and_a_refusal_fails_the_setup` drives
+   the real setup path over a recording route whose `NetworkConnect` returns exit 125 with
+   `unknown flag` on stderr, and asserts the refusal propagates as an error naming both the
+   bridge and Docker's message — not a warning, not a gateway left attached differently
+   from what was asked for. The same test asserts the production call site carries
+   `NeverDefaultGateway`, and it was verified to fail when that is reverted to Docker's
+   default.
+3. **Still reasoned, not measured:** that the create *handler* then tears the session down
+   and marks it `Error` (`main.rs` step 11's error arm) is a code read.
+
+So an older in-VM Docker yields a **refused create**, never a session on a silently
+mis-wired network.
 
 ### 2.6 Two singletons that must become per-operator
 

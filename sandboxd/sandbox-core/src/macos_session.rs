@@ -903,6 +903,149 @@ mod tests {
         );
     }
 
+    // -- The session-bridge attach (hermetic, over a recording route) --------
+
+    /// A route whose executor records every op and can be told to refuse the
+    /// attach — enough to observe what the setup path asks for, and what it
+    /// does when Docker says no.
+    #[cfg(target_os = "macos")]
+    struct RecordingExecutor {
+        ops: std::sync::Mutex<Vec<DockerOp>>,
+        /// When set, `NetworkConnect` fails with this on stderr.
+        refuse_connect_with: Option<String>,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[async_trait::async_trait]
+    impl crate::docker::DockerExecutor for RecordingExecutor {
+        fn run(
+            &self,
+            _op_uid: u32,
+            op: DockerOp,
+            _timeout: Duration,
+            _label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            use std::os::unix::process::ExitStatusExt;
+
+            let is_connect = matches!(op, DockerOp::NetworkConnect { .. });
+            self.ops.lock().expect("op log").push(op);
+
+            match (&self.refuse_connect_with, is_connect) {
+                (Some(stderr), true) => Ok(std::process::Output {
+                    // Docker's own exit code for a command line it will not
+                    // accept, which is what an unsupported flag produces.
+                    status: std::process::ExitStatus::from_raw(125 << 8),
+                    stdout: Vec::new(),
+                    stderr: stderr.as_bytes().to_vec(),
+                }),
+                _ => Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }),
+            }
+        }
+
+        async fn open_stream(
+            &self,
+            _op_uid: u32,
+            _stream: crate::docker::DockerStream,
+        ) -> Result<crate::docker::DockerStreamConn, SandboxError> {
+            unreachable!("gateway setup opens no streams")
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_network_info() -> NetworkInfo {
+        NetworkInfo {
+            bridge_name: "sb-aabbccddeeff".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
+            docker_network_name: "sandbox-net-aabbccddeeff".to_string(),
+            vmnet_slot: None,
+            operator_uid: None,
+        }
+    }
+
+    /// Two properties of the session-bridge attach, both at the production
+    /// call site rather than in an argv-rendering test.
+    ///
+    /// **It declines the default-gateway election.** Attaching a network to
+    /// a running container re-runs that election and has been measured to
+    /// move the default route onto the new endpoint — which for this
+    /// container would be the session bridge, whose masquerade was
+    /// deliberately removed. Its route out is the egress bridge it was
+    /// started on, so the attach has to say so explicitly.
+    ///
+    /// **A refused attach fails the setup.** This is what makes it safe not
+    /// to assert a minimum Docker version for the flag: a daemon too old to
+    /// accept it refuses the command, and that refusal has to propagate as
+    /// an error rather than leaving a gateway wired to a bridge that leads
+    /// nowhere. Exercised with Docker's own exit code for a command line it
+    /// will not accept.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_bridge_attach_declines_the_default_route_and_a_refusal_fails_the_setup() {
+        let executor = std::sync::Arc::new(RecordingExecutor {
+            ops: std::sync::Mutex::new(Vec::new()),
+            refuse_connect_with: Some("unknown flag: --gw-priority\n".to_string()),
+        });
+        let route = DockerRoute::Vm {
+            op_uid: TEST_OPERATOR_UID,
+            executor: executor.clone(),
+        };
+        let session_id = SessionId::parse("aabbccddeeff").unwrap();
+
+        let err = setup_macos_lite_gateway(
+            &session_id,
+            &test_network_info(),
+            &route,
+            "sandbox-gateway:test",
+            None,
+            None,
+            None,
+        )
+        .expect_err("a refused attach must fail gateway setup");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown flag"),
+            "the failure must carry what Docker refused, so an operator can \
+             see why; got: {msg}"
+        );
+        assert!(
+            msg.contains("sandbox-net-aabbccddeeff"),
+            "the failure must name the bridge it could not attach; got: {msg}"
+        );
+
+        let ops = executor.ops.lock().expect("op log");
+        let connect = ops
+            .iter()
+            .find(|op| matches!(op, DockerOp::NetworkConnect { .. }))
+            .expect("setup must attach the session bridge");
+        match connect {
+            DockerOp::NetworkConnect {
+                network,
+                ip,
+                gateway_priority,
+                ..
+            } => {
+                assert_eq!(
+                    *gateway_priority,
+                    EndpointGatewayPriority::NeverDefaultGateway,
+                    "the session-bridge endpoint must decline the default-gateway \
+                     election; with it left at Docker's default the gateway \
+                     container's own route out moves onto a bridge that no longer \
+                     masquerades",
+                );
+                assert_eq!(network, "sandbox-net-aabbccddeeff");
+                assert_eq!(ip.as_deref(), Some("10.209.0.2"));
+            }
+            other => unreachable!("matched a connect op, got {other:?}"),
+        }
+    }
+
     // -- VmnetPool slot claim/release (hermetic, delegates to VmnetPool) ------
 
     #[cfg(target_os = "macos")]
