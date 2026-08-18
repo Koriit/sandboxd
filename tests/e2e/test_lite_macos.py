@@ -219,6 +219,16 @@ def _set_container_default_route(container: str, via: str) -> None:
     fails with ``Operation not permitted`` — the only way to reach this
     state is from the VM side, which is what makes it the lite analogue of
     the full backend's root guest rewriting its own routing table.
+
+    **The privilege here is the test's, not the exploit's.** Do not read
+    this as "the bypass needs root". A default route via the bridge is the
+    state Docker *starts every session container in*, before a single
+    process of ours runs — it costs no capability, no escalation, and no
+    exploit to be in it, only timing. The privileged exec exists because
+    the container cannot put itself back into a state it was born in: the
+    capabilities that would let it were dropped at create. So this call
+    reconstructs the window; it does not represent what an attacker would
+    have to do to reach it.
     """
     _gateway_vm_docker(
         "exec", "--privileged", "-u", "0", container,
