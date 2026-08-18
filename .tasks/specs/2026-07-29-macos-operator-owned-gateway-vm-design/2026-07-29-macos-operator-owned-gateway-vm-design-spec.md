@@ -1898,6 +1898,42 @@ network only after the route is installed. The first also closes the bypass in �
 assertion 4 structurally rather than only testing for it. **Verify the Linux lite path
 does not depend on that NAT before applying it cross-platform.**
 
+#### ✅ DONE — masquerade disabled, macOS lite only. The Linux check came back negative
+
+Run 2026-08-18 on the gateway VM's own Docker (29.1.3, Ubuntu 24.04 aarch64), with the
+argv the change emits. All **[M]**.
+
+**The bypass, before and after.** A probe whose default route points at the bridge:
+**exit 0 in 94 ms** with masquerade on — the #80 bypass, open — and **exit 28 at 8010 ms**
+with it off. Closed, but by black-holing rather than refusing: `DOCKER-FORWARD` counts the
+SYNs (5, one per retry) as ACCEPTed, so they leave the VM un-SNAT'd and die past it, where
+nothing can return an RST or an ICMP error. **This is why §3.6 assertion 4's expected
+signature does not appear.** A REJECT rule scoped to the session bridge does produce it
+(**exit 7 in 3 ms**), but that rule is new per-session enforcement machinery outside the
+container netns, on both platforms, with its own teardown — a separate piece of work, and
+one that lands on the route helper's authorization surface.
+
+**The Linux check: the Linux lite path *does* depend on that NAT — so it is not applied
+there.** On Linux the gateway container is created with a single NIC, on the session
+bridge itself (`gateway.rs:566-574`), and `sandboxd-egress` does not exist — it is created
+inside the macOS gateway VM (`gateway_lima.rs:1596`, a `#[cfg(target_os = "macos")]`
+module). That bridge's masquerade is therefore what NATs every *allowed* flow out of a
+Linux host, not merely the bypass; a container whose only NIC is on a masquerade-off
+bridge measured **exit 28** to the internet. The option is now set only for bridges created
+on the in-VM route (macOS lite), which is the branch this instruction exists to choose.
+
+**A second finding, without which the change ships broken.** With production's wiring —
+gateway container started on `sandboxd-egress`, session bridge attached afterwards
+(`macos_session.rs:379-459`) — the attach **moves the gateway container's default route
+onto the session bridge** (`default via 172.18.0.1 dev eth0` → `via 10.250.98.1 dev eth1`).
+So today allowed egress leaves via the *session bridge's* masquerade, not via
+`sandboxd-egress` as `docs/concepts/networking.md:341` describes; and with masquerade off
+the gateway container itself measured **exit 28**. Attaching with a gateway priority below
+Docker's default keeps its route on the uplink and restores egress (**exit 0 in 69 ms**),
+and is now part of the change. Untested here, and stated as an observation rather than a
+claim: the full backend's macvlan leg is attached the same way, and `macvlan_mode=private`
+blocks egress over it.
+
 ### 2.6 Two singletons that must become per-operator
 
 **The global recovery latch.** `AppState.gateway_recovering: Arc<AtomicBool>`
