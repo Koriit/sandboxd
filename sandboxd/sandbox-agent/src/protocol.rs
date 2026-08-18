@@ -594,6 +594,8 @@ pub enum InspectFormat {
     StateHealthStatus,
     StatePid,
     NetworkIpAddress,
+    /// The container's address on the shared egress bridge specifically.
+    EgressNetworkIpAddress,
 }
 
 /// How `docker inspect` spells its format flag.
@@ -932,6 +934,7 @@ impl From<InspectFormat> for sandbox_docker_argv::container::InspectFormat {
             InspectFormat::StateHealthStatus => Self::StateHealthStatus,
             InspectFormat::StatePid => Self::StatePid,
             InspectFormat::NetworkIpAddress => Self::NetworkIpAddress,
+            InspectFormat::EgressNetworkIpAddress => Self::EgressNetworkIpAddress,
         }
     }
 }
@@ -1125,6 +1128,7 @@ impl From<sandbox_docker_argv::container::InspectFormat> for InspectFormat {
             Src::StateHealthStatus => Self::StateHealthStatus,
             Src::StatePid => Self::StatePid,
             Src::NetworkIpAddress => Self::NetworkIpAddress,
+            Src::EgressNetworkIpAddress => Self::EgressNetworkIpAddress,
         }
     }
 }

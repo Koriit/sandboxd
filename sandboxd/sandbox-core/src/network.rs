@@ -150,6 +150,18 @@ pub struct NetworkInfo {
     /// rather than the record.
     #[serde(default)]
     pub operator_uid: Option<u32>,
+
+    /// The gateway container's address on the shared egress bridge, when it
+    /// has one (macOS lite only; `None` on Linux, where the gateway
+    /// container's single NIC is on the session bridge itself).
+    ///
+    /// Docker assigns it, so it changes with the container and is refreshed
+    /// every time the gateway container is created. It reaches the
+    /// enforcement plane: the gateway's own egress filter admits its
+    /// upstream leg by source address, and once the session bridge stops
+    /// masquerading, that leg sources from here instead.
+    #[serde(default)]
+    pub gateway_egress_ip: Option<String>,
 }
 
 /// Identity of a socket_vmnet slot claimed by a running macOS Lima session.
@@ -487,6 +499,7 @@ impl NetworkManager {
 
             if output.status.success() {
                 let info = NetworkInfo {
+                    gateway_egress_ip: None,
                     bridge_name,
                     subnet: subnet.clone(),
                     gateway_ip: gateway_ip.to_string(),
@@ -636,6 +649,30 @@ impl NetworkManager {
             "Docker bridge network deleted"
         );
 
+        Ok(())
+    }
+
+    /// Replace the tracked `NetworkInfo` for a session.
+    ///
+    /// The subnet allocation is untouched — this rewrites the record the
+    /// daemon renders enforcement rules from, for values that are only
+    /// knowable once the gateway container exists (its address on the
+    /// shared egress bridge). Silently does nothing for a session with no
+    /// network, because there is then nothing whose record could drift.
+    pub fn set_network_info(
+        &self,
+        session_id: &SessionId,
+        info: &NetworkInfo,
+    ) -> Result<(), SandboxError> {
+        let mut nets = self
+            .networks
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+        if let Some((block_idx, existing)) = nets.get(session_id) {
+            let block_idx = *block_idx;
+            let _ = existing;
+            nets.insert(*session_id, (block_idx, info.clone()));
+        }
         Ok(())
     }
 
@@ -2120,6 +2157,7 @@ mod tests {
         let docker_network_name = format!("sandbox-net-{session_id}");
 
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: bridge_name.clone(),
             subnet: format!("{subnet_base}/28"),
@@ -2153,6 +2191,7 @@ mod tests {
     #[test]
     fn test_network_info_serialization() {
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "sb-550e8400-e2".to_string(),
             subnet: "10.209.0.0/28".to_string(),
@@ -2213,6 +2252,7 @@ mod tests {
         }
 
         let current = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: Some(501),
             bridge_name: "lima3".to_string(),
             subnet: "10.209.128.24/29".to_string(),
@@ -2246,6 +2286,7 @@ mod tests {
         let id2 = SessionId::generate();
 
         let info1 = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "sb-aaaaaaaaaaa".to_string(),
             subnet: "10.209.0.0/28".to_string(),
@@ -2256,6 +2297,7 @@ mod tests {
         };
 
         let info2 = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "sb-bbbbbbbbbbb".to_string(),
             subnet: "10.209.0.32/28".to_string(),
@@ -2335,6 +2377,7 @@ mod tests {
             socket_path: "/var/run/sandbox/vmnet/slot-3.sock".to_string(),
         };
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "lima3".to_string(),
             subnet: "10.209.128.24/29".to_string(),
@@ -2845,6 +2888,7 @@ mod tests {
 
             // Populate the full NetworkInfo (optional step after claim).
             let info = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
@@ -2874,6 +2918,7 @@ mod tests {
 
             let (s0, _, _, _) = pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
             let info = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
@@ -3096,6 +3141,7 @@ mod tests {
             let id1 = SessionId::generate();
 
             let info0 = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
@@ -3109,6 +3155,7 @@ mod tests {
                 }),
             };
             let info1 = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima2".to_string(),
                 subnet: "10.209.128.16/29".to_string(),
@@ -3140,6 +3187,7 @@ mod tests {
             let id = SessionId::generate();
 
             let info = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "sb-test".to_string(),
                 subnet: "10.209.0.0/28".to_string(),
@@ -3191,6 +3239,7 @@ mod tests {
             let id1 = SessionId::generate();
 
             let info0 = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
@@ -3204,6 +3253,7 @@ mod tests {
                 }),
             };
             let info1 = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima2".to_string(),
                 subnet: "10.209.128.16/29".to_string(),
@@ -3265,6 +3315,7 @@ mod tests {
             let pool = VmnetPool::new(4);
             let id = SessionId::generate();
             let info = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
@@ -3305,6 +3356,7 @@ mod tests {
             // claim_lima_slot simulates what create did at runtime.
             let (slot, subnet, gw, vm) = pool.claim_lima_slot(&id, TEST_OPERATOR_UID).unwrap();
             let info = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: format!("lima{}", slot.index),
                 subnet,
@@ -3371,6 +3423,7 @@ mod tests {
 
             // Construct two NetworkInfo entries (as if loaded from DB).
             let info_running = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima0".to_string(),
                 subnet: "10.209.128.0/29".to_string(),
@@ -3388,6 +3441,7 @@ mod tests {
             // restore_from_infos (the daemon releases the slot for stopped sessions
             // first and only restores running-session infos).
             let _info_stopped = NetworkInfo {
+                gateway_egress_ip: None,
                 operator_uid: None,
                 bridge_name: "lima1".to_string(),
                 subnet: "10.209.128.8/29".to_string(),

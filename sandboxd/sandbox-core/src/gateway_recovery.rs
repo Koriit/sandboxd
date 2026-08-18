@@ -423,6 +423,7 @@ mod tests {
     /// Minimal `NetworkInfo` suitable for stubs.
     fn stub_network_info() -> NetworkInfo {
         NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "lima0".into(),
             subnet: "10.0.0.0/29".into(),

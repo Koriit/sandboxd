@@ -4255,6 +4255,31 @@ fn gateway_for_probes(state: &AppState) -> Arc<GatewayManager> {
     Arc::clone(&state.gateway)
 }
 
+/// Record the gateway container's address on the shared egress bridge.
+///
+/// Docker assigns it when the gateway container is created, so it changes
+/// with the container and is read on every create and start. It has to be
+/// persisted rather than used once: the enforcement ruleset is re-rendered
+/// on every DNS-propagation pass from the session's stored `NetworkInfo`,
+/// and a pass rendering it without this address would take the gateway's
+/// own upstream leg out of its egress filter — a healthy control plane
+/// with a dead data plane.
+#[cfg(target_os = "macos")]
+fn record_gateway_egress_ip(
+    state: &AppState,
+    session_id: &sandbox_core::session::SessionId,
+    caller_username: &str,
+    network_info: &sandbox_core::network::NetworkInfo,
+    egress_ip: &str,
+) -> Result<(), SandboxError> {
+    let mut updated = network_info.clone();
+    updated.gateway_egress_ip = Some(egress_ip.to_string());
+    state.network.set_network_info(session_id, &updated)?;
+    state
+        .store
+        .set_network_info(session_id, caller_username, &updated)
+}
+
 /// Return a `GatewayManager` suitable for the policy/DNS distribution plane
 /// (policy apply, DNS propagation, the synchronous DNS gate) against the
 /// given session's gateway.
@@ -4409,6 +4434,7 @@ async fn create_session_macos_lima(
     };
     let docker_network_name = format!("sandbox-net-{session_id}");
     let network_info = NetworkInfo {
+        gateway_egress_ip: None,
         // Persisted so a restart routes this claim back to the same pool
         // without having to re-resolve a username against the directory.
         operator_uid: Some(operator.uid),
@@ -5538,7 +5564,28 @@ async fn create_session_macos_lite(
         })
         .await
         {
-            Ok(Ok(())) => {}
+            // The gateway's egress-side address is discovered during setup
+            // and belongs to the session's network info: the enforcement
+            // ruleset is re-rendered on every DNS propagation pass, and a
+            // pass that could not see this address would re-render the
+            // gateway's own upstream leg out of its egress filter.
+            Ok(Ok(egress_ip)) => {
+                if let Err(e) = record_gateway_egress_ip(
+                    &state,
+                    &session_id,
+                    &operator.name,
+                    &network_info,
+                    &egress_ip,
+                ) {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to record the gateway's egress-side address; the \
+                         next policy propagation would drop it from the gateway's \
+                         own egress filter"
+                    );
+                }
+            }
             Ok(Err(e)) => {
                 // Best-effort: stop gateway container (may not have started yet).
                 let gw = sandbox_core::GatewayManager::with_route(state.docker.clone());
@@ -6303,6 +6350,7 @@ async fn start_session_macos_lima(
     };
     let docker_network_name = format!("sandbox-net-{session_id}");
     let network_info = NetworkInfo {
+        gateway_egress_ip: None,
         operator_uid: Some(operator.uid),
         bridge_name: nic_name.clone(),
         subnet: subnet_cidr,
@@ -10145,7 +10193,24 @@ async fn restore_session_networking_lite(
         })
         .await
         {
-            Ok(Ok(())) => {}
+            // Same reason as the create path: the address is per-container,
+            // so a restart discovers a new one and the stored copy must
+            // follow it.
+            Ok(Ok(egress_ip)) => {
+                if let Err(e) = record_gateway_egress_ip(
+                    state,
+                    session_id,
+                    caller_username,
+                    &network_info,
+                    &egress_ip,
+                ) {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to record the gateway's egress-side address on start"
+                    );
+                }
+            }
             Ok(Err(e)) => {
                 let net = state.network.clone();
                 let drop_route = state.docker.clone();

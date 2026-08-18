@@ -500,6 +500,7 @@ mod tests {
 
     fn slot_info(slot: u16, operator_uid: Option<u32>) -> NetworkInfo {
         NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid,
             bridge_name: format!("lima{slot}"),
             subnet: "10.209.128.0/29".to_string(),

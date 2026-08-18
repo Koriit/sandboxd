@@ -543,6 +543,7 @@ mod tests {
 
     fn test_network_info() -> NetworkInfo {
         NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "sb-test1234567".to_string(),
             subnet: "10.209.0.0/28".to_string(),

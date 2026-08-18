@@ -740,6 +740,21 @@ pub(crate) fn render_two_table_ruleset(
     let tcp_elements_block = format_nft_set_elements(tcp_elements);
     let udp_elements_block = format_nft_set_elements(udp_elements);
 
+    // The gateway's upstream leg sources from whichever of its addresses
+    // the default route selects. On Linux it has exactly one and this is
+    // empty, leaving the rendered ruleset byte-identical to before.
+    let egress_source_rules = match network_info.gateway_egress_ip.as_deref() {
+        Some(egress_ip) => {
+            let tcp_set = NFT_POLICY_ALLOW_TCP_SET;
+            let udp_set = NFT_POLICY_ALLOW_UDP_SET;
+            format!(
+                "        ip saddr {egress_ip} ip daddr . tcp dport @{tcp_set} accept\n\
+                 \x20       ip saddr {egress_ip} ip daddr . udp dport @{udp_set} accept\n"
+            )
+        }
+        None => String::new(),
+    };
+
     format!(
         r#"table inet sandbox_dnat {{}}
 flush table inet sandbox_dnat
@@ -817,9 +832,16 @@ table inet sandbox_policy {{
         # MITM). Keyed on the same set as the VM-egress DNAT decision so
         # a rule that admits VM traffic also admits the gateway's
         # upstream leg.
+        #
+        # Scoped by source to the gateway's own addresses. Which one the
+        # kernel picks depends on which NIC carries the default route, so
+        # the egress-side address is admitted too wherever the container
+        # has one — see `NetworkInfo::gateway_egress_ip`. Both are the
+        # gateway's; nothing else in this namespace is admitted, and the
+        # destination set is still what decides where it may go.
         ip saddr {gateway_ip} ip daddr . tcp dport @{tcp_set} accept
         ip saddr {gateway_ip} ip daddr . udp dport @{udp_set} accept
-
+{egress_source_rules}
         # Fall-through: reject anything else originated by the gateway.
         reject
     }}
@@ -2054,6 +2076,7 @@ mod tests {
 
     fn test_network_info() -> NetworkInfo {
         NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "sb-test1234567".to_string(),
             subnet: "10.209.0.0/28".to_string(),
@@ -5822,5 +5845,76 @@ mod tests {
                  expected tail:\n{ref_tail}\n\nactual tail:\n{tail}"
             );
         }
+    }
+
+    /// The gateway's egress filter admits its upstream leg by source
+    /// address. Which address that is depends on which NIC carries the
+    /// default route, so where the container has an egress-side address
+    /// the chain admits that one too — otherwise every flow the gateway
+    /// originates hits the fall-through `reject`, which is a dead data
+    /// plane behind a healthy control plane.
+    #[test]
+    fn gateway_output_chain_admits_the_egress_side_source_when_there_is_one() {
+        let mut ni = test_network_info();
+        ni.gateway_egress_ip = Some("172.18.0.2".to_string());
+        let nft = render_two_table_ruleset(&["1.2.3.4 . 80".to_string()], &[], &ni);
+
+        assert!(
+            nft.contains("ip saddr 172.18.0.2 ip daddr . tcp dport @policy_allow_tcp accept"),
+            "the egress-side source must be admitted; got:\n{nft}"
+        );
+        assert!(
+            nft.contains(&format!(
+                "ip saddr {} ip daddr . tcp dport @policy_allow_tcp accept",
+                ni.gateway_ip
+            )),
+            "the session-side source must stay admitted; got:\n{nft}"
+        );
+    }
+
+    /// What the predicate still excludes, pinned: the chain remains
+    /// source-scoped to the gateway's own two addresses and still ends in
+    /// `reject`. A third source — anything else that might come to share
+    /// this namespace — is not admitted by widening, because nothing was
+    /// widened; a second address was named.
+    #[test]
+    fn gateway_output_chain_stays_source_scoped_and_still_rejects() {
+        let mut ni = test_network_info();
+        ni.gateway_egress_ip = Some("172.18.0.2".to_string());
+        let nft = render_two_table_ruleset(&["1.2.3.4 . 80".to_string()], &[], &ni);
+        let output_chain = nft
+            .split("chain output {")
+            .nth(1)
+            .expect("the output chain is rendered");
+
+        for line in output_chain.lines() {
+            let rule = line.trim();
+            if !rule.contains("@policy_allow") {
+                continue;
+            }
+            assert!(
+                rule.starts_with("ip saddr "),
+                "every allow-set rule must name a source; unscoped rule: {rule}"
+            );
+        }
+        assert!(
+            output_chain.contains("reject"),
+            "the chain must still end in a reject; got:\n{output_chain}"
+        );
+    }
+
+    /// Linux has no egress bridge, so the rendered ruleset is unchanged
+    /// there — the same bytes it produced before this field existed.
+    #[test]
+    fn without_an_egress_address_the_ruleset_is_unchanged() {
+        let ni = test_network_info();
+        assert!(ni.gateway_egress_ip.is_none());
+        let nft = render_two_table_ruleset(&[], &[], &ni);
+        assert_eq!(
+            nft.matches("ip daddr . tcp dport @policy_allow_tcp accept")
+                .count(),
+            1,
+            "exactly one source-scoped TCP allow rule when there is one address"
+        );
     }
 }

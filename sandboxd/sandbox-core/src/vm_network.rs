@@ -132,6 +132,7 @@ mod tests {
     #[test]
     fn test_guest_script_for_network_info() {
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "sb-550e8400e29b".to_string(),
             subnet: "10.209.0.0/28".to_string(),

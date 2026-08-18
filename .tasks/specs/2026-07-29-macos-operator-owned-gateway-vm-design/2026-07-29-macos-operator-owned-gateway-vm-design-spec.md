@@ -1898,7 +1898,48 @@ network only after the route is installed. The first also closes the bypass in �
 assertion 4 structurally rather than only testing for it. **Verify the Linux lite path
 does not depend on that NAT before applying it cross-platform.**
 
-#### ✅ DONE — masquerade disabled, macOS lite only. The Linux check came back negative
+#### ✅ DONE — but it is three changes, not one. Read the prerequisite before choosing this means
+
+**⚠️ §2.5's first means has a dependency this section does not mention, and skipping it
+takes allowed egress out.** Disabling the session bridge's masquerade *requires* moving the
+gateway container's default route to its egress bridge — and moving that route *requires*
+editing the gateway's own egress filter, because that filter is **source-scoped to the
+address the old route selected**. `policy.rs:820-821` emits, into the gateway container's
+`sandbox_policy` `hook output` chain (`policy drop`, fall-through `reject`):
+
+```
+ip saddr {gateway_ip} ip daddr . tcp dport @policy_allow_tcp accept
+ip saddr {gateway_ip} ip daddr . udp dport @policy_allow_udp accept
+```
+
+with `gateway_ip` the gateway's **session-bridge** address. Every flow the gateway
+originates — CoreDNS's upstream forward, Envoy's upstream leg — is admitted only while the
+kernel picks that source. The first attempt shipped means 1 + the route move without this,
+and the fall-through fired on everything the gateway originated: CoreDNS answering
+`rcode=SERVFAIL, ips=[]`, the gateway refused on `8.8.8.8:53` in **4 ms**, allowed egress
+from a session `curl (56) Recv failure`, **while health checks stayed green** — `oif "lo"
+accept` and `ct established,related accept` keep the control plane alive. Twelve
+container-backend tests regressed. It was reverted, then re-landed with the third change.
+
+**What shipped, in the order it must be understood:**
+
+1. the per-session bridge created with masquerade disabled (in-VM route only);
+2. the gateway's session-bridge endpoint declining the default-gateway election, so its
+   route out stays on `sandboxd-egress`;
+3. **the output chain admitting the gateway's egress-side source as well as its
+   session-side one**, threaded from a new `NetworkInfo::gateway_egress_ip` read from
+   Docker on every gateway-container create and start — Docker assigns it per container,
+   and a stale value silently rejects the gateway's own traffic again.
+
+**The chain stays source-scoped.** A second address was *named*; the predicate was not
+dropped. It still excludes every source that is not one of the gateway's own two
+addresses, the destination allow-set still decides where those sources may go, and the
+fall-through `reject` is unchanged. Measured on a live session: with both admitted the
+allowed request returns **200**; with the session-side pair deleted, name resolution stops;
+without the egress-side pair (the first attempt) nothing the gateway originates leaves at
+all. **Both are load-bearing.**
+
+#### The measurements behind it — masquerade disabled, macOS lite only. The Linux check came back negative
 
 Run 2026-08-18 on the gateway VM's own Docker (29.1.3, Ubuntu 24.04 aarch64), with the
 argv the change emits. All **[M]**.
@@ -2935,7 +2976,9 @@ It is deferred because it is per-session filter machinery outside the container 
 both platforms, with its own teardown, landing on the route helper's authorization
 surface — a session of work, not a clause. **Do not read the deferral as an open bypass.**
 
-Landed as `TestLiteMacosBypassResistance` in `tests/e2e/test_lite_macos.py`.
+Landed as `TestLiteMacosBypassResistance` in `tests/e2e/test_lite_macos.py`, and passing
+against the shipped change — which required the enforcement-chain prerequisite recorded at
+§2.5 → *✅ DONE*.
 
 - **This is still the only test of *topological* control rather than *policy* control**, and
   it is the lite analogue of the spec-mandated full-backend regression

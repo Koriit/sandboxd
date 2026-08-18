@@ -265,6 +265,7 @@ mod integration_macos_session_lifecycle {
         let nic_name = format!("lima{slot_idx}");
 
         let network_info = sandbox_core::NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: nic_name.clone(),
             subnet: subnet_cidr.clone(),
@@ -483,6 +484,7 @@ mod integration_macos_session_lifecycle {
         let nic_name = format!("lima{}", vmnet_slot.index);
 
         let network_info = sandbox_core::NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: nic_name.clone(),
             subnet: subnet_cidr,
@@ -584,6 +586,7 @@ mod integration_macos_session_lifecycle {
         let _slot_idx = vmnet_slot.index; // not used after claim; slot released via release_lima_slot
 
         let network_info = sandbox_core::NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: "nonexistent_nic_xyz".to_string(),
             subnet: subnet_cidr,
@@ -733,6 +736,7 @@ mod integration_macos_session_lifecycle {
         assert_eq!(pool.running_session_count(), 0);
 
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: format!("lima{}", vmnet_slot.index),
             subnet: subnet_cidr,
@@ -934,6 +938,7 @@ mod integration_macos_session_lifecycle {
 
         // Record the full NetworkInfo so the pool tracks the mapping.
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: format!("lima{slot_idx}"),
             subnet: subnet.clone(),
@@ -1055,6 +1060,7 @@ mod integration_macos_session_lifecycle {
         // Step 7: restore_from_infos is called only for confirmed-Running sessions.
         // The dead session's info is excluded — only the running session is restored.
         let info_running = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: Some(TEST_OPERATOR_UID),
             bridge_name: format!("lima{}", slot_r.index),
             subnet: subnet_r,

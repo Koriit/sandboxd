@@ -23,7 +23,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
-use sandbox_docker_argv::container::RemoveForce;
+use sandbox_docker_argv::container::{InspectFlag, InspectFormat, RemoveForce};
 #[cfg(target_os = "macos")]
 use sandbox_docker_argv::gateway::GatewayFile;
 use sandbox_docker_argv::network::{
@@ -359,7 +359,7 @@ pub fn setup_macos_lite_gateway(
     ca_dir: Option<&Path>,
     initial_dns_policy: Option<&str>,
     owner_pool: Option<&str>,
-) -> Result<(), SandboxError> {
+) -> Result<String, SandboxError> {
     let container_name = macos_gateway_container_name(session_id);
     // The per-session bridge was created by create_network_on_socket
     // and follows the same naming convention as the macvlan case.
@@ -473,6 +473,43 @@ pub fn setup_macos_lite_gateway(
         );
     }
 
+    // Step 8a: read the address Docker gave the gateway on the egress
+    // bridge. The gateway's own egress filter admits its upstream leg by
+    // source address, and with the session bridge no longer masquerading
+    // that leg sources from here — so the ruleset injected below has to
+    // name it. Docker assigns it per container, which is why it is read
+    // here, on the create path, rather than remembered.
+    let egress_ip = {
+        let output = docker.run(
+            DockerOp::ContainerInspect {
+                name: container_name.clone(),
+                format: InspectFormat::EgressNetworkIpAddress,
+                flag: InspectFlag::Short,
+            },
+            DOCKER_CONNECT_TIMEOUT,
+            "docker inspect (gateway egress address)",
+        )?;
+        let addr = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || addr.is_empty() || addr == "<no value>" {
+            return Err(SandboxError::Gateway(format!(
+                "could not read {container_name}'s address on {}: without it the \
+                 gateway's own upstream leg is not admitted by its egress filter",
+                crate::gateway_lima::EGRESS_BRIDGE_NAME
+            )));
+        }
+        debug!(
+            session_id = %session_id,
+            container = %container_name,
+            egress_ip = %addr,
+            "gateway egress-side address discovered"
+        );
+        addr
+    };
+    let network_info = &NetworkInfo {
+        gateway_egress_ip: Some(egress_ip.clone()),
+        ..network_info.clone()
+    };
+
     // Steps 9-11: Use GatewayManager over the forwarded socket for nft and health.
     {
         use crate::gateway::GatewayManager;
@@ -487,7 +524,7 @@ pub fn setup_macos_lite_gateway(
         container = %container_name,
         "macOS lite gateway fully initialised"
     );
-    Ok(())
+    Ok(egress_ip)
 }
 
 /// The `docker run` op for a session's gateway container inside the VM.
@@ -958,6 +995,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn test_network_info() -> NetworkInfo {
         NetworkInfo {
+            gateway_egress_ip: None,
             bridge_name: "sb-aabbccddeeff".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
@@ -1098,6 +1136,7 @@ mod tests {
 
         // Simulate partial create: set_lima_network_info was called.
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: format!("lima{}", slot.index),
             subnet: subnet_cidr,
@@ -1126,6 +1165,7 @@ mod tests {
     fn test_vmnet_slot_json_roundtrip() {
         use crate::network::{NetworkInfo, VmnetSlot};
         let info = NetworkInfo {
+            gateway_egress_ip: None,
             operator_uid: None,
             bridge_name: "lima2".to_string(),
             subnet: "10.209.128.16/29".to_string(),

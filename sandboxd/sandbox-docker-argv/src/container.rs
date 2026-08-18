@@ -331,6 +331,14 @@ pub enum InspectFormat {
     /// `{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}` — the
     /// container's address on its attached network.
     NetworkIpAddress,
+    /// The container's address on the shared egress bridge specifically.
+    ///
+    /// Distinct from [`InspectFormat::NetworkIpAddress`], which ranges over
+    /// every attached network and concatenates: a gateway container has two
+    /// NICs, so that template returns both addresses run together. This one
+    /// names the bridge, and the name is a constant of this crate rather
+    /// than anything a caller supplies.
+    EgressNetworkIpAddress,
 }
 
 impl InspectFormat {
@@ -343,6 +351,9 @@ impl InspectFormat {
             InspectFormat::StatePid => "{{.State.Pid}}",
             InspectFormat::NetworkIpAddress => {
                 "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+            }
+            InspectFormat::EgressNetworkIpAddress => {
+                "{{(index .NetworkSettings.Networks \"sandboxd-egress\").IPAddress}}"
             }
         }
     }

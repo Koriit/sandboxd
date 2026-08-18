@@ -1880,6 +1880,7 @@ mod tests {
     #[test]
     fn the_dnat_step_is_paired_with_its_generators() {
         let network_info = NetworkInfo {
+            gateway_egress_ip: None,
             bridge_name: "sb-550e8400e29b".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
@@ -1959,6 +1960,7 @@ mod tests {
         });
         let session_id = SessionId::parse("550e8400e29b").unwrap();
         let network_info = NetworkInfo {
+            gateway_egress_ip: None,
             bridge_name: "sb-550e8400e29b".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),

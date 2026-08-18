@@ -128,6 +128,7 @@ fn seeded_dns_cache() -> DnsCache {
 /// collision with other integration tests that might run in parallel.
 fn test_network_info() -> NetworkInfo {
     NetworkInfo {
+        gateway_egress_ip: None,
         operator_uid: None,
         bridge_name: "sb-validator-test".to_string(),
         subnet: "10.209.15.0/28".to_string(),
