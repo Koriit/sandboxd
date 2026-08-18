@@ -37,7 +37,7 @@ use sandbox_docker_argv::container::{
 };
 use sandbox_docker_argv::gateway::StdinCommand;
 use sandbox_docker_argv::image::StagedImage;
-use sandbox_docker_argv::network::{EndpointGatewayPriority, NetworkCreateSpec};
+use sandbox_docker_argv::network::NetworkCreateSpec;
 
 use crate::error::SandboxError;
 
@@ -123,14 +123,11 @@ pub enum DockerOp {
     NetworkRemove { name: String },
     /// Inspect a Docker network (presence check).
     NetworkInspect { name: String },
-    /// Attach a container to a network, optionally pinning its address and
-    /// declaring whether the new endpoint may become the container's
-    /// default route.
+    /// Attach a container to a network, optionally pinning its address.
     NetworkConnect {
         network: String,
         container: String,
         ip: Option<String>,
-        gateway_priority: EndpointGatewayPriority,
     },
     /// List network names matching a prefix and, optionally, an owner pool.
     NetworkList {
@@ -236,8 +233,7 @@ impl DockerOp {
                 network: net,
                 container: ctr,
                 ip,
-                gateway_priority,
-            } => network::network_connect_argv(net, ctr, ip.as_deref(), *gateway_priority),
+            } => network::network_connect_argv(net, ctr, ip.as_deref()),
             DockerOp::NetworkList {
                 name_prefix,
                 owner_pool,
@@ -915,7 +911,6 @@ mod tests {
                 network: "n".to_string(),
                 container: "c".to_string(),
                 ip: Some("10.209.0.2".to_string()),
-                gateway_priority: EndpointGatewayPriority::NeverDefaultGateway,
             },
             DockerOp::NetworkList {
                 name_prefix: "sandbox-net-".to_string(),

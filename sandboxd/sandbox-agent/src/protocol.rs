@@ -538,8 +538,6 @@ pub enum DockerOp {
         network: String,
         container: String,
         ip: Option<String>,
-        #[serde(default)]
-        gateway_priority: EndpointGatewayPriority,
     },
     /// `docker network ls` filtered by name prefix and optional owner pool.
     NetworkList {
@@ -720,22 +718,6 @@ pub enum StagedImage {
 pub enum NetworkDriver {
     Bridge,
     Macvlan,
-}
-
-/// Whether an endpoint being attached may become the container's default
-/// route.
-///
-/// Nullary, like [`NetworkOption::MacvlanModePrivate`]: the daemon says
-/// which of the two intents it has, and the number Docker is given is the
-/// agent's to choose. Older daemons do not send the field at all, which
-/// deserializes as [`EndpointGatewayPriority::Default`] — Docker's own
-/// behaviour, and what those daemons already relied on.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EndpointGatewayPriority {
-    #[default]
-    Default,
-    NeverDefaultGateway,
 }
 
 /// The enumerated `--opt key=value` pairs a network may carry.
@@ -1168,25 +1150,6 @@ impl From<sandbox_docker_argv::network::NetworkDriver> for NetworkDriver {
         match value {
             Src::Bridge => Self::Bridge,
             Src::Macvlan => Self::Macvlan,
-        }
-    }
-}
-
-impl From<EndpointGatewayPriority> for sandbox_docker_argv::network::EndpointGatewayPriority {
-    fn from(value: EndpointGatewayPriority) -> Self {
-        match value {
-            EndpointGatewayPriority::Default => Self::Default,
-            EndpointGatewayPriority::NeverDefaultGateway => Self::NeverDefaultGateway,
-        }
-    }
-}
-
-impl From<sandbox_docker_argv::network::EndpointGatewayPriority> for EndpointGatewayPriority {
-    fn from(value: sandbox_docker_argv::network::EndpointGatewayPriority) -> Self {
-        use sandbox_docker_argv::network::EndpointGatewayPriority as Src;
-        match value {
-            Src::Default => Self::Default,
-            Src::NeverDefaultGateway => Self::NeverDefaultGateway,
         }
     }
 }
@@ -1638,8 +1601,7 @@ pub fn docker_argv(op: &crate::protocol::DockerOp) -> Result<Vec<String>, String
             network: net,
             container: ctr,
             ip,
-            gateway_priority,
-        } => network::network_connect_argv(net, ctr, ip.as_deref(), (*gateway_priority).into()),
+        } => network::network_connect_argv(net, ctr, ip.as_deref()),
         DockerOp::NetworkList {
             name_prefix,
             owner_pool,

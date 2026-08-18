@@ -1898,7 +1898,52 @@ network only after the route is installed. The first also closes the bypass in �
 assertion 4 structurally rather than only testing for it. **Verify the Linux lite path
 does not depend on that NAT before applying it cross-platform.**
 
-#### ✅ DONE — masquerade disabled, macOS lite only. The Linux check came back negative
+#### ⛔ ATTEMPTED AND REVERTED — this means cannot ship as specified. Read the blocker first
+
+**The blocker, stated before the supporting detail because it governs the whole item:
+the gateway container's own egress filter is source-pinned to its session-bridge
+address.** `policy.rs:820-821` emits, into the gateway container's `sandbox_policy`
+`hook output` chain (`policy drop`):
+
+```
+ip saddr {gateway_ip} ip daddr . tcp dport @policy_allow_tcp accept
+ip saddr {gateway_ip} ip daddr . udp dport @policy_allow_udp accept
+reject
+```
+
+where `gateway_ip` is the gateway container's address **on the session bridge**. So every
+flow the gateway *originates* — CoreDNS's upstream forward, Envoy's upstream leg,
+mitmproxy's — is admitted only while the kernel picks that address as its source, which
+happens only while the gateway's default route points at the session bridge. That is a
+standing dependency on the exact route this change moves.
+
+The two halves of the change are therefore jointly unsatisfiable as written:
+
+- **Masquerade off, route left alone** → the gateway keeps source `gateway_ip` and passes
+  its own filter, but the session bridge no longer NATs, so the traffic dies past the VM.
+  Measured: gateway egress **exit 28**.
+- **Masquerade off, route pinned to the egress bridge** (what shipped) → the NAT is there
+  and the route is right, but the source becomes the egress-side address, **no rule
+  matches, and the chain's fall-through `reject` fires**. Measured on a live session:
+  CoreDNS answering `rcode=SERVFAIL, ips=[]`, gateway TCP to `8.8.8.8:53` refused in
+  **4 ms**, allowed egress from the session `curl (56) Recv failure` — while health checks
+  stayed green, because `oif "lo" accept` and `ct established,related accept` keep the
+  control plane alive. Control plane up, data plane dead.
+
+**Reverted on 2026-08-18** (code, durable test and the docs that described the new
+default). The suite regression it caused is described in the milestone entry; the
+comparator passes and HEAD failed the same single test on the same host minutes apart,
+which is how the attribution was established.
+
+**What a working version needs.** The gateway's output chain must admit the gateway's
+*egress-side* source as well — either by threading that address in (it is knowable:
+`docker inspect` reports the container's `sandboxd-egress` address) or by dropping the
+source predicate and letting the destination allow-set carry the control, as it already
+does. **That is an edit to the egress-enforcement ruleset**, which §4 Phase 2 requires be
+reviewed as such; it is not a detail of the masquerade change and must not be smuggled in
+as one.
+
+The rest of this section records what was measured before the revert, and stands.
 
 Run 2026-08-18 on the gateway VM's own Docker (29.1.3, Ubuntu 24.04 aarch64), with the
 argv the change emits. All **[M]**.
@@ -1947,29 +1992,14 @@ changed. It is a lead for whoever owns that defect, not a finding about it.
 
 **On the flag's version requirement, stated to its evidence.** `--gw-priority` is
 **verified working on Docker 29.1.3** (the gateway VM's). It is documented as introduced in
-Docker 28; **the lower bound is not measured here**, so no floor is asserted. What makes an
-unmeasured floor safe to leave unmeasured is the failure mode, and that is measured in two
-halves — with what remains reasoned marked as such.
-
-1. **Docker's side — measured, by analogue.** `docker network connect` given an
-   unsupported flag exits **125**, prints `unknown flag`, and **does not attach the
-   container** (inspect after the failed call lists only the networks it already had).
-   Flags are parsed client-side, so this is the same path an older CLI takes for
-   `--gw-priority` — but it was produced with a deliberately nonexistent flag on a *new*
-   CLI. **No older Docker was run.**
-2. **The daemon's side — measured, hermetically.** `macos_session::tests::`
-   `session_bridge_attach_declines_the_default_route_and_a_refusal_fails_the_setup` drives
-   the real setup path over a recording route whose `NetworkConnect` returns exit 125 with
-   `unknown flag` on stderr, and asserts the refusal propagates as an error naming both the
-   bridge and Docker's message — not a warning, not a gateway left attached differently
-   from what was asked for. The same test asserts the production call site carries
-   `NeverDefaultGateway`, and it was verified to fail when that is reverted to Docker's
-   default.
-3. **Still reasoned, not measured:** that the create *handler* then tears the session down
-   and marks it `Error` (`main.rs` step 11's error arm) is a code read.
-
-So an older in-VM Docker yields a **refused create**, never a session on a silently
-mis-wired network.
+Docker 28; **the lower bound is not measured here**, so no floor is asserted. What *is*
+measured is the failure mode, which matters more: `docker network connect` given an
+unsupported flag exits **125**, prints `unknown flag`, and **does not attach the container**
+(inspect after the failed call lists only the networks it already had). The daemon treats a
+non-zero connect as a hard error and the create path tears the session down
+(`macos_session.rs`, the `!output.status.success()` branch; `main.rs` step 11's error arm) —
+so an older in-VM Docker yields a **refused create**, never a session on a silently
+mis-wired network. The CLI half is measured; the daemon half is a code read.
 
 ### 2.6 Two singletons that must become per-operator
 
@@ -2935,7 +2965,11 @@ It is deferred because it is per-session filter machinery outside the container 
 both platforms, with its own teardown, landing on the route helper's authorization
 surface — a session of work, not a clause. **Do not read the deferral as an open bypass.**
 
-Landed as `TestLiteMacosBypassResistance` in `tests/e2e/test_lite_macos.py`.
+⛔ **Not in effect.** The change this amendment was written against was reverted the same
+day — see §2.5 → *⛔ ATTEMPTED AND REVERTED*. The reasoning here stands and should be
+reused when the property is delivered; the test it describes
+(`TestLiteMacosBypassResistance`) came out with the revert, because the property it
+asserts is not true again yet.
 
 - **This is still the only test of *topological* control rather than *policy* control**, and
   it is the lite analogue of the spec-mandated full-backend regression
@@ -4012,12 +4046,12 @@ ops and share the serialization concern in §2.5.
 - [ ] Any `sh -c` path built from daemon-supplied input is validated agent-side against an
       allowlist. Watch `policy_distributor.rs:39-48` (no escaping of embedded quotes) and
       `macos_session.rs:786` (guarded only by a `debug_assert!`, compiled out in release).
-- [x] The pre-route window fails closed: a container whose route helper has not yet run
+- [ ] The pre-route window fails closed: a container whose route helper has not yet run
       **cannot** reach the internet (§2.5). Assert it directly. **Asserted by the same test
       as the criterion below, and that is not a shortcut**: a default route pointing at the
       bridge *is* the pre-route state — Docker's own route, unmodified — so the test rebuilds
       it on a running session rather than racing a window too short and too early to sample.
-- [x] **Bypass resistance now holds and is asserted** (§3.6 assertion 4, moved here): with
+- [ ] **Bypass resistance now holds and is asserted** (§3.6 assertion 4, moved here): with
       masquerade disabled, a probe whose default route points at the Docker bridge instead of
       the gateway container **cannot** reach the internet. Assert the route installed first.
       This is the property phase 0 could only record.
@@ -4029,7 +4063,7 @@ ops and share the serialization concern in §2.5.
         controls that discriminate it from a broken fixture, and the assertion must fail if
         a control leg does not succeed. Do not restore the clause on the reasonable-sounding
         grounds that a refusal is the better signature: it is, and it is a separate session.
-- [x] **The Linux lite path is confirmed not to depend on bridge masquerade** before the
+- [~] **The Linux lite path is confirmed not to depend on bridge masquerade** before the
       change ships — `network.rs:401-415` is shared code and `docker_socket` is `None` on
       Linux, so the same argv runs there. The check: create a Linux lite session with
       masquerade disabled on its network and confirm egress still works through the gateway.

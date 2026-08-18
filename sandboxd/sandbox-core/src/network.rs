@@ -30,56 +30,6 @@ const DELETE_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 const INSPECT_NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
-// Per-session bridge options
-// ---------------------------------------------------------------------------
-
-/// Driver options every per-session bridge carries.
-///
-/// One function rather than a literal at each call site, because the two
-/// creation paths — first create and the recreate-on-start path in
-/// [`NetworkManager::ensure_network`] — must not be able to drift apart. A
-/// session whose bridge was recreated with different options is a session
-/// with different egress properties.
-///
-/// # Masquerade, and why the answer depends on the route
-///
-/// Docker's bridge driver masquerades a network's subnet out of the host's
-/// uplink by default, which gives every container on the bridge a working
-/// path to the internet through the bridge's `.1` address from the instant
-/// it starts — before `sandbox-route-helper` has replaced that default
-/// route with the gateway container's address, and again any time something
-/// inside the container points its default route back at `.1`. The second
-/// one is the bypass no policy rule can see, because it never reaches the
-/// gateway container at all. Turning the NAT off removes the path instead
-/// of filtering it, and makes the pre-route state fail closed.
-///
-/// It can only be turned off where the gateway container has an uplink of
-/// its own, and that differs by platform:
-///
-/// - **In-VM bridges (macOS lite, [`DockerRoute::Vm`]).** The gateway
-///   container is started on the `sandboxd-egress` bridge and the session
-///   bridge is attached to it afterwards, so it keeps a route to the
-///   internet that does not depend on this NAT. Masquerade off.
-/// - **Host bridges ([`DockerRoute::Host`], Linux).** The gateway container
-///   has exactly one NIC, on the session bridge itself, and there is no
-///   `sandboxd-egress` — that bridge exists only inside the macOS gateway
-///   VM. Here the session bridge's masquerade *is* the gateway's uplink,
-///   and removing it takes out every allowed flow, not just the bypass.
-///   Masquerade left at Docker's default.
-///
-/// Note this is about the *gateway's* traffic, not the sandbox's: a session
-/// container's allowed traffic never consults this NAT either way, because
-/// it is addressed to the gateway container on the same bridge and never
-/// leaves it.
-fn session_bridge_options(bridge_name: &str, route: &DockerRoute) -> Vec<NetworkOption> {
-    let mut options = vec![NetworkOption::BridgeName(bridge_name.to_string())];
-    if matches!(route, DockerRoute::Vm { .. }) {
-        options.push(NetworkOption::BridgeMasquerade(false));
-    }
-    options
-}
-
-// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -470,7 +420,7 @@ impl NetworkManager {
                 gateway: None,
                 session_id: Some(session_id.to_string()),
                 owner_pool: Some(self.owner_pool.clone()),
-                options: session_bridge_options(&bridge_name, route),
+                options: vec![NetworkOption::BridgeName(bridge_name.clone())],
             };
             let output = route
                 .run(
@@ -742,7 +692,7 @@ impl NetworkManager {
             gateway: None,
             session_id: Some(session_id.to_string()),
             owner_pool: None,
-            options: session_bridge_options(&info.bridge_name, route),
+            options: vec![NetworkOption::BridgeName(info.bridge_name.clone())],
         };
         let output = route
             .run(
@@ -1796,39 +1746,6 @@ impl std::fmt::Display for OwnershipAssertionError {
 mod tests {
     use super::*;
 
-    /// A [`DockerRoute::Vm`] for tests that only ask the route *which* it
-    /// is. Nothing here runs an op — the option set is decided by the
-    /// variant, so the executor never has to answer.
-    fn test_vm_route() -> DockerRoute {
-        struct UnusedExecutor;
-
-        #[async_trait::async_trait]
-        impl crate::docker::DockerExecutor for UnusedExecutor {
-            fn run(
-                &self,
-                _op_uid: u32,
-                _op: DockerOp,
-                _timeout: Duration,
-                _label: &str,
-            ) -> Result<std::process::Output, SandboxError> {
-                unreachable!("these tests render argv; they run no ops")
-            }
-
-            async fn open_stream(
-                &self,
-                _op_uid: u32,
-                _stream: crate::docker::DockerStream,
-            ) -> Result<crate::docker::DockerStreamConn, SandboxError> {
-                unreachable!("these tests render argv; they open no streams")
-            }
-        }
-
-        DockerRoute::Vm {
-            op_uid: 501,
-            executor: std::sync::Arc::new(UnusedExecutor),
-        }
-    }
-
     // -- network ops -------------------------------------------------------
 
     /// The removal op names the network and nothing else. Which Docker
@@ -1843,84 +1760,6 @@ mod tests {
         .argv()
         .expect("network rm renders");
         assert_eq!(argv, vec!["network", "rm", "sandbox-net-abc123"]);
-    }
-
-    /// A bridge created inside the gateway VM is created with Docker's
-    /// masquerade turned off. This is the whole of the pre-route window's
-    /// fail-closed property: with the NAT in place, a container reaches the
-    /// internet through the bridge's `.1` from the instant it starts —
-    /// before the route helper has pointed it at the gateway, and again any
-    /// time something inside it rewrites its default route back.
-    #[test]
-    fn in_vm_session_bridge_disables_docker_masquerade() {
-        let argv = DockerOp::NetworkCreate {
-            spec: NetworkCreateSpec {
-                name: "sandbox-net-abc123".to_string(),
-                driver: NetworkDriver::Bridge,
-                subnet: Some("10.209.0.0/28".to_string()),
-                gateway: None,
-                session_id: Some("abc123".to_string()),
-                owner_pool: Some("10.209.0.0/20".to_string()),
-                options: session_bridge_options("sb-abc123", &test_vm_route()),
-            },
-        }
-        .argv()
-        .expect("network create renders");
-        assert!(
-            argv.windows(2).any(|w| w[0] == "--opt"
-                && w[1] == "com.docker.network.bridge.enable_ip_masquerade=false"),
-            "an in-VM session bridge must be created with masquerade disabled, \
-             got: {argv:?}"
-        );
-    }
-
-    /// The host route keeps Docker's default. On Linux the gateway
-    /// container has one NIC, on the session bridge itself, and no
-    /// `sandboxd-egress` to fall back on — the bridge's masquerade is what
-    /// carries every allowed flow out, so removing it would take out
-    /// legitimate egress rather than only the bypass.
-    #[test]
-    fn host_session_bridge_keeps_docker_masquerade() {
-        let argv = DockerOp::NetworkCreate {
-            spec: NetworkCreateSpec {
-                name: "sandbox-net-abc123".to_string(),
-                driver: NetworkDriver::Bridge,
-                subnet: Some("10.209.0.0/28".to_string()),
-                gateway: None,
-                session_id: Some("abc123".to_string()),
-                owner_pool: Some("10.209.0.0/20".to_string()),
-                options: session_bridge_options("sb-abc123", &DockerRoute::Host),
-            },
-        }
-        .argv()
-        .expect("network create renders");
-        assert!(
-            !argv
-                .iter()
-                .any(|arg| arg.starts_with("com.docker.network.bridge.enable_ip_masquerade")),
-            "a host session bridge must not name the masquerade option at all, \
-             got: {argv:?}"
-        );
-    }
-
-    /// The full option set, pinned per route. Both creation paths — first
-    /// create and the recreate-on-start path — read their options from this
-    /// one function, so pinning it here pins what a session's bridge is on
-    /// either path. A bridge recreated on start with a different option set
-    /// would be a session whose egress properties changed under it.
-    #[test]
-    fn session_bridge_options_are_pinned_per_route() {
-        assert_eq!(
-            session_bridge_options("sb-abc123", &test_vm_route()),
-            vec![
-                NetworkOption::BridgeName("sb-abc123".to_string()),
-                NetworkOption::BridgeMasquerade(false),
-            ],
-        );
-        assert_eq!(
-            session_bridge_options("sb-abc123", &DockerRoute::Host),
-            vec![NetworkOption::BridgeName("sb-abc123".to_string())],
-        );
     }
 
     /// The per-session bridge carries both labels the orphan reaper filters

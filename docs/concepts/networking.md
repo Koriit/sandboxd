@@ -44,16 +44,6 @@ When you create a session, sandboxd allocates a `/28` subnet from a configurable
 
 Because each session has its own bridge — a separate L2 segment — sessions cannot see each other's traffic. The gateway container attaches only to that session's bridge, so it has no visibility into the host network or other sessions either.
 
-### Is `.1` a way out? (macOS lite: no)
-
-`.1` is the bridge itself, and Docker's bridge driver masquerades a network's subnet out of the host's uplink by default. Where that default stands, `.1` is a working route to the internet that never passes the gateway container — which matters twice: a container is started before `sandbox-route-helper` has replaced Docker's default route with the gateway's address, and anything that can write the container's routing table can point it back at `.1` afterwards. Neither is reachable by policy, because the traffic never arrives at the thing that applies policy.
-
-**On macOS lite the per-session bridge is created with masquerade disabled** (`--opt com.docker.network.bridge.enable_ip_masquerade=false`), on both first create and the recreate that a `sandbox start` performs. There is then no NAT for the session subnet, so `.1` leads nowhere: the pre-route window fails closed, and the route the helper installs is the only route out. Traffic addressed to the gateway container is unaffected — it is on the same bridge and never leaves it. The regression test that holds this property is `TestLiteMacosBypassResistance` in `tests/e2e/test_lite_macos.py`.
-
-**On Linux the default stands, deliberately.** There the gateway container has a single NIC, on the session bridge itself, and no separate egress bridge to fall back on — so that bridge's masquerade is what carries every *allowed* flow out of the host. Removing it there would take out legitimate egress, not just the bypass. The bypass on Linux remains what issue #80 tracks.
-
-Because macOS lite's gateway container has an uplink of its own (`sandboxd-egress`, see [macOS networking topology](#macos-networking-topology)), it is attached to the session bridge with a gateway priority that keeps its default route on that uplink. Without that, attaching the second network moves its default route onto the session bridge — a bridge that now deliberately leads nowhere.
-
 ### The naming scheme
 
 Session IDs are 12 lowercase hex characters. Every per-session resource has a fixed name shape derived from the session id:
@@ -346,11 +336,9 @@ The gateway container has two NICs, serving opposite directions:
 | NIC | Type | IP | Role |
 | --- | ---- | --- | ---- |
 | VM-facing | `macvlan(private)` child of `limaN` | `B+3` | Receives traffic from the sandbox VM; nftables DNAT intercepts it |
-| Upstream egress | NIC on the shared `sandboxd-egress` Docker bridge | DHCP from bridge | The intended way out: re-originated upstream traffic exits here → gateway VM `eth0` → host → internet |
+| Upstream egress | NIC on the shared `sandboxd-egress` Docker bridge | DHCP from bridge | Default route out; re-originated upstream traffic exits here → gateway VM `eth0` → host → internet |
 
 `macvlan(private)` mode prevents macvlan-to-parent and macvlan-to-macvlan traffic — the gateway cannot egress over the VM-facing NIC, and two gateway containers on the same parent cannot reach each other at L2. The upstream egress NIC is on the shared `sandboxd-egress` NAT-masqueraded bridge, which the daemon creates once at gateway init. That bridge is the inside (trusted-infra) side only — no sandbox VM ever touches it.
-
-**Which NIC actually carries the default route is a Docker decision, and it does not always land where the table says.** The gateway container is started on `sandboxd-egress` and the session-side network is attached to it afterwards; attaching a network to a running container re-runs Docker's default-gateway election, which has been measured to move the default route onto the newly attached NIC. On the **lite** path the session-side attachment therefore declines that election explicitly (a gateway priority below Docker's default), so the route out stays on `sandboxd-egress` — which the lite path depends on, since its session bridge no longer masquerades. On the **full** (macvlan) path no such priority is set, and the election has been measured to put the default route on the VM-facing macvlan NIC — over which `macvlan(private)` blocks egress. Read the row above as the topology's intent; on the full backend it is not yet what Docker is doing.
 
 The end-to-end path:
 
