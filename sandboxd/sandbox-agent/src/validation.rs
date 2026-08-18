@@ -1020,6 +1020,10 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
             network,
             container,
             ip,
+            // The daemon states an intent, not a number: both variants are
+            // in-range by construction and the value Docker sees is this
+            // agent's constant, so there is nothing here to re-validate.
+            gateway_priority: _,
         } => {
             validate_docker_name("network", network)?;
             validate_docker_name("container", container)?;
@@ -2081,10 +2085,10 @@ user:
     mod docker {
         use super::super::*;
         use crate::protocol::{
-            ContainerCommand, ContainerCreateSpec, DockerOp, EnvoyStat, FileDelivery,
-            GatewayComponent, GatewayFile, InspectFlag, InspectFormat, NetworkCreateSpec,
-            NetworkDriver, NetworkOption, NftTable, RemoveForce, StagedImage, StdinCommand,
-            WorkspaceBindSpec,
+            ContainerCommand, ContainerCreateSpec, DockerOp, EndpointGatewayPriority, EnvoyStat,
+            FileDelivery, GatewayComponent, GatewayFile, InspectFlag, InspectFormat,
+            NetworkCreateSpec, NetworkDriver, NetworkOption, NftTable, RemoveForce, StagedImage,
+            StdinCommand, WorkspaceBindSpec,
         };
 
         fn create_spec() -> ContainerCreateSpec {
@@ -2193,6 +2197,7 @@ user:
                     network: "sandbox-net-abc123def456".to_string(),
                     container: "sandbox-gw-abc123def456".to_string(),
                     ip: Some("10.209.0.2".to_string()),
+                    gateway_priority: EndpointGatewayPriority::NeverDefaultGateway,
                 },
                 DockerOp::NetworkList {
                     name_prefix: "sandbox-net-".to_string(),
@@ -2286,6 +2291,7 @@ user:
                     network: flaggy.clone(),
                     container: "sandbox-abc".to_string(),
                     ip: None,
+                    gateway_priority: EndpointGatewayPriority::Default,
                 },
                 DockerOp::VolumeRemove {
                     name: flaggy.clone(),
@@ -2440,6 +2446,7 @@ user:
                     network: "sandbox-net-abc".to_string(),
                     container: "sandbox-gw-abc".to_string(),
                     ip: Some(bad.to_string()),
+                    gateway_priority: EndpointGatewayPriority::Default,
                 };
                 assert!(
                     validate_docker_op(&op).is_err(),

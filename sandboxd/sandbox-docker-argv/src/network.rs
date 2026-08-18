@@ -126,12 +126,69 @@ pub fn network_inspect_argv(name: &str) -> Vec<String> {
     ]
 }
 
-/// `docker network connect [--ip <addr>] <network> <container>`.
-pub fn network_connect_argv(network: &str, container: &str, ip: Option<&str>) -> Vec<String> {
+/// The `--gw-priority` value attached to an endpoint that must never win
+/// the container's default route.
+///
+/// Any value below Docker's default of `0` would do; a round negative
+/// number is chosen so the intent is legible in `docker network inspect`
+/// output rather than looking like an off-by-one.
+const NEVER_DEFAULT_GATEWAY_PRIORITY: i32 = -100;
+
+/// Which endpoint provides the container's default route, when a container
+/// is attached to more than one network.
+///
+/// Docker elects the gateway endpoint by `--gw-priority`, and among equal
+/// priorities the choice is not something to rely on: attaching a second
+/// network to a *running* container has been observed to move the default
+/// route onto the newly attached endpoint. That is exactly what happens to
+/// the gateway container, which is started on its egress bridge and then
+/// attached to each session bridge — so the session bridge silently became
+/// its way out.
+///
+/// A nullary pair rather than a number, for the reason
+/// [`NetworkOption::MacvlanModePrivate`] is nullary: the project has one
+/// reason to touch this knob, and naming the intent keeps every other value
+/// out of the op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EndpointGatewayPriority {
+    /// Docker's default — this endpoint takes part in the election
+    /// normally.
+    #[default]
+    Default,
+    /// This endpoint must not become the container's default route. Used
+    /// for the gateway container's session-bridge leg, whose route out is
+    /// the egress bridge it was started on.
+    NeverDefaultGateway,
+}
+
+impl EndpointGatewayPriority {
+    /// The `--gw-priority <n>` pair this renders as, if any.
+    fn argv(self) -> Option<[String; 2]> {
+        match self {
+            EndpointGatewayPriority::Default => None,
+            EndpointGatewayPriority::NeverDefaultGateway => Some([
+                "--gw-priority".to_string(),
+                NEVER_DEFAULT_GATEWAY_PRIORITY.to_string(),
+            ]),
+        }
+    }
+}
+
+/// `docker network connect [--ip <addr>] [--gw-priority <n>] <network>
+/// <container>`.
+pub fn network_connect_argv(
+    network: &str,
+    container: &str,
+    ip: Option<&str>,
+    gateway_priority: EndpointGatewayPriority,
+) -> Vec<String> {
     let mut argv = vec!["network".to_string(), "connect".to_string()];
     if let Some(ip) = ip {
         argv.push("--ip".to_string());
         argv.push(ip.to_string());
+    }
+    if let Some(pair) = gateway_priority.argv() {
+        argv.extend(pair);
     }
     argv.push(network.to_string());
     argv.push(container.to_string());
@@ -229,13 +286,42 @@ mod tests {
     #[test]
     fn connect_argv_omits_the_ip_flag_when_no_address_is_pinned() {
         assert_eq!(
-            network_connect_argv("net", "ctr", None),
+            network_connect_argv("net", "ctr", None, EndpointGatewayPriority::Default),
             vec!["network", "connect", "net", "ctr"]
         );
         assert_eq!(
-            network_connect_argv("net", "ctr", Some("10.209.0.2")),
+            network_connect_argv(
+                "net",
+                "ctr",
+                Some("10.209.0.2"),
+                EndpointGatewayPriority::Default
+            ),
             vec!["network", "connect", "--ip", "10.209.0.2", "net", "ctr"]
         );
+    }
+
+    /// Docker's default priority is `0` and the flag is how an endpoint
+    /// declines the election, so the value has to be negative — a `0` or a
+    /// missing flag would leave the newly attached endpoint able to take
+    /// the default route, which is the whole failure this exists to stop.
+    #[test]
+    fn connect_argv_declines_the_default_route_with_a_negative_priority() {
+        let argv = network_connect_argv(
+            "net",
+            "ctr",
+            Some("10.209.0.2"),
+            EndpointGatewayPriority::NeverDefaultGateway,
+        );
+        let value = argv
+            .windows(2)
+            .find(|w| w[0] == "--gw-priority")
+            .map(|w| w[1].clone())
+            .expect("the flag must be present");
+        assert!(
+            value.parse::<i32>().expect("a number") < 0,
+            "gateway priority must be below Docker's default of 0, got {value}"
+        );
+        assert_eq!(argv.last().expect("container is last"), "ctr");
     }
 
     #[test]

@@ -58,9 +58,13 @@
 //!   container PID and invoking `sandbox-route-helper` is wired here:
 //!   when the network info has a non-`None` `route_helper_path` and
 //!   `gateway_ip`, the runtime spawns the helper between `docker start`
-//!   and returning. Per the documented contract, the
-//!   agent does no outbound I/O before this point so the window is
-//!   benign even though the default route still points at `.1`.
+//!   and returning. Until the helper returns, the container's default
+//!   route is still Docker's own, pointing at the bridge's `.1`. That
+//!   state fails closed rather than being raced: the per-session bridge
+//!   is created with masquerade disabled
+//!   (`session_bridge_options`, `network.rs`), so `.1` has no path to
+//!   the internet for this subnet and the helper's gateway route is the
+//!   only route out.
 //! - [`SessionRuntime::stop`]: `docker stop -t 10 <name>`. Idempotent —
 //!   stopping a non-running / nonexistent container returns `Ok(())`.
 //! - [`SessionRuntime::delete`]: `docker rm -f <name>` then

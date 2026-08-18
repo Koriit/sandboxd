@@ -44,6 +44,16 @@ When you create a session, sandboxd allocates a `/28` subnet from a configurable
 
 Because each session has its own bridge — a separate L2 segment — sessions cannot see each other's traffic. The gateway container attaches only to that session's bridge, so it has no visibility into the host network or other sessions either.
 
+### Is `.1` a way out? (macOS lite: no)
+
+`.1` is the bridge itself, and Docker's bridge driver masquerades a network's subnet out of the host's uplink by default. Where that default stands, `.1` is a working route to the internet that never passes the gateway container — which matters twice: a container is started before `sandbox-route-helper` has replaced Docker's default route with the gateway's address, and anything that can write the container's routing table can point it back at `.1` afterwards. Neither is reachable by policy, because the traffic never arrives at the thing that applies policy.
+
+**On macOS lite the per-session bridge is created with masquerade disabled** (`--opt com.docker.network.bridge.enable_ip_masquerade=false`), on both first create and the recreate that a `sandbox start` performs. There is then no NAT for the session subnet, so `.1` leads nowhere: the pre-route window fails closed, and the route the helper installs is the only route out. Traffic addressed to the gateway container is unaffected — it is on the same bridge and never leaves it. The regression test that holds this property is `TestLiteMacosBypassResistance` in `tests/e2e/test_lite_macos.py`.
+
+**On Linux the default stands, deliberately.** There the gateway container has a single NIC, on the session bridge itself, and no separate egress bridge to fall back on — so that bridge's masquerade is what carries every *allowed* flow out of the host. Removing it there would take out legitimate egress, not just the bypass. The bypass on Linux remains what issue #80 tracks.
+
+Because macOS lite's gateway container has an uplink of its own (`sandboxd-egress`, see [macOS networking topology](#macos-networking-topology)), it is attached to the session bridge with a gateway priority that keeps its default route on that uplink. Without that, attaching the second network moves its default route onto the session bridge — a bridge that now deliberately leads nowhere.
+
 ### The naming scheme
 
 Session IDs are 12 lowercase hex characters. Every per-session resource has a fixed name shape derived from the session id:

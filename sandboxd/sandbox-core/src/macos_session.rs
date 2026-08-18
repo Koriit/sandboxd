@@ -26,7 +26,9 @@ use tracing::{debug, info, warn};
 use sandbox_docker_argv::container::RemoveForce;
 #[cfg(target_os = "macos")]
 use sandbox_docker_argv::gateway::GatewayFile;
-use sandbox_docker_argv::network::{NetworkCreateSpec, NetworkDriver, NetworkOption};
+use sandbox_docker_argv::network::{
+    EndpointGatewayPriority, NetworkCreateSpec, NetworkDriver, NetworkOption,
+};
 
 use crate::docker::{DockerOp, DockerRoute};
 use crate::error::SandboxError;
@@ -273,12 +275,17 @@ pub fn setup_macos_gateway(
     }
 
     // Step 8: Connect container to macvlan with static IP (gateway_ip = B+3).
+    //
+    // The endpoint takes part in Docker's default-gateway election exactly
+    // as it always has. Only the lite bridge declines it, because only that
+    // bridge's masquerade was removed.
     {
         let output = docker.run(
             DockerOp::NetworkConnect {
                 network: network_name.clone(),
                 container: container_name.clone(),
                 ip: Some(network_info.gateway_ip.clone()),
+                gateway_priority: EndpointGatewayPriority::Default,
             },
             DOCKER_CONNECT_TIMEOUT,
             "docker network connect (macvlan)",
@@ -434,12 +441,20 @@ pub fn setup_macos_lite_gateway(
 
     // Step 8: Connect container to the per-session bridge with static IP.
     // For the lite path the network is a plain bridge (not macvlan).
+    //
+    // The endpoint declines the default-gateway election. Attaching a
+    // second network to a running container otherwise moves its default
+    // route onto the new endpoint, which would put this container's own way
+    // out on the session bridge — a bridge deliberately created without
+    // masquerade (`session_bridge_options`, `network.rs`), and therefore a
+    // dead end. Its route out is the egress bridge it was started on.
     {
         let output = docker.run(
             DockerOp::NetworkConnect {
                 network: network_name.clone(),
                 container: container_name.clone(),
                 ip: Some(network_info.gateway_ip.clone()),
+                gateway_priority: EndpointGatewayPriority::NeverDefaultGateway,
             },
             DOCKER_CONNECT_TIMEOUT,
             "docker network connect (lite bridge)",
