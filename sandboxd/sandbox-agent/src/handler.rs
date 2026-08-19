@@ -2597,9 +2597,20 @@ mod tests {
     /// The wire form of `CreateGateway` carries no VM-name field.
     ///
     /// Asserted on the serialized JSON rather than on the Rust type, because
-    /// the field's absence is a property of what crosses the channel: a daemon
-    /// cannot name the instance because there is nowhere on the wire to put a
-    /// name, and an unknown field is refused at deserialization.
+    /// the field's absence is a property of what crosses the channel: there is
+    /// nowhere on a `CreateGateway` frame for a daemon to put an instance name.
+    ///
+    /// What makes that load-bearing is the receiving end. `handle_create_gateway`
+    /// is handed only `lima_yaml` and names the instance from `ctx.own_uid` —
+    /// the agent's own `getuid()` — so there is no reader for a name even if one
+    /// arrives. The broker read loop keeps only the deserialized value; the raw
+    /// line survives it solely as text in the parse-error log.
+    ///
+    /// `BrokerOp` also carries `deny_unknown_fields`, so a `vm` key appended
+    /// anyway is refused rather than discarded. That is a second layer and a
+    /// recent one — serde's default is to drop it silently — so it is asserted
+    /// separately in `broker_op_refuses_an_unknown_field` rather than assumed
+    /// here.
     #[test]
     fn create_gateway_carries_no_vm_name_on_the_wire() {
         let op = BrokerOp::CreateGateway {
@@ -2621,6 +2632,45 @@ mod tests {
             vec!["lima_yaml", "op_uid", "subcommand"],
             "CreateGateway must carry exactly the op tag, the uid cross-check and \
              the template — no vm name, no owner, no wrapper path"
+        );
+    }
+
+    /// A key no `BrokerOp` variant declares is a parse error, not a discard.
+    ///
+    /// Both halves of the enum's closure are asserted together because they are
+    /// enforced by two different mechanisms that read alike: the `subcommand`
+    /// tag closes the variants, and `deny_unknown_fields` closes the fields.
+    /// Only the first is on by default — drop the attribute and the field half
+    /// silently becomes "accepted and ignored" with nothing else complaining.
+    #[test]
+    fn broker_op_refuses_an_unknown_field() {
+        // The `vm` key CreateGateway deliberately does not declare.
+        let with_extra = r#"{"subcommand":"create_gateway","op_uid":501,"lima_yaml":"vmType: \"qemu\"\n","vm":"evil"}"#;
+        let err = serde_json::from_str::<BrokerOp>(with_extra)
+            .expect_err("a frame with an undeclared key must not deserialize")
+            .to_string();
+        assert!(
+            err.contains("unknown field `vm`"),
+            "the parse error must name the refused key; got: {err}"
+        );
+
+        // The same frame minus that key parses — the refusal is about the key,
+        // not about the frame being malformed in some other way.
+        let clean =
+            r#"{"subcommand":"create_gateway","op_uid":501,"lima_yaml":"vmType: \"qemu\"\n"}"#;
+        assert!(
+            matches!(
+                serde_json::from_str::<BrokerOp>(clean),
+                Ok(BrokerOp::CreateGateway { .. })
+            ),
+            "the frame CreateGateway does declare must still deserialize"
+        );
+
+        // The variant axis, for the same reason and by the other mechanism.
+        let unknown_variant = r#"{"subcommand":"create_evil","op_uid":501,"lima_yaml":"x"}"#;
+        assert!(
+            serde_json::from_str::<BrokerOp>(unknown_variant).is_err(),
+            "an op outside the enum must not deserialize"
         );
     }
 

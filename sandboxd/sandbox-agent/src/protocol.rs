@@ -202,8 +202,34 @@ pub enum BrokerResult {
 /// Variants marked with `op_uid` carry the daemon-asserted operator uid for
 /// belt-and-suspenders cross-checking (the agent independently verifies this
 /// matches its own `getuid()` — see `validation::validate_op_uid`).
+///
+/// # Closed on the field axis too
+///
+/// `deny_unknown_fields` closes the fields the way the `subcommand` tag already
+/// closes the variants: a key no variant declares is a parse error rather than
+/// a silent discard, which is serde's default. The daemon builds every frame
+/// from this same type in this same workspace, so an honest same-version daemon
+/// cannot emit such a key at all; what is left is a compromised daemon or an
+/// undetected version skew. On neither should the agent execute a request it
+/// only partly understands and answer `Ok` — that is the one thing an
+/// enforcement point must not do, and it is what discarding the key produces.
+///
+/// The cost is one-directional forward compatibility: a newer daemon that adds
+/// a field to an existing variant is no longer understood by an older *running*
+/// agent. That is accepted rather than overlooked. The channel carries no
+/// version handshake (check-in is a bare `CHECKIN` frame), the install ships
+/// `sandboxd` and `sandbox-agent` as one versioned set, and the variant axis
+/// already behaves this way — a new op on an old agent is a parse error today.
+/// In both cases the read loop logs the parse error and drops the frame without
+/// answering it, so the skew surfaces as an unanswered request rather than as a
+/// rejection; that is pre-existing behaviour, now reachable through one more
+/// door.
+///
+/// Note the scope: this closes `BrokerOp`. The `BrokerRequest` envelope around
+/// it, and the op enums nested inside individual variants (`DockerOp`,
+/// `InVmOp`, `DockerStreamOp`, …), still take serde's default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "subcommand", rename_all = "snake_case")]
+#[serde(tag = "subcommand", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerOp {
     /// Create a new Lima VM instance from a daemon-rendered `lima.yaml`.
     ///
