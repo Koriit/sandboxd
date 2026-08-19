@@ -618,7 +618,11 @@ The daemon honors a `SANDBOX_USERS_CONF` environment variable that overrides the
 
 ### sandbox-route-helper
 
-`sandbox-route-helper` is a small privileged binary, built alongside the daemon, that installs the per-session default route inside container netns'es on the daemon's behalf. The production install path is `/usr/local/libexec/sandboxd/sandbox-route-helper` (per FHS § 4.7: libexec is for non-user-facing helper binaries that other binaries invoke directly). The binary must carry three capabilities: `cap_sys_admin` (for `setns(2)` into the container netns), `cap_net_admin` (for `RTM_NEWROUTE`, raised to the ambient set before the helper execs `ip(8)`), and `cap_sys_ptrace` (because the container's PID 1 runs as the operator's uid — distinct from the helper's `sandbox` uid — so the `pidfd` + `setns(2)` path triggers a `ptrace_may_access` check across the uid boundary that is only satisfied with `CAP_SYS_PTRACE`):
+`sandbox-route-helper` is a small privileged binary, built alongside the daemon, that installs the per-session default route inside container netns'es on the daemon's behalf. The production install path is `/usr/local/libexec/sandboxd/sandbox-route-helper` (per FHS § 4.7: libexec is for non-user-facing helper binaries that other binaries invoke directly). The binary must carry three capabilities: `cap_sys_admin` (for `setns(2)` into the container netns), `cap_net_admin` (for `RTM_NEWROUTE`, raised to the ambient set before the helper execs `ip(8)`), and `cap_sys_ptrace` (because the container's PID 1 runs as the operator's uid, distinct from the helper's own `sandbox` uid).
+
+The `cap_sys_ptrace` requirement follows from that uid split. The `pidfd` + `setns(2)` path makes the kernel run a `ptrace_may_access` check that compares the helper's **real** uid and gid against the container process's; when those differ — as they do here, by construction — the check passes only for a caller holding `CAP_SYS_PTRACE`. A helper whose uid already matched the container's would not need the capability at all.
+
+Install and cap the binary:
 
 ```bash
 sudo install -D -m 0755 \
@@ -627,7 +631,9 @@ sudo install -D -m 0755 \
 sudo setcap 'cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip' /usr/local/libexec/sandboxd/sandbox-route-helper
 ```
 
-The `=eip` flags put both caps in Permitted **and** Inheritable; the Inheritable bit is what lets the helper raise `CAP_NET_ADMIN` to the ambient set so the spawned `ip(8)` inherits it. Under rootless Docker the previous `cap_sys_admin+ep`-only install also worked because `CAP_SYS_ADMIN` in the parent userns implicitly grants every cap inside child userns'es; under rootful Docker the netns is in init userns directly and that promotion does not happen, so `CAP_NET_ADMIN` must be wired through explicitly.
+The `=eip` flags put all three capabilities in Permitted **and** Inheritable; the Inheritable bit is what lets the helper raise `CAP_NET_ADMIN` to the ambient set so the spawned `ip(8)` inherits it. That raise is what makes the route install work, because the helper runs unprivileged as the `sandbox` user: measured on Linux 6.8, when such a process execs a binary carrying no file capabilities of its own, the child's Permitted and Effective sets are both empty and the `ip route` call fails with `Operation not permitted`.
+
+Install all three capabilities on every host, rootless or rootful. A narrower `cap_sys_admin+ep` install is not sufficient in general, and where it appeared to work on a rootless host the reason was **not** that `CAP_SYS_ADMIN` in a parent user namespace implicitly grants every capability inside a child namespace — it does not. Measured on the same kernel: a capability held in an ancestor user namespace applies within its descendants for that one capability only, while what does grant every capability inside a namespace is holding an effective uid equal to that namespace's owner. That is a uid coincidence — it depends on which account started the container runtime, not on anything installed here — so it is not something to rely on.
 
 If you only built in debug mode, swap `release` for `debug` in the source path. The capabilities must be re-applied after every reinstall — `setcap` attributes do not survive a binary copy. The make target `make install-route-helper-prod-cap` automates both steps and is stamp-driven on the source's mtime so a re-run after an unchanged build is a no-op.
 
