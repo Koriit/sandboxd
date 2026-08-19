@@ -684,14 +684,18 @@ provision:
     script: |
       #!/bin/bash
       # Allow the daemon to invoke sandbox-route-helper inside the VM without
-      # a password prompt. The sudoers entry is scoped to exactly one binary
-      # so no other command can be run as root via this grant.
+      # a password prompt. The command field is scoped to exactly one binary,
+      # so no other command can be run as root through this grant — the two
+      # `ALL`s are the *user* and *host* fields, not a command wildcard.
       #
-      # This grant is redundant, and is kept deliberately. It is redundant
-      # because the VM's login user already holds `ALL=(ALL) NOPASSWD:ALL`
-      # from the distro image's own cloud-init — measured, not assumed — so
-      # every sudo in this VM is already passwordless and this fragment
-      # authorizes nothing that was not authorized without it.
+      # For the account that actually uses it the grant is redundant, and it
+      # is kept deliberately. It is redundant because the VM's login user
+      # already holds `ALL=(ALL) NOPASSWD:ALL` from the distro image's own
+      # cloud-init — measured, not assumed — so that user's sudo is already
+      # passwordless and this fragment adds nothing to what it may do. The
+      # open user field is not redundant in the same way: it reaches accounts
+      # cloud-init's grant does not. See the sandbox-route-helper module docs
+      # for what that does and does not amount to.
       #
       # It is kept because it is the only place the *intended* privilege is
       # written down. If the base image ever tightens its default (a distro
@@ -699,6 +703,24 @@ provision:
       # sudo the daemon actually needs working, and the route-install path
       # does not silently start prompting. Removing it would trade a line of
       # documentation for a dependency on someone else's default.
+      #
+      # A security property was weighed here and deliberately NOT pursued:
+      # that an interactive shell into this VM is not, by itself, a
+      # route-rewrite primitive. That is a decision, not an oversight, and
+      # narrowing this grant is not what would deliver it. The daemon reaches
+      # the helper as `limactl shell <vm> -- sudo <helper>`, so a brokered
+      # invocation arrives as the same login user an interactive shell gets,
+      # already carrying the blanket cloud-init sudo above. Tightening the
+      # user field here would change nothing an in-VM process can do.
+      #
+      # A separate in-VM principal for brokered ops would not be enough on
+      # its own either — the login user keeps its blanket elevation and can
+      # invoke the helper directly regardless. The property needs that
+      # blanket right removed, and every privileged in-VM step runs `sudo -n`
+      # as that same user: install-dir creation, binary install, chmod,
+      # setcap, and the nft baseline load (see the sandbox-invm-argv crate).
+      # All of them would have to move onto the new principal first. The cost
+      # is a rework of in-VM privilege, not an edit to this fragment.
       #
       # printf is used instead of a heredoc because the Lima template is a
       # YAML block scalar — heredoc terminators at column 0 would be
