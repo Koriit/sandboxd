@@ -374,7 +374,7 @@ pub enum BrokerOp {
     ///
     /// Grouped behind one variant for the same reason [`BrokerOp::Docker`] is:
     /// a reviewer asking "what can the daemon make happen inside my VM?" reads
-    /// one enum, [`InVmOp`], rather than picking eleven variants out of a list
+    /// one enum, [`InVmOp`], rather than picking twelve variants out of a list
     /// that also contains VM lifecycle.
     ///
     /// **The daemon does not name the VM.** No instance name crosses the wire
@@ -879,6 +879,33 @@ pub enum InVmOp {
     },
     /// Remove a session's staging directory.
     LiteStageRemove { session_id: String },
+    /// Run the provisioned `sandbox-route-helper` to install a sandbox
+    /// container's default route.
+    ///
+    /// **This is the other egress-enforcement op in this set.**
+    /// [`InVmOp::ApplyNftBaseline`] decides what the gateway drops; this
+    /// decides whether the sandbox's packets reach the gateway to be judged at
+    /// all. A wrong `gateway_ip` produces a container that routes elsewhere and
+    /// reports no error.
+    ///
+    /// Both fields are typed rather than stringly, and that is the whole of
+    /// what this side guarantees about them: a `u32` renders no leading `-` and
+    /// so can never be read as a flag by the helper's parser, and an
+    /// `Ipv4Addr` rejects at *deserialization* anything that is not an address
+    /// — no hostname, no path, no shell metacharacter, no IPv6 literal the
+    /// helper would refuse later. The agent's validation adds only the bound
+    /// the far end's `i32` parse needs.
+    ///
+    /// **The agent cannot check that the address is correct, and does not
+    /// try.** It is on the caller's side of the boundary: a process inside the
+    /// VM can run the installed helper directly, and such a caller never
+    /// reaches this enum. The check that survives a direct invocation is in the
+    /// helper, after it enters the container's network namespace, against what
+    /// the kernel reports there.
+    InstallContainerRoute {
+        container_pid: u32,
+        gateway_ip: std::net::Ipv4Addr,
+    },
 }
 
 /// The four files a lite session stages into its VM directory.
@@ -1496,6 +1523,13 @@ pub fn in_vm_shell_steps(op: &InVmOp) -> Option<Vec<Vec<String>>> {
         InVmOp::LiteStageRemove { session_id } => {
             vec![lite_stage::rm_argv(&lite_stage::stage_dir(session_id))]
         }
+        InVmOp::InstallContainerRoute {
+            container_pid,
+            gateway_ip,
+        } => vec![route_helper::install_container_route_argv(
+            *container_pid,
+            *gateway_ip,
+        )],
         InVmOp::RouteHelperStage | InVmOp::LiteStageWrite { .. } => return None,
     };
     Some(steps)

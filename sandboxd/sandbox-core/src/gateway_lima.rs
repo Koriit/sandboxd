@@ -687,6 +687,19 @@ provision:
       # a password prompt. The sudoers entry is scoped to exactly one binary
       # so no other command can be run as root via this grant.
       #
+      # This grant is redundant, and is kept deliberately. It is redundant
+      # because the VM's login user already holds `ALL=(ALL) NOPASSWD:ALL`
+      # from the distro image's own cloud-init — measured, not assumed — so
+      # every sudo in this VM is already passwordless and this fragment
+      # authorizes nothing that was not authorized without it.
+      #
+      # It is kept because it is the only place the *intended* privilege is
+      # written down. If the base image ever tightens its default (a distro
+      # change nothing here controls), this fragment is what keeps the one
+      # sudo the daemon actually needs working, and the route-install path
+      # does not silently start prompting. Removing it would trade a line of
+      # documentation for a dependency on someone else's default.
+      #
       # printf is used instead of a heredoc because the Lima template is a
       # YAML block scalar — heredoc terminators at column 0 would be
       # misinterpreted by the YAML parser as end-of-scalar.
@@ -873,41 +886,6 @@ table inet sandboxd-gateway-eth0 {
 }
 "#
     .to_string()
-}
-
-// ---------------------------------------------------------------------------
-// Shared command helpers
-// ---------------------------------------------------------------------------
-
-/// Apply minimal-reconstruction environment sanitization to a `limactl` command.
-///
-/// Mirrors the env-clearing discipline in `run_limactl_direct` (daemon's `broker.rs`):
-/// clear the inherited environment and reconstruct only what `limactl` needs
-/// (`LIMA_HOME`, `PATH`, `HOME`, `TERM`). This prevents stale env vars from
-/// the daemon process (e.g., `LIMA_HOME` pointing to a user's personal Lima,
-/// `DOCKER_HOST`, or any shell export) from influencing gateway operations.
-///
-/// `daemon_uid` is used to resolve the daemon's LIMA_HOME path; the caller
-/// supplies it directly so this function has no side effects beyond building
-/// the command.
-#[cfg(target_os = "macos")]
-fn apply_limactl_env(cmd: &mut Command, daemon_uid: u32) {
-    let lima_home = crate::lima::operator_lima_home(daemon_uid);
-    let lima_home_str = lima_home.to_string_lossy().into_owned();
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let path_value = format!("/opt/homebrew/bin:/usr/local/bin:{current_path}");
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        tracing::warn!(
-            "apply_limactl_env: HOME is unset; limactl may fail to locate its config directory"
-        );
-    }
-
-    cmd.env_clear()
-        .env("LIMA_HOME", &lima_home_str)
-        .env("PATH", &path_value)
-        .env("HOME", home)
-        .env("TERM", "dumb");
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,51 +1651,60 @@ impl GatewayLimaManager {
     }
 
     /// The Lima instance name for the daemon-owned gateway VM.
-    /// Exposed as an associated constant so daemon code that needs to pass
-    /// the VM name to `build_in_vm_route_helper_argv` can reference it without
-    /// importing the module-level constant directly.
+    ///
+    /// Exposed as an associated constant so daemon code that needs to name the
+    /// gateway instance can reference it without importing the module-level
+    /// constant directly.
     pub const GATEWAY_INSTANCE_NAME: &'static str = GATEWAY_INSTANCE_NAME;
 
-    /// Run an arbitrary argv inside the gateway Lima VM via `limactl shell`.
+    /// Install a sandbox container's default route by running the provisioned
+    /// `sandbox-route-helper` inside the gateway VM.
     ///
-    /// The argv is expected to be in the form returned by
-    /// `build_in_vm_route_helper_argv`: `["shell", "<vm>", "--", <cmd>, <args>...]`.
-    /// The first two elements (`shell` and the VM name) are extracted as
-    /// positional args after `limactl`; the rest are passed verbatim.
+    /// This is the second half of the egress promise. [`Self::apply_nft_baseline`]
+    /// decides what the gateway forwards; this decides whether the container's
+    /// packets reach the gateway to be judged at all. Both must succeed for a
+    /// session to be contained, and a failure here has to fail the caller —
+    /// a container with the wrong default route is not a degraded sandbox, it
+    /// is an uncontained one that reports success.
     ///
-    /// # The last direct `limactl shell` in this file, and why it is still here
+    /// # What crosses the seam
     ///
-    /// Every other in-VM operation now goes through the typed [`InVmRoute`]
-    /// seam, which is what lets them run against a VM the daemon does not own.
-    /// This one does not, because its only callers are the in-VM
-    /// `sandbox-route-helper --vm-gateway-mode` invocation — an operation with
-    /// its own authorization question (it rewrites a container's default
-    /// route) that is being typed separately, along with the sudoers grant it
-    /// leans on.
+    /// A pid and an address. Not a path to the helper (a constant of
+    /// `sandbox-invm-argv`), not the VM's name (the executing side addresses
+    /// its own instance), not an argv. The types are the shape control: a
+    /// `u32` cannot render a word beginning with `-`, and an `Ipv4Addr` cannot
+    /// hold anything that is not an address.
     ///
-    /// Until that lands, this remains an ownership-blocked site: it builds
-    /// `limactl` directly and applies the *daemon's* LIMA_HOME, so it works
-    /// only while the gateway VM belongs to the daemon account.
-    pub fn run_gateway_shell_argv(
+    /// # What this cannot check, and where that check lives
+    ///
+    /// Whether `gateway_ip` is the *correct* gateway for `container_pid` is not
+    /// decidable here, and deliberately is not attempted. The process this
+    /// matters against is one running inside the VM that invokes the installed
+    /// helper directly — it never passes through this method, the broker, or
+    /// the agent's validation, so a check on this side constrains only callers
+    /// who were already cooperating. The check that binds every caller is in
+    /// the helper: it enters the container's network namespace and compares the
+    /// address against what the kernel reports there. See
+    /// `sandbox-route-helper`'s `containment` module.
+    pub fn install_container_route(
         &self,
-        argv: &[String],
-    ) -> Result<std::process::Output, SandboxError> {
-        // argv shape: ["shell", "<vm>", "--", <rest...>]
-        // limactl shell <vm> -- <rest...>
-        if argv.len() < 4 || argv[0] != "shell" || argv[2] != "--" {
-            return Err(SandboxError::Internal(format!(
-                "run_gateway_shell_argv: unexpected argv shape: {argv:?}"
+        container_pid: u32,
+        gateway_ip: std::net::Ipv4Addr,
+    ) -> Result<(), SandboxError> {
+        let op = InVmOp::InstallContainerRoute {
+            container_pid,
+            gateway_ip,
+        };
+        let label = op.label();
+        let output = self.in_vm.run(op, GATEWAY_SHELL_TIMEOUT, label)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "install_container_route: {label} failed for pid {container_pid} \
+                 gateway {gateway_ip}: {stderr}"
             )));
         }
-        let mut cmd = Command::new("limactl");
-        apply_limactl_env(&mut cmd, self.daemon_uid);
-        // argv[0] = "shell", argv[1] = vm_name, argv[2] = "--", argv[3..] = command
-        cmd.args(argv);
-        run_with_timeout(
-            &mut cmd,
-            GATEWAY_SHELL_TIMEOUT,
-            "gateway: limactl shell (argv)",
-        )
+        Ok(())
     }
 
     /// Ensure `sandbox-route-helper` is installed and setcap'd inside the
@@ -3746,5 +3733,188 @@ mod tests {
             );
             assert_eq!(body, "content");
         }
+    }
+
+    // -- install_container_route (fake in-VM executor, hermetic) ---------------
+
+    /// An [`InVmExecutor`](crate::in_vm::InVmExecutor) that records what it was
+    /// asked to do and runs nothing. It answers with a canned exit status, so a
+    /// test asserts on exactly what crossed the seam and on what the caller does
+    /// with each of the two answers.
+    #[cfg(target_os = "macos")]
+    struct RecordingInVmExecutor {
+        seen: Mutex<Vec<(u32, InVmOp, Duration, String)>>,
+        exit_code: i32,
+        stderr: &'static str,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RecordingInVmExecutor {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                exit_code: 0,
+                stderr: "",
+            })
+        }
+
+        fn failing(stderr: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                exit_code: 1,
+                stderr,
+            })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl crate::in_vm::InVmExecutor for RecordingInVmExecutor {
+        fn run(
+            &self,
+            op_uid: u32,
+            op: InVmOp,
+            timeout: Duration,
+            label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            use std::os::unix::process::ExitStatusExt;
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).push((
+                op_uid,
+                op,
+                timeout,
+                label.to_string(),
+            ));
+            Ok(std::process::Output {
+                // Wait-status encoding: the exit code is the high byte.
+                status: std::process::ExitStatus::from_raw(self.exit_code << 8),
+                stdout: Vec::new(),
+                stderr: self.stderr.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    /// The manager holds a `LimaExecutor` too, and route installation must not
+    /// reach for it — the whole operation is one in-VM op. Panicking rather
+    /// than returning an error makes an accidental `limactl` call a failure
+    /// here rather than a silent second code path.
+    #[cfg(target_os = "macos")]
+    struct UnusedLimaExecutor;
+
+    #[cfg(target_os = "macos")]
+    #[async_trait::async_trait]
+    impl LimaExecutor for UnusedLimaExecutor {
+        fn run(
+            &self,
+            _op_uid: u32,
+            _op: LimaOp<'_>,
+            _timeout: Duration,
+            label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            unreachable!("installing a container route issues no limactl op; got {label}")
+        }
+
+        async fn guest_socat(
+            &self,
+            _op_uid: u32,
+            _vm: &str,
+        ) -> Result<Box<dyn crate::backend::AsyncReadWrite + Send + Unpin>, SandboxError> {
+            unreachable!("installing a container route opens no guest stream")
+        }
+    }
+
+    /// A manager whose in-VM ops go to `in_vm` and whose every other seam is
+    /// inert. `op_uid` is distinct from the daemon uid so a test can tell which
+    /// of the two the route actually carries.
+    #[cfg(target_os = "macos")]
+    fn manager_for_in_vm(in_vm: Arc<RecordingInVmExecutor>, op_uid: u32) -> GatewayLimaManager {
+        GatewayLimaManager::new(
+            PathBuf::from("/var/lib/sandboxd/60/60/lima"),
+            Arc::new(UnusedLimaExecutor),
+            DockerRoute::Host,
+            InVmRoute::new(op_uid, in_vm),
+            60,
+        )
+    }
+
+    /// The op is built from the two arguments and dispatched once, on the
+    /// in-VM route, with the pid and address it was given and nothing else.
+    ///
+    /// The values are the point: a route installed for the wrong pid, or
+    /// pointing at the wrong address, does not fail — it produces a container
+    /// whose egress leaves by some other path while the session reports
+    /// success. So the recorded op is destructured and both fields compared,
+    /// rather than the call merely being checked for `Ok`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_container_route_dispatches_one_typed_op_carrying_its_two_arguments() {
+        let exec = RecordingInVmExecutor::ok();
+        let mgr = manager_for_in_vm(Arc::clone(&exec), 501);
+
+        let gateway: std::net::Ipv4Addr = "10.209.0.2".parse().unwrap();
+        mgr.install_container_route(4242, gateway)
+            .expect("a zero-exit in-VM step means the route is installed");
+
+        let seen = exec.seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.len(), 1, "exactly one in-VM op, not a sequence");
+        let (op_uid, op, timeout, label) = &seen[0];
+
+        let InVmOp::InstallContainerRoute {
+            container_pid,
+            gateway_ip,
+        } = op
+        else {
+            panic!("expected InstallContainerRoute, got {op:?}");
+        };
+        assert_eq!(*container_pid, 4242);
+        assert_eq!(*gateway_ip, gateway);
+
+        assert_eq!(*op_uid, 501, "the op runs as the route's operator uid");
+        assert_eq!(*timeout, GATEWAY_SHELL_TIMEOUT);
+        assert_eq!(label, "in-vm: install container route");
+
+        // And what the executing side would run names those same two values —
+        // the argv is where a mismatch between op and command would show up.
+        let steps = op.shell_steps().expect("a command, not a transfer");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].last().map(String::as_str), Some("10.209.0.2"));
+        assert!(
+            steps[0].iter().any(|w| w == "4242"),
+            "the rendered command must carry the pid: {:?}",
+            steps[0]
+        );
+    }
+
+    /// A failed route install fails the caller, and says which pid and address
+    /// it failed for.
+    ///
+    /// This is the half that cannot be allowed to degrade quietly: a container
+    /// with no default route into the gateway is not a slower sandbox, it is an
+    /// uncontained one. The error also has to carry the in-VM stderr, because
+    /// the operator has no other view of what happened inside the VM.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_route_install_fails_the_caller_and_names_what_it_failed_on() {
+        let exec = RecordingInVmExecutor::failing("sandbox-route-helper: netns entry refused\n");
+        let mgr = manager_for_in_vm(Arc::clone(&exec), 501);
+
+        let gateway: std::net::Ipv4Addr = "10.209.0.2".parse().unwrap();
+        let err = mgr
+            .install_container_route(4242, gateway)
+            .expect_err("a non-zero in-VM step must fail the caller");
+
+        let msg = err.to_string();
+        for needle in [
+            "4242",
+            "10.209.0.2",
+            "netns entry refused",
+            "in-vm: install container route",
+        ] {
+            assert!(msg.contains(needle), "error must name {needle}: {msg}");
+        }
+
+        assert_eq!(
+            exec.seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "a failure is reported, not retried"
+        );
     }
 }

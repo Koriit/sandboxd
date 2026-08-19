@@ -28,6 +28,14 @@
 //! on stdin to a parser, never a command line. Adding a variant that took a
 //! command would make every other variant decorative, because the destination
 //! is a host where `sudo` needs no password.
+//!
+//! The remaining values are a container pid and a gateway address, typed as
+//! `u32` and `Ipv4Addr` so that neither can render an argv word that is a flag,
+//! a path, or anything a parser might read as syntax. That is a claim about
+//! their *shape*, and it is the only claim this side of the seam can make about
+//! them: whether the gateway address is the correct one for that container is
+//! decided in the helper, from inside the namespace it enters, because a caller
+//! who runs the helper directly never passes through here at all.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,6 +129,34 @@ pub enum InVmOp {
     },
     /// Remove a session's staging directory from the VM.
     LiteStageRemove { session_id: String },
+
+    // -- Container routing ---------------------------------------------------
+    /// Install a sandbox container's default route, by running the provisioned
+    /// `sandbox-route-helper` inside the gateway VM.
+    ///
+    /// **This op is the other half of the egress-enforcement path.**
+    /// [`Self::ApplyNftBaseline`] makes the gateway drop what policy forbids;
+    /// this one is what makes the sandbox's traffic arrive at the gateway in
+    /// the first place. A wrong value here does not fail loudly — it produces a
+    /// container whose packets leave by some other route, with nothing inside
+    /// the sandbox able to tell.
+    ///
+    /// The two values are typed rather than stringly for that reason: a `u32`
+    /// pid cannot render a leading `-` and so can never be read as a flag by
+    /// the helper's parser, and an `Ipv4Addr` cannot be a hostname, a path, or
+    /// anything carrying a shell metacharacter.
+    ///
+    /// What the types cannot establish is that `gateway_ip` is the *right*
+    /// gateway for `container_pid`. Nothing on this side of the seam can:
+    /// a process inside the VM may invoke the helper directly, never passing
+    /// through the daemon, the broker, or the agent's validation. The control
+    /// that survives that path is inside the helper — it enters the container's
+    /// network namespace and checks the address against what the kernel reports
+    /// there. See `sandbox-route-helper`'s `containment` module.
+    InstallContainerRoute {
+        container_pid: u32,
+        gateway_ip: std::net::Ipv4Addr,
+    },
 }
 
 impl InVmOp {
@@ -155,6 +191,13 @@ impl InVmOp {
             InVmOp::LiteStageRemove { session_id } => {
                 vec![lite_stage::rm_argv(&lite_stage::stage_dir(session_id))]
             }
+            InVmOp::InstallContainerRoute {
+                container_pid,
+                gateway_ip,
+            } => vec![route_helper::install_container_route_argv(
+                *container_pid,
+                *gateway_ip,
+            )],
             InVmOp::RouteHelperStage | InVmOp::LiteStageWrite { .. } => return None,
         };
         Some(steps)
@@ -207,6 +250,7 @@ impl InVmOp {
             InVmOp::LiteStageCreate { .. } => "in-vm: lite stage create",
             InVmOp::LiteStageWrite { .. } => "in-vm: lite stage write",
             InVmOp::LiteStageRemove { .. } => "in-vm: lite stage remove",
+            InVmOp::InstallContainerRoute { .. } => "in-vm: install container route",
         }
     }
 }
@@ -457,15 +501,70 @@ impl InVmExecutor for LocalLimactlInVmExecutor {
 }
 
 /// Whether `getcap` output from [`InVmOp::RouteHelperProbe`] shows the helper
-/// carrying the capabilities it needs.
+/// carrying **every** capability [`InVmOp::RouteHelperSetcap`] grants it.
 ///
 /// Kept next to the op rather than at the call site because it is the other
 /// half of the probe: the op deliberately reports rather than decides, and
 /// this is the deciding.
+///
+/// The whole set is required, not one member of it. A binary carrying only
+/// some of them passes `test -x`, and a probe satisfied by one of them then
+/// reports "already installed" — so provisioning is skipped and the missing
+/// capability surfaces much later as `EPERM` at `setns`, which is the late,
+/// confusing failure the probe exists to prevent.
+///
+/// The required names are read off the same constant the `setcap` step
+/// renders, so the two cannot drift: a capability added to the install is one
+/// this immediately starts requiring.
+///
+/// Matching is per-name and order-independent, because `getcap` does not echo
+/// back what `setcap` was given — it prints the names in the kernel's own
+/// order after the file path, so the set installed here comes back as
+/// `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`.
+///
+/// What this does **not** check is which capability sets each name sits in. A
+/// file carrying all three names under the wrong flags would pass here and
+/// still fail at route-install time; catching the install that left the
+/// capabilities off altogether is what this is for.
 pub fn route_helper_probe_says_installed(output: &std::process::Output) -> bool {
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .contains(sandbox_invm_argv::route_helper::PROBE_CAPS_MARKER)
+    if !output.status.success() {
+        return false;
+    }
+    let mut required = required_route_helper_capabilities().peekable();
+    if required.peek().is_none() {
+        // `all` over an empty iterator is vacuously true, which would turn
+        // this into an unconditional "installed". Nothing can currently
+        // produce an empty set; this is what keeps that unable to matter.
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    required.all(|cap| getcap_output_names(&stdout, cap))
+}
+
+/// The capability names the in-VM `setcap` step asks for.
+///
+/// Parsed from the constant that renders the install rather than restated
+/// beside it — a second list is a second thing to keep in agreement, and the
+/// one that drifts is the one nothing executes.
+fn required_route_helper_capabilities() -> impl Iterator<Item = &'static str> {
+    sandbox_invm_argv::route_helper::CAPABILITIES
+        .split(['=', '+', '-'])
+        .next()
+        .unwrap_or("")
+        .split(',')
+        .filter(|name| !name.is_empty())
+}
+
+/// Whether `getcap` output names `cap` as a whole token.
+///
+/// Tokenised rather than substring-matched: the output carries the installed
+/// file's path on the same line as the names, and the punctuation separating
+/// the names from the flag letters is not something this side should have to
+/// predict.
+fn getcap_output_names(getcap_output: &str, cap: &str) -> bool {
+    getcap_output
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|token| token == cap)
 }
 
 /// The path a `limactl copy` of the route helper takes its source from, given
@@ -622,25 +721,118 @@ mod tests {
         }
     }
 
+    /// A successful `getcap` run whose stdout is `stdout`.
+    fn probe_output(stdout: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
     #[test]
     fn probe_output_is_judged_on_the_capability_not_the_exit_status_alone() {
-        use std::os::unix::process::ExitStatusExt;
-        let ok = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: b"/usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip\n".to_vec(),
-            stderr: Vec::new(),
-        };
+        let ok = probe_output(
+            "/usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip\n",
+        );
         assert!(route_helper_probe_says_installed(&ok));
 
         // Exit zero, but the capabilities were stripped: the binary runs and
         // then fails at route-install time. This is the case the probe exists
         // for.
-        let stripped = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: Vec::new(),
+        let stripped = probe_output("");
+        assert!(!route_helper_probe_says_installed(&stripped));
+    }
+
+    /// What the probe demands is what the install grants, read off the one
+    /// constant that renders the install.
+    #[test]
+    fn the_required_capabilities_are_the_ones_the_install_grants() {
+        let mut required: Vec<&str> = required_route_helper_capabilities().collect();
+        required.sort_unstable();
+        assert_eq!(
+            required,
+            vec!["cap_net_admin", "cap_sys_admin", "cap_sys_ptrace"],
+            "derived from {}",
+            sandbox_invm_argv::route_helper::CAPABILITIES
+        );
+    }
+
+    /// Every incomplete set is rejected, not just the empty one.
+    ///
+    /// A binary carrying some of the capabilities is the case that motivates
+    /// this: it passes `test -x`, it names `cap_net_admin`, and a probe
+    /// satisfied by that reports "already installed" — so provisioning never
+    /// repairs it and the missing capability surfaces as `EPERM` at `setns`,
+    /// far from the decision that caused it.
+    #[test]
+    fn every_proper_subset_of_the_installed_capabilities_is_rejected() {
+        let required: Vec<&str> = required_route_helper_capabilities().collect();
+        assert_eq!(required.len(), 3, "the subset enumeration below assumes 3");
+        // 0..7 is every subset except the full one.
+        for bits in 0u8..(1 << 3) - 1 {
+            let present: Vec<&str> = required
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bits & (1 << i) != 0)
+                .map(|(_, name)| *name)
+                .collect();
+            let stdout = format!(
+                "/usr/local/libexec/sandboxd/sandbox-route-helper {}=eip\n",
+                present.join(",")
+            );
+            assert!(
+                !route_helper_probe_says_installed(&probe_output(&stdout)),
+                "accepted a binary carrying only {present:?}"
+            );
+        }
+    }
+
+    /// The probe reads names, not layout.
+    ///
+    /// `getcap` does not echo the string `setcap` was given: the set installed
+    /// here is asked for as `cap_net_admin,cap_sys_admin,cap_sys_ptrace` and
+    /// comes back reordered, because the names print in the kernel's order.
+    /// The remaining cases are here to say that the punctuation around them is
+    /// not something this side has to predict — they are a claim about the
+    /// parser, not about what any particular `getcap` release emits.
+    #[test]
+    fn the_probe_reads_names_rather_than_layout() {
+        for stdout in [
+            // Measured on libcap 2.66: reordered relative to the setcap argument.
+            "/usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n",
+            "/usr/local/libexec/sandboxd/sandbox-route-helper = cap_net_admin,cap_sys_ptrace,cap_sys_admin+eip\n",
+            "/usr/local/libexec/sandboxd/sandbox-route-helper cap_sys_admin=eip cap_net_admin=eip cap_sys_ptrace=eip\n",
+        ] {
+            assert!(
+                route_helper_probe_says_installed(&probe_output(stdout)),
+                "rejected {stdout:?}"
+            );
+        }
+    }
+
+    /// A name is matched whole. `cap_net_admin_wrapper` is not `cap_net_admin`,
+    /// and the substring test that would say otherwise is the one this
+    /// replaced.
+    #[test]
+    fn a_longer_name_containing_a_required_one_does_not_satisfy_it() {
+        let stdout = "/usr/local/libexec/sandboxd/sandbox-route-helper \
+             cap_net_admin_x,cap_sys_admin,cap_sys_ptrace=eip\n";
+        assert!(!route_helper_probe_says_installed(&probe_output(stdout)));
+    }
+
+    /// A non-zero `getcap` still decides nothing on its own — but neither does
+    /// stdout that would otherwise pass.
+    #[test]
+    fn a_failed_probe_run_is_not_installed_however_it_printed() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"/usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n".to_vec(),
             stderr: Vec::new(),
         };
-        assert!(!route_helper_probe_says_installed(&stripped));
+        assert!(!route_helper_probe_says_installed(&failed));
     }
 
     /// Neither transfer names a source path. What the op carries is which
@@ -753,10 +945,14 @@ mod tests {
             InVmOp::LiteStageRemove {
                 session_id: "sess1".to_string(),
             },
+            InVmOp::InstallContainerRoute {
+                container_pid: 4242,
+                gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
+            },
         ];
         assert_eq!(
             ops.len(),
-            11,
+            12,
             "the in-VM op set changed size; every property test in this module \
              iterates this list, and a variant missing from it is a variant \
              nothing here checks"

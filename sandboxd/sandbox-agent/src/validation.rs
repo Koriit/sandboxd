@@ -1062,9 +1062,9 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
 /// builds any argv from it.
 ///
 /// There is very little to check, and that is the shape working rather than
-/// the check being thin. Nine of the eleven variants carry no daemon-supplied
+/// the check being thin. Eight of the twelve variants carry no daemon-supplied
 /// value at all — what they do is fixed by the variant and rendered from
-/// constants. What remains is two kinds of value, and each gets the check its
+/// constants. What remains is three kinds of value, and each gets the check its
 /// destination needs:
 ///
 /// - **The session identifier**, which is joined onto a constant root to name
@@ -1078,6 +1078,26 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
 ///   what the policy says, and the one that matters is `nft`'s. What makes
 ///   them safe is where they go — a parser's stdin and a file's contents —
 ///   not what they look like.
+/// - **The container pid and gateway address** on
+///   [`crate::protocol::InVmOp::InstallContainerRoute`], where almost all of
+///   the checking was done by the types before this function ran. An
+///   `Ipv4Addr` field cannot hold a non-address; a `u32` cannot hold a
+///   negative. The one thing left over is that the far end parses the pid into
+///   an `i32`, so a value above `i32::MAX` would arrive here well-formed and
+///   fail at the helper's own parser with a message about argument syntax
+///   rather than about the value. Rejecting it here is the difference between
+///   a clear error and a confusing one.
+///
+/// # What this function deliberately does not check
+///
+/// That the gateway address is the *right* one for that container. It is not a
+/// check that can be made here, and writing a weak version of it would be
+/// worse than none: the process this control exists to stop runs the installed
+/// helper directly, inside the VM, and never reaches this function. A caller
+/// who is subject to this validation is one who was already going through the
+/// daemon. The control that binds the other caller too is in the helper, after
+/// it enters the container's network namespace — see that crate's
+/// `containment` module.
 pub fn validate_in_vm_op(op: &crate::protocol::InVmOp) -> Result<(), String> {
     use crate::protocol::InVmOp;
 
@@ -1086,6 +1106,9 @@ pub fn validate_in_vm_op(op: &crate::protocol::InVmOp) -> Result<(), String> {
         | InVmOp::LiteStageRemove { session_id }
         | InVmOp::LiteStageWrite { session_id, .. } => {
             validate_session_name(session_id)?;
+        }
+        InVmOp::InstallContainerRoute { container_pid, .. } => {
+            validate_container_pid(*container_pid)?;
         }
         // Nothing daemon-supplied crosses the wire on these. The commands are
         // constants of the argv crate; the ruleset on `ApplyNftBaseline` is
@@ -1098,6 +1121,37 @@ pub fn validate_in_vm_op(op: &crate::protocol::InVmOp) -> Result<(), String> {
         | InVmOp::RouteHelperStage
         | InVmOp::RouteHelperInstall
         | InVmOp::RouteHelperSetcap => {}
+    }
+    Ok(())
+}
+
+/// The process the route-install op enters the network namespace of.
+///
+/// The type already did the work that matters — a `u32` cannot be negative, so
+/// the rendered argv word cannot start with `-` and be read as a flag. Two
+/// bounds remain, and both exist so that a bad value fails here with a message
+/// naming it rather than three layers down with a message about something else:
+///
+/// - **Zero is not a pid.** It is the value an uninitialised field or a failed
+///   `docker inspect` produces, and `pidfd_open(0)` fails with `EINVAL` — an
+///   error that reads like a kernel problem rather than a missing container.
+/// - **Above `i32::MAX` is not a pid the far end can parse.** The helper's
+///   argument parser takes an `i32`. A larger value is well-formed on this side
+///   and unparseable on the other.
+///
+/// The upper bound is deliberately `i32::MAX` rather than the running kernel's
+/// `pid_max`: `pid_max` is tunable, lives in the VM rather than here, and a pid
+/// that is merely improbable is not the thing worth rejecting. What is worth
+/// rejecting is a value that cannot survive the wire.
+fn validate_container_pid(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("container pid must be a real process id; got 0".to_string());
+    }
+    if pid > i32::MAX as u32 {
+        return Err(format!(
+            "container pid {pid} exceeds the maximum a pid can be ({})",
+            i32::MAX
+        ));
     }
     Ok(())
 }
@@ -2680,13 +2734,17 @@ user:
                 InVmOp::LiteStageRemove {
                     session_id: "abc123def456".to_string(),
                 },
+                InVmOp::InstallContainerRoute {
+                    container_pid: 4242,
+                    gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
+                },
             ]
         }
 
         #[test]
         fn every_well_formed_op_is_accepted() {
             let ops = every_op();
-            assert_eq!(ops.len(), 11, "every InVmOp variant must be covered here");
+            assert_eq!(ops.len(), 12, "every InVmOp variant must be covered here");
             for op in ops {
                 assert!(
                     validate_in_vm_op(&op).is_ok(),
@@ -2873,6 +2931,91 @@ user:
         #[test]
         fn an_op_name_not_in_the_enum_fails_to_deserialize() {
             let json = r#"{"in_vm_op":"run_shell","command":"rm -rf /"}"#;
+            assert!(serde_json::from_str::<InVmOp>(json).is_err());
+        }
+
+        // -- the route-install op's two fields -------------------------------
+
+        #[test]
+        fn a_zero_container_pid_is_rejected() {
+            let op = InVmOp::InstallContainerRoute {
+                container_pid: 0,
+                gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
+            };
+            let err = validate_in_vm_op(&op).expect_err("pid 0 must be rejected");
+            assert!(err.contains('0'), "the error should name the value: {err}");
+        }
+
+        /// The helper's parser takes an `i32`. A pid above that arrives
+        /// well-formed on this side and dies at the far end's argument parser,
+        /// where the message is about syntax rather than about the value.
+        #[test]
+        fn a_container_pid_the_far_end_cannot_parse_is_rejected() {
+            for pid in [i32::MAX as u32 + 1, u32::MAX] {
+                let op = InVmOp::InstallContainerRoute {
+                    container_pid: pid,
+                    gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
+                };
+                assert!(
+                    validate_in_vm_op(&op).is_err(),
+                    "pid {pid} exceeds i32::MAX and must be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn the_container_pid_bounds_admit_the_values_a_real_container_has() {
+            for pid in [1u32, 2, 4242, 65535, i32::MAX as u32] {
+                let op = InVmOp::InstallContainerRoute {
+                    container_pid: pid,
+                    gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
+                };
+                assert!(
+                    validate_in_vm_op(&op).is_ok(),
+                    "pid {pid} is a legitimate value and must be accepted"
+                );
+            }
+        }
+
+        /// The gateway address is an `Ipv4Addr` field, so the rejection of
+        /// everything that is not an address happens at deserialization — this
+        /// op cannot be *constructed* from a hostile wire value, which is a
+        /// stronger property than rejecting one after construction.
+        ///
+        /// The leading-zero case is the one worth pinning by name. Historically
+        /// `inet_aton` read `010.0.0.1` as octal, and a parser that admitted it
+        /// would let one written form denote two different addresses. Rust's
+        /// does not, and a future parser swap that reintroduced it would break
+        /// here.
+        #[test]
+        fn the_gateway_address_rejects_everything_that_is_not_an_ipv4_address() {
+            for bad in [
+                "10.0.0.2; rm -rf /",
+                "$(id)",
+                "gateway.local",
+                "fd00::1",
+                "10.0.0.2/28",
+                "010.0.0.1",
+                "10.0.0",
+                "",
+                "-10.0.0.2",
+            ] {
+                let json = format!(
+                    r#"{{"in_vm_op":"install_container_route","container_pid":4242,"gateway_ip":"{bad}"}}"#
+                );
+                assert!(
+                    serde_json::from_str::<InVmOp>(&json).is_err(),
+                    "{bad:?} must not deserialize into a gateway address"
+                );
+            }
+        }
+
+        /// The pid is a `u32`, so a negative never becomes an op at all. The
+        /// rendered argv word can therefore never begin with `-`, which is what
+        /// keeps it from being read as a flag by the helper's parser.
+        #[test]
+        fn a_negative_container_pid_does_not_deserialize() {
+            let json = r#"{"in_vm_op":"install_container_route","container_pid":-1,"gateway_ip":"10.0.0.2"}"#;
             assert!(serde_json::from_str::<InVmOp>(json).is_err());
         }
     }

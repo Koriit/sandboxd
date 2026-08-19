@@ -156,9 +156,8 @@ pub use lima::{
     reap_lima_orphans, vm_name,
 };
 pub use lite_macos::{
-    DEFAULT_LITE_SHARED_ROOT, IN_VM_ROUTE_HELPER_PATH, LITE_SHARED_ROOT_ENV, SharedPathError,
-    build_in_vm_route_helper_argv, lite_shared_root, lite_shared_root_9p_stanza,
-    translate_shared_path, validate_shared_path,
+    DEFAULT_LITE_SHARED_ROOT, LITE_SHARED_ROOT_ENV, SharedPathError, lite_shared_root,
+    lite_shared_root_9p_stanza, translate_shared_path, validate_shared_path,
 };
 #[cfg(target_os = "macos")]
 pub use macos_session::{

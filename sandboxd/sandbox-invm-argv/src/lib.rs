@@ -38,10 +38,25 @@
 //! constant of this crate. There is no builder that takes a command, a shell
 //! body, or a path to run something on, because the ops these serve reach a
 //! host where `sudo` needs no password: one such builder would make the rest
-//! of the enumeration decorative. The values that do vary are a session
-//! identifier, an nftables ruleset delivered on stdin as content, and the
-//! choice of one of four staged filenames — each of which is either validated
-//! or drawn from a closed enum on the side that runs the command.
+//! of the enumeration decorative.
+//!
+//! The values that do vary are a short list, and each is constrained by
+//! something other than this crate's good intentions:
+//!
+//! - a **session identifier**, checked on the executing side against a charset
+//!   that admits no shell metacharacter;
+//! - an **nftables ruleset**, which never reaches an argv at all — it is
+//!   delivered to a parser on stdin as content;
+//! - the choice of one of **four staged filenames**, drawn from a closed enum;
+//! - a **container pid** and a **gateway address**, which are a `u32` and an
+//!   [`std::net::Ipv4Addr`] rather than strings, so the words they render into
+//!   cannot be flags, paths, or anything with a metacharacter in it.
+//!
+//! The last of those is the only one whose *correctness* — as opposed to its
+//! shape — is not decided anywhere in this crate or on the calling side. It
+//! cannot be: the question "is this the right gateway for that container?" is
+//! answerable only from inside the container's network namespace. See
+//! [`route_helper::install_container_route_argv`].
 //!
 //! # No shell — and exactly where the one that exists lives
 //!
@@ -156,6 +171,7 @@ mod tests {
             route_helper::setcap_argv(),
             route_helper::chmod_argv(),
             route_helper::remove_staged_argv(),
+            route_helper::install_container_route_argv(1234, std::net::Ipv4Addr::new(10, 0, 0, 2)),
         ];
         argvs.extend(route_helper::install_argv());
         argvs.push(lite_stage::mkdir_argv("/tmp/sandbox-lite/s1"));

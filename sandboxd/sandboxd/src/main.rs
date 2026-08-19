@@ -4951,6 +4951,39 @@ async fn cleanup_lite_stage_dir(state: &Arc<AppState>, session_id: &sandbox_core
     let _ = tokio::task::spawn_blocking(move || glm.cleanup_lite_session_files(&sid_str)).await;
 }
 
+/// Narrow the two values the route-install op carries from the shapes their
+/// producers hand back to the shapes the op accepts.
+///
+/// Both producers are wider than the operation is. `inspect_container_pid_on_route`
+/// returns an `i32` because that is what `docker inspect` prints, and the
+/// session's gateway address is an `IpAddr` because the network layer is
+/// written against both families. The op takes a `u32` and an `Ipv4Addr`, so
+/// that the argv words it renders cannot be a flag and cannot be an address the
+/// helper's parser will refuse.
+///
+/// Narrowing here rather than inside the op is what makes the failures legible.
+/// A negative pid means the inspect step returned something impossible; an IPv6
+/// gateway means a session was allocated on a family the in-VM route path does
+/// not implement. Both are bugs on this side, and both would otherwise surface
+/// from inside the VM as a complaint about argument syntax.
+#[cfg(target_os = "macos")]
+fn container_route_params(
+    vm_pid: i32,
+    gateway_ip: std::net::IpAddr,
+) -> Result<(u32, std::net::Ipv4Addr), SandboxError> {
+    let pid = u32::try_from(vm_pid).map_err(|_| {
+        SandboxError::Internal(format!(
+            "container pid {vm_pid} is not a valid process id for the in-VM route helper"
+        ))
+    })?;
+    let std::net::IpAddr::V4(gw) = gateway_ip else {
+        return Err(SandboxError::Internal(format!(
+            "the in-VM route helper installs IPv4 routes only; session gateway is {gateway_ip}"
+        )));
+    };
+    Ok((pid, gw))
+}
+
 /// macOS lite create: container session inside the gateway Lima VM.
 ///
 /// Sandbox containers run inside the `sandboxd-gateway` Lima VM over its
@@ -4979,9 +5012,7 @@ async fn create_session_macos_lite(
 ) -> axum::response::Response {
     use sandbox_core::backend::inspect_container_pid_on_route;
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
-    use sandbox_core::lite_macos::{
-        build_in_vm_route_helper_argv, lite_shared_root, validate_shared_path,
-    };
+    use sandbox_core::lite_macos::{lite_shared_root, validate_shared_path};
     use sandbox_core::macos_session::setup_macos_lite_gateway;
 
     // Resolve this operator's pool up front. Failing here is the 409 shape
@@ -5429,34 +5460,20 @@ async fn create_session_macos_lite(
                 .into_response();
             }
         };
-        let argv = build_in_vm_route_helper_argv(
-            sandbox_core::GATEWAY_INSTANCE_NAME,
-            vm_pid,
-            gateway_ip_addr,
-        );
         let glm = state.gateway_lima_manager.clone();
-        match tokio::task::spawn_blocking(move || glm.run_gateway_shell_argv(&argv)).await {
-            Ok(Ok(output)) if output.status.success() => {
-                debug!(session_id = %session_id, "in-VM route helper succeeded");
+        // The op is typed, so a failing route install now arrives as one `Err`
+        // carrying the helper's stderr rather than as a separate non-zero-exit
+        // arm. The narrowing of the two values is fallible for reasons that are
+        // bugs on this side, so it joins the same arm.
+        let route_result = match container_route_params(vm_pid, gateway_ip_addr) {
+            Ok((pid, gw)) => {
+                tokio::task::spawn_blocking(move || glm.install_container_route(pid, gw)).await
             }
-            Ok(Ok(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
-                let _ = state
-                    .network
-                    .delete_network_on_route(&session_id, &state.docker);
-                let _ = vmnet_pool.release_lite_token();
-                let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                return error_response(SandboxError::Network(format!(
-                    "in-VM sandbox-route-helper denied: {}",
-                    stderr.trim()
-                )))
-                .into_response();
+            Err(e) => Ok(Err(e)),
+        };
+        match route_result {
+            Ok(Ok(())) => {
+                debug!(session_id = %session_id, "in-VM route helper succeeded");
             }
             Ok(Err(e)) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
@@ -5961,7 +5978,6 @@ async fn start_session_macos_lite(
     state: Arc<AppState>,
 ) -> axum::response::Response {
     use sandbox_core::backend::inspect_container_pid_on_route;
-    use sandbox_core::lite_macos::build_in_vm_route_helper_argv;
 
     let session_id = session.id;
 
@@ -6169,28 +6185,19 @@ async fn start_session_macos_lite(
             }
         };
 
-        let argv =
-            build_in_vm_route_helper_argv(sandbox_core::GATEWAY_INSTANCE_NAME, vm_pid, gateway_ip);
         let glm = state.gateway_lima_manager.clone();
-        match tokio::task::spawn_blocking(move || glm.run_gateway_shell_argv(&argv)).await {
-            Ok(Ok(output)) if output.status.success() => {
-                debug!(session_id = %session_id, "in-VM route helper succeeded on restart");
+        // Same shape as the create path: the typed op folds a non-zero exit and
+        // a transport failure into one `Err` that carries the helper's stderr,
+        // and the narrowing of the two values joins it.
+        let route_result = match container_route_params(vm_pid, gateway_ip) {
+            Ok((pid, gw)) => {
+                tokio::task::spawn_blocking(move || glm.install_container_route(pid, gw)).await
             }
-            Ok(Ok(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime
-                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
-                    .await;
-                let _ = state
-                    .store
-                    .update_state(&session_id, &operator.name, SessionState::Error);
-                teardown_session_networking(&session_id, &state).await;
-                return error_response(SandboxError::Network(format!(
-                    "in-VM sandbox-route-helper denied on restart: {}",
-                    stderr.trim()
-                )))
-                .into_response();
+            Err(e) => Ok(Err(e)),
+        };
+        match route_result {
+            Ok(Ok(())) => {
+                debug!(session_id = %session_id, "in-VM route helper succeeded on restart");
             }
             Ok(Err(e)) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
