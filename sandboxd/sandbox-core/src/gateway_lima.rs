@@ -2491,6 +2491,75 @@ pub fn observe_vmnet_daemon_set(
 mod tests {
     use super::*;
 
+    /// The generated gateway template must satisfy the rule the agent applies
+    /// to a gateway-class create.
+    ///
+    /// The enforcing copy of this rule is `validate_gateway_lima_yaml_shape` in
+    /// `sandbox-agent`, which runs outside this crate's trust boundary and is
+    /// the one that actually decides. It cannot be called from here — the agent
+    /// deliberately does not depend on `sandbox-core`, and the dependency in
+    /// the other direction would defeat the point of that. So this is the
+    /// generator-side mirror: it asserts the properties that validator checks,
+    /// against the live generator output, so a template change that the agent
+    /// would refuse fails here rather than at the first attempt to create a
+    /// gateway VM. The agent's own fixture is a captured copy of this output.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn generated_gateway_template_satisfies_the_agent_gateway_rule() {
+        let slots = [0u16, 1, 2, 3, 4, 5, 6, 7];
+        let template = generate_gateway_template(&slots);
+
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&template).expect("gateway template must parse as YAML");
+        let top = doc
+            .as_mapping()
+            .expect("gateway template top level must be a mapping");
+
+        assert_eq!(
+            top.get("vmType").and_then(|v| v.as_str()),
+            Some("qemu"),
+            "vmType must be qemu; VZ cannot attach socket_vmnet"
+        );
+        assert!(
+            !top.contains_key("network"),
+            "the singular network: alias is rejected by the agent"
+        );
+
+        let networks = top
+            .get("networks")
+            .and_then(|v| v.as_sequence())
+            .expect("gateway template must carry a networks sequence");
+        assert_eq!(
+            networks.len(),
+            slots.len(),
+            "one NIC entry per pool slot, no more and no fewer"
+        );
+
+        let mut seen: Vec<u16> = Vec::new();
+        for entry in networks {
+            let nic = entry.as_mapping().expect("each NIC entry is a mapping");
+            let keys: Vec<&str> = nic.keys().filter_map(|k| k.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec!["socket", "interface"],
+                "the agent accepts exactly the socket/interface key pair"
+            );
+            let socket = nic
+                .get("socket")
+                .and_then(|v| v.as_str())
+                .expect("socket is a string");
+            let slot = crate::network::slot_from_vmnet_socket_path(socket)
+                .unwrap_or_else(|| panic!("{socket} must be a canonical pool slot socket path"));
+            assert_eq!(
+                nic.get("interface").and_then(|v| v.as_str()),
+                Some(slot_interface_name(slot).as_str()),
+                "{socket} must be pinned to its own slot's interface name"
+            );
+            assert!(!seen.contains(&slot), "slot {slot} attached more than once");
+            seen.push(slot);
+        }
+    }
+
     // -- NIC discovery parser (pure, hermetic) --------------------------------
 
     /// Representative `ip -json link show` output from a gateway VM with

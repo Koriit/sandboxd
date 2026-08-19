@@ -40,6 +40,15 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+# serde_yaml: test-only. The gateway Lima template is validated structurally by
+# `sandbox-agent` before it is written, and this crate's generator-side mirror
+# test asserts the same properties against the live generator. Doing that by
+# text inspection is what the older session-template mirror does, and it has
+# already needed a carve-out for a `network:` key appearing inside a provision
+# script's block scalar — a parse has no such problem. Dev-only: the shipped
+# library gains no YAML dependency, and the enforcing validator stays in the
+# agent, which deliberately does not depend on this crate.
+serde_yaml = "0.9"
 
 # Optional features.
 #
