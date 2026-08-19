@@ -219,6 +219,10 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
             qemu_wrapper,
             is_hardened_session,
         } => handle_create(ctx, vm, lima_yaml, owner, qemu_wrapper, is_hardened_session).await,
+        BrokerOp::CreateGateway {
+            op_uid: _,
+            lima_yaml,
+        } => handle_create_gateway(ctx, lima_yaml).await,
         BrokerOp::Start {
             op_uid: _,
             vm,
@@ -699,6 +703,32 @@ fn own_gateway_vm(_ctx: &RunContext) -> &'static str {
     GATEWAY_VM_NAME
 }
 
+/// The instance name this agent creates its own gateway VM under.
+///
+/// Same doctrine as [`own_gateway_vm`] and for the same reason — the name is
+/// what `limactl create --name` acts on, so it is derived from the agent's own
+/// `getuid()` and never read off the wire. `BrokerOp::CreateGateway` carries no
+/// VM-name field at all; there is nothing for a daemon to get wrong.
+///
+/// The uid suffix is not decoration. Gateway instances live in per-operator
+/// LIMA_HOMEs but are enumerated by a single `limactl list`-shaped view of the
+/// host, so an unsuffixed name is ambiguous the moment two operators are
+/// present, and "which operator's gateway is this" stops having an answer.
+///
+/// # Known divergence from [`own_gateway_vm`]
+///
+/// [`own_gateway_vm`] still returns the unsuffixed `sandboxd-gateway` — it, and
+/// the daemon-side constants it mirrors, predate the per-operator naming and
+/// have not been renamed yet. So a VM created through this function is not the
+/// VM the in-VM and Docker op paths currently address. That is survivable only
+/// because nothing invokes `CreateGateway` yet: the daemon still creates the
+/// gateway through its own direct path under the unsuffixed name. Whoever wires
+/// the daemon to send `CreateGateway` must rename the constants in the same
+/// change, or the two halves will name different instances.
+fn own_gateway_vm_instance_name(ctx: &RunContext) -> String {
+    format!("{GATEWAY_VM_NAME}-{}", ctx.own_uid)
+}
+
 /// `umask` for in-VM operations.
 ///
 /// Deliberately **not** the `0o077` the Lima lifecycle ops use. That value
@@ -1011,6 +1041,64 @@ async fn handle_create(
     }
 
     result
+}
+
+/// Create this operator's own gateway Lima VM.
+///
+/// Deliberately not a branch inside [`handle_create`]. The two differ in which
+/// NIC-shape rule the YAML is held to, and that is precisely the decision that
+/// must not be reachable from a wire field — see `BrokerOp::CreateGateway`'s
+/// doc for the argument. Separate handlers make the two rules statically
+/// distinct code paths, so there is no flag to flip and no name to spell in a
+/// particular way to move between them.
+///
+/// Differences from [`handle_create`], each with a reason:
+/// - The instance name is derived from the agent's own uid, not taken from the
+///   request ([`own_gateway_vm_instance_name`]).
+/// - The YAML is validated by `validate_gateway_lima_yaml_shape` — one NIC per
+///   pool slot, each pinned to its own slot's interface name.
+/// - No `sandboxd-owner` marker is written. The gateway is daemon-owned
+///   infrastructure with no per-operator owner; the daemon's existing direct
+///   gateway-create path writes no marker either.
+/// - No `QEMU_SYSTEM_AARCH64` is set. The gateway VM runs without the
+///   `restrict=on` qemu-wrapper on its management NIC — again matching the
+///   direct path, which passes an empty wrapper for this instance.
+async fn handle_create_gateway(ctx: &RunContext, lima_yaml: String) -> BrokerResult {
+    let vm = own_gateway_vm_instance_name(ctx);
+
+    // The name is agent-constructed, so this cannot fail today. It is called
+    // anyway because the property it asserts — safe as a `limactl` positional,
+    // no leading dash, no shell metacharacters — is a property of the argv
+    // built below, and it should be checked where the argv is built rather
+    // than assumed from a `format!` several functions away.
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_gateway_lima_yaml_shape(&lima_yaml) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    let yaml_path = format!("{}/{}.yaml", ctx.lima_home, vm);
+    if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &yaml_path) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    // Write the yaml verbatim (validated above), at 0600.
+    unsafe { libc::umask(0o077) };
+    if let Err(e) = std::fs::write(&yaml_path, lima_yaml.as_bytes()) {
+        return BrokerResult::Rejected {
+            reason: format!("failed to write lima.yaml to {yaml_path}: {e}"),
+        };
+    }
+
+    info!(vm, yaml_path, "wrote daemon-rendered gateway lima.yaml");
+
+    run_limactl(
+        ctx,
+        &["create", "--name", &vm, &yaml_path, "--tty=false"],
+        &[],
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2339,6 +2427,200 @@ mod tests {
             matches!(result, BrokerResult::Rejected { .. }),
             "Create with flow-style {{socket: ..., mode: shared}} NIC must be rejected; \
              previously evadable with line-based mode: check"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Create vs CreateGateway — the class is the op, not any wire field
+    // -----------------------------------------------------------------------
+
+    /// A four-NIC gateway-shaped template, as the daemon renders one.
+    fn gateway_shaped_yaml() -> String {
+        "vmType: \"qemu\"\ncpus: 2\nnetworks:\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-0.sock\n    interface: lima0\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-1.sock\n    interface: lima1\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-2.sock\n    interface: lima2\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-3.sock\n    interface: lima3\n"
+            .to_string()
+    }
+
+    /// A `Create` naming a gateway-shaped VM is still a session create and is
+    /// still held to the single-NIC rule.
+    ///
+    /// This is the property the class split exists to establish. The VM name is
+    /// a daemon-supplied wire field, and the daemon is untrusted here; if the
+    /// name selected the class, a compromised daemon would obtain the multi-NIC
+    /// rule for a session VM by spelling the name a particular way. Dispatching
+    /// on the op variant means there is no spelling that does it.
+    #[tokio::test]
+    async fn dispatch_create_with_gateway_shaped_name_gets_the_session_rule() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        for name in [
+            format!("sandboxd-gateway-{own_uid}"),
+            "sandboxd-gateway".to_string(),
+        ] {
+            let op = BrokerOp::Create {
+                op_uid: own_uid,
+                vm: name.clone(),
+                lima_yaml: format!("# vm: {name}\n{}", gateway_shaped_yaml()),
+                owner: "10.209.0.0/20".to_string(),
+                qemu_wrapper: String::new(),
+                is_hardened_session: true,
+            };
+            let result = dispatch_op(&ctx, op).await;
+            let BrokerResult::Rejected { reason } = result else {
+                panic!(
+                    "a gateway-shaped name on Create must not obtain the gateway rule; \
+                     got {result:?} for {name}"
+                );
+            };
+            assert!(
+                reason.contains("exactly one socket_vmnet entry"),
+                "{name}: rejection must come from the session single-NIC rule; \
+                 got {reason:?}"
+            );
+        }
+    }
+
+    /// `CreateGateway` carries no VM name on the wire: the agent derives the
+    /// instance name from its own uid, writes the template under that name, and
+    /// hands that name to `limactl create`.
+    ///
+    /// This is also the end-to-end acceptance case: a legitimate gateway
+    /// template must clear *every* check on this path, not just the NIC-count
+    /// rule that a session template trips on first.
+    ///
+    /// The LIMA_HOME deliberately does not exist, so the template write fails
+    /// with ENOENT. That stops the op before `limactl` is reached — a hermetic
+    /// unit test must not provision a real Lima instance — while still naming
+    /// the path the agent chose. Reaching the write at all is the assertion:
+    /// every validator ahead of it returned `Ok`, and the filename shows the
+    /// instance name was derived from the agent's own uid rather than read off
+    /// the wire.
+    #[tokio::test]
+    async fn dispatch_create_gateway_derives_the_instance_name_from_own_uid() {
+        let own_uid = unsafe { libc::getuid() };
+        let parent = tempfile::tempdir().expect("temp dir");
+        let lima_home = parent.path().join("absent");
+        let ctx = RunContext {
+            own_uid,
+            lima_home: lima_home.to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
+        };
+        let op = BrokerOp::CreateGateway {
+            op_uid: own_uid,
+            lima_yaml: gateway_shaped_yaml(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        let BrokerResult::Rejected { reason } = result else {
+            panic!("expected the deliberate write failure, got {result:?}");
+        };
+        assert!(
+            reason.starts_with("failed to write lima.yaml to "),
+            "a legitimate gateway template must pass every validator on this path; \
+             the only permitted failure is the deliberate write failure, got {reason:?}"
+        );
+        assert!(
+            reason.contains(&format!("/absent/sandboxd-gateway-{own_uid}.yaml")),
+            "the agent must name the instance from its own uid; got {reason:?}"
+        );
+    }
+
+    /// A `CreateGateway` whose interface pin disagrees with its socket's slot is
+    /// rejected, and nothing is written.
+    #[tokio::test]
+    async fn dispatch_rejects_create_gateway_with_interface_slot_mismatch() {
+        let own_uid = unsafe { libc::getuid() };
+        let lima_home = tempfile::tempdir().expect("temp lima home");
+        let ctx = RunContext {
+            own_uid,
+            lima_home: lima_home.path().to_string_lossy().into_owned(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
+        };
+        let op = BrokerOp::CreateGateway {
+            op_uid: own_uid,
+            lima_yaml: "vmType: \"qemu\"\nnetworks:\n\
+                        \x20 - socket: /var/run/sandbox/vmnet/slot-7.sock\n    interface: lima2\n"
+                .to_string(),
+        };
+        let result = dispatch_op(&ctx, op).await;
+        let BrokerResult::Rejected { reason } = result else {
+            panic!("an interface/slot mismatch must be rejected; got {result:?}");
+        };
+        assert!(
+            reason.contains("slot 7") && reason.contains("lima7"),
+            "rejection must name the slot the socket belongs to; got {reason:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(lima_home.path())
+                .expect("read temp lima home")
+                .count(),
+            0,
+            "a rejected gateway create must write nothing"
+        );
+    }
+
+    /// A session template on `CreateGateway` is rejected — the gateway op does
+    /// not accept the session shape any more than the reverse.
+    #[tokio::test]
+    async fn dispatch_rejects_create_gateway_with_a_session_template() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::CreateGateway {
+            op_uid: own_uid,
+            lima_yaml:
+                "vmType: \"qemu\"\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n"
+                    .to_string(),
+        };
+        assert!(
+            matches!(dispatch_op(&ctx, op).await, BrokerResult::Rejected { .. }),
+            "a session template on CreateGateway must be rejected"
+        );
+    }
+
+    /// The own-uid gate covers `CreateGateway` like every other op.
+    #[tokio::test]
+    async fn dispatch_rejects_create_gateway_for_a_foreign_uid() {
+        let own_uid = unsafe { libc::getuid() };
+        let ctx = ctx(own_uid);
+        let op = BrokerOp::CreateGateway {
+            op_uid: own_uid + 1,
+            lima_yaml: gateway_shaped_yaml(),
+        };
+        assert!(
+            matches!(dispatch_op(&ctx, op).await, BrokerResult::Rejected { .. }),
+            "CreateGateway for a foreign uid must be rejected"
+        );
+    }
+
+    /// The wire form of `CreateGateway` carries no VM-name field.
+    ///
+    /// Asserted on the serialized JSON rather than on the Rust type, because
+    /// the field's absence is a property of what crosses the channel: a daemon
+    /// cannot name the instance because there is nowhere on the wire to put a
+    /// name, and an unknown field is refused at deserialization.
+    #[test]
+    fn create_gateway_carries_no_vm_name_on_the_wire() {
+        let op = BrokerOp::CreateGateway {
+            op_uid: 501,
+            lima_yaml: "vmType: \"qemu\"\n".to_string(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&op).expect("serialize CreateGateway"))
+                .expect("reparse CreateGateway");
+        let mut fields: Vec<&str> = json
+            .as_object()
+            .expect("CreateGateway serializes to an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            vec!["lima_yaml", "op_uid", "subcommand"],
+            "CreateGateway must carry exactly the op tag, the uid cross-check and \
+             the template — no vm name, no owner, no wrapper path"
         );
     }
 

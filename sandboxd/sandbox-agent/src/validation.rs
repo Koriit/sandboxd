@@ -319,7 +319,139 @@ pub fn validate_backend(backend: &str) -> Result<(), String> {
 // Lima YAML shape validation
 // ---------------------------------------------------------------------------
 
-/// Validate the shape of a daemon-rendered `lima.yaml` for a sandbox VM.
+// The validator is split by VM *class*, and the split is the security-relevant
+// part of this module. Read this before changing either half.
+//
+// Two classes exist, and the class is selected by **which `BrokerOp` variant
+// the daemon invoked** — `Create` for the session class, `CreateGateway` for
+// the gateway class. Nothing else selects it. Not a flag on the request, not
+// the VM's name, not anything else the daemon writes on the wire. That matters
+// because the daemon is an untrusted requester here (see the module doc above):
+// any selector the daemon can set is a selector the daemon can set *wrongly*,
+// and the thing it would be choosing is whether a VM may attach more than one
+// NIC. The closed op enum is what already bounds a compromised daemon, so the
+// class rides on it and inherits the same bound.
+//
+// What each class still guarantees, in this module's own terms:
+//
+// * Both classes — the YAML parses, its top level is a mapping, `vmType` is
+//   present and exactly `"qemu"` (an absent one would let Lima default to VZ on
+//   macOS, which cannot attach socket_vmnet at all), and there is no top-level
+//   singular `network:` key. Every NIC entry's `socket:` is absolute, free of
+//   `..`, and inside `/var/run/sandbox/vmnet/`. No entry may carry `mode:`
+//   (a Lima-managed named network).
+//
+// * Session class (`validate_lima_yaml_shape`) — **exactly one** NIC entry, and
+//   that entry's only key is `socket:`. This is unchanged, and it is applied
+//   unconditionally on the `Create` path: nothing about the name, the YAML, or
+//   any other field can obtain a different rule for a session VM.
+//   `require_socket_vmnet == false` (the base-image build VM, which has no
+//   `networks:` key by design) waives only the *presence* of `networks:`; if
+//   the key is there it is held to the same single-entry rule.
+//
+// * Gateway class (`validate_gateway_lima_yaml_shape`) — one or more NIC
+//   entries, because a gateway VM's job is to sit on every pool slot's L2
+//   segment at once. This is a different rule, not a weaker one: each entry
+//   must carry exactly the two keys `socket:` and `interface:`; each socket
+//   must be a canonical `slot-<n>.sock` path (round-trip exact, so `slot-04`
+//   and a foreign directory are both out); the interface name must be the
+//   `lima<n>` that belongs to *that* slot; and no two entries may name the same
+//   slot. Lima itself will not check any of this — it accepts
+//   `interface: lima2` on `slot-7.sock` without a murmur, and the result is a
+//   VM whose NIC names point at the wrong segments. So where the session rule
+//   bounds the *number* of segments a VM reaches, the gateway rule bounds
+//   *which* segment each of its NICs is on, and both are checks the daemon
+//   cannot skip.
+//
+// The two rules are also mutually exclusive by entry shape: a session entry has
+// exactly `{socket}` and a gateway entry exactly `{socket, interface}`. A
+// gateway template presented on the `Create` op is rejected (two keys), and a
+// session template presented on `CreateGateway` is rejected (no `interface`).
+
+/// Validate the parts of a daemon-rendered `lima.yaml` that every VM class
+/// shares, returning the parsed top-level mapping for the class-specific
+/// checks to work from.
+///
+/// Covers: non-empty, parses as YAML, top level is a mapping, `vmType` present
+/// and `"qemu"`, no top-level singular `network:` key. See the class-split
+/// comment above for why these are the shared set.
+fn validate_lima_yaml_common(lima_yaml: &str) -> Result<serde_yaml::Mapping, String> {
+    use serde_yaml::Value;
+
+    if lima_yaml.trim().is_empty() {
+        return Err("lima.yaml is empty".to_string());
+    }
+
+    // Parse the YAML. serde_yaml rejects malformed YAML; multi-document
+    // (`---`-separated) docs are handled by `from_str` which returns the
+    // first document — we then check for the absence of structural keys
+    // the second doc could smuggle in. A completely valid single-document
+    // YAML is what we expect from the daemon template.
+    let doc: Value = serde_yaml::from_str(lima_yaml)
+        .map_err(|e| format!("lima.yaml failed to parse as YAML: {e}"))?;
+
+    // The top-level document must be a mapping.
+    let top = match doc {
+        Value::Mapping(m) => m,
+        _ => return Err("lima.yaml top-level must be a YAML mapping".to_string()),
+    };
+
+    // Check: `vmType` must be present and equal to `"qemu"`.
+    //
+    // Lima on macOS defaults to VZ (Virtualization.framework) when `vmType` is
+    // unset. VZ cannot attach socket_vmnet NICs — it would boot the VM under
+    // vzNAT, bypassing the gateway and voiding egress control entirely. An
+    // absent `vmType` is therefore as dangerous as `vmType: vz` on macOS.
+    //
+    // The daemon template must always emit `vmType: "qemu"` explicitly so this
+    // check can verify the correct backend is selected. Any other value
+    // (`vz`, `libkrun`, etc.) or an absent key is rejected.
+    //
+    // Parsing normalises all syntactic forms — `vmType: qemu`, `{vmType: qemu}`,
+    // `'vmType': qemu`, `"vmType": qemu` — into the same key/value in the mapping,
+    // so this check is robust to YAML serialisation style.
+    let vmtype_val = top
+        .get("vmType")
+        .ok_or_else(|| {
+            "lima.yaml must contain vmType: \"qemu\"; absent vmType is rejected because \
+             Lima defaults to VZ on macOS, which cannot attach socket_vmnet and \
+             would void egress control"
+                .to_string()
+        })?
+        .as_str()
+        .ok_or_else(|| "lima.yaml vmType value must be a string".to_string())?;
+    if vmtype_val != "qemu" {
+        return Err(format!(
+            "lima.yaml vmType must be \"qemu\", got {vmtype_val:?}; \
+             vz (and any other non-qemu backend) cannot attach socket_vmnet \
+             and would void egress control"
+        ));
+    }
+
+    // Check: no `network` key (singular) at the top level. Some Lima versions
+    // accept this form as an alias for `networks`; reject it unconditionally so
+    // the check below on `networks` is the only code path. This applies to
+    // every VM class.
+    if top.contains_key("network") {
+        return Err(
+            "lima.yaml must not contain a 'network' key; use 'networks' with a socket: entry"
+                .to_string(),
+        );
+    }
+
+    Ok(top)
+}
+
+/// Validate the shape of a daemon-rendered `lima.yaml` for a **session-class**
+/// VM (or the transient base-image build VM).
+///
+/// This is the rule for every VM reached through `BrokerOp::Create`, and it is
+/// applied to all of them unconditionally: a session VM gets the single-NIC
+/// rule no matter what it is called. A gateway-shaped name presented here is
+/// still a session create and is still held to this rule — the name buys
+/// nothing. The gateway class has its own entry point,
+/// [`validate_gateway_lima_yaml_shape`], reachable only from
+/// `BrokerOp::CreateGateway`.
 ///
 /// The agent writes the YAML verbatim after this check; it does not parse or
 /// reassemble the YAML. Shape validation asserts the YAML is safe to write:
@@ -365,68 +497,7 @@ pub fn validate_lima_yaml_shape(
     expected_vm: &str,
     require_socket_vmnet: bool,
 ) -> Result<(), String> {
-    use serde_yaml::Value;
-
-    if lima_yaml.trim().is_empty() {
-        return Err("lima.yaml is empty".to_string());
-    }
-
-    // Parse the YAML. serde_yaml rejects malformed YAML; multi-document
-    // (`---`-separated) docs are handled by `from_str` which returns the
-    // first document — we then check for the absence of structural keys
-    // the second doc could smuggle in. A completely valid single-document
-    // YAML is what we expect from the daemon template.
-    let doc: Value = serde_yaml::from_str(lima_yaml)
-        .map_err(|e| format!("lima.yaml failed to parse as YAML: {e}"))?;
-
-    // The top-level document must be a mapping.
-    let top = match &doc {
-        Value::Mapping(m) => m,
-        _ => return Err("lima.yaml top-level must be a YAML mapping".to_string()),
-    };
-
-    // Check: `vmType` must be present and equal to `"qemu"`.
-    //
-    // Lima on macOS defaults to VZ (Virtualization.framework) when `vmType` is
-    // unset. VZ cannot attach socket_vmnet NICs — it would boot the VM under
-    // vzNAT, bypassing the gateway and voiding egress control entirely. An
-    // absent `vmType` is therefore as dangerous as `vmType: vz` on macOS.
-    //
-    // The daemon template must always emit `vmType: "qemu"` explicitly so this
-    // check can verify the correct backend is selected. Any other value
-    // (`vz`, `libkrun`, etc.) or an absent key is rejected.
-    //
-    // Parsing normalises all syntactic forms — `vmType: qemu`, `{vmType: qemu}`,
-    // `'vmType': qemu`, `"vmType": qemu` — into the same key/value in the mapping,
-    // so this check is robust to YAML serialisation style.
-    let vmtype_val = top
-        .get("vmType")
-        .ok_or_else(|| {
-            "lima.yaml must contain vmType: \"qemu\"; absent vmType is rejected because \
-             Lima defaults to VZ on macOS, which cannot attach socket_vmnet and \
-             would void egress control"
-                .to_string()
-        })?
-        .as_str()
-        .ok_or_else(|| "lima.yaml vmType value must be a string".to_string())?;
-    if vmtype_val != "qemu" {
-        return Err(format!(
-            "lima.yaml vmType must be \"qemu\", got {vmtype_val:?}; \
-             vz (and any other non-qemu backend) cannot attach socket_vmnet \
-             and would void egress control"
-        ));
-    }
-
-    // Check: no `network` key (singular) at the top level. Some Lima versions
-    // accept this form as an alias for `networks`; reject it unconditionally so
-    // the check below on `networks` is the only code path. This applies to both
-    // session VMs and base-image build VMs.
-    if top.contains_key("network") {
-        return Err(
-            "lima.yaml must not contain a 'network' key; use 'networks' with a socket: entry"
-                .to_string(),
-        );
-    }
+    let top = validate_lima_yaml_common(lima_yaml)?;
 
     // Check: the `networks` sequence contains exactly one entry with a valid
     // socket_vmnet path.
@@ -474,6 +545,202 @@ pub fn validate_lima_yaml_shape(
         return Err(format!(
             "lima.yaml does not appear to reference the expected VM name {expected_vm:?}"
         ));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gateway-class Lima YAML shape validation
+// ---------------------------------------------------------------------------
+
+/// Directory holding the socket_vmnet slot sockets. Mirrors
+/// `sandbox_core::network::VMNET_SOCKET_DIR`, restated here because this crate
+/// deliberately does not depend on `sandbox-core` — the agent's validators must
+/// not be reachable from, or weakenable by, the daemon's own crate graph.
+const VMNET_SLOT_SOCKET_DIR: &str = "/var/run/sandbox/vmnet";
+
+/// The socket path belonging to pool slot `slot`.
+///
+/// The agent-side mirror of `sandbox_core::network::vmnet_slot_socket_path`.
+fn vmnet_slot_socket_path(slot: u16) -> String {
+    format!("{VMNET_SLOT_SOCKET_DIR}/slot-{slot}.sock")
+}
+
+/// The in-VM interface name pinned to pool slot `slot`.
+///
+/// The agent-side mirror of `sandbox_core::gateway_lima::slot_interface_name`.
+fn slot_interface_name(slot: u16) -> String {
+    format!("lima{slot}")
+}
+
+/// Recover the pool slot from a vmnet slot socket path — the exact inverse of
+/// [`vmnet_slot_socket_path`].
+///
+/// The socket path is the authority on which L2 segment a NIC lands on, so an
+/// entry claiming a `lima<n>` interface name can be *checked* against the
+/// socket it sits on rather than believed. Returns `None` unless the path is
+/// byte-for-byte what [`vmnet_slot_socket_path`] would emit for the parsed
+/// index, which rejects a foreign directory and non-canonical spellings
+/// (`slot-04.sock`, `slot-+4.sock`) alike — an inexact parse here would let two
+/// different spellings of "the same" path disagree about which slot they mean,
+/// and the disagreement is exactly what the interface check is trying to catch.
+///
+/// The agent-side mirror of `sandbox_core::network::slot_from_vmnet_socket_path`.
+fn slot_from_vmnet_socket_path(path: &str) -> Option<u16> {
+    let file = std::path::Path::new(path).file_name()?.to_str()?;
+    let digits = file.strip_prefix("slot-")?.strip_suffix(".sock")?;
+    let slot: u16 = digits.parse().ok()?;
+    (vmnet_slot_socket_path(slot) == path).then_some(slot)
+}
+
+/// Validate the shape of a daemon-rendered `lima.yaml` for a **gateway-class**
+/// VM.
+///
+/// Reachable only from `BrokerOp::CreateGateway`. See the class-split comment
+/// at the top of this section of the module for why the class rides on the op
+/// variant and on nothing else.
+///
+/// A gateway VM's purpose is to terminate every pool slot's L2 segment, so
+/// unlike a session VM it carries one socket_vmnet NIC per slot. That is the
+/// only thing this rule permits that the session rule does not; everything else
+/// it demands is *additional*:
+///
+/// - `networks:` must be present and must be a non-empty sequence. A gateway VM
+///   with no slot NICs has nothing to gateway.
+/// - Each entry's keys are exactly `socket:` and `interface:` — no more (an
+///   extra key could turn on Lima networking behaviour nobody reviewed), no
+///   fewer. In particular `mode:` is rejected, as it is for a session VM.
+/// - Each `socket:` passes [`validate_socket_path`] *and* parses back to a pool
+///   slot via [`slot_from_vmnet_socket_path`]. The session rule stops at the
+///   directory prefix; here the whole filename must be canonical, because the
+///   slot number it encodes is load-bearing for the next check.
+/// - Each `interface:` is exactly the `lima<n>` belonging to that entry's own
+///   slot. Lima will not check this: it accepts `interface: lima2` on
+///   `slot-7.sock` silently, and since the NIC name is what selects the macvlan
+///   parent inside the VM, the result is sessions parented on the wrong
+///   segment — a cross-session isolation failure that looks like nothing at
+///   all from the outside. The daemon's template generator makes the same
+///   check when it renders; this one makes it from outside the daemon's trust
+///   boundary, where a compromised daemon cannot skip it.
+/// - No two entries name the same slot. Two NICs on one segment is never a
+///   thing a correct render produces, and it would give the VM two interface
+///   names for one segment.
+///
+/// There is deliberately **no expected-VM-name argument**. `CreateGateway`
+/// carries no VM name on the wire — the agent derives the instance name from
+/// its own uid — so there is no name here to cross-check the YAML against, and
+/// the session path's belt-and-suspenders containment check has nothing to
+/// operate on. That check exists to catch a daemon mis-routing a YAML to the
+/// wrong *named* instance; with the name gone from the request, so is the
+/// mis-routing it guards against. (Lima templates carry no instance name in
+/// their body in any case.)
+pub fn validate_gateway_lima_yaml_shape(lima_yaml: &str) -> Result<(), String> {
+    use serde_yaml::Value;
+
+    let top = validate_lima_yaml_common(lima_yaml)?;
+
+    let networks_val = top.get("networks").ok_or_else(|| {
+        "lima.yaml must contain a 'networks' key with one socket_vmnet entry per pool slot"
+            .to_string()
+    })?;
+
+    let networks_seq = match networks_val {
+        Value::Sequence(s) => s,
+        _ => {
+            return Err(
+                "lima.yaml 'networks' must be a sequence (list of NIC entries)".to_string(),
+            );
+        }
+    };
+
+    if networks_seq.is_empty() {
+        return Err(
+            "lima.yaml 'networks' must contain at least one socket_vmnet entry; a gateway \
+             instance with no slot NICs terminates no session segment"
+                .to_string(),
+        );
+    }
+
+    let mut seen_slots: Vec<u16> = Vec::with_capacity(networks_seq.len());
+
+    for (index, entry) in networks_seq.iter().enumerate() {
+        let nic = match entry {
+            Value::Mapping(m) => m,
+            _ => {
+                return Err(format!(
+                    "lima.yaml 'networks[{index}]' must be a mapping \
+                     (expected {{socket: ..., interface: ...}})"
+                ));
+            }
+        };
+
+        // `mode:` names a Lima-managed network. Called out separately from the
+        // key-set check below so the error says why, not just "unexpected key".
+        if nic.contains_key("mode") {
+            return Err(format!(
+                "lima.yaml 'networks[{index}]' must not have a 'mode' key; \
+                 managed named-network entries are not permitted — only socket: entries"
+            ));
+        }
+
+        if !nic.contains_key("socket") {
+            return Err(format!(
+                "lima.yaml 'networks[{index}]' must have a 'socket' key (socket_vmnet path)"
+            ));
+        }
+        if !nic.contains_key("interface") {
+            return Err(format!(
+                "lima.yaml 'networks[{index}]' must have an 'interface' key pinning the \
+                 in-VM NIC name to its slot; without it Lima names NICs by array position \
+                 and a non-contiguous slot set is parented on the wrong segments"
+            ));
+        }
+        if nic.len() != 2 {
+            return Err(format!(
+                "lima.yaml 'networks[{index}]' must have exactly two keys \
+                 ('socket', 'interface'), found {} keys: {:?}",
+                nic.len(),
+                nic.keys().filter_map(|k| k.as_str()).collect::<Vec<_>>()
+            ));
+        }
+
+        let socket_val = nic.get("socket").and_then(|v| v.as_str()).ok_or_else(|| {
+            format!("lima.yaml 'networks[{index}].socket' must be a string value")
+        })?;
+        validate_socket_path(socket_val)?;
+
+        let slot = slot_from_vmnet_socket_path(socket_val).ok_or_else(|| {
+            format!(
+                "lima.yaml 'networks[{index}].socket' {socket_val:?} is not a canonical \
+                 pool slot socket path (expected {VMNET_SLOT_SOCKET_DIR}/slot-<n>.sock \
+                 with no leading zeros or sign)"
+            )
+        })?;
+
+        let interface_val = nic
+            .get("interface")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                format!("lima.yaml 'networks[{index}].interface' must be a string value")
+            })?;
+        let expected_interface = slot_interface_name(slot);
+        if interface_val != expected_interface {
+            return Err(format!(
+                "lima.yaml 'networks[{index}]' pins interface {interface_val:?} onto socket \
+                 {socket_val:?}, which belongs to slot {slot} \
+                 (expected interface {expected_interface:?}); the in-VM NIC name selects the \
+                 macvlan parent, so a mismatch parents sessions on another slot's segment"
+            ));
+        }
+
+        if seen_slots.contains(&slot) {
+            return Err(format!(
+                "lima.yaml 'networks[{index}]' repeats slot {slot}; each pool slot may be \
+                 attached at most once"
+            ));
+        }
+        seen_slots.push(slot);
     }
 
     Ok(())
@@ -2130,6 +2397,515 @@ user:
             "macOS template with 9p shared workspace must pass shape validation; error: {:?}",
             result.err()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Class split: the session rule is applied to every session create
+    //
+    // The property these two guard is that VM class is selected by the op the
+    // daemon invoked and by nothing else. They are written against the session
+    // entry point specifically, because that is the side where a leak is
+    // dangerous: a session VM permitted the gateway shape reaches more than one
+    // L2 segment and routes around its own gateway.
+    // -----------------------------------------------------------------------
+
+    /// A four-NIC gateway-shaped template, as the daemon renders one.
+    fn gateway_shaped_networks_yaml() -> String {
+        "vmType: \"qemu\"\ncpus: 4\nnetworks:\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-0.sock\n    interface: lima0\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-1.sock\n    interface: lima1\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-2.sock\n    interface: lima2\n\
+         \x20 - socket: /var/run/sandbox/vmnet/slot-3.sock\n    interface: lima3\n"
+            .to_string()
+    }
+
+    /// A session create carrying two NIC entries is rejected — the single-NIC
+    /// rule, which is what holds a session VM to one L2 segment.
+    #[test]
+    fn session_rule_rejects_two_network_entries() {
+        let yaml = "vmType: \"qemu\"\nnetworks:\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-0.sock\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-1.sock\n";
+        let err = validate_lima_yaml_shape(yaml, "", true)
+            .expect_err("two NIC entries must be rejected on the session path");
+        assert!(
+            err.contains("exactly one socket_vmnet entry"),
+            "rejection must come from the single-NIC rule, not incidentally from \
+             some other check; got: {err:?}"
+        );
+    }
+
+    /// A gateway-shaped *name* on the session path buys nothing: the session
+    /// rule still applies, and a gateway-shaped template is still rejected.
+    ///
+    /// This is the half of the class split that a name-derived class selector
+    /// would get wrong. The name is a daemon-supplied wire field; if it chose
+    /// the rule, a compromised daemon would pick the multi-NIC rule for a
+    /// session VM by spelling its name a particular way.
+    #[test]
+    fn session_rule_applies_to_a_gateway_shaped_name() {
+        let yaml = gateway_shaped_networks_yaml();
+        for name in [
+            "sandboxd-gateway",
+            "sandboxd-gateway-0",
+            "sandboxd-gateway-501",
+            "sandboxd-gateway-1000",
+        ] {
+            let yaml_with_name = format!("# vm: {name}\n{yaml}");
+            let err = validate_lima_yaml_shape(&yaml_with_name, name, true).expect_err(
+                "a gateway-shaped name on the session path must not obtain the gateway rule",
+            );
+            assert!(
+                err.contains("exactly one socket_vmnet entry"),
+                "{name}: rejection must come from the session single-NIC rule; got: {err:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gateway-class lima.yaml shape validation
+    // -----------------------------------------------------------------------
+
+    /// The gateway template the daemon renders — the verbatim output of
+    /// `sandbox_core::gateway_lima::generate_gateway_template(&[0, 1, 2, 3, 4,
+    /// 5, 6, 7])`, the default 8-slot pool, captured on 2026-08-19.
+    ///
+    /// A copy rather than a call: this crate deliberately does not depend on
+    /// `sandbox-core` (see `Cargo.toml`), which is why the pre-existing
+    /// session-template round-trip fixtures above are copies too. It is kept
+    /// whole, provisioning scripts and all, rather than trimmed to the
+    /// shape-critical stanzas — the scripts are YAML block scalars containing
+    /// `printf` lines full of `\n` escapes and `#` comments, and whether the
+    /// parser survives them is part of what "the real template is accepted"
+    /// means. `sandbox_core::gateway_lima`'s own
+    /// `generated_gateway_template_satisfies_the_agent_gateway_rule` asserts
+    /// the live generator still emits a template of this shape, so drift is
+    /// caught there rather than silently invalidating this fixture.
+    const GATEWAY_TEMPLATE: &str = r##"vmType: "qemu"
+minimumLimaVersion: "1.2.0"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+
+cpus: 2
+memory: "2GiB"
+disk: "20GiB"
+
+# N socket_vmnet NICs — one per pool slot.
+# Count = max_macos_sessions (default 8). Fixed at instance creation.
+networks:
+  - socket: /var/run/sandbox/vmnet/slot-0.sock
+    interface: lima0
+  - socket: /var/run/sandbox/vmnet/slot-1.sock
+    interface: lima1
+  - socket: /var/run/sandbox/vmnet/slot-2.sock
+    interface: lima2
+  - socket: /var/run/sandbox/vmnet/slot-3.sock
+    interface: lima3
+  - socket: /var/run/sandbox/vmnet/slot-4.sock
+    interface: lima4
+  - socket: /var/run/sandbox/vmnet/slot-5.sock
+    interface: lima5
+  - socket: /var/run/sandbox/vmnet/slot-6.sock
+    interface: lima6
+  - socket: /var/run/sandbox/vmnet/slot-7.sock
+    interface: lima7
+
+# Expose the guest Docker socket to the macOS host via Lima forwarding.
+portForwards:
+  - guestSocket: "/var/run/docker.sock"
+    hostSocket: "{{.Dir}}/gateway-docker.sock"
+
+# 9p mount for lite-mode shared: workspaces.
+# The shared root is exposed read-write at the same absolute path so the
+# host->VM path translation is an identity. Per-session shared: paths must
+# fall under this root (validated at session-create time).
+# NOTE: reads are performed as _sandboxd (the gateway VM user), not the
+# operator. Sources outside TCC-protected dirs work without consent.
+mountType: "9p"
+mounts:
+  - location: "/tmp/sandbox-shared"
+    writable: true
+    9p:
+      securityModel: "mapped-xattr"
+      cache: "mmap"
+
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Install Docker Engine from Ubuntu packages (docker.io — NOT docker-ce).
+      # Matches the Linux base/gateway provisioning path:
+      # no extra apt source, fewer moving parts, works offline-after-mirror.
+      # Retry loop because Lima slirp can drop packets under concurrent fetches.
+      until apt-get update -qq && apt-get install -y docker.io; do
+        echo "apt retry..." >&2; sleep 5
+      done
+      systemctl enable docker
+      systemctl start docker
+      # Make the in-VM Docker socket world-readable/writable.
+      #
+      # Lima's socket-forward connects to /var/run/docker.sock as the SSH login
+      # user (the operator). The obvious approach — chgrp the 0660 socket to the
+      # docker group and add the operator to that group — does NOT work here:
+      # Lima establishes a persistent ControlPersist SSH master connection at VM
+      # boot, BEFORE this provision runs, so every forwarded channel inherits the
+      # operator's boot-time supplementary groups. The docker group added now is
+      # absent from those channels' credentials (`id` for the operator over the
+      # master shows no docker group despite /etc/group listing it), so the
+      # forward can't read a 0660 socket and the host side sees EOF.
+      #
+      # 0666 is safe here: the HOST-side forwarded gateway-docker.sock is 0600
+      # (operator-only), the gateway VM is a single-tenant daemon-owned appliance,
+      # and the VM's /var/run/docker.sock is a unix socket that is never
+      # bind-mounted into any lite/gateway container — so no container can reach
+      # it. Widening the in-VM mode does not widen the external attack surface.
+      #
+      # The drop-in makes the mode survive docker.socket restarts; the direct
+      # chmod fixes the already-running socket for the current boot (the drop-in
+      # only takes effect on the next docker.socket (re)start, which we must not
+      # force here without disrupting the running dockerd).
+      groupadd -f docker
+      mkdir -p /etc/systemd/system/docker.socket.d
+      printf '[Socket]\nSocketMode=0666\n' \
+        > /etc/systemd/system/docker.socket.d/10-socketmode.conf
+      systemctl daemon-reload
+      chmod 666 /var/run/docker.sock
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Allow the daemon to invoke sandbox-route-helper inside the VM without
+      # a password prompt. The sudoers entry is scoped to exactly one binary
+      # so no other command can be run as root via this grant.
+      #
+      # This grant is redundant, and is kept deliberately. It is redundant
+      # because the VM's login user already holds `ALL=(ALL) NOPASSWD:ALL`
+      # from the distro image's own cloud-init — measured, not assumed — so
+      # every sudo in this VM is already passwordless and this fragment
+      # authorizes nothing that was not authorized without it.
+      #
+      # It is kept because it is the only place the *intended* privilege is
+      # written down. If the base image ever tightens its default (a distro
+      # change nothing here controls), this fragment is what keeps the one
+      # sudo the daemon actually needs working, and the route-install path
+      # does not silently start prompting. Removing it would trade a line of
+      # documentation for a dependency on someone else's default.
+      #
+      # printf is used instead of a heredoc because the Lima template is a
+      # YAML block scalar — heredoc terminators at column 0 would be
+      # misinterpreted by the YAML parser as end-of-scalar.
+      printf 'ALL ALL=(root) NOPASSWD: /usr/local/libexec/sandboxd/sandbox-route-helper\n' \
+        > /etc/sudoers.d/sandbox-route-helper
+      chmod 0440 /etc/sudoers.d/sandbox-route-helper
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Clamp eth0 (slirp/Lima management NIC) MTU to 1280.
+      # Lima/slirp does not relay host PMTU into the guest; on paths with
+      # PMTU < 1500 (PPPoE, WiFi, VPN) TCP segments get silently dropped.
+      # 1280 is the IPv6 minimum — safe on all paths. The socket_vmnet NICs
+      # (lima0…) use native L2 MTU and are unaffected.
+      # Clamp by NIC name (eth0 = slirp/management), never by index.
+      #
+      # printf is used instead of a heredoc because the Lima template is a
+      # YAML block scalar — heredoc terminators at column 0 would be
+      # misinterpreted by the YAML parser as end-of-scalar.
+      printf 'network:\n  ethernets:\n    eth0:\n      mtu: 1280\n' \
+        > /etc/netplan/99-sandbox-mtu.yaml
+      chmod 0644 /etc/netplan/99-sandbox-mtu.yaml
+      netplan apply
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Disable IPv6 on the socket_vmnet NICs (lima0…limaN-1) and
+      # configure them as link-up only with no DHCP.
+      #
+      # Rationale:
+      # - The in-container ruleset already drops ip6, but disabling IPv6 on
+      #   the host-side NIC closes the parallel link-local/RA path — a guest
+      #   cannot emit IPv6 RAs or link-local multicast onto the segment to
+      #   reach a neighbor.
+      # - Without `dhcp4: no` + `optional: true`, Ubuntu systemd-networkd
+      #   attempts DHCP on every unconfigured NIC and BLOCKS boot waiting for
+      #   leases that never arrive on network-identifier segments (no DHCP).
+      #
+      # printf is used to write the netplan YAML to avoid column-0 heredoc
+      # markers that would break YAML parsing of the Lima template.
+      sysctl -w net.ipv6.conf.lima0.disable_ipv6=1
+      sysctl -w net.ipv6.conf.lima1.disable_ipv6=1
+      sysctl -w net.ipv6.conf.lima2.disable_ipv6=1
+      sysctl -w net.ipv6.conf.lima3.disable_ipv6=1
+      sysctl -w net.ipv6.conf.lima4.disable_ipv6=1
+      sysctl -w net.ipv6.conf.lima5.disable_ipv6=1
+      sysctl -w net.ipv6.conf.lima6.disable_ipv6=1
+      sysctl -w net.ipv6.conf.lima7.disable_ipv6=1
+      printf 'network:\n  ethernets:\n' > /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima0:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima1:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima2:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima3:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima4:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima5:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima6:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      printf '    lima7:\n      dhcp4: no\n      optional: true\n' >> /etc/netplan/99-sandbox-vmnet.yaml
+      chmod 0644 /etc/netplan/99-sandbox-vmnet.yaml
+      netplan apply
+"##;
+
+    /// The whole point of the split: a legitimate 8-NIC gateway template passes
+    /// every check on the gateway path.
+    ///
+    /// "Every check" is load-bearing. The NIC-count rule is only the first one
+    /// a gateway template trips on the session path; behind it sit the
+    /// entry-shape rules and, at the end, the session path's expected-VM-name
+    /// containment check — which a Lima template can never satisfy, since a
+    /// template carries no instance name in its body. The gateway path has no
+    /// name to check against and so does not make that check at all.
+    #[test]
+    fn gateway_rule_accepts_the_real_gateway_template() {
+        let result = validate_gateway_lima_yaml_shape(GATEWAY_TEMPLATE);
+        assert!(
+            result.is_ok(),
+            "the daemon's rendered gateway template must pass the gateway-class \
+             validator; error: {:?}",
+            result.err()
+        );
+    }
+
+    /// The same template is still rejected on the session path — the split adds
+    /// a class, it does not widen the existing one.
+    #[test]
+    fn session_rule_still_rejects_the_real_gateway_template() {
+        let err = validate_lima_yaml_shape(GATEWAY_TEMPLATE, "", true)
+            .expect_err("the gateway template must not pass the session-class validator");
+        assert!(
+            err.contains("exactly one socket_vmnet entry"),
+            "rejection must come from the session single-NIC rule; got: {err:?}"
+        );
+    }
+
+    /// An interface name pinned onto a socket belonging to a different slot is
+    /// rejected.
+    ///
+    /// Lima accepts this silently, and the in-VM NIC name is what selects the
+    /// macvlan parent — so the result is sessions parented on another slot's L2
+    /// segment, with nothing anywhere reporting a problem.
+    #[test]
+    fn gateway_rule_rejects_interface_slot_mismatch() {
+        let yaml = "vmType: \"qemu\"\nnetworks:\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-7.sock\n    interface: lima2\n";
+        let err = validate_gateway_lima_yaml_shape(yaml)
+            .expect_err("interface pinned to the wrong slot must be rejected");
+        assert!(
+            err.contains("slot 7") && err.contains("lima7"),
+            "the rejection must name the slot the socket belongs to and the \
+             interface that slot requires; got: {err:?}"
+        );
+    }
+
+    /// A session-shaped entry (`socket:` only, no `interface:`) is rejected on
+    /// the gateway path. Without the pin Lima names NICs by array position, so
+    /// a non-contiguous slot set lands on the wrong segments.
+    #[test]
+    fn gateway_rule_rejects_entry_without_interface() {
+        let yaml = "vmType: \"qemu\"\nnetworks:\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
+        let err = validate_gateway_lima_yaml_shape(yaml)
+            .expect_err("a gateway NIC entry without interface: must be rejected");
+        assert!(
+            err.contains("interface"),
+            "rejection must name the missing interface key; got: {err:?}"
+        );
+    }
+
+    /// Two entries naming the same slot are rejected.
+    #[test]
+    fn gateway_rule_rejects_duplicate_slot() {
+        let yaml = "vmType: \"qemu\"\nnetworks:\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-3.sock\n    interface: lima3\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-3.sock\n    interface: lima3\n";
+        let err = validate_gateway_lima_yaml_shape(yaml)
+            .expect_err("the same slot attached twice must be rejected");
+        assert!(
+            err.contains("repeats slot 3"),
+            "rejection must name the repeated slot; got: {err:?}"
+        );
+    }
+
+    /// A non-canonical socket spelling is rejected even though it names a real
+    /// directory. `slot-04.sock` is not a path the pool ever creates, and an
+    /// inexact parse would make it agree with `lima4` while socket_vmnet has
+    /// nothing listening on it.
+    #[test]
+    fn gateway_rule_rejects_non_canonical_socket_spelling() {
+        for socket in [
+            "/var/run/sandbox/vmnet/slot-04.sock",
+            "/var/run/sandbox/vmnet/slot-+4.sock",
+            "/var/run/sandbox/vmnet/slot-4.sock.bak",
+            "/var/run/sandbox/vmnet/slot-.sock",
+        ] {
+            let yaml = format!(
+                "vmType: \"qemu\"\nnetworks:\n  - socket: {socket}\n    interface: lima4\n"
+            );
+            assert!(
+                validate_gateway_lima_yaml_shape(&yaml).is_err(),
+                "non-canonical socket spelling {socket:?} must be rejected"
+            );
+        }
+    }
+
+    /// A socket outside the pool's directory is rejected, exactly as on the
+    /// session path — this is where a VM would be attached to a socket_vmnet
+    /// instance sandboxd does not run.
+    #[test]
+    fn gateway_rule_rejects_socket_outside_the_pool_directory() {
+        for socket in [
+            "/tmp/slot-0.sock",
+            "/var/run/sandbox/vmnet/../evil/slot-0.sock",
+            "slot-0.sock",
+        ] {
+            let yaml = format!(
+                "vmType: \"qemu\"\nnetworks:\n  - socket: {socket}\n    interface: lima0\n"
+            );
+            assert!(
+                validate_gateway_lima_yaml_shape(&yaml).is_err(),
+                "socket outside the pool directory {socket:?} must be rejected"
+            );
+        }
+    }
+
+    /// `mode:` names a Lima-managed network and is rejected on the gateway path
+    /// as it is on the session path — including in flow style, which a
+    /// line-based check would miss.
+    #[test]
+    fn gateway_rule_rejects_mode_key() {
+        for yaml in [
+            "vmType: \"qemu\"\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n    \
+             interface: lima0\n    mode: shared\n",
+            "vmType: \"qemu\"\nnetworks: [{socket: /var/run/sandbox/vmnet/slot-0.sock, \
+             interface: lima0, mode: shared}]\n",
+        ] {
+            let err = validate_gateway_lima_yaml_shape(yaml)
+                .expect_err("a NIC entry with mode: must be rejected");
+            assert!(
+                err.contains("mode"),
+                "rejection must name the mode key; got: {err:?}"
+            );
+        }
+    }
+
+    /// Any key beyond `socket:` and `interface:` is rejected — an unreviewed
+    /// key could switch on Lima networking behaviour nobody looked at.
+    #[test]
+    fn gateway_rule_rejects_extra_keys() {
+        let yaml = "vmType: \"qemu\"\nnetworks:\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-0.sock\n\
+                    \x20   interface: lima0\n    macAddress: \"52:54:00:12:34:56\"\n";
+        let err =
+            validate_gateway_lima_yaml_shape(yaml).expect_err("an extra NIC key must be rejected");
+        assert!(
+            err.contains("exactly two keys"),
+            "rejection must come from the key-set rule; got: {err:?}"
+        );
+    }
+
+    /// A gateway VM with no slot NICs terminates no session segment; an absent
+    /// or empty `networks:` is rejected rather than treated as "nothing to
+    /// check".
+    #[test]
+    fn gateway_rule_rejects_absent_or_empty_networks() {
+        for yaml in [
+            "vmType: \"qemu\"\ncpus: 2\n",
+            "vmType: \"qemu\"\nnetworks: []\n",
+        ] {
+            let err = validate_gateway_lima_yaml_shape(yaml)
+                .expect_err("a gateway template with no NIC entries must be rejected");
+            assert!(
+                err.contains("networks"),
+                "rejection must name the networks key; got: {err:?}"
+            );
+        }
+    }
+
+    /// The shared prelude still applies on the gateway path: a non-qemu (or
+    /// absent) `vmType` is rejected. On macOS an unset `vmType` means VZ, which
+    /// cannot attach socket_vmnet at all.
+    #[test]
+    fn gateway_rule_rejects_non_qemu_vmtype() {
+        for yaml in [
+            "vmType: \"vz\"\nnetworks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n    \
+             interface: lima0\n",
+            "networks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n    interface: lima0\n",
+        ] {
+            let err = validate_gateway_lima_yaml_shape(yaml)
+                .expect_err("a non-qemu vmType must be rejected on the gateway path too");
+            assert!(
+                err.contains("vmType"),
+                "rejection must name vmType; got: {err:?}"
+            );
+        }
+    }
+
+    /// The singular `network:` alias is rejected on the gateway path too — the
+    /// plural key must be the only code path on both classes.
+    #[test]
+    fn gateway_rule_rejects_singular_network_key() {
+        let yaml = "vmType: \"qemu\"\nnetwork:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n\
+                    networks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n    interface: lima0\n";
+        let err = validate_gateway_lima_yaml_shape(yaml)
+            .expect_err("a singular network: key must be rejected");
+        assert!(
+            err.contains("'network' key"),
+            "rejection must name the singular network key; got: {err:?}"
+        );
+    }
+
+    /// A session-class template on the gateway path is rejected. Together with
+    /// `session_rule_still_rejects_the_real_gateway_template` this makes the two
+    /// rules mutually exclusive by entry shape: neither class's template is
+    /// accepted by the other class's rule.
+    #[test]
+    fn gateway_rule_rejects_a_session_template() {
+        let yaml = "vmType: \"qemu\"\ncpus: 2\nnetworks:\n\
+                    \x20 - socket: /var/run/sandbox/vmnet/slot-0.sock\n";
+        assert!(
+            validate_gateway_lima_yaml_shape(yaml).is_err(),
+            "a session template must not pass the gateway-class validator"
+        );
+    }
+
+    /// The slot parser round-trips exactly, in both directions.
+    #[test]
+    fn slot_socket_path_round_trips_exactly() {
+        for slot in [0u16, 1, 7, 8, 63, 1000, u16::MAX] {
+            let path = vmnet_slot_socket_path(slot);
+            assert_eq!(
+                slot_from_vmnet_socket_path(&path),
+                Some(slot),
+                "{path} must parse back to slot {slot}"
+            );
+        }
+        for path in [
+            "/var/run/sandbox/vmnet/slot-04.sock",
+            "/var/run/sandbox/vmnet/slot-+4.sock",
+            "/var/run/sandbox/vmnet/slot- 4.sock",
+            "/var/run/sandbox/vmnet/slot-65536.sock",
+            "/var/run/sandbox/vmnet/slot-.sock",
+            "/var/run/sandbox/vmnet/slot-0.sock/",
+            "/tmp/slot-0.sock",
+            "slot-0.sock",
+        ] {
+            assert_eq!(
+                slot_from_vmnet_socket_path(path),
+                None,
+                "{path} must not parse to a slot"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

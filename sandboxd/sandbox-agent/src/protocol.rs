@@ -231,6 +231,50 @@ pub enum BrokerOp {
         /// and therefore has no `networks:` key in its lima.yaml.
         is_hardened_session: bool,
     },
+    /// Create this operator's own gateway Lima VM from a daemon-rendered
+    /// `lima.yaml`.
+    ///
+    /// # Why this is a separate variant rather than a flag on `Create`
+    ///
+    /// A gateway VM and a session VM are held to *different* NIC-shape rules:
+    /// a session VM must have exactly one socket_vmnet NIC (one L2 segment,
+    /// one gateway, no second path off the box), while a gateway VM legitimately
+    /// carries one NIC per pool slot. Something has to say which rule applies,
+    /// and that selector is the whole security question — pick it wrong and a
+    /// session VM is permitted the multi-NIC shape that routes around egress
+    /// policy.
+    ///
+    /// So the selector is **which variant the daemon invoked**, and nothing
+    /// else. It is not a `bool`, not a class string, and — importantly — not
+    /// derived from the VM's name: the name is a daemon-supplied wire field and
+    /// the daemon is an untrusted requester here (see `validation`'s module
+    /// doc). Deriving the class from a name would move the daemon's control
+    /// from one field to another rather than remove it. Deriving it from the
+    /// variant reuses the property the whole op set already rests on: the enum
+    /// is closed, so the reachable classes are exactly the ones someone
+    /// reviewed.
+    ///
+    /// # No `vm` field
+    ///
+    /// There is deliberately no VM-name field on the wire. The agent derives
+    /// the instance name from its own `getuid()` — same reasoning as
+    /// `handler::own_gateway_vm`: an instance name is what `limactl` acts on,
+    /// and a daemon that names the instance can point a reviewed operation at
+    /// an arbitrary one. With no field there is nothing to get wrong.
+    ///
+    /// Consequently there is also no `owner` field (the gateway is daemon-owned
+    /// infrastructure and gets no per-operator owner marker — this matches what
+    /// the existing daemon-uid direct path does today) and no `qemu_wrapper`
+    /// field (the gateway VM deliberately runs without the `restrict=on`
+    /// wrapper on its management NIC; `Create`'s wrapper field is already
+    /// empty on this path).
+    CreateGateway {
+        op_uid: u32,
+        /// The complete rendered `lima.yaml` content. The agent validates it
+        /// against the *gateway-class* shape rule and writes it verbatim; it
+        /// does not assemble or modify the content.
+        lima_yaml: String,
+    },
     /// Start (boot) an existing Lima VM instance.
     Start {
         op_uid: u32,
@@ -1373,6 +1417,7 @@ impl BrokerOp {
     pub fn op_uid(&self) -> u32 {
         match self {
             BrokerOp::Create { op_uid, .. }
+            | BrokerOp::CreateGateway { op_uid, .. }
             | BrokerOp::Start { op_uid, .. }
             | BrokerOp::Stop { op_uid, .. }
             | BrokerOp::Delete { op_uid, .. }
@@ -1408,6 +1453,7 @@ impl BrokerOp {
             BrokerOp::GuestSocat { stream_token, .. }
             | BrokerOp::DockerStream { stream_token, .. } => Some(stream_token),
             BrokerOp::Create { .. }
+            | BrokerOp::CreateGateway { .. }
             | BrokerOp::Start { .. }
             | BrokerOp::Stop { .. }
             | BrokerOp::Delete { .. }
@@ -1428,6 +1474,7 @@ impl BrokerOp {
     pub fn label(&self) -> &'static str {
         match self {
             BrokerOp::Create { .. } => "create",
+            BrokerOp::CreateGateway { .. } => "create-gateway",
             BrokerOp::Start { .. } => "start",
             BrokerOp::Stop { .. } => "stop",
             BrokerOp::Delete { .. } => "delete",
