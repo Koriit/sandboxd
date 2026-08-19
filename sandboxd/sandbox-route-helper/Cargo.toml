@@ -44,9 +44,16 @@ nix = { version = "0.29", features = ["user", "sched", "net"] }
 # errno read. The rest of the crate uses nix wrappers.
 libc = "0.2"
 # Manipulate the helper's own capability sets so `CAP_NET_ADMIN` survives
-# the `ip(8)` exec via the ambient set — required under rootful Docker
-# where the container netns is in init userns and there's no userns
-# implicit-cap promotion to cover the post-exec child.
+# the `ip(8)` exec via the ambient set. Measured on Linux 6.8 aarch64 for
+# a NON-ROOT parent — the host path, where an unprivileged caller execs
+# the setcap helper: holding CAP_NET_ADMIN in permitted+effective and
+# exec'ing a file with no file capabilities yields a child whose permitted
+# and effective sets are both empty, and an `ip(8)` operation needing that
+# capability fails "Operation not permitted"; raising it to ambient first
+# is what carries it across. A uid-0 parent is the opposite case: the same
+# narrowed set gave the child the full bounding set with ambient still
+# empty, so the in-VM root path reaches the same place without needing the
+# raise. See the Privilege model in `src/main.rs`.
 caps = "0.5"
 
 [dev-dependencies]
