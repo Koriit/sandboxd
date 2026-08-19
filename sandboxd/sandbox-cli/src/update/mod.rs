@@ -2662,19 +2662,21 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         // in the install-binaries step). cap_sys_ptrace is required because
         // the container's PID 1 runs as the operator's uid, so the helper
         // (sandbox uid) enters a foreign-uid netns; the pidfd setns path
-        // runs ptrace_may_access(PTRACE_MODE_READ) on the target, satisfied
-        // across the uid boundary only with CAP_SYS_PTRACE. The cap order
-        // must match `getcap`'s output (sorted by capability number:
-        // net_admin=12, sys_ptrace=19, sys_admin=21) because `already_set`
-        // is a substring check against `getcap` below.
+        // runs ptrace_may_access(PTRACE_MODE_READ_REALCREDS) on the target,
+        // which compares real uid and gid rather than effective ones — and
+        // when those differ, as they do here, only CAP_SYS_PTRACE satisfies
+        // it. The literal below is in `setcap` argument order; it does not
+        // have to match the kernel numeric order `getcap` prints
+        // (net_admin=12, sys_ptrace=19, sys_admin=21) because the gate
+        // compares capability *sets*.
         let helper = backup::ROUTE_HELPER_BIN_PATH;
-        let expected = "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip";
+        let expected = ROUTE_HELPER_CAPS;
         let cur_out = Command::new("getcap").arg(helper).output();
         let current = cur_out
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let already_set = current.contains(expected);
+        let already_set = getcap_output_matches_exactly(&current, expected);
         if already_set {
             log_step("setcap", "caps=already-set action=skip status=ok");
         } else {
@@ -2726,21 +2728,21 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         // the lima-helper; running setcap after start_daemon would guarantee
         // a start failure and trigger recovery.
         //
-        // The `=ep` form is used for both the `setcap` invocation and the
-        // `getcap` output match. `setcap` accepts both `+ep` and `=ep` as
-        // input (they are equivalent), but `getcap` (libcap ≥2.42) always
-        // emits the `=` form — using `+ep` as a substring match against
-        // `getcap` output would never match, causing a spurious "not set"
-        // failure. The route-helper constant uses `=eip` for the same reason.
+        // The `=ep` form is what goes to `setcap`; `+ep` is the equivalent
+        // input spelling and is what older libcap prints back. The gate below
+        // compares capability sets rather than spellings, so it accepts either
+        // rendering of the intended set and re-runs `setcap` only when the set
+        // actually differs — including when it is a *superset*, since an
+        // over-capped setuid-capable helper has to be narrowed, not skipped.
         {
             let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-            let lima_caps = "cap_setuid=ep";
+            let lima_caps = LIMA_HELPER_CAPS;
             let cur_out = Command::new("getcap").arg(lima_helper).output();
             let current = cur_out
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default();
-            let already_set = getcap_output_has_cap(&current, lima_caps);
+            let already_set = getcap_output_matches_exactly(&current, lima_caps);
             if already_set {
                 log_step(
                     "install_lima_helper",
@@ -2800,10 +2802,15 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         // Verify lima-helper capabilities.
         // Post-install check: getcap must confirm cap_setuid=ep is present so
         // the next session create does not fail with permission-denied at the
-        // uid-map step.
+        // uid-map step. This is a presence probe, deliberately: it mirrors the
+        // daemon's own startup gate, which tests the CAP_SETUID bit and the
+        // effective flag in the file's xattr rather than the whole set. Extra
+        // capabilities do not fail it — bringing the set back down to the
+        // intended one is the job of the set-equality gate above, which has
+        // already run.
         {
             let lima_helper = backup::LIMA_HELPER_BIN_PATH;
-            let required_cap = "cap_setuid=ep";
+            let required_cap = LIMA_HELPER_CAPS;
             let verify_out = Command::new("getcap").arg(lima_helper).output();
             match verify_out {
                 Ok(o) => {
@@ -3609,16 +3616,180 @@ fn render_systemd_unit(template: &str, base_dir: &str) -> Result<Vec<u8>, String
     Ok(rendered.into_bytes())
 }
 
-/// Return `true` if `getcap` stdout contains the capability string `cap`.
+// ---------------------------------------------------------------------------
+// getcap output predicates
+// ---------------------------------------------------------------------------
+//
+// `getcap` prints `<path> <clause>[ <clause>…]`, where a clause is
+// `name[,name…]<op><flags>` with `op` one of `=`/`+`/`-` and `flags` drawn
+// from `e`, `i`, `p`. That rendering is not a stable string:
+//
+//   - names come out in kernel numeric order, never the order `setcap`
+//     received them (CAP_NET_ADMIN=12, CAP_SYS_PTRACE=19, CAP_SYS_ADMIN=21);
+//   - libcap ≥2.42 prints `<path> cap_setuid=ep`; older libcap prints
+//     `<path> = cap_setuid+ep`;
+//   - capabilities carrying different flags are split across clauses, e.g.
+//     `<path> cap_net_admin=i cap_chown+p`.
+//
+// So neither predicate below may use a substring test. `contains` accepts a
+// strict superset — `cap_chown,cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`
+// contains the expected `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`
+// verbatim, which reports an over-capped helper as already configured — and it
+// rejects a correct set spelled the older way, which re-runs `setcap` forever.
+//
+// These are pure string functions with no OS dependency, so they are compiled
+// on every host and their unit tests run on the macOS dev host as well; only
+// the call sites that fork `getcap` stay Linux-only.
+
+/// Capability set `sandbox update` installs on `sandbox-route-helper`, in
+/// `setcap` argument order. Compared as a set, so it need not be written in
+/// the kernel numeric order `getcap` prints it back in.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const ROUTE_HELPER_CAPS: &str = "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip";
+
+/// Capability set `sandbox update` installs on `sandbox-lima-helper`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const LIMA_HELPER_CAPS: &str = "cap_setuid=ep";
+
+/// Tokenise a capability clause list into a sorted token multiset.
 ///
-/// `getcap` (libcap ≥2.42, as shipped on Ubuntu 22.04+) emits the `=` form:
-/// e.g. `"/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n"`.
-/// The `setcap` *input* syntax accepts both `cap_setuid+ep` and `cap_setuid=ep`,
-/// but getcap output always uses `=`. Matching against `+ep` would never
-/// succeed — use the `=` form for both constants and this check.
-#[cfg(not(target_os = "macos"))]
+/// Splits on every separator libcap uses — whitespace between clauses, `,`
+/// between names, `=`/`+` before the flag letters — drops empties and sorts,
+/// so the result is independent of clause order, name order and `=`-versus-`+`
+/// spelling. The flag letters survive as their own token, so `=ep` never
+/// compares equal to `=eip`; nothing is de-duplicated, so an extra or a
+/// missing capability changes the multiset. `-` is deliberately *not* a
+/// separator: a `cap_x-e` clause stays a single token that can never equal an
+/// expected name or flag token.
+///
+/// Because the result is a multiset, a flag token appearing in two clauses
+/// counts twice: a libcap that split one flag group across clauses would
+/// compare unequal and re-run `setcap`. That is the conservative direction,
+/// and the same one the shell filter takes.
+///
+/// The sort is byte-wise, matching the `LC_ALL=C sort` of the shell filter
+/// this mirrors (`NORMALIZE_CAPS` in the Makefile, `normalize_caps()` in
+/// `scripts/dev/canonical-binary.sh`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn cap_tokens(clauses: &str) -> Vec<&str> {
+    let mut tokens: Vec<&str> = clauses
+        .split([' ', '\t', ',', '=', '+'])
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens.sort_unstable();
+    tokens
+}
+
+/// [`cap_tokens`] over a whole `getcap` stdout: each line's leading path field
+/// (everything up to and including the first space) is dropped first. A line
+/// with no space is kept whole — the same rule as the shell filter's
+/// `sed 's|^[^ ]* ||'`, which also leaves such a line alone.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn getcap_cap_tokens(getcap_stdout: &str) -> Vec<&str> {
+    let mut tokens: Vec<&str> = getcap_stdout
+        .lines()
+        .flat_map(|line| {
+            let clauses = match line.find(' ') {
+                Some(i) => &line[i + 1..],
+                None => line,
+            };
+            cap_tokens(clauses)
+        })
+        .collect();
+    tokens.sort_unstable();
+    tokens
+}
+
+/// Return `true` when `getcap` reports *exactly* the capability set
+/// `expected`.
+///
+/// This is the predicate for the "already correctly capped, skip the
+/// `setcap`" gates. `setcap` replaces a file's entire capability set, so the
+/// only state that may skip it is one that already equals the intended set: a
+/// superset must not skip, because narrowing an over-capped privileged helper
+/// back to its intended set is precisely what the gate exists to do, and a
+/// subset must not skip because the helper cannot do its job.
+///
+/// `expected` is a bare clause literal with no path field, so it is tokenised
+/// without the leading-path strip — unlike the shell filter, which passes both
+/// operands through one path-stripping stage and therefore silently loses the
+/// first clause of any expected literal containing a space.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn getcap_output_matches_exactly(getcap_stdout: &str, expected: &str) -> bool {
+    getcap_cap_tokens(getcap_stdout) == cap_tokens(expected)
+}
+
+/// Return `true` when `getcap` stdout shows the capability named by `cap`
+/// carrying *at least* the flags `cap` names — a single-capability presence
+/// probe, not a set comparison.
+///
+/// `cap` is one `name=flags` / `name+flags` spec. Extra capabilities on the
+/// binary do not make this false, and that is deliberate: its caller is the
+/// post-install check that the daemon will be able to start, and the daemon's
+/// own gate is a presence test too — it reads the file's `security.capability`
+/// xattr and tests the single `CAP_SETUID` bit plus the effective flag, never
+/// the whole set. Whether the set is exactly the intended one is the separate
+/// question [`getcap_output_matches_exactly`] answers, at the gate that runs
+/// before this check.
+///
+/// Clauses are applied left to right with libcap's operator semantics (`=`
+/// sets, `+` adds, `-` removes) for the queried name only, so a capability
+/// split across clauses resolves correctly. A clause that names no capability
+/// is ignored — that covers the bare `=` separator older libcap prints, and it
+/// means a rendering that granted flags without naming a capability would read
+/// as absent here. The caller turns a `false` into a hard failure carrying a
+/// manual `setcap` hint, and the set-equality gate above has already re-capped
+/// anything that far from the intended set, so erring that way costs nothing.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn getcap_output_has_cap(getcap_stdout: &str, cap: &str) -> bool {
-    getcap_stdout.contains(cap)
+    let Some(spec_op) = cap.find(['=', '+']) else {
+        return false;
+    };
+    let want_name = &cap[..spec_op];
+    let want = cap_flag_bits(&cap[spec_op + 1..]);
+    if want_name.is_empty() || want == 0 {
+        return false;
+    }
+    let mut have = 0u8;
+    for line in getcap_stdout.lines() {
+        let clauses = match line.find(' ') {
+            Some(i) => &line[i + 1..],
+            None => line,
+        };
+        for clause in clauses.split_whitespace() {
+            let Some(op) = clause.find(['=', '+', '-']) else {
+                continue;
+            };
+            let (names, rest) = clause.split_at(op);
+            if !names.split(',').any(|n| n == want_name) {
+                continue;
+            }
+            let bits = cap_flag_bits(&rest[1..]);
+            match &rest[..1] {
+                "=" => have = bits,
+                "+" => have |= bits,
+                _ => have &= !bits,
+            }
+        }
+    }
+    (have & want) == want
+}
+
+/// Bit set of the libcap flag letters `e`, `i` and `p`; any other character is
+/// ignored. Used only to compare one clause's flags against another's, so the
+/// bit assignment itself carries no meaning outside this file.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn cap_flag_bits(flags: &str) -> u8 {
+    let mut bits = 0u8;
+    for c in flags.chars() {
+        match c {
+            'e' => bits |= 1,
+            'i' => bits |= 2,
+            'p' => bits |= 4,
+            _ => {}
+        }
+    }
+    bits
 }
 
 /// Return the operator username when this process was invoked through `sudo`.
@@ -5481,40 +5652,365 @@ mod tests {
         );
     }
 
-    /// `getcap_output_has_cap` must match the `=` form that libcap ≥2.42 emits
-    /// and must not match an uncapped or unrelated output line.
-    ///
-    /// libcap ≥2.42 (Ubuntu 22.04+) always prints the `=` form:
-    ///   `/path/to/binary cap_setuid=ep`
-    /// The `setcap` input syntax accepts `+ep` but `getcap` never emits it.
-    /// Matching `+ep` against `getcap` output would always return false —
-    /// confirming that only the `=ep` form works as a substring match here.
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn getcap_output_has_cap_matches_equals_form() {
-        let realistic_output = "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n";
+    // -----------------------------------------------------------------------
+    // getcap output predicates
+    // -----------------------------------------------------------------------
+    //
+    // Two predicates with deliberately different semantics:
+    //
+    //   - `getcap_output_matches_exactly` gates the two "skip the setcap"
+    //     decisions, so it asks whether the binary's capability set is
+    //     EXACTLY the intended one. A superset must not skip: `setcap`
+    //     replaces the whole set, and narrowing an over-capped privileged
+    //     helper is the reason the step exists.
+    //   - `getcap_output_has_cap` is the post-install verification that the
+    //     daemon will start, so it asks only whether one capability is
+    //     PRESENT with at least the flags named. Extra capabilities pass.
+    //
+    // Both must be immune to the spellings libcap can produce: kernel numeric
+    // name order, `+eip` versus `=eip`, multi-clause output and the leading
+    // path field.
 
-        // The `=ep` form must match.
+    /// Real `getcap` output for a correctly capped route-helper.
+    const ROUTE_GETCAP: &str = "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                                cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n";
+    /// Real `getcap` output for a correctly capped lima-helper.
+    const LIMA_GETCAP: &str = "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep\n";
+
+    /// The intended set, exactly as `getcap` prints it, must be accepted —
+    /// this is the case that must keep short-circuiting, or every update
+    /// re-runs `sudo setcap` on an already-correct binary.
+    #[test]
+    fn getcap_caps_match_accepts_exact_intended_set() {
         assert!(
-            getcap_output_has_cap(realistic_output, "cap_setuid=ep"),
-            "must match the getcap `=ep` output form"
+            getcap_output_matches_exactly(ROUTE_GETCAP, ROUTE_HELPER_CAPS),
+            "the intended route-helper set must be recognised as already installed"
         );
-        // The `+ep` setcap-input form must NOT match getcap output.
         assert!(
-            !getcap_output_has_cap(realistic_output, "cap_setuid+ep"),
-            "must not match the setcap `+ep` input form against getcap output"
+            getcap_output_matches_exactly(LIMA_GETCAP, LIMA_HELPER_CAPS),
+            "the intended lima-helper set must be recognised as already installed"
         );
-        // Empty/uncapped output (file has no caps, getcap prints nothing).
+    }
+
+    /// `getcap` prints names in kernel numeric order (net_admin=12,
+    /// sys_ptrace=19, sys_admin=21) whatever order `setcap` received them in,
+    /// so the expected literal's order must not matter.
+    #[test]
+    fn getcap_caps_match_accepts_any_setcap_argument_order() {
+        let rejected: Vec<&str> = [
+            "cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip",
+            "cap_sys_admin,cap_sys_ptrace,cap_net_admin=eip",
+            "cap_sys_ptrace,cap_sys_admin,cap_net_admin=eip",
+        ]
+        .into_iter()
+        .filter(|expected| !getcap_output_matches_exactly(ROUTE_GETCAP, expected))
+        .collect();
         assert!(
-            !getcap_output_has_cap("", "cap_setuid=ep"),
-            "must not match empty getcap output"
+            rejected.is_empty(),
+            "every one of these names the set getcap printed, in a different order, \
+             yet it was reported as not installed: {rejected:?}"
         );
-        // Unrelated caps line must not match.
-        let route_output = "/usr/local/libexec/sandboxd/sandbox-route-helper \
-                            cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n";
+    }
+
+    /// Older libcap spells the same set `<path> = cap_setuid+ep` where current
+    /// libcap prints `<path> cap_setuid=ep`. Both are the intended set, so
+    /// both must short-circuit; treating the older spelling as "not set"
+    /// re-runs `setcap` on every single invocation.
+    #[test]
+    fn getcap_caps_match_accepts_old_libcap_plus_spelling() {
         assert!(
-            !getcap_output_has_cap(route_output, "cap_setuid=ep"),
-            "must not match when only unrelated caps are present"
+            getcap_output_matches_exactly(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper = cap_setuid+ep\n",
+                LIMA_HELPER_CAPS,
+            ),
+            "old-libcap `= cap_setuid+ep` is the intended lima-helper set"
+        );
+        assert!(
+            getcap_output_matches_exactly(
+                "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                 = cap_net_admin,cap_sys_ptrace,cap_sys_admin+eip\n",
+                ROUTE_HELPER_CAPS,
+            ),
+            "old-libcap `+eip` is the intended route-helper set"
+        );
+    }
+
+    /// A strict superset must be rejected: the helper carries a capability it
+    /// was never meant to have, and only re-running `setcap` — which replaces
+    /// the whole set — brings it back down. Covered with the extra capability
+    /// sorting before the intended ones (cap_chown=0) and after them
+    /// (cap_wake_alarm=35), and as a separate clause, which is how libcap
+    /// renders an extra capability carrying different flags.
+    ///
+    /// Every case is evaluated before asserting, so a run that regresses names
+    /// all the shapes it got wrong rather than only the first.
+    #[test]
+    fn getcap_caps_match_rejects_superset() {
+        let wrongly_accepted: Vec<&str> = [
+            (
+                "extra capability sorting BEFORE the intended ones",
+                "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                 cap_chown,cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip\n",
+                ROUTE_HELPER_CAPS,
+            ),
+            (
+                "extra capability sorting AFTER the intended ones",
+                "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                 cap_net_admin,cap_sys_ptrace,cap_sys_admin,cap_wake_alarm=eip\n",
+                ROUTE_HELPER_CAPS,
+            ),
+            (
+                "extra capability in a clause of its own",
+                "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                 cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip cap_chown+p\n",
+                ROUTE_HELPER_CAPS,
+            ),
+            (
+                "over-capped lima-helper",
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid,cap_sys_admin=ep\n",
+                LIMA_HELPER_CAPS,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, out, expected)| getcap_output_matches_exactly(out, expected))
+        .map(|(what, _, _)| what)
+        .collect();
+        assert!(
+            wrongly_accepted.is_empty(),
+            "an over-capped helper must be narrowed by re-running setcap, not skipped; \
+             reported as already configured: {wrongly_accepted:?}"
+        );
+    }
+
+    /// A missing capability must be rejected — the helper cannot do its job,
+    /// and the failure would otherwise surface as an opaque EPERM at run time.
+    #[test]
+    fn getcap_caps_match_rejects_subset() {
+        assert!(
+            !getcap_output_matches_exactly(
+                "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                 cap_net_admin,cap_sys_admin=eip\n",
+                ROUTE_HELPER_CAPS,
+            ),
+            "a route-helper without cap_sys_ptrace is not configured"
+        );
+        assert!(
+            !getcap_output_matches_exactly(
+                "/usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin=eip\n",
+                ROUTE_HELPER_CAPS,
+            ),
+            "a route-helper with only one of the three caps is not configured"
+        );
+    }
+
+    /// Right count, wrong membership: one intended capability swapped for
+    /// another must be rejected.
+    #[test]
+    fn getcap_caps_match_rejects_substituted_capability() {
+        assert!(
+            !getcap_output_matches_exactly(
+                "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                 cap_net_admin,cap_net_raw,cap_sys_admin=eip\n",
+                ROUTE_HELPER_CAPS,
+            ),
+            "cap_net_raw substituted for cap_sys_ptrace is a different set"
+        );
+        assert!(
+            !getcap_output_matches_exactly(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setgid=ep\n",
+                LIMA_HELPER_CAPS,
+            ),
+            "cap_setgid is not cap_setuid"
+        );
+    }
+
+    /// The right capabilities with the wrong flags must be rejected: the flag
+    /// letters are compared as their own token, so `=ep` never satisfies an
+    /// expected `=eip`.
+    #[test]
+    fn getcap_caps_match_rejects_wrong_flags() {
+        for flags in ["ep", "ei", "p", "e", "i"] {
+            let out = format!(
+                "/usr/local/libexec/sandboxd/sandbox-route-helper \
+                 cap_net_admin,cap_sys_ptrace,cap_sys_admin={flags}\n"
+            );
+            assert!(
+                !getcap_output_matches_exactly(&out, ROUTE_HELPER_CAPS),
+                "flags `={flags}` must not satisfy the intended `=eip`"
+            );
+        }
+        for flags in ["e", "i", "p", "ei"] {
+            let out =
+                format!("/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid={flags}\n");
+            assert!(
+                !getcap_output_matches_exactly(&out, LIMA_HELPER_CAPS),
+                "flags `={flags}` must not satisfy the intended `=ep`"
+            );
+        }
+    }
+
+    /// An uncapped binary prints nothing at all on current libcap, and the
+    /// `getcap` invocation may itself have failed (the call sites map that to
+    /// an empty string). Neither may be read as "already configured".
+    #[test]
+    fn getcap_caps_match_rejects_uncapped_binary() {
+        for out in [
+            "",
+            "\n",
+            "   \n",
+            // A path with no capability field at all.
+            "/usr/local/libexec/sandboxd/sandbox-route-helper\n",
+        ] {
+            assert!(
+                !getcap_output_matches_exactly(out, ROUTE_HELPER_CAPS),
+                "getcap output {out:?} carries no capabilities"
+            );
+            assert!(
+                !getcap_output_matches_exactly(out, LIMA_HELPER_CAPS),
+                "getcap output {out:?} carries no capabilities"
+            );
+        }
+    }
+
+    /// Multi-clause output — which current libcap does produce when different
+    /// capabilities carry different flags — is compared clause-pool against
+    /// clause-pool, so an unrelated multi-clause set is rejected.
+    #[test]
+    fn getcap_caps_match_rejects_unrelated_multi_clause_output() {
+        let out = "/usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin=i cap_chown+p\n";
+        assert!(
+            !getcap_output_matches_exactly(out, ROUTE_HELPER_CAPS),
+            "an inheritable-only net_admin plus a permitted chown is not the intended set"
+        );
+        assert!(
+            !getcap_output_matches_exactly(out, LIMA_HELPER_CAPS),
+            "the same output does not carry the lima-helper set either"
+        );
+    }
+
+    /// The presence probe accepts the intended capability in either libcap
+    /// spelling, including the older `= <name>+<flags>` rendering — a false
+    /// negative here aborts the update and rolls it back.
+    #[test]
+    fn getcap_has_cap_accepts_either_libcap_spelling() {
+        assert!(
+            getcap_output_has_cap(LIMA_GETCAP, LIMA_HELPER_CAPS),
+            "current libcap's `cap_setuid=ep` carries the required capability"
+        );
+        assert!(
+            getcap_output_has_cap(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper = cap_setuid+ep\n",
+                LIMA_HELPER_CAPS,
+            ),
+            "old libcap's `= cap_setuid+ep` carries the required capability"
+        );
+    }
+
+    /// The probe asks about ONE capability, so other capabilities alongside it
+    /// — in the same clause on either side of it, or in a clause of their own
+    /// — must not change the answer. The daemon's own startup gate is a
+    /// presence test on the CAP_SETUID bit, so answering "absent" here for a
+    /// helper the daemon would accept would fail an update for no reason.
+    ///
+    /// Unlike the set-equality gate, a superset is ACCEPTED here by design.
+    /// Narrowing it belongs to that gate, which runs first.
+    #[test]
+    fn getcap_has_cap_accepts_capability_beside_others() {
+        let wrongly_rejected: Vec<&str> = [
+            // Extra capability sorting after cap_setuid (numerically and
+            // lexically) — the shape a substring test gets wrong.
+            "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid,cap_sys_admin=ep\n",
+            // Extra capability sorting before it.
+            "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_chown,cap_setuid=ep\n",
+            // Extra capability with different flags, hence its own clause.
+            "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_chown=i cap_setuid=ep\n",
+            // Flags beyond the required ones.
+            "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=eip\n",
+        ]
+        .into_iter()
+        .filter(|out| !getcap_output_has_cap(out, LIMA_HELPER_CAPS))
+        .collect();
+        assert!(
+            wrongly_rejected.is_empty(),
+            "cap_setuid is present with at least `ep` in each of these, \
+             yet it was reported absent: {wrongly_rejected:?}"
+        );
+    }
+
+    /// The probe must still say "absent" when the capability is genuinely
+    /// absent — an uncapped binary, an unrelated capability set, or a
+    /// neighbouring capability name.
+    #[test]
+    fn getcap_has_cap_rejects_missing_capability() {
+        for out in ["", "\n", ROUTE_GETCAP] {
+            assert!(
+                !getcap_output_has_cap(out, LIMA_HELPER_CAPS),
+                "cap_setuid is not present in {out:?}"
+            );
+        }
+        assert!(
+            !getcap_output_has_cap(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setgid=ep\n",
+                LIMA_HELPER_CAPS,
+            ),
+            "cap_setgid must not be read as cap_setuid"
+        );
+        assert!(
+            !getcap_output_has_cap(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid_extra=ep\n",
+                LIMA_HELPER_CAPS,
+            ),
+            "a longer name starting with cap_setuid is a different capability"
+        );
+    }
+
+    /// Present but under-flagged is not present enough: the daemon needs
+    /// `cap_setuid` permitted AND effective, so a clause missing either letter
+    /// must be rejected.
+    #[test]
+    fn getcap_has_cap_rejects_insufficient_flags() {
+        for flags in ["e", "i", "p", "ei", "ip"] {
+            let out =
+                format!("/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid={flags}\n");
+            assert!(
+                !getcap_output_has_cap(&out, LIMA_HELPER_CAPS),
+                "flags `={flags}` do not cover the required `ep`"
+            );
+        }
+    }
+
+    /// libcap's clause operators are applied in order, so a later `-` clause
+    /// takes the flag back away. Matching the earlier clause and stopping
+    /// would report a capability the kernel will not grant.
+    #[test]
+    fn getcap_has_cap_honours_a_later_removal_clause() {
+        assert!(
+            !getcap_output_has_cap(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep cap_setuid-e\n",
+                LIMA_HELPER_CAPS,
+            ),
+            "the effective flag was removed by the second clause"
+        );
+        assert!(
+            getcap_output_has_cap(
+                "/usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=p cap_setuid+e\n",
+                LIMA_HELPER_CAPS,
+            ),
+            "the effective flag was added by the second clause"
+        );
+    }
+
+    /// A spec with no operator names no flags, so it cannot be answered; the
+    /// probe reports absence rather than treating the bare name as a match.
+    #[test]
+    fn getcap_has_cap_rejects_a_spec_without_flags() {
+        assert!(
+            !getcap_output_has_cap(LIMA_GETCAP, "cap_setuid"),
+            "a spec with no operator is not a capability requirement"
+        );
+        assert!(
+            !getcap_output_has_cap(LIMA_GETCAP, "cap_setuid="),
+            "a spec with no flag letters is not a capability requirement"
         );
     }
 

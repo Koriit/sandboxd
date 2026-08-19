@@ -213,6 +213,73 @@ PRIV_PROGRESS_FIFO=""
 PRIV_SCRIPT=""
 
 # ----------------------------------------------------------------------------
+# normalize_caps — stdin → stdout filter reducing a capability string to a
+# canonical, ORDER-INDEPENDENT form, so every capability guard below compares
+# capability SETS rather than spellings.
+#
+# Same filter as the Makefile's NORMALIZE_CAPS and normalize_caps() in
+# scripts/dev/canonical-binary.sh; the three are byte-identical pipelines so
+# all three guards accept and reject identically. It is duplicated rather than
+# sourced because install.sh is delivered via `curl … | sh` and has no adjacent
+# file to source (the same reason the lib.sh constants are inlined above). A
+# fourth copy lives inside the privileged child script, which is a separate
+# `sh` process and cannot see this definition.
+#
+# Why a SET compare, and why not the previous `getcap … | awk '{print $NF}'`
+# plus string equality:
+#
+#   - `awk '{print $NF}'` keeps only the LAST whitespace-separated field.
+#     `getcap` legitimately emits multi-clause output — measured on libcap
+#     2.66, a lima-helper carrying one extra capability reads back as
+#     `<path> cap_chown=ei cap_setuid+ep` — so every clause but the last was
+#     discarded and the comparison ran against a fragment. With the `+`→`=`
+#     rewrite the lima guard then matched that fragment exactly and reported
+#     an over-capped helper as already configured. `setcap` REPLACES a file's
+#     whole capability set, so a superset is misconfigured, not acceptable;
+#     narrowing it back down is precisely what these guards exist to trigger.
+#   - `getcap` prints capability names in kernel numeric order, not the order
+#     `setcap` received them (CAP_NET_ADMIN=12, CAP_SYS_PTRACE=19,
+#     CAP_SYS_ADMIN=21), and libcap versions differ in how they render the
+#     same set. Measured: libcap 2.24 and 2.25 print a literal `=` field
+#     between the path and the clauses and spell every clause with `+`
+#     (`<path> = cap_net_admin,cap_sys_ptrace,cap_sys_admin+eip`), while
+#     libcap 2.44 and 2.66 drop that field and spell the leading clause with
+#     `=` (`<path> cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`); the
+#     changeover sits somewhere in 2.26–2.43, which was not measured. On the
+#     older rendering the route guard REJECTED a correctly-capped helper —
+#     a hard install failure, the same defect pointing the other way.
+#
+# How: drop the leading path field `getcap` prints, split the rest on every
+# separator libcap uses (space between clauses, `,` between names, `=`/`+`
+# before the flag letters), drop empties, sort, rejoin. Both operands go
+# through it, so only the token multiset is compared.
+#
+# It stays strict in the direction that matters — a wrongly-capped binary must
+# NOT be reported as current, because that defers the failure to an opaque
+# EPERM at run time:
+#   - the flag letters survive as their own token, so `=ep` never matches
+#     `=eip`;
+#   - nothing is de-duplicated (plain `sort`, not `sort -u`), so an extra
+#     capability adds a token and fails;
+#   - a missing or substituted capability changes a token and fails;
+#   - clauses beyond the first are kept rather than discarded, so an extra
+#     capability carrying different flags also fails;
+#   - `getcap` prints nothing for an uncapped or absent path (and still exits
+#     0, so its exit status cannot be used here), which normalizes to the
+#     empty string and can never equal the non-empty expected set.
+#
+# `LC_ALL=C` pins the collation so the sort order cannot drift with the
+# operator's locale. The leading-path strip requires a space to match, which
+# makes the filter a no-op on a bare expected literal — so expected literals
+# passed through it must stay single-clause and space-free. Every literal
+# compared below (PLAN_ROUTE_CAPS_STR, PLAN_LIMA_CAPS_STR, `cap_setuid=ep`)
+# satisfies that.
+# ----------------------------------------------------------------------------
+normalize_caps() {
+    sed 's|^[^ ]* ||' | tr ' ,=+' '\n\n\n\n' | sed '/^$/d' | LC_ALL=C sort | tr '\n' ','
+}
+
+# ----------------------------------------------------------------------------
 # Phase-name constants for ui_init_phases.
 # Two sets: acquire (Phases 6) and install (Phase 8).
 # ----------------------------------------------------------------------------
@@ -645,16 +712,25 @@ install_health_check() {
     # the operator knows what to install.
     if [ "$_hc_ok" -eq 1 ]; then
         if command -v getcap >/dev/null 2>&1; then
-            # H2 — Route-helper has the required capabilities.
-            _hc_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | awk '{print $NF}')
-            if [ "$_hc_route_caps" != "$PLAN_ROUTE_CAPS_STR" ]; then
+            # H2 — Route-helper carries EXACTLY the required capability set.
+            # Both sides go through normalize_caps (see its definition) so the
+            # comparison is over capability sets, not getcap's spelling: an
+            # over-capped helper is unhealthy, not "already configured".
+            _hc_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | normalize_caps)
+            _hc_route_want=$(printf '%s\n' "$PLAN_ROUTE_CAPS_STR" | normalize_caps)
+            if [ "$_hc_route_caps" != "$_hc_route_want" ]; then
                 _unhealthy="${_unhealthy:+$_unhealthy,}route-caps"
             fi
 
-            # H3 — Lima-helper has the required capabilities.
-            # getcap emits cap_setuid+ep; normalise '+' → '=' for comparison.
-            _hc_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
-            if [ "$_hc_lima_caps" != "cap_setuid=ep" ]; then
+            # H3 — Lima-helper carries EXACTLY cap_setuid=ep. normalize_caps
+            # subsumes the old '+' → '=' rewrite (both spellings tokenise the
+            # same), and unlike that rewrite it cannot be fooled by a second
+            # clause: libcap 2.66 renders an over-capped helper as
+            # `<path> cap_chown=ei cap_setuid+ep`, whose last field alone was
+            # indistinguishable from the intended set.
+            _hc_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | normalize_caps)
+            _hc_lima_want=$(printf '%s\n' "cap_setuid=ep" | normalize_caps)
+            if [ "$_hc_lima_caps" != "$_hc_lima_want" ]; then
                 _unhealthy="${_unhealthy:+$_unhealthy,}lima-caps"
             fi
         else
@@ -1772,9 +1848,14 @@ _compute_plan_linux() {
     PLAN_OPERATOR_SLOT_RANGE=""
 
     # ---- route-helper capabilities ----
+    # "skip" is only correct when the on-disk set EQUALS the intended one.
+    # Both operands go through normalize_caps (see its definition): `setcap`
+    # replaces the whole set, so a helper carrying a superset must be re-capped
+    # to narrow it, and a correct set spelled getcap's way must not re-cap.
     expected_route_caps="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
-    current_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | awk '{print $NF}')
-    if [ "$current_route_caps" = "$expected_route_caps" ]; then
+    current_route_caps=$(getcap "$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | normalize_caps)
+    expected_route_caps_norm=$(printf '%s\n' "$expected_route_caps" | normalize_caps)
+    if [ "$current_route_caps" = "$expected_route_caps_norm" ]; then
         PLAN_ROUTE_HELPER_CAPS="skip"
     else
         PLAN_ROUTE_HELPER_CAPS="set"
@@ -1782,8 +1863,9 @@ _compute_plan_linux() {
 
     # ---- lima-helper capabilities ----
     expected_lima_caps="cap_setuid=ep"
-    current_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | awk '{print $NF}' | tr '+' '=')
-    if [ "$current_lima_caps" = "$expected_lima_caps" ]; then
+    current_lima_caps=$(getcap "$PLAN_LIMA_HELPER_PATH" 2>/dev/null | normalize_caps)
+    expected_lima_caps_norm=$(printf '%s\n' "$expected_lima_caps" | normalize_caps)
+    if [ "$current_lima_caps" = "$expected_lima_caps_norm" ]; then
         PLAN_LIMA_HELPER_CAPS="skip"
     else
         PLAN_LIMA_HELPER_CAPS="set"
@@ -2599,6 +2681,16 @@ json_str() {
     printf '"%s"' "\$s"
 }
 
+# normalize_caps — byte-identical copy of the parent's filter (see its long
+# comment there for the rationale). Duplicated because this child runs as a
+# separate \`sh\` process under sudo and cannot see the parent's functions.
+# Used by the setcap verify steps below so they compare capability SETS,
+# immune to getcap's kernel-numeric-order printing, its multi-clause output
+# and the libcap-version difference between \`+eip\` and \`=eip\`.
+normalize_caps() {
+    sed 's|^[^ ]* ||' | tr ' ,=+' '\n\n\n\n' | sed '/^\$/d' | LC_ALL=C sort | tr '\n' ','
+}
+
 # ----- Ensure install log is writable -----
 if [ ! -e "\$_LOG" ]; then
     touch "\$_LOG" 2>/dev/null || true
@@ -3312,8 +3404,14 @@ _priv_maybe_abort_at "setcap-route-helper"
 if [ "\$PLAN_ROUTE_HELPER_CAPS" = "set" ]; then
     setcap "\$PLAN_ROUTE_CAPS_STR" "\$PLAN_ROUTE_HELPER_PATH" >> "\$_LOG" 2>&1 \
         || { _log "step=setcap caps=\$PLAN_ROUTE_CAPS_STR action=fail status=fail"; _step_fail; }
-    _new=\$(getcap "\$PLAN_ROUTE_HELPER_PATH" 2>/dev/null | awk '{print \$NF}')
-    if [ "\$_new" != "\$PLAN_ROUTE_CAPS_STR" ]; then
+    # Verify the set setcap just installed EQUALS the one we asked for.
+    # Compared through normalize_caps so a correct set is not rejected merely
+    # for being spelled \`+eip\` by an older libcap, and so an unexpected extra
+    # clause cannot hide behind the last field.
+    _new=\$(getcap "\$PLAN_ROUTE_HELPER_PATH" 2>/dev/null)
+    _new_norm=\$(printf '%s\n' "\$_new" | normalize_caps)
+    _want_norm=\$(printf '%s\n' "\$PLAN_ROUTE_CAPS_STR" | normalize_caps)
+    if [ "\$_new_norm" != "\$_want_norm" ]; then
         _log "step=setcap caps=\$PLAN_ROUTE_CAPS_STR action=verify-fail got='\$_new' status=fail"
         _step_fail
     fi
@@ -3331,8 +3429,13 @@ _priv_maybe_abort_at "setcap-lima-helper"
 if [ "\$PLAN_LIMA_HELPER_CAPS" = "set" ]; then
     setcap "\$PLAN_LIMA_CAPS_STR" "\$PLAN_LIMA_HELPER_PATH" >> "\$_LOG" 2>&1 \
         || { _log "step=setcap caps=\$PLAN_LIMA_CAPS_STR action=fail status=fail"; _step_fail; }
-    _new=\$(getcap "\$PLAN_LIMA_HELPER_PATH" 2>/dev/null | awk '{print \$NF}' | tr '+' '=')
-    if [ "\$_new" != "cap_setuid=ep" ]; then
+    # As above: set equality through normalize_caps. The old '+' → '=' rewrite
+    # on the last field alone accepted \`<path> cap_chown=ei cap_setuid+ep\`,
+    # i.e. a helper carrying capabilities this installer never granted.
+    _new=\$(getcap "\$PLAN_LIMA_HELPER_PATH" 2>/dev/null)
+    _new_norm=\$(printf '%s\n' "\$_new" | normalize_caps)
+    _want_norm=\$(printf '%s\n' "cap_setuid=ep" | normalize_caps)
+    if [ "\$_new_norm" != "\$_want_norm" ]; then
         _log "step=setcap caps=\$PLAN_LIMA_CAPS_STR action=verify-fail got='\$_new' status=fail"
         _step_fail
     fi

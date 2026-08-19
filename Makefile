@@ -543,6 +543,48 @@ USERS_CONF_PATH             := /etc/sandboxd/users.conf
 BRIDGE_CONF_PATH            := /etc/qemu/bridge.conf
 QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 
+# NORMALIZE_CAPS — a shell filter (stdin → stdout) that reduces a capability
+# string to a canonical, ORDER-INDEPENDENT form, so the cap'd-install guards
+# below compare capability *sets* rather than spellings.
+#
+# Why this is needed: `getcap` prints capability names in kernel numeric
+# order, not in the order they were handed to `setcap`. Measured on libcap
+# 2.66, `setcap cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip` reads back as
+#
+#     <path> cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip
+#
+# (CAP_NET_ADMIN=12, CAP_SYS_PTRACE=19, CAP_SYS_ADMIN=21). A guard that
+# string-compares an expected literal written in setcap-argument order can
+# therefore never match, and reinstalls on every invocation. Older libcap
+# also spells the same thing `<path> = cap_setuid+ep` where newer prints
+# `<path> cap_setuid=ep`.
+#
+# How it works: drop the leading path field `getcap` prints, split the rest
+# into tokens on every separator libcap uses (space between clauses, `,`
+# between names, `=`/`+` before the flag letters), drop empties, sort, rejoin.
+# Both operands are passed through it, so only the token multiset is compared.
+#
+# It stays strict in the direction that matters — a wrongly-capped binary must
+# NOT be reported as current, because that defers the failure to an opaque
+# EPERM at run time:
+#   - the flag letters survive as their own token, so `=ep` never matches
+#     `=eip`;
+#   - nothing is de-duplicated (plain `sort`, not `sort -u`), so an extra
+#     capability adds a token and fails;
+#   - a missing capability removes one and fails;
+#   - clauses beyond the first are kept rather than discarded, so an extra
+#     capability carrying *different* flags (which libcap emits as a separate
+#     clause) also fails;
+#   - an uncapped or absent binary yields no capability names at all (on
+#     libcap 2.66, `getcap` prints nothing), so it cannot normalize to the
+#     non-empty expected set.
+#
+# `LC_ALL=C` pins the collation so the sort order cannot drift with the
+# operator's locale. The leading-path strip requires a space to match, which
+# makes the filter a no-op on a bare expected literal — so expected literals
+# passed to it must stay single-clause and space-free.
+NORMALIZE_CAPS = sed 's|^[^ ]* ||' | tr ' ,=+' '\n\n\n\n' | sed '/^$$/d' | LC_ALL=C sort | tr '\n' ','
+
 # Path of the sudoers fragment authorising the operator to run the
 # fallback `sudo -u sandbox` daemon launch without a password prompt.
 # `setup-test-sudoers-fragment` writes this file; the e2e harness
@@ -1110,11 +1152,16 @@ sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/s
 	@# sandbox-route-helper/test-env-override, so the binary we cmp against
 	@# is guaranteed to be the feature artifact — not some earlier plain
 	@# `cargo build` that could have left a non-feature binary at that path.
+	@# The capability comparison runs both sides through NORMALIZE_CAPS (see
+	@# its definition) so it compares capability SETS: `getcap` reports names in
+	@# kernel numeric order regardless of the order `setcap` received them, and
+	@# older libcap spells the flags `+eip` where newer prints `=eip`.
 	@_built=sandboxd/target/debug/sandbox-route-helper; \
 	_dst="$(ROUTE_HELPER_TEST_PATH)"; \
-	_expected_caps="cap_net_admin,cap_sys_admin,cap_sys_ptrace=eip"; \
-	_current_caps=$$(getcap "$$_dst" 2>/dev/null | awk '{print $$NF}'); \
-	if cmp -s "$$_built" "$$_dst" && [ "$$_current_caps" = "$$_expected_caps" ]; then \
+	_expected_caps="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"; \
+	_expected_norm=$$(printf '%s\n' "$$_expected_caps" | $(NORMALIZE_CAPS)); \
+	_current_norm=$$(getcap "$$_dst" 2>/dev/null | $(NORMALIZE_CAPS)); \
+	if cmp -s "$$_built" "$$_dst" && [ "$$_current_norm" = "$$_expected_norm" ]; then \
 	  echo "$(GREEN)✓ already current: $$_dst (content matches build, $$_expected_caps)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
@@ -1201,14 +1248,21 @@ sandboxd/target/.dev-env-stamps/lima-helper-test.stamp: sandboxd/target/debug/sa
 	@# sandbox-lima-helper/test-env-override, so the binary we cmp against
 	@# is guaranteed to be the feature artifact — not some earlier plain
 	@# `cargo build` that could have left a non-feature binary at that path.
-	@# getcap output format varies across libcap versions: older kernels emit
-	@# "path = cap_setuid+ep", newer emit "path cap_setuid=ep". Normalize by
-	@# translating '+' to '=' before comparing, matching install.sh's pattern.
+	@# The capability comparison runs both sides through NORMALIZE_CAPS (see
+	@# its definition) so it compares capability SETS. That absorbs the libcap
+	@# version spread this recipe already had to handle — older emits "path =
+	@# cap_setuid+ep", newer "path cap_setuid=ep" — and additionally makes the
+	@# guard immune to `getcap`'s kernel-numeric-order printing, which silently
+	@# breaks a string compare the moment a second capability is added here.
+	@# `_expected_caps` stays distinct from the setcap argument below on
+	@# purpose: `=ep` assigns the set, `+ep` adds to it, and only the latter is
+	@# what this recipe means to run.
 	@_built=sandboxd/target/debug/sandbox-lima-helper; \
 	_dst="$(LIMA_HELPER_TEST_PATH)"; \
 	_expected_caps="cap_setuid=ep"; \
-	_current_caps=$$(getcap "$$_dst" 2>/dev/null | awk '{print $$NF}' | tr '+' '='); \
-	if cmp -s "$$_built" "$$_dst" && [ "$$_current_caps" = "$$_expected_caps" ]; then \
+	_expected_norm=$$(printf '%s\n' "$$_expected_caps" | $(NORMALIZE_CAPS)); \
+	_current_norm=$$(getcap "$$_dst" 2>/dev/null | $(NORMALIZE_CAPS)); \
+	if cmp -s "$$_built" "$$_dst" && [ "$$_current_norm" = "$$_expected_norm" ]; then \
 	  echo "$(GREEN)✓ already current: $$_dst (content matches build, $$_expected_caps)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 $$_built $$_dst"; \

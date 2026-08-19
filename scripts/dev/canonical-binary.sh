@@ -45,6 +45,49 @@ usage() {
     exit 2
 }
 
+# normalize_caps — stdin → stdout filter reducing a capability string to a
+# canonical, ORDER-INDEPENDENT form, so the install guard below compares
+# capability SETS rather than spellings. Same filter as the Makefile's
+# NORMALIZE_CAPS, which the cap'd test-path installs use for the same reason.
+#
+# Why a set compare and not a substring test: `getcap` prints capability names
+# in kernel numeric order, not the order `setcap` received them, and older
+# libcap spells a clause `<path> = cap_setuid+ep` where newer prints
+# `<path> cap_setuid=ep`. A substring test therefore accepts a strict SUPERSET
+# — `cap_chown,cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip` contains the
+# expected `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip` verbatim — so an
+# over-capped binary was reported as already configured and never brought back
+# down to the intended set. Narrowing an over-capped helper is precisely what
+# this installer exists to do, so that answer has to be wrong.
+#
+# How: drop the leading path field `getcap` prints, split the rest on every
+# separator libcap uses (space between clauses, `,` between names, `=`/`+`
+# before the flag letters), drop empties, sort, rejoin. Both operands go
+# through it, so only the token multiset is compared.
+#
+# It stays strict in the direction that matters — a wrongly-capped binary must
+# NOT be reported as current, because that defers the failure to an opaque
+# EPERM at run time:
+#   - the flag letters survive as their own token, so `=ep` never matches
+#     `=eip`;
+#   - nothing is de-duplicated (plain `sort`, not `sort -u`), so an extra
+#     capability adds a token and fails;
+#   - a missing capability removes one and fails;
+#   - clauses beyond the first are kept rather than discarded, so an extra
+#     capability carrying *different* flags (which libcap emits as a separate
+#     clause) also fails;
+#   - an uncapped or absent binary yields no capability names at all, so it
+#     cannot normalize to the non-empty expected set.
+#
+# `LC_ALL=C` pins the collation so the sort order cannot drift with the
+# operator's locale. The leading-path strip requires a space to match, which
+# makes the filter a no-op on a bare expected literal — so expected literals
+# passed to this script must stay single-clause and space-free (both cap'd
+# call sites are).
+normalize_caps() {
+    sed 's|^[^ ]* ||' | tr ' ,=+' '\n\n\n\n' | sed '/^$/d' | LC_ALL=C sort | tr '\n' ','
+}
+
 cmd=${1:-}
 case "$cmd" in
 install)
@@ -75,10 +118,22 @@ install)
     # Install the dev build, skipping the sudo when canonical is already
     # byte-identical AND carries the expected caps — preserves the
     # "no-op ⇒ no sudo" property on a pure dev host (no stash present).
+    #
+    # The capability side compares SETS via normalize_caps (see above), never
+    # substrings. Callers that declare no expected caps (the guest binary, which
+    # carries none and gets no `setcap`) short-circuit before `getcap` is
+    # reached, so this stays runnable on a host that has no `getcap` at all.
     need_install=1
     if [ -e "$canonical" ] && cmp -s "$built" "$canonical"; then
-        if [ -z "$expected_getcap" ] || getcap "$canonical" 2>/dev/null | grep -qF "$expected_getcap"; then
+        if [ -z "$expected_getcap" ]; then
             need_install=0
+        else
+            expected_norm=$(printf '%s\n' "$expected_getcap" | normalize_caps)
+            current_caps=$(getcap "$canonical" 2>/dev/null || true)
+            current_norm=$(printf '%s\n' "$current_caps" | normalize_caps)
+            if [ "$current_norm" = "$expected_norm" ]; then
+                need_install=0
+            fi
         fi
     fi
     if [ "$need_install" = 1 ]; then

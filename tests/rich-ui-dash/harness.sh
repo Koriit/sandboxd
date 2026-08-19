@@ -51,12 +51,29 @@ PRINT_FAILURE_REPORT_BLOCK=$(awk '
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
 
-# Extract install_health_check and maybe_emit_group_activation_hint.
-INSTALL_HEALTH_CHECK_BLOCK=$(awk '
-    /^install_health_check\(\)/ { in_block = 1 }
+# Extract normalize_caps — the capability-set comparison filter that every
+# getcap guard in install.sh pipes both operands through. install_health_check
+# calls it, so it has to be injected alongside; extracted separately (rather
+# than widening the health-check awk) because it is defined near the top of
+# install.sh, far from the function that uses it. install.sh carries a second,
+# byte-identical copy inside the privileged-child heredoc; the `exit` on first
+# match keeps this pinned to the top-level definition, and the caps-guard
+# drift scenario below asserts the two copies have not diverged.
+NORMALIZE_CAPS_BLOCK=$(awk '
+    /^normalize_caps\(\)/ { in_block = 1 }
     in_block { print }
     in_block && /^}$/ { in_block = 0; exit }
 ' "$INSTALL_SH")
+
+# Extract install_health_check and maybe_emit_group_activation_hint.
+INSTALL_HEALTH_CHECK_BLOCK=$(
+    printf '%s\n' "$NORMALIZE_CAPS_BLOCK"
+    awk '
+        /^install_health_check\(\)/ { in_block = 1 }
+        in_block { print }
+        in_block && /^}$/ { in_block = 0; exit }
+    ' "$INSTALL_SH"
+)
 
 MAYBE_EMIT_HINT_BLOCK=$(awk '
     /^maybe_emit_group_activation_hint\(\)/ { in_block = 1 }
@@ -2656,6 +2673,343 @@ case "$_unhealthy" in
     *"daemon-inactive"*) : ;;
     *) printf "expected daemon-inactive in _unhealthy; got: %s\n" "$_unhealthy" >&2; exit 1 ;;
 esac
+'
+
+# ===========================================================================
+# Capability-guard semantics (H2 / H3)
+#
+# install.sh compares a helper binary's capabilities against an expected set in
+# six places: the two health checks below, the two "is it already configured?"
+# probes in _compute_plan_linux, and the two post-setcap verifications inside
+# the privileged child script.  All six pipe both operands through
+# normalize_caps and test for EXACT SET EQUALITY.  Exactness is the point:
+# setcap REPLACES a file's whole capability set, so a helper carrying a
+# superset of the expected capabilities is misconfigured, not "already fine".
+#
+# Only H2/H3 are reachable as shell scenarios (the other four sites are not
+# separately callable functions); the two structural scenarios at the end of
+# this section cover them, and pin the four normalize_caps copies together.
+#
+# Every getcap string used below is a VERBATIM libcap rendering captured by
+# running setcap/getcap on Linux, not a hand-written approximation:
+#
+#   libcap 2.66 (Debian 12) and 2.44 (Debian 11)
+#     setcap cap_setuid=ep                     -> <path> cap_setuid=ep
+#     setcap cap_chown=ei cap_setuid=ep        -> <path> cap_chown=ei cap_setuid+ep
+#     setcap cap_chown=ei cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip
+#                                              -> <path> cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip cap_chown+ei
+#   libcap 2.25 (Ubuntu 18.04) and 2.24 (Ubuntu 16.04)
+#     setcap cap_setuid=ep                     -> <path> = cap_setuid+ep
+#     setcap cap_chown=ei cap_setuid=ep        -> <path> = cap_chown+ei cap_setuid+ep
+#
+# Three properties of those renderings drive the test selection:
+#   (1) The name order is the kernel numeric order (CAP_CHOWN=0, CAP_SETUID=7,
+#       CAP_NET_ADMIN=12, CAP_SYS_PTRACE=19, CAP_SYS_ADMIN=21, CAP_SYSLOG=34),
+#       never the order setcap received.
+#   (2) When output is multi-clause, the LAST clause is always spelled with
+#       `+`, whichever clause that is.  So "extra capability sorts before vs.
+#       after the expected ones" does NOT decide whether a superset survives
+#       `awk {print $NF}` -- what decides it is whether the guard also rewrites
+#       `+` to `=`.  Only the lima guard did, which is why only the lima guard
+#       had a reachable fail-open.
+#   (3) 2.24/2.25 emit an extra `=` field after the path and spell every clause
+#       with `+`; 2.44/2.66 do not.  That is a second, independent way for a
+#       string compare to be wrong, and it points the other way: it made the
+#       route guard reject a CORRECTLY capped helper.
+# ===========================================================================
+
+# Shared fixture for the capability-guard scenarios.  Builds a temp install
+# tree that satisfies H1/H4/H5/H6 so the only invariant any scenario can break
+# is H2 or H3, and installs a getcap stub driven by two variables.
+_CG_SETUP='
+_cg_d=$(mktemp -d)
+_cg_cleanup() { rm -rf "$_cg_d"; }; trap _cg_cleanup EXIT
+mkdir -p "$_cg_d/libexec" "$_cg_d/bin" "$_cg_d/etc/sandboxd"
+for _b in sandboxd sandbox-route-helper sandbox-lima-helper sandbox-guest; do
+    printf "#!/bin/sh\n" > "$_cg_d/libexec/$_b"; chmod +x "$_cg_d/libexec/$_b"
+done
+printf "#!/bin/sh\n" > "$_cg_d/bin/sandbox"; chmod +x "$_cg_d/bin/sandbox"
+printf "{\"_schema_version\":%d}\n" 1 > "$_cg_d/etc/sandboxd/users.conf"
+PLAN_DAEMON_PATH="$_cg_d/libexec/sandboxd"
+PLAN_CLI_PATH="$_cg_d/bin/sandbox"
+PLAN_ROUTE_HELPER_PATH="$_cg_d/libexec/sandbox-route-helper"
+PLAN_LIMA_HELPER_PATH="$_cg_d/libexec/sandbox-lima-helper"
+PLAN_GUEST_PATH="$_cg_d/libexec/sandbox-guest"
+PLAN_USERS_CONF_PATH="$_cg_d/etc/sandboxd/users.conf"
+PLAN_ROUTE_CAPS_STR="cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip"
+existing_ver="1.2.3"
+docker() { return 0; }
+systemctl() { printf "active\n"; }
+jq() { printf "1\n"; }
+
+# getcap stub.  _CG_ROUTE_OUT / _CG_LIMA_OUT hold everything getcap prints
+# AFTER the path, exactly as libcap renders it.  An empty value models an
+# uncapped binary or a path that does not exist: real getcap prints nothing
+# and still exits 0 for both, so the stub must do the same -- an exit-status
+# test cannot tell those apart from success, which is why the guards do not
+# use one.
+_CG_ROUTE_OUT=""
+_CG_LIMA_OUT=""
+getcap() {
+    case "$1" in
+        *route-helper) _cg_o="$_CG_ROUTE_OUT" ;;
+        *lima-helper)  _cg_o="$_CG_LIMA_OUT" ;;
+        *)             _cg_o="" ;;
+    esac
+    if [ -n "$_cg_o" ]; then
+        printf "%s %s\n" "$1" "$_cg_o"
+    fi
+    return 0
+}
+
+# _cg_case ROUTE_OUT LIMA_OUT WANT_ROUTE WANT_LIMA LABEL
+#   WANT_*: ok  = that caps token must be ABSENT from _unhealthy
+#           bad = that caps token must be PRESENT in _unhealthy
+_cg_case() {
+    _CG_ROUTE_OUT="$1"; _CG_LIMA_OUT="$2"
+    _cg_wr="$3"; _cg_wl="$4"; _cg_lbl="$5"
+    install_health_check || true
+    case "$_unhealthy" in *route-caps*) _cg_gr=bad ;; *) _cg_gr=ok ;; esac
+    case "$_unhealthy" in *lima-caps*)  _cg_gl=bad ;; *) _cg_gl=ok ;; esac
+    if [ "$_cg_gr" != "$_cg_wr" ] || [ "$_cg_gl" != "$_cg_wl" ]; then
+        printf "%s\n  route want=%s got=%s [%s]\n  lima  want=%s got=%s [%s]\n  _unhealthy=[%s]\n" \
+            "$_cg_lbl" "$_cg_wr" "$_cg_gr" "$1" "$_cg_wl" "$_cg_gl" "$2" "$_unhealthy" >&2
+        exit 1
+    fi
+}
+'
+
+_run_caps_guard_scenario() {
+    _rcgs_label="$1"
+    _rcgs_snippet="$2"
+    _run_health_check_scenario "$_rcgs_label" "${_CG_SETUP}
+${_rcgs_snippet}"
+}
+
+# CG-1 -- DEFECT-TARGETING.  An over-capped lima-helper must be reported
+# unhealthy.  Distinguishes "the guard compares capability SETS" from "the
+# guard compares getcap's last whitespace-separated field after rewriting + to
+# =".  Under the second hypothesis every string here reduces to exactly
+# `cap_setuid=ep` and the helper is certified healthy -- the fail-open.
+#
+# Why an extra capability in its OWN clause rather than in the same clause:
+# `cap_chown,cap_setuid=ep` is a superset too, but libcap renders it as a
+# single clause carrying both names, so the last field differs from the
+# expected string and even the old guard rejected it.  A suite built only from
+# same-clause supersets passes against the defect and certifies it absent.
+# Both shapes are covered -- own-clause here (the discriminating one),
+# same-clause in CG-5 (a regression guard) -- but only this one is red.
+#
+# Three own-clause variants, because the extra capability sorts BEFORE the
+# expected one (cap_chown=0 < cap_setuid=7), AFTER it (cap_syslog=34 > 7), and
+# in a group.  All three render with the expected clause LAST and spelled `+`,
+# which is the measured reason clause ordering does not affect the outcome.
+_run_caps_guard_scenario \
+    "caps-guard: CG-1 over-capped lima-helper is unhealthy (own-clause superset)" '
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" \
+         "cap_chown=ei cap_setuid+ep" ok bad "extra cap sorting BEFORE cap_setuid"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" \
+         "cap_syslog=ei cap_setuid+ep" ok bad "extra cap sorting AFTER cap_setuid"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" \
+         "cap_chown,cap_dac_override,cap_fowner,cap_kill=ei cap_setuid+ep" ok bad "four extra caps"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin+eip" \
+         "= cap_chown+ei cap_setuid+ep" ok bad "libcap 2.25 rendering of the same superset"
+'
+
+# CG-2 -- DEFECT-TARGETING for the route guard, regression-guard for lima.
+# The libcap 2.24/2.25 rendering of a CORRECTLY capped pair must be accepted.
+# Distinguishes "the guard compares sets" from "the guard compares strings":
+# under the string hypothesis the route side reads `...+eip` against an
+# expected `...=eip` and reports a correctly-installed helper as broken.  That
+# is the same defect as CG-1 with the sign flipped -- fail-closed, not
+# fail-open -- and it is why the fix normalises the spelling on BOTH operands
+# instead of just deleting the lima side's + to = rewrite.
+#
+# The leading `= ` field is part of the real 2.24/2.25 output, not decoration:
+# it is a second thing a naive string compare trips over, and it is why the
+# path-stripping step cannot simply take the second field.
+_run_caps_guard_scenario \
+    "caps-guard: CG-2 libcap 2.25 spelling of a correct install stays healthy" '
+_cg_case "= cap_net_admin,cap_sys_ptrace,cap_sys_admin+eip" \
+         "= cap_setuid+ep" ok ok "libcap 2.25: leading = field, all clauses spelled +"
+'
+
+# CG-3 -- REGRESSION-GUARD, and the positive control for this whole section.
+# The libcap 2.44/2.66 rendering of a correct install must stay healthy.  Every
+# other scenario here asserts that something is REJECTED; without this one a
+# guard that rejected unconditionally would satisfy all of them.  It is the
+# only scenario in the section that proves the reject verdicts are discriminating.
+_run_caps_guard_scenario \
+    "caps-guard: CG-3 exact match in the libcap 2.66 spelling stays healthy" '
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" \
+         "cap_setuid=ep" ok ok "exact set, modern spelling"
+'
+
+# CG-4 -- REGRESSION-GUARD.  Over-capped ROUTE helper is unhealthy.
+# These were already rejected before the fix, but by accident rather than by
+# design: the expected clause renders first and the extra capability lands in a
+# trailing `+` clause, so the last-field compare happened to disagree.  The
+# route guard also had no + to = rewrite, so nothing rescued it.  Pinning the
+# behaviour matters because the cheapest wrong fix -- dropping the awk and
+# testing whether the expected string is CONTAINED in getcap output -- would
+# accept every string here.  Containment is fail-open for exactly the reason
+# set equality is required: setcap replaces the whole set.
+_run_caps_guard_scenario \
+    "caps-guard: CG-4 over-capped route-helper is unhealthy" '
+_cg_case "cap_chown,cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" \
+         "cap_setuid=ep" bad ok "extra cap in the SAME clause"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip cap_chown+ei" \
+         "cap_setuid=ep" bad ok "extra cap in its OWN clause, expected clause first"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip cap_syslog+ei" \
+         "cap_setuid=ep" bad ok "extra high-numbered cap in its own clause"
+'
+
+# CG-5 -- REGRESSION-GUARD.  The three non-superset ways to be wrong.  Each
+# isolates one token class that normalize_caps must keep significant:
+#   subset       -- a capability token disappears (nothing is added, so only a
+#                   set compare catches it; a containment check would not)
+#   substituted  -- same cardinality, one name swapped (catches any check that
+#                   only counts capabilities)
+#   wrong flags  -- same names, different flag letters (catches any check that
+#                   compares names and discards the =eip / =ep suffix; this is
+#                   the class the doctor.rs C9 advisory deliberately ignores)
+# The same-clause lima superset is here rather than in CG-1 because it is not
+# discriminating: the pre-fix guard rejected it too.
+_run_caps_guard_scenario \
+    "caps-guard: CG-5 subset, substitution and wrong flags are unhealthy" '
+_cg_case "cap_net_admin,cap_sys_admin=eip" "cap_setuid=ep" bad ok "route subset: cap_sys_ptrace dropped"
+_cg_case "cap_net_admin,cap_net_raw,cap_sys_ptrace=eip" "cap_setuid=ep" bad ok "route substituted: sys_admin -> net_raw"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=ep" "cap_setuid=ep" bad ok "route wrong flags: =ep not =eip"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" "cap_setuid=p" ok bad "lima wrong flags: =p not =ep"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" "cap_setuid=eip" ok bad "lima wrong flags: =eip not =ep"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" "cap_chown,cap_setuid=ep" ok bad "lima same-clause superset"
+'
+
+# CG-6 -- REGRESSION-GUARD, plus the instrument control for the empty case.
+# An uncapped binary and a nonexistent path both make getcap print nothing and
+# exit 0.  The empty string must never compare equal to a non-empty expected
+# set, and -- because the exit status is 0 in both cases -- no guard may infer
+# anything from it.  The control case at the end proves the stub is capable of
+# reporting healthy, so the two empty verdicts are real rejections rather than
+# a stub that always fails.
+_run_caps_guard_scenario \
+    "caps-guard: CG-6 no capabilities at all is unhealthy (getcap exits 0 either way)" '
+_cg_case "" "" bad bad "both helpers uncapped: getcap silent, rc=0"
+_cg_case "" "cap_setuid=ep" bad ok "route uncapped only"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" "" ok bad "lima uncapped only"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" "cap_setuid=ep" ok ok "CONTROL: stub can report healthy"
+'
+
+# CG-7 -- DEFECT-TARGETING.  The comparison must not depend on the order the
+# expected literal happens to be written in.  getcap always prints kernel
+# numeric order; PLAN_ROUTE_CAPS_STR is maintained by hand and today happens to
+# be written in that same order (12, 19, 21), which is the only reason the old
+# string compare worked at all.  Reordering the constant -- a plausible future
+# edit, and one nothing else would catch -- broke the guard before the fix.
+# This is the second half of the original defect: order dependence, separate
+# from the last-field truncation that CG-1 targets.
+_run_caps_guard_scenario \
+    "caps-guard: CG-7 expected literal written in a different order still matches" '
+PLAN_ROUTE_CAPS_STR="cap_sys_admin,cap_net_admin,cap_sys_ptrace=eip"
+_cg_case "cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip" \
+         "cap_setuid=ep" ok ok "same set, expected literal in a different name order"
+'
+
+# CG-8 -- DEFECT-TARGETING, structural.  Four of the six capability guards in
+# install.sh live where a shell scenario cannot reach them: two in
+# _compute_plan_linux (which touches the real filesystem and systemd) and two
+# inside the privileged child script, which exists only as heredoc text until
+# install.sh writes it out and runs it under sudo.  This scenario is the only
+# coverage those four have, so it checks the property that actually failed --
+# that each site routes getcap output through normalize_caps -- rather than
+# trying to execute them.
+#
+# The predicate matches a getcap COMMAND SUBSTITUTION, not the bare word:
+# install.sh also contains `command -v getcap` and an unhealthy token literally
+# named getcap-missing, and a bare-word match reports both as violations.
+_run_scenario "caps-guard: CG-8 every getcap guard in install.sh routes through normalize_caps" '
+_cg_d=$(mktemp -d)
+_cg_cleanup() { rm -rf "$_cg_d"; }; trap _cg_cleanup EXIT
+cat > "$_cg_d/a.awk" <<"AWKEOF"
+{ line[NR] = $0 }
+END {
+    ok = 0; bad = 0
+    for (i = 1; i <= NR; i++) {
+        l = line[i]
+        if (l ~ /^[ \t]*#/) continue
+        if (l !~ /\$\(getcap/) continue
+        nxt = (i < NR) ? line[i+1] : ""
+        if (l ~ /normalize_caps/ || nxt ~ /normalize_caps/) { ok++; continue }
+        printf "  UNGUARDED %d: %s\n", i, l
+        bad++
+    }
+    printf "SITES_OK=%d BAD=%d\n", ok, bad
+}
+AWKEOF
+_cg_res=$(awk -f "$_cg_d/a.awk" "$INSTALL_SH")
+case "$_cg_res" in
+    *"BAD=0"*) : ;;
+    *) printf "getcap guard site not routed through normalize_caps:\n%s\n" "$_cg_res" >&2; exit 1 ;;
+esac
+# Positive control: the check is only meaningful if it found the sites at all.
+# Six are expected -- health check x2, _compute_plan_linux x2, privileged
+# child x2.  A count of zero would satisfy BAD=0 vacuously.
+_cg_n=${_cg_res#*SITES_OK=}; _cg_n=${_cg_n%% *}
+if [ "$_cg_n" -lt 6 ]; then
+    printf "expected at least 6 getcap guard sites, found %s -- check is vacuous\n" "$_cg_n" >&2
+    exit 1
+fi
+# The truncating filter itself must be gone from every guard site.
+_cg_awk=$(awk "/^[ \t]*#/ { next } /\\\$\\(getcap/ && /awk/ { n++ } END { print n+0 }" "$INSTALL_SH")
+if [ "$_cg_awk" -ne 0 ]; then
+    printf "%s getcap guard line(s) still pipe through awk\n" "$_cg_awk" >&2; exit 1
+fi
+'
+
+# CG-9 -- DEFECT-TARGETING, structural.  normalize_caps exists in four places
+# that cannot share code: install.sh top level, the privileged child heredoc
+# inside install.sh (a separate sh process that cannot see the parent's
+# functions), scripts/dev/canonical-binary.sh, and the Makefile's
+# NORMALIZE_CAPS.  install.sh is delivered by `curl | sh` and has no adjacent
+# file to source, so duplication is forced -- which makes silent drift between
+# the copies the standing risk, and the reason the same defect could be fixed
+# in two places while three others kept it.
+#
+# Comparison is modulo indentation and the two escaping conventions the copies
+# are obliged to differ in: the heredoc copy writes \$ for a literal $, and
+# make writes $$.  Anything else counts as drift.
+_run_scenario "caps-guard: CG-9 all four normalize_caps copies are identical" '
+_cg_d=$(mktemp -d)
+_cg_cleanup() { rm -rf "$_cg_d"; }; trap _cg_cleanup EXIT
+_cg_root=$(dirname "$(dirname "$INSTALL_SH")")
+cat > "$_cg_d/d.awk" <<"AWKEOF"
+function canon(s) {
+    sub(/^[ \t]+/, "", s)
+    sub(/[ \t]+$/, "", s)
+    sub(/^NORMALIZE_CAPS[ \t]*=[ \t]*/, "", s)
+    gsub(/\\\$/, "$", s)
+    gsub(/\$\$/, "$", s)
+    return s
+}
+FNR == 1 { prev = "" }
+/^[ \t]*NORMALIZE_CAPS[ \t]*=/ { print canon($0); next }
+prev ~ /normalize_caps\(\)[ \t]*\{/ { print canon($0) }
+{ prev = $0 }
+AWKEOF
+awk -f "$_cg_d/d.awk" \
+    "$INSTALL_SH" \
+    "$_cg_root/scripts/dev/canonical-binary.sh" \
+    "$_cg_root/Makefile" > "$_cg_d/copies"
+_cg_n=$(wc -l < "$_cg_d/copies" | tr -d " ")
+if [ "$_cg_n" -ne 4 ]; then
+    printf "expected 4 normalize_caps copies, found %s:\n" "$_cg_n" >&2
+    cat "$_cg_d/copies" >&2; exit 1
+fi
+_cg_u=$(sort -u "$_cg_d/copies" | wc -l | tr -d " ")
+if [ "$_cg_u" -ne 1 ]; then
+    printf "normalize_caps copies have drifted (%s distinct):\n" "$_cg_u" >&2
+    sort -u "$_cg_d/copies" >&2; exit 1
+fi
 '
 
 # ---------------------------------------------------------------------------
