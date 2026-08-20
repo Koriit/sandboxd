@@ -4375,10 +4375,14 @@ mod tests {
     /// here when the scan still shelled out to `limactl` and `docker`,
     /// which on a host that had them would list real `sandbox-*`
     /// resources alongside the seeded fixtures and race any test that
-    /// created some. The integration profile's
-    /// `docker-sandbox-namespace` serialization group is what kept the
-    /// two apart. Both enumerators are stubs now, so nothing outside
-    /// this test's `base_dir` can reach it.
+    /// created some. What the prefix bought against that was the
+    /// default profile's `(^|::)integration_` filter, which excludes
+    /// this test from `make test` — not a place in the
+    /// `docker-sandbox-namespace` serialization group, which this test
+    /// has never been in. That group's clauses anchor at the start of
+    /// the test name, and this one is `store::tests::integration_…`.
+    /// Both enumerators are stubs now, so nothing outside this test's
+    /// `base_dir` can reach it either way.
     #[test]
     fn integration_v006_orphan_scan_logs_each_found_orphan() {
         use std::sync::{Arc, Mutex as StdMutex};
