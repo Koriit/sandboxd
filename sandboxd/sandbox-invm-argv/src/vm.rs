@@ -39,8 +39,9 @@ pub fn link_show_json_argv() -> Vec<String> {
 /// # What this ruleset is
 ///
 /// The gateway VM's `eth0` baseline: a default-drop `output` chain bounding
-/// the VM's *own host-namespace* egress, and an `input` chain that drops
-/// unsolicited inbound on `eth0`. It declares no `forward` chain and does not
+/// the VM's *own host-namespace* egress on `eth0` and nowhere else — it
+/// accepts `oifname != "eth0"` outright — and an `input` chain that drops new
+/// and invalid inbound on `eth0`. It declares no `forward` chain and does not
 /// govern session traffic, which the per-session `sandbox_dnat`/`sandbox_policy`
 /// ruleset in each gateway container's netns judges instead. What it bounds is
 /// the blast radius of a component that escapes a container netns into the VM.

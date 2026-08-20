@@ -633,15 +633,16 @@ impl<D: GatewayRecoveryDeps> GatewayRecoveryDeps for RecoveryShardDeps<'_, D> {
 /// # Why the caller cannot infer this from a health probe
 ///
 /// Because a gateway can answer a health probe and still be one this run
-/// failed to restore. `restart_instance_for_recovery` reaches most of its
-/// failure exits *after* the restarted instance's Docker daemon has already
-/// answered — re-verifying the slot NICs, re-establishing the egress bridge
-/// and re-applying the eth0 baseline policy all run past that point, and any
-/// of them can fail. A caller that polls the daemon and calls in when the poll
-/// fails will therefore see a healthy instance, ask for nothing, and never
-/// learn that the sessions this run tagged `Degraded` still have no gateway
-/// container. Returning the outcome is what lets the caller owe a retry to
-/// something other than its probe.
+/// failed to restore. Three of `restart_instance_for_recovery`'s six failure
+/// exits are reached *after* the restarted instance's Docker daemon has
+/// already answered — re-verifying the slot NICs, re-establishing the egress
+/// bridge and re-applying the eth0 baseline policy all run past that point,
+/// and any of them can fail. A caller that polls the daemon and calls in when
+/// the poll fails will therefore see a healthy instance, ask for nothing, and
+/// never learn that this run repaired none of the sessions it tagged
+/// `Degraded` — see [`Self::GatewayNotRestarted`] for what that leaves.
+/// Returning the outcome is what lets the caller owe a retry to something
+/// other than its probe.
 ///
 /// `#[must_use]` for that reason: a call site that drops this value has
 /// re-created the defect it was added to close.
@@ -661,6 +662,12 @@ pub enum GatewayRecoveryOutcome {
     /// was re-applied into one, and the session is still `Running` and still
     /// tagged `Degraded`. A caller that does not schedule another attempt
     /// leaves it that way for as long as the daemon runs.
+    ///
+    /// That is not the same as the session having no gateway container.
+    /// Gateway containers are created with `--restart unless-stopped`, so one
+    /// that predates the fault can be running again once the instance's Docker
+    /// daemon is back. What this establishes is only that no pass re-created
+    /// one or re-applied a policy into it.
     GatewayNotRestarted,
 }
 

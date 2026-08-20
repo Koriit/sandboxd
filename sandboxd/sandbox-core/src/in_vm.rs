@@ -80,7 +80,9 @@ pub enum InVmOp {
     /// than an argv or a file, and what each of those alternatives got wrong.
     ///
     /// A failure here must fail the caller. What goes missing is the bound on
-    /// the gateway VM's *own host-namespace* egress — the table has no
+    /// the gateway VM's *own host-namespace* egress **on `eth0`** — the chain
+    /// accepts `oifname != "eth0"` outright, so it is the uplink it narrows and
+    /// nothing else. The table has no
     /// `forward` chain and does not govern session traffic, which the
     /// per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway
     /// container's netns judges instead. So a failure removes no constraint on
@@ -147,7 +149,8 @@ pub enum InVmOp {
     /// `sandbox_dnat`/`sandbox_policy` ruleset in the gateway container's own
     /// netns; this decides whether the traffic arrives there to be judged at
     /// all. [`Self::ApplyNftBaseline`] is a different bound — the gateway VM's
-    /// own host-namespace egress — and does not govern session traffic. A
+    /// own host-namespace egress on `eth0` — and does not govern session
+    /// traffic. A
     /// wrong value here does not fail loudly: it produces a container whose
     /// packets leave by some other route, with nothing inside the sandbox able
     /// to tell.

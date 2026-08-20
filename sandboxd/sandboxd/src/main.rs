@@ -13370,9 +13370,9 @@ fn gateway_lima_retry_backoff(consecutive_failed_recoveries: u32) -> Duration {
 ///
 /// # Why a probe cannot be the only trigger
 ///
-/// Most of the ways a restart fails leave the instance's Docker daemon
-/// answering (see [`sandbox_core::GatewayRecoveryOutcome`]), so the probes
-/// that follow a failed pass are healthy ones. On the threshold alone they
+/// Half of the ways a restart fails leave the instance's Docker daemon
+/// answering (see [`sandbox_core::GatewayRecoveryOutcome`]), and after those
+/// the probes that follow a failed pass are healthy ones. On the threshold alone they
 /// zero the failure count, the threshold is never reached again, and this loop
 /// never calls another pass in — so the sessions that pass tagged Degraded
 /// never get their gateway containers rebuilt, until something else
@@ -13483,16 +13483,19 @@ impl GatewayLimaTrigger {
 /// propagating them). Until a pass gets past the restart, none of that has
 /// been attempted for any session in it.
 ///
-/// So this is a containment bound and not only a liveness fix. The window
-/// stays open until some pass gets past the restart, and what the schedule
-/// below decides is how soon the next pass is tried. What a session's traffic
-/// can do inside that window is a separate question this loop does not settle:
-/// it turns on what a gateway container that outlived the fault is doing, and
-/// nothing here measures that.
+/// So the gap is not only a liveness one: the policy re-application is part of
+/// what a pass withholds, and what the schedule below decides is how soon the
+/// next pass is tried. What a session's traffic can do meanwhile is a separate
+/// question this loop does not settle: it turns on what a gateway container
+/// that outlived the fault is doing, and nothing here measures that. Nor is a
+/// pass the only thing that can rebuild a container — [`gateway_monitor`]
+/// re-creates one it finds `NotRunning` or `Unhealthy`, without clearing the
+/// `Degraded` tag a failed pass left.
 ///
 /// `run_gateway_recovery` does not retry — this loop is what retries. It
 /// cannot schedule that from its probes, which go on answering healthy through
-/// most kinds of failure, so it schedules from the pass's own outcome:
+/// half of the restart's failure exits, so it schedules from the pass's own
+/// outcome:
 /// [`GatewayLimaTrigger`] holds what is owed and
 /// [`gateway_lima_retry_backoff`] spaces the attempts. The earliest re-attempt
 /// is the first poll at or after [`gateway_lima_retry_delay`] from the failed
@@ -18300,10 +18303,10 @@ mod tests {
         /// A failed pass is retried even though every probe after it is
         /// healthy.
         ///
-        /// This is the case the schedule exists for. Most of the ways
-        /// `restart_instance_for_recovery` fails happen after the instance's
-        /// Docker daemon is already answering, so the probes that follow are
-        /// reachable ones — and on a probe-only trigger they zero the failure
+        /// This is the case the schedule exists for. Three of
+        /// `restart_instance_for_recovery`'s six failure exits are reached
+        /// after the instance's Docker daemon is already answering, and after
+        /// those the probes that follow are reachable ones — and on a probe-only trigger they zero the failure
         /// count, the threshold is never reached again, and the sessions that
         /// pass left Degraded never get their gateway containers rebuilt, for
         /// as long as the daemon runs.

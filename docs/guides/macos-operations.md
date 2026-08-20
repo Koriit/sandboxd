@@ -452,11 +452,18 @@ you ever see it non-empty on this build, that contradicts the code rather than
 telling you about a session — treat it as a bug report, not an operational
 condition.
 
-For "did a recovery leave a sandbox without egress?", use the per-session
-status instead. A recovery that cannot restart the gateway VM leaves every
-session it was going to rebuild reporting `"networking_status": "degraded"` on
-`GET /sessions` and `GET /sessions/<id>`, and they keep reporting it for as
-long as the VM stays down. That surface is live here; this one is not.
+For "did a recovery fail to rebuild a session's gateway container?", use the
+per-session status instead. A recovery that reads the session list and then
+cannot restart the gateway VM leaves every session in that list reporting
+`"networking_status": "degraded"` on `GET /sessions` and `GET /sessions/<id>`.
+That surface is live here; this one is not.
+
+Read `degraded` for what it is: the flag lives in the daemon's memory, so a
+daemon restart clears it whether or not the VM has come back, and nothing
+clears it when the gateway monitor re-creates an unhealthy session's gateway
+container on its own. So it records that a recovery pass did not complete for
+that session — not that the session has no gateway container, and not anything
+about what its traffic can currently do.
 
 ### Preconditions this does not cover
 

@@ -956,7 +956,8 @@ pub enum InVmOp {
     /// Apply the VM's `eth0` default-drop nftables baseline, the ruleset
     /// arriving on `nft`'s standard input.
     ///
-    /// The baseline bounds the VM's *own host-namespace* egress. It declares
+    /// The baseline bounds the VM's *own host-namespace* egress on `eth0`, and
+    /// only there — the chain accepts `oifname != "eth0"` outright. It declares
     /// no `forward` chain and does not govern session traffic, which the
     /// per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway
     /// container's netns judges instead.
@@ -1011,7 +1012,8 @@ pub enum InVmOp {
     /// `sandbox_dnat`/`sandbox_policy` ruleset in the gateway container's own
     /// netns; this decides whether the sandbox's packets reach it to be judged
     /// at all. [`InVmOp::ApplyNftBaseline`] is a different bound — the gateway
-    /// VM's own host-namespace egress — and does not govern session traffic. A
+    /// VM's own host-namespace egress on `eth0` — and does not govern session
+    /// traffic. A
     /// wrong `gateway_ip` produces a container that routes elsewhere and
     /// reports no error.
     ///
