@@ -320,6 +320,44 @@ pub enum BrokerOp {
         /// provisioning. Only valid together with `bridge`.
         unrestricted_slirp_for_provisioning: bool,
     },
+    /// Start (boot) this operator's own gateway Lima VM.
+    ///
+    /// # Why this is a separate variant rather than a flag on `Start`
+    ///
+    /// Same argument as `CreateGateway`, applied to the field that decides
+    /// whether a VM's management NIC is left unrestricted. A session VM must
+    /// boot under the `restrict=on` qemu-wrapper; the gateway must not, because
+    /// its `eth0` is the sanctioned egress uplink. Something has to say which
+    /// applies, and — as there — the selector is **which variant the daemon
+    /// invoked**, not the VM's name and not an emptiness test on the wrapper
+    /// field.
+    ///
+    /// The alternative that looks safe and is not: let `Start` skip wrapper
+    /// validation when `vm` equals a name the agent computes from its own uid.
+    /// The comparand is agent-derived, but the daemon still selects the branch
+    /// by selecting the name, and nothing on the `Create` path constrains what a
+    /// VM may be called. A session-shaped VM created as `sandboxd-gateway` would
+    /// then boot with its socket_vmnet NIC *and* an unrestricted slirp NIC —
+    /// egress routed around the gateway entirely. Splitting the op removes the
+    /// question from the wire instead of answering it there.
+    ///
+    /// # No `vm` and no `qemu_wrapper` field
+    ///
+    /// The instance name is derived from the agent's own `getuid()`, exactly as
+    /// on `CreateGateway`, so the two brokered gateway ops name the same
+    /// instance by construction. There is no wrapper field at all: a gateway has
+    /// no wrapper, so rather than carry one that must be empty — and be checked
+    /// for emptiness on arrival — the field does not exist.
+    ///
+    /// # No `hardened`, `memory_mb` or `cpus`
+    ///
+    /// Not merely unused for a gateway but inert: those three reach QEMU only
+    /// through the `SANDBOX_QEMU_*` variables that the qemu-wrapper reads, and
+    /// this VM runs without one. A gateway's sizing comes from the `cpus:` and
+    /// `memory:` lines of the template it was created from. `start_timeout_s`
+    /// remains because it is the one value the daemon legitimately varies, and
+    /// it is range-checked on arrival like every other numeric field.
+    StartGateway { op_uid: u32, start_timeout_s: u32 },
     /// Stop a running Lima VM instance.
     Stop {
         op_uid: u32,
@@ -1445,6 +1483,7 @@ impl BrokerOp {
             BrokerOp::Create { op_uid, .. }
             | BrokerOp::CreateGateway { op_uid, .. }
             | BrokerOp::Start { op_uid, .. }
+            | BrokerOp::StartGateway { op_uid, .. }
             | BrokerOp::Stop { op_uid, .. }
             | BrokerOp::Delete { op_uid, .. }
             | BrokerOp::Clone { op_uid, .. }
@@ -1481,6 +1520,7 @@ impl BrokerOp {
             BrokerOp::Create { .. }
             | BrokerOp::CreateGateway { .. }
             | BrokerOp::Start { .. }
+            | BrokerOp::StartGateway { .. }
             | BrokerOp::Stop { .. }
             | BrokerOp::Delete { .. }
             | BrokerOp::Clone { .. }
@@ -1502,6 +1542,7 @@ impl BrokerOp {
             BrokerOp::Create { .. } => "create",
             BrokerOp::CreateGateway { .. } => "create-gateway",
             BrokerOp::Start { .. } => "start",
+            BrokerOp::StartGateway { .. } => "start-gateway",
             BrokerOp::Stop { .. } => "stop",
             BrokerOp::Delete { .. } => "delete",
             BrokerOp::Clone { .. } => "clone",

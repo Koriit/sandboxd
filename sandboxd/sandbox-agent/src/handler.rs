@@ -223,6 +223,10 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
             op_uid: _,
             lima_yaml,
         } => handle_create_gateway(ctx, lima_yaml).await,
+        BrokerOp::StartGateway {
+            op_uid: _,
+            start_timeout_s,
+        } => handle_start_gateway(ctx, start_timeout_s).await,
         BrokerOp::Start {
             op_uid: _,
             vm,
@@ -719,12 +723,13 @@ fn own_gateway_vm(_ctx: &RunContext) -> &'static str {
 ///
 /// [`own_gateway_vm`] still returns the unsuffixed `sandboxd-gateway` — it, and
 /// the daemon-side constants it mirrors, predate the per-operator naming and
-/// have not been renamed yet. So a VM created through this function is not the
-/// VM the in-VM and Docker op paths currently address. That is survivable only
-/// because nothing invokes `CreateGateway` yet: the daemon still creates the
-/// gateway through its own direct path under the unsuffixed name. Whoever wires
-/// the daemon to send `CreateGateway` must rename the constants in the same
-/// change, or the two halves will name different instances.
+/// have not been renamed yet. So a VM created or started through this function
+/// is not the VM the in-VM and Docker op paths currently address. That is
+/// survivable only because nothing invokes `CreateGateway` or `StartGateway`
+/// yet: the daemon still creates and starts the gateway through its own direct
+/// path under the unsuffixed name. Whoever wires the daemon to send them must
+/// rename the constants in the same change, or the two halves will name
+/// different instances.
 fn own_gateway_vm_instance_name(ctx: &RunContext) -> String {
     format!("{GATEWAY_VM_NAME}-{}", ctx.own_uid)
 }
@@ -1104,6 +1109,48 @@ async fn handle_create_gateway(ctx: &RunContext, lima_yaml: String) -> BrokerRes
     .await
 }
 
+/// Start this operator's own gateway Lima VM.
+///
+/// Deliberately not a branch inside [`handle_start`], for the reason spelled out
+/// on `BrokerOp::StartGateway`: whether a VM may boot without the `restrict=on`
+/// qemu-wrapper is the decision that must not be reachable from a wire field,
+/// and separate handlers make the two answers statically distinct code paths.
+/// [`handle_start`] therefore keeps validating its wrapper unconditionally, with
+/// no name and no emptiness test able to move a request between the two.
+///
+/// Differences from [`handle_start`], each with a reason:
+/// - The instance name is derived from the agent's own uid, not taken from the
+///   request — [`own_gateway_vm_instance_name`], the same function
+///   [`handle_create_gateway`] names the instance with, so the two brokered
+///   gateway ops address the same instance by construction rather than by two
+///   sites agreeing.
+/// - No wrapper is validated or exported, because a gateway has none. There is
+///   no `QEMU_SYSTEM_AARCH64` in the environment at all rather than an empty
+///   one: the daemon's own direct gateway-start path omits the variable when
+///   the wrapper is empty, so omitting it here makes the brokered environment
+///   identical to the direct one instead of differing by an empty override.
+/// - No `SANDBOX_RESTRICT_MARKER`. The marker records that the management NIC
+///   was rewritten to `restrict=on`; nothing rewrites this one, so a marker
+///   would be a claim no step in this path establishes.
+/// - No `SANDBOX_QEMU_*`. Those are read by the qemu-wrapper, which is absent
+///   here; the VM's sizing comes from its template.
+async fn handle_start_gateway(ctx: &RunContext, start_timeout_s: u32) -> BrokerResult {
+    let vm = own_gateway_vm_instance_name(ctx);
+
+    // Agent-constructed, so this cannot fail today — checked anyway because it
+    // is a property of the argv built below. Same reasoning as
+    // `handle_create_gateway`'s call to it.
+    if let Err(reason) = validation::validate_vm_name(&vm) {
+        return BrokerResult::Rejected { reason };
+    }
+    if let Err(reason) = validation::validate_range("start_timeout_s", start_timeout_s, 1, 600) {
+        return BrokerResult::Rejected { reason };
+    }
+
+    let timeout_flag = format!("--timeout={start_timeout_s}s");
+    run_limactl(ctx, &["start", &vm, &timeout_flag, "--tty=false"], &[]).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_start(
     ctx: &RunContext,
@@ -1170,11 +1217,14 @@ async fn handle_start(
     // Tell the qemu-wrapper where to write the restrict=on marker after it
     // rewrites the management NIC. The broker-mediated RestrictOnVerify reads
     // this file as fallback evidence when QMP query-netdev is unavailable
-    // (e.g. QEMU < 7.2, which lacks the command). Mirrors the daemon-direct
-    // path in broker.rs. Only set when a wrapper is present (the gateway
-    // instance passes an empty wrapper and must NOT have its management NIC
-    // restricted); the wrapper itself skips the marker write for unrestricted
-    // provisioning (base-image) builds.
+    // (e.g. QEMU < 7.2, which lacks the command). The wrapper itself skips the
+    // marker write for unrestricted provisioning (base-image) builds.
+    //
+    // Set unconditionally, because on this op a wrapper is always present: the
+    // validation above rejects an empty path, and there is no VM this op starts
+    // that legitimately runs unwrapped. The one that does — the gateway — has
+    // its own op. A guard here testing the wrapper for emptiness would be dead,
+    // and worse, would read as though an unwrapped VM could still arrive.
     let marker_path_owned = format!("{}/{}/sandboxd-restrict-marker", ctx.lima_home, vm);
 
     let mut extra_env: Vec<(&str, &str)> = vec![
@@ -1182,10 +1232,8 @@ async fn handle_start(
         ("SANDBOX_QEMU_HARDENED", hardened_str),
         ("SANDBOX_QEMU_MEMORY_MB", &memory_mb_str),
         ("SANDBOX_QEMU_CPUS", &cpus_str),
+        ("SANDBOX_RESTRICT_MARKER", &marker_path_owned),
     ];
-    if !qemu_wrapper.is_empty() {
-        extra_env.push(("SANDBOX_RESTRICT_MARKER", &marker_path_owned));
-    }
 
     // Bridge env vars are built from validated bridge data.
     let bridge_name_owned;
@@ -2819,6 +2867,192 @@ mod tests {
         assert!(
             matches!(result, BrokerResult::Rejected { .. }),
             "Start with non-existent qemu-wrapper must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Start vs StartGateway — the class is the op, not the VM name
+    // -----------------------------------------------------------------------
+
+    /// Fragment of the refusal `run_limactl` returns when it cannot resolve the
+    /// binary. Asserting on it is how the tests below prove an op reached the
+    /// exec point rather than being turned away by a validation gate.
+    const LIMACTL_UNRESOLVABLE: &str = "limactl not found in PATH";
+
+    /// Empties `PATH` for the duration of a dispatch test, restoring it on drop.
+    ///
+    /// This is containment, not convenience. `run_limactl` resolves `limactl`
+    /// from this process's `PATH`, and `ctx` builds a `lima_home` under
+    /// `/var/lib/sandboxd/`, which on a developer host is the operator's **live**
+    /// LIMA_HOME. `limactl start <name>` for an instance that does not exist is
+    /// not an error — it creates one from `template:default` and boots it. So a
+    /// dispatch test that passed every validation gate and reached `run_limactl`
+    /// would start a real VM on the host running the unit suite.
+    ///
+    /// With `PATH` empty, `resolve_limactl()` returns `None` and the op is
+    /// refused before anything is spawned. Every caller asserts the refusal
+    /// reason rather than accepting any rejection, so that if the resolution
+    /// mechanism ever stops consulting `PATH` these tests fail loudly instead of
+    /// quietly beginning to boot VMs.
+    ///
+    /// The process environment is global, so this is only safe because each test
+    /// gets its own process under the workspace's runner.
+    struct ClearedPath(Option<std::ffi::OsString>);
+
+    impl ClearedPath {
+        fn new() -> Self {
+            let prior = std::env::var_os("PATH");
+            unsafe { std::env::set_var("PATH", "") };
+            Self(prior)
+        }
+    }
+
+    impl Drop for ClearedPath {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prior) => unsafe { std::env::set_var("PATH", prior) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    /// The general Start op refuses an empty qemu-wrapper for **every** VM name,
+    /// including the names this agent's own gateway instances carry.
+    ///
+    /// The empty wrapper is what makes a VM's management NIC unrestricted, so
+    /// the set of names that may pass one is the set of VMs allowed to bypass
+    /// egress policy. `Start` takes its name off the wire, from a daemon this
+    /// module treats as untrusted, so for `Start` that set must be empty — a
+    /// gateway is started by its own op instead.
+    ///
+    /// The trap this guards is specific and was very nearly implemented: letting
+    /// `Start` skip wrapper validation when `vm` matches an agent-derived
+    /// gateway name. That reads like a uid-derived check, but the daemon still
+    /// chooses which branch runs by choosing the name, and nothing on the Create
+    /// path constrains a VM's name — so a session-shaped VM created as
+    /// `sandboxd-gateway` would boot with a session socket_vmnet NIC *and* an
+    /// unrestricted slirp NIC. The gateway names are in the table below
+    /// precisely because they are the ones such a guard would have admitted.
+    #[tokio::test]
+    async fn start_refuses_an_empty_qemu_wrapper_whatever_the_vm_is_named() {
+        let own_uid = TEST_DAEMON_UID;
+        let ctx = ctx(own_uid);
+        let _path = ClearedPath::new();
+
+        for vm in [
+            "sandbox-abcdef123456",
+            GATEWAY_VM_NAME,
+            &format!("{GATEWAY_VM_NAME}-{own_uid}"),
+            &format!("{GATEWAY_VM_NAME}-0"),
+        ] {
+            let op = BrokerOp::Start {
+                op_uid: own_uid,
+                vm: vm.to_string(),
+                qemu_wrapper: String::new(),
+                hardened: true,
+                memory_mb: 4096,
+                cpus: 2,
+                start_timeout_s: 300,
+                bridge: None,
+                unrestricted_slirp_for_provisioning: false,
+            };
+            let result = dispatch_op(&ctx, op).await;
+            let BrokerResult::Rejected { reason } = result else {
+                panic!("Start {vm} with an empty qemu_wrapper must be Rejected; got {result:?}");
+            };
+            assert!(
+                reason.contains("qemu_wrapper"),
+                "Start {vm} must be refused by wrapper validation specifically; got {reason:?}"
+            );
+            assert!(
+                !reason.contains(LIMACTL_UNRESOLVABLE),
+                "Start {vm} with an empty wrapper reached the exec point, so some class \
+                 escape admitted it"
+            );
+        }
+    }
+
+    /// `StartGateway` boots this agent's own gateway instance, and carries
+    /// neither a name nor a wrapper to get wrong.
+    ///
+    /// Reaching the exec point is the assertion: it means the op cleared every
+    /// validation gate without a `qemu_wrapper` field existing to supply. The
+    /// gateway legitimately runs without the `restrict=on` wrapper on its
+    /// management NIC — its `eth0` is the sanctioned uplink — and this is the op
+    /// that expresses that, rather than an emptiness test inside `Start`.
+    #[tokio::test]
+    async fn start_gateway_reaches_limactl_without_a_wrapper() {
+        let ctx = ctx(TEST_DAEMON_UID);
+        let _path = ClearedPath::new();
+
+        let op = BrokerOp::StartGateway {
+            op_uid: TEST_DAEMON_UID,
+            start_timeout_s: 300,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        let BrokerResult::Rejected { reason } = result else {
+            panic!("StartGateway should have been refused at limactl resolution; got {result:?}");
+        };
+        assert!(
+            reason.contains(LIMACTL_UNRESOLVABLE),
+            "StartGateway must clear every validation gate and be turned away only at \
+             the exec point; got {reason:?}"
+        );
+    }
+
+    /// `StartGateway`'s range check still applies to the one field it does take.
+    #[tokio::test]
+    async fn start_gateway_rejects_an_out_of_range_timeout() {
+        let ctx = ctx(TEST_DAEMON_UID);
+        let _path = ClearedPath::new();
+
+        let op = BrokerOp::StartGateway {
+            op_uid: TEST_DAEMON_UID,
+            start_timeout_s: 0,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { ref reason } if reason.contains("start_timeout_s")),
+            "a zero start_timeout_s must be refused by the range check; got {result:?}"
+        );
+    }
+
+    /// The wire form of `StartGateway` carries neither a VM name nor a wrapper.
+    ///
+    /// Same reasoning as `create_gateway_carries_no_vm_name_on_the_wire`, and
+    /// asserted on the serialized JSON for the same reason: the absence is a
+    /// property of what crosses the channel. The wrapper's absence is the half
+    /// that matters here — there is no field for a daemon to leave empty, so
+    /// "may this VM run unwrapped" is answered by which op was invoked and
+    /// cannot be re-asked per request.
+    ///
+    /// The three fields `Start` carries that this one drops — `hardened`,
+    /// `memory_mb`, `cpus` — are omitted because they are inert for a gateway,
+    /// not merely unused: they reach QEMU only by way of the `SANDBOX_QEMU_*`
+    /// variables that the qemu-wrapper reads, and a gateway has no wrapper. Its
+    /// sizing comes from the `cpus:`/`memory:` lines of the template it was
+    /// created from.
+    #[test]
+    fn start_gateway_carries_no_vm_name_and_no_wrapper_on_the_wire() {
+        let op = BrokerOp::StartGateway {
+            op_uid: 501,
+            start_timeout_s: 300,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&op).expect("serialize StartGateway"))
+                .expect("reparse StartGateway");
+        let mut fields: Vec<&str> = json
+            .as_object()
+            .expect("StartGateway serializes to an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            vec!["op_uid", "start_timeout_s", "subcommand"],
+            "StartGateway must carry exactly the op tag, the uid cross-check and the \
+             timeout — no vm name and no wrapper path"
         );
     }
 
