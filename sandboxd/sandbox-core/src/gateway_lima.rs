@@ -2480,6 +2480,15 @@ impl GatewayLimaManager {
     /// drops out of the map, and the sessions on it are refused rather than
     /// re-parented onto a guess.
     ///
+    /// The forced stop is unconditional — nothing here probes the instance
+    /// first — so a pass that arrives while the instance is reachable stops it
+    /// anyway, and what is running inside the VM goes down with it, gateway
+    /// containers included. The daemon's gateway monitor
+    /// (`sandboxd/src/main.rs`) can call a pass in on exactly that state:
+    /// a retry it scheduled from an earlier failure fires on its own deadline
+    /// regardless of what the probes have since seen, and a healthy probe
+    /// clears the failure count without clearing that deadline.
+    ///
     /// Callers must wrap this in `tokio::task::spawn_blocking` because it
     /// shells out to `limactl` and `docker`.
     pub fn restart_instance_for_recovery(&self, slots: &[u16]) -> Result<(), SandboxError> {

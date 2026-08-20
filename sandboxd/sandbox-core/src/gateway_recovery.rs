@@ -2309,8 +2309,9 @@ mod tests {
         assert_eq!(
             outcome,
             GatewayRecoveryOutcome::GatewayNotRestarted,
-            "a failed restart must say so: the sessions below stay Degraded until \
-             someone runs this again, and nothing else tells the caller that"
+            "a failed restart must say so: the outcome is the only place the \
+             caller learns a retry is owed, and it is what the monitor arms \
+             the next attempt from"
         );
 
         // Session must remain Degraded (still in the map).

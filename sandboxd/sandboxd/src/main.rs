@@ -13421,10 +13421,23 @@ impl GatewayLimaTrigger {
     /// Whether this poll should call a recovery in.
     ///
     /// A pending retry takes the decision from the probes rather than racing
-    /// them: the probe that would re-trigger on the threshold is the same
-    /// failing probe that triggered the pass which just failed, so honouring
-    /// both would collapse the backoff back to the threshold in exactly the
-    /// case — an instance that cannot come back — the backoff is for.
+    /// them, and the reason is arithmetic rather than the probes being stale.
+    /// [`Self::recovery_finished`] zeroes the failure count before it looks at
+    /// the outcome, so a probe-driven trigger after a failed pass always needs
+    /// a fresh full threshold — never the probes that drove the pass. But a
+    /// fresh threshold takes [`gateway_lima_retry_delay`], which is
+    /// [`gateway_lima_retry_backoff`]'s own first delay and is shorter than
+    /// every delay after it. So honouring both would pin the backoff at that
+    /// floor however far it had grown, in exactly the case — an instance that
+    /// cannot come back, so its probes keep failing — it exists to stretch.
+    ///
+    /// The two schedules this chooses between, measured: with no attempt owed,
+    /// a trigger takes [`GATEWAY_LIMA_FAILURE_THRESHOLD`] failing probes at
+    /// [`GATEWAY_LIMA_PROBE_INTERVAL`] — three at ten seconds, the thirty
+    /// seconds [`gateway_lima_retry_delay`] is derived from. With one owed at
+    /// the backoff's cap it is [`GATEWAY_LIMA_MAX_RETRY_DELAY`], ten minutes,
+    /// and the probes do not shorten it: the `Some` arm below reads `retry_at`
+    /// and not `consecutive_failures`.
     fn should_recover(&self, now: Instant) -> bool {
         match self.retry_at {
             Some(at) => now >= at,
@@ -18428,6 +18441,28 @@ mod tests {
                 gateway_lima_retry_backoff(u32::MAX),
                 GATEWAY_LIMA_MAX_RETRY_DELAY,
                 "a fault that never clears must keep being retried, at the cap"
+            );
+
+            // Pin the cap itself, and where it first binds. The assertion
+            // above reads `GATEWAY_LIMA_MAX_RETRY_DELAY` on both sides — the
+            // function returns it and the expectation is it — so it holds for
+            // whatever value the constant takes. The floor is pinned to a
+            // literal at the top of this test; the ceiling was not, which left
+            // the ten minutes the constant declares free to drift.
+            assert_eq!(
+                gateway_lima_retry_backoff(5),
+                Duration::from_secs(480),
+                "the doubling must still be clear of the cap at the fifth retry"
+            );
+            assert_eq!(
+                gateway_lima_retry_backoff(6),
+                Duration::from_secs(600),
+                "the cap must first bind at the sixth retry"
+            );
+            assert_eq!(
+                gateway_lima_retry_backoff(u32::MAX),
+                Duration::from_secs(600),
+                "the cap is ten minutes"
             );
         }
     }
