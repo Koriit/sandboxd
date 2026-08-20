@@ -1190,8 +1190,9 @@ mod tests {
 
     /// [`DockerOps`] fake that counts enumerations rather than recording
     /// removals. Nothing exists on this Docker daemon, so every pass over it
-    /// leaves exactly the state the pass before it left — which is why the
-    /// count, and not the state, is what these tests assert on.
+    /// leaves exactly the state the pass before it left — which is why these
+    /// tests assert on what the sweep did and never on how the daemon looks
+    /// afterwards.
     #[cfg(target_os = "macos")]
     #[derive(Default)]
     struct CountingDocker {

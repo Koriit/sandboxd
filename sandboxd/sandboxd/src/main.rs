@@ -14353,8 +14353,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // On macOS there is no host Docker; lite containers and their volumes
         // and networks live inside a gateway Lima VM, one per gateway owner.
         // The sweep visits each distinct owner once — see
-        // `reap_orphans_per_gateway_owner` for why the count, not the end
-        // state, is what says it did.
+        // `reap_orphans_per_gateway_owner` for why the owners it returns, and
+        // not the host afterwards, are what say so.
         {
             #[cfg(not(target_os = "macos"))]
             {
