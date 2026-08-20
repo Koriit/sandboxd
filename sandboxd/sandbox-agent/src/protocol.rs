@@ -351,12 +351,24 @@ pub enum BrokerOp {
     ///
     /// # No `hardened`, `memory_mb` or `cpus`
     ///
-    /// Not merely unused for a gateway but inert: those three reach QEMU only
-    /// through the `SANDBOX_QEMU_*` variables that the qemu-wrapper reads, and
-    /// this VM runs without one. A gateway's sizing comes from the `cpus:` and
-    /// `memory:` lines of the template it was created from. `start_timeout_s`
-    /// remains because it is the one value the daemon legitimately varies, and
-    /// it is range-checked on arrival like every other numeric field.
+    /// Not merely unused for a gateway but inert on this platform. Those three
+    /// travel as the `SANDBOX_QEMU_*` variables, whose only reader is the
+    /// **Linux** qemu-wrapper, where they select QEMU device lockdown and a
+    /// systemd scope's cgroup limits — mechanisms macOS does not have. The macOS
+    /// wrapper reads neither; its whole environment surface is the restrict
+    /// marker and the provisioning-slirp flag. So on macOS the three are inert
+    /// whether or not a wrapper is present, which is a wider claim than "this VM
+    /// has no wrapper" and the reason the omission is safe.
+    ///
+    /// The evidence that this drops nothing live: the direct start path this op
+    /// supersedes already passes them as bare literals — `hardened: false`,
+    /// `memory_mb: 2048`, `cpus: 2` — alongside its empty wrapper, and has for as
+    /// long as the gateway has existed. The values are decorative there already;
+    /// this op declines to carry them rather than dropping something that acted.
+    /// A gateway's real sizing comes from the `cpus:` and `memory:` lines of the
+    /// template it was created from. `start_timeout_s` remains because it is the
+    /// one value the daemon legitimately varies, and it is range-checked on
+    /// arrival like every other numeric field.
     StartGateway { op_uid: u32, start_timeout_s: u32 },
     /// Stop a running Lima VM instance.
     Stop {

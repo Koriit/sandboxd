@@ -734,6 +734,52 @@ fn own_gateway_vm_instance_name(ctx: &RunContext) -> String {
     format!("{GATEWAY_VM_NAME}-{}", ctx.own_uid)
 }
 
+/// Validate a VM name that an op is **claiming** — binding to instance content
+/// the daemon authored.
+///
+/// # Why a name check is a class check here
+///
+/// The typed gateway ops answer "may this VM run unwrapped" and "may the agent
+/// run commands as root in this VM" by *which op was invoked*, and then name
+/// their target from the agent's own uid. That removes the daemon's control over
+/// which branch runs. It does not, on its own, remove its control over **which
+/// instance the branch acts on**: the name→instance binding is made by a
+/// different op, and the general placing ops take the name off the wire. A
+/// daemon that binds a session-shaped instance to a name a typed gateway op
+/// later acts on gets the permissive treatment applied to content it chose.
+///
+/// So the two names this agent's own gateway ops act on are claimable only
+/// through those ops. Neither is decorative:
+///
+/// - [`own_gateway_vm_instance_name`] is what `StartGateway` boots, with no
+///   qemu-wrapper and therefore no `restrict=on` rewrite of the management NIC.
+/// - [`own_gateway_vm`] is what the `InVm` and Docker ops execute inside, as
+///   root — see that function's doc for why that is the sharper of the two.
+///
+/// The set is exactly those names and nothing that merely resembles them.
+/// Another operator's gateway lives in another operator's LIMA_HOME and is named
+/// by no op of this agent's, so refusing it would cost legitimate work and buy
+/// nothing.
+///
+/// # What this does not cover
+///
+/// Only ops that *place* a name. `Delete` still accepts a reserved name, because
+/// removing one's own gateway is legitimate lifecycle work and refusing it would
+/// need a typed delete op that does not exist. Freeing the name is harmless on
+/// its own: it can be re-claimed only through `CreateGateway`, and
+/// [`handle_start_gateway`] refuses to boot an instance that is not there rather
+/// than letting `limactl` invent one.
+fn validate_claimed_vm_name(ctx: &RunContext, vm: &str) -> Result<(), String> {
+    validation::validate_vm_name(vm)?;
+    if vm == own_gateway_vm_instance_name(ctx) || vm == own_gateway_vm(ctx) {
+        return Err(format!(
+            "vm name {vm:?} is reserved for this agent's own gateway; it can be \
+             claimed only by the gateway ops, which validate the instance they create"
+        ));
+    }
+    Ok(())
+}
+
 /// `umask` for in-VM operations.
 ///
 /// Deliberately **not** the `0o077` the Lima lifecycle ops use. That value
@@ -963,8 +1009,9 @@ async fn handle_create(
     qemu_wrapper: String,
     is_hardened_session: bool,
 ) -> BrokerResult {
-    // Validate all fields before any filesystem access.
-    if let Err(reason) = validation::validate_vm_name(&vm) {
+    // Validate all fields before any filesystem access. This op places a name,
+    // so the name is checked for claimability, not just for shape.
+    if let Err(reason) = validate_claimed_vm_name(ctx, &vm) {
         return BrokerResult::Rejected { reason };
     }
     if let Err(reason) = validation::validate_cidr_owner("owner", &owner) {
@@ -1132,8 +1179,12 @@ async fn handle_create_gateway(ctx: &RunContext, lima_yaml: String) -> BrokerRes
 /// - No `SANDBOX_RESTRICT_MARKER`. The marker records that the management NIC
 ///   was rewritten to `restrict=on`; nothing rewrites this one, so a marker
 ///   would be a claim no step in this path establishes.
-/// - No `SANDBOX_QEMU_*`. Those are read by the qemu-wrapper, which is absent
-///   here; the VM's sizing comes from its template.
+/// - No `SANDBOX_QEMU_*`. Their only reader is the **Linux** qemu-wrapper
+///   (device lockdown, systemd cgroup limits); the macOS wrapper reads none of
+///   them, so they are inert here with or without a wrapper. The direct start
+///   path this op supersedes passes them as bare literals beside its empty
+///   wrapper, so nothing that acted is being dropped. The VM's sizing comes from
+///   its template.
 async fn handle_start_gateway(ctx: &RunContext, start_timeout_s: u32) -> BrokerResult {
     let vm = own_gateway_vm_instance_name(ctx);
 
@@ -1145,6 +1196,26 @@ async fn handle_start_gateway(ctx: &RunContext, start_timeout_s: u32) -> BrokerR
     }
     if let Err(reason) = validation::validate_range("start_timeout_s", start_timeout_s, 1, 600) {
         return BrokerResult::Rejected { reason };
+    }
+
+    // Boot only an instance that is already there. `limactl start` on a name it
+    // does not know is not an error: it creates an instance from
+    // `template:default` and boots that. Since this op supplies no qemu-wrapper,
+    // that VM would come up with unrestricted user-mode networking — the
+    // permissive path manufacturing its own target out of a Lima default. The
+    // name is reserved to the gateway ops, so the only thing that can put this
+    // file here is `CreateGateway`, whose YAML is held to the gateway shape.
+    let instance_config = format!("{}/{}/lima.yaml", ctx.lima_home, vm);
+    if let Err(reason) = validation::validate_lima_home_path(&ctx.lima_home, &instance_config) {
+        return BrokerResult::Rejected { reason };
+    }
+    if !std::path::Path::new(&instance_config).is_file() {
+        return BrokerResult::Rejected {
+            reason: format!(
+                "no such instance {vm:?}: {instance_config} is absent, and this op will not \
+                 let limactl create one from template:default"
+            ),
+        };
     }
 
     let timeout_flag = format!("--timeout={start_timeout_s}s");
@@ -1311,10 +1382,13 @@ async fn handle_clone(
     disk_gb: u32,
     owner: String,
 ) -> BrokerResult {
+    // `base` is read, `vm` is placed — so only `vm` is held to the reservation.
+    // A clone *from* a gateway is a different question, and not one this rule
+    // answers.
     if let Err(reason) = validation::validate_vm_name(&base) {
         return BrokerResult::Rejected { reason };
     }
-    if let Err(reason) = validation::validate_vm_name(&vm) {
+    if let Err(reason) = validate_claimed_vm_name(ctx, &vm) {
         return BrokerResult::Rejected { reason };
     }
     if let Err(reason) = validation::validate_range("cpus", cpus, 1, 64) {
@@ -2503,13 +2577,21 @@ mod tests {
     /// name selected the class, a compromised daemon would obtain the multi-NIC
     /// rule for a session VM by spelling the name a particular way. Dispatching
     /// on the op variant means there is no spelling that does it.
+    ///
+    /// The names exercised here are gateway-*shaped* but are not the two this
+    /// agent's own gateway ops act on. Those two are refused earlier now, by the
+    /// name reservation rather than by this rule — see
+    /// `the_gateway_names_cannot_be_claimed_by_the_general_placing_ops`. They are
+    /// not used here because a rejection from the reservation would say nothing
+    /// about whether the session NIC rule is still applied to gateway-shaped
+    /// content, which is what this test is for.
     #[tokio::test]
     async fn dispatch_create_with_gateway_shaped_name_gets_the_session_rule() {
         let own_uid = unsafe { libc::getuid() };
         let ctx = ctx(own_uid);
         for name in [
-            format!("sandboxd-gateway-{own_uid}"),
-            "sandboxd-gateway".to_string(),
+            format!("sandboxd-gateway-{}", own_uid + 1),
+            "sandboxd-gatewayx".to_string(),
         ] {
             let op = BrokerOp::Create {
                 op_uid: own_uid,
@@ -2982,7 +3064,11 @@ mod tests {
     /// that expresses that, rather than an emptiness test inside `Start`.
     #[tokio::test]
     async fn start_gateway_reaches_limactl_without_a_wrapper() {
-        let ctx = ctx(TEST_DAEMON_UID);
+        let home = tempfile::tempdir().expect("temp LIMA_HOME");
+        let ctx = ctx_in(&home);
+        let dir = home.path().join(own_gateway_vm_instance_name(&ctx));
+        std::fs::create_dir_all(&dir).expect("instance dir");
+        std::fs::write(dir.join("lima.yaml"), "# instance\n").expect("instance lima.yaml");
         let _path = ClearedPath::new();
 
         let op = BrokerOp::StartGateway {
@@ -3027,11 +3113,11 @@ mod tests {
     /// cannot be re-asked per request.
     ///
     /// The three fields `Start` carries that this one drops — `hardened`,
-    /// `memory_mb`, `cpus` — are omitted because they are inert for a gateway,
-    /// not merely unused: they reach QEMU only by way of the `SANDBOX_QEMU_*`
-    /// variables that the qemu-wrapper reads, and a gateway has no wrapper. Its
-    /// sizing comes from the `cpus:`/`memory:` lines of the template it was
-    /// created from.
+    /// `memory_mb`, `cpus` — are omitted because they are inert on this platform,
+    /// not merely unused: they travel as the `SANDBOX_QEMU_*` variables, read
+    /// only by the Linux qemu-wrapper, and the macOS wrapper reads none of them.
+    /// The gateway's sizing comes from the `cpus:`/`memory:` lines of the
+    /// template it was created from.
     #[test]
     fn start_gateway_carries_no_vm_name_and_no_wrapper_on_the_wire() {
         let op = BrokerOp::StartGateway {
@@ -3053,6 +3139,228 @@ mod tests {
             vec!["op_uid", "start_timeout_s", "subcommand"],
             "StartGateway must carry exactly the op tag, the uid cross-check and the \
              timeout — no vm name and no wrapper path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gateway-name reservation — the permissive op's target, not just its branch
+    // -----------------------------------------------------------------------
+
+    /// A `RunContext` whose LIMA_HOME is a temp dir rather than the operator's
+    /// real one.
+    ///
+    /// `ctx` builds `/var/lib/sandboxd/…`, which on a developer host is live
+    /// operator state, and `handle_create` writes its staging YAML there *before*
+    /// reaching `run_limactl` — so `ClearedPath` does not contain that write.
+    /// Tests that exercise a placing op take this instead. `own_uid` is still the
+    /// fixture's, because the reserved names derive from the uid, not the home.
+    fn ctx_in(home: &tempfile::TempDir) -> RunContext {
+        RunContext {
+            own_uid: TEST_DAEMON_UID,
+            lima_home: home.path().display().to_string(),
+            broker_socket: std::path::PathBuf::from("/tmp/test_broker.sock"),
+        }
+    }
+
+    /// Session-shaped YAML that passes `validate_lima_yaml_shape` for `vm`.
+    ///
+    /// It has to pass, or a claiming op would be refused for its *content* and
+    /// the tests below would prove nothing about its *name*.
+    fn session_yaml(vm: &str) -> String {
+        format!(
+            "# vm: {vm}\nvmType: \"qemu\"\ncpus: 2\nmemory: \"4GiB\"\ndisk: \"20GiB\"\n\
+             networks:\n  - socket: /var/run/sandbox/vmnet/slot-0.sock\n"
+        )
+    }
+
+    /// The two-op attack: claim the name the permissive start op acts on, then
+    /// start it. Both halves must not both succeed.
+    ///
+    /// Splitting `StartGateway` off `Start` removed the daemon's control over
+    /// *which branch runs*. It did not remove its control over *which instance
+    /// the permissive branch acts on*: `StartGateway` derives a **name** from the
+    /// agent's uid, but the name→instance binding is made by a different op that
+    /// takes the name off the wire. `handle_create` checked `vm` for charset
+    /// only, so a daemon could bind a session-shaped instance — or, with
+    /// `is_hardened_session: false`, a slirp-only one — to that name and then
+    /// invoke `StartGateway`, which boots it with no wrapper and therefore no
+    /// `restrict=on` rewrite. `handle_clone` reaches the same name the same way,
+    /// and `Delete` frees it, so "the name is already taken" is not a defence.
+    ///
+    /// Both names are reserved, and neither is merely defensive.
+    /// `own_gateway_vm_instance_name` is what `StartGateway` boots.
+    /// `own_gateway_vm` is what the `InVm` and Docker ops execute inside — as
+    /// root, per that function's own doc — so binding daemon-authored content to
+    /// it hands the daemon a root shell in a VM it shaped.
+    ///
+    /// What this test can and cannot show: with `PATH` cleared, an op that clears
+    /// every gate is turned away at `limactl` resolution, so "the agent does not
+    /// refuse this sequence" is what a `LIMACTL_UNRESOLVABLE` reason on step one
+    /// means. It does not boot a VM and observe its NICs; the NIC consequence is
+    /// established by reading the wrapper, not here.
+    #[tokio::test]
+    async fn the_gateway_names_cannot_be_claimed_by_the_general_placing_ops() {
+        let home = tempfile::tempdir().expect("temp LIMA_HOME");
+        let ctx = ctx_in(&home);
+        let _path = ClearedPath::new();
+
+        let reserved = [
+            own_gateway_vm_instance_name(&ctx),
+            own_gateway_vm(&ctx).to_string(),
+        ];
+
+        for vm in &reserved {
+            let claims = [
+                BrokerOp::Create {
+                    op_uid: TEST_DAEMON_UID,
+                    vm: vm.clone(),
+                    lima_yaml: session_yaml(vm),
+                    owner: "10.1.0.0/29".to_string(),
+                    qemu_wrapper: String::new(),
+                    is_hardened_session: true,
+                },
+                BrokerOp::Clone {
+                    op_uid: TEST_DAEMON_UID,
+                    base: "sandbox-base".to_string(),
+                    vm: vm.clone(),
+                    cpus: 2,
+                    memory_gib: 4,
+                    disk_gb: 20,
+                    owner: "10.1.0.0/29".to_string(),
+                },
+            ];
+
+            for op in claims {
+                let label = op.label();
+                let result = dispatch_op(&ctx, op).await;
+                let BrokerResult::Rejected { reason } = result else {
+                    panic!("{label} claiming {vm} must be Rejected; got {result:?}");
+                };
+                assert!(
+                    reason.contains("reserved"),
+                    "{label} claiming {vm} must be refused by the name reservation \
+                     specifically; got {reason:?}"
+                );
+                assert!(
+                    !reason.contains(LIMACTL_UNRESOLVABLE),
+                    "{label} claiming {vm} reached the exec point, so the name is \
+                     claimable and the attack sequence is open"
+                );
+            }
+        }
+
+        // The second half of the attack is real, not hypothetical: this op takes
+        // no name and no wrapper, clears every gate, and boots whatever carries
+        // the reserved name. Only step one's refusal stops the sequence. Standing
+        // in for the instance `CreateGateway` would have left behind, since the
+        // op now requires one to exist.
+        let dir = home.path().join(&reserved[0]);
+        std::fs::create_dir_all(&dir).expect("instance dir");
+        std::fs::write(dir.join("lima.yaml"), "# instance\n").expect("instance lima.yaml");
+        let start = dispatch_op(
+            &ctx,
+            BrokerOp::StartGateway {
+                op_uid: TEST_DAEMON_UID,
+                start_timeout_s: 300,
+            },
+        )
+        .await;
+        assert!(
+            matches!(start, BrokerResult::Rejected { ref reason } if reason.contains(LIMACTL_UNRESOLVABLE)),
+            "StartGateway must still clear every gate and act on {:?}; got {start:?}",
+            reserved[0]
+        );
+    }
+
+    /// The reservation covers exactly the names this agent's own gateway ops act
+    /// on, and nothing that merely resembles them.
+    ///
+    /// Reserving more would refuse legitimate work for no gain: another
+    /// operator's gateway lives in another operator's LIMA_HOME, and no op of
+    /// this agent's ever names it, so it is not a target the reservation exists
+    /// to protect. Reaching the exec point is how a name proves it is still
+    /// claimable.
+    #[tokio::test]
+    async fn the_reservation_does_not_reach_beyond_this_agents_own_gateway_names() {
+        let home = tempfile::tempdir().expect("temp LIMA_HOME");
+        let ctx = ctx_in(&home);
+        let _path = ClearedPath::new();
+
+        for vm in [
+            "sandbox-abcdef123456",
+            "sandbox-base",
+            &format!("{GATEWAY_VM_NAME}-{}", TEST_DAEMON_UID + 1),
+            &format!("{GATEWAY_VM_NAME}x"),
+        ] {
+            let op = BrokerOp::Create {
+                op_uid: TEST_DAEMON_UID,
+                vm: vm.to_string(),
+                lima_yaml: session_yaml(vm),
+                owner: "10.1.0.0/29".to_string(),
+                qemu_wrapper: String::new(),
+                is_hardened_session: true,
+            };
+            let result = dispatch_op(&ctx, op).await;
+            assert!(
+                matches!(result, BrokerResult::Rejected { ref reason } if reason.contains(LIMACTL_UNRESOLVABLE)),
+                "Create {vm} must still clear every gate and be turned away only at \
+                 the exec point; got {result:?}"
+            );
+        }
+    }
+
+    /// `StartGateway` refuses an instance that does not exist.
+    ///
+    /// Not tidiness — `limactl start <unknown name>` does not fail, it creates an
+    /// instance from `template:default` and boots it. Without this check the
+    /// permissive op manufactures its own target: `Delete` frees the reserved
+    /// name (deleting one's own gateway is legitimate lifecycle work, so the name
+    /// reservation deliberately does not cover it), and the next `StartGateway`
+    /// boots a fresh Lima-default VM with unrestricted user-mode networking,
+    /// which `InstallGuestAgent` and `RunRsync` can then load. The same hole
+    /// swallows an honest daemon that starts before creating.
+    ///
+    /// Existence is checked against the instance's `lima.yaml` rather than the
+    /// directory, because that is the file `limactl` reads; a bare directory is
+    /// not an instance. This is not a transactional guarantee, and does not need
+    /// to be: the only op that can make that file appear under a reserved name is
+    /// `CreateGateway`, whose YAML is held to the gateway shape.
+    #[tokio::test]
+    async fn start_gateway_refuses_an_instance_that_does_not_exist() {
+        let home = tempfile::tempdir().expect("temp LIMA_HOME");
+        let ctx = ctx_in(&home);
+        let _path = ClearedPath::new();
+
+        let op = BrokerOp::StartGateway {
+            op_uid: TEST_DAEMON_UID,
+            start_timeout_s: 300,
+        };
+        let result = dispatch_op(&ctx, op).await;
+        let BrokerResult::Rejected { reason } = result else {
+            panic!("StartGateway with no instance present must be Rejected; got {result:?}");
+        };
+        assert!(
+            reason.contains("no such instance"),
+            "StartGateway must refuse a missing instance specifically, rather than \
+             letting limactl create one from template:default; got {reason:?}"
+        );
+
+        // And it starts once the instance exists, so the check gates on presence
+        // rather than refusing outright.
+        let dir = home.path().join(own_gateway_vm_instance_name(&ctx));
+        std::fs::create_dir_all(&dir).expect("instance dir");
+        std::fs::write(dir.join("lima.yaml"), "# instance\n").expect("instance lima.yaml");
+        let result = dispatch_op(
+            &ctx,
+            BrokerOp::StartGateway {
+                op_uid: TEST_DAEMON_UID,
+                start_timeout_s: 300,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, BrokerResult::Rejected { ref reason } if reason.contains(LIMACTL_UNRESOLVABLE)),
+            "with the instance present StartGateway must reach the exec point; got {result:?}"
         );
     }
 
