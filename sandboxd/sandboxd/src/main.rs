@@ -18,8 +18,13 @@ use clap::Parser;
 use sandbox_core::backend::{
     BackendKind, ContainerRuntime, LimaRuntime, RuntimeHandle, RuntimeStartArgs,
     SANDBOX_CA_CONTAINER_PATH, SessionRuntime, compute_default_resource_limits, home_volume_name,
-    lite_image_tag_for_version, map_container_uid_gid, reap_orphans, rebuild_lite_image,
+    lite_image_tag_for_version, map_container_uid_gid, rebuild_lite_image,
 };
+// The one-pass form addresses the single Docker daemon the host has. macOS
+// has one per gateway owner and reaches them through
+// `reap_orphans_per_gateway_owner` instead.
+#[cfg(not(target_os = "macos"))]
+use sandbox_core::backend::reap_orphans;
 // The orphan reaper runs over whichever Docker route the daemon holds: the
 // host daemon on Linux, the gateway VM's on macOS.
 use sandbox_core::RoutedDockerOps;
@@ -14243,66 +14248,130 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Best-effort and idempotent — a Docker hiccup logs and continues
     // rather than aborting startup.
     // Daemon-internal orphan reaper — needs every session row regardless
-    // of owner. Per-caller filtering does not apply here.
-    let live_session_ids: HashSet<SessionId> = match store.list_sessions_unfiltered() {
-        Ok(sessions) => sessions.into_iter().map(|s| s.id).collect(),
+    // of owner. Per-caller filtering does not apply here, and neither does
+    // any narrowing the passes below apply to *whose* resources they look at:
+    // a resource is reaped when its session id is absent from this set, so a
+    // set narrowed to one operator would make every other operator's live
+    // session look like an orphan. Recovery narrows its session list for
+    // reasons that belong to recovery; a reaper must not.
+    //
+    // An unreadable session list is not an empty one. Handing an empty set to
+    // a reaper says every session that exists has no row, which reaps all of
+    // them — so a failed read skips the pass, as the log below has always
+    // said it does.
+    let live_session_ids: Option<HashSet<SessionId>> = match store.list_sessions_unfiltered() {
+        Ok(sessions) => Some(sessions.into_iter().map(|s| s.id).collect()),
         Err(e) => {
             warn!(
                 error = %e,
                 "orphan reaper: failed to list sessions; skipping reaper pass"
             );
-            HashSet::new()
+            None
         }
     };
-    // Wrap the reaper in a guarded enable-flag: if the daemon is
-    // running on a host without Docker (e.g. a Lima-only deployment),
-    // every list_* call would error and clog the log. The cheapest
-    // probe is the reaper itself — any error path inside `reap_orphans`
-    // already logs at `warn!` and continues.
-    //
-    // The reaper additionally gates `sandbox-net-*` networks against
-    // the daemon's allocator pool — only networks whose IPAM-reported
-    // IPv4 subnets fall fully inside `allocation_pool` are reaped, and
-    // out-of-pool networks' container/volume siblings inherit the same
-    // exemption. See the `orphan_reaper.rs` module docs for the
-    // dual-anchor model.
-    //
-    // On macOS there is no host Docker; lite containers and their volumes
-    // and networks live inside the `sandboxd-gateway` Lima VM. The reaper
-    // routes through that VM's forwarded Docker socket so it can enumerate
-    // and prune orphaned resources correctly.
-    {
-        #[cfg(target_os = "macos")]
-        let docker_ops = RoutedDockerOps::vm(docker_route.clone());
-        #[cfg(not(target_os = "macos"))]
-        let docker_ops = RoutedDockerOps::host();
-        // `let _ =` is intentional: ReaperReport is logged inside reap_orphans.
-        let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
-    }
 
-    // Lima VM orphan cleanup: runs in parallel with the Docker reaper
-    // (both are post-reconcile, both are startup-only).
-    //
-    // Enumerates operator uids from the daemon-owned FS tree (not from
-    // session rows — that is the [L-1] gap `reconcile` leaves open) and
-    // removes `sandbox-{id}` VMs whose session id is absent from the live
-    // set. The owner marker (`sandboxd-owner`) file is consulted so a
-    // shared-LIMA_HOME edge case doesn't cause cross-daemon reaping.
-    {
-        let pool_str = format!(
-            "{}/{}",
-            allocation_pool.base(),
-            allocation_pool.prefix_len()
-        );
-        // `let _ =` is intentional: LimaReaperReport is logged inside
-        // reap_lima_orphans; the outer spawn_blocking result is discarded
-        // because a join-error here (thread panics) should not abort startup.
-        let _ = tokio::task::spawn_blocking({
+    if let Some(live_session_ids) = live_session_ids {
+        // Which operators a pass can act for is a question about reach, and
+        // on macOS the answer changes while the daemon runs: every docker
+        // call to an operator's gateway, and every limactl call for an
+        // operator, is executed by that operator's own agent, so an operator
+        // with no agent checked in cannot be acted for at all. The daemon
+        // itself is always reachable — its own limactl calls and its own
+        // gateway's docker socket need no agent — and while per-operator
+        // gateways are off, its gateway is the one every operator is served
+        // by. That is why it is named here unconditionally instead of the
+        // sweep waiting for somebody to log in.
+        #[cfg(target_os = "macos")]
+        let reachable_operators: Vec<u32> = {
+            let mut uids = vec![daemon_uid];
+            uids.extend(agent_registry.connected_uids().await);
+            uids
+        };
+
+        // Wrap the reaper in a guarded enable-flag: if the daemon is
+        // running on a host without Docker (e.g. a Lima-only deployment),
+        // every list_* call would error and clog the log. The cheapest
+        // probe is the reaper itself — any error path inside `reap_orphans`
+        // already logs at `warn!` and continues.
+        //
+        // The reaper additionally gates `sandbox-net-*` networks against
+        // the daemon's allocator pool — only networks whose IPAM-reported
+        // IPv4 subnets fall fully inside `allocation_pool` are reaped, and
+        // out-of-pool networks' container/volume siblings inherit the same
+        // exemption. See the `orphan_reaper.rs` module docs for the
+        // dual-anchor model.
+        //
+        // On macOS there is no host Docker; lite containers and their volumes
+        // and networks live inside a gateway Lima VM, one per gateway owner.
+        // The sweep visits each distinct owner once — see
+        // `reap_orphans_per_gateway_owner` for why the count, not the end
+        // state, is what says it did.
+        {
+            #[cfg(not(target_os = "macos"))]
+            {
+                let docker_ops = RoutedDockerOps::host();
+                // `let _ =` is intentional: ReaperReport is logged inside reap_orphans.
+                let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let executor =
+                    Arc::clone(broker_executor.as_ref().expect("set by the executor block"))
+                        as Arc<dyn sandbox_core::docker::DockerExecutor>;
+                let swept = sandbox_core::backend::reap_orphans_per_gateway_owner(
+                    &reachable_operators,
+                    &|owner_uid| {
+                        Arc::new(RoutedDockerOps::vm(sandbox_core::docker::DockerRoute::Vm {
+                            op_uid: owner_uid,
+                            executor: Arc::clone(&executor),
+                        })) as Arc<dyn sandbox_core::backend::DockerOps>
+                    },
+                    &live_session_ids,
+                    &allocation_pool,
+                )
+                .await;
+                info!(
+                    gateways_swept = swept.len(),
+                    operators_reachable = reachable_operators.len(),
+                    "orphan reaper: gateway Docker sweep complete"
+                );
+            }
+        }
+
+        // Lima VM orphan cleanup: runs in parallel with the Docker reaper
+        // (both are post-reconcile, both are startup-only).
+        //
+        // Enumerates operator uids from the daemon-owned FS tree (not from
+        // session rows — that is the [L-1] gap `reconcile` leaves open) and
+        // removes `sandbox-{id}` VMs whose session id is absent from the live
+        // set. The owner marker (`sandboxd-owner`) file is consulted so a
+        // shared-LIMA_HOME edge case doesn't cause cross-daemon reaping.
+        {
+            let pool_str = format!(
+                "{}/{}",
+                allocation_pool.base(),
+                allocation_pool.prefix_len()
+            );
             let registry = lima_registry.clone();
             let live = live_session_ids.clone();
-            move || sandbox_core::reap_lima_orphans(&registry, &live, &pool_str)
-        })
-        .await;
+            // `let _ =` is intentional: LimaReaperReport is logged inside the
+            // reaper; the outer spawn_blocking result is discarded because a
+            // join-error here (thread panics) should not abort startup.
+            #[cfg(target_os = "macos")]
+            let reap = {
+                let reachable = reachable_operators.clone();
+                tokio::task::spawn_blocking(move || {
+                    sandbox_core::reap_lima_orphans_for_operators(
+                        &registry, &reachable, &live, &pool_str,
+                    )
+                })
+            };
+            #[cfg(not(target_os = "macos"))]
+            let reap = tokio::task::spawn_blocking(move || {
+                sandbox_core::reap_lima_orphans(&registry, &live, &pool_str)
+            });
+            let _ = reap.await;
+        }
     }
 
     // Hydrate the in-memory policy map from SQLite **before**

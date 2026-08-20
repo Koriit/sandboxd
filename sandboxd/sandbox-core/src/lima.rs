@@ -627,6 +627,62 @@ pub fn reap_lima_orphans(
     reap_lima_orphans_inner(&op_uids, &ops, live, my_pool)
 }
 
+/// [`reap_lima_orphans`], restricted to operators the daemon can currently act
+/// as.
+///
+/// Identical classification; the only difference is which operators are
+/// scanned. The filesystem scan still decides which per-operator LIMA_HOMEs
+/// exist and `reachable` decides which of those this pass opens, so an
+/// operator named in `reachable` who has no LIMA_HOME is not scanned and does
+/// not get one: `get_or_create` provisions the directory as a side effect of
+/// being asked for it, and a reaper has no business creating the tree it is
+/// auditing.
+///
+/// # Why a reaper has to be told who is reachable
+///
+/// Every `limactl` call for an operator is made *as* that operator — on Linux
+/// by `sandbox-lima-helper` pivoting to their uid, on macOS by their own
+/// LaunchAgent over the broker. The macOS half answers only while that agent
+/// is checked in; with no agent the call fails, so
+/// [`reap_lima_orphans_inner`] logs a warning and moves on. Naming the
+/// reachable set turns an attempt that could not have succeeded into one that
+/// was never made. The same VMs are deleted either way — this narrows the
+/// scan, it does not widen it.
+///
+/// # `live` stays the global union
+///
+/// `reachable` narrows *whose VMs are examined* and must never narrow the set
+/// of sessions considered live. A VM is reaped when its session id is absent
+/// from `live`, so a `live` filtered to one operator would classify every
+/// other operator's running session as an orphan and delete its VM. Recovery
+/// narrows its session list, for reasons that belong to recovery; the reaper
+/// must not, and the two land together looking symmetric. They are not: the
+/// asymmetry is the difference between a session's VM surviving and being
+/// deleted.
+pub fn reap_lima_orphans_for_operators(
+    registry: &LimaManagerRegistry,
+    reachable: &[u32],
+    live: &std::collections::HashSet<crate::session::SessionId>,
+    my_pool: &str,
+) -> LimaReaperReport {
+    let op_uids = scan_scoped_to_reachable(enumerate_operator_uids_from_fs(), reachable);
+    let ops = RegistryLimaReaperOps::new(registry);
+    reap_lima_orphans_inner(&op_uids, &ops, live, my_pool)
+}
+
+/// The operator uids a scoped reap pass scans: those with a LIMA_HOME on disk
+/// *and* named as reachable.
+///
+/// Both conditions are necessary and neither implies the other. An operator
+/// with VMs on disk who is not reachable cannot be listed; a reachable
+/// operator with nothing on disk has nothing to list.
+fn scan_scoped_to_reachable(on_disk: Vec<u32>, reachable: &[u32]) -> Vec<u32> {
+    on_disk
+        .into_iter()
+        .filter(|uid| reachable.contains(uid))
+        .collect()
+}
+
 /// Ensure `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/` exists and carries
 /// the correct POSIX ACL so helper-pivoted `limactl` (running as `op_uid`)
 /// can write into it.
@@ -7006,6 +7062,31 @@ mod tests {
             .set_marker(1001, OWN_ORPHAN_SID, Some(MY_POOL))
             .set_marker(1001, FOREIGN_SID, Some(FOREIGN_POOL))
         // LIVE_SID and ABSENT_MARKER_SID: no marker registered
+    }
+
+    /// An operator with VMs on disk is not scanned while the daemon cannot
+    /// reach them — the pass that would have listed them can only fail.
+    #[test]
+    fn an_unreachable_operator_on_disk_is_not_scanned() {
+        assert_eq!(
+            scan_scoped_to_reachable(vec![1001, 1002], &[1002]),
+            vec![1002]
+        );
+    }
+
+    /// A reachable operator with no LIMA_HOME is not scanned either. Asking
+    /// for their manager would create the directory, so the disk decides what
+    /// exists and reachability only narrows it.
+    #[test]
+    fn a_reachable_operator_with_no_lima_home_is_not_scanned() {
+        assert!(scan_scoped_to_reachable(vec![1001], &[1001, 1002]).contains(&1001));
+        assert!(!scan_scoped_to_reachable(vec![1001], &[1001, 1002]).contains(&1002));
+    }
+
+    /// Nobody reachable is nobody scanned — not everybody.
+    #[test]
+    fn no_reachable_operators_scans_nothing() {
+        assert!(scan_scoped_to_reachable(vec![1001, 1002], &[]).is_empty());
     }
 
     /// An orphan whose marker == my pool must be deleted (own orphan).

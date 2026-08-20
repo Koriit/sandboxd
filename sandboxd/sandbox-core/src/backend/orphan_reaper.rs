@@ -577,6 +577,72 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
     report
 }
 
+/// Sweep the gateway Docker daemon of every operator in `operator_uids`,
+/// making exactly one pass per *distinct gateway owner*.
+///
+/// Several operators can be served by one gateway VM — with per-operator
+/// gateways off, all of them are. Their resources sit side by side on that
+/// one daemon, so a pass made for any one of them enumerates all of them and
+/// a second pass finds nothing left to do.
+/// [`crate::gateway_lima::gateway_owner_uid`] is what collapses the operator
+/// list into the owner list, and collapsing before sweeping rather than after
+/// is the difference between one pass and one per operator.
+///
+/// Returns the owners swept, in sweep order. The count is the only
+/// observable that separates one pass over a gateway from several: the passes
+/// after the first delete nothing, so every end state — resources present,
+/// resources gone, report totals — is identical either way, and only the
+/// number of enumerations differs.
+///
+/// `live` is the global union of every session row and stays that way however
+/// narrowly the owner set is scoped; see [`reap_orphans`], which does the
+/// classifying.
+#[cfg(target_os = "macos")]
+pub async fn reap_orphans_per_gateway_owner(
+    operator_uids: &[u32],
+    ops_for_owner: &dyn Fn(u32) -> std::sync::Arc<dyn DockerOps>,
+    live: &HashSet<SessionId>,
+    pool: &Cidr4,
+) -> Vec<u32> {
+    reap_orphans_per_gateway_owner_with(
+        operator_uids,
+        &crate::gateway_lima::gateway_owner_uid,
+        ops_for_owner,
+        live,
+        pool,
+    )
+    .await
+}
+
+/// [`reap_orphans_per_gateway_owner`] with the operator→owner mapping supplied
+/// rather than taken from [`crate::gateway_lima::gateway_owner_uid`].
+///
+/// Split out for the reason `gateway_instance_name_in_mode` is: both the
+/// collapsed and the one-gateway-each mapping are reachable from a test
+/// without a process-global variable deciding which one runs. A test that
+/// could only ever produce one pass would agree with a loop that had no
+/// collapsing in it at all.
+#[cfg(target_os = "macos")]
+async fn reap_orphans_per_gateway_owner_with(
+    operator_uids: &[u32],
+    owner_of: &dyn Fn(u32) -> u32,
+    ops_for_owner: &dyn Fn(u32) -> std::sync::Arc<dyn DockerOps>,
+    live: &HashSet<SessionId>,
+    pool: &Cidr4,
+) -> Vec<u32> {
+    let mut owners: Vec<u32> = operator_uids.iter().copied().map(owner_of).collect();
+    owners.sort_unstable();
+    owners.dedup();
+
+    for &owner in &owners {
+        let ops = ops_for_owner(owner);
+        // `let _ =` is intentional: ReaperReport is logged inside reap_orphans.
+        let _ = reap_orphans(ops.as_ref(), live, pool).await;
+    }
+
+    owners
+}
+
 /// Enumerate owned containers and partition into orphans. Extracted
 /// so the deletion loop can have its own scope separate from enumeration.
 async fn collect_orphan_containers<D: DockerOps + ?Sized>(
@@ -1115,5 +1181,146 @@ mod tests {
             .expect("network rm renders"),
             vec!["network", "rm", "n"]
         );
+    }
+
+    // -- Per-gateway-owner sweep -------------------------------------------
+
+    /// [`DockerOps`] fake that counts enumerations rather than recording
+    /// removals. Nothing exists on this Docker daemon, so every pass over it
+    /// leaves exactly the state the pass before it left — which is why the
+    /// count, and not the state, is what these tests assert on.
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    struct CountingDocker {
+        container_listings: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CountingDocker {
+        fn listings(&self) -> usize {
+            self.container_listings
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[async_trait]
+    impl DockerOps for CountingDocker {
+        async fn list_owned_containers(&self, _pool: &str) -> Result<Vec<String>, SandboxError> {
+            self.container_listings
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+        async fn list_owned_home_volumes(&self, _pool: &str) -> Result<Vec<String>, SandboxError> {
+            Ok(Vec::new())
+        }
+        async fn list_owned_networks(&self, _pool: &str) -> Result<Vec<String>, SandboxError> {
+            Ok(Vec::new())
+        }
+        async fn remove_container(&self, _name: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn remove_volume(&self, _name: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn remove_network(&self, _name: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    /// The production mapping, with per-operator gateways off, puts every
+    /// operator on the daemon's own gateway. Three operators must therefore
+    /// enumerate that one Docker daemon once — not three times.
+    ///
+    /// Asserted on the enumeration count because nothing else can see the
+    /// difference: passes two and three would find the same empty daemon and
+    /// remove the same nothing.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn operators_sharing_one_gateway_are_swept_in_a_single_pass() {
+        let docker = std::sync::Arc::new(CountingDocker::default());
+        let handed_out = Mutex::new(Vec::new());
+
+        let swept = reap_orphans_per_gateway_owner(
+            &[1001, 1002, 1003],
+            &|owner| {
+                handed_out.lock().expect("mutex").push(owner);
+                std::sync::Arc::clone(&docker) as std::sync::Arc<dyn DockerOps>
+            },
+            &HashSet::new(),
+            &pool_a(),
+        )
+        .await;
+
+        assert_eq!(
+            swept,
+            vec![nix::unistd::Uid::current().as_raw()],
+            "three operators collapsed onto more than the one gateway they share"
+        );
+        assert_eq!(
+            handed_out.lock().expect("mutex").len(),
+            1,
+            "one Docker handle per gateway, not per operator"
+        );
+        assert_eq!(
+            docker.listings(),
+            1,
+            "the shared gateway was enumerated more than once"
+        );
+    }
+
+    /// The same sweep over a mapping that gives each operator their own
+    /// gateway makes one pass each.
+    ///
+    /// Without this the test above proves nothing: a loop that ignored its
+    /// operator list entirely, or one that swept a hardcoded single owner,
+    /// would satisfy it just as well.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn operators_with_their_own_gateways_are_swept_once_each() {
+        let dockers: HashMap<u32, std::sync::Arc<CountingDocker>> = [1001u32, 1002, 1003]
+            .into_iter()
+            .map(|uid| (uid, std::sync::Arc::new(CountingDocker::default())))
+            .collect();
+
+        let swept = reap_orphans_per_gateway_owner_with(
+            &[1001, 1002, 1003],
+            &|operator_uid| operator_uid,
+            &|owner| {
+                std::sync::Arc::clone(dockers.get(&owner).expect("owner has a fake"))
+                    as std::sync::Arc<dyn DockerOps>
+            },
+            &HashSet::new(),
+            &pool_a(),
+        )
+        .await;
+
+        assert_eq!(swept, vec![1001, 1002, 1003]);
+        for (uid, docker) in &dockers {
+            assert_eq!(
+                docker.listings(),
+                1,
+                "gateway of {uid} was not enumerated exactly once"
+            );
+        }
+    }
+
+    /// One operator named twice is one gateway, and one pass.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_repeated_operator_does_not_repeat_its_sweep() {
+        let docker = std::sync::Arc::new(CountingDocker::default());
+
+        let swept = reap_orphans_per_gateway_owner_with(
+            &[1001, 1001],
+            &|operator_uid| operator_uid,
+            &|_owner| std::sync::Arc::clone(&docker) as std::sync::Arc<dyn DockerOps>,
+            &HashSet::new(),
+            &pool_a(),
+        )
+        .await;
+
+        assert_eq!(swept, vec![1001]);
+        assert_eq!(docker.listings(), 1);
     }
 }

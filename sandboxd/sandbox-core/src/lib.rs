@@ -161,7 +161,7 @@ pub use lima::{
     MACOS_UNIX_PATH_MAX, PRODUCTION_GUEST_BINARY_PATH, SANDBOXD_STATE_ROOT, SetuidHelperExecutor,
     VmInfo, VmStatus, decide_lima_vm, ensure_operator_lima_home, enumerate_operator_uids_from_fs,
     guest_agent_path, instance_socket_path_fits, instance_ssh_socket_path, operator_lima_home,
-    reap_lima_orphans, vm_name,
+    reap_lima_orphans, reap_lima_orphans_for_operators, vm_name,
 };
 pub use lite_macos::{
     DEFAULT_LITE_SHARED_ROOT, LITE_SHARED_ROOT_ENV, SharedPathError, lite_shared_root,
