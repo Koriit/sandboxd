@@ -477,6 +477,12 @@ So the end-to-end path is: **sandbox VM (`B+4`) → gateway container (`B+3`, is
 
 > **Defense-in-depth on the shared `eth0` uplink.** `eth0` is QEMU user-mode SLIRP — the *one* place SLIRP is allowed, because it is the trusted-infra uplink, not a guest NIC (no sandbox VM/container is ever on the `sandboxd-egress` bridge that reaches it). Per-session enforcement lives entirely on the VM-facing side, so a *compromised gateway component* (Envoy/mitmproxy/CoreDNS, or a container escape — § Security posture / Known deltas) would otherwise have an unfiltered path straight out `eth0`, defeating egress control for every session at once. The gateway VM's `eth0` therefore **MUST** carry a baseline egress nft policy (default-drop; allow only the gateway containers' re-originated upstream flows + DNS), applied as part of gateway-VM init (daemon startup step 4, alongside the `sandboxd-egress` bridge), so even a compromised in-VM component cannot freely egress. This is the gateway VM's egress control — distinct from (and mutually exclusive with) the sandbox VMs' `restrict=on`, which cannot be used here because the gateway legitimately *must* egress. It does not change the per-session model; it bounds the shared-chokepoint blast radius.
 
+> **Correction, 2026-08-20.** The MUST above is preserved as written. Its purpose clause was built; its **mechanism clause — "allow only the gateway containers' re-originated upstream flows + DNS" — was not, and is false as a description of the table that shipped.** `generate_gateway_eth0_nft_policy` (`sandbox-core/src/gateway_lima.rs`) emits `table inet sandboxd-gateway-eth0` declaring `output-eth0` and `input-eth0` and **no `forward` chain**. The output chain accepts loopback, `oifname != "eth0"`, established/related, and DNS/HTTP/HTTPS, and drops the rest; the input chain drops new and invalid inbound on `eth0`. Nothing in it matches on, or can distinguish, a gateway container's flow — the only match types present are `oifname`/`iifname`, `ct state`, and `ip protocol` + `dport` — and it admits HTTP and HTTPS from the VM's host namespace with no container involved. So "allow only re-originated container flows" is not what this table does, and selecting only those flows would need the `forward` chain the implementation deliberately omits.
+>
+> What the table does deliver is the paragraph's stated purpose, and *bounds* rather than prevents: a compromised in-VM component in the host namespace is held to DNS, HTTP and HTTPS on `eth0`. The same parenthetical is repeated at the daemon-startup step below (step 4g) and was copied into `docs/internal/milestones/M20.md` and `networking-design.md`, all three introduced by commit `451c91d` (2026-06-17); those two are corrected as of 2026-08-20. Code comments restating it as fact appeared from `cfff692` (2026-06-18) through `91990da` (2026-08-19) and were corrected on the same day.
+>
+> **Still live elsewhere, and not corrected here.** A descendant of this clause — the gateway VM's nft baseline being "on the egress-enforcement path and must be reviewed as such" — reached the 2026-07-29 operator-owned-gateway-VM spec (row at line 4047) and from there `docs/internal/milestones/M24.md` (lines 420, 425, 438), where it is a session exit criterion rather than a description. Those are live artifacts under active implementation, not closed-arc record, so they are flagged for their owners rather than annotated. Note the 2026-07-29 spec also states the correct fact about the same table (no `forward` chain, Docker NAT untouched) roughly a thousand lines earlier, so it contradicts itself.
+
 ### Slot lifecycle
 
 | Event | Slot state |
@@ -774,6 +780,11 @@ Disk state (Lima VM image) is preserved. The session can be resumed with `start`
       only the gateway containers' re-originated upstream flows + DNS; § Gateway → internet egress).
       The gateway VM's eth0 is the egress uplink and is NEVER restrict=on; this nft policy is its
       egress control, bounding a compromised-gateway-component blast radius.
+
+      > **Correction, 2026-08-20.** Preserved as written. The parenthetical repeats the
+      > mechanism clause of the MUST in § Gateway → internet egress; the correction is
+      > recorded there. The table declares no `forward` chain and has no rule that can
+      > select a container's flows.
 
 5. Load sessions from sessions.db
 

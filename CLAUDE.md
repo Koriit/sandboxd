@@ -4,13 +4,16 @@ Sandbox daemon providing isolated Linux environments for coding agents — Lima/
 
 ## Project structure
 
-- `sandboxd/` — Rust workspace, 8 crates:
+- `sandboxd/` — Rust workspace, 12 crates:
   - `sandbox-core` — shared library (backends, store, policy, events, guest protocol)
   - `sandboxd` — daemon binary (HTTP API over unix socket)
   - `sandbox-cli` — `sandbox` CLI binary (also installed as `git-remote-sandbox`)
   - `sandbox-guest` — guest-agent binary that runs inside each VM/container
+  - `sandbox-agent` — the macOS operator-execution seam, and a privilege boundary in its own right. A per-operator LaunchAgent running in the operator's own login session: it connects *out* to the daemon's broker socket, is identified by the kernel-supplied peer credential, and then runs the typed `limactl`, `docker` and in-VM operations the daemon asks for — as the operator, against a VM and a Docker socket the daemon account cannot touch. It is what replaces `sandbox-lima-helper`'s `cap_setuid` pivot on macOS. It also self-gates at startup — `getgrouplist(3)` for `_sandboxd` membership of its own `getuid()`, then a clean exit if absent — but that is a respawn-loop guard, not the authorization boundary: enrollment is decided by the daemon against the peer credential, which the agent cannot influence. It deliberately does **not** depend on `sandbox-core`, which is what keeps it small enough to review as a boundary; its `sandbox_agent_protocol` lib target holds the broker wire types so both sides of the channel serialize from one definition.
   - `sandbox-route-helper` — privileged setcap binary that installs the default route inside a container netns on behalf of an authorized caller
   - `sandbox-lima-helper` — privileged setcap binary that pivots to an operator's uid before exec'ing `limactl` for every Lima control-plane operation
+  - `sandbox-docker-argv` — zero-dependency leaf crate of pure functions from typed values to `docker` argv fragments. Both sides of the broker channel build the same invocation from it (`sandbox-core → sandbox-docker-argv ← sandbox-agent`, no edge between those two), so the shape the daemon assumes and the shape the agent runs cannot drift. No I/O, no spawning, no policy — whether an invocation is *allowed* is decided on the agent side. Builds on every target: the Linux lite backend uses it too.
+  - `sandbox-invm-argv` — the same leaf-crate shape for work done *inside* the gateway Lima VM (`limactl shell`, `limactl copy`) rather than against a Docker daemon. Separate from the Docker crate because the trust story differs: a `limactl shell` runs in the VM hosting the containers, as its login user with passwordless `sudo`. It is pure data with no `cfg` gates and compiles into the Linux build via `sandbox-core`; the gateway-VM path it serves is macOS-only.
   - `sandbox-event-emitter` — shared lib used by both nft-loggers (JSONL writer + record types)
   - `sandbox-nft-deny-logger` — gateway-container binary that emits `deny` records (TCP DNAT + UDP NFLOG)
   - `sandbox-nft-allow-logger` — gateway-container binary that audits allowed UDP flows via NFCT

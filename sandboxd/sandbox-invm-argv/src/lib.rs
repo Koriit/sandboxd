@@ -19,8 +19,9 @@
 //!   product exists to contain. A `limactl shell` runs in the VM *hosting*
 //!   those containers, as the VM's own login user, with passwordless `sudo`.
 //!   The blast radius of a bad argv is the gateway itself — including the
-//!   nftables baseline that is the egress promise — so the enumeration here is
-//!   load-bearing in a way that is worth reading separately.
+//!   nftables baseline that bounds what the VM's own host-namespace processes
+//!   can reach — so the enumeration here is load-bearing in a way that is
+//!   worth reading separately.
 //! - **A different Linux story.** The docker fragments run on Linux too (the
 //!   lite container backend). These do not: there is no gateway VM on Linux.
 //!   The crate still builds everywhere, because it is pure data, but nothing

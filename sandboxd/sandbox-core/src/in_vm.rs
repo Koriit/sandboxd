@@ -15,7 +15,8 @@
 //! different, not merely the program name. A `docker exec` enters a container
 //! the product exists to contain. A `limactl shell` runs in the VM hosting
 //! those containers, as a user with passwordless `sudo` — and one of the
-//! operations below installs the nftables baseline that is the egress promise.
+//! operations below installs the nftables baseline that bounds what that VM's
+//! own host-namespace processes can reach.
 //! Reading the two enums separately is what makes "what can the daemon ask for
 //! in here?" a question with two short answers instead of one long one.
 //!
@@ -71,7 +72,7 @@ pub enum InVmOp {
     /// declared slot set; this is what it is checked against.
     LinkShowJson,
 
-    // -- Egress plane --------------------------------------------------------
+    // -- The VM's own uplink bound -------------------------------------------
     /// Apply the gateway VM's `eth0` default-drop nftables baseline.
     ///
     /// `ruleset` is the policy itself, delivered to `nft -f -` on standard
