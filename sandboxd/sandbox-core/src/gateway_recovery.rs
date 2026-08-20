@@ -20,7 +20,7 @@
 //! - [`run_gateway_recovery`] — full state-machine orchestrator; manages the
 //!   networking-status map transitions from Degraded through Recovering to Healthy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -214,12 +214,23 @@ pub fn sessions_to_recover(all: Vec<Session>) -> Vec<Session> {
 /// there is one gateway, it serves every session, and which operator a session
 /// belongs to changes nothing about where it recovers. Making that an arm
 /// rather than a constant function is what keeps those sessions recoverable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Both arms name the gateways the caller holds — [`Self::Shared`] its one
+/// uid, [`Self::PerOperator`] a set of them — so a gateway that needs
+/// restarting is never missed for want of a session pointing at it. Sessions
+/// can *add* owners the caller did not name (see
+/// [`partition_by_gateway_owner`]); they cannot take away the ones it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayOwnership {
     /// One gateway, owned by this uid, serves every session.
     Shared(u32),
     /// Each operator's sessions recover against that operator's own gateway.
-    PerOperator,
+    ///
+    /// Carries the gateway owners the caller knows it can act on. Each gets a
+    /// shard whether or not a session resolves to it — see
+    /// [`partition_by_gateway_owner`], which also takes in the owners the
+    /// sessions themselves name.
+    PerOperator(BTreeSet<u32>),
 }
 
 /// The sessions that recover against one gateway owner's gateway.
@@ -293,18 +304,34 @@ impl RecoveryPartition {
 /// here would announce a problem before anyone had decided it was one — the
 /// reason [`resolve_session_operator`] is silent too.
 ///
-/// # Shared ownership always yields exactly one shard
+/// # A shard is a gateway, so ownership decides the shards
 ///
-/// Including for an empty input. A recovery restarts its gateway before it
-/// looks at any session, so "no sessions to re-create" and "no gateway to
-/// restart" are different answers, and a caller looping over shards would
-/// conflate them if an empty candidate set produced no shard. The shard is
-/// the gateway; the sessions are its contents.
+/// [`GatewayOwnership::Shared`] yields exactly one shard, including for an
+/// empty input. A recovery restarts its gateway before it looks at any
+/// session, so "no sessions to re-create" and "no gateway to restart" are
+/// different answers, and a caller looping over shards would conflate them if
+/// an empty candidate set produced no shard. The shard is the gateway; the
+/// sessions are its contents.
 ///
-/// Under [`GatewayOwnership::PerOperator`] the reverse holds: a shard appears
-/// only for an owner that has at least one session, because an owner with no
-/// sessions is not named by anything in the input. A gateway with nothing
-/// running on it is that gateway's monitor's business, not this partition's.
+/// [`GatewayOwnership::PerOperator`] holds the same property once per owner:
+/// the shards are the owners that arm carries, unioned with the owners the
+/// sessions resolve to. Both halves of the union are load-bearing.
+///
+/// - A carried owner gets a shard even when no session lands in it. Deriving
+///   the shards from the sessions alone loses the case a crash-recovery exists
+///   for: an owner whose sessions have all stopped, or whose every session was
+///   declined, would name no shard, and [`run_gateway_recovery`] restarts a
+///   gateway once per run — so a gateway no shard names is a gateway nothing
+///   in this recovery restarts.
+/// - An owner that only a session names gets a shard too, rather than having
+///   its sessions declined for being absent from the carried set. Declining
+///   them would strand `Running` sandboxes whose gateway nobody rebuilds,
+///   which is the outcome [`RecoveryPartition::declined`] exists to report,
+///   not to cause.
+///
+/// So no carried owners and no session naming one yields no shards at all —
+/// the answer to "this caller holds no gateway and no session points at one",
+/// which is a different question from the empty-input case above.
 pub fn partition_by_gateway_owner(
     sessions: Vec<Session>,
     ownership: GatewayOwnership,
@@ -319,11 +346,18 @@ pub fn partition_by_gateway_owner(
             }],
             declined: Vec::new(),
         },
-        GatewayOwnership::PerOperator => {
-            // Keyed by owner and ordered by owner at the end; insertion order
-            // within a shard is the input's, so a shard reads as the subsequence
-            // of the input that belongs to it.
-            let mut by_owner: HashMap<u32, Vec<Session>> = HashMap::new();
+        GatewayOwnership::PerOperator(owners) => {
+            // Seeded with the owners the caller carries, so an owner's shard
+            // exists because its gateway does and not because a session
+            // pointed at it. Sessions then add owners the caller did not name,
+            // making the shard set the union of the two.
+            //
+            // Keyed by owner in a BTreeMap: shard order is the owner order
+            // without a sort at the end. Insertion order within a shard is the
+            // input's, so a shard reads as the subsequence of the input that
+            // belongs to it.
+            let mut by_owner: BTreeMap<u32, Vec<Session>> =
+                owners.into_iter().map(|uid| (uid, Vec::new())).collect();
             let mut declined = Vec::new();
 
             for session in sessions {
@@ -336,14 +370,13 @@ pub fn partition_by_gateway_owner(
                 }
             }
 
-            let mut shards: Vec<RecoveryShard> = by_owner
+            let shards: Vec<RecoveryShard> = by_owner
                 .into_iter()
                 .map(|(owner_uid, sessions)| RecoveryShard {
                     owner_uid,
                     sessions,
                 })
                 .collect();
-            shards.sort_by_key(|shard| shard.owner_uid);
 
             RecoveryPartition { shards, declined }
         }
@@ -675,8 +708,12 @@ pub async fn run_gateway_recovery<Deps, RestartFut, SessionFut, SuccessFut>(
             info!("gateway Lima recovery: instance restarted and Docker daemon ready");
         }
         Err(e) => {
-            // Includes the 90 s readiness timeout: leave sessions Degraded and
-            // let the monitor re-trigger on the next 10 s tick.
+            // Includes the 90 s readiness timeout: leave the sessions Degraded
+            // and return. When to try again is the caller's monitor's decision
+            // and it is not that monitor's next poll — `gateway_lima_monitor`
+            // needs a run of consecutive failing probes and resets that count
+            // before it calls in, so a retry is several polls away. The
+            // figures live with that loop rather than being restated here.
             error!(
                 error = %e,
                 "gateway Lima recovery: instance restart failed; sessions remain Degraded"
@@ -996,6 +1033,13 @@ mod tests {
         (sessions, networks)
     }
 
+    /// Per-operator ownership carrying `owners`. Passing none makes the shards
+    /// exactly the owners the sessions name, which is the half of the union
+    /// most of these cases are about.
+    fn per_operator_of(owners: impl IntoIterator<Item = u32>) -> GatewayOwnership {
+        GatewayOwnership::PerOperator(owners.into_iter().collect())
+    }
+
     /// Resolves only `alice`, to a uid no persisted hint in the generated set
     /// uses — so a session attributed to 504 was attributed by name and by
     /// nothing else.
@@ -1020,10 +1064,16 @@ mod tests {
         let input_ids: Vec<SessionId> = sessions.iter().map(|s| s.id).collect();
         let network_for = |s: &Session| networks.get(&s.id).cloned();
 
-        for ownership in [GatewayOwnership::Shared(0), GatewayOwnership::PerOperator] {
+        // The third case carries an owner no session names: its shard is empty,
+        // and the accounting must stay exact with an empty shard in the set.
+        for ownership in [
+            GatewayOwnership::Shared(0),
+            per_operator_of([]),
+            per_operator_of([999]),
+        ] {
             let partition = partition_by_gateway_owner(
                 sessions.clone(),
-                ownership,
+                ownership.clone(),
                 &network_for,
                 &resolve_alice,
             );
@@ -1069,12 +1119,8 @@ mod tests {
         let (sessions, networks) = every_hint_combination();
         let network_for = |s: &Session| networks.get(&s.id).cloned();
 
-        let partition = partition_by_gateway_owner(
-            sessions,
-            GatewayOwnership::PerOperator,
-            &network_for,
-            &resolve_alice,
-        );
+        let partition =
+            partition_by_gateway_owner(sessions, per_operator_of([]), &network_for, &resolve_alice);
 
         // 27 sessions: 18 have a network uid (9 × 501, 9 × 502); of the 9
         // without, 3 carry column 501, 3 carry column 503, and the remaining
@@ -1122,7 +1168,7 @@ mod tests {
 
         let partition = partition_by_gateway_owner(
             vec![first, second, third],
-            GatewayOwnership::PerOperator,
+            per_operator_of([]),
             &|_| None,
             &unused_resolver,
         );
@@ -1210,17 +1256,111 @@ mod tests {
         assert!(partition.shards()[0].sessions.is_empty());
     }
 
-    /// With a gateway per operator, an empty candidate set names no owner, so
-    /// there is nothing to act on. The mirror image of the shared case, and
-    /// the reason the two are separate arms rather than one uid mapping.
+    /// A gateway with nothing running on it is still handed back as a shard,
+    /// so the caller has something to restart.
+    ///
+    /// This is the case a crash-recovery is for: the gateway is down, which is
+    /// why its sessions are not there to name it. Shards derived from the
+    /// sessions alone would be empty here and the crashed gateway would stay
+    /// down while whatever noticed the crash kept re-triggering.
     #[test]
-    fn per_operator_ownership_yields_no_shard_for_an_empty_session_set() {
+    fn per_operator_ownership_yields_a_shard_for_a_carried_owner_with_no_sessions() {
+        let partition =
+            partition_by_gateway_owner(Vec::new(), per_operator_of([501, 502]), &|_| None, &|_| {
+                None
+            });
+
+        let owners: Vec<u32> = partition.shards().iter().map(|s| s.owner_uid).collect();
+        assert_eq!(
+            owners,
+            vec![501, 502],
+            "each gateway the caller holds must come back as a shard to restart"
+        );
+        assert!(
+            partition.shards().iter().all(|s| s.sessions.is_empty()),
+            "a shard for an owner with no sessions holds no sessions"
+        );
+        assert!(partition.declined().is_empty());
+    }
+
+    /// Declining every one of an owner's sessions does not withdraw the
+    /// gateway they were running against.
+    ///
+    /// The two outcomes are independent: the sessions are reported as
+    /// unplaceable *and* the gateway is restarted. Folding them together
+    /// would make an attribution failure silently cancel the recovery.
+    #[test]
+    fn per_operator_ownership_yields_a_shard_when_every_session_is_declined() {
         let partition = partition_by_gateway_owner(
-            Vec::new(),
-            GatewayOwnership::PerOperator,
-            &unused_network,
+            vec![
+                attributable_session("ghost", None),
+                attributable_session("", None),
+            ],
+            per_operator_of([501]),
+            &|_| None,
+            &resolve_alice,
+        );
+
+        let owners: Vec<u32> = partition.shards().iter().map(|s| s.owner_uid).collect();
+        assert_eq!(
+            owners,
+            vec![501],
+            "the carried owner's gateway must still be handed back as a shard to restart"
+        );
+        assert!(partition.shards()[0].sessions.is_empty());
+        assert_eq!(
+            partition.declined().len(),
+            2,
+            "both unattributable sessions must still be reported"
+        );
+    }
+
+    /// An owner only a session names gets a shard too.
+    ///
+    /// The shards are the union of what the caller carries and what the
+    /// sessions resolve to. Restricting them to the carried set would decline
+    /// the sessions of an owner the caller had not heard of — `Running`
+    /// sandboxes whose gateway nobody then rebuilds.
+    #[test]
+    fn per_operator_ownership_shards_an_owner_only_a_session_names() {
+        let session = attributable_session("", Some(600));
+        let sid = session.id;
+
+        let partition = partition_by_gateway_owner(
+            vec![session],
+            per_operator_of([501]),
+            &|_| None,
             &unused_resolver,
         );
+
+        let owners: Vec<u32> = partition.shards().iter().map(|s| s.owner_uid).collect();
+        assert_eq!(
+            owners,
+            vec![501, 600],
+            "an owner the caller did not carry must gain a shard, not lose its sessions"
+        );
+        assert_eq!(
+            partition.shards()[1]
+                .sessions
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![sid],
+            "the session must land in its own owner's shard"
+        );
+        assert!(partition.declined().is_empty());
+    }
+
+    /// No owner carried and no session naming one yields no shards.
+    ///
+    /// Not the mirror of the shared case: [`GatewayOwnership::Shared`] keeps
+    /// its shard over an empty input because it carries its owner, and a
+    /// carried per-operator owner keeps its shard for the same reason. What
+    /// produces nothing here is a caller that named no gateway at all.
+    #[test]
+    fn per_operator_ownership_yields_no_shard_when_nothing_names_an_owner() {
+        let partition =
+            partition_by_gateway_owner(Vec::new(), per_operator_of([]), &|_| None, &|_| None);
 
         assert!(partition.shards().is_empty());
         assert!(partition.declined().is_empty());
@@ -1234,12 +1374,8 @@ mod tests {
             attributable_session("", None),
         ];
 
-        let partition = partition_by_gateway_owner(
-            sessions,
-            GatewayOwnership::PerOperator,
-            &|_| None,
-            &resolve_alice,
-        );
+        let partition =
+            partition_by_gateway_owner(sessions, per_operator_of([]), &|_| None, &resolve_alice);
         let borrowed_shards: Vec<u32> = partition.shards().iter().map(|s| s.owner_uid).collect();
         let borrowed_declines: Vec<SessionId> =
             partition.declined().iter().map(|d| d.session_id).collect();
@@ -1270,7 +1406,7 @@ mod tests {
         let sid = session.id;
         let partition = partition_by_gateway_owner(
             vec![session],
-            GatewayOwnership::PerOperator,
+            per_operator_of([]),
             &|_| None,
             &resolve_alice,
         );
@@ -1297,7 +1433,7 @@ mod tests {
         let stranded = attributable_session("ghost", None);
         let first = partition_by_gateway_owner(
             vec![stranded],
-            GatewayOwnership::PerOperator,
+            per_operator_of([]),
             &|_| None,
             &resolve_alice,
         );
@@ -1309,7 +1445,7 @@ mod tests {
         let placed = attributable_session("alice", None);
         let second = partition_by_gateway_owner(
             vec![placed],
-            GatewayOwnership::PerOperator,
+            per_operator_of([]),
             &|_| None,
             &resolve_alice,
         );
