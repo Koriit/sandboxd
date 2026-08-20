@@ -13879,9 +13879,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 2b/2c: limactl + docker CLI presence is implicitly validated when
         // ensure_ready() (step 4) calls limactl — any missing binary will produce
-        // a clear error there. Startup compares no versions; the limactl floor
-        // is enforced outside it — `sandbox doctor` checks MIN_LIMA_VERSION,
-        // and the gateway template declares it as `minimumLimaVersion`.
+        // a clear error there. Startup compares no versions. The limactl floor
+        // is enforced outside it, at three sites that stop different things.
+        // `scripts/install.sh` is the one that refuses to install: its macOS
+        // prerequisite check compares `limactl --version` against
+        // MIN_LIMA_VERSION and exits non-zero below it. The gateway template
+        // declares `minimumLimaVersion`, which is Lima's own refusal at
+        // instance start rather than one of ours. `sandbox doctor` renders the
+        // same comparison as a check row and stops nothing.
 
         // ---------------------------------------------------------------------------
         // Count running Lima sessions before pool construction so the resize
