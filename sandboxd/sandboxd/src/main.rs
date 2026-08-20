@@ -1481,6 +1481,26 @@ struct AppState {
     agent_registry: broker::AgentRegistry,
 }
 
+/// Collapse an operator uid to its gateway owner, then ask `route` for that
+/// owner's Docker route.
+///
+/// This is the whole body of [`AppState::docker_route_for_operator`]; the
+/// accessor is this plus a field read. It is a free function taking the
+/// factory rather than a method so the collapse can be exercised on its own —
+/// `AppState` owns a session store, a Lima runtime and a broker registry, none
+/// of which this decision touches, and a test that had to stand all of them up
+/// to ask which uid reaches the factory would not get written.
+fn resolve_docker_route(
+    route: &(dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync),
+    operator_uid: u32,
+) -> sandbox_core::docker::DockerRoute {
+    #[cfg(target_os = "macos")]
+    let owner_uid = sandbox_core::gateway_owner_uid(operator_uid);
+    #[cfg(not(target_os = "macos"))]
+    let owner_uid = operator_uid;
+    route(owner_uid)
+}
+
 impl AppState {
     /// The Docker route for the gateway that serves `operator_uid`'s sessions.
     ///
@@ -1502,11 +1522,7 @@ impl AppState {
     /// On Linux there is no gateway VM: every sandbox container lives on the
     /// host Docker daemon, and the uid reaches a factory that ignores it.
     fn docker_route_for_operator(&self, operator_uid: u32) -> sandbox_core::docker::DockerRoute {
-        #[cfg(target_os = "macos")]
-        let owner_uid = sandbox_core::gateway_owner_uid(operator_uid);
-        #[cfg(not(target_os = "macos"))]
-        let owner_uid = operator_uid;
-        (self.gateway_docker_route)(owner_uid)
+        resolve_docker_route(self.gateway_docker_route.as_ref(), operator_uid)
     }
 
     /// The gateway Lima manager for the gateway that serves `operator_uid`'s
@@ -15368,6 +15384,68 @@ mod tests {
     fn error_body(err: SandboxError) -> (StatusCode, ApiError) {
         let (status, Json(body)) = error_response(err);
         (status, body)
+    }
+
+    // -----------------------------------------------------------------------
+    // Which gateway a request's Docker route lands on.
+    // -----------------------------------------------------------------------
+
+    /// While per-operator gateways are off, the route resolved for *any*
+    /// operator must be the same route the daemon uses for itself.
+    ///
+    /// This is the one property of the off state that nothing else here
+    /// reaches. A handler that resolved its route from the raw operator uid
+    /// would still name the right gateway *instance* — the instance name
+    /// collapses too — while aiming at that operator's agent instead of the
+    /// daemon's, so neither the instance name nor any type would show it.
+    ///
+    /// The assertion watches the uid that reaches the factory rather than
+    /// comparing two `DockerRoute`s: the macOS variant carries an
+    /// `Arc<dyn DockerExecutor>` and is not comparable, and the uid is the
+    /// part that would be wrong anyway.
+    ///
+    /// The daemon's own leg calls the factory at `getuid()` because that is
+    /// literally how startup builds `AppState::docker`. Sweeping several
+    /// operator uids matters more than the specific answer: the property is
+    /// "the result did not depend on the operator", and a single uid that
+    /// happened to equal the daemon's would satisfy both readings at once.
+    ///
+    /// macOS-only, because the switch is. On Linux the factory ignores the
+    /// uid and answers `DockerRoute::Host` for everyone, so no two legs of
+    /// this comparison could differ.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_operators_docker_route_is_the_daemons_own_while_the_switch_is_off() {
+        assert!(
+            !sandbox_core::per_operator_gateway_enabled(),
+            "this test describes the switched-off state; with the switch on \
+             every operator legitimately gets their own route and the \
+             comparison below would be asserting the wrong thing"
+        );
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        let route: Box<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync> =
+            Box::new(move |owner_uid| {
+                recorded.lock().unwrap().push(owner_uid);
+                sandbox_core::docker::DockerRoute::Host
+            });
+        let take_recorded_uid = || seen.lock().unwrap().pop().expect("the factory ran");
+
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+        let _ = route(daemon_uid);
+        let daemons_own_owner = take_recorded_uid();
+
+        for operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
+            let _ = resolve_docker_route(route.as_ref(), operator_uid);
+            assert_eq!(
+                take_recorded_uid(),
+                daemons_own_owner,
+                "with per-operator gateways off, operator uid {operator_uid} must be \
+                 served by the daemon's own gateway route, not by a route aimed at \
+                 uid {operator_uid}'s own agent"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
