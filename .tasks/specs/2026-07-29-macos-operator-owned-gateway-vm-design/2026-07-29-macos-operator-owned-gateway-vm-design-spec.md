@@ -2028,9 +2028,19 @@ suppress every other operator's per-session gateway monitor.** Key it by operato
 **`GatewayRecoveryDeps` does need one, though** — an earlier draft said it did not.
 `list_sessions()` (`:179`) is unfiltered and `sessions_to_recover` (`:77-82`) filters only
 on state and backend, so "invoke it once per operator" against an unfiltered list would
-tag and recover **every** operator's sessions once per operator. Either the trait gains an
-operator scope or the caller supplies a filtering impl — **decide which in the ownership
-phase**; do not leave it to the implementer to discover at the Nth invocation.
+tag and recover **every** operator's sessions once per operator.
+
+**Decided — and it is neither of the two options this paragraph originally offered.**
+The diagnosis above stands; the prescription that followed it ("either the trait gains an
+operator scope or the caller supplies a filtering impl — decide which in the ownership
+phase") is withdrawn, because both options scope from the inside and both lose the
+sessions no operator resolves for. The session set is **partitioned once by a pure
+function ahead of the orchestrator**, which returns the shards *and* the sessions no
+shard claimed from the same call; the orchestrator is driven once per shard through a
+caller-supplied deps impl that answers `list_sessions` from that shard, and the recovery
+trait is unchanged. Full reasoning, the conservation property that pins it, and the two
+consequences that reach outside this phase: *Open questions* → *Previously open, now
+decided* → **How `run_gateway_recovery` gets operator scope**.
 
 **The Lima orphan-reaper landmine.** The gateway VM survives the reaper today **only
 because its name fails a parse.** `decide_lima_vm` (`lima.rs:350`) classifies each VM;
@@ -4162,7 +4172,7 @@ preamble. Phase 1 supplies the range.
 | `sandbox-core/src/lima.rs:460-490` (`reap_lima_orphans_inner`) **or** `:350` with a new `name` parameter | **explicit** gateway exclusion — `decide_lima_vm` never sees a name (§2.6) |
 | daemon-side name-keyed maps | re-key by operator uid — a name is only meaningful with its LIMA_HOME (§2.6) |
 | `sandboxd/src/main.rs:1339`, `:1349`, `:1373` | `AppState` — pool, manager and recovery latch become uid-keyed |
-| `sandbox-core/src/gateway_recovery.rs:179`, `:249-266` | operator scope on `GatewayRecoveryDeps` **or** a filtering impl — decide which (§2.6); per-operator latch |
+| `sandbox-core/src/gateway_recovery.rs:179`, `:249-266` | ~~operator scope on `GatewayRecoveryDeps` **or** a filtering impl — decide which~~ **Done, and neither:** a pure `partition_by_gateway_owner` ahead of the orchestrator returning shards *and* the sessions no shard claimed, driven once per shard through `RecoveryShardDeps`; the trait is unchanged (§2.6). Per-operator latch: done |
 | `sandboxd/src/main.rs:12766`, `:12910` | `recover_gateway_lima` / `gateway_lima_monitor` — per-operator |
 | `sandbox-core/src/backend/orphan_reaper.rs:566`; `sandboxd/src/main.rs:13978, 13984` | reap once per operator VM; gate on `connected_uids` (`broker.rs:680-683`) |
 | `sandbox-core/src/store.rs:245, 266, 286, 342-360` | neuter the V006 Docker scan — because it targets the **host** daemon with no `-H` (§2.4), not because of logout |
@@ -4876,19 +4886,28 @@ This section once claimed to be empty when it was not — §2.5 had left a mitig
 while the section declared the design closed. So the claim above is deliberately narrower
 than "nothing is undecided", and here is exactly what it excludes:
 
-**One bounded implementation choice is still delegated to its phase**, with both options
-stated and neither affecting anything outside the phase that makes it:
+**No implementation choice is delegated any longer.** This section carried one — how
+`run_gateway_recovery` gets operator scope (§2.6) — with two options stated and the
+standing instruction that if the choice turned out to have a consequence outside its
+phase it became an open question again rather than being absorbed. It has now been made,
+it took **neither** of the two stated options, and it **did** have such a consequence.
+Both facts are recorded rather than absorbed:
 
-| Choice | Options | Phase |
-|---|---|---|
-| How `run_gateway_recovery` gets operator scope (§2.6) | operator scope on `GatewayRecoveryDeps`, or a filtering impl supplied by the caller | 4 |
+- **Neither option was taken.** Both stated options scope recovery from the inside — one
+  by widening `GatewayRecoveryDeps`, one by narrowing what an impl answers — and both
+  leave the sessions that belong to no operator existing only implicitly, recoverable
+  by unioning the invocations and diffing against the input. With no operator resolved
+  there are no invocations to union. The session set is instead **partitioned once, by a
+  pure function, ahead of any invocation**, which cannot produce the shards without also
+  producing the sessions no shard claimed.
+- **It reached outside phase 4.** `GET /diagnostics` grows a
+  `gateway_recovery_declined_sessions` field so the residual is reportable, which is a
+  wire-shape change and a Linux-omission contract entry, not phase-4-internal
+  implementation shape.
 
-That is implementation shape, not design. If it turns out to have a consequence
-outside its phase, it becomes an open question again — say so rather than absorbing it.
-
-The other one — where the reaper's gateway exclusion lives — has been made, and it
-carries a measured correction to the mechanism §2.6 describes. Both are recorded in
-*Previously open, now decided* below.
+Both are in *Previously open, now decided* below, alongside the reaper's
+gateway-exclusion decision and the measured correction it carries to the mechanism §2.6
+describes.
 
 
 ### Still unverified (facts, not decisions)
@@ -4992,6 +5011,7 @@ named, not here.
 | Quota model | **Superseded in part.** "First-claim-wins at VM creation" is withdrawn: ranges are assigned at enrollment. What survives is the *default* (a single-operator host gets the whole pool, so nothing regresses) and the two distinct error shapes | §1.3, §2.2 |
 | Gate harness form and lifetime | **A throwaway shell script**, executed once in phase 0 and **deleted at that phase's exit**; phase 6's retargeted e2e suite owns ongoing regression coverage, and a parallel bespoke harness would be a second system that can disagree with it | §3 *Form and lifetime*; phase 0 files + exit |
 | Per-operator gateway VM naming | **`sandboxd-gateway-<operator_uid>`** — keeps the greppable prefix, encodes the owner, structurally cannot match the `sandbox-<12hex>` session grammar; paired with an **explicit** reaper exclusion rather than reliance on the parse failing | §2.6; phase 4 files + criteria |
+| How `run_gateway_recovery` gets operator scope | **Neither stated option. The session set is partitioned once, ahead of the orchestrator, by a pure `partition_by_gateway_owner`; the orchestrator is then driven once per shard through a caller-supplied `GatewayRecoveryDeps` that answers `list_sessions` from that shard. The recovery trait is unchanged.** Both stated options scope from the inside, and both leave the *residual* — the sessions no operator can be resolved for — existing only implicitly, recoverable by unioning the invocations and diffing against the input. Nothing does that, and nothing *can* when zero operators resolve and there are no invocations to union: every Running session with live egress would drop out of recovery with no code path executing to notice. The partition returns the shards and the declined sessions from one call, so the residual cannot be produced without also producing what was dropped. Its conservation property — every input session in exactly one shard or in the declined list, never both, never neither — is a test over every combination of the three hints the operator resolver ranks, counted rather than set-compared so a session placed twice fails too; it is deliberately not a doc comment, because a comment cannot fail. Shared ownership is a **variant, not a constant uid mapping**: a mapping can only be applied to a resolved uid, so an unattributable session would be stranded even on a host with one gateway, where the question does not arise. **One consequence reaches outside the phase, recorded not absorbed:** `GET /diagnostics` grows `gateway_recovery_declined_sessions` (wire shape + Linux-omission contract) so the residual is reportable while it is still always empty. **And one earlier in-phase decision was re-opened by this one and re-affirmed:** the per-owner recovery latch was introduced while the session list stayed global, an asymmetry this change removes. It is kept per-owner, and both sides now state the same rule — key the latch by *the gateway the work lands on*, the writer from the shard's owner and the monitor's read from `state.docker`'s uid. Those are the same value today only because one gateway serves every session; neither side is pinned to the other, so they move independently when the route becomes per-session | §2.6; phase 4 |
 | Where the reaper's gateway exclusion lives | **In `reap_lima_orphans_inner`**, as a candidate filter over the listed VMs, alongside the filtering that loop already does. `decide_lima_vm` keeps its signature: it is asked to classify a VM *by its session id*, and a gateway VM has none, so a `name` parameter would hand it a case it has no vocabulary for and would bury the protection inside a function whose other four rules are about session ownership. Its doc-comment now names the exclusion site, so its rules cannot be read as the complete account of what survives a pass — the defect being fixed is a protection that was implicit, and a second implicit one would repeat it | §2.6; phase 4 |
 | The mechanism by which the gateway VM survives a reap pass today | **Corrected, measured.** §2.6 says the gateway survives because its name fails the session-id parse. It does fail that parse — but the parse is never reached. `LimaManager::list_vms` (`sandbox-core/src/lima.rs`) admits only names carrying `VM_NAME_PREFIX` (`sandbox-`), and both `sandboxd-gateway` and `sandboxd-gateway-<uid>` fail *that* first: the two prefixes differ at their eighth byte. So the parse-based protection is real but unreachable, and it is the prefix filter that has been doing the work. Both gates are now pinned by `gateway_names_are_disjoint_from_the_session_vm_grammar`, which fails if either grammar moves toward the other. This does not weaken the case for the explicit exclusion — it is the argument for it: the surviving mechanism is a coincidence of two independently chosen name schemes, and neither module states that they must stay apart. **§2.6's rationale is left as written**; this row is the correction, not an edit to it | §2.6; phase 4 |
 | Which second uid plays "operator B" | **Fix issue #85 first**, then a dedicated test-operator account in the proper group; adding another member to Apple's reserved gid 60 was rejected as making #85 worse. **The "own per-operator group" half of this is a phase 1 criterion, not phase 0's** — that group does not exist until phase 1 creates it, and Part B ran with a dedicated account in the shared `_sandboxd` | §3.7; [Before you start](#before-you-start); **phase 1 criteria** |
