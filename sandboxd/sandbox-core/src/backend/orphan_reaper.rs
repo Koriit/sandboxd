@@ -588,11 +588,14 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
 /// list into the owner list, and collapsing before sweeping rather than after
 /// is the difference between one pass and one per operator.
 ///
-/// Returns the owners swept, in sweep order. The count is the only
-/// observable that separates one pass over a gateway from several: the passes
-/// after the first delete nothing, so every end state — resources present,
-/// resources gone, report totals — is identical either way, and only the
-/// number of enumerations differs.
+/// Returns the owners swept, in sweep order — one entry per pass.
+///
+/// Assert on that list, not on what is left behind. When the first pass over a
+/// gateway succeeds, the passes after it re-enumerate a daemon whose orphans
+/// are already gone and remove nothing, so the host looks the same after one
+/// pass as after three. What differs is the number of passes, and three things
+/// see it: the length of this list, how many times `ops_for_owner` is asked
+/// for a route, and how many times the daemon is enumerated.
 ///
 /// `live` is the global union of every session row and stays that way however
 /// narrowly the owner set is scoped; see [`reap_orphans`], which does the
@@ -1232,9 +1235,10 @@ mod tests {
     /// operator on the daemon's own gateway. Three operators must therefore
     /// enumerate that one Docker daemon once — not three times.
     ///
-    /// Asserted on the enumeration count because nothing else can see the
-    /// difference: passes two and three would find the same empty daemon and
-    /// remove the same nothing.
+    /// Nothing about the host can see the difference — passes two and three
+    /// would find the same empty daemon and remove the same nothing — so the
+    /// assertions are on the sweep itself: the owners returned, the routes
+    /// handed out, and the enumerations made.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn operators_sharing_one_gateway_are_swept_in_a_single_pass() {

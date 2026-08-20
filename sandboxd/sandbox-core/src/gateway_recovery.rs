@@ -137,9 +137,10 @@ impl GatewayRecoveryLatches {
 
     /// Whether a recovery is in flight for `owner_uid`.
     ///
-    /// An owner with no entry is not recovering: an entry only ever appears
-    /// because someone asked for the latch they were about to engage, so
-    /// "absent" and "present and clear" describe the same state. Reading
+    /// An owner with no entry is not recovering: `for_owner` inserts a cleared
+    /// latch, and a cleared latch reads the same `false` an absent one does, so
+    /// "absent" and "present and clear" are one answer here whatever put the
+    /// entry there — a lookup that never engaged included. Reading
     /// therefore does not insert — a monitor that polls every owner it sees
     /// would otherwise grow the map with entries for owners that never
     /// recover.
