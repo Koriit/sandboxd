@@ -13757,7 +13757,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 2b/2c: limactl + docker CLI presence is implicitly validated when
         // ensure_ready() (step 4) calls limactl — any missing binary will produce
-        // a clear error there. Explicit version checks are deferred to M21-S4.
+        // a clear error there. Startup compares no versions; the limactl floor
+        // is enforced outside it — `sandbox doctor` checks MIN_LIMA_VERSION,
+        // and the gateway template declares it as `minimumLimaVersion`.
 
         // ---------------------------------------------------------------------------
         // Count running Lima sessions before pool construction so the resize
@@ -14389,7 +14391,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (both are post-reconcile, both are startup-only).
         //
         // Enumerates operator uids from the daemon-owned FS tree (not from
-        // session rows — that is the [L-1] gap `reconcile` leaves open) and
+        // session rows — an operator whose sessions were all deleted has no
+        // row left to enumerate, which is the gap `reconcile` leaves open) and
         // removes `sandbox-{id}` VMs whose session id is absent from the live
         // set. The owner marker (`sandboxd-owner`) file is consulted so a
         // shared-LIMA_HOME edge case doesn't cause cross-daemon reaping.

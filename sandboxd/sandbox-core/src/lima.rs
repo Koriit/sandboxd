@@ -286,7 +286,7 @@ fn daemon_lima_root() -> PathBuf {
 /// `{state_root}/{daemon_uid}/` — any immediate numeric subdir that also
 /// contains a `lima/` child is an operator uid.
 ///
-/// This is the resolution for the [L-1] gap in `reconcile()`: `reconcile`
+/// This is the resolution for a gap in `reconcile()`: `reconcile`
 /// only enumerates op_uids from session rows, missing operators whose sessions
 /// have all been deleted. This function discovers op_uids from the filesystem
 /// regardless of session-row state, closing the orphan-VM leak.
@@ -607,8 +607,8 @@ pub fn reap_lima_orphans_inner(
 /// Enumerate and reap orphaned Lima VMs at daemon startup.
 ///
 /// This runs AFTER `reconcile()` (which is state-only) and parallel to
-/// `reap_orphans` (the Docker reaper). It closes the [L-1] gap:
-/// `reconcile` only enumerates op_uids from session rows, so operators
+/// `reap_orphans` (the Docker reaper). It closes the gap `reconcile` leaves
+/// open: `reconcile` only enumerates op_uids from session rows, so operators
 /// whose last session was deleted never have their VMs cleaned up.
 ///
 /// Algorithm:
@@ -7169,7 +7169,8 @@ mod tests {
     }
 
     /// An operator with NO live session rows in the DB must still have its VMs
-    /// enumerated — this is the [L-1] gap fix. The test passes op_uid 1002
+    /// enumerated — the case an op_uid list built from session rows misses,
+    /// and the reason this one is built from the disk. The test passes op_uid 1002
     /// (an operator whose only VM is orphaned and has no session rows) and
     /// verifies the orphan IS reaped.
     #[test]
