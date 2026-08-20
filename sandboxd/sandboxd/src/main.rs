@@ -13327,6 +13327,14 @@ fn gateway_lima_retry_delay() -> Duration {
 
 /// The longest the monitor waits between attempts at a recovery that keeps
 /// failing.
+///
+/// Read [`gateway_lima_retry_backoff`] before changing it. Lowering this makes
+/// the monitor force-stop and restart the gateway VM more often against a
+/// fault that is not clearing, and each attempt takes every gateway container
+/// on that VM down with it. Raising it leaves the sessions of a failed pass
+/// waiting longer for their containers to be rebuilt — the window
+/// [`gateway_lima_monitor`] describes. The figure is a judgement between those
+/// two costs, not a measured optimum.
 #[cfg(target_os = "macos")]
 const GATEWAY_LIMA_MAX_RETRY_DELAY: Duration = Duration::from_secs(600);
 
