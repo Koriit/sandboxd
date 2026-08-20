@@ -13177,6 +13177,41 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
 }
 
 // ---------------------------------------------------------------------------
+// Startup orphan-reaper input
+// ---------------------------------------------------------------------------
+
+/// The live-session set the startup reapers classify against, or `None` when
+/// the session list could not be read.
+///
+/// A reaper deletes every resource it enumerates whose session id is absent
+/// from this set, which makes an unreadable list and an empty one opposite
+/// inputs sharing one shape. Empty is an answer — no session exists — and
+/// sweeping on it removes everything the passes find, correctly. Unreadable is
+/// no answer, and sweeping on it removes exactly the same things while the
+/// store may be full of live rows. One `HashSet::new()` separates the two, and
+/// that substitution is what this block shipped with first.
+///
+/// Hence a function, and hence a `Result` argument rather than the store: this
+/// choice is the one thing between a failed read and deleting every sandbox on
+/// the host, and inline in `main` nothing could test it. `None` means the
+/// passes do not run at all; a caller that turns it back into an empty set
+/// restores the original defect.
+fn live_session_ids_for_reapers(
+    listed: Result<Vec<Session>, SandboxError>,
+) -> Option<HashSet<SessionId>> {
+    match listed {
+        Ok(sessions) => Some(sessions.into_iter().map(|s| s.id).collect()),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "orphan reaper: failed to list sessions; skipping reaper pass"
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -14277,20 +14312,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // session look like an orphan. Recovery narrows its session list for
     // reasons that belong to recovery; a reaper must not.
     //
-    // An unreadable session list is not an empty one. Handing an empty set to
-    // a reaper says every session that exists has no row, which reaps all of
-    // them — so a failed read skips the pass, as the log below has always
-    // said it does.
-    let live_session_ids: Option<HashSet<SessionId>> = match store.list_sessions_unfiltered() {
-        Ok(sessions) => Some(sessions.into_iter().map(|s| s.id).collect()),
-        Err(e) => {
-            warn!(
-                error = %e,
-                "orphan reaper: failed to list sessions; skipping reaper pass"
-            );
-            None
-        }
-    };
+    // An unreadable session list is not an empty one, and `None` rather than
+    // an empty set is how that is said here — see
+    // `live_session_ids_for_reapers`, which owns the distinction.
+    let live_session_ids = live_session_ids_for_reapers(store.list_sessions_unfiltered());
 
     if let Some(live_session_ids) = live_session_ids {
         // Which operators a pass can act for is a question about reach, and
@@ -14725,6 +14750,58 @@ mod tests {
     fn error_body(err: SandboxError) -> (StatusCode, ApiError) {
         let (status, Json(body)) = error_response(err);
         (status, body)
+    }
+
+    // -----------------------------------------------------------------------
+    // live_session_ids_for_reapers — what the startup reapers classify against.
+    //
+    // These assert on which variant comes back, never on the size of the set
+    // inside it. A skipped pass and a pass swept against an empty set leave
+    // the same end state in the fake, and only one of them is correct after a
+    // failed read, so end state is the one thing that cannot decide this.
+    // -----------------------------------------------------------------------
+
+    /// A read that failed hands the reapers nothing to sweep against.
+    ///
+    /// This is the assertion the original defect would have failed: it
+    /// returned an empty set, and every downstream pass then treated a store
+    /// full of live sessions as a host full of orphans.
+    #[test]
+    fn an_unreadable_session_list_yields_no_live_set() {
+        let listed = Err(SandboxError::Internal("lock poisoned".into()));
+
+        assert!(
+            live_session_ids_for_reapers(listed).is_none(),
+            "a failed session read must skip the reapers, not sweep them against an empty set"
+        );
+    }
+
+    /// A store that really holds no session is an answer, and reaping on it is
+    /// correct. Without this the test above is satisfied by a function that
+    /// returns `None` for every input and never reaps anything.
+    #[test]
+    fn an_empty_session_list_yields_an_empty_live_set() {
+        let live = live_session_ids_for_reapers(Ok(Vec::new()))
+            .expect("an empty store is an answer: no session exists");
+
+        assert!(
+            live.is_empty(),
+            "no rows read means no session ids to protect"
+        );
+    }
+
+    /// The live set is the ids of the rows that were read — pinning that the
+    /// `Ok` arm carries the rows through rather than merely being non-`None`.
+    #[test]
+    fn a_read_session_list_yields_its_session_ids() {
+        let a = Session::new(Some("a".into()));
+        let b = Session::new(Some("b".into()));
+        let expected: HashSet<SessionId> = [a.id, b.id].into_iter().collect();
+
+        let live =
+            live_session_ids_for_reapers(Ok(vec![a, b])).expect("a successful read is an answer");
+
+        assert_eq!(live, expected);
     }
 
     // -----------------------------------------------------------------------
