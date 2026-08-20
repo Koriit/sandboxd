@@ -7,8 +7,10 @@
 //!
 //! # Pieces
 //!
-//! - [`GatewayRecoveringGuard`] — RAII latch guard; clears `gateway_recovering`
-//!   on drop so all return paths (including panics) release the latch.
+//! - [`GatewayRecoveringGuard`] — RAII latch guard; clears the latch it
+//!   engaged on drop so all return paths (including panics) release it.
+//! - [`GatewayRecoveryLatches`] — one such latch per gateway owner, so a
+//!   recovery of one owner's gateway is invisible to readers of another's.
 //! - [`sessions_to_recover`] — pure filter: which sessions a gateway-Lima
 //!   recovery must re-create (Running + Lima backend only).
 //! - [`run_bounded_recovery`] — bounded-concurrency fill/drain loop with
@@ -36,7 +38,11 @@ use crate::store::SessionStore;
 // GatewayRecoveringGuard
 // ---------------------------------------------------------------------------
 
-/// RAII guard that clears `gateway_recovering` on drop.
+/// RAII guard that clears on drop the one latch it was engaged on.
+///
+/// Which latch that is comes from the caller: the daemon pulls an owner's out
+/// of [`GatewayRecoveryLatches`], so engaging a guard says "this owner's
+/// gateway is recovering" and says nothing about anyone else's.
 ///
 /// Used by `recover_gateway_lima` so that the latch is released on all return
 /// paths, including early returns and async cancellation (tokio drop). Defined
@@ -61,6 +67,103 @@ impl GatewayRecoveringGuard {
 impl Drop for GatewayRecoveringGuard {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GatewayRecoveryLatches
+// ---------------------------------------------------------------------------
+
+/// One recovery latch per gateway owner.
+///
+/// A single flag is the right shape for one gateway and the wrong one for
+/// several: while it is held, every reader is told a recovery is running,
+/// including readers whose gateway is untouched and healthy. Holding one
+/// owner's flag would suppress per-session work on every other owner's
+/// gateway for the length of a recovery.
+///
+/// The latch itself is unchanged — each entry is the same `Arc<AtomicBool>`
+/// [`GatewayRecoveringGuard`] engages and clears, so the release-on-every-path
+/// property comes along untouched. What changes is that there is one per
+/// owner rather than one for the process.
+///
+/// # Keys are gateway owners, not operators
+///
+/// Callers collapse an operator uid through
+/// [`crate::gateway_lima::gateway_owner_uid`] before looking a latch up.
+/// While per-operator gateways are off every operator collapses onto the
+/// daemon's own uid, so the map holds a single entry that every reader and
+/// the one writer share — the single flag, spelled as a map of one.
+///
+/// # Locking
+///
+/// One `Mutex<HashMap<u32, _>>`, held across a lookup or an insert and never
+/// across an await, with the map growing monotonically — the discipline
+/// [`crate::gateway_lima_registry::GatewayLimaManagerRegistry`] uses. Nothing
+/// is removed on release because a released latch and an absent one say the
+/// same thing, and an entry is one `Arc<AtomicBool>`.
+pub struct GatewayRecoveryLatches {
+    by_owner: std::sync::Mutex<HashMap<u32, Arc<AtomicBool>>>,
+}
+
+impl GatewayRecoveryLatches {
+    /// An empty set of latches: nobody is recovering.
+    pub fn new() -> Self {
+        Self {
+            by_owner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The latch for `owner_uid`, creating a cleared one on first lookup.
+    ///
+    /// The returned `Arc` is stable for the process lifetime: every lookup for
+    /// an owner yields the same latch, which is what makes a guard engaged on
+    /// one of them visible through the others. Handing back a fresh
+    /// `AtomicBool` would hand back a latch nobody else can observe.
+    ///
+    /// A poisoned lock is recovered rather than propagated, for the reason
+    /// `GatewayLimaManagerRegistry::get_or_create` gives: the values are
+    /// `Arc`s inserted whole, so a panic elsewhere cannot leave the map in a
+    /// state that makes a later lookup wrong, and refusing every gateway
+    /// recovery for the rest of the process is the worse answer.
+    pub fn for_owner(&self, owner_uid: u32) -> Arc<AtomicBool> {
+        let mut by_owner = self.by_owner.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            by_owner
+                .entry(owner_uid)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+        )
+    }
+
+    /// Whether a recovery is in flight for `owner_uid`.
+    ///
+    /// An owner with no entry is not recovering: an entry only ever appears
+    /// because someone asked for the latch they were about to engage, so
+    /// "absent" and "present and clear" describe the same state. Reading
+    /// therefore does not insert — a monitor that polls every owner it sees
+    /// would otherwise grow the map with entries for owners that never
+    /// recover.
+    pub fn is_recovering(&self, owner_uid: u32) -> bool {
+        self.by_owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&owner_uid)
+            .is_some_and(|latch| latch.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Number of owners with a latch. Exposed for tests.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+}
+
+impl Default for GatewayRecoveryLatches {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -236,7 +339,9 @@ impl GatewayRecoveryDeps for Arc<SessionStore> {
 /// - `deps` — store operations: list sessions, get network info, mark error.
 /// - `networking_status` — transient in-memory health map; source of truth
 ///   for the Degraded / Recovering / Healthy transitions.
-/// - `latch` — daemon-wide `gateway_recovering` flag.
+/// - `latch` — the recovering flag for the gateway being restarted, which the
+///   caller takes from [`GatewayRecoveryLatches`] under its owner's uid. Held
+///   for the whole run and released however the run ends.
 /// - `restart_gateway` — async thunk that restarts the Lima instance.
 ///   Returns `Ok(())` on success, `Err(msg)` on failure.
 /// - `per_session_recover` — per-session gateway re-create (teardown + setup +
@@ -841,6 +946,71 @@ mod tests {
             !latch.load(Ordering::SeqCst),
             "latch must be released on the panic-unwind path"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // GatewayRecoveryLatches (one latch per gateway owner)
+    // -----------------------------------------------------------------------
+
+    /// The defect the map exists to remove: one owner's recovery must leave
+    /// every other owner's latch clear, so a monitor reading for a healthy
+    /// gateway is not told to stand down.
+    #[test]
+    fn engaging_one_owners_latch_leaves_another_owners_clear() {
+        let latches = GatewayRecoveryLatches::new();
+
+        let _guard = GatewayRecoveringGuard::engage(&latches.for_owner(1001));
+
+        assert!(latches.is_recovering(1001));
+        assert!(
+            !latches.is_recovering(1002),
+            "a recovery of 1001's gateway must not report 1002's as recovering"
+        );
+    }
+
+    /// Every lookup for an owner yields the same latch. Without this the
+    /// writer would engage one `AtomicBool` and the reader would poll a
+    /// different one, and the reader would never see a recovery at all.
+    #[test]
+    fn an_owner_gets_the_same_latch_on_every_lookup() {
+        let latches = GatewayRecoveryLatches::new();
+
+        assert!(Arc::ptr_eq(
+            &latches.for_owner(1001),
+            &latches.for_owner(1001)
+        ));
+        assert!(!Arc::ptr_eq(
+            &latches.for_owner(1001),
+            &latches.for_owner(1002)
+        ));
+    }
+
+    /// Releasing one owner's recovery does not release another's.
+    #[test]
+    fn dropping_one_owners_guard_leaves_another_owner_recovering() {
+        let latches = GatewayRecoveryLatches::new();
+        let _held = GatewayRecoveringGuard::engage(&latches.for_owner(1002));
+
+        {
+            let _transient = GatewayRecoveringGuard::engage(&latches.for_owner(1001));
+        }
+
+        assert!(!latches.is_recovering(1001));
+        assert!(
+            latches.is_recovering(1002),
+            "1001's guard dropping must not clear the latch 1002 still holds"
+        );
+    }
+
+    /// An owner nobody has recovered is not recovering, and asking does not
+    /// give them a latch — a monitor polling per session must not grow the map
+    /// with an entry per owner it happens to see.
+    #[test]
+    fn an_unknown_owner_is_not_recovering_and_is_not_recorded() {
+        let latches = GatewayRecoveryLatches::new();
+
+        assert!(!latches.is_recovering(1001));
+        assert_eq!(latches.len(), 0);
     }
 
     /// End-to-end over the two seams together: engage the guard, drive a

@@ -1401,18 +1401,26 @@ struct AppState {
     #[cfg(target_os = "macos")]
     networking_status: Arc<tokio::sync::Mutex<HashMap<SessionId, NetworkingStatus>>>,
 
-    /// macOS only: coarse latch held while the gateway Lima instance is being
-    /// crash-recovered by `recover_gateway_lima`.
+    /// macOS only: one latch per gateway owner, each held while that owner's
+    /// gateway Lima instance is being crash-recovered by
+    /// `recover_gateway_lima`.
     ///
-    /// The per-session `gateway_monitor` reads this flag and skips per-session
-    /// gateway container re-creates while it is set — the instance-level
-    /// recovery orchestrator holds exclusive responsibility during the window.
-    /// Modelled on `sessions_stopping`: set before recovery begins, cleared in
-    /// a defer-guard so a panic still releases the latch.
+    /// The per-session `gateway_monitor` reads the latch for the gateway it is
+    /// about to act on and skips per-session gateway container re-creates while
+    /// it is set — the instance-level recovery orchestrator holds exclusive
+    /// responsibility during that window. Modelled on `sessions_stopping`: set
+    /// before recovery begins, cleared in a defer-guard so a panic still
+    /// releases the latch.
+    ///
+    /// Keyed per owner rather than held as one process-wide flag so a recovery
+    /// of one owner's gateway does not stand the monitor down on gateways that
+    /// are untouched and healthy. While per-operator gateways are off there is
+    /// one owner, so the map holds one entry and behaves as the single flag it
+    /// replaces.
     ///
     /// Not accessed on Linux (cfg-gated).
     #[cfg(target_os = "macos")]
-    gateway_recovering: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    gateway_recovering: Arc<sandbox_core::GatewayRecoveryLatches>,
 
     /// macOS only: per-operator agent broker registry.
     ///
@@ -12482,10 +12490,19 @@ async fn gateway_monitor(state: Arc<AppState>) {
             // macOS only: while the gateway Lima instance is being recovered by
             // `recover_gateway_lima`, skip per-session re-creates — the instance
             // monitor holds exclusive recovery responsibility during that window.
+            //
+            // The owner asked about is the daemon's own because the gateway
+            // this loop acts on is the daemon's own: every re-create below
+            // runs over `state.docker`, which names the daemon's uid. When
+            // that route becomes per-session, the key has to be derived from
+            // whatever the route is derived from, and the two have to move
+            // together — a key naming one owner while the work lands on
+            // another's gateway would skip the wrong sessions and re-create
+            // containers a recovery is rebuilding.
             #[cfg(target_os = "macos")]
             if state
                 .gateway_recovering
-                .load(std::sync::atomic::Ordering::Relaxed)
+                .is_recovering(sandbox_core::gateway_owner_uid(state.daemon_uid))
             {
                 debug!(
                     session_id = %session.id,
@@ -12964,7 +12981,12 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
     sandbox_core::run_gateway_recovery(
         &store,
         Arc::clone(&state.networking_status),
-        Arc::clone(&state.gateway_recovering),
+        // The gateway restarted below is `state.gateway_lima_manager`'s — the
+        // daemon's own — so the daemon's is the latch this recovery holds, and
+        // the one the monitor's matching read polls.
+        state
+            .gateway_recovering
+            .for_owner(sandbox_core::gateway_owner_uid(state.daemon_uid)),
         // restart_gateway: force-stop → start → wait for Docker readiness (blocking).
         // Re-verifying the slot NICs and re-establishing the egress bridge are
         // performed inside `restart_instance_for_recovery`. The slot set is read
@@ -14446,7 +14468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         #[cfg(target_os = "macos")]
-        gateway_recovering: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        gateway_recovering: Arc::new(sandbox_core::GatewayRecoveryLatches::new()),
         #[cfg(target_os = "macos")]
         agent_registry: agent_registry.clone(),
     });
