@@ -52,6 +52,7 @@ pub mod policy_distributor;
 pub mod process;
 pub mod qmp;
 pub mod session;
+pub mod session_operator;
 pub mod ssh;
 pub mod store;
 /// Test-only helpers shared across `sandbox-core`'s integration tests
@@ -135,10 +136,10 @@ pub use gateway_lima::{
     EGRESS_BRIDGE_NAME, GATEWAY_INSTANCE_NAME, GatewayLimaManager, IpLinkEntry, MIN_LIMA_VERSION,
     NicMap, PER_OPERATOR_GATEWAY_ENV, PoolResizeDecision, UBUNTU_NOBLE_ARM64_URL,
     VMNET_LAUNCH_DAEMONS_DIR, count_reachable_slot_sockets, count_vmnet_plists, decide_pool_resize,
-    discover_nics_from_ip_json, gateway_instance_name, generate_gateway_eth0_nft_policy,
-    generate_gateway_template, nic_from_record_or_map, nic_from_verified_map,
-    observe_vmnet_daemon_set, per_operator_gateway_enabled, slot_for_persisted_session,
-    slot_interface_name,
+    discover_nics_from_ip_json, gateway_instance_name, gateway_owner_uid,
+    generate_gateway_eth0_nft_policy, generate_gateway_template, nic_from_record_or_map,
+    nic_from_verified_map, observe_vmnet_daemon_set, per_operator_gateway_enabled,
+    slot_for_persisted_session, slot_interface_name,
 };
 #[cfg(target_os = "macos")]
 pub use gateway_lima_registry::GatewayLimaManagerRegistry;
@@ -188,6 +189,7 @@ pub use session::{
     Session, SessionConfig, SessionId, SessionRootlessDocker, SessionState, WorkspaceMode,
     WorkspaceModeKind, WorkspaceSecurityModel,
 };
+pub use session_operator::{SessionOperator, UnresolvedSessionOperator, resolve_session_operator};
 pub use ssh::{SSH_CONFIG_IDENTITY_FILE_PLACEHOLDER, SshKeypair, render_ssh_config_block};
 pub use store::{OrphanInfo, ResolveOutcome, SessionStore};
 // Only the daemon-side users-conf surface is re-exported at the crate

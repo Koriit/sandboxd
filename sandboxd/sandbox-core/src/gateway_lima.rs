@@ -311,6 +311,59 @@ fn gateway_instance_name_in_mode(owner_uid: u32, per_operator: bool) -> String {
     }
 }
 
+/// The uid that owns the gateway VM serving `operator_uid`.
+///
+/// With [`PER_OPERATOR_GATEWAY_ENV`] off — the default — every operator is
+/// served by the one gateway the daemon owns, so every operator uid collapses
+/// to the daemon's own. With the switch on each operator owns theirs and this
+/// is the identity.
+///
+/// It exists for the reason [`gateway_instance_name`] accepts an owner uid it
+/// then ignores: a site that wants the gateway for the operator in its hand
+/// can be written once, in the form it will keep, while the switch is still
+/// off. The difference is which half of a gateway's identity each one
+/// collapses, and this is the half that actually diverges. A name is the same
+/// string for every uid while the switch is off, so a site that resolved a
+/// gateway by handing a raw operator uid to
+/// [`crate::gateway_lima_registry::GatewayLimaManagerRegistry::get_or_create`]
+/// would still get the right *name* — and with it the wrong LIMA_HOME, a
+/// forwarded Docker socket path nothing creates, and a Docker route aimed at
+/// that operator's agent rather than at the daemon itself. None of those three
+/// announce themselves at the point of the mistake: the name matches, so what
+/// surfaces later is a socket that was never connected to.
+///
+/// Resolving through here also keeps the switch in one more function instead
+/// of at every site that resolves a gateway, which is what makes switch-off
+/// identity a property a single test can pin rather than an invariant
+/// re-established by hand at each of them.
+///
+/// # Why the daemon's uid is not a parameter
+///
+/// It comes from `getuid()`, as the daemon segment of
+/// [`crate::lima::operator_lima_home`]'s path does. A caller-supplied "daemon
+/// uid" would be one more value a wiring site could get wrong, and a wiring
+/// site getting the gateway's owner wrong is the whole of what this function
+/// removes.
+#[cfg(target_os = "macos")]
+pub fn gateway_owner_uid(operator_uid: u32) -> u32 {
+    gateway_owner_uid_in_mode(operator_uid, per_operator_gateway_enabled())
+}
+
+/// [`gateway_owner_uid`] with the mode supplied rather than read from the
+/// environment.
+///
+/// Split out for the same reason [`gateway_instance_name_in_mode`] is: both
+/// modes are reachable from a test without a process-global variable deciding
+/// which one runs.
+#[cfg(target_os = "macos")]
+fn gateway_owner_uid_in_mode(operator_uid: u32, per_operator: bool) -> u32 {
+    if per_operator {
+        operator_uid
+    } else {
+        nix::unistd::Uid::current().as_raw()
+    }
+}
+
 /// Whether `name` is a gateway Lima instance, in either mode.
 ///
 /// Deliberately independent of the switch. A host that has had per-operator
@@ -3711,6 +3764,185 @@ mod tests {
         }
     }
 
+    // -- Which uid owns an operator's gateway ---------------------------------
+
+    /// With the switch off every operator is served by the daemon's own
+    /// gateway; with it on each operator is served by their own.
+    ///
+    /// The off half is asserted twice over, because the interesting property
+    /// is not "it returned the daemon's uid" but "it did not depend on the
+    /// operator": every uid in the sweep must produce the *same* answer, and
+    /// that answer must be the uid the daemon builds its own gateway with.
+    ///
+    /// The uid the env-driven half asks about is derived from the running
+    /// uid rather than written down, because on a host whose uid happens to
+    /// equal the literal a test picked, "collapses to the daemon" and "is the
+    /// operator's own" are the same number and both directions pass
+    /// regardless of what the function does.
+    ///
+    /// This test mutates the process environment. `cargo nextest` — the runner
+    /// this workspace uses — gives each test its own process, which is what
+    /// keeps that from racing the crate's other env-reading tests.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_operator_shares_the_daemons_gateway_until_the_switch_is_on() {
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        for uid in NAMING_UIDS {
+            assert_eq!(
+                gateway_owner_uid_in_mode(uid, false),
+                daemon_uid,
+                "with per-operator gateways off, operator uid {uid} must be served by \
+                 the daemon's own gateway"
+            );
+            assert_eq!(
+                gateway_owner_uid_in_mode(uid, true),
+                uid,
+                "with per-operator gateways on, operator uid {uid} must own its gateway"
+            );
+        }
+
+        // Through the real entry point, on an operator uid that cannot
+        // coincide with the daemon's.
+        let operator_uid = daemon_uid.wrapping_add(1);
+        assert_ne!(operator_uid, daemon_uid);
+
+        let prior = std::env::var_os(PER_OPERATOR_GATEWAY_ENV);
+        unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) };
+        assert_eq!(
+            gateway_owner_uid(operator_uid),
+            daemon_uid,
+            "an absent {PER_OPERATOR_GATEWAY_ENV} must leave the daemon owning every \
+             operator's gateway"
+        );
+
+        unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, "1") };
+        assert_eq!(
+            gateway_owner_uid(operator_uid),
+            operator_uid,
+            "{PER_OPERATOR_GATEWAY_ENV}=1 must give the operator their own gateway"
+        );
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, value) },
+            None => unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) },
+        }
+    }
+
+    /// A manager composed the way the daemon composes one, for `owner_uid`.
+    ///
+    /// Every seam is aimed at `owner_uid` and every seam is inert: this is
+    /// about which uid the four derived values carry, and a manager that has
+    /// only been constructed has issued no operation.
+    #[cfg(target_os = "macos")]
+    fn gateway_manager_for(owner_uid: u32) -> GatewayLimaManager {
+        GatewayLimaManager::new(
+            crate::lima::operator_lima_home(owner_uid),
+            Arc::new(UnusedLimaExecutor),
+            DockerRoute::Vm {
+                op_uid: owner_uid,
+                executor: Arc::new(UnusedDockerExecutor),
+            },
+            InVmRoute::new(owner_uid, RecordingInVmExecutor::ok()),
+            owner_uid,
+        )
+    }
+
+    /// The uid a Docker route runs its ops as.
+    #[cfg(target_os = "macos")]
+    fn docker_route_uid(route: &DockerRoute) -> Option<u32> {
+        match route {
+            DockerRoute::Host => None,
+            DockerRoute::Vm { op_uid, .. } => Some(*op_uid),
+        }
+    }
+
+    /// With the switch off, a registry lookup made through
+    /// [`gateway_owner_uid`] is the daemon's own gateway on every axis of its
+    /// identity — and a lookup made with the raw operator uid is not.
+    ///
+    /// The name is the one axis that agrees either way, which is exactly what
+    /// makes the mistake invisible: a site that skipped the accessor would
+    /// name the VM the daemon runs while addressing a LIMA_HOME the daemon
+    /// never populated, a forwarded Docker socket nothing creates, and a
+    /// Docker route that goes out to that operator's agent. So the identity is
+    /// asserted on all four, and the second half asserts the three that
+    /// diverge really do — without it, a builder that had stopped reading its
+    /// owner uid would satisfy the first half and make the whole test
+    /// vacuous.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_gateway_resolved_through_the_owner_accessor_is_the_daemons_own() {
+        use crate::gateway_lima_registry::GatewayLimaManagerRegistry;
+
+        let prior = std::env::var_os(PER_OPERATOR_GATEWAY_ENV);
+        unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) };
+
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+        let operator_uid = daemon_uid.wrapping_add(1);
+        assert_ne!(operator_uid, daemon_uid);
+
+        let daemons_own = gateway_manager_for(daemon_uid);
+        let registry = GatewayLimaManagerRegistry::new(gateway_manager_for);
+
+        let resolved = registry.get_or_create(gateway_owner_uid(operator_uid));
+        assert_eq!(
+            resolved.instance_name(),
+            daemons_own.instance_name(),
+            "the resolved gateway names a different Lima instance"
+        );
+        assert_eq!(
+            resolved.daemon_lima_home, daemons_own.daemon_lima_home,
+            "the resolved gateway lives in a different LIMA_HOME"
+        );
+        assert_eq!(
+            resolved.gateway_docker_socket(),
+            daemons_own.gateway_docker_socket(),
+            "the resolved gateway forwards a different Docker socket"
+        );
+        assert_eq!(
+            docker_route_uid(&resolved.docker),
+            docker_route_uid(&daemons_own.docker),
+            "the resolved gateway runs its Docker ops as a different uid"
+        );
+        assert_eq!(
+            resolved.in_vm.op_uid(),
+            daemons_own.in_vm.op_uid(),
+            "the resolved gateway runs its in-VM ops as a different uid"
+        );
+        assert_eq!(
+            resolved.owner_uid, daemons_own.owner_uid,
+            "the resolved gateway names a different owner"
+        );
+
+        let unresolved = registry.get_or_create(operator_uid);
+        assert_eq!(
+            unresolved.instance_name(),
+            daemons_own.instance_name(),
+            "the name is supposed to agree even without the accessor — if it stopped, \
+             this test no longer covers the miss it was written for"
+        );
+        assert_ne!(
+            unresolved.daemon_lima_home, daemons_own.daemon_lima_home,
+            "skipping the accessor is supposed to move the LIMA_HOME"
+        );
+        assert_ne!(
+            unresolved.gateway_docker_socket(),
+            daemons_own.gateway_docker_socket(),
+            "skipping the accessor is supposed to move the forwarded Docker socket"
+        );
+        assert_ne!(
+            docker_route_uid(&unresolved.docker),
+            docker_route_uid(&daemons_own.docker),
+            "skipping the accessor is supposed to change the Docker route's uid"
+        );
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, value) },
+            None => unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) },
+        }
+    }
+
     /// No gateway instance name, in either mode, can be mistaken for a session
     /// VM by the Lima orphan reaper.
     ///
@@ -4338,6 +4570,36 @@ mod tests {
             _vm: &str,
         ) -> Result<Box<dyn crate::backend::AsyncReadWrite + Send + Unpin>, SandboxError> {
             unreachable!("installing a container route opens no guest stream")
+        }
+    }
+
+    /// The [`DockerRoute::Vm`] counterpart of [`UnusedLimaExecutor`], for tests
+    /// that care which uid a route carries rather than what it runs. A manager
+    /// that has only been constructed has issued no Docker op, so panicking
+    /// makes an accidental one a failure here rather than a shell-out from a
+    /// unit test.
+    #[cfg(target_os = "macos")]
+    struct UnusedDockerExecutor;
+
+    #[cfg(target_os = "macos")]
+    #[async_trait::async_trait]
+    impl crate::docker::DockerExecutor for UnusedDockerExecutor {
+        fn run(
+            &self,
+            _op_uid: u32,
+            _op: DockerOp,
+            _timeout: Duration,
+            label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            unreachable!("constructing a manager issues no docker op; got {label}")
+        }
+
+        async fn open_stream(
+            &self,
+            _op_uid: u32,
+            _stream: crate::docker::DockerStream,
+        ) -> Result<crate::docker::DockerStreamConn, SandboxError> {
+            unreachable!("constructing a manager opens no docker stream")
         }
     }
 
