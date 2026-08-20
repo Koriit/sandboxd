@@ -380,6 +380,12 @@ pub enum LimaVmDecision {
 ///    (shared-LIMA_HOME defense: a VM belonging to another daemon).
 /// 4. Otherwise (marker matches my_pool, or marker is absent for a legacy VM
 ///    within the daemon's own LIMA_HOME tree) → [`LimaVmDecision::Reap`].
+///
+/// These rules are not the whole of what survives a reap pass. The gateway VM
+/// is excluded by name in [`reap_lima_orphans_inner`], before this function is
+/// consulted, because it is not a session VM and has no session id to classify
+/// by. Reading the rules above as the complete account would put a
+/// `Reap` in front of the one VM every running session's egress depends on.
 pub fn decide_lima_vm(
     session_id: Option<&crate::session::SessionId>,
     marker: Option<&str>,
@@ -484,6 +490,25 @@ impl LimaReaperOps for RegistryLimaReaperOps<'_> {
     }
 }
 
+/// Whether a Lima instance name belongs to a gateway VM.
+///
+/// The reaper is platform-neutral and the gateway VM is not: it exists only on
+/// macOS, where the gateway runs inside a Lima instance instead of a container
+/// on the host. So the question is answered by the module that owns the name
+/// where there is one to own, and answered `false` where no gateway instance
+/// can exist. That `false` is a statement about the platform, not a default —
+/// a Linux host has no gateway Lima instance for this to be wrong about.
+#[cfg(target_os = "macos")]
+fn is_gateway_instance(name: &str) -> bool {
+    crate::gateway_lima::is_gateway_instance_name(name)
+}
+
+/// See the macOS definition above; there is no gateway Lima instance here.
+#[cfg(not(target_os = "macos"))]
+fn is_gateway_instance(_name: &str) -> bool {
+    false
+}
+
 /// Core loop of the Lima orphan reaper, parametrised over injected I/O ops.
 ///
 /// Takes an explicit `op_uids` slice (the caller decides how to enumerate
@@ -506,6 +531,18 @@ pub fn reap_lima_orphans_inner(
         };
 
         for vm in &vms {
+            // The gateway VM is not a candidate. It is daemon infrastructure
+            // rather than a session VM: it carries no owner marker (nothing
+            // stamps one) and no session id (its name is not a session name),
+            // so every input `decide_lima_vm` classifies by is absent for it.
+            // Deleting it takes egress away from every running session on the
+            // host, so it is excluded here, by name, ahead of the classifier —
+            // not left to be protected by the shape of a name it happens not
+            // to have.
+            if is_gateway_instance(&vm.name) {
+                continue;
+            }
+
             // Only read the owner marker when we have a session_id.
             let marker = vm
                 .session_id
@@ -7088,6 +7125,70 @@ mod tests {
             deleted.iter().any(|(_, s)| s == SID_B),
             "SID_B must be deleted; deleted={deleted:?}"
         );
+    }
+
+    /// A gateway VM survives a pass that would otherwise delete it.
+    ///
+    /// **The fixture cannot occur in production, and that is deliberate.** It
+    /// pairs a gateway instance name with a session id, and nothing writes such
+    /// a VM: `list_vms` admits only `VM_NAME_PREFIX`-prefixed names, and a
+    /// gateway name has no 12-hex tail for `parse_session_id_from_name` to
+    /// return an id from. A real gateway VM therefore arrives here — if it
+    /// arrives at all — with every input the classifier reads absent. No
+    /// realistic input can make this test red.
+    ///
+    /// It is written anyway, because the alternative is that the gateway's
+    /// survival stays a by-product of two name schemes that were never
+    /// required to stay apart, with no test that fails when the exclusion is
+    /// removed. Pinning the schemes is a different assertion and already
+    /// exists, next to the names, as
+    /// `gateway_names_are_disjoint_from_the_session_vm_grammar`. This one
+    /// supplies the only input the exclusion can be observed on: a VM the
+    /// classifier rules `Reap` on, wearing the gateway's name.
+    ///
+    /// The session-named VM beside it is the control — same session-id shape,
+    /// same matching marker, same absence from the live set, differing only in
+    /// its name — and it is reaped in the same pass. Without it a green run
+    /// would be equally consistent with a pass that reaped nothing at all.
+    ///
+    /// macOS-gated because the gateway VM is. Off macOS the gateway is a
+    /// container on the host, no Lima instance is a gateway, and
+    /// `is_gateway_instance` answers `false` — so there the fixture is reaped,
+    /// correctly.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_gateway_vm_is_not_reaped_as_an_orphan() {
+        const GATEWAY_SID: &str = "a10000000010";
+        const CONTROL_SID: &str = "a20000000011";
+
+        // Both naming modes, spelled out: the exclusion is not supposed to
+        // consult the switch, so neither does the test.
+        for gateway_name in ["sandboxd-gateway", "sandboxd-gateway-501"] {
+            let fake = FakeLimaReaperOps::new()
+                .add_vm(1004, gateway_name, Some(GATEWAY_SID))
+                .add_vm(1004, &format!("sandbox-{CONTROL_SID}"), Some(CONTROL_SID))
+                .set_marker(1004, GATEWAY_SID, Some(MY_POOL))
+                .set_marker(1004, CONTROL_SID, Some(MY_POOL));
+
+            let live = test_live(&[]);
+            let report = reap_lima_orphans_inner(&[1004], &fake, &live, MY_POOL);
+
+            let deleted = fake.deleted_vms();
+            assert!(
+                !deleted.iter().any(|(_, s)| s == GATEWAY_SID),
+                "{gateway_name} was reaped as an orphan, taking egress away from \
+                 every running session; deleted={deleted:?}"
+            );
+            assert!(
+                deleted.iter().any(|(_, s)| s == CONTROL_SID),
+                "the control VM was not reaped either, so this pass proves nothing \
+                 about {gateway_name}; deleted={deleted:?}"
+            );
+            assert_eq!(
+                report.vms_reaped, 1,
+                "only the control VM is an orphan in this fixture"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

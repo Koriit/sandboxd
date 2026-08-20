@@ -11,6 +11,12 @@
 /// path of the `LimaExecutor` seam (i.e., `run_limactl_direct` in the daemon —
 /// no agent, no privilege pivot needed because the daemon already is `_sandboxd`).
 ///
+/// That is a description of the deployed arrangement, not of the manager.
+/// [`GatewayLimaManager`] is built with the uid that owns its instance, derives
+/// the instance name from that uid, and runs every op as it; the paragraph
+/// above holds because every owner uid currently derives the same name, not
+/// because the manager encodes the daemon anywhere.
+///
 /// ## Lifecycle (startup)
 ///
 /// `ensure_ready` drives the full gateway-init sequence described in
@@ -302,6 +308,30 @@ fn gateway_instance_name_in_mode(owner_uid: u32, per_operator: bool) -> String {
         format!("{GATEWAY_INSTANCE_NAME}-{owner_uid}")
     } else {
         GATEWAY_INSTANCE_NAME.to_string()
+    }
+}
+
+/// Whether `name` is a gateway Lima instance, in either mode.
+///
+/// Deliberately independent of the switch. A host that has had per-operator
+/// gateways turned on and then off again still has the suffixed instances on
+/// disk, and a predicate that answered from the *current* mode would stop
+/// recognising them at the moment the mode changed — which is precisely when a
+/// caller most needs to know what it is looking at. Recognising both costs
+/// nothing: the two forms are disjoint from every other instance name this
+/// daemon creates.
+///
+/// The suffix must parse as the `u32` an owner uid is, so the in-VM nft table
+/// name `sandboxd-gateway-eth0` — the other object that wears this prefix — is
+/// not mistaken for an instance.
+#[cfg(target_os = "macos")]
+pub fn is_gateway_instance_name(name: &str) -> bool {
+    match name.strip_prefix(GATEWAY_INSTANCE_NAME) {
+        None => false,
+        Some("") => true,
+        Some(suffix) => suffix
+            .strip_prefix('-')
+            .is_some_and(|owner| owner.parse::<u32>().is_ok()),
     }
 }
 
@@ -999,11 +1029,17 @@ table inet sandboxd-gateway-eth0 {
 // GatewayLimaManager
 // ---------------------------------------------------------------------------
 
-/// Manages the `sandboxd-gateway` Lima instance and its Docker infrastructure.
+/// Manages one gateway Lima instance and its Docker infrastructure.
 ///
-/// Constructed once at daemon startup (macOS only) with the `LimaExecutor`
-/// (for `limactl` ops via the daemon-uid degenerate path). It holds no pool and
-/// no slot set — the slot set is an argument to the calls that need one.
+/// Constructed with the `LimaExecutor` (for `limactl` ops) and the uid that
+/// owns the instance. It holds no pool and no slot set — the slot set is an
+/// argument to the calls that need one.
+///
+/// Every `limactl` op it issues names [`Self::instance_name`], which is derived
+/// once at construction from the owner uid. The manager never reads
+/// [`GATEWAY_INSTANCE_NAME`]: a manager that re-derived its own name per call
+/// would change which VM it operates on the moment the process environment
+/// changed underneath it, mid-lifecycle.
 ///
 /// After `ensure_ready` completes successfully:
 /// - `nic_map()` returns the verified slot→NIC mapping.
@@ -1011,17 +1047,21 @@ table inet sandboxd-gateway-eth0 {
 /// - The baseline `eth0` nft policy is in place.
 #[cfg(target_os = "macos")]
 pub struct GatewayLimaManager {
-    /// Daemon's LIMA_HOME: `/var/lib/sandboxd/<daemon-uid>/<daemon-uid>/lima/`.
+    /// LIMA_HOME the instance lives in:
+    /// `/var/lib/sandboxd/<daemon-uid>/<owner-uid>/lima/`.
     daemon_lima_home: PathBuf,
 
+    /// This manager's Lima instance name, from [`gateway_instance_name`].
+    instance_name: String,
+
     /// Derived path to the forwarded Docker socket:
-    /// `<daemon_lima_home>/sandboxd-gateway/gateway-docker.sock`
+    /// `<daemon_lima_home>/<instance_name>/gateway-docker.sock`
     gateway_docker_socket: PathBuf,
 
-    /// Daemon uid — passed as `op_uid` to the executor (degenerate path).
-    daemon_uid: u32,
+    /// Uid that owns the instance — passed as `op_uid` to the executor.
+    owner_uid: u32,
 
-    /// Operator-execution seam for `limactl` ops (all go via daemon_uid).
+    /// Operator-execution seam for `limactl` ops (all go via `owner_uid`).
     executor: Arc<dyn LimaExecutor>,
 
     /// Where this manager's `docker` operations against the gateway VM go.
@@ -1040,13 +1080,18 @@ pub struct GatewayLimaManager {
 impl GatewayLimaManager {
     /// Construct a new manager.
     ///
-    /// - `daemon_lima_home` — the daemon's LIMA_HOME root (e.g.
-    ///   `/var/lib/sandboxd/<daemon_uid>/<daemon_uid>/lima/`).
+    /// - `daemon_lima_home` — the LIMA_HOME the instance lives in (e.g.
+    ///   `/var/lib/sandboxd/<daemon_uid>/<owner_uid>/lima/`).
     /// - `executor` — the `LimaExecutor` implementation (on macOS this is
     ///   `AgentBrokerExecutor`; when `op_uid == daemon_uid` it routes to
     ///   `run_limactl_direct`).
-    /// - `daemon_uid` — the daemon's own uid; passed as `op_uid` on every
-    ///   `limactl` call so the executor takes the degenerate direct path.
+    /// - `owner_uid` — the uid that owns the instance; passed as `op_uid` on
+    ///   every `limactl` call, and the uid the instance name is derived from.
+    ///   When it is the daemon's own uid the executor takes the degenerate
+    ///   direct path.
+    ///
+    /// Pure: no filesystem, no process, no network. The name and the socket
+    /// path are computed here so they are fixed for the manager's lifetime.
     ///
     /// The manager holds **no** pool and no slot set. Which slots the gateway
     /// instance owns is supplied per call, by the caller, from the assignment
@@ -1058,20 +1103,30 @@ impl GatewayLimaManager {
         executor: Arc<dyn LimaExecutor>,
         docker: DockerRoute,
         in_vm: InVmRoute,
-        daemon_uid: u32,
+        owner_uid: u32,
     ) -> Self {
+        let instance_name = gateway_instance_name(owner_uid);
         let gateway_docker_socket = daemon_lima_home
-            .join(GATEWAY_INSTANCE_NAME)
+            .join(&instance_name)
             .join("gateway-docker.sock");
         Self {
             daemon_lima_home,
+            instance_name,
             gateway_docker_socket,
-            daemon_uid,
+            owner_uid,
             executor,
             docker,
             in_vm,
             nic_map: Mutex::new(None),
         }
+    }
+
+    /// The Lima instance name this manager operates on.
+    ///
+    /// Derived from the owner uid at construction. With per-operator gateways
+    /// off — the default — this is [`GATEWAY_INSTANCE_NAME`] for every owner.
+    pub fn instance_name(&self) -> &str {
+        &self.instance_name
     }
 
     /// Return the path to the forwarded Docker socket on the macOS host.
@@ -1220,7 +1275,9 @@ impl GatewayLimaManager {
             // The tarball is not yet in daemon_lima_home.  Check whether
             // install.sh staged it at the daemon base dir
             // (`{state_root}/{daemon_uid}/gateway-image.tar`), which is two
-            // levels above daemon_lima_home (`…/{daemon_uid}/{daemon_uid}/lima`).
+            // levels above daemon_lima_home (`…/{daemon_uid}/{owner_uid}/lima`)
+            // whichever uid owns the instance — the staged tarball is per
+            // daemon, not per owner.
             // If it is there, copy it into daemon_lima_home so that the path
             // the Docker-load code below expects is satisfied.
             let staged = self
@@ -1422,7 +1479,7 @@ impl GatewayLimaManager {
     /// Returns `"Running"`, `"Stopped"`, or `"None"` (instance absent).
     fn query_instance_state(&self) -> Result<String, SandboxError> {
         let output = self.executor.run(
-            self.daemon_uid,
+            self.owner_uid,
             LimaOp::ListJson,
             GATEWAY_LIST_TIMEOUT,
             "gateway: limactl list",
@@ -1447,7 +1504,7 @@ impl GatewayLimaManager {
                 Err(_) => continue,
             };
             let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-            if name == GATEWAY_INSTANCE_NAME {
+            if name == self.instance_name {
                 let status = obj
                     .get("status")
                     .and_then(|v| v.as_str())
@@ -1493,7 +1550,7 @@ impl GatewayLimaManager {
             ))
         })?;
 
-        let template_path = template_dir.join("sandboxd-gateway-tmpl.yaml");
+        let template_path = template_dir.join(format!("{}-tmpl.yaml", self.instance_name));
         std::fs::write(&template_path, &template_content).map_err(|e| {
             SandboxError::Internal(format!(
                 "gateway: failed to write template to {}: {e}",
@@ -1503,9 +1560,9 @@ impl GatewayLimaManager {
         info!(path = %template_path.display(), "gateway Lima template written");
 
         let result = self.executor.run(
-            self.daemon_uid,
+            self.owner_uid,
             LimaOp::Create {
-                vm: GATEWAY_INSTANCE_NAME,
+                vm: &self.instance_name,
                 yaml_path: &template_path,
                 // No per-operator owner marker for the gateway instance —
                 // it is daemon infrastructure, not tracked by the Lima orphan
@@ -1537,14 +1594,14 @@ impl GatewayLimaManager {
         Ok(())
     }
 
-    /// Run `limactl start sandboxd-gateway`.
+    /// Run `limactl start` on this manager's instance.
     fn start_instance(&self) -> Result<(), SandboxError> {
         let start_timeout_s = GATEWAY_START_TIMEOUT.as_secs() as u32;
 
         let output = self.executor.run(
-            self.daemon_uid,
+            self.owner_uid,
             LimaOp::Start {
-                vm: GATEWAY_INSTANCE_NAME,
+                vm: &self.instance_name,
                 // The gateway instance NEVER uses the qemu-wrapper (restrict=on
                 // applies to sandbox VMs only; the gateway VM's eth0 is the
                 // sanctioned egress uplink). Pass an empty path to signal
@@ -1756,13 +1813,6 @@ impl GatewayLimaManager {
         info!("gateway Lima eth0 baseline nft policy applied");
         Ok(())
     }
-
-    /// The Lima instance name for the daemon-owned gateway VM.
-    ///
-    /// Exposed as an associated constant so daemon code that needs to name the
-    /// gateway instance can reference it without importing the module-level
-    /// constant directly.
-    pub const GATEWAY_INSTANCE_NAME: &'static str = GATEWAY_INSTANCE_NAME;
 
     /// Install a sandbox container's default route by running the provisioned
     /// `sandbox-route-helper` inside the gateway VM.
@@ -2069,9 +2119,9 @@ impl GatewayLimaManager {
     /// Called on clean daemon shutdown when no sessions are running.
     pub fn stop_instance(&self) -> Result<(), SandboxError> {
         let output = self.executor.run(
-            self.daemon_uid,
+            self.owner_uid,
             LimaOp::Stop {
-                vm: GATEWAY_INSTANCE_NAME,
+                vm: &self.instance_name,
                 force: false,
             },
             GATEWAY_STOP_TIMEOUT,
@@ -2245,9 +2295,9 @@ impl GatewayLimaManager {
     /// orchestrator can call this without needing to know the current state.
     pub fn force_stop_instance(&self) -> Result<(), SandboxError> {
         let output = self.executor.run(
-            self.daemon_uid,
+            self.owner_uid,
             LimaOp::Stop {
-                vm: GATEWAY_INSTANCE_NAME,
+                vm: &self.instance_name,
                 force: true,
             },
             GATEWAY_STOP_TIMEOUT,
@@ -2278,7 +2328,7 @@ impl GatewayLimaManager {
         )))
     }
 
-    /// Delete the gateway Lima instance (`limactl delete sandboxd-gateway`).
+    /// Delete the gateway Lima instance (`limactl delete <instance>`).
     ///
     /// Idempotent: "not found" and "no instance" errors are treated as success.
     /// Called by the pool-resize rebuild arm after `force_stop_instance` to
@@ -2287,9 +2337,9 @@ impl GatewayLimaManager {
     /// directory is still present.)
     pub fn delete_instance(&self) -> Result<(), SandboxError> {
         let output = self.executor.run(
-            self.daemon_uid,
+            self.owner_uid,
             LimaOp::Delete {
-                vm: GATEWAY_INSTANCE_NAME,
+                vm: &self.instance_name,
             },
             GATEWAY_STOP_TIMEOUT,
             "gateway: limactl delete",
@@ -3591,6 +3641,76 @@ mod tests {
         }
     }
 
+    /// A manager built for any owner uid, with the switch off.
+    ///
+    /// Uses the panicking `LimaExecutor` on purpose: construction is supposed
+    /// to be pure, so an executor that cannot be called without failing the
+    /// test is the assertion that it stays that way.
+    #[cfg(target_os = "macos")]
+    fn manager_owned_by(lima_home: &Path, owner_uid: u32) -> GatewayLimaManager {
+        GatewayLimaManager::new(
+            lima_home.to_path_buf(),
+            Arc::new(UnusedLimaExecutor),
+            DockerRoute::Host,
+            InVmRoute::new(owner_uid, RecordingInVmExecutor::ok()),
+            owner_uid,
+        )
+    }
+
+    /// With per-operator gateways off, a manager names the same instance and
+    /// forwards the same socket path as it did before it derived either.
+    ///
+    /// The manager now computes both from its owner uid, so "the switch is
+    /// off" stopped being a property of one constant and became a property of
+    /// every manager built from any uid — including the ones the registry will
+    /// build for operators who are not the daemon. Nothing downstream would
+    /// report a divergence: a manager naming an instance that does not exist
+    /// gets `limactl`'s ordinary "no such instance", and a socket forwarded to
+    /// a different path is simply never connected to.
+    ///
+    /// Both expected values are spelled out as literals rather than built from
+    /// [`GATEWAY_INSTANCE_NAME`], because the constant is one of the things
+    /// this is checking: a test that derived its expectation from it would
+    /// stay green if the constant itself moved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_manager_names_the_unsuffixed_instance_while_the_switch_is_off() {
+        let prior = std::env::var_os(PER_OPERATOR_GATEWAY_ENV);
+        unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) };
+
+        let lima_home = Path::new("/var/lib/sandboxd/60/60/lima");
+        for uid in NAMING_UIDS {
+            let mgr = manager_owned_by(lima_home, uid);
+            assert_eq!(
+                mgr.instance_name(),
+                "sandboxd-gateway",
+                "owner uid {uid} changed the instance name with the switch off"
+            );
+            assert_eq!(
+                mgr.gateway_docker_socket(),
+                lima_home.join("sandboxd-gateway/gateway-docker.sock"),
+                "owner uid {uid} moved the forwarded Docker socket with the switch off"
+            );
+        }
+
+        // With the switch on the same construction names the owner's instance
+        // and moves the socket under it. Without this half the equality above
+        // would also hold for a manager that had stopped reading its uid at
+        // all, which is the other way to make it true and the wrong one.
+        unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, "1") };
+        let mgr = manager_owned_by(lima_home, 501);
+        assert_eq!(mgr.instance_name(), "sandboxd-gateway-501");
+        assert_eq!(
+            mgr.gateway_docker_socket(),
+            lima_home.join("sandboxd-gateway-501/gateway-docker.sock")
+        );
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, value) },
+            None => unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) },
+        }
+    }
+
     /// No gateway instance name, in either mode, can be mistaken for a session
     /// VM by the Lima orphan reaper.
     ///
@@ -3629,16 +3749,68 @@ mod tests {
         }
     }
 
+    /// The predicate the Lima orphan reaper excludes on recognises every name
+    /// the generator can produce, in both modes.
+    ///
+    /// This is the link between the two: the reaper protects what this
+    /// predicate says is a gateway, and the generator decides what a gateway
+    /// is called. A name scheme that grew a form the predicate did not
+    /// recognise would leave that form unprotected, and nothing else in the
+    /// tree would notice — the exclusion would simply stop matching.
+    #[test]
+    fn every_generated_gateway_name_is_recognised_as_one() {
+        for per_operator in [false, true] {
+            for uid in NAMING_UIDS {
+                let name = gateway_instance_name_in_mode(uid, per_operator);
+                assert!(
+                    is_gateway_instance_name(&name),
+                    "generated gateway name {name} is not recognised as a gateway instance"
+                );
+            }
+        }
+    }
+
+    /// And nothing else is. The nft table inside the VM wears the same prefix
+    /// and is the near miss most likely to be reached for by a future caller.
+    #[test]
+    fn names_that_are_not_gateway_instances_are_not_recognised() {
+        for name in [
+            "",
+            "sandboxd",
+            "sandboxd-gatewa",
+            "sandboxd-gatewayx",
+            "sandboxd-gateway-",
+            "sandboxd-gateway-abc",
+            "sandboxd-gateway-eth0",
+            "sandboxd-gateway-501-501",
+            "x-sandboxd-gateway",
+            "sandbox-aa0000000001",
+            "sandbox-base",
+        ] {
+            assert!(
+                !is_gateway_instance_name(name),
+                "{name} is not a gateway instance name but was recognised as one"
+            );
+        }
+    }
+
     // -- LIMA_HOME path depth (§ UNIX_PATH_MAX) --------------------------------
 
-    /// The gateway instance's `ssh.sock` address fits in `sun_path`.
+    /// Every instance's `ssh.sock` address fits in `sun_path`.
     ///
     /// Computed from the real path builders rather than eyeballed, so it stays
-    /// true when the state root, the nesting or the instance-name scheme
+    /// true when the state root, the nesting or an instance-name scheme
     /// changes — which are the three things that consume the headroom. Lima
     /// resolves symlinks before binding, so there is no way to spell around an
     /// over-long path; the VM simply fails to start, with an error that does
     /// not name path length as the cause.
+    ///
+    /// All three name schemes are checked at every uid pair rather than one of
+    /// them being argued for as the worst case. Which is longest depends on
+    /// the owner uid: a session name is a fixed width, a per-operator gateway
+    /// name grows with the digits of the uid, and they cross over somewhere in
+    /// the middle of the uid range. An argument about which one to check would
+    /// have to get that crossover right; checking all of them does not.
     #[test]
     fn gateway_instance_socket_path_fits_unix_path_max() {
         use crate::lima::{
@@ -3646,26 +3818,32 @@ mod tests {
             instance_ssh_socket_path, operator_lima_home_inner,
         };
 
-        // Production shape (daemon is its own operator) plus a 5-digit-uid host,
-        // which is the widest realistic uid pair.
-        for (daemon_uid, op_uid) in [(309u32, 309u32), (309, 501), (12345, 98765)] {
+        // Production shape (daemon is its own operator), a 5-digit-uid host,
+        // and the widest pair a `u32` uid admits at all — the last of which is
+        // not realistic and is the point: it bounds every host that could ever
+        // exist, so no later host needs this recomputed.
+        for (daemon_uid, op_uid) in [
+            (309u32, 309u32),
+            (309, 501),
+            (12345, 98765),
+            (u32::MAX, u32::MAX),
+        ] {
             let lima_home = operator_lima_home_inner(SANDBOXD_STATE_ROOT, daemon_uid, op_uid);
-            let sock = instance_ssh_socket_path(&lima_home, GATEWAY_INSTANCE_NAME);
-            let len = sock.as_os_str().len();
-            assert!(
-                instance_socket_path_fits(&lima_home, GATEWAY_INSTANCE_NAME),
-                "{} is {len} bytes; sun_path holds {MACOS_UNIX_PATH_MAX} including the \
-                 terminator, so the gateway VM would fail to start",
-                sock.display()
-            );
-            // A session VM's instance name is the longer of the two schemes in
-            // this tree; hold the bound for it too.
-            let session_instance = crate::lima::vm_name(&crate::session::SessionId::generate());
-            assert!(
-                instance_socket_path_fits(&lima_home, &session_instance),
-                "session instance {session_instance} under {} exceeds sun_path",
-                lima_home.display()
-            );
+            let candidates = [
+                gateway_instance_name_in_mode(op_uid, false),
+                gateway_instance_name_in_mode(op_uid, true),
+                crate::lima::vm_name(&crate::session::SessionId::generate()),
+            ];
+            for instance in candidates {
+                let sock = instance_ssh_socket_path(&lima_home, &instance);
+                let len = sock.as_os_str().len();
+                assert!(
+                    instance_socket_path_fits(&lima_home, &instance),
+                    "{} is {len} bytes; sun_path holds {MACOS_UNIX_PATH_MAX} including the \
+                     terminator, so the VM would fail to start",
+                    sock.display()
+                );
+            }
         }
     }
 
