@@ -4876,16 +4876,19 @@ This section once claimed to be empty when it was not — §2.5 had left a mitig
 while the section declared the design closed. So the claim above is deliberately narrower
 than "nothing is undecided", and here is exactly what it excludes:
 
-**Two bounded implementation choices are delegated to their phase**, with both options
+**One bounded implementation choice is still delegated to its phase**, with both options
 stated and neither affecting anything outside the phase that makes it:
 
 | Choice | Options | Phase |
 |---|---|---|
-| Where the reaper's gateway exclusion lives (§2.6) | in `reap_lima_orphans_inner`, or `decide_lima_vm` gains a `name` parameter | 4 |
 | How `run_gateway_recovery` gets operator scope (§2.6) | operator scope on `GatewayRecoveryDeps`, or a filtering impl supplied by the caller | 4 |
 
-Those are implementation shape, not design. If either turns out to have a consequence
+That is implementation shape, not design. If it turns out to have a consequence
 outside its phase, it becomes an open question again — say so rather than absorbing it.
+
+The other one — where the reaper's gateway exclusion lives — has been made, and it
+carries a measured correction to the mechanism §2.6 describes. Both are recorded in
+*Previously open, now decided* below.
 
 
 ### Still unverified (facts, not decisions)
@@ -4989,6 +4992,8 @@ named, not here.
 | Quota model | **Superseded in part.** "First-claim-wins at VM creation" is withdrawn: ranges are assigned at enrollment. What survives is the *default* (a single-operator host gets the whole pool, so nothing regresses) and the two distinct error shapes | §1.3, §2.2 |
 | Gate harness form and lifetime | **A throwaway shell script**, executed once in phase 0 and **deleted at that phase's exit**; phase 6's retargeted e2e suite owns ongoing regression coverage, and a parallel bespoke harness would be a second system that can disagree with it | §3 *Form and lifetime*; phase 0 files + exit |
 | Per-operator gateway VM naming | **`sandboxd-gateway-<operator_uid>`** — keeps the greppable prefix, encodes the owner, structurally cannot match the `sandbox-<12hex>` session grammar; paired with an **explicit** reaper exclusion rather than reliance on the parse failing | §2.6; phase 4 files + criteria |
+| Where the reaper's gateway exclusion lives | **In `reap_lima_orphans_inner`**, as a candidate filter over the listed VMs, alongside the filtering that loop already does. `decide_lima_vm` keeps its signature: it is asked to classify a VM *by its session id*, and a gateway VM has none, so a `name` parameter would hand it a case it has no vocabulary for and would bury the protection inside a function whose other four rules are about session ownership. Its doc-comment now names the exclusion site, so its rules cannot be read as the complete account of what survives a pass — the defect being fixed is a protection that was implicit, and a second implicit one would repeat it | §2.6; phase 4 |
+| The mechanism by which the gateway VM survives a reap pass today | **Corrected, measured.** §2.6 says the gateway survives because its name fails the session-id parse. It does fail that parse — but the parse is never reached. `LimaManager::list_vms` (`sandbox-core/src/lima.rs`) admits only names carrying `VM_NAME_PREFIX` (`sandbox-`), and both `sandboxd-gateway` and `sandboxd-gateway-<uid>` fail *that* first: the two prefixes differ at their eighth byte. So the parse-based protection is real but unreachable, and it is the prefix filter that has been doing the work. Both gates are now pinned by `gateway_names_are_disjoint_from_the_session_vm_grammar`, which fails if either grammar moves toward the other. This does not weaken the case for the explicit exclusion — it is the argument for it: the surviving mechanism is a coincidence of two independently chosen name schemes, and neither module states that they must stay apart. **§2.6's rationale is left as written**; this row is the correction, not an edit to it | §2.6; phase 4 |
 | Which second uid plays "operator B" | **Fix issue #85 first**, then a dedicated test-operator account in the proper group; adding another member to Apple's reserved gid 60 was rejected as making #85 worse. **The "own per-operator group" half of this is a phase 1 criterion, not phase 0's** — that group does not exist until phase 1 creates it, and Part B ran with a dedicated account in the shared `_sandboxd` | §3.7; [Before you start](#before-you-start); **phase 1 criteria** |
 | Does `interface:` pinning work on `socket:` networks | **Yes — verified**, and it is a real fd-level binding rather than a relabel. Brings two obligations with it: the generator must guard the `lima<slot>` correspondence itself (Lima does not), and `UNIX_PATH_MAX` bounds how deep a LIMA_HOME may sit | §1.4 fix 1 + fix 1a; §2.8; phase 1 criteria |
 | `shared:` export mechanism | **Operator-declared export roots** — neither per-session subtree export nor a blanket home export. The operator declares which roots are exportable; they are exported at VM creation and the Docker bind `src=` selects the subtree per session. A **generalisation of today's fixed `/tmp/sandbox-shared`**, not a new mechanism | §5.1; phase 5 |
