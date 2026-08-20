@@ -20,6 +20,10 @@ pub mod events;
 pub mod gateway;
 #[cfg(target_os = "macos")]
 pub mod gateway_lima;
+/// Per-owner `GatewayLimaManager` instances behind a uid-keyed registry.
+/// macOS only — `GatewayLimaManager` is.
+#[cfg(target_os = "macos")]
+pub mod gateway_lima_registry;
 /// Gateway Lima crash-recovery orchestrator and its building blocks (latch
 /// guard, session filter, bounded-concurrency loop). Platform-neutral so the
 /// state-machine behaviours can be covered by hermetic unit tests on any host.
@@ -136,6 +140,8 @@ pub use gateway_lima::{
     observe_vmnet_daemon_set, per_operator_gateway_enabled, slot_for_persisted_session,
     slot_interface_name,
 };
+#[cfg(target_os = "macos")]
+pub use gateway_lima_registry::GatewayLimaManagerRegistry;
 pub use gateway_recovery::{
     GatewayRecoveringGuard, GatewayRecoveryDeps, run_bounded_recovery, run_gateway_recovery,
     sessions_to_recover,

@@ -1365,6 +1365,25 @@ struct AppState {
     /// handler that needs the forwarded socket path or the NIC map.
     #[cfg(target_os = "macos")]
     gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager>,
+    /// macOS only: one `GatewayLimaManager` per gateway-owning uid, built on
+    /// first lookup.
+    ///
+    /// Nothing reads this yet, and the `allow` says so rather than hiding it.
+    /// Every handler still reaches the gateway through `gateway_lima_manager`
+    /// above — the daemon's own — and that is correct for all of them today:
+    /// there is one gateway VM, it lives in the daemon's LIMA_HOME, and while
+    /// instances are named without an owner suffix a manager built for an
+    /// operator uid would go looking for that same name in *that operator's*
+    /// LIMA_HOME, where no gateway has been created. Routing a handler through
+    /// the registry now would change where it looks without there being
+    /// anything new to find.
+    ///
+    /// It is held so the managers exist where the handlers will look for them,
+    /// and so the type is built on the real startup path rather than only in
+    /// its own tests.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    gateway_lima_managers: Arc<sandbox_core::GatewayLimaManagerRegistry>,
     /// macOS only: in-memory transient networking health per Running Lima session.
     ///
     /// Written by the gateway recovery orchestrator (Pass 2) when a session
@@ -13979,6 +13998,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (pools, manager_arc)
     };
 
+    // A manager per gateway-owning uid, alongside the daemon's own. The
+    // closure is the only place that knows how to compose one: an owner's
+    // LIMA_HOME, and the three seams aimed at that owner's uid rather than
+    // the daemon's. The broker executor is shared — it routes per call by the
+    // uid it is handed, so one instance serves every owner.
+    #[cfg(target_os = "macos")]
+    let gateway_lima_managers = {
+        let executor = Arc::clone(broker_executor.as_ref().expect("set by the executor block"));
+        Arc::new(sandbox_core::GatewayLimaManagerRegistry::new(
+            move |owner_uid| {
+                sandbox_core::GatewayLimaManager::new(
+                    sandbox_core::lima::operator_lima_home(owner_uid),
+                    Arc::clone(&executor) as Arc<dyn sandbox_core::lima::LimaExecutor>,
+                    sandbox_core::docker::DockerRoute::Vm {
+                        op_uid: owner_uid,
+                        executor: Arc::clone(&executor)
+                            as Arc<dyn sandbox_core::docker::DockerExecutor>,
+                    },
+                    sandbox_core::in_vm::InVmRoute::new(
+                        owner_uid,
+                        Arc::clone(&executor) as Arc<dyn sandbox_core::in_vm::InVmExecutor>,
+                    ),
+                    owner_uid,
+                )
+            },
+        ))
+    };
+
     // Build the Lima runtime backed by the registry and register it in
     // the backend dispatch table. The same Arc<LimaRuntime> is held both
     // as a typed handle (for Lima-only orchestration via
@@ -14325,6 +14372,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vmnet_pools,
         #[cfg(target_os = "macos")]
         gateway_lima_manager,
+        #[cfg(target_os = "macos")]
+        gateway_lima_managers,
         #[cfg(target_os = "macos")]
         networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         #[cfg(target_os = "macos")]
