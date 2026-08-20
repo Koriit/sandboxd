@@ -360,7 +360,7 @@ sandbox VM (B+4) → macvlan slot segment → gateway container (B+3)
   → sandboxd-egress bridge → NAT → gateway VM eth0 → macOS host → internet
 ```
 
-The gateway VM's `eth0` is the one sanctioned use of SLIRP on macOS — it is the upstream uplink, not a guest-facing NIC. Because a compromised gateway component would otherwise have an unfiltered path to the internet via `eth0`, the daemon applies a baseline nftables policy on the gateway VM's `eth0` at startup: default-drop, with explicit allows only for conntrack-established/related responses, DNS (53), HTTPS (443), and HTTP (80). The HTTPS/HTTP allows are what let the in-VM Docker daemon pull gateway images and the policed traffic re-originated by the gateway containers exit; they are not a guest-reachable path (the sandbox VMs never reach `eth0` — see below). This is the macOS gateway VM's egress control; the sandbox VMs enforce via `restrict=on` on their management NIC (see below).
+The gateway VM's `eth0` is the one sanctioned use of SLIRP on macOS — it is the upstream uplink, not a guest-facing NIC. Because a compromised gateway component would otherwise have an unfiltered path to the internet via `eth0`, the daemon applies a baseline nftables policy on the gateway VM's `eth0` at startup: default-drop, with explicit allows only for conntrack-established/related responses, DNS (53), HTTPS (443), and HTTP (80). The HTTPS/HTTP allows are what let the in-VM Docker daemon pull gateway images; they are not a guest-reachable path (the sandbox VMs never reach `eth0` — see below). This policy governs only the VM's own host-namespace traffic: it declares no `forward` chain, so the traffic gateway containers re-originate — which traverses `forward` and Docker's NAT — is neither permitted nor restricted by it. What judges session traffic is the per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway container's own netns. This is the macOS gateway VM's blast-radius bound; the sandbox VMs enforce via `restrict=on` on their management NIC (see below).
 
 ### The baseline `eth0` split: `restrict=on` vs. the baseline egress policy
 
@@ -372,7 +372,7 @@ The macOS topology has two kinds of `eth0` — sandbox VM management NIC and gat
 
 The daemon verifies `restrict=on` is in effect on each sandbox VM before marking the session `Running`. If the wrapper fails to inject it — or the verification does not confirm — the VM is torn down and the create operation fails rather than starting a session with an unrestricted management NIC.
 
-The `sandboxd-gateway` VM's `eth0` is also **never** `restrict=on` for the same reason — but enforced via the baseline nft policy applied once at gateway init, not per session. These two distinct enforcement paths on the same physical NIC type (`eth0`) are what make the topology work: sandbox VMs are locked out, gateway containers are let through but filtered.
+The `sandboxd-gateway` VM's `eth0` is also **never** `restrict=on` — bounded instead by the baseline nft policy, applied once at gateway init rather than per session. The two controls on the same physical NIC type (`eth0`) do different jobs: `restrict=on` locks a sandbox VM out of its own management NIC, and the baseline policy bounds what the gateway VM's own host-namespace processes can reach. Neither is what filters a session's traffic — that is the per-session ruleset inside the gateway container's netns, which the traffic reaches over the socket_vmnet segment.
 
 ### Session networking lifecycle on macOS
 

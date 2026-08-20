@@ -36,13 +36,19 @@ pub fn link_show_json_argv() -> Vec<String> {
 /// `sudo -n nft -f -` inside the VM — apply an nftables ruleset read from
 /// stdin.
 ///
-/// # This one is the egress plane
+/// # What this ruleset is
 ///
-/// The ruleset this reads is the gateway VM's `eth0` baseline: the
-/// default-drop policy that makes the VM's uplink refuse anything the session
-/// policy did not allow. A ruleset that arrives corrupted, truncated or not
-/// at all is not a broken session — it is an unenforced one, and the failure
-/// is silent from inside the sandbox.
+/// The gateway VM's `eth0` baseline: a default-drop `output` chain bounding
+/// the VM's *own host-namespace* egress, and an `input` chain that drops
+/// unsolicited inbound on `eth0`. It declares no `forward` chain and does not
+/// govern session traffic, which the per-session `sandbox_dnat`/`sandbox_policy`
+/// ruleset in each gateway container's netns judges instead. What it bounds is
+/// the blast radius of a component that escapes a container netns into the VM.
+///
+/// A ruleset that arrives corrupted or truncated fails to parse and so fails
+/// the caller; one that arrives subtly altered but still valid installs
+/// silently, and nothing at runtime re-checks what is installed. That is what
+/// the three properties below are for.
 ///
 /// Three properties keep that honest, and all three are why the ruleset
 /// travels on **stdin** rather than in the command line:

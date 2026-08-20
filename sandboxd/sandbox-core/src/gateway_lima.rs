@@ -55,11 +55,15 @@
 /// Applied via `limactl shell … nft -f -` on stdin. The policy:
 ///
 /// - Default drop on `output` (egress from the gateway VM itself via `eth0`)
-/// - Allow conntrack established/related (re-originated upstream responses from
-///   gateway containers that have already been intercepted and re-opened)
+/// - Allow conntrack established/related (return traffic for connections the
+///   VM's own host-namespace processes opened)
 /// - Allow DNS egress (port 53 UDP/TCP) so Lima's embedded resolver can reach
 ///   upstream nameservers
 /// - Allow established/related INPUT (return traffic for DNS + upstream)
+///
+/// No `forward` chain, so gateway-container traffic — which traverses `forward`
+/// and Docker's NAT — is not governed here at all; the per-session ruleset in
+/// each container's own netns is what judges that.
 ///
 /// The gateway VM's `eth0` is NEVER `restrict=on` — it is the sanctioned egress
 /// uplink. This nft policy is its defense-in-depth control, not a block.
@@ -1867,10 +1871,12 @@ impl GatewayLimaManager {
     /// chain, and a gateway container's traffic traverses `forward` and
     /// Docker's NAT; what judges that traffic is the per-session
     /// `sandbox_dnat`/`sandbox_policy` ruleset in the container's own netns,
-    /// which this path never touches. A failure here is therefore not a
-    /// sandbox with unrestricted egress, and a security threshold that means
-    /// to be about session egress must be set on the per-session pipeline
-    /// rather than on this call.
+    /// which this path never touches. A failure here therefore removes no
+    /// constraint on session egress, because this table imposes none — and it
+    /// is equally no evidence that session egress *is* constrained, which
+    /// turns on the per-session ruleset and is not observable from here. A
+    /// security threshold meant to be about session egress must be set on the
+    /// per-session pipeline rather than on this call.
     ///
     /// The error is still returned rather than logged and swallowed, and
     /// `ensure_ready` fails with it. The bound is a security property, and
@@ -3371,7 +3377,8 @@ mod tests {
         let ruleset = generate_gateway_eth0_nft_policy();
         assert!(
             ruleset.contains("ct state established,related accept"),
-            "baseline nft must allow established/related (re-originated upstream)"
+            "baseline nft must allow established/related — every port accept in \
+             the output chain depends on it for its return path"
         );
     }
 

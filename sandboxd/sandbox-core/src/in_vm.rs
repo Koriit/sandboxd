@@ -83,9 +83,10 @@ pub enum InVmOp {
     /// the gateway VM's *own host-namespace* egress — the table has no
     /// `forward` chain and does not govern session traffic, which the
     /// per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway
-    /// container's netns judges instead. So a failure is not a sandbox with
-    /// unrestricted egress; it is the loss of the blast-radius bound on a
-    /// component that escapes a container netns into the VM. Two paths install
+    /// container's netns judges instead. So a failure removes no constraint on
+    /// session egress, and is no evidence about session egress in either
+    /// direction. What it loses is the blast-radius bound on a component that
+    /// escapes a container netns into the VM. Two paths install
     /// that table and nothing at runtime re-checks it, so a failure logged and
     /// swallowed here leaves a running VM without the bound and nothing that
     /// would notice. `sandbox_core::gateway_lima`'s `apply_eth0_nft_policy`
