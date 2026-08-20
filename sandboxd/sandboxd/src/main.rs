@@ -1422,6 +1422,25 @@ struct AppState {
     #[cfg(target_os = "macos")]
     gateway_recovering: Arc<sandbox_core::GatewayRecoveryLatches>,
 
+    /// macOS only: the sessions the last `recover_gateway_lima` run could not
+    /// attribute to a gateway, held so `GET /diagnostics` can report them.
+    ///
+    /// Recovery shards its candidate sessions by gateway owner, and a session
+    /// no shard claims is a Running sandbox whose gateway nobody rebuilds —
+    /// possibly still emitting traffic through the gateway that crashed. The
+    /// list has to be somewhere an administrator can find it, not only in a log
+    /// line from whenever the crash happened.
+    ///
+    /// Empty while one gateway serves every session: with one shard there is
+    /// nothing for a session to fall outside of. It fills only once each
+    /// operator owns a gateway, which is why it is wired before then — the run
+    /// that first produces a residual should not also be the run that discovers
+    /// nowhere reports it.
+    ///
+    /// Not accessed on Linux (cfg-gated).
+    #[cfg(target_os = "macos")]
+    gateway_recovery_declines: Arc<sandbox_core::GatewayRecoveryDeclines>,
+
     /// macOS only: per-operator agent broker registry.
     ///
     /// The same live `AgentRegistry` the broker listener and the
@@ -11283,6 +11302,20 @@ async fn diagnostics_handler(
             .collect();
         fields.push(("vmnet_declined_restores", serde_json::json!(declined)));
 
+        // Sessions the last gateway recovery could not attribute to a gateway,
+        // in the same one-line-per-session shape as the declined claims above
+        // and for the same reason: the recovered sessions are the ones nothing
+        // reports, so a session left out of every shard is invisible unless it
+        // gets its own list. Each is a Running sandbox whose gateway nobody
+        // rebuilt, which is worse than a declined slot claim, not better.
+        //
+        // Empty while one gateway serves every session — there is one shard,
+        // and nothing can fall outside of it.
+        fields.push((
+            "gateway_recovery_declined_sessions",
+            serde_json::json!(state.gateway_recovery_declines.describe()),
+        ));
+
         // Who holds which slots, for the administrator reading a 409 that
         // deliberately does not name them.
         let claimed_by_operator: Vec<String> = claimed_pairs
@@ -12491,12 +12524,15 @@ async fn gateway_monitor(state: Arc<AppState>) {
             // `recover_gateway_lima`, skip per-session re-creates — the instance
             // monitor holds exclusive recovery responsibility during that window.
             //
-            // The owner asked about is the daemon's own because the gateway
-            // this loop acts on is the daemon's own: every re-create below
-            // runs over `state.docker`, which names the daemon's uid. When
-            // that route becomes per-session, the key has to be derived from
-            // whatever the route is derived from, and the two have to move
-            // together — a key naming one owner while the work lands on
+            // Both sides key the latch by the gateway the work lands on, and
+            // that is the whole rule. `recover_one_gateway` takes the shard's
+            // owner because that names the gateway it restarts; this read takes
+            // the daemon's own because every re-create below runs over
+            // `state.docker`, which names the daemon's uid. The two agree today
+            // because one gateway serves every session, so the shard's owner
+            // *is* the daemon's — not because either side was pinned to match
+            // the other. When the route below becomes per-session, this key
+            // moves with it, and a key naming one owner while the work lands on
             // another's gateway would skip the wrong sessions and re-create
             // containers a recovery is rebuilding.
             #[cfg(target_os = "macos")]
@@ -12947,11 +12983,27 @@ async fn gateway_monitor(state: Arc<AppState>) {
 /// that were running through it.
 ///
 /// Called by `gateway_lima_monitor` after three consecutive probe failures.
-/// Delegates the state-machine logic (Degraded → Recovering → Healthy
+/// Decides which sessions recover against which gateway and then hands each
+/// gateway to `recover_one_gateway`, which supplies the injected closures and
+/// delegates the state-machine logic (Degraded → Recovering → Healthy
 /// transitions, latch management, bounded-concurrency loop) to
-/// `sandbox_core::run_gateway_recovery`. This function supplies the four
-/// injected closures: gateway restart, per-session re-create, post-success
-/// side-effects, and the store-backed dependency implementation.
+/// `sandbox_core::run_gateway_recovery`.
+///
+/// ## One run per gateway
+///
+/// The candidate sessions are read once and split by the gateway each recovers
+/// against ([`sandbox_core::partition_by_gateway_owner`]), and the orchestrator
+/// is then driven once per shard. A session must have its gateway container
+/// re-created against *its own* operator's gateway VM, and one pass over every
+/// session against one VM only happens to be right while there is one VM.
+///
+/// Ownership is [`sandbox_core::GatewayOwnership::Shared`] here because this
+/// daemon holds one `GatewayLimaManager` and one Docker route, so there is
+/// exactly one gateway to drive whatever the per-operator-gateway switch says.
+/// It is a statement about what `state` holds, not about the switch, and it
+/// changes when the manager and the route below become per-owner rather than
+/// when the switch flips. Under `Shared` the split yields one shard holding
+/// every candidate, so this runs exactly as it did before the split existed.
 ///
 /// ## What this function does NOT do
 ///
@@ -12961,13 +13013,75 @@ async fn gateway_monitor(state: Arc<AppState>) {
 /// operators' agents.
 #[cfg(target_os = "macos")]
 async fn recover_gateway_lima(state: &Arc<AppState>) {
+    let store = Arc::clone(&state.store);
+
+    // Read the candidates once, here, rather than once per shard: two reads
+    // would see two different session sets, and a session that appeared
+    // between them would belong to a shard that had already run.
+    let candidates = match store.list_sessions_unfiltered() {
+        Ok(all) => sandbox_core::sessions_to_recover(all),
+        Err(e) => {
+            error!(error = %e, "gateway Lima recovery: failed to list sessions");
+            return;
+        }
+    };
+
+    let network_for = |session: &sandbox_core::Session| {
+        store
+            .get_network_info_unfiltered(&session.id)
+            .ok()
+            .flatten()
+    };
+    let (shards, declined) = sandbox_core::partition_by_gateway_owner(
+        candidates,
+        sandbox_core::GatewayOwnership::Shared(sandbox_core::gateway_owner_uid(state.daemon_uid)),
+        &network_for,
+        &resolve_name_to_uid,
+    )
+    .into_parts();
+
+    // Recorded on every run, including the empty case: an empty record is how
+    // a run that placed everything clears a previous run's report.
+    for line in declined.iter().map(|d| d.describe()) {
+        warn!(
+            "gateway Lima recovery: no gateway to recover this session against: {}",
+            line
+        );
+    }
+    state.gateway_recovery_declines.record(declined);
+
+    for shard in shards {
+        recover_one_gateway(state, &store, shard).await;
+    }
+}
+
+/// Recover one gateway VM and the sessions that run through it.
+///
+/// Split out from `recover_gateway_lima` because everything it holds is
+/// per-gateway and has to be rebuilt for each one: the closures move what they
+/// capture, so a loop body that captured once would compile only for a single
+/// iteration.
+///
+/// `shard.owner_uid` is the uid owning the gateway this call acts on. It is the
+/// key for the latch, and it is what the manager and the Docker route below
+/// will be selected by once there is more than one of each — until then it is
+/// the daemon's own uid and every one of them agrees by construction.
+#[cfg(target_os = "macos")]
+async fn recover_one_gateway(
+    state: &Arc<AppState>,
+    store: &Arc<sandbox_core::SessionStore>,
+    shard: sandbox_core::RecoveryShard,
+) {
     use sandbox_core::NetworkInfo;
 
-    let store = Arc::clone(&state.store);
+    let shard_deps = sandbox_core::RecoveryShardDeps::new(store, shard.sessions);
     let mgr_restart = Arc::clone(&state.gateway_lima_manager);
     let mgr_per_session = Arc::clone(&state.gateway_lima_manager);
-    // The gateway VM carries a NIC on every slot on the host, not on one
-    // operator's share — recovery must rebuild all of them.
+    // One gateway VM serves every operator's sessions and so carries a NIC on
+    // every slot on the host, not on the share of whoever owns it — recovery
+    // must rebuild all of them. A gateway VM per operator would carry NICs on
+    // that operator's slots only, and this would become a per-owner read; the
+    // manager restarted below is what settles which of the two it is.
     let pool_slots = state.vmnet_pools.host_slots();
     let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     let pool = format!(
@@ -12979,14 +13093,12 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
     let state_success = Arc::clone(state);
 
     sandbox_core::run_gateway_recovery(
-        &store,
+        &shard_deps,
         Arc::clone(&state.networking_status),
-        // The gateway restarted below is `state.gateway_lima_manager`'s — the
-        // daemon's own — so the daemon's is the latch this recovery holds, and
-        // the one the monitor's matching read polls.
-        state
-            .gateway_recovering
-            .for_owner(sandbox_core::gateway_owner_uid(state.daemon_uid)),
+        // The latch is the one for the gateway being restarted, which is the
+        // gateway this shard's sessions recover against — the same uid the
+        // monitor's matching read polls under.
+        state.gateway_recovering.for_owner(shard.owner_uid),
         // restart_gateway: force-stop → start → wait for Docker readiness (blocking).
         // Re-verifying the slot NICs and re-establishing the egress bridge are
         // performed inside `restart_instance_for_recovery`. The slot set is read
@@ -13196,6 +13308,16 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
 /// the host, and inline in `main` nothing could test it. `None` means the
 /// passes do not run at all; a caller that turns it back into an empty set
 /// restores the original defect.
+///
+/// # This set stays whole no matter how many operators there are
+///
+/// Recovery splits its session list by the operator whose gateway each session
+/// runs through, and narrowing this one to match would look like the same
+/// change. It is the opposite one. Recovery *acts on* the sessions it is given,
+/// so a session missing from its input is merely not recovered; a reaper acts
+/// on the sessions **absent** from its input, so a session missing from this
+/// set has its VM deleted. Handing a pass one operator's sessions would make
+/// every other operator's running sandbox an orphan by definition.
 fn live_session_ids_for_reapers(
     listed: Result<Vec<Session>, SandboxError>,
 ) -> Option<HashSet<SessionId>> {
@@ -14497,6 +14619,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         #[cfg(target_os = "macos")]
         gateway_recovering: Arc::new(sandbox_core::GatewayRecoveryLatches::new()),
+        #[cfg(target_os = "macos")]
+        gateway_recovery_declines: Arc::new(sandbox_core::GatewayRecoveryDeclines::new()),
         #[cfg(target_os = "macos")]
         agent_registry: agent_registry.clone(),
     });

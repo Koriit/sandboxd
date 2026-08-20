@@ -649,6 +649,7 @@ async fn integration_diagnostics_macos_fields_omitted_on_linux() {
         "vmnet_slot_assignment",
         "vmnet_assignment_warnings",
         "vmnet_declined_restores",
+        "gateway_recovery_declined_sessions",
         "vmnet_claimed_by_operator",
         "gateway_image_tag_inside_lima",
         "socket_vmnet_installed",
