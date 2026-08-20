@@ -344,6 +344,22 @@ fn gateway_instance_name_in_mode(owner_uid: u32, per_operator: bool) -> String {
 /// uid" would be one more value a wiring site could get wrong, and a wiring
 /// site getting the gateway's owner wrong is the whole of what this function
 /// removes.
+///
+/// # Precondition: the calling process is the daemon
+///
+/// Taking the uid from `getuid()` makes the switch-off answer correct only
+/// for a caller that *is* the daemon, and nothing here enforces that. The
+/// `cfg` gate is on the OS, not on the crate; the function is `pub` and
+/// re-exported at the crate root; there is no module boundary in the way.
+/// `sandbox-cli` links this crate and runs as the operator on macOS, so a
+/// call from there returns the operator's own uid with the switch **off** —
+/// the binary behaving as though per-operator gateways were on, which is the
+/// inversion this function exists to prevent. No non-daemon crate calls it
+/// today; that is the weakest guarantee available and not one to rely on.
+///
+/// [`crate::lima::operator_lima_home`] carries the same precondition for the
+/// same reason. Discharging either in the type system, rather than in a
+/// doc-comment, is tracked separately.
 #[cfg(target_os = "macos")]
 pub fn gateway_owner_uid(operator_uid: u32) -> u32 {
     gateway_owner_uid_in_mode(operator_uid, per_operator_gateway_enabled())
