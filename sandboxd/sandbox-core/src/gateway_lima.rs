@@ -974,10 +974,13 @@ provision:
 ///
 /// 1. **FORWARD chain**: Gateway container traffic — Docker NAT/MASQUERADE takes
 ///    packets from the `sandboxd-egress` bridge, masquerades them as the gateway
-///    VM's IP, and forwards them out `eth0`. This path is managed entirely by
-///    Docker's own iptables/nft rules in the `ip filter`/`ip nat` tables. Our
-///    policy must NOT interfere with it, and deliberately does not — this table
-///    declares no FORWARD chain, so Docker NAT is completely unaffected.
+///    VM's IP, and forwards them out `eth0`. This path is managed by Docker's own
+///    iptables/nft rules in the `ip filter`/`ip nat` tables. Our policy must NOT
+///    interfere with it. What is measured is that this table declares no FORWARD
+///    chain, so it holds no rule that can match a packet traversing `forward`;
+///    that a gateway container's traffic is what traverses `forward` rather than
+///    this table's OUTPUT is the standard netfilter reading and very likely true,
+///    and has not been observed on this host.
 ///
 /// 2. **OUTPUT chain**: Traffic originating from the gateway VM's own host-namespace
 ///    processes — Lima agents, Docker daemon (image pulls, registry access),
@@ -1006,15 +1009,21 @@ provision:
 /// - Drop new/invalid: external parties cannot initiate connections into the
 ///   gateway VM.
 ///
-/// ## Why container egress is unaffected
+/// ## What this table is and is not established to bound
 ///
-/// Gateway container re-originated traffic traverses the FORWARD chain (Docker
-/// NAT/MASQUERADE), not the OUTPUT chain. Because this table declares no FORWARD
-/// chain, Docker's iptables FORWARD rules operate without any interference. The
-/// OUTPUT restrictions bind only VM-host-namespace processes — which is exactly
-/// the blast-radius bound required: a compromised component that escapes its
-/// container netns into the gateway VM's host network namespace is constrained to
-/// DNS + HTTPS + HTTP, not arbitrary outbound.
+/// Measured, and structural: this table declares no FORWARD chain, so it holds
+/// no rule that can match a packet traversing `forward`, and Docker's own
+/// FORWARD rules run without interference from it. Not measured: that gateway
+/// container re-originated traffic is what traverses `forward` rather than this
+/// table's OUTPUT. That step is the standard netfilter reading and very likely
+/// true; it has not been observed on this host, and an attempt to establish it
+/// from the session record was audited on 2026-08-20 and found not to. So what
+/// this table is established to bound is the blast radius of a component that
+/// escapes its container netns into the gateway VM's host network namespace:
+/// on `eth0` such a component is constrained to DNS + HTTPS + HTTP rather than
+/// arbitrary outbound. What judges session traffic is the per-session
+/// `sandbox_dnat`/`sandbox_policy` ruleset in each gateway container's own
+/// netns, which this table never touches.
 #[cfg(target_os = "macos")]
 pub fn generate_gateway_eth0_nft_policy() -> String {
     // The ruleset is applied inside the gateway Lima VM via `nft -f` on a tempfile.
@@ -1037,10 +1046,11 @@ pub fn generate_gateway_eth0_nft_policy() -> String {
 # host-namespace processes to the specific ports they genuinely need.
 #
 # Traffic path clarification:
-# - Gateway CONTAINER egress goes through the FORWARD chain (Docker NAT), not
-#   this OUTPUT chain. This table has no FORWARD chain, so Docker NAT is
-#   completely unaffected — container egress policy is enforced separately by
-#   the per-session Envoy/nft pipeline.
+# - This table declares no FORWARD chain, so it holds no rule that can match a
+#   packet traversing forward, and Docker NAT is unaffected by it. That gateway
+#   CONTAINER egress is what traverses forward rather than this OUTPUT chain is
+#   the standard netfilter reading and has not been measured here. Container
+#   egress policy is enforced separately by the per-session Envoy/nft pipeline.
 # - OUTPUT governs only the gateway VM's host-namespace processes (Lima agents,
 #   Docker daemon, systemd-resolved, etc.). These are restricted to an explicit
 #   port allow-list so a component that escapes its container namespace into the
@@ -1059,8 +1069,9 @@ table inet sandboxd-gateway-eth0 {
     oifname "lo" accept
 
     # Do NOT restrict traffic on socket_vmnet NICs (lima0…) or Docker bridges —
-    # those are managed by per-session gateway container nftables and Docker's
-    # own FORWARD chain rules. This policy controls only eth0.
+    # this table deliberately accepts them, leaving them to the per-session
+    # gateway container nftables and Docker's own rules. This policy controls
+    # only eth0.
     oifname != "eth0" accept
 
     # Allow return traffic for connections already opened.

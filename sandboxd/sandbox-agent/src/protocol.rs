@@ -957,10 +957,14 @@ pub enum InVmOp {
     /// arriving on `nft`'s standard input.
     ///
     /// The baseline bounds the VM's *own host-namespace* egress on `eth0`, and
-    /// only there — the chain accepts `oifname != "eth0"` outright. It declares
-    /// no `forward` chain and does not govern session traffic, which the
-    /// per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway
-    /// container's netns judges instead.
+    /// only there — the chain accepts `oifname != "eth0"` outright. That it
+    /// does not govern session traffic is part measured and part not: it
+    /// declares no `forward` chain, so it holds no rule that can match a packet
+    /// traversing `forward` — but that a gateway container's traffic is what
+    /// traverses `forward` rather than this table's `output` is the standard
+    /// netfilter reading, very likely true, and not observed on this host. What
+    /// judges session traffic is the per-session `sandbox_dnat`/`sandbox_policy`
+    /// ruleset in each gateway container's netns.
     ///
     /// The body is the policy: multi-KB, full of newlines, and read as content
     /// by a parser rather than as a command line by anything. It travels as a

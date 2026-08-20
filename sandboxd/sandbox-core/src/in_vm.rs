@@ -83,13 +83,17 @@ pub enum InVmOp {
     /// A failure here must fail the caller. What goes missing is the bound on
     /// the gateway VM's *own host-namespace* egress **on `eth0`** — the chain
     /// accepts `oifname != "eth0"` outright, so it is the uplink it narrows and
-    /// nothing else. The table has no
-    /// `forward` chain and does not govern session traffic, which the
-    /// per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway
-    /// container's netns judges instead. So a failure removes no constraint on
-    /// session egress, and is no evidence about session egress in either
-    /// direction. What it loses is the blast-radius bound on a component that
-    /// escapes a container netns into the VM. Two paths install
+    /// nothing else. That it does not govern session traffic is part measured
+    /// and part not: the table declares no `forward` chain, so it holds no rule
+    /// that can match a packet traversing `forward` — but that a gateway
+    /// container's traffic is what traverses `forward` rather than this table's
+    /// `output` is the standard netfilter reading, very likely true, and not
+    /// observed on this host. What judges session traffic is the per-session
+    /// `sandbox_dnat`/`sandbox_policy` ruleset in each gateway container's
+    /// netns. So what a failure loses is the blast-radius bound on a component
+    /// that escapes a container netns into the VM, and it is no evidence either
+    /// way about session egress, which turns on that per-session ruleset and is
+    /// not observable from here. Two paths install
     /// that table and nothing at runtime re-checks it, so a failure logged and
     /// swallowed here leaves a running VM without the bound and nothing that
     /// would notice. `sandbox_core::gateway_lima`'s `apply_eth0_nft_policy`
@@ -150,8 +154,8 @@ pub enum InVmOp {
     /// `sandbox_dnat`/`sandbox_policy` ruleset in the gateway container's own
     /// netns; this decides whether the traffic arrives there to be judged at
     /// all. [`Self::ApplyNftBaseline`] is a different bound — the gateway VM's
-    /// own host-namespace egress on `eth0` — and does not govern session
-    /// traffic. A
+    /// own host-namespace egress on `eth0` — and is not what governs session
+    /// traffic; see there for which half of that is measured. A
     /// wrong value here does not fail loudly: it produces a container whose
     /// packets leave by some other route, with nothing inside the sandbox able
     /// to tell.
