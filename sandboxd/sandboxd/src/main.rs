@@ -13366,11 +13366,11 @@ fn gateway_lima_retry_backoff(consecutive_failed_recoveries: u32) -> Duration {
 /// answering (see [`sandbox_core::GatewayRecoveryOutcome`]), so the probes
 /// that follow a failed pass are healthy ones. On the threshold alone they
 /// zero the failure count, the threshold is never reached again, and this loop
-/// never calls another pass in — leaving the sessions that pass tagged
-/// Degraded with no gateway container until something else intervenes.
-/// [`Self::retry_at`] is the state that survives a healthy probe. It is set
-/// from the pass's own outcome, because that is the only place the information
-/// exists.
+/// never calls another pass in — so the sessions that pass tagged Degraded
+/// never get their gateway containers rebuilt, until something else
+/// intervenes. [`Self::retry_at`] is the state that survives a healthy probe.
+/// It is set from the pass's own outcome, because that is the only place the
+/// information exists.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct GatewayLimaTrigger {
@@ -13464,18 +13464,32 @@ impl GatewayLimaTrigger {
 /// increment the failure counter — so a single transient blip does not trigger a
 /// full instance recovery.
 ///
-/// ## What a failed recovery costs
+/// ## What a failed recovery withholds, and what the retry restores
 ///
-/// A pass that does not restart the gateway leaves its sessions Degraded with
-/// no gateway container, and `run_gateway_recovery` does not retry — this loop
-/// is what retries. It cannot schedule that from its probes, which go on
-/// answering healthy through most kinds of failure, so it schedules from the
-/// pass's own outcome: [`GatewayLimaTrigger`] holds what is owed and
-/// [`gateway_lima_retry_backoff`] spaces the attempts. The earliest
-/// re-attempt is the first poll at or after [`gateway_lima_retry_delay`] from
-/// the failed pass returning, and each further consecutive failure doubles
-/// that wait up to [`GATEWAY_LIMA_MAX_RETRY_DELAY`]. The sessions spend that
-/// long Degraded.
+/// A pass that does not restart the gateway returns above the per-session
+/// loop, and that loop is what repairs a session: for each one it tears the
+/// gateway container down and creates a fresh one (`teardown_macos_gateway`
+/// then `setup_macos_gateway`), re-spawns the event ingestor, and re-applies
+/// the session's stored policy — or the fail-closed empty one if it has none
+/// (best-effort: [`reapply_session_policy`] logs its failures rather than
+/// propagating them). Until a pass gets past the restart, none of that has
+/// been attempted for any session in it.
+///
+/// So this is a containment bound and not only a liveness fix. The window
+/// stays open until some pass gets past the restart, and what the schedule
+/// below decides is how soon the next pass is tried. What a session's traffic
+/// can do inside that window is a separate question this loop does not settle:
+/// it turns on what a gateway container that outlived the fault is doing, and
+/// nothing here measures that.
+///
+/// `run_gateway_recovery` does not retry — this loop is what retries. It
+/// cannot schedule that from its probes, which go on answering healthy through
+/// most kinds of failure, so it schedules from the pass's own outcome:
+/// [`GatewayLimaTrigger`] holds what is owed and
+/// [`gateway_lima_retry_backoff`] spaces the attempts. The earliest re-attempt
+/// is the first poll at or after [`gateway_lima_retry_delay`] from the failed
+/// pass returning, and each further consecutive failure doubles that wait up
+/// to [`GATEWAY_LIMA_MAX_RETRY_DELAY`]. The sessions spend that long Degraded.
 #[cfg(target_os = "macos")]
 async fn gateway_lima_monitor(state: Arc<AppState>) {
     let poll_interval = GATEWAY_LIMA_PROBE_INTERVAL;
@@ -13546,7 +13560,7 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
                 retry_in_secs = delay.as_secs(),
                 consecutive_failed_recoveries = trigger.failed_recoveries,
                 "gateway Lima monitor: recovery did not restart the gateway; its sessions stay \
-                 Degraded with no gateway container until the next attempt"
+                 Degraded, and their gateway containers are not rebuilt until the next attempt"
             ),
             None => debug!("gateway Lima monitor: recovery pass restarted the gateway"),
         }
@@ -18283,8 +18297,8 @@ mod tests {
         /// Docker daemon is already answering, so the probes that follow are
         /// reachable ones — and on a probe-only trigger they zero the failure
         /// count, the threshold is never reached again, and the sessions that
-        /// pass left Degraded keep no gateway container for as long as the
-        /// daemon runs.
+        /// pass left Degraded never get their gateway containers rebuilt, for
+        /// as long as the daemon runs.
         #[test]
         fn a_failed_pass_is_retried_though_every_probe_after_it_is_healthy() {
             let t0 = Instant::now();

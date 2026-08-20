@@ -656,9 +656,11 @@ pub enum GatewayRecoveryOutcome {
     /// The gateway was not restarted, so nothing this run tagged `Degraded`
     /// has been repaired.
     ///
-    /// Every session it tagged is still `Degraded`, with no gateway container
-    /// and nothing scheduled to rebuild one. A caller that does not schedule
-    /// another attempt leaves them that way for as long as the daemon runs.
+    /// This returns above the per-session loop, so for every session it
+    /// tagged: no gateway container was torn down and re-created, no policy
+    /// was re-applied into one, and the session is still `Running` and still
+    /// tagged `Degraded`. A caller that does not schedule another attempt
+    /// leaves it that way for as long as the daemon runs.
     GatewayNotRestarted,
 }
 

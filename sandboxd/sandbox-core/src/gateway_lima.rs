@@ -228,7 +228,7 @@ const NFT_INJECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// recovery the VM is already provisioned — the Docker daemon typically becomes
 /// reachable in a few seconds. A stuck recovery must surface quickly so the
 /// caller can schedule another attempt, rather than holding the pass open for
-/// five minutes while its sessions sit Degraded with no gateway container.
+/// five minutes before its sessions can have their gateway containers rebuilt.
 #[cfg(target_os = "macos")]
 const GATEWAY_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(90);
 
