@@ -1338,16 +1338,39 @@ struct AppState {
     /// shows the actually-resolved pool rather than expecting the
     /// operator to grep journald.
     users_conf_pool: sandbox_core::users_conf::SubnetEntry,
-    /// Where every container-, network-, volume- and image-lifecycle
-    /// `docker` operation goes.
+    /// The route to the gateway the **daemon itself** owns —
+    /// [`AppState::gateway_docker_route`] evaluated at the daemon's own uid.
     ///
     /// On Linux this is the host daemon and the calls run in-process. On
-    /// macOS it names the operator whose VM hosts the Docker daemon and the
-    /// executor that reaches it — today the daemon's own uid, which the
-    /// executor short-circuits to a direct invocation; after ownership flips
-    /// it is the operator's, and the same call sites route through their
-    /// agent without changing.
+    /// macOS it names the daemon's uid and the executor that reaches its VM,
+    /// which the executor short-circuits to a direct invocation.
+    ///
+    /// A handler serving a request must not read this: the gateway a request
+    /// belongs to is the *caller's*, which is
+    /// [`AppState::docker_route_for_operator`]. What is left here are the
+    /// daemon's own background paths — startup reconcile, the monitors, the
+    /// recovery loop — which act on no operator's behalf and are converted
+    /// separately.
     docker: sandbox_core::docker::DockerRoute,
+    /// Builds the Docker route for the gateway owned by a given uid.
+    ///
+    /// A gateway owner's route is not interchangeable with another's: on macOS
+    /// a route names the uid whose VM hosts the Docker daemon and the executor
+    /// that reaches it, so the uid alone decides which operator's agent runs
+    /// the call. Handlers therefore never build one; they ask
+    /// [`AppState::docker_route_for_operator`], which is the only thing here
+    /// that turns an operator into an owner.
+    ///
+    /// A factory rather than a getter, following the per-owner orphan sweep,
+    /// which is handed one for the same reason: a getter hanging off a
+    /// per-owner manager would let a caller pair owner A's manager with owner
+    /// B's route, and a factory cannot be misused that way.
+    ///
+    /// On Linux every sandbox container lives on the host Docker daemon, there
+    /// is no gateway VM to own, and the uid is accepted and ignored — the same
+    /// shape `sandbox-core`'s gateway accessors take while per-operator
+    /// gateways are off.
+    gateway_docker_route: Box<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
     /// macOS only: socket_vmnet NIC slot pools, one per operator.
     ///
     /// Tracks which slots are in use by running Lima sessions and enforces
@@ -1367,29 +1390,29 @@ struct AppState {
     /// containers. After `ensure_ready` succeeds at startup, exposes
     /// the NIC map and the forwarded Docker socket path.
     ///
-    /// The manager is constructed once at startup (in `main()`) and
-    /// the same `Arc` is shared into every session create/start/stop/rm
-    /// handler that needs the forwarded socket path or the NIC map.
+    /// The manager is constructed once at startup (in `main()`). Handlers no
+    /// longer read it — they resolve the caller's gateway through
+    /// `gateway_lima_managers` below — and what is left are the background and
+    /// recovery paths that have no operator in hand: the per-session gateway
+    /// monitor, gateway crash recovery, the gateway health monitor, the
+    /// startup health seed, and the session-networking restore. Each of those
+    /// still speaks for the one gateway the daemon owns, and each is converted
+    /// separately because "which gateway" has a different answer in each.
     #[cfg(target_os = "macos")]
     gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager>,
     /// macOS only: one `GatewayLimaManager` per gateway-owning uid, built on
     /// first lookup.
     ///
-    /// Nothing reads this yet, and the `allow` says so rather than hiding it.
-    /// Every handler still reaches the gateway through `gateway_lima_manager`
-    /// above — the daemon's own — and that is correct for all of them today:
-    /// there is one gateway VM, it lives in the daemon's LIMA_HOME, and while
-    /// instances are named without an owner suffix a manager built for an
-    /// operator uid would go looking for that same name in *that operator's*
-    /// LIMA_HOME, where no gateway has been created. Routing a handler through
-    /// the registry now would change where it looks without there being
-    /// anything new to find.
+    /// Every handler that acts for a caller reaches its gateway through here,
+    /// via [`AppState::gateway_lima_manager_for_operator`] — never by handing
+    /// an operator uid straight to `get_or_create`, which would resolve to a
+    /// gateway that operator does not own while per-operator gateways are off.
     ///
-    /// It is held so the managers exist where the handlers will look for them,
-    /// and so the type is built on the real startup path rather than only in
-    /// its own tests.
+    /// While they are off, every uid collapses to the daemon's, so the map
+    /// holds the single entry the singleton above also names, and the two are
+    /// built from identical inputs: the same LIMA_HOME, the same executor, the
+    /// same Docker and in-VM routes.
     #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
     gateway_lima_managers: Arc<sandbox_core::GatewayLimaManagerRegistry>,
     /// macOS only: in-memory transient networking health per Running Lima session.
     ///
@@ -1456,6 +1479,57 @@ struct AppState {
     /// privileged helpers directly without an agent broker).
     #[cfg(target_os = "macos")]
     agent_registry: broker::AgentRegistry,
+}
+
+impl AppState {
+    /// The Docker route for the gateway that serves `operator_uid`'s sessions.
+    ///
+    /// The argument is the *operator's* uid, not the gateway owner's.
+    /// [`sandbox_core::gateway_owner_uid`] is what collapses one into the
+    /// other, and it is applied here rather than at each call site so the
+    /// switch stays in one function instead of at every handler that needs a
+    /// route. A site that skipped the collapse would still name the right
+    /// gateway *instance* while per-operator gateways are off — the instance
+    /// name collapses too — and would aim the route at that operator's agent
+    /// rather than at the daemon, which nothing about the name would reveal.
+    ///
+    /// While per-operator gateways are off, `gateway_owner_uid` answers
+    /// `getuid()` for every operator, so every caller gets the daemon's own
+    /// route. That it is the *same* route [`AppState::docker`] holds is not a
+    /// coincidence to be checked: startup builds that field by calling this
+    /// same factory at the daemon's uid, so the two are one expression's value.
+    ///
+    /// On Linux there is no gateway VM: every sandbox container lives on the
+    /// host Docker daemon, and the uid reaches a factory that ignores it.
+    fn docker_route_for_operator(&self, operator_uid: u32) -> sandbox_core::docker::DockerRoute {
+        #[cfg(target_os = "macos")]
+        let owner_uid = sandbox_core::gateway_owner_uid(operator_uid);
+        #[cfg(not(target_os = "macos"))]
+        let owner_uid = operator_uid;
+        (self.gateway_docker_route)(owner_uid)
+    }
+
+    /// The gateway Lima manager for the gateway that serves `operator_uid`'s
+    /// sessions.
+    ///
+    /// The operator-to-owner collapse is [`AppState::docker_route_for_operator`]'s,
+    /// for the same reasons and with the same consequences for a site that
+    /// skips it — a manager built straight from an operator uid would name the
+    /// right instance and hold the wrong LIMA_HOME and the wrong forwarded
+    /// Docker socket.
+    ///
+    /// The manager and the route are separate lookups on purpose. Both
+    /// collapse through `gateway_owner_uid`, so a handler that asks for each
+    /// with the same operator uid cannot end up with a manager for one gateway
+    /// and a route to another.
+    #[cfg(target_os = "macos")]
+    fn gateway_lima_manager_for_operator(
+        &self,
+        operator_uid: u32,
+    ) -> Arc<sandbox_core::GatewayLimaManager> {
+        self.gateway_lima_managers
+            .get_or_create(sandbox_core::gateway_owner_uid(operator_uid))
+    }
 }
 
 /// Look up the runtime for a given backend kind from the dispatch
@@ -2029,16 +2103,18 @@ async fn create_session(
     // without bouncing the daemon.
     //
     // On macOS there is no host Docker; the gateway image lives inside the
-    // persistent `sandboxd-gateway` Lima VM whose Docker is reachable only
-    // via the forwarded socket. `gateway_image_present_inside_lima` targets
-    // that forwarded socket directly, bypassing any ambient DOCKER_HOST.
+    // gateway Lima VM serving this operator, whose Docker is reachable only
+    // via that VM's forwarded socket. `gateway_image_present_inside_lima`
+    // targets the forwarded socket directly, bypassing any ambient
+    // DOCKER_HOST. Asking the operator's own gateway is the point: the image
+    // this request needs is the one on the VM the session will land on.
     // On Linux the image lives on host Docker and is checked via the
     // standard `gateway_image_present` path.
     let gateway_tag =
         sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     #[cfg(target_os = "macos")]
     let present_result = {
-        let glm = Arc::clone(&state.gateway_lima_manager);
+        let glm = state.gateway_lima_manager_for_operator(operator.uid);
         tokio::task::spawn_blocking(move || glm.gateway_image_present_inside_lima()).await
     };
     #[cfg(not(target_os = "macos"))]
@@ -2908,7 +2984,7 @@ async fn create_session(
             // Linux container backend: the host docker daemon. The macOS lite
             // path runs the same probe on its own route in
             // `create_session_macos_lite`.
-            let probe_route = state.docker.clone();
+            let probe_route = state.docker_route_for_operator(operator.uid);
             let probe_result = tokio::task::spawn_blocking(move || {
                 probe_container_sshd_ready(&container_name, &probe_route)
             })
@@ -4401,6 +4477,14 @@ async fn create_session_macos_lima(
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
     use sandbox_core::macos_session::{setup_macos_gateway, teardown_macos_gateway};
 
+    // The gateway serving this operator, resolved once for the whole handler.
+    // The NIC map this create reads its parent interface from, the gateway
+    // container it brings up, and the routes its rollback arms tear down with
+    // all have to name one gateway — resolving per site is one more place for
+    // them to disagree.
+    let gateway_lima = state.gateway_lima_manager_for_operator(operator.uid);
+    let docker_route = state.docker_route_for_operator(operator.uid);
+
     // Step 1: generate the per-session CA certificate.
     let ca_dir = {
         let base_dir = state.base_dir.clone();
@@ -4482,7 +4566,7 @@ async fn create_session_macos_lima(
     // carry the interface this session's macvlan would be parented on. Refuse
     // the create rather than invent a name.
     let nic_name = match sandbox_core::nic_from_verified_map(
-        state.gateway_lima_manager.nic_map().as_ref(),
+        gateway_lima.nic_map().as_ref(),
         vmnet_slot.index,
     ) {
         Ok(name) => name,
@@ -4523,7 +4607,7 @@ async fn create_session_macos_lima(
     let rollback = {
         let state2 = state.clone();
         let pool2 = vmnet_pool.clone();
-        let route = state.docker.clone();
+        let route = docker_route.clone();
         let sid = session_id;
         let op_name = operator.name.clone();
         let base_dir = state.base_dir.clone();
@@ -4748,7 +4832,7 @@ async fn create_session_macos_lima(
     // Steps 5-9: setup gateway (macvlan + container + deny-all + health + DNAT).
     // Must complete before limactl start (egress happens-before invariant).
     {
-        let gateway_route = state.docker.clone();
+        let gateway_route = docker_route.clone();
         let ni = network_info.clone();
         let nic = nic_name.clone();
         let dns = compute_initial_dns_policy(&req);
@@ -5013,9 +5097,20 @@ async fn create_session_macos_lima(
 /// bytes are non-secret and the bind holds no lock on them — a stale dir is
 /// reclaimed by the next VM reboot if cleanup fails). Used by the lite
 /// create/delete error and teardown ladders.
+///
+/// `owner_uid` names the gateway VM the staging dir lives in, and is an owner
+/// uid rather than an operator's — the caller has already collapsed it through
+/// [`sandbox_core::gateway_owner_uid`]. Every caller is a teardown arm inside
+/// one handler, which resolved the gateway once at its top; taking the uid as
+/// a parameter is what keeps those arms cleaning up the gateway the handler
+/// actually built on.
 #[cfg(target_os = "macos")]
-async fn cleanup_lite_stage_dir(state: &Arc<AppState>, session_id: &sandbox_core::SessionId) {
-    let glm = state.gateway_lima_manager.clone();
+async fn cleanup_lite_stage_dir(
+    state: &Arc<AppState>,
+    session_id: &sandbox_core::SessionId,
+    owner_uid: u32,
+) {
+    let glm = state.gateway_lima_managers.get_or_create(owner_uid);
     let sid_str = session_id.as_str().to_string();
     let _ = tokio::task::spawn_blocking(move || glm.cleanup_lite_session_files(&sid_str)).await;
 }
@@ -5098,10 +5193,18 @@ async fn create_session_macos_lite(
             return error_response(e).into_response();
         }
     };
-    let gateway_docker_socket = state
-        .gateway_lima_manager
-        .gateway_docker_socket()
-        .to_path_buf();
+    // The gateway serving this operator, resolved once for the whole handler.
+    //
+    // Every step below — the bridge inside the VM, the staged session files,
+    // the container's route, the gateway container itself — has to land on one
+    // gateway, and so does every arm of the teardown ladder that undoes them.
+    // Deriving the manager or the route again per step would be eighteen
+    // chances to name a different one, and the arms that got it wrong would
+    // leave resources behind on a gateway nothing else cleans up.
+    let gateway_owner = sandbox_core::gateway_owner_uid(operator.uid);
+    let gateway_lima = state.gateway_lima_manager_for_operator(operator.uid);
+    let docker_route = state.docker_route_for_operator(operator.uid);
+    let gateway_docker_socket = gateway_lima.gateway_docker_socket().to_path_buf();
 
     // `--no-gitignore` for the `local:` initial push. The generic
     // `create_session` already ran `validate_no_gitignore_against_workspace`
@@ -5119,7 +5222,7 @@ async fn create_session_macos_lite(
         ($err_resp:expr) => {{
             let _ = state
                 .network
-                .delete_network_on_route(&session_id, &state.docker);
+                .delete_network_on_route(&session_id, &docker_route);
             let _ = vmnet_pool.release_lite_token();
             let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
             let _ = state
@@ -5185,7 +5288,7 @@ async fn create_session_macos_lite(
     let network_info = {
         let network = state.network.clone();
         let sid = session_id;
-        let route = state.docker.clone();
+        let route = docker_route.clone();
         match tokio::task::spawn_blocking(move || network.create_network_on_route(&sid, &route))
             .await
         {
@@ -5336,7 +5439,7 @@ async fn create_session_macos_lite(
     // overwriting copies), so the restart path can call it again safely.
     // On error: delete network + remove CA + release token + mark Error.
     let vm_stage_dir = {
-        let glm = state.gateway_lima_manager.clone();
+        let glm = Arc::clone(&gateway_lima);
         let sid_str = session_id.as_str().to_string();
         let cert_src = ca_dir.join("cert.pem");
         let authorized_keys_src = ssh_host_dir.join("authorized_keys");
@@ -5419,15 +5522,15 @@ async fn create_session_macos_lite(
     // Fail-closed: propagate the error rather than proceeding to `docker create`,
     // which would surface a less actionable "No such image" from inside the VM.
     {
-        let glm = state.gateway_lima_manager.clone();
+        let glm = Arc::clone(&gateway_lima);
         match tokio::task::spawn_blocking(move || glm.load_lite_image_into_gateway()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 early_lite_cleanup_and_return!(error_response(e).into_response());
             }
             Err(e) => {
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 early_lite_cleanup_and_return!(
                     error_response(SandboxError::Internal(format!(
                         "task join error in load_lite_image_into_gateway: {e}"
@@ -5451,10 +5554,10 @@ async fn create_session_macos_lite(
         match runtime.create(&session_id, &spec).await {
             Ok(_) => {}
             Err(e) => {
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 let _ = state
                     .network
-                    .delete_network_on_route(&session_id, &state.docker);
+                    .delete_network_on_route(&session_id, &docker_route);
                 let _ = vmnet_pool.release_lite_token();
                 let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
                 let _ = state
@@ -5486,10 +5589,10 @@ async fn create_session_macos_lite(
             Err(e) => {
                 let runtime2 = runtime_for(&state, BackendKind::Container);
                 let _ = runtime2.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 let _ = state
                     .network
-                    .delete_network_on_route(&session_id, &state.docker);
+                    .delete_network_on_route(&session_id, &docker_route);
                 let _ = vmnet_pool.release_lite_token();
                 let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
                 let _ = state
@@ -5507,17 +5610,17 @@ async fn create_session_macos_lite(
     {
         let container_name = format!("sandbox-{session_id}");
         // Get the container's PID as seen from inside the gateway VM.
-        let vm_pid = match inspect_container_pid_on_route(&container_name, state.docker.clone())
+        let vm_pid = match inspect_container_pid_on_route(&container_name, docker_route.clone())
             .await
         {
             Ok(pid) => pid,
             Err(e) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
                 let _ = runtime.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 let _ = state
                     .network
-                    .delete_network_on_route(&session_id, &state.docker);
+                    .delete_network_on_route(&session_id, &docker_route);
                 let _ = vmnet_pool.release_lite_token();
                 let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
                 let _ = state
@@ -5529,7 +5632,7 @@ async fn create_session_macos_lite(
                 .into_response();
             }
         };
-        let glm = state.gateway_lima_manager.clone();
+        let glm = Arc::clone(&gateway_lima);
         // The op is typed, so a failing route install now arrives as one `Err`
         // carrying the helper's stderr rather than as a separate non-zero-exit
         // arm. The narrowing of the two values is fallible for reasons that are
@@ -5547,10 +5650,10 @@ async fn create_session_macos_lite(
             Ok(Err(e)) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
                 let _ = runtime.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 let _ = state
                     .network
-                    .delete_network_on_route(&session_id, &state.docker);
+                    .delete_network_on_route(&session_id, &docker_route);
                 let _ = vmnet_pool.release_lite_token();
                 let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
                 let _ = state
@@ -5564,10 +5667,10 @@ async fn create_session_macos_lite(
             Err(e) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
                 let _ = runtime.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 let _ = state
                     .network
-                    .delete_network_on_route(&session_id, &state.docker);
+                    .delete_network_on_route(&session_id, &docker_route);
                 let _ = vmnet_pool.release_lite_token();
                 let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
                 let _ = state
@@ -5589,7 +5692,7 @@ async fn create_session_macos_lite(
         // macOS lite: probe the container inside the gateway VM via the
         // forwarded socket. A host `docker exec` would report "No such
         // container".
-        let probe_route = state.docker.clone();
+        let probe_route = docker_route.clone();
         let probe_result = tokio::task::spawn_blocking(move || {
             probe_container_sshd_ready(&container_name, &probe_route)
         })
@@ -5636,7 +5739,7 @@ async fn create_session_macos_lite(
         let ca = ca_dir.clone();
         let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
         let sid = session_id;
-        let gateway_route = state.docker.clone();
+        let gateway_route = docker_route.clone();
         match tokio::task::spawn_blocking(move || {
             setup_macos_lite_gateway(
                 &sid,
@@ -5674,14 +5777,14 @@ async fn create_session_macos_lite(
             }
             Ok(Err(e)) => {
                 // Best-effort: stop gateway container (may not have started yet).
-                let gw = sandbox_core::GatewayManager::with_route(state.docker.clone());
+                let gw = sandbox_core::GatewayManager::with_route(docker_route.clone());
                 let _ = gw.stop_gateway(&session_id);
                 let runtime = runtime_for(&state, BackendKind::Container);
                 let _ = runtime.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 let _ = state
                     .network
-                    .delete_network_on_route(&session_id, &state.docker);
+                    .delete_network_on_route(&session_id, &docker_route);
                 let _ = vmnet_pool.release_lite_token();
                 let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
                 let _ = state
@@ -5692,10 +5795,10 @@ async fn create_session_macos_lite(
             Err(e) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
                 let _ = runtime.delete(&handle, operator.uid).await;
-                cleanup_lite_stage_dir(&state, &session_id).await;
+                cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
                 let _ = state
                     .network
-                    .delete_network_on_route(&session_id, &state.docker);
+                    .delete_network_on_route(&session_id, &docker_route);
                 let _ = vmnet_pool.release_lite_token();
                 let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
                 let _ = state
@@ -5721,14 +5824,14 @@ async fn create_session_macos_lite(
         .store
         .update_state(&session_id, &operator.name, SessionState::Running)
     {
-        let gw = sandbox_core::GatewayManager::with_route(state.docker.clone());
+        let gw = sandbox_core::GatewayManager::with_route(docker_route.clone());
         let _ = gw.stop_gateway(&session_id);
         let runtime = runtime_for(&state, BackendKind::Container);
         let _ = runtime.delete(&handle, operator.uid).await;
-        cleanup_lite_stage_dir(&state, &session_id).await;
+        cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
         let _ = state
             .network
-            .delete_network_on_route(&session_id, &state.docker);
+            .delete_network_on_route(&session_id, &docker_route);
         let _ = vmnet_pool.release_lite_token();
         let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
         let _ = state
@@ -5756,14 +5859,14 @@ async fn create_session_macos_lite(
     // macro so the ordering cannot drift between blocks.
     macro_rules! lite_provision_teardown_and_return {
         ($resp:expr) => {{
-            let gw = sandbox_core::GatewayManager::with_route(state.docker.clone());
+            let gw = sandbox_core::GatewayManager::with_route(docker_route.clone());
             let _ = gw.stop_gateway(&session_id);
             let runtime = runtime_for(&state, BackendKind::Container);
             let _ = runtime.delete(&handle, operator.uid).await;
-            cleanup_lite_stage_dir(&state, &session_id).await;
+            cleanup_lite_stage_dir(&state, &session_id, gateway_owner).await;
             let _ = state
                 .network
-                .delete_network_on_route(&session_id, &state.docker);
+                .delete_network_on_route(&session_id, &docker_route);
             let _ = vmnet_pool.release_lite_token();
             let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
             let _ = state
@@ -5858,7 +5961,7 @@ async fn create_session_macos_lite(
         let socket_str = gateway_docker_socket.to_string_lossy().to_string();
         match sandbox_core::workspace_rsync::run_initial_push(
             BackendKind::Container,
-            Some(&state.docker),
+            Some(&docker_route),
             Some(&socket_str),
             &session_name,
             host_path,
@@ -6050,12 +6153,19 @@ async fn start_session_macos_lite(
 
     let session_id = session.id;
 
+    // The gateway serving this operator, resolved once for the whole handler,
+    // for the reason the create path resolves it once: the bridge, the staged
+    // files, the gateway container and the container's route all have to land
+    // on one gateway.
+    let gateway_lima = state.gateway_lima_manager_for_operator(operator.uid);
+    let docker_route = state.docker_route_for_operator(operator.uid);
+
     // Step 1: Recreate the per-session Docker bridge network inside the gateway VM.
     // This is a no-op if the network already exists; if it was removed on stop, it
     // is recreated with the original subnet.
     {
         let network = state.network.clone();
-        let route = state.docker.clone();
+        let route = docker_route.clone();
         let sid = session_id;
         match tokio::task::spawn_blocking(move || network.ensure_network_on_route(&sid, &route))
             .await
@@ -6104,7 +6214,7 @@ async fn start_session_macos_lite(
     // (only the containers are removed/stopped), so the source bytes are still
     // on disk.
     {
-        let glm = state.gateway_lima_manager.clone();
+        let glm = Arc::clone(&gateway_lima);
         let sid_str = session_id.as_str().to_string();
         let ca_dir = CaManager::ca_dir(&state.base_dir, &session_id);
         let ssh_host_dir = state
@@ -6184,7 +6294,7 @@ async fn start_session_macos_lite(
     // that exists on the create path between docker-start and the route-helper).
     {
         let container_name = format!("sandbox-{session_id}");
-        let vm_pid = match inspect_container_pid_on_route(&container_name, state.docker.clone())
+        let vm_pid = match inspect_container_pid_on_route(&container_name, docker_route.clone())
             .await
         {
             Ok(pid) => pid,
@@ -6254,7 +6364,7 @@ async fn start_session_macos_lite(
             }
         };
 
-        let glm = state.gateway_lima_manager.clone();
+        let glm = Arc::clone(&gateway_lima);
         // Same shape as the create path: the typed op folds a non-zero exit and
         // a transport failure into one `Err` that carries the helper's stderr,
         // and the narrowing of the two values joins it.
@@ -6385,6 +6495,12 @@ async fn start_session_macos_lima(
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
     use sandbox_core::macos_session::{setup_macos_gateway, teardown_macos_gateway};
 
+    // The gateway serving this operator, resolved once for the whole handler,
+    // for the reason the create path resolves it once: the NIC map, the gateway
+    // container and the rollback arm all have to name one gateway.
+    let gateway_lima = state.gateway_lima_manager_for_operator(operator.uid);
+    let docker_route = state.docker_route_for_operator(operator.uid);
+
     let session_id = session.id;
     // A restart re-claims from the operator's pool, so a range reassigned
     // while the session was stopped takes effect here rather than silently
@@ -6413,7 +6529,7 @@ async fn start_session_macos_lima(
     // `bridge_name` names a *different* slot and is not a fallback — this site
     // resolves like create, from the verified map alone.
     let nic_name = match sandbox_core::nic_from_verified_map(
-        state.gateway_lima_manager.nic_map().as_ref(),
+        gateway_lima.nic_map().as_ref(),
         vmnet_slot.index,
     ) {
         Ok(name) => name,
@@ -6438,7 +6554,7 @@ async fn start_session_macos_lima(
 
     let rollback = {
         let pool2 = vmnet_pool.clone();
-        let route = state.docker.clone();
+        let route = docker_route.clone();
         let sid = session_id;
         move || {
             let pool2 = pool2.clone();
@@ -6531,7 +6647,7 @@ async fn start_session_macos_lima(
 
     // Steps 4-8: setup gateway (gateway-before-VM invariant).
     {
-        let gateway_route = state.docker.clone();
+        let gateway_route = docker_route.clone();
         let ni = network_info.clone();
         let nic = nic_name.clone();
         let owner_pool = format!(
@@ -7387,10 +7503,15 @@ async fn stop_session(
     // Everything else (Linux Lima + Container on all platforms): host Docker.
     #[cfg(target_os = "macos")]
     {
+        // The gateway this session was built on is the caller's — session
+        // lookup is owner-scoped, so the requester is that operator. Resolved
+        // once for both arms: tearing down against a different gateway finds
+        // none of this session's resources and reports success.
+        let docker_route = state.docker_route_for_operator(operator.uid);
         if session.backend == BackendKind::Lima {
             let sid = session.id;
             let vmnet_pool = state.vmnet_pools.clone();
-            let teardown_route = state.docker.clone();
+            let teardown_route = docker_route.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 debug!(session_id = %sid, "tearing down macOS session networking");
                 if let Err(e) =
@@ -7416,7 +7537,7 @@ async fn stop_session(
             // stop/start cycle, allowing over-admission.
             let network = state.network.clone();
             let sid = session.id;
-            let route = state.docker.clone();
+            let route = docker_route.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 debug!(session_id = %sid, "tearing down lite container session networking (macOS)");
                 // Use the VM-routed gateway manager so stop_gateway targets
@@ -7590,12 +7711,17 @@ async fn remove_session(
 
         #[cfg(target_os = "macos")]
         {
+            // The caller's gateway — the one this session was built on, since
+            // session lookup is owner-scoped — resolved once for both arms.
+            // A remove aimed at a different gateway finds nothing to remove
+            // and leaves the real resources behind, reporting success.
+            let docker_route = state.docker_route_for_operator(operator.uid);
             if session.backend == BackendKind::Lima {
                 // macOS Lima: tear down via the forwarded gateway socket + release the vmnet slot.
                 let sid = session.id;
                 let vmnet_pool = state.vmnet_pools.clone();
                 let base_dir = state.base_dir.clone();
-                let teardown_route = state.docker.clone();
+                let teardown_route = docker_route.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     debug!(session_id = %sid, "tearing down macOS session networking (full cleanup)");
                     if let Err(e) =
@@ -7614,7 +7740,7 @@ async fn remove_session(
             } else {
                 // Container (lite) backend on macOS: tear down via forwarded
                 // gateway socket + release the session-count token.
-                let glm = state.gateway_lima_manager.clone();
+                let glm = state.gateway_lima_manager_for_operator(operator.uid);
                 let vmnet_pool = state.vmnet_pools.clone();
                 // A token is a count, so releasing one needs the operator
                 // whose quota it came out of. Session access is owner-scoped,
@@ -7623,12 +7749,13 @@ async fn remove_session(
                 let network = state.network.clone();
                 let base_dir = state.base_dir.clone();
                 let sid = session.id;
-                // Clone the socket for the network delete before the gateway
-                // manager consumes the original — the per-session bridge lives
-                // inside the gateway VM, so a host `docker network rm` would be
-                // a silent no-op and leak the VM network.
-                let net_delete_route = state.docker.clone();
-                let gw_route = state.docker.clone();
+                // Two clones of the one route: the gateway manager consumes
+                // what it is given, and the network delete needs the same
+                // destination — the per-session bridge lives inside the
+                // gateway VM, so a host `docker network rm` would be a silent
+                // no-op and leak the VM network.
+                let net_delete_route = docker_route.clone();
+                let gw_route = docker_route.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     debug!(session_id = %sid, "tearing down lite container session networking (macOS, full cleanup)");
                     let gw = sandbox_core::GatewayManager::with_route(gw_route);
@@ -10496,7 +10623,7 @@ async fn session_health(
         // On macOS the per-session bridge lives inside the gateway VM, so the
         // inspect goes wherever the route points; a host `docker network
         // inspect` would never find it.
-        let route = state.docker.clone();
+        let route = state.docker_route_for_operator(operator.uid);
         tokio::task::spawn_blocking(move || {
             route
                 .run(
@@ -10689,10 +10816,16 @@ async fn get_proxy(
     // other Docker operation: the host daemon on Linux, the operator's VM on
     // macOS. It holds no socket path of its own, so it cannot disagree with
     // the route about which Docker daemon the session's container lives in.
+    //
+    // Resolving the route here is what keeps that true. The proxy receives an
+    // operator *name*, not a uid, so it cannot resolve a gateway itself — it
+    // uses whatever route it was handed. Handing it the caller's own gateway
+    // route is therefore the only place the pump can be pointed at the Docker
+    // daemon actually hosting the session's container.
     let proxy_state = Arc::new(sandboxd::proxy_http::ProxyState {
         store: Arc::clone(&state.store),
         lima_registry: Arc::clone(state.lima_runtime.registry()),
-        docker: state.docker.clone(),
+        docker: state.docker_route_for_operator(operator.uid),
     });
     match sandboxd::proxy_http::handle_proxy(proxy_state, operator.name, id, ws).await {
         Ok(resp) => resp.into_response(),
@@ -10975,12 +11108,18 @@ async fn diagnostics_handler(
     // outcome.
     //
     // On macOS there is no host Docker. Both the gateway image and the lite
-    // image live inside the `sandboxd-gateway` Lima VM; probes route through
-    // the forwarded socket so they succeed on production hosts where
+    // image live inside a gateway Lima VM; probes route through that VM's
+    // forwarded socket so they succeed on production hosts where
     // /var/run/docker.sock does not exist.
+    //
+    // Both image-presence fields are **caller-scoped**: they answer "can the
+    // operator asking this create a session right now", so they probe the
+    // gateway that operator's sessions would land on, not some host-wide one.
+    // An operator whose own gateway is missing an image needs to see that, and
+    // reporting another gateway's images would tell them the opposite.
     #[cfg(target_os = "macos")]
     let gateway_probe = {
-        let glm = Arc::clone(&state.gateway_lima_manager);
+        let glm = state.gateway_lima_manager_for_operator(operator.uid);
         let join =
             tokio::task::spawn_blocking(move || glm.gateway_image_present_inside_lima()).await;
         match join {
@@ -11011,7 +11150,7 @@ async fn diagnostics_handler(
     };
     #[cfg(target_os = "macos")]
     let lite_probe = {
-        let glm = Arc::clone(&state.gateway_lima_manager);
+        let glm = state.gateway_lima_manager_for_operator(operator.uid);
         let join = tokio::task::spawn_blocking(move || glm.lite_image_present_inside_lima()).await;
         match join {
             Ok(Ok(true)) => (true, None),
@@ -11246,7 +11385,12 @@ async fn diagnostics_handler(
         // `instance_state()` returns "Running"/"Stopped"/"None"; we fold
         // the docker-health probe into a single coarse verdict the doctor
         // row consumes: running / stopped / absent / error.
-        let glm = state.gateway_lima_manager.clone();
+        //
+        // **Caller-scoped**: the state of the gateway serving the operator who
+        // asked. Doctor's row exists to tell that operator whether their own
+        // sessions can run, which a verdict about a gateway they never touch
+        // would answer wrongly in both directions.
+        let glm = state.gateway_lima_manager_for_operator(operator.uid);
         let gateway_lima_state = tokio::task::spawn_blocking(move || match glm.instance_state() {
             Ok(s) if s == "Running" => match glm.probe_docker_health() {
                 Ok(true) => "running".to_string(),
@@ -11354,7 +11498,14 @@ async fn diagnostics_handler(
         // Gateway image inside the gateway Lima instance (forwarded
         // docker socket), with the same three-state contract the
         // host-side gateway-image probe uses.
-        let glm2 = state.gateway_lima_manager.clone();
+        //
+        // **Caller-scoped**, like the image probes above: the image that
+        // matters is the one on the gateway this operator's next create would
+        // use. The expected *tag* beside it is daemon-wide by construction —
+        // it is derived from the daemon's own version, so every gateway is
+        // expected to carry the same one — and is read from the same manager
+        // only because that is where the derivation lives.
+        let glm2 = state.gateway_lima_manager_for_operator(operator.uid);
         let (image_present, image_probe_error) =
             tokio::task::spawn_blocking(move || match glm2.gateway_image_present_inside_lima() {
                 Ok(true) => (true, None),
@@ -11366,7 +11517,9 @@ async fn diagnostics_handler(
                 false,
                 Some("daemon-side probe task failed to run".to_string()),
             ));
-        let expected_tag = state.gateway_lima_manager.expected_gateway_image_tag();
+        let expected_tag = state
+            .gateway_lima_manager_for_operator(operator.uid)
+            .expected_gateway_image_tag();
         fields.push((
             "gateway_image_tag_inside_lima",
             serde_json::json!(if image_present {
@@ -11429,7 +11582,18 @@ async fn diagnostics_handler(
         // gateway instance). Probe failure leaves the field null so the
         // doctor row can render a "probe failed" skip rather than a
         // false "too old" verdict.
-        let glm3 = state.gateway_lima_manager.clone();
+        //
+        // **Host-scoped, not caller-scoped** — the one field here that is.
+        // `lima_version` runs `limactl --version` in this process and reads
+        // nothing off the manager it is called on, so every manager returns
+        // the same string; the daemon's own gateway owner is named to say
+        // which answer this is rather than to pick one. Doctor compares it
+        // against the daemon's minimum supported Lima, which is a property of
+        // the host install, so a per-caller answer would be the same number
+        // dressed up as something narrower.
+        let glm3 = state
+            .gateway_lima_managers
+            .get_or_create(sandbox_core::gateway_owner_uid(state.daemon_uid));
         let lima_version = tokio::task::spawn_blocking(move || glm3.lima_version().ok())
             .await
             .ok()
@@ -13992,17 +14156,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Every container-, network-, volume- and image-lifecycle docker call
-    // routes through here. Linux talks to the host daemon in-process; macOS
-    // names the uid whose VM hosts the Docker daemon and the executor that
-    // reaches it.
+    // routes through a route built here. Linux talks to the host daemon
+    // in-process; macOS names the uid whose VM hosts the Docker daemon and the
+    // executor that reaches it. The broker executor routes per call by the uid
+    // it is handed, so one instance serves every gateway owner and the uid is
+    // the only thing that varies between their routes.
     #[cfg(target_os = "macos")]
-    let docker_route = sandbox_core::docker::DockerRoute::Vm {
-        op_uid: daemon_uid,
-        executor: Arc::clone(broker_executor.as_ref().expect("set by the executor block"))
-            as Arc<dyn sandbox_core::docker::DockerExecutor>,
+    let gateway_docker_route: Box<
+        dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
+    > = {
+        let executor = Arc::clone(broker_executor.as_ref().expect("set by the executor block"))
+            as Arc<dyn sandbox_core::docker::DockerExecutor>;
+        Box::new(move |owner_uid| sandbox_core::docker::DockerRoute::Vm {
+            op_uid: owner_uid,
+            executor: Arc::clone(&executor),
+        })
     };
+    // On Linux there is no gateway VM and nothing to own one: every route is
+    // the host daemon's, and the uid is ignored.
     #[cfg(not(target_os = "macos"))]
-    let docker_route = sandbox_core::docker::DockerRoute::Host;
+    let gateway_docker_route: Box<
+        dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
+    > = Box::new(|_owner_uid| sandbox_core::docker::DockerRoute::Host);
+
+    // The daemon's own route: the same construction, for the uid this process
+    // runs as. Deriving it here rather than building a second one is what makes
+    // it impossible for the two to disagree — while per-operator gateways are
+    // off, `gateway_owner_uid` answers `getuid()` for every operator, which is
+    // this uid, so every handler's route is this very expression's value.
+    let docker_route = gateway_docker_route(daemon_uid);
 
     // Build the per-operator LimaManager registry. One LimaManager per
     // operator uid, created lazily on first session-create. All limactl
@@ -14896,6 +15078,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store,
         runtimes,
         docker: docker_route.clone(),
+        gateway_docker_route,
         lima_runtime,
         container_runtime,
         guest,
