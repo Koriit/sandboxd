@@ -649,6 +649,20 @@ pub fn reap_lima_orphans(
 /// was never made. The same VMs are deleted either way — this narrows the
 /// scan, it does not widen it.
 ///
+/// # Why this is macOS-only
+///
+/// That premise is, so this is. On Linux the pivot needs nothing from the
+/// operator — `sandbox-lima-helper` gates on its *caller* and then becomes
+/// whichever uid it was asked for — so every operator with a LIMA_HOME can be
+/// listed at any time and "unreachable operator" names nothing. Compiled
+/// there, this would narrow the scan to whatever uids a caller happened to
+/// pass and quietly stop collecting orphans for everyone else, with the
+/// section above reading like a licence for it. Linux wants
+/// [`reap_lima_orphans`], which scans the whole tree; reaching for this one
+/// instead means first answering what `reachable` could mean where nothing is
+/// unreachable. The Docker counterpart,
+/// `backend::reap_orphans_per_gateway_owner`, is gated for the same reason.
+///
 /// # `live` stays the global union
 ///
 /// `reachable` narrows *whose VMs are examined* and must never narrow the set
@@ -659,6 +673,7 @@ pub fn reap_lima_orphans(
 /// must not, and the two land together looking symmetric. They are not: the
 /// asymmetry is the difference between a session's VM surviving and being
 /// deleted.
+#[cfg(target_os = "macos")]
 pub fn reap_lima_orphans_for_operators(
     registry: &LimaManagerRegistry,
     reachable: &[u32],
@@ -676,6 +691,7 @@ pub fn reap_lima_orphans_for_operators(
 /// Both conditions are necessary and neither implies the other. An operator
 /// with VMs on disk who is not reachable cannot be listed; a reachable
 /// operator with nothing on disk has nothing to list.
+#[cfg(target_os = "macos")]
 fn scan_scoped_to_reachable(on_disk: Vec<u32>, reachable: &[u32]) -> Vec<u32> {
     on_disk
         .into_iter()
@@ -7066,6 +7082,7 @@ mod tests {
 
     /// An operator with VMs on disk is not scanned while the daemon cannot
     /// reach them — the pass that would have listed them can only fail.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_unreachable_operator_on_disk_is_not_scanned() {
         assert_eq!(
@@ -7077,6 +7094,7 @@ mod tests {
     /// A reachable operator with no LIMA_HOME is not scanned either. Asking
     /// for their manager would create the directory, so the disk decides what
     /// exists and reachability only narrows it.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_reachable_operator_with_no_lima_home_is_not_scanned() {
         assert!(scan_scoped_to_reachable(vec![1001], &[1001, 1002]).contains(&1001));
@@ -7084,6 +7102,7 @@ mod tests {
     }
 
     /// Nobody reachable is nobody scanned — not everybody.
+    #[cfg(target_os = "macos")]
     #[test]
     fn no_reachable_operators_scans_nothing() {
         assert!(scan_scoped_to_reachable(vec![1001, 1002], &[]).is_empty());
