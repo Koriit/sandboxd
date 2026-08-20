@@ -2462,13 +2462,16 @@ fn lima_op_to_broker_op(
                     yaml_path.display()
                 ))
             })?;
-            // The qemu-wrapper path is not part of LimaOp::Create on macOS —
-            // the daemon resolves it and embeds it in the YAML content.
-            // We use a sentinel that the agent validation accepts for gateway
-            // instances. For session VMs on macOS the qemu-wrapper path will
-            // be embedded in the YAML by the caller before this runs.
-            // Pass an empty string; the agent's YAML validation checks for the
-            // wrapper reference inside the lima_yaml content, not separately.
+            // `LimaOp::Create` carries no qemu-wrapper field, and the empty
+            // string is the accurate value rather than a sentinel standing in
+            // for one: the wrapper never travels inside `lima_yaml`. The macOS
+            // template generator writes no reference to it, and no validator
+            // reads `lima_yaml` looking for one — a wrapper is validated from
+            // the `qemu_wrapper` field alone. It reaches Lima as the
+            // `QEMU_SYSTEM_AARCH64` environment variable on the `limactl`
+            // invocation, and on this one there is nothing for it to act on:
+            // `limactl create` provisions the instance directory without
+            // booting QEMU.
             BrokerOp::Create {
                 op_uid,
                 vm: vm.to_string(),

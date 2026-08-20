@@ -965,12 +965,15 @@ async fn handle_create(
     if let Err(reason) = validation::validate_cidr_owner("owner", &owner) {
         return BrokerResult::Rejected { reason };
     }
-    // The qemu_wrapper field is empty for Create: the daemon embeds the wrapper
-    // reference inside the rendered lima.yaml, which is shape-validated below.
-    // The wrapper is a Start-time concern (QEMU_SYSTEM_AARCH64 env var); for
-    // Create, limactl only provisions the instance directory — it does not boot
-    // a QEMU process. Skipping validation when empty avoids rejecting every
-    // operator session-create where no wrapper path is separately supplied.
+    // The qemu_wrapper field is empty on the brokered Create path, because the
+    // daemon-side op it is translated from carries no wrapper to forward. The
+    // wrapper is not hiding in the rendered lima.yaml either — it is never part
+    // of that content, and the shape validation below does not look for it. It
+    // travels as the QEMU_SYSTEM_AARCH64 environment variable set on the
+    // `limactl` invocation, and on this one it has nothing to act on: `limactl
+    // create` provisions the instance directory without booting a QEMU process.
+    // Validating only a non-empty value is what keeps every operator
+    // session-create from being rejected.
     if !qemu_wrapper.is_empty() {
         if let Err(reason) = validation::validate_qemu_wrapper(&qemu_wrapper) {
             return BrokerResult::Rejected { reason };
