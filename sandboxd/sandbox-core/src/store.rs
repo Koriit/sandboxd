@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -231,78 +230,27 @@ impl SessionStore {
     }
 
     /// Substrate-orphan scan emitted exactly once on the boot where
-    /// V006 is freshly applied. Enumerates Lima VMs, Docker containers,
-    /// volumes, networks, and `{base_dir}/sessions/<id>/` directories
-    /// matching the daemon's `sandbox-*` naming conventions, and logs
-    /// one `warn!` line per found orphan plus a summary line.
+    /// V006 is freshly applied. Logs one `warn!` line per found orphan
+    /// plus a summary line.
     ///
     /// **Diagnostic only.** The scan never deletes — that is the
     /// operator's call once they have read the log lines.
+    ///
+    /// Of the substrates it was written to enumerate, only
+    /// `{base_dir}/sessions/<id>/` directories still are: both
+    /// [`Self::v006_scan_lima_vms`] and [`Self::v006_scan_docker_resource`]
+    /// are stubs that log why they cannot answer and return zero. Each
+    /// needs a per-operator route the store does not have while it is
+    /// being opened — see the two functions for the specific reason. The
+    /// call shape is kept so the surrounding code and the migration SQL
+    /// do not change with them.
     fn run_v006_orphan_scan(base_dir: &Path) {
         let mut found: u32 = 0;
 
         found += Self::v006_scan_lima_vms();
-        found += Self::v006_scan_docker_resource(
-            "container",
-            &[
-                "ps",
-                "-a",
-                "--filter",
-                "name=sandbox-",
-                "--format",
-                "{{.Names}} {{.Status}}",
-            ],
-            |line| {
-                let mut parts = line.splitn(2, ' ');
-                let name = parts.next()?.trim().to_string();
-                if !name.starts_with("sandbox-") {
-                    return None;
-                }
-                let status = parts.next().unwrap_or("unknown").trim().to_string();
-                Some((name, status))
-            },
-            "Docker container",
-        );
-        found += Self::v006_scan_docker_resource(
-            "volume",
-            &[
-                "volume",
-                "ls",
-                "--filter",
-                "name=sandbox-home-",
-                "--format",
-                "{{.Name}}",
-            ],
-            |line| {
-                let name = line.trim().to_string();
-                if name.starts_with("sandbox-home-") {
-                    Some((name, String::new()))
-                } else {
-                    None
-                }
-            },
-            "Docker volume",
-        );
-        found += Self::v006_scan_docker_resource(
-            "network",
-            &[
-                "network",
-                "ls",
-                "--filter",
-                "name=sandbox-net-",
-                "--format",
-                "{{.Name}}",
-            ],
-            |line| {
-                let name = line.trim().to_string();
-                if name.starts_with("sandbox-net-") {
-                    Some((name, String::new()))
-                } else {
-                    None
-                }
-            },
-            "Docker network",
-        );
+        found += Self::v006_scan_docker_resource("container");
+        found += Self::v006_scan_docker_resource("volume");
+        found += Self::v006_scan_docker_resource("network");
         found += Self::v006_scan_session_directories(base_dir);
 
         warn!(
@@ -335,54 +283,50 @@ impl SessionStore {
         0
     }
 
-    /// Run a `docker ...` command and parse one orphan per output
-    /// line. The `parse` callback returns `(name, status_string)` for
-    /// matching lines or `None` to skip. Returns the count of orphans
-    /// logged.
-    fn v006_scan_docker_resource(
-        kind: &str,
-        args: &[&str],
-        parse: impl Fn(&str) -> Option<(String, String)>,
-        label: &str,
-    ) -> u32 {
-        let output = match Command::new("docker").args(args).output() {
-            Ok(o) if o.status.success() => o,
-            Ok(_) | Err(_) => {
-                warn!(
-                    event = "v006_orphan_scan_tool_unavailable",
-                    tool = "docker",
-                    kind = kind,
-                    "V006 orphan scan: docker is unavailable or failed; \
-                     skipping {kind} enumeration"
-                );
-                return 0;
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut found = 0u32;
-        for line in stdout.lines() {
-            if let Some((name, status)) = parse(line) {
-                if status.is_empty() {
-                    warn!(
-                        event = "v006_orphan_docker",
-                        kind = kind,
-                        name = %name,
-                        "orphaned {label} after V006: {name}"
-                    );
-                } else {
-                    warn!(
-                        event = "v006_orphan_docker",
-                        kind = kind,
-                        name = %name,
-                        status = %status,
-                        "orphaned {label} after V006: {name} (status: {status})"
-                    );
-                }
-                found += 1;
-            }
-        }
-        found
+    /// Docker orphan scan for V006, by resource kind. Neutralized: it
+    /// enumerated the wrong Docker daemon.
+    ///
+    /// It shelled out to `docker` with no `-H` and no environment override,
+    /// so which daemon it reached was decided by this process's environment.
+    /// On macOS the Docker daemon holding sandbox containers, volumes and
+    /// networks runs *inside the gateway Lima VM* and is reached over a
+    /// forwarded socket; a bare `docker` reaches the host's Docker, if the
+    /// host has one at all, and enumerates `sandbox-*` resources that are
+    /// not the daemon's — or finds nothing and reports no orphans on a host
+    /// that has them. Picking the right daemon needs a
+    /// [`crate::docker::DockerRoute`], and `SessionStore::new` runs long
+    /// before the daemon has built one.
+    ///
+    /// # Not a logged-out-operator problem
+    ///
+    /// This is a "which daemon", not a "whose daemon", and the ordering
+    /// rules the second reading out rather than merely arguing against it:
+    /// the scan is reached from `SessionStore::new`, which returns before
+    /// the agent-broker socket is bound. At scan time no operator has
+    /// checked in, none can have, and there is no check-in or logout state
+    /// in existence to consult.
+    ///
+    /// # Why neutered rather than routed
+    ///
+    /// On a host where the bare command does reach the daemon holding
+    /// sandbox resources, this scan was right — so what it lost is real,
+    /// and small: it is diagnostic, it deletes nothing, and it runs on
+    /// exactly one boot, the one where V006 is first applied. Routing it
+    /// would mean giving the store a Docker route it has no other use for,
+    /// at a point in startup where the route does not yet exist. The stub
+    /// keeps [`Self::run_v006_orphan_scan`] and the migration SQL unchanged,
+    /// matching [`Self::v006_scan_lima_vms`].
+    fn v006_scan_docker_resource(kind: &str) -> u32 {
+        warn!(
+            event = "v006_orphan_scan_docker_skipped",
+            kind = kind,
+            "V006 Docker {kind} orphan scan skipped: a bare `docker` reaches \
+             whichever daemon this process's environment names, which on macOS \
+             is not the one inside the gateway VM that holds sandbox \
+             resources. Selecting it needs a Docker route the store does not \
+             have at open time."
+        );
+        0
     }
 
     /// Enumerate `{base_dir}/sessions/<id>/` directories and
@@ -4425,20 +4369,16 @@ mod tests {
     ///   * One `v006_orphan_session_dir` `warn!` per seeded directory,
     ///     carrying the directory's path in the `path` field.
     ///   * One `v006_orphan_scan_complete` summary `warn!` with
-    ///     `orphan_count` ≥ the per-directory event count (additional
-    ///     orphans may surface from `limactl`/`docker` when those tools
-    ///     happen to be present and list `sandbox-*` resources on the
-    ///     host; the scan logs and continues either way).
+    ///     `orphan_count` ≥ the per-directory event count.
     ///
-    /// Why the integration prefix on a hermetic test: the host may
-    /// have `limactl`/`docker` installed and may list real `sandbox-*`
-    /// VMs/containers/volumes/networks alongside the seeded fixtures.
-    /// The hermetic default profile would still pass, but running this
-    /// test alongside other tests that create real `sandbox-{id}`
-    /// substrate would yield false positives in the summary count
-    /// assertion. Running under the integration profile gives the
-    /// test access to the `docker-sandbox-namespace` serialization
-    /// group so it does not race those tests.
+    /// Why the integration prefix and the lower bounds: both were put
+    /// here when the scan still shelled out to `limactl` and `docker`,
+    /// which on a host that had them would list real `sandbox-*`
+    /// resources alongside the seeded fixtures and race any test that
+    /// created some. The integration profile's
+    /// `docker-sandbox-namespace` serialization group is what kept the
+    /// two apart. Both enumerators are stubs now, so nothing outside
+    /// this test's `base_dir` can reach it.
     #[test]
     fn integration_v006_orphan_scan_logs_each_found_orphan() {
         use std::sync::{Arc, Mutex as StdMutex};
@@ -4449,10 +4389,8 @@ mod tests {
         /// Captures every `warn!` event whose `event` field is one of
         /// the V006-orphan-scan markers, plus its discriminating field
         /// (`path` for the per-directory event, `orphan_count` for the
-        /// summary). Other tracing events (and tool-unavailable warnings
-        /// emitted when `limactl`/`docker` are missing on the test host)
-        /// are recorded too, so the test can assert *additional* events
-        /// did not fire.
+        /// summary). Other tracing events are recorded too, so the test
+        /// can assert *additional* events did not fire.
         #[derive(Clone, Default)]
         struct EventLog {
             /// (event_name, path_or_count_as_string)
@@ -4596,10 +4534,7 @@ mod tests {
         );
 
         // (b) Exactly one summary `v006_orphan_scan_complete` event,
-        // with `orphan_count` ≥ the number of seeded directories. (The
-        // host may surface additional `sandbox-*` resources from
-        // `limactl`/`docker`; we assert the lower bound rather than
-        // exact equality to stay portable across hosts.)
+        // with `orphan_count` ≥ the number of seeded directories.
         let summary_events: Vec<&(String, String)> = entries
             .iter()
             .filter(|(name, _)| name == "v006_orphan_scan_complete")
