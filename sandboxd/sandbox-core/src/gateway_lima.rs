@@ -61,9 +61,12 @@
 ///   upstream nameservers
 /// - Allow established/related INPUT (return traffic for DNS + upstream)
 ///
-/// No `forward` chain, so gateway-container traffic — which traverses `forward`
-/// and Docker's NAT — is not governed here at all; the per-session ruleset in
-/// each container's own netns is what judges that.
+/// No `forward` chain, so this table holds no rule that can match a packet
+/// traversing `forward` — that much is structural. That gateway-container
+/// traffic is what traverses `forward`, rather than this table's `output`, is
+/// the routing step, and nothing on this host has measured it: it follows from
+/// standard netfilter semantics and is very likely true. What judges session
+/// traffic is the per-session ruleset in each container's own netns.
 ///
 /// The gateway VM's `eth0` is NEVER `restrict=on` — it is the sanctioned egress
 /// uplink. This nft policy is its defense-in-depth control, not a block.
@@ -1867,13 +1870,18 @@ impl GatewayLimaManager {
     /// the VM host namespace — [`generate_gateway_eth0_nft_policy`] carries
     /// the detail.
     ///
-    /// It does **not** govern session egress. The table declares no `forward`
-    /// chain, and a gateway container's traffic traverses `forward` and
-    /// Docker's NAT; what judges that traffic is the per-session
-    /// `sandbox_dnat`/`sandbox_policy` ruleset in the container's own netns,
-    /// which this path never touches. A failure here therefore removes no
-    /// constraint on session egress, because this table imposes none — and it
-    /// is equally no evidence that session egress *is* constrained, which
+    /// It is not what governs session egress — a claim that is part measured
+    /// and part not. Measured: the table declares no `forward` chain, so it
+    /// holds no rule that can match a packet traversing `forward`. Not
+    /// measured: that a gateway container's traffic is what traverses
+    /// `forward` rather than this table's `output`. That step follows from
+    /// standard netfilter semantics and is very likely true; it has not been
+    /// observed on this host, and an attempt to establish it from the session
+    /// record was audited on 2026-08-20 and found not to. What judges session
+    /// traffic is the per-session `sandbox_dnat`/`sandbox_policy` ruleset in
+    /// the container's own netns, which this path never touches. So what a
+    /// failure here removes is the bound on the VM's own host-namespace
+    /// egress — and it is no evidence either way about session egress, which
     /// turns on the per-session ruleset and is not observable from here. A
     /// security threshold meant to be about session egress must be set on the
     /// per-session pipeline rather than on this call.
