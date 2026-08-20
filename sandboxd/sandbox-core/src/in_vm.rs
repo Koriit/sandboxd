@@ -74,15 +74,22 @@ pub enum InVmOp {
     // -- Egress plane --------------------------------------------------------
     /// Apply the gateway VM's `eth0` default-drop nftables baseline.
     ///
-    /// **This op is the egress-enforcement path.** `ruleset` is the policy
-    /// itself, delivered to `nft -f -` on standard input where nothing parses
-    /// it as a command line. See
+    /// `ruleset` is the policy itself, delivered to `nft -f -` on standard
+    /// input where nothing parses it as a command line. See
     /// [`sandbox_invm_argv::vm::apply_nft_baseline_argv`] for why stdin rather
     /// than an argv or a file, and what each of those alternatives got wrong.
     ///
-    /// A failure here must fail the caller. An unapplied baseline is not a
-    /// degraded gateway — it is a gateway whose uplink forwards whatever it is
-    /// handed, and nothing inside the sandbox can tell.
+    /// A failure here must fail the caller. What goes missing is the bound on
+    /// the gateway VM's *own host-namespace* egress — the table has no
+    /// `forward` chain and does not govern session traffic, which the
+    /// per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway
+    /// container's netns judges instead. So a failure is not a sandbox with
+    /// unrestricted egress; it is the loss of the blast-radius bound on a
+    /// component that escapes a container netns into the VM. Two paths install
+    /// that table and nothing at runtime re-checks it, so a failure logged and
+    /// swallowed here leaves a running VM without the bound and nothing that
+    /// would notice. `sandbox_core::gateway_lima`'s `apply_eth0_nft_policy`
+    /// spells out both halves.
     ApplyNftBaseline { ruleset: String },
 
     // -- Route-helper provisioning -------------------------------------------
@@ -134,12 +141,15 @@ pub enum InVmOp {
     /// Install a sandbox container's default route, by running the provisioned
     /// `sandbox-route-helper` inside the gateway VM.
     ///
-    /// **This op is the other half of the egress-enforcement path.**
-    /// [`Self::ApplyNftBaseline`] makes the gateway drop what policy forbids;
-    /// this one is what makes the sandbox's traffic arrive at the gateway in
-    /// the first place. A wrong value here does not fail loudly — it produces a
-    /// container whose packets leave by some other route, with nothing inside
-    /// the sandbox able to tell.
+    /// **This op is what puts a sandbox's traffic in front of the gateway's
+    /// policy.** What decides where that traffic may go is the per-session
+    /// `sandbox_dnat`/`sandbox_policy` ruleset in the gateway container's own
+    /// netns; this decides whether the traffic arrives there to be judged at
+    /// all. [`Self::ApplyNftBaseline`] is a different bound — the gateway VM's
+    /// own host-namespace egress — and does not govern session traffic. A
+    /// wrong value here does not fail loudly: it produces a container whose
+    /// packets leave by some other route, with nothing inside the sandbox able
+    /// to tell.
     ///
     /// The two values are typed rather than stringly for that reason: a `u32`
     /// pid cannot render a leading `-` and so can never be read as a flag by

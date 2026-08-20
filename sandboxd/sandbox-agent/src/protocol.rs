@@ -956,10 +956,14 @@ pub enum InVmOp {
     /// Apply the VM's `eth0` default-drop nftables baseline, the ruleset
     /// arriving on `nft`'s standard input.
     ///
-    /// **This is the egress-enforcement op in this set.** The body is the
-    /// policy: multi-KB, full of newlines, and read as content by a parser
-    /// rather than as a command line by anything. It travels as a JSON string
-    /// field on the newline-delimited channel for the same reason
+    /// The baseline bounds the VM's *own host-namespace* egress. It declares
+    /// no `forward` chain and does not govern session traffic, which the
+    /// per-session `sandbox_dnat`/`sandbox_policy` ruleset in each gateway
+    /// container's netns judges instead.
+    ///
+    /// The body is the policy: multi-KB, full of newlines, and read as content
+    /// by a parser rather than as a command line by anything. It travels as a
+    /// JSON string field on the newline-delimited channel for the same reason
     /// [`DockerOp::ContainerExecStdin`]'s does, and is safe for the same
     /// reason — JSON string encoding is what escapes the frame delimiter.
     ApplyNftBaseline { ruleset: String },
@@ -1002,10 +1006,13 @@ pub enum InVmOp {
     /// Run the provisioned `sandbox-route-helper` to install a sandbox
     /// container's default route.
     ///
-    /// **This is the other egress-enforcement op in this set.**
-    /// [`InVmOp::ApplyNftBaseline`] decides what the gateway drops; this
-    /// decides whether the sandbox's packets reach the gateway to be judged at
-    /// all. A wrong `gateway_ip` produces a container that routes elsewhere and
+    /// **This is what puts a sandbox's traffic in front of the gateway's
+    /// policy.** What decides where that traffic may go is the per-session
+    /// `sandbox_dnat`/`sandbox_policy` ruleset in the gateway container's own
+    /// netns; this decides whether the sandbox's packets reach it to be judged
+    /// at all. [`InVmOp::ApplyNftBaseline`] is a different bound — the gateway
+    /// VM's own host-namespace egress — and does not govern session traffic. A
+    /// wrong `gateway_ip` produces a container that routes elsewhere and
     /// reports no error.
     ///
     /// Both fields are typed rather than stringly, and that is the whole of

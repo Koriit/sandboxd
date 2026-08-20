@@ -1852,14 +1852,31 @@ impl GatewayLimaManager {
     /// Apply the baseline default-drop egress nft policy on the gateway VM's
     /// `eth0` NIC.
     ///
-    /// # This is the egress-enforcement path
+    /// # What this ruleset governs, and what it does not
     ///
-    /// The ruleset applied here is what makes the gateway VM's uplink refuse
-    /// anything the session policy did not allow. If it does not land, the
-    /// session still comes up, the containers still talk to the gateway, and
-    /// the uplink forwards whatever it is handed — a failure invisible from
-    /// inside the sandbox. So the error is returned, never logged and
-    /// swallowed, and `ensure_ready` fails with it.
+    /// It governs the gateway VM's *own host-namespace* traffic on `eth0`: an
+    /// `output` chain that defaults to drop and admits only DNS, HTTP and
+    /// HTTPS (plus loopback, established/related, and every interface that is
+    /// not `eth0`), and an `input` chain that drops new and invalid inbound on
+    /// `eth0` while leaving every other interface alone. That
+    /// is a blast-radius bound on a component escaping a container netns into
+    /// the VM host namespace — [`generate_gateway_eth0_nft_policy`] carries
+    /// the detail.
+    ///
+    /// It does **not** govern session egress. The table declares no `forward`
+    /// chain, and a gateway container's traffic traverses `forward` and
+    /// Docker's NAT; what judges that traffic is the per-session
+    /// `sandbox_dnat`/`sandbox_policy` ruleset in the container's own netns,
+    /// which this path never touches. A failure here is therefore not a
+    /// sandbox with unrestricted egress, and a security threshold that means
+    /// to be about session egress must be set on the per-session pipeline
+    /// rather than on this call.
+    ///
+    /// The error is still returned rather than logged and swallowed, and
+    /// `ensure_ready` fails with it. The bound is a security property, and
+    /// only two paths establish it — `ensure_ready` and
+    /// `restart_instance_for_recovery` — so a failure swallowed here leaves a
+    /// running VM without it and nothing that would notice.
     ///
     /// The ruleset reaches `nft` on standard input, unmodified from its
     /// generator. See [`InVmOp::ApplyNftBaseline`] and
@@ -1887,10 +1904,11 @@ impl GatewayLimaManager {
     /// Install a sandbox container's default route by running the provisioned
     /// `sandbox-route-helper` inside the gateway VM.
     ///
-    /// This is the second half of the egress promise. [`Self::apply_nft_baseline`]
-    /// decides what the gateway forwards; this decides whether the container's
-    /// packets reach the gateway to be judged at all. Both must succeed for a
-    /// session to be contained, and a failure here has to fail the caller —
+    /// This is the second half of the egress promise. The per-session
+    /// `sandbox_dnat`/`sandbox_policy` ruleset in the gateway container's netns
+    /// decides what a sandbox's traffic is allowed to do; this decides whether
+    /// that traffic reaches the gateway to be judged at all. Both must succeed
+    /// for a session to be contained, and a failure here has to fail the caller —
     /// a container with the wrong default route is not a degraded sandbox, it
     /// is an uncontained one that reports success.
     ///
