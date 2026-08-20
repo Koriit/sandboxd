@@ -129,11 +129,12 @@ pub use gateway::{
 #[cfg(target_os = "macos")]
 pub use gateway_lima::{
     EGRESS_BRIDGE_NAME, GATEWAY_INSTANCE_NAME, GatewayLimaManager, IpLinkEntry, MIN_LIMA_VERSION,
-    NicMap, PoolResizeDecision, UBUNTU_NOBLE_ARM64_URL, VMNET_LAUNCH_DAEMONS_DIR,
-    count_reachable_slot_sockets, count_vmnet_plists, decide_pool_resize,
-    discover_nics_from_ip_json, generate_gateway_eth0_nft_policy, generate_gateway_template,
-    nic_from_record_or_map, nic_from_verified_map, observe_vmnet_daemon_set,
-    slot_for_persisted_session, slot_interface_name,
+    NicMap, PER_OPERATOR_GATEWAY_ENV, PoolResizeDecision, UBUNTU_NOBLE_ARM64_URL,
+    VMNET_LAUNCH_DAEMONS_DIR, count_reachable_slot_sockets, count_vmnet_plists, decide_pool_resize,
+    discover_nics_from_ip_json, gateway_instance_name, generate_gateway_eth0_nft_policy,
+    generate_gateway_template, nic_from_record_or_map, nic_from_verified_map,
+    observe_vmnet_daemon_set, per_operator_gateway_enabled, slot_for_persisted_session,
+    slot_interface_name,
 };
 pub use gateway_recovery::{
     GatewayRecoveringGuard, GatewayRecoveryDeps, run_bounded_recovery, run_gateway_recovery,

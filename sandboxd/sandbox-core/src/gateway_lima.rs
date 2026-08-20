@@ -97,8 +97,36 @@ use sandbox_invm_argv::lite_stage::{LiteStageFile, stage_dir as lite_stage_dir};
 // ---------------------------------------------------------------------------
 
 /// Lima instance name for the daemon-owned gateway VM.
+///
+/// This is the *unsuffixed* form: the name the one daemon-owned gateway carries
+/// while [`PER_OPERATOR_GATEWAY_ENV`] is off, which is every install today.
+/// New call sites should derive the name from an owner uid via
+/// [`gateway_instance_name`] instead of reading this constant — a site that
+/// reads the constant is pinned to the single-gateway arrangement and has to be
+/// found again when the switch is thrown.
 #[cfg(target_os = "macos")]
 pub const GATEWAY_INSTANCE_NAME: &str = "sandboxd-gateway";
+
+/// Environment variable that selects per-operator gateway VMs.
+///
+/// Off — the default, and the arrangement every install runs today — means one
+/// daemon-owned gateway named [`GATEWAY_INSTANCE_NAME`]. On means one gateway
+/// per operator, each named `sandboxd-gateway-<owner_uid>`.
+///
+/// Only an explicit affirmative turns it on; unset, empty, `0` and anything
+/// unrecognised all mean off. The asymmetry is deliberate: off is the
+/// arrangement the host is already running, so a typo or a half-written
+/// deployment script leaves it there rather than silently splitting the gateway
+/// in two. See [`per_operator_gateway_enabled`] for the accepted spellings.
+///
+/// One thing to know before grepping for a gateway by name: the in-VM nftables
+/// table that governs the gateway's `eth0` egress is called
+/// `sandboxd-gateway-eth0`, so `sandboxd-gateway-<something>` names two
+/// different kinds of object once the suffix exists — a Lima instance on the
+/// host and an nft table inside the VM. They cannot collide (an owner uid is a
+/// `u32` and can never spell `eth0`), but a bare grep returns both.
+#[cfg(target_os = "macos")]
+pub const PER_OPERATOR_GATEWAY_ENV: &str = "SANDBOX_PER_OPERATOR_GATEWAY";
 
 /// Docker bridge name created inside the gateway Lima VM for upstream egress.
 /// All gateway containers attach to this bridge as their default route.
@@ -219,6 +247,63 @@ const ROUTE_HELPER_COPY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for staging a per-session lite container file into the gateway VM.
 #[cfg(target_os = "macos")]
 const LITE_FILE_STAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Instance naming
+// ---------------------------------------------------------------------------
+
+/// Whether per-operator gateway VMs are selected, per [`PER_OPERATOR_GATEWAY_ENV`].
+///
+/// Accepted affirmatives, case-insensitive and surrounding whitespace ignored:
+/// `1`, `true`, `yes`, `on`. Every other value — including an absent variable,
+/// an empty one, `0`, and a value that is not valid UTF-8 — is off.
+#[cfg(target_os = "macos")]
+pub fn per_operator_gateway_enabled() -> bool {
+    match std::env::var(PER_OPERATOR_GATEWAY_ENV) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Lima instance name for the gateway VM owned by `owner_uid`.
+///
+/// With [`PER_OPERATOR_GATEWAY_ENV`] off — the default — every owner gets
+/// [`GATEWAY_INSTANCE_NAME`] verbatim, because there is one gateway and the
+/// daemon owns it. `owner_uid` is accepted and ignored in that mode on purpose:
+/// it lets a call site be written once, in the form it will keep, while the
+/// switch is still off. With the switch on the name gains a `-<owner_uid>`
+/// suffix, so a single `limactl list`-shaped view of the host can say which
+/// operator each gateway belongs to — which an unsuffixed name cannot the
+/// moment two operators are present.
+///
+/// Both forms are disjoint from the session-VM grammar in `lima.rs`
+/// (`sandbox-<session-id>`) on both of the axes that matter to the Lima orphan
+/// reaper: neither carries `VM_NAME_PREFIX`, and neither parses as a session
+/// name. That disjointness is a coincidence of two independently chosen names
+/// rather than something either grammar enforces, so
+/// `gateway_names_are_disjoint_from_the_session_vm_grammar` pins it instead of
+/// leaving it to hold by luck.
+#[cfg(target_os = "macos")]
+pub fn gateway_instance_name(owner_uid: u32) -> String {
+    gateway_instance_name_in_mode(owner_uid, per_operator_gateway_enabled())
+}
+
+/// [`gateway_instance_name`] with the mode supplied rather than read from the
+/// environment.
+///
+/// Split out so both modes are reachable from a test without a process-global
+/// variable deciding which one runs.
+#[cfg(target_os = "macos")]
+fn gateway_instance_name_in_mode(owner_uid: u32, per_operator: bool) -> String {
+    if per_operator {
+        format!("{GATEWAY_INSTANCE_NAME}-{owner_uid}")
+    } else {
+        GATEWAY_INSTANCE_NAME.to_string()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // NIC map
@@ -3377,6 +3462,171 @@ mod tests {
             0
         );
         assert!(slot_for_persisted_session(&network_info_with_slot(None, "lima0")).is_err());
+    }
+
+    // -- Instance naming -------------------------------------------------------
+
+    /// Owner uids the naming tests sweep: the boundaries, the macOS first-user
+    /// value, a daemon-uid-shaped value, and widths of 1 through 10 digits.
+    const NAMING_UIDS: [u32; 9] = [0, 1, 309, 501, 1000, 12345, 98765, 4294967294, u32::MAX];
+
+    /// With the switch off the derived name is the existing constant, byte for
+    /// byte, for every owner uid.
+    ///
+    /// This is the whole of the compatibility claim the switch rests on. Every
+    /// site that names the gateway instance — the daemon's own `limactl` ops,
+    /// the forwarded Docker socket path under it, the four `sandbox doctor`
+    /// strings, the e2e fixtures and the docs — keeps working only because this
+    /// equality holds, and none of them would fail visibly at the moment it
+    /// stopped: they would name a VM that does not exist. So it is asserted
+    /// rather than argued.
+    #[test]
+    fn gateway_instance_name_with_the_switch_off_is_the_unsuffixed_constant() {
+        for uid in NAMING_UIDS {
+            assert_eq!(
+                gateway_instance_name_in_mode(uid, false),
+                GATEWAY_INSTANCE_NAME,
+                "with per-operator gateways off, owner uid {uid} must not change the \
+                 instance name"
+            );
+        }
+    }
+
+    /// With the switch on the name identifies its owner, and is still something
+    /// `limactl` will accept as an instance name.
+    ///
+    /// The charset and length bounds are the agent's `validate_vm_name` rule
+    /// (`^[a-zA-Z0-9_-]{1,64}$`, no leading dash), restated here because a
+    /// gateway created through the broker is held to it and the check lives in
+    /// a crate this one deliberately cannot depend on.
+    #[test]
+    fn per_operator_gateway_names_identify_their_owner() {
+        let mut seen: Vec<String> = Vec::new();
+        for uid in NAMING_UIDS {
+            let name = gateway_instance_name_in_mode(uid, true);
+
+            assert_eq!(
+                name.strip_prefix(GATEWAY_INSTANCE_NAME),
+                Some(format!("-{uid}").as_str()),
+                "a per-operator gateway name is the unsuffixed name plus the owner uid"
+            );
+            assert!(
+                !seen.contains(&name),
+                "two owner uids produced the same gateway name {name}"
+            );
+            assert!(
+                !name.starts_with('-') && name.len() <= 64,
+                "{name} is not admissible as a limactl instance name"
+            );
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{name} carries a character limactl instance names do not admit"
+            );
+            seen.push(name);
+        }
+    }
+
+    /// The switch is off unless something explicitly turned it on.
+    ///
+    /// Both halves matter and they fail differently. An affirmative that is not
+    /// recognised leaves an operator who asked for per-operator gateways with a
+    /// shared one; a non-affirmative that is recognised as `true` splits a
+    /// working single-gateway host in two. The table pins both directions,
+    /// including the `0` and empty-string spellings that a shell script is most
+    /// likely to produce by accident.
+    ///
+    /// This test mutates the process environment. `cargo nextest` — the runner
+    /// this workspace uses — gives each test its own process, which is what
+    /// keeps that from racing the crate's other env-reading tests.
+    #[test]
+    fn per_operator_gateway_switch_is_off_unless_explicitly_affirmative() {
+        let prior = std::env::var_os(PER_OPERATOR_GATEWAY_ENV);
+
+        // Absent is off, and the derived name is the unsuffixed constant — the
+        // switch-off identity through the real entry point rather than through
+        // the mode-taking one.
+        unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) };
+        assert!(
+            !per_operator_gateway_enabled(),
+            "an absent {PER_OPERATOR_GATEWAY_ENV} must leave per-operator gateways off"
+        );
+        for uid in NAMING_UIDS {
+            assert_eq!(
+                gateway_instance_name(uid),
+                GATEWAY_INSTANCE_NAME,
+                "with {PER_OPERATOR_GATEWAY_ENV} absent the derived name must be the constant"
+            );
+        }
+
+        for off in ["", " ", "0", "false", "no", "off", "maybe", "2", "trueish"] {
+            unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, off) };
+            assert!(
+                !per_operator_gateway_enabled(),
+                "{PER_OPERATOR_GATEWAY_ENV}={off:?} must not turn per-operator gateways on"
+            );
+            assert_eq!(
+                gateway_instance_name(501),
+                GATEWAY_INSTANCE_NAME,
+                "{PER_OPERATOR_GATEWAY_ENV}={off:?} must not change the derived name"
+            );
+        }
+
+        for on in ["1", "true", "TRUE", "True", "yes", "YES", "on", " true\n"] {
+            unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, on) };
+            assert!(
+                per_operator_gateway_enabled(),
+                "{PER_OPERATOR_GATEWAY_ENV}={on:?} must turn per-operator gateways on"
+            );
+            assert_eq!(
+                gateway_instance_name(501),
+                format!("{GATEWAY_INSTANCE_NAME}-501"),
+                "{PER_OPERATOR_GATEWAY_ENV}={on:?} must select the per-operator name"
+            );
+        }
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, value) },
+            None => unsafe { std::env::remove_var(PER_OPERATOR_GATEWAY_ENV) },
+        }
+    }
+
+    /// No gateway instance name, in either mode, can be mistaken for a session
+    /// VM by the Lima orphan reaper.
+    ///
+    /// The reaper reaches a VM through two gates in sequence: `list_vms` drops
+    /// any name without `VM_NAME_PREFIX`, and the classifier needs
+    /// `parse_session_id_from_name` to yield an id. A gateway name clears
+    /// neither, which is why the reaper has never deleted a gateway VM.
+    ///
+    /// Both gates hold today by coincidence — `sandboxd-` and `sandbox-` differ
+    /// at their eighth byte, and nothing in either module says the two grammars
+    /// must stay apart. This test is deliberately **not** a test of any
+    /// exclusion the reaper may grow: removing such an exclusion leaves it
+    /// green, because the gateway VM would still survive on the grammars alone.
+    /// What it fails on is either grammar moving — a gateway name that starts
+    /// carrying the session prefix, or a session-id parser that widens to admit
+    /// one — which is the change that would actually arm the reaper against the
+    /// gateway, silently, on a host where it currently cannot fire.
+    #[test]
+    fn gateway_names_are_disjoint_from_the_session_vm_grammar() {
+        use crate::lima::{VM_NAME_PREFIX, parse_session_id_from_name};
+
+        for per_operator in [false, true] {
+            for uid in NAMING_UIDS {
+                let name = gateway_instance_name_in_mode(uid, per_operator);
+                assert!(
+                    !name.starts_with(VM_NAME_PREFIX),
+                    "gateway name {name} carries the session-VM prefix {VM_NAME_PREFIX:?}, \
+                     so the reaper's candidate filter would admit it"
+                );
+                assert!(
+                    parse_session_id_from_name(&name).is_none(),
+                    "gateway name {name} parses as a session id, so the reaper would \
+                     classify it as a session VM"
+                );
+            }
+        }
     }
 
     // -- LIMA_HOME path depth (§ UNIX_PATH_MAX) --------------------------------
