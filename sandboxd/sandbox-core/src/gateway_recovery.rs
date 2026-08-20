@@ -628,6 +628,40 @@ impl<D: GatewayRecoveryDeps> GatewayRecoveryDeps for RecoveryShardDeps<'_, D> {
 // run_gateway_recovery
 // ---------------------------------------------------------------------------
 
+/// What one [`run_gateway_recovery`] pass did to the gateway it drove.
+///
+/// # Why the caller cannot infer this from a health probe
+///
+/// Because a gateway can answer a health probe and still be one this run
+/// failed to restore. `restart_instance_for_recovery` reaches most of its
+/// failure exits *after* the restarted instance's Docker daemon has already
+/// answered — re-verifying the slot NICs, re-establishing the egress bridge
+/// and re-applying the eth0 baseline policy all run past that point, and any
+/// of them can fail. A caller that polls the daemon and calls in when the poll
+/// fails will therefore see a healthy instance, ask for nothing, and never
+/// learn that the sessions this run tagged `Degraded` still have no gateway
+/// container. Returning the outcome is what lets the caller owe a retry to
+/// something other than its probe.
+///
+/// `#[must_use]` for that reason: a call site that drops this value has
+/// re-created the defect it was added to close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum GatewayRecoveryOutcome {
+    /// The gateway was restarted, and the per-session pass ran against it.
+    ///
+    /// Says nothing about the individual sessions: one of them failing to
+    /// come back is reported per-session (`Error` + a log line), not here.
+    GatewayRestarted,
+    /// The gateway was not restarted, so nothing this run tagged `Degraded`
+    /// has been repaired.
+    ///
+    /// Every session it tagged is still `Degraded`, with no gateway container
+    /// and nothing scheduled to rebuild one. A caller that does not schedule
+    /// another attempt leaves them that way for as long as the daemon runs.
+    GatewayNotRestarted,
+}
+
 /// Orchestrate a full gateway-Lima recovery, driving the networking-status
 /// state machine from **Degraded** → **Recovering** → **Healthy**.
 ///
@@ -644,8 +678,10 @@ impl<D: GatewayRecoveryDeps> GatewayRecoveryDeps for RecoveryShardDeps<'_, D> {
 /// 2. Snapshot all Running Lima sessions (`deps.list_sessions()` +
 ///    [`sessions_to_recover`]) and tag each `Degraded` in `networking_status`.
 /// 3. Restart the gateway Lima instance (`restart_gateway().await`).
-///    On failure: leave sessions `Degraded` and return — the monitor will
-///    re-trigger on the next tick.
+///    On failure: leave sessions `Degraded` and return
+///    [`GatewayRecoveryOutcome::GatewayNotRestarted`]. Nothing here retries,
+///    and nothing here decides when anything will — that is the returned
+///    value's job.
 /// 4. For each session (bounded concurrency, `max_concurrent` at a time):
 ///    tag `Recovering`, fetch network info (absent → mark Error + skip),
 ///    spawn `per_session_recover(id, owner, info)`, then on success remove
@@ -667,6 +703,16 @@ impl<D: GatewayRecoveryDeps> GatewayRecoveryDeps for RecoveryShardDeps<'_, D> {
 /// - `on_session_success` — called after a successful per-session recovery
 ///   (spawn ingestor, re-apply policy — daemon-specific side-effects).
 /// - `max_concurrent` — maximum number of simultaneous per-session tasks.
+///
+/// ## Returns
+///
+/// Whether the gateway was restarted — see [`GatewayRecoveryOutcome`], which
+/// is also where the reason the caller needs telling lives.
+/// [`GatewayRecoveryOutcome::GatewayNotRestarted`] covers two ways of not
+/// restarting it: the restart itself failing, and a session list that could
+/// not be read, which returns before the restart is attempted. What the caller
+/// acts on is the same either way — nothing was repaired and another attempt
+/// is owed.
 pub async fn run_gateway_recovery<Deps, RestartFut, SessionFut, SuccessFut>(
     deps: &Deps,
     networking_status: Arc<tokio::sync::Mutex<HashMap<SessionId, NetworkingStatus>>>,
@@ -675,7 +721,8 @@ pub async fn run_gateway_recovery<Deps, RestartFut, SessionFut, SuccessFut>(
     mut per_session_recover: impl FnMut(SessionId, String, NetworkInfo) -> SessionFut,
     mut on_session_success: impl FnMut(SessionId, String) -> SuccessFut,
     max_concurrent: usize,
-) where
+) -> GatewayRecoveryOutcome
+where
     Deps: GatewayRecoveryDeps,
     RestartFut: Future<Output = Result<(), String>>,
     SessionFut: Future<Output = (SessionId, String, Result<(), String>)> + Send + 'static,
@@ -690,7 +737,10 @@ pub async fn run_gateway_recovery<Deps, RestartFut, SessionFut, SuccessFut>(
         Ok(s) => sessions_to_recover(s),
         Err(e) => {
             error!(error = %e, "gateway Lima recovery: failed to list sessions");
-            return;
+            // The gateway was not restarted — this returns above the restart —
+            // so the caller is owed another attempt exactly as it is when the
+            // restart itself fails.
+            return GatewayRecoveryOutcome::GatewayNotRestarted;
         }
     };
 
@@ -708,17 +758,16 @@ pub async fn run_gateway_recovery<Deps, RestartFut, SessionFut, SuccessFut>(
             info!("gateway Lima recovery: instance restarted and Docker daemon ready");
         }
         Err(e) => {
-            // Includes the 90 s readiness timeout: leave the sessions Degraded
-            // and return. When to try again is the caller's monitor's decision
-            // and it is not that monitor's next poll — `gateway_lima_monitor`
-            // needs a run of consecutive failing probes and resets that count
-            // before it calls in, so a retry is several polls away. The
-            // figures live with that loop rather than being restated here.
+            // Includes the readiness timeout waiting for the instance's Docker
+            // daemon. Leave the sessions Degraded and hand the caller the one
+            // fact it cannot obtain any other way: nothing was restored. When
+            // to try again is the caller's decision — see
+            // `GatewayRecoveryOutcome` for why its health probe cannot make it.
             error!(
                 error = %e,
                 "gateway Lima recovery: instance restart failed; sessions remain Degraded"
             );
-            return;
+            return GatewayRecoveryOutcome::GatewayNotRestarted;
         }
     }
 
@@ -820,6 +869,7 @@ pub async fn run_gateway_recovery<Deps, RestartFut, SessionFut, SuccessFut>(
 
     info!("gateway Lima recovery: complete");
     // _guard drops here, clearing the recovering latch.
+    GatewayRecoveryOutcome::GatewayRestarted
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,9 +1309,13 @@ mod tests {
     /// A gateway with nothing running on it is still handed back as a shard,
     /// so the caller has something to restart.
     ///
-    /// This is the case a crash-recovery is for: the gateway is down, which is
-    /// why its sessions are not there to name it. Shards derived from the
-    /// sessions alone would be empty here and the crashed gateway would stay
+    /// An empty candidate list is not evidence the gateway is well. Nothing
+    /// about a gateway crash empties it — [`sessions_to_recover`] filters on
+    /// the persisted `state` and `backend` columns and a crash writes neither
+    /// — so an owner with nothing `Running` on their gateway right now is
+    /// indistinguishable here from an owner whose gateway never went down. The
+    /// gateway is still theirs and can still be the one that did. Shards
+    /// derived from the sessions alone would be empty here and it would stay
     /// down while whatever noticed the crash kept re-triggering.
     #[test]
     fn per_operator_ownership_yields_a_shard_for_a_carried_owner_with_no_sessions() {
@@ -1509,7 +1563,7 @@ mod tests {
         let recovered: Arc<Mutex<Vec<SessionId>>> = Arc::new(Mutex::new(Vec::new()));
         let rec = Arc::clone(&recovered);
 
-        run_gateway_recovery(
+        let outcome = run_gateway_recovery(
             &shard,
             Arc::clone(&networking_status),
             latch,
@@ -1526,6 +1580,11 @@ mod tests {
         )
         .await;
 
+        assert_eq!(
+            outcome,
+            GatewayRecoveryOutcome::GatewayRestarted,
+            "a run whose restart thunk succeeded reports the gateway restarted"
+        );
         assert_eq!(
             *recovered.lock().unwrap(),
             vec![mine_id],
@@ -1974,7 +2033,7 @@ mod tests {
         let success_called: Arc<Mutex<Vec<SessionId>>> = Arc::new(Mutex::new(Vec::new()));
         let sc = Arc::clone(&success_called);
 
-        run_gateway_recovery(
+        let outcome = run_gateway_recovery(
             &deps,
             Arc::clone(&networking_status),
             Arc::clone(&latch),
@@ -1998,6 +2057,12 @@ mod tests {
             8,
         )
         .await;
+
+        assert_eq!(
+            outcome,
+            GatewayRecoveryOutcome::GatewayRestarted,
+            "a run whose restart thunk succeeded reports the gateway restarted"
+        );
 
         // Session must be Recovering at the time the recovery task runs.
         assert_eq!(
@@ -2055,7 +2120,7 @@ mod tests {
         let success_called: Arc<Mutex<Vec<SessionId>>> = Arc::new(Mutex::new(Vec::new()));
         let sc = Arc::clone(&success_called);
 
-        run_gateway_recovery(
+        let outcome = run_gateway_recovery(
             &deps,
             Arc::clone(&networking_status),
             Arc::clone(&latch),
@@ -2077,6 +2142,12 @@ mod tests {
             8,
         )
         .await;
+
+        assert_eq!(
+            outcome,
+            GatewayRecoveryOutcome::GatewayRestarted,
+            "one session failing to come back does not make this a gateway that was not restarted"
+        );
 
         // All sessions must be absent from the map after the run.
         let map = networking_status.lock().await;
@@ -2136,7 +2207,7 @@ mod tests {
         };
 
         // First run.
-        run_gateway_recovery(
+        let first = run_gateway_recovery(
             &deps,
             Arc::clone(&networking_status),
             Arc::clone(&latch),
@@ -2163,7 +2234,7 @@ mod tests {
         );
 
         // Second run with the same deps (sessions still Running in the stub).
-        run_gateway_recovery(
+        let second = run_gateway_recovery(
             &deps,
             Arc::clone(&networking_status),
             Arc::clone(&latch),
@@ -2173,6 +2244,15 @@ mod tests {
             8,
         )
         .await;
+
+        assert_eq!(
+            (first, second),
+            (
+                GatewayRecoveryOutcome::GatewayRestarted,
+                GatewayRecoveryOutcome::GatewayRestarted
+            ),
+            "a second run over already-recovered sessions is still a restarted gateway"
+        );
 
         // After second run: all sessions still Healthy, latch still clear.
         {
@@ -2203,7 +2283,7 @@ mod tests {
         let per_session_called = Arc::new(AtomicUsize::new(0));
         let psc = Arc::clone(&per_session_called);
 
-        run_gateway_recovery(
+        let outcome = run_gateway_recovery(
             &deps,
             Arc::clone(&networking_status),
             Arc::clone(&latch),
@@ -2216,6 +2296,13 @@ mod tests {
             8,
         )
         .await;
+
+        assert_eq!(
+            outcome,
+            GatewayRecoveryOutcome::GatewayNotRestarted,
+            "a failed restart must say so: the sessions below stay Degraded until \
+             someone runs this again, and nothing else tells the caller that"
+        );
 
         // Session must remain Degraded (still in the map).
         assert_eq!(
@@ -2254,7 +2341,7 @@ mod tests {
         let success_called: Arc<Mutex<Vec<SessionId>>> = Arc::new(Mutex::new(Vec::new()));
         let sc = Arc::clone(&success_called);
 
-        run_gateway_recovery(
+        let outcome = run_gateway_recovery(
             &deps,
             Arc::clone(&networking_status),
             Arc::clone(&latch),
@@ -2269,6 +2356,13 @@ mod tests {
             8,
         )
         .await;
+
+        assert_eq!(
+            outcome,
+            GatewayRecoveryOutcome::GatewayRestarted,
+            "a session skipped for missing network info does not make this a gateway \
+             that was not restarted"
+        );
 
         // The session with info must be Healthy (absent from map).
         assert!(

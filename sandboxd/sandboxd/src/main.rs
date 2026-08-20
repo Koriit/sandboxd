@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 use axum::{
     Extension, Json, Router,
@@ -13036,7 +13038,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
 /// sandbox VM owned by an operator — those are managed independently by their
 /// operators' agents.
 #[cfg(target_os = "macos")]
-async fn recover_gateway_lima(state: &Arc<AppState>) {
+async fn recover_gateway_lima(state: &Arc<AppState>) -> sandbox_core::GatewayRecoveryOutcome {
     let store = Arc::clone(&state.store);
 
     // Read the candidates once, here, rather than once per shard: two reads
@@ -13046,7 +13048,11 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
         Ok(all) => sandbox_core::sessions_to_recover(all),
         Err(e) => {
             error!(error = %e, "gateway Lima recovery: failed to list sessions");
-            return;
+            // No shard ran, so no gateway was restarted. Reported as such
+            // rather than as a completed pass: the instance that made the
+            // monitor call in is still in whatever state it was, and a caller
+            // told otherwise would stop asking.
+            return sandbox_core::GatewayRecoveryOutcome::GatewayNotRestarted;
         }
     };
 
@@ -13069,9 +13075,23 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
         report_declined_sessions(declined, &mut statuses, &state.gateway_recovery_declines);
     }
 
+    // One shard left unrestarted makes the whole pass one that owes a retry:
+    // the caller's schedule is per-daemon, not per-shard, so the strongest
+    // thing it can honour is "something here still needs another attempt".
+    // Under `Shared` there is exactly one shard and this is that shard's
+    // answer. A pass with no shards at all drove no gateway and so left none
+    // unrestarted — it reports a restarted gateway, which is the accurate
+    // answer to the only question the value is asked ("is another attempt
+    // owed?") and is unreachable here, since `Shared` always yields a shard.
+    let mut outcome = sandbox_core::GatewayRecoveryOutcome::GatewayRestarted;
     for shard in shards {
-        recover_one_gateway(state, &store, shard).await;
+        if recover_one_gateway(state, &store, shard).await
+            == sandbox_core::GatewayRecoveryOutcome::GatewayNotRestarted
+        {
+            outcome = sandbox_core::GatewayRecoveryOutcome::GatewayNotRestarted;
+        }
     }
+    outcome
 }
 
 /// Report the sessions a recovery could not attribute to any gateway.
@@ -13135,7 +13155,7 @@ async fn recover_one_gateway(
     state: &Arc<AppState>,
     store: &Arc<sandbox_core::SessionStore>,
     shard: sandbox_core::RecoveryShard,
-) {
+) -> sandbox_core::GatewayRecoveryOutcome {
     use sandbox_core::NetworkInfo;
 
     let shard_deps = sandbox_core::RecoveryShardDeps::new(store, shard.sessions);
@@ -13281,7 +13301,7 @@ async fn recover_one_gateway(
         },
         8, // max_concurrent
     )
-    .await;
+    .await
 }
 
 /// How often `gateway_lima_monitor` probes the gateway instance.
@@ -13293,43 +13313,174 @@ const GATEWAY_LIMA_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const GATEWAY_LIMA_FAILURE_THRESHOLD: u32 = 3;
 
-/// How long a failed recovery leaves its sessions Degraded before the monitor
-/// tries again.
+/// The shortest a failed recovery leaves its sessions Degraded before the
+/// monitor tries again — the first step of [`gateway_lima_retry_backoff`].
 ///
 /// Derived rather than written down, so it cannot drift from the loop's two
-/// figures: the counter is reset before the recovery call, so the next trigger
-/// is a whole threshold of failing probes away. A floor, not a promise — a
-/// probe that errors is not counted as a failure, which pushes the retry out
-/// further.
+/// figures. It is the time a full threshold of failing probes takes, which is
+/// what the monitor would have waited had a probe been able to see the failure
+/// at all.
 #[cfg(target_os = "macos")]
 fn gateway_lima_retry_delay() -> Duration {
     GATEWAY_LIMA_PROBE_INTERVAL * GATEWAY_LIMA_FAILURE_THRESHOLD
 }
 
+/// The longest the monitor waits between attempts at a recovery that keeps
+/// failing.
+#[cfg(target_os = "macos")]
+const GATEWAY_LIMA_MAX_RETRY_DELAY: Duration = Duration::from_secs(600);
+
+/// How long to wait before the `n`th consecutive re-attempt at a recovery that
+/// failed, `n` counting from 1.
+///
+/// [`gateway_lima_retry_delay`], doubled per consecutive failure, capped at
+/// [`GATEWAY_LIMA_MAX_RETRY_DELAY`]. Backoff rather than a flat retry because
+/// an attempt is a force-stop and restart of the gateway VM, which takes every
+/// gateway container on it down with it. A fault that will not clear by itself
+/// — a NIC that is no longer there, an image that will not start — would
+/// otherwise have the monitor doing that every half-minute for as long as the
+/// daemon runs, and a session is worse off being torn down repeatedly than
+/// waiting.
+///
+/// It never stops retrying, at any `n`: a bound on the number of attempts
+/// would hand a Degraded session's gateway back to whatever else happens to
+/// notice, which is the situation this schedule exists to end.
+#[cfg(target_os = "macos")]
+fn gateway_lima_retry_backoff(consecutive_failed_recoveries: u32) -> Duration {
+    let doublings = consecutive_failed_recoveries.saturating_sub(1).min(16);
+    gateway_lima_retry_delay()
+        .saturating_mul(1u32 << doublings)
+        .min(GATEWAY_LIMA_MAX_RETRY_DELAY)
+}
+
+/// When `gateway_lima_monitor` calls a recovery in: what its probes have seen,
+/// and what a failed pass still owes.
+///
+/// Pure, and separate from the loop, because the loop cannot be tested — it
+/// sleeps and probes a live VM — while every rule deciding *when* a recovery
+/// runs is here.
+///
+/// # Why a probe cannot be the only trigger
+///
+/// Most of the ways a restart fails leave the instance's Docker daemon
+/// answering (see [`sandbox_core::GatewayRecoveryOutcome`]), so the probes
+/// that follow a failed pass are healthy ones. On the threshold alone they
+/// zero the failure count, the threshold is never reached again, and this loop
+/// never calls another pass in — leaving the sessions that pass tagged
+/// Degraded with no gateway container until something else intervenes.
+/// [`Self::retry_at`] is the state that survives a healthy probe. It is set
+/// from the pass's own outcome, because that is the only place the information
+/// exists.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct GatewayLimaTrigger {
+    /// Consecutive probes that could not reach the instance.
+    consecutive_failures: u32,
+    /// Consecutive recovery passes that did not restart the gateway. Drives
+    /// the backoff; zeroed by a pass that did.
+    failed_recoveries: u32,
+    /// When the next attempt is owed, if one is. `None` means no pass is
+    /// outstanding and the probes decide.
+    retry_at: Option<Instant>,
+}
+
+#[cfg(target_os = "macos")]
+impl GatewayLimaTrigger {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            failed_recoveries: 0,
+            retry_at: None,
+        }
+    }
+
+    /// A probe that could not reach the instance.
+    fn probe_unreachable(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    /// A probe that reached it.
+    ///
+    /// Clears the failure count and deliberately not `retry_at`: a healthy
+    /// probe after a failed pass is the expected state, not evidence the pass
+    /// worked, because a pass can fail at steps that run once the daemon is
+    /// already answering. A retry is discharged by another pass, never by a
+    /// probe.
+    fn probe_reachable(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Whether this poll should call a recovery in.
+    ///
+    /// A pending retry takes the decision from the probes rather than racing
+    /// them: the probe that would re-trigger on the threshold is the same
+    /// failing probe that triggered the pass which just failed, so honouring
+    /// both would collapse the backoff back to the threshold in exactly the
+    /// case — an instance that cannot come back — the backoff is for.
+    fn should_recover(&self, now: Instant) -> bool {
+        match self.retry_at {
+            Some(at) => now >= at,
+            None => self.consecutive_failures >= GATEWAY_LIMA_FAILURE_THRESHOLD,
+        }
+    }
+
+    /// Record what a pass did, and when the next one is owed. Returns the
+    /// delay until that attempt, or `None` if none is owed.
+    ///
+    /// The failure count is zeroed for both outcomes: the probes that led to
+    /// this pass have been acted on, so any further trigger has to come from
+    /// probes taken after it — a full threshold of them — or from `retry_at`.
+    fn recovery_finished(
+        &mut self,
+        outcome: sandbox_core::GatewayRecoveryOutcome,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.consecutive_failures = 0;
+        match outcome {
+            sandbox_core::GatewayRecoveryOutcome::GatewayRestarted => {
+                self.failed_recoveries = 0;
+                self.retry_at = None;
+                None
+            }
+            sandbox_core::GatewayRecoveryOutcome::GatewayNotRestarted => {
+                self.failed_recoveries = self.failed_recoveries.saturating_add(1);
+                let delay = gateway_lima_retry_backoff(self.failed_recoveries);
+                self.retry_at = Some(now + delay);
+                Some(delay)
+            }
+        }
+    }
+}
+
 /// Background task that monitors the gateway Lima instance for crashes and
 /// drives full recovery when the instance Docker daemon becomes unreachable.
 ///
-/// Polls every [`GATEWAY_LIMA_PROBE_INTERVAL`]. [`GATEWAY_LIMA_FAILURE_THRESHOLD`]
-/// **consecutive** `probe_docker_health() == Ok(false)` results trigger
-/// `recover_gateway_lima` (the consecutive-failure counter resets on any healthy
-/// probe). Probe errors are logged but treated conservatively — they do not
+/// Polls every [`GATEWAY_LIMA_PROBE_INTERVAL`]. With no attempt already owed,
+/// [`GATEWAY_LIMA_FAILURE_THRESHOLD`] **consecutive**
+/// `probe_docker_health() == Ok(false)` results trigger `recover_gateway_lima`
+/// (the consecutive-failure counter resets on any healthy probe); with one
+/// owed, [`GatewayLimaTrigger`] decides instead and the probes only keep the
+/// counter. Probe errors are logged but treated conservatively — they do not
 /// increment the failure counter — so a single transient blip does not trigger a
 /// full instance recovery.
 ///
 /// ## What a failed recovery costs
 ///
-/// The counter is reset *before* the call, so a recovery that fails — including
-/// one that times out waiting for the instance to become ready — is not retried
-/// on the next poll. It is retried after a full threshold of failing probes
-/// again, i.e. [`gateway_lima_retry_delay`] later. That is the delay the
-/// sessions this leaves Degraded spend waiting: `run_gateway_recovery`'s
-/// restart-failure path returns rather than retrying, so this loop is what
-/// retries.
+/// A pass that does not restart the gateway leaves its sessions Degraded with
+/// no gateway container, and `run_gateway_recovery` does not retry — this loop
+/// is what retries. It cannot schedule that from its probes, which go on
+/// answering healthy through most kinds of failure, so it schedules from the
+/// pass's own outcome: [`GatewayLimaTrigger`] holds what is owed and
+/// [`gateway_lima_retry_backoff`] spaces the attempts. The earliest
+/// re-attempt is the first poll at or after [`gateway_lima_retry_delay`] from
+/// the failed pass returning, and each further consecutive failure doubles
+/// that wait up to [`GATEWAY_LIMA_MAX_RETRY_DELAY`]. The sessions spend that
+/// long Degraded.
 #[cfg(target_os = "macos")]
 async fn gateway_lima_monitor(state: Arc<AppState>) {
     let poll_interval = GATEWAY_LIMA_PROBE_INTERVAL;
     let failure_threshold: u32 = GATEWAY_LIMA_FAILURE_THRESHOLD;
-    let mut consecutive_failures: u32 = 0;
+    let mut trigger = GatewayLimaTrigger::new();
 
     loop {
         tokio::time::sleep(poll_interval).await;
@@ -13339,40 +13490,24 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
 
         match probe_result {
             Ok(Ok(true)) => {
-                // Gateway Docker daemon is healthy.
-                if consecutive_failures > 0 {
+                // Gateway Docker daemon is healthy. This does not discharge a
+                // retry a failed pass owes — see `probe_reachable`.
+                if trigger.consecutive_failures > 0 {
                     debug!(
-                        consecutive_failures,
+                        consecutive_failures = trigger.consecutive_failures,
                         "gateway Lima monitor: probe healthy; resetting failure counter"
                     );
                 }
-                consecutive_failures = 0;
+                trigger.probe_reachable();
             }
             Ok(Ok(false)) => {
                 // Gateway unreachable — increment the consecutive failure counter.
-                consecutive_failures += 1;
+                trigger.probe_unreachable();
                 warn!(
-                    consecutive_failures,
+                    consecutive_failures = trigger.consecutive_failures,
                     threshold = failure_threshold,
                     "gateway Lima monitor: Docker daemon unreachable"
                 );
-
-                if consecutive_failures >= failure_threshold {
-                    warn!(
-                        consecutive_failures,
-                        "gateway Lima monitor: threshold reached; triggering recovery"
-                    );
-                    consecutive_failures = 0;
-                    recover_gateway_lima(&state).await;
-                    // Logged whether that pass fixed anything or not: the
-                    // counter is reset above, so this is the earliest the
-                    // instance can be recovered again, and it is what a
-                    // session left Degraded by a failed pass is waiting for.
-                    debug!(
-                        earliest_retry_secs = gateway_lima_retry_delay().as_secs(),
-                        "gateway Lima monitor: recovery pass complete; failure counter reset"
-                    );
-                }
             }
             Ok(Err(e)) => {
                 // Unexpected error from the probe — log but do not count as a
@@ -13389,6 +13524,31 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
                     "gateway Lima monitor: spawn_blocking join error on probe (not counted)"
                 );
             }
+        }
+
+        if !trigger.should_recover(Instant::now()) {
+            continue;
+        }
+
+        warn!(
+            consecutive_failures = trigger.consecutive_failures,
+            retrying_a_failed_pass = trigger.retry_at.is_some(),
+            "gateway Lima monitor: triggering recovery"
+        );
+
+        let outcome = recover_gateway_lima(&state).await;
+
+        // Timed from here rather than from the trigger above: a pass takes as
+        // long as it takes, and a delay measured across it would already be
+        // spent when it returned.
+        match trigger.recovery_finished(outcome, Instant::now()) {
+            Some(delay) => warn!(
+                retry_in_secs = delay.as_secs(),
+                consecutive_failed_recoveries = trigger.failed_recoveries,
+                "gateway Lima monitor: recovery did not restart the gateway; its sessions stay \
+                 Degraded with no gateway container until the next attempt"
+            ),
+            None => debug!("gateway Lima monitor: recovery pass restarted the gateway"),
         }
     }
 }
@@ -18037,7 +18197,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod gateway_recovery_reporting {
         use super::*;
-        use sandbox_core::{GatewayRecoveryDeclines, UnresolvedSessionOperator};
+        use sandbox_core::{
+            GatewayRecoveryDeclines, GatewayRecoveryOutcome, UnresolvedSessionOperator,
+        };
 
         /// A `Running` Lima session — the shape `sessions_to_recover` selects,
         /// and so the shape a decline can happen to.
@@ -18113,25 +18275,134 @@ mod tests {
             );
         }
 
-        /// A failed recovery is not retried on the monitor's next poll.
+        /// A failed pass is retried even though every probe after it is
+        /// healthy.
         ///
-        /// The monitor resets its consecutive-failure counter before calling
-        /// in, so the next trigger is a whole threshold of failing probes
-        /// away. This is the delay the sessions a failed recovery leaves
-        /// Degraded actually wait, and the figure `run_gateway_recovery`'s
-        /// restart-failure path defers to.
+        /// This is the case the schedule exists for. Most of the ways
+        /// `restart_instance_for_recovery` fails happen after the instance's
+        /// Docker daemon is already answering, so the probes that follow are
+        /// reachable ones — and on a probe-only trigger they zero the failure
+        /// count, the threshold is never reached again, and the sessions that
+        /// pass left Degraded keep no gateway container for as long as the
+        /// daemon runs.
         #[test]
-        fn a_failed_recovery_waits_a_full_threshold_of_probes_to_be_retried() {
+        fn a_failed_pass_is_retried_though_every_probe_after_it_is_healthy() {
+            let t0 = Instant::now();
+            let mut trigger = GatewayLimaTrigger::new();
+
+            for _ in 0..GATEWAY_LIMA_FAILURE_THRESHOLD {
+                trigger.probe_unreachable();
+            }
+            assert!(
+                trigger.should_recover(t0),
+                "a threshold of unreachable probes is what calls the first pass in"
+            );
+
+            let delay = trigger
+                .recovery_finished(GatewayRecoveryOutcome::GatewayNotRestarted, t0)
+                .expect("a pass that did not restart the gateway owes another attempt");
+
+            // From here every probe reaches the instance.
+            let mut now = t0;
+            let mut retried_at = None;
+            for _ in 0..12 {
+                now += GATEWAY_LIMA_PROBE_INTERVAL;
+                trigger.probe_reachable();
+                if trigger.should_recover(now) {
+                    retried_at = Some(now);
+                    break;
+                }
+            }
+
+            let retried_at = retried_at.expect(
+                "a failed pass followed only by healthy probes must still be retried: nothing \
+                 else ever looks at its sessions again",
+            );
+            assert!(
+                retried_at >= t0 + delay,
+                "the retry must not come before the delay the pass was given"
+            );
+            assert!(
+                retried_at < t0 + delay + GATEWAY_LIMA_PROBE_INTERVAL,
+                "and must come at the first poll at or after it, not a poll later"
+            );
+        }
+
+        /// A pass that restarted the gateway hands the decision back to the
+        /// probes, counting from zero.
+        ///
+        /// The failures that triggered that pass have been acted on. Were the
+        /// count left standing, the next single failing probe would be the
+        /// threshold's fourth and would call another pass in one poll after
+        /// the last one returned. Zeroing it inside `recovery_finished` — after
+        /// the pass, not before it — is what makes the probes taken *since*
+        /// the pass the only ones that count.
+        #[test]
+        fn a_restarted_gateway_needs_a_fresh_threshold_of_failing_probes() {
+            let t0 = Instant::now();
+            let mut trigger = GatewayLimaTrigger::new();
+
+            for _ in 0..GATEWAY_LIMA_FAILURE_THRESHOLD {
+                trigger.probe_unreachable();
+            }
+
+            assert_eq!(
+                trigger.recovery_finished(GatewayRecoveryOutcome::GatewayRestarted, t0),
+                None,
+                "a pass that restarted the gateway owes no further attempt"
+            );
+            assert!(
+                !trigger.should_recover(t0),
+                "and must not re-trigger on the failures it was called in to fix"
+            );
+
+            let mut now = t0;
+            for seen in 1..GATEWAY_LIMA_FAILURE_THRESHOLD {
+                now += GATEWAY_LIMA_PROBE_INTERVAL;
+                trigger.probe_unreachable();
+                assert!(
+                    !trigger.should_recover(now),
+                    "{seen} failing probes since the pass is short of the \
+                     {GATEWAY_LIMA_FAILURE_THRESHOLD} it takes"
+                );
+            }
+
+            now += GATEWAY_LIMA_PROBE_INTERVAL;
+            trigger.probe_unreachable();
+            assert!(
+                trigger.should_recover(now),
+                "a fresh threshold of failing probes must trigger a new pass"
+            );
+        }
+
+        /// The retry schedule: a threshold of probes' worth of wait, doubled
+        /// per consecutive failure, capped, and never giving up.
+        #[test]
+        fn the_retry_backoff_doubles_from_the_probe_threshold_up_to_a_cap() {
             assert_eq!(
                 gateway_lima_retry_delay(),
                 Duration::from_secs(30),
-                "reset counter + {GATEWAY_LIMA_FAILURE_THRESHOLD} probes at \
-                 {GATEWAY_LIMA_PROBE_INTERVAL:?} is the retry delay"
+                "{GATEWAY_LIMA_FAILURE_THRESHOLD} probes at {GATEWAY_LIMA_PROBE_INTERVAL:?}"
             );
             assert_ne!(
                 gateway_lima_retry_delay(),
                 GATEWAY_LIMA_PROBE_INTERVAL,
-                "the retry delay is not one poll interval"
+                "the first retry is not one poll away"
+            );
+
+            assert_eq!(gateway_lima_retry_backoff(1), gateway_lima_retry_delay());
+            assert_eq!(
+                gateway_lima_retry_backoff(2),
+                gateway_lima_retry_delay() * 2
+            );
+            assert_eq!(
+                gateway_lima_retry_backoff(3),
+                gateway_lima_retry_delay() * 4
+            );
+            assert_eq!(
+                gateway_lima_retry_backoff(u32::MAX),
+                GATEWAY_LIMA_MAX_RETRY_DELAY,
+                "a fault that never clears must keep being retried, at the cap"
             );
         }
     }

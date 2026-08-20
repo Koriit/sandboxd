@@ -145,8 +145,9 @@ pub use gateway_lima::{
 pub use gateway_lima_registry::GatewayLimaManagerRegistry;
 pub use gateway_recovery::{
     GatewayOwnership, GatewayRecoveringGuard, GatewayRecoveryDeclines, GatewayRecoveryDeps,
-    GatewayRecoveryLatches, RecoveryPartition, RecoveryShard, RecoveryShardDeps,
-    partition_by_gateway_owner, run_bounded_recovery, run_gateway_recovery, sessions_to_recover,
+    GatewayRecoveryLatches, GatewayRecoveryOutcome, RecoveryPartition, RecoveryShard,
+    RecoveryShardDeps, partition_by_gateway_owner, run_bounded_recovery, run_gateway_recovery,
+    sessions_to_recover,
 };
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,

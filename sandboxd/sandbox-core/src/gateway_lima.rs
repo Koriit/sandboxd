@@ -227,7 +227,8 @@ const NFT_INJECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Shorter than `DOCKER_READY_TIMEOUT` (300 s for first-boot) because on
 /// recovery the VM is already provisioned — the Docker daemon typically becomes
 /// reachable in a few seconds. A stuck recovery must surface quickly so the
-/// 10-second poll loop can re-attempt rather than blocking for five minutes.
+/// caller can schedule another attempt, rather than holding the pass open for
+/// five minutes while its sessions sit Degraded with no gateway container.
 #[cfg(target_os = "macos")]
 const GATEWAY_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -2442,8 +2443,9 @@ impl GatewayLimaManager {
     /// Performs a forced stop followed by a start, then waits up to
     /// `GATEWAY_RECOVERY_READY_TIMEOUT` (90 s) for the Docker daemon to
     /// become reachable. Unlike `ensure_ready`'s 300-second first-boot timeout,
-    /// the 90-second recovery timeout surfaces a stuck restart quickly so the
-    /// monitor's 10-second poll can re-attempt.
+    /// the 90-second recovery timeout gives up on a stuck restart quickly, so
+    /// the failure reaches the caller — which is what schedules another
+    /// attempt — instead of the pass sitting on a VM that is not coming back.
     ///
     /// On success, re-verifies the slot→NIC map against `slots` and re-caches
     /// it, then re-establishes the egress bridge and applies the baseline
