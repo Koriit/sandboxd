@@ -3808,9 +3808,10 @@ mod tests {
     /// All three name schemes are checked at every uid pair rather than one of
     /// them being argued for as the worst case. Which is longest depends on
     /// the owner uid: a session name is a fixed width, a per-operator gateway
-    /// name grows with the digits of the uid, and they cross over somewhere in
-    /// the middle of the uid range. An argument about which one to check would
-    /// have to get that crossover right; checking all of them does not.
+    /// name grows with the digits of the uid, and the two are equal only for
+    /// 3-digit uids (100-999) before the gateway name becomes longer at uid
+    /// 1000. An argument about which one to check would have to get that
+    /// crossover right; checking all of them does not.
     #[test]
     fn gateway_instance_socket_path_fits_unix_path_max() {
         use crate::lima::{
