@@ -653,16 +653,28 @@ pub fn reap_lima_orphans(
 ///
 /// That premise is, so this is. `reachable` is the daemon's own uid plus the
 /// operators whose agent is checked in, and only the macOS path has an agent
-/// to check in. `sandbox-lima-helper` does gate on the operator it is asked to
-/// become — they must resolve via `getpwuid_r` and be in the sandbox group —
-/// but both gates read the passwd and group databases, which say who the host
-/// is configured for and not who is answering right now. So there is no
-/// runtime-varying unreachability on Linux for `reachable` to name, a caller
-/// there would have to invent one, and any set narrower than the whole tree
-/// quietly stops collecting orphans for the operators outside it — with the
-/// section above reading like a licence for it. Linux wants
-/// [`reap_lima_orphans`], which scans the whole tree. The Docker counterpart,
-/// `backend::reap_orphans_per_gateway_owner`, is gated for the same reason.
+/// to check in. Check-in is not the only condition on that set: the broker's
+/// `classify_peer_uid` rejects uid 0, rejects uids below the system floor, and
+/// requires sandbox-group membership via `getgrouplist(3)` before the registry
+/// records the uid. So the macOS set is host configuration *and* liveness, and
+/// `sandbox-lima-helper` gates on the same configuration — the uid it is asked
+/// to become must be non-zero, must resolve via `getpwuid_r`, and must be in
+/// the sandbox group, all three checked before its single `setresuid`.
+///
+/// It is the liveness half Linux has no analogue for. Whether the helper will
+/// pivot to a given uid turns on passwd and group state the daemon keeps no
+/// registry of; to predict it the daemon would have to repeat the helper's own
+/// lookups. Attempting instead ends in a denial the reaper already handles —
+/// `RegistryLimaReaperOps::list_vms` logs a `warn!` naming the operator and the
+/// pass moves on — which is why nothing on Linux computes such a set.
+///
+/// Naming a set is free only when the operators it leaves out could not have
+/// been acted for at all; that is what the section above argues, and it is the
+/// whole of the licence. Leave out an operator who could have been acted for
+/// and the pass stops collecting their orphans, with nothing in the log to say
+/// so. Linux wants [`reap_lima_orphans`], which scans the whole tree. The
+/// Docker counterpart, `backend::reap_orphans_per_gateway_owner`, is gated for
+/// the same reason.
 ///
 /// # `live` stays the global union
 ///
