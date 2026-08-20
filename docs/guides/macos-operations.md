@@ -421,30 +421,24 @@ Each line names the session, the slot it held and why it could not be routed.
 Remedy: stop the session (`sandbox session stop <id>`), which releases the
 slot for real, or restore the account the session was created under.
 
-### Sessions a gateway recovery could not place
+### `gateway_recovery_declined_sessions` — inert in this build
 
-A second, differently-caused decline, reported under its own `/diagnostics`
-field:
+A second `/diagnostics` field, unrelated to the pool declines above:
 
 | Field | What it holds |
 |---|---|
 | `gateway_recovery_declined_sessions` | one line per session the last gateway recovery could not attribute to any gateway |
 
-When the gateway VM's Docker daemon goes unreachable, the daemon restarts the
-instance and re-creates each running session's gateway container against it.
-Which gateway a session recovers against follows from its operator, so a
-session with no operator uid persisted on the session or its network record,
-and an owner name that is empty or no longer resolves to an account, is
-**declined** rather than recovered against a guessed gateway.
+**In this build it is always `[]`, and no operator action can put a line in
+it.** The daemon holds one gateway VM, so a recovery has exactly one gateway to
+drive and every session it recovers goes to that one — there is no attribution
+to get wrong, and the code path that declines a session is not the path this
+daemon takes. The field ships ahead of per-operator gateways, where a
+session whose operator cannot be determined would have no gateway of its own to
+recover against and would be declined rather than recovered against a guessed
+one.
 
-That leaves a running sandbox whose gateway container is not rebuilt, which is
-reported three ways rather than one:
-
-- logged at `error` with the session id, the owner name and the reason;
-- the session reports `"networking_status": "degraded"` on `GET /sessions` and
-  `GET /sessions/<id>`, and keeps reporting it until a later recovery can
-  attribute the session and rebuild its gateway;
-- it appears here, one line per session:
+So the field is worth reading only to confirm it is empty:
 
 ```bash
 curl --unix-socket /var/run/sandbox/sandboxd.sock \
@@ -452,16 +446,17 @@ curl --unix-socket /var/run/sandbox/sandboxd.sock \
   | grep -A5 gateway_recovery_declined
 ```
 
-Each recovery run that reads the session list replaces this report rather than
-adding to it, so an empty list means the last such run placed every session —
-not that no recovery has run. Both the report and the `degraded` status live in
-the daemon's memory, so a daemon restart also clears them; they come back on
-the next recovery that declines something.
+and an empty list carries no information about recoveries: it is the state on a
+host that has never run one and the state on a host that has run a hundred. If
+you ever see it non-empty on this build, that contradicts the code rather than
+telling you about a session — treat it as a bug report, not an operational
+condition.
 
-Remedy: restore the account the session was created under, so the next recovery
-can attribute it. Failing that, stop the session (`sandbox session stop <id>`):
-nothing is rebuilding its gateway, so stopping it is the only way to be sure
-its egress is down.
+For "did a recovery leave a sandbox without egress?", use the per-session
+status instead. A recovery that cannot restart the gateway VM leaves every
+session it was going to rebuild reporting `"networking_status": "degraded"` on
+`GET /sessions` and `GET /sessions/<id>`, and they keep reporting it for as
+long as the VM stays down. That surface is live here; this one is not.
 
 ### Preconditions this does not cover
 
