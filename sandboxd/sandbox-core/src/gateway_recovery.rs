@@ -32,6 +32,9 @@ use crate::api::NetworkingStatus;
 use crate::error::SandboxError;
 use crate::network::NetworkInfo;
 use crate::session::{Session, SessionId, SessionState};
+use crate::session_operator::{
+    SessionOperator, UnresolvedSessionOperator, resolve_session_operator,
+};
 use crate::store::SessionStore;
 
 // ---------------------------------------------------------------------------
@@ -186,6 +189,235 @@ pub fn sessions_to_recover(all: Vec<Session>) -> Vec<Session> {
 }
 
 // ---------------------------------------------------------------------------
+// partition_by_gateway_owner
+// ---------------------------------------------------------------------------
+
+/// How the gateways a recovery has to drive are shared out.
+///
+/// This is **not** the per-operator-gateway switch, and a caller must not
+/// derive it from [`crate::gateway_lima::per_operator_gateway_enabled`]
+/// without also holding one gateway per owner.
+/// [`crate::gateway_lima::gateway_instance_name`] and
+/// [`crate::gateway_lima::gateway_owner_uid`] answer what a gateway is called
+/// and which uid owns it; this answers how many there are to act on, which is
+/// a property of what the caller is holding rather than of the switch. A
+/// daemon carrying one `GatewayLimaManager` drives one gateway in either mode.
+///
+/// # Why an enum rather than a uid-collapsing function
+///
+/// A `Fn(u32) -> u32` mapping an operator uid onto an owner uid would express
+/// [`Self::PerOperator`] as the identity and [`Self::Shared`] as a constant,
+/// and it would be wrong for the shared case: it can only be applied to a uid,
+/// so every session's operator would have to be resolved first, and a session
+/// whose operator cannot be determined would be stranded with no owner to
+/// attribute it to. Under [`Self::Shared`] that question does not arise —
+/// there is one gateway, it serves every session, and which operator a session
+/// belongs to changes nothing about where it recovers. Making that an arm
+/// rather than a constant function is what keeps those sessions recoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayOwnership {
+    /// One gateway, owned by this uid, serves every session.
+    Shared(u32),
+    /// Each operator's sessions recover against that operator's own gateway.
+    PerOperator,
+}
+
+/// The sessions that recover against one gateway owner's gateway.
+#[derive(Debug, Clone)]
+pub struct RecoveryShard {
+    /// The uid owning the gateway these sessions recover against.
+    pub owner_uid: u32,
+    /// The sessions, in the order the input presented them.
+    pub sessions: Vec<Session>,
+}
+
+/// A recovery's session set, split by the gateway each session recovers
+/// against, plus the sessions that belong to no gateway.
+///
+/// # The residual is a value, not a leftover
+///
+/// The point of returning both halves from one call is that the second cannot
+/// be produced without the first. Sharding by "invoke recovery once per
+/// operator" leaves the sessions that matched no operator existing only
+/// implicitly — recoverable by unioning the invocations and diffing against
+/// the input, which nothing does, and which nothing *can* do when the
+/// invocation count is zero. Here the sessions that no shard claimed are
+/// returned alongside the shards that claimed the rest, so a caller that
+/// wants to ignore them has to write that down.
+///
+/// The conservation property — every input session lands in exactly one shard
+/// or in [`Self::declined`], never both and never neither — is asserted over
+/// whole inputs by this module's tests. It is not restated as an invariant
+/// comment on the fields, because a comment cannot fail.
+#[derive(Debug, Clone)]
+pub struct RecoveryPartition {
+    shards: Vec<RecoveryShard>,
+    declined: Vec<UnresolvedSessionOperator>,
+}
+
+impl RecoveryPartition {
+    /// The shards, ordered by owner uid.
+    ///
+    /// Ordered so a caller's per-shard logging and a test's expectations do
+    /// not depend on hash iteration order.
+    pub fn shards(&self) -> &[RecoveryShard] {
+        &self.shards
+    }
+
+    /// The sessions no shard claimed, each carrying why.
+    pub fn declined(&self) -> &[UnresolvedSessionOperator] {
+        &self.declined
+    }
+
+    /// Both halves, by value, for a caller that consumes the shards.
+    pub fn into_parts(self) -> (Vec<RecoveryShard>, Vec<UnresolvedSessionOperator>) {
+        (self.shards, self.declined)
+    }
+}
+
+/// Split a recovery's candidate sessions by the gateway each recovers against.
+///
+/// `sessions` is a candidate set — in production, [`sessions_to_recover`]'s
+/// output. Partitioning candidates rather than every row keeps the declined
+/// list to sessions a recovery would otherwise have acted on; a `Stopped`
+/// session nobody could attribute is not something an administrator needs
+/// told about.
+///
+/// `network_for` reads a session's persisted [`NetworkInfo`], and
+/// `resolve_uid` maps an account name to a uid — the two hints
+/// [`resolve_session_operator`] ranks. Both are consulted lazily and per
+/// session, so under [`GatewayOwnership::Shared`] neither runs at all.
+///
+/// Pure: it reads no file, opens no store and logs nothing. What to do about
+/// the sessions it declines is the caller's decision, and a warning emitted
+/// here would announce a problem before anyone had decided it was one — the
+/// reason [`resolve_session_operator`] is silent too.
+///
+/// # Shared ownership always yields exactly one shard
+///
+/// Including for an empty input. A recovery restarts its gateway before it
+/// looks at any session, so "no sessions to re-create" and "no gateway to
+/// restart" are different answers, and a caller looping over shards would
+/// conflate them if an empty candidate set produced no shard. The shard is
+/// the gateway; the sessions are its contents.
+///
+/// Under [`GatewayOwnership::PerOperator`] the reverse holds: a shard appears
+/// only for an owner that has at least one session, because an owner with no
+/// sessions is not named by anything in the input. A gateway with nothing
+/// running on it is that gateway's monitor's business, not this partition's.
+pub fn partition_by_gateway_owner(
+    sessions: Vec<Session>,
+    ownership: GatewayOwnership,
+    network_for: &dyn Fn(&Session) -> Option<NetworkInfo>,
+    resolve_uid: &dyn Fn(&str) -> Option<u32>,
+) -> RecoveryPartition {
+    match ownership {
+        GatewayOwnership::Shared(owner_uid) => RecoveryPartition {
+            shards: vec![RecoveryShard {
+                owner_uid,
+                sessions,
+            }],
+            declined: Vec::new(),
+        },
+        GatewayOwnership::PerOperator => {
+            // Keyed by owner and ordered by owner at the end; insertion order
+            // within a shard is the input's, so a shard reads as the subsequence
+            // of the input that belongs to it.
+            let mut by_owner: HashMap<u32, Vec<Session>> = HashMap::new();
+            let mut declined = Vec::new();
+
+            for session in sessions {
+                let network = network_for(&session);
+                match resolve_session_operator(&session, network.as_ref(), resolve_uid) {
+                    SessionOperator::Uid(operator_uid) => {
+                        by_owner.entry(operator_uid).or_default().push(session);
+                    }
+                    SessionOperator::Unresolved(unresolved) => declined.push(unresolved),
+                }
+            }
+
+            let mut shards: Vec<RecoveryShard> = by_owner
+                .into_iter()
+                .map(|(owner_uid, sessions)| RecoveryShard {
+                    owner_uid,
+                    sessions,
+                })
+                .collect();
+            shards.sort_by_key(|shard| shard.owner_uid);
+
+            RecoveryPartition { shards, declined }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GatewayRecoveryDeclines
+// ---------------------------------------------------------------------------
+
+/// The sessions the most recent recovery declined to attribute to a gateway.
+///
+/// A recovery that shards its session set can leave sessions behind, and a
+/// session left behind is a `Running` sandbox whose gateway nobody is going to
+/// rebuild — potentially with live egress. That is the outcome this daemon
+/// exists to prevent, so the residual is held where `GET /diagnostics` can
+/// report it rather than being logged once and lost.
+///
+/// Modelled on [`crate::vmnet_pool_registry::VmnetPoolRegistry::declined_restores`],
+/// which reports the same class of thing for slot claims and renders the same
+/// way — one `describe()` line per session.
+///
+/// # Why the last run replaces rather than accumulates
+///
+/// The list answers "which sessions is recovery currently unable to place",
+/// and a recovery re-answers that question in full every time it runs. Keeping
+/// earlier runs would report sessions a later run placed, and sessions that
+/// have since been deleted, as though they were still stranded. The pool's
+/// list accumulates because a restore happens once per daemon lifetime; this
+/// one runs on every gateway crash.
+pub struct GatewayRecoveryDeclines {
+    last_run: std::sync::Mutex<Vec<UnresolvedSessionOperator>>,
+}
+
+impl GatewayRecoveryDeclines {
+    /// Nothing has been declined: no recovery has run, or the last one placed
+    /// every session it was given.
+    pub fn new() -> Self {
+        Self {
+            last_run: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Replace the list with what the run that just finished declined.
+    ///
+    /// Recording an empty list is the point of recording at all: it is how a
+    /// run that placed everything clears a previous run's report.
+    ///
+    /// A poisoned lock is recovered rather than propagated, for the reason
+    /// [`GatewayRecoveryLatches::for_owner`] gives: refusing to report for the
+    /// rest of the process is the worse answer, and the value is replaced
+    /// whole so a panic elsewhere cannot leave a half-written list behind.
+    pub fn record(&self, declined: Vec<UnresolvedSessionOperator>) {
+        *self.last_run.lock().unwrap_or_else(|e| e.into_inner()) = declined;
+    }
+
+    /// One human-readable line per declined session, for `/diagnostics`.
+    pub fn describe(&self) -> Vec<String> {
+        self.last_run
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|declined| declined.describe())
+            .collect()
+    }
+}
+
+impl Default for GatewayRecoveryDeclines {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // run_bounded_recovery
 // ---------------------------------------------------------------------------
 
@@ -304,6 +536,58 @@ impl GatewayRecoveryDeps for Arc<SessionStore> {
 
     fn mark_session_error(&self, id: &SessionId) -> Result<(), SandboxError> {
         self.update_state_reconcile(id, SessionState::Error)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecoveryShardDeps
+// ---------------------------------------------------------------------------
+
+/// A [`GatewayRecoveryDeps`] that presents one shard's sessions in place of the
+/// whole store's.
+///
+/// [`run_gateway_recovery`] asks its dependencies for a session list and selects
+/// its candidates from what comes back. Handing it a shard is therefore all it
+/// takes to scope a run to one gateway owner, and it needs no change to the
+/// trait: `list_sessions` is already the only question the orchestrator asks
+/// about *which* sessions exist, and the other two it asks per session, about a
+/// session it was handed.
+///
+/// Both reads and the write pass to `inner` unchanged. Narrowing them to the
+/// shard would be a second filter with no second question behind it — a session
+/// in the shard is by construction one this store listed.
+///
+/// # The candidate filter runs twice, deliberately
+///
+/// The orchestrator applies [`sessions_to_recover`] to whatever `list_sessions`
+/// returns, and a shard from [`partition_by_gateway_owner`] is already that
+/// filter's output, so it runs again here. It is idempotent, and leaving it in
+/// place is what keeps this an adapter rather than a second entry point: a
+/// caller that assembles a shard by some other route still gets the candidate
+/// selection every other caller gets.
+pub struct RecoveryShardDeps<'a, D: GatewayRecoveryDeps> {
+    inner: &'a D,
+    sessions: Vec<Session>,
+}
+
+impl<'a, D: GatewayRecoveryDeps> RecoveryShardDeps<'a, D> {
+    /// Scope `inner`'s session list to `sessions` for the duration of one run.
+    pub fn new(inner: &'a D, sessions: Vec<Session>) -> Self {
+        Self { inner, sessions }
+    }
+}
+
+impl<D: GatewayRecoveryDeps> GatewayRecoveryDeps for RecoveryShardDeps<'_, D> {
+    fn list_sessions(&self) -> Result<Vec<Session>, SandboxError> {
+        Ok(self.sessions.clone())
+    }
+
+    fn get_network_info(&self, id: &SessionId) -> Result<Option<NetworkInfo>, SandboxError> {
+        self.inner.get_network_info(id)
+    }
+
+    fn mark_session_error(&self, id: &SessionId) -> Result<(), SandboxError> {
+        self.inner.mark_session_error(id)
     }
 }
 
@@ -645,6 +929,476 @@ mod tests {
     #[test]
     fn filter_empty_input_is_empty() {
         assert!(sessions_to_recover(Vec::new()).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // partition_by_gateway_owner (pure split)
+    // -----------------------------------------------------------------------
+
+    /// A Running Lima session carrying the two persisted hints the resolver
+    /// ranks ahead of the owner name.
+    fn attributable_session(owner: &str, operator_uid: Option<u32>) -> Session {
+        let mut session = session_with(SessionState::Running, BackendKind::Lima);
+        session.owner_username = owner.to_string();
+        session.operator_uid = operator_uid;
+        session
+    }
+
+    /// A network record naming `operator_uid`, the resolver's first hint.
+    fn network_owned_by(operator_uid: u32) -> NetworkInfo {
+        NetworkInfo {
+            operator_uid: Some(operator_uid),
+            ..stub_network_info()
+        }
+    }
+
+    /// A network reader that fails the test if it is consulted.
+    fn unused_network(session: &Session) -> Option<NetworkInfo> {
+        unreachable!(
+            "session {} must not have its network record read when one gateway serves every \
+             session",
+            session.id
+        )
+    }
+
+    /// A name resolver that fails the test if it is consulted.
+    fn unused_resolver(name: &str) -> Option<u32> {
+        unreachable!(
+            "the owner name '{name}' must not be resolved when one gateway serves every session"
+        )
+    }
+
+    /// Every combination of the three hints the resolver ranks, as a session
+    /// set with the network records to read alongside it.
+    ///
+    /// Enumerated rather than hand-picked so the conservation check runs over
+    /// every path through the resolver at once, including all three ways a
+    /// session can fail to name an operator. Deterministic: same set, same
+    /// order, every run.
+    fn every_hint_combination() -> (Vec<Session>, HashMap<SessionId, NetworkInfo>) {
+        let mut sessions = Vec::new();
+        let mut networks = HashMap::new();
+
+        for network_uid in [None, Some(501), Some(502)] {
+            for column_uid in [None, Some(501), Some(503)] {
+                // "" has no account on it at all; "ghost" names one this host
+                // does not have; "alice" resolves.
+                for owner in ["", "alice", "ghost"] {
+                    let session = attributable_session(owner, column_uid);
+                    if let Some(uid) = network_uid {
+                        networks.insert(session.id, network_owned_by(uid));
+                    }
+                    sessions.push(session);
+                }
+            }
+        }
+
+        (sessions, networks)
+    }
+
+    /// Resolves only `alice`, to a uid no persisted hint in the generated set
+    /// uses — so a session attributed to 504 was attributed by name and by
+    /// nothing else.
+    fn resolve_alice(name: &str) -> Option<u32> {
+        match name {
+            "alice" => Some(504),
+            _ => None,
+        }
+    }
+
+    /// Every input session lands in exactly one shard or in the declined
+    /// list — never both, never neither.
+    ///
+    /// This is the property the whole partition exists for: a session that
+    /// falls out of it is a `Running` sandbox with live egress that no
+    /// recovery will rebuild a gateway for. Asserted over the full
+    /// hint-combination set, under both ownership modes, by counting rather
+    /// than by spot-checking.
+    #[test]
+    fn every_session_lands_in_exactly_one_shard_or_the_declined_list() {
+        let (sessions, networks) = every_hint_combination();
+        let input_ids: Vec<SessionId> = sessions.iter().map(|s| s.id).collect();
+        let network_for = |s: &Session| networks.get(&s.id).cloned();
+
+        for ownership in [GatewayOwnership::Shared(0), GatewayOwnership::PerOperator] {
+            let partition = partition_by_gateway_owner(
+                sessions.clone(),
+                ownership,
+                &network_for,
+                &resolve_alice,
+            );
+
+            // Counted rather than compared as sets: a set comparison would
+            // pass on a session placed in two shards at once.
+            let mut appearances: HashMap<SessionId, usize> = HashMap::new();
+            let mut total = 0usize;
+            for id in partition
+                .shards()
+                .iter()
+                .flat_map(|shard| shard.sessions.iter().map(|s| s.id))
+                .chain(partition.declined().iter().map(|d| d.session_id))
+            {
+                *appearances.entry(id).or_default() += 1;
+                total += 1;
+            }
+
+            for id in &input_ids {
+                assert_eq!(
+                    appearances.get(id).copied().unwrap_or(0),
+                    1,
+                    "{ownership:?}: session {id} must appear exactly once across the shards \
+                     and the declined list"
+                );
+            }
+            // With every input session appearing exactly once, an equal total
+            // leaves no room for anything the input did not contain.
+            assert_eq!(
+                total,
+                input_ids.len(),
+                "{ownership:?}: the shards and the declined list together must account for \
+                 nothing beyond the input"
+            );
+        }
+    }
+
+    /// Under per-operator ownership every generated session is placed by the
+    /// hint the resolver ranks highest, and the ones no hint answers for are
+    /// declined with a reason naming what was missing.
+    #[test]
+    fn per_operator_shards_by_the_highest_ranked_hint() {
+        let (sessions, networks) = every_hint_combination();
+        let network_for = |s: &Session| networks.get(&s.id).cloned();
+
+        let partition = partition_by_gateway_owner(
+            sessions,
+            GatewayOwnership::PerOperator,
+            &network_for,
+            &resolve_alice,
+        );
+
+        // 27 sessions: 18 have a network uid (9 × 501, 9 × 502); of the 9
+        // without, 3 carry column 501, 3 carry column 503, and the remaining
+        // 3 are placed by name only when the name resolves.
+        let counts: HashMap<u32, usize> = partition
+            .shards()
+            .iter()
+            .map(|shard| (shard.owner_uid, shard.sessions.len()))
+            .collect();
+        assert_eq!(
+            counts,
+            HashMap::from([(501, 12), (502, 9), (503, 3), (504, 1)]),
+            "each shard must hold the sessions whose highest-ranked hint names its owner"
+        );
+
+        assert_eq!(
+            partition.declined().len(),
+            2,
+            "the two sessions with no uid hint and an unusable owner name must be declined"
+        );
+        let reasons: Vec<&str> = partition
+            .declined()
+            .iter()
+            .map(|d| d.reason.as_str())
+            .collect();
+        assert!(
+            reasons.iter().any(|r| r.contains("no owner account")),
+            "the session with no name at all must say so: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("does not resolve")),
+            "the session whose owner names no account on this host must say so: {reasons:?}"
+        );
+    }
+
+    /// Shards come back ordered by owner uid, and within a shard the input's
+    /// order survives — so a caller's per-shard logging and a test's
+    /// expectations do not ride on hash iteration order.
+    #[test]
+    fn shards_are_ordered_by_owner_and_hold_the_input_order_within() {
+        let first = attributable_session("", Some(700));
+        let second = attributable_session("", Some(600));
+        let third = attributable_session("", Some(700));
+        let expected_700 = vec![first.id, third.id];
+
+        let partition = partition_by_gateway_owner(
+            vec![first, second, third],
+            GatewayOwnership::PerOperator,
+            &|_| None,
+            &unused_resolver,
+        );
+
+        let owners: Vec<u32> = partition.shards().iter().map(|s| s.owner_uid).collect();
+        assert_eq!(
+            owners,
+            vec![600, 700],
+            "shards must be ordered by owner uid"
+        );
+
+        let ids: Vec<SessionId> = partition.shards()[1]
+            .sessions
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            ids, expected_700,
+            "a shard must read as the subsequence of the input that belongs to it"
+        );
+    }
+
+    /// One gateway serving every session yields one shard whatever the
+    /// sessions say about their operators — including sessions no resolver
+    /// could attribute.
+    ///
+    /// This is the behaviour that keeps today's daemon recovering everything
+    /// it recovers now: an unattributable session is not a session without a
+    /// gateway when there is only one gateway.
+    #[test]
+    fn shared_ownership_yields_one_shard_holding_every_session() {
+        let sessions = vec![
+            attributable_session("", None),
+            attributable_session("ghost", None),
+            attributable_session("alice", Some(501)),
+        ];
+        let ids: Vec<SessionId> = sessions.iter().map(|s| s.id).collect();
+
+        let partition = partition_by_gateway_owner(
+            sessions,
+            GatewayOwnership::Shared(77),
+            &unused_network,
+            &unused_resolver,
+        );
+
+        assert_eq!(partition.shards().len(), 1, "one gateway is one shard");
+        assert_eq!(partition.shards()[0].owner_uid, 77);
+        assert_eq!(
+            partition.shards()[0]
+                .sessions
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            ids,
+            "every session recovers against the one gateway, in input order"
+        );
+        assert!(
+            partition.declined().is_empty(),
+            "nothing can be declined when the one gateway serves every session"
+        );
+    }
+
+    /// An empty candidate set still yields a shard when one gateway serves
+    /// every session.
+    ///
+    /// A recovery restarts its gateway before it looks at any session, so a
+    /// caller looping over shards must still be handed the gateway to
+    /// restart. Producing no shard here would turn "nothing to re-create"
+    /// into "nothing to restart", and a crashed gateway would stay down.
+    #[test]
+    fn shared_ownership_yields_a_shard_for_an_empty_session_set() {
+        let partition = partition_by_gateway_owner(
+            Vec::new(),
+            GatewayOwnership::Shared(77),
+            &unused_network,
+            &unused_resolver,
+        );
+
+        assert_eq!(
+            partition.shards().len(),
+            1,
+            "the gateway to restart exists whether or not anything is running on it"
+        );
+        assert_eq!(partition.shards()[0].owner_uid, 77);
+        assert!(partition.shards()[0].sessions.is_empty());
+    }
+
+    /// With a gateway per operator, an empty candidate set names no owner, so
+    /// there is nothing to act on. The mirror image of the shared case, and
+    /// the reason the two are separate arms rather than one uid mapping.
+    #[test]
+    fn per_operator_ownership_yields_no_shard_for_an_empty_session_set() {
+        let partition = partition_by_gateway_owner(
+            Vec::new(),
+            GatewayOwnership::PerOperator,
+            &unused_network,
+            &unused_resolver,
+        );
+
+        assert!(partition.shards().is_empty());
+        assert!(partition.declined().is_empty());
+    }
+
+    /// `into_parts` hands back exactly what the accessors report.
+    #[test]
+    fn into_parts_yields_the_same_shards_and_declines_the_accessors_report() {
+        let sessions = vec![
+            attributable_session("alice", Some(501)),
+            attributable_session("", None),
+        ];
+
+        let partition = partition_by_gateway_owner(
+            sessions,
+            GatewayOwnership::PerOperator,
+            &|_| None,
+            &resolve_alice,
+        );
+        let borrowed_shards: Vec<u32> = partition.shards().iter().map(|s| s.owner_uid).collect();
+        let borrowed_declines: Vec<SessionId> =
+            partition.declined().iter().map(|d| d.session_id).collect();
+
+        let (shards, declined) = partition.into_parts();
+        assert_eq!(
+            shards.iter().map(|s| s.owner_uid).collect::<Vec<_>>(),
+            borrowed_shards
+        );
+        assert_eq!(
+            declined.iter().map(|d| d.session_id).collect::<Vec<_>>(),
+            borrowed_declines
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GatewayRecoveryDeclines (what /diagnostics reports)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nothing_is_declined_before_a_recovery_has_run() {
+        assert!(GatewayRecoveryDeclines::new().describe().is_empty());
+    }
+
+    #[test]
+    fn a_declined_session_is_described_with_its_owner_and_the_reason() {
+        let session = attributable_session("ghost", None);
+        let sid = session.id;
+        let partition = partition_by_gateway_owner(
+            vec![session],
+            GatewayOwnership::PerOperator,
+            &|_| None,
+            &resolve_alice,
+        );
+
+        let declines = GatewayRecoveryDeclines::new();
+        declines.record(partition.into_parts().1);
+
+        let lines = declines.describe();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains(&sid.to_string()) && lines[0].contains("ghost"),
+            "the report must name the session and its owner: {}",
+            lines[0]
+        );
+    }
+
+    /// A later run replaces an earlier run's report rather than adding to it.
+    ///
+    /// Recovery re-answers "which sessions can I not place" in full every
+    /// time it runs, so a session a later run placed — or one that has since
+    /// been deleted — must stop being reported as stranded.
+    #[test]
+    fn a_later_run_replaces_what_an_earlier_run_declined() {
+        let stranded = attributable_session("ghost", None);
+        let first = partition_by_gateway_owner(
+            vec![stranded],
+            GatewayOwnership::PerOperator,
+            &|_| None,
+            &resolve_alice,
+        );
+
+        let declines = GatewayRecoveryDeclines::new();
+        declines.record(first.into_parts().1);
+        assert_eq!(declines.describe().len(), 1);
+
+        let placed = attributable_session("alice", None);
+        let second = partition_by_gateway_owner(
+            vec![placed],
+            GatewayOwnership::PerOperator,
+            &|_| None,
+            &resolve_alice,
+        );
+        declines.record(second.into_parts().1);
+
+        assert!(
+            declines.describe().is_empty(),
+            "a run that placed every session must clear the previous run's report"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RecoveryShardDeps (scoping one run to one gateway owner)
+    // -----------------------------------------------------------------------
+
+    /// The adapter answers "which sessions" from the shard and every other
+    /// question from the store behind it.
+    #[test]
+    fn shard_deps_lists_the_shard_and_delegates_the_rest() {
+        let in_shard = session_with(SessionState::Running, BackendKind::Lima);
+        let elsewhere = session_with(SessionState::Running, BackendKind::Lima);
+        let in_shard_id = in_shard.id;
+        let elsewhere_id = elsewhere.id;
+
+        let store = StubDeps::new(vec![in_shard.clone(), elsewhere]);
+        let shard = RecoveryShardDeps::new(&store, vec![in_shard]);
+
+        assert_eq!(
+            shard.list_sessions().unwrap().len(),
+            1,
+            "the adapter must list the shard, not the store"
+        );
+
+        // The reads and the write are the store's, unnarrowed: a session id
+        // the shard does not hold is still a session this store knows.
+        assert!(
+            shard.get_network_info(&elsewhere_id).unwrap().is_some(),
+            "network info must come from the store, not be filtered by the shard"
+        );
+        shard.mark_session_error(&elsewhere_id).unwrap();
+        assert_eq!(*store.errors_marked.lock().unwrap(), vec![elsewhere_id]);
+        assert_ne!(in_shard_id, elsewhere_id);
+    }
+
+    /// A recovery driven through a shard acts only on that shard's sessions,
+    /// even though the store behind it holds another owner's too.
+    ///
+    /// This is the whole point of the change: before it, one recovery pass
+    /// re-created every session's gateway against one gateway VM.
+    #[tokio::test]
+    async fn recovery_through_a_shard_touches_no_other_owners_sessions() {
+        let mine = session_with(SessionState::Running, BackendKind::Lima);
+        let theirs = session_with(SessionState::Running, BackendKind::Lima);
+        let mine_id = mine.id;
+        let theirs_id = theirs.id;
+
+        let store = StubDeps::new(vec![mine.clone(), theirs]);
+        let shard = RecoveryShardDeps::new(&store, vec![mine]);
+
+        let (networking_status, latch) = make_recovery_state();
+        let recovered: Arc<Mutex<Vec<SessionId>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&recovered);
+
+        run_gateway_recovery(
+            &shard,
+            Arc::clone(&networking_status),
+            latch,
+            || async { Ok::<(), String>(()) },
+            |session_id, owner, _info| {
+                let rec = Arc::clone(&rec);
+                async move {
+                    rec.lock().unwrap().push(session_id);
+                    (session_id, owner, Ok(()))
+                }
+            },
+            |_session_id, _owner| async {},
+            8,
+        )
+        .await;
+
+        assert_eq!(
+            *recovered.lock().unwrap(),
+            vec![mine_id],
+            "only the shard's sessions may have their gateway re-created"
+        );
+        assert!(
+            !networking_status.lock().await.contains_key(&theirs_id),
+            "another owner's session must not even be tagged by this run"
+        );
     }
 
     // -----------------------------------------------------------------------
