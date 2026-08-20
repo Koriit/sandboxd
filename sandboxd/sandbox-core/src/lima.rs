@@ -443,10 +443,14 @@ impl<'a> RegistryLimaReaperOps<'a> {
 
 impl LimaReaperOps for RegistryLimaReaperOps<'_> {
     fn list_vms(&self, op_uid: u32) -> Option<Vec<VmInfo>> {
-        // `get_or_create` runs `ensure_operator_lima_home` (mkdir +
-        // setfacl shell-out, ~10 s timeout) on the first call for this uid.
-        // For uids found on disk but no longer in passwd (deleted operator)
-        // this resolves in a fast NSS lookup error before touching the FS.
+        // `get_or_create` runs `ensure_operator_lima_home` (mkdir + ACL
+        // shell-out, ~10 s timeout) on the first call for this uid. The mkdir
+        // runs before anything looks the uid up, so a uid found on disk but no
+        // longer in passwd still gets its directory: macOS then fails here
+        // resolving the username `chmod +a` needs, while the Linux branch
+        // resolves nothing — its ACL spec is numeric — so on that path the
+        // uid is refused by the helper on the `list_vms` call below, not
+        // here. Either way the operator is warned about and skipped.
         let mgr = match self.registry.get_or_create(op_uid) {
             Ok(m) => m,
             Err(e) => {
