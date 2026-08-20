@@ -164,7 +164,8 @@ pub use lima::{
     reap_lima_orphans, vm_name,
 };
 // Gated with the function: its reachability premise is the macOS agent
-// check-in, and on Linux the helper pivots to any operator uid without one.
+// check-in, and on Linux the helper's operator gates are static host
+// configuration rather than a runtime check-in.
 // The Docker counterpart, `backend::reap_orphans_per_gateway_owner`, is gated
 // at its re-export for the same reason.
 #[cfg(target_os = "macos")]

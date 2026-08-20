@@ -651,16 +651,17 @@ pub fn reap_lima_orphans(
 ///
 /// # Why this is macOS-only
 ///
-/// That premise is, so this is. On Linux the pivot needs nothing from the
-/// operator — `sandbox-lima-helper` gates on its *caller* and then becomes
-/// whichever uid it was asked for — so every operator with a LIMA_HOME can be
-/// listed at any time and "unreachable operator" names nothing. Compiled
-/// there, this would narrow the scan to whatever uids a caller happened to
-/// pass and quietly stop collecting orphans for everyone else, with the
+/// That premise is, so this is. `reachable` is the daemon's own uid plus the
+/// operators whose agent is checked in, and only the macOS path has an agent
+/// to check in. `sandbox-lima-helper` does gate on the operator it is asked to
+/// become — they must resolve via `getpwuid_r` and be in the sandbox group —
+/// but both gates read the passwd and group databases, which say who the host
+/// is configured for and not who is answering right now. So there is no
+/// runtime-varying unreachability on Linux for `reachable` to name, a caller
+/// there would have to invent one, and any set narrower than the whole tree
+/// quietly stops collecting orphans for the operators outside it — with the
 /// section above reading like a licence for it. Linux wants
-/// [`reap_lima_orphans`], which scans the whole tree; reaching for this one
-/// instead means first answering what `reachable` could mean where nothing is
-/// unreachable. The Docker counterpart,
+/// [`reap_lima_orphans`], which scans the whole tree. The Docker counterpart,
 /// `backend::reap_orphans_per_gateway_owner`, is gated for the same reason.
 ///
 /// # `live` stays the global union
