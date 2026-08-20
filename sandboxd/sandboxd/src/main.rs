@@ -4271,13 +4271,29 @@ async fn macos_networking_status_for(
     state: &AppState,
     session: &Session,
 ) -> Option<NetworkingStatus> {
+    let map = state.networking_status.lock().await;
+    macos_networking_status_from(session, &map)
+}
+
+/// The lookup [`macos_networking_status_for`] performs, over a map rather than
+/// over `AppState`.
+///
+/// Split out so what a session reports is testable against what a writer of
+/// the map wrote, without a daemon. The absent-entry default is the reason it
+/// is worth testing: an entry nobody writes reads as healthy, so any path that
+/// leaves a session's networking broken has to write one.
+#[cfg(target_os = "macos")]
+fn macos_networking_status_from(
+    session: &Session,
+    statuses: &HashMap<SessionId, NetworkingStatus>,
+) -> Option<NetworkingStatus> {
     use sandbox_core::backend::BackendKind;
     if session.state != SessionState::Running || session.backend != BackendKind::Lima {
         return None;
     }
-    let map = state.networking_status.lock().await;
     Some(
-        map.get(&session.id)
+        statuses
+            .get(&session.id)
             .copied()
             .unwrap_or(NetworkingStatus::Healthy),
     )
@@ -13005,6 +13021,14 @@ async fn gateway_monitor(state: Arc<AppState>) {
 /// when the switch flips. Under `Shared` the split yields one shard holding
 /// every candidate, so this runs exactly as it did before the split existed.
 ///
+/// Handing [`sandbox_core::GatewayOwnership::PerOperator`] a set of owners here
+/// is therefore not a one-line switch-over: it would produce a shard per owner
+/// while `recover_one_gateway` still drives the single
+/// `state.gateway_lima_manager`, force-stopping and restarting one VM once per
+/// shard and tearing down the sessions the previous shard had just recovered.
+/// The manager becoming per-owner is what makes that arm correct, and it is the
+/// same change that makes it necessary.
+///
 /// ## What this function does NOT do
 ///
 /// Recovery only re-creates per-session gateway *containers* over the forwarded
@@ -13040,19 +13064,59 @@ async fn recover_gateway_lima(state: &Arc<AppState>) {
     )
     .into_parts();
 
-    // Recorded on every run, including the empty case: an empty record is how
-    // a run that placed everything clears a previous run's report.
-    for line in declined.iter().map(|d| d.describe()) {
-        warn!(
-            "gateway Lima recovery: no gateway to recover this session against: {}",
-            line
-        );
+    {
+        let mut statuses = state.networking_status.lock().await;
+        report_declined_sessions(declined, &mut statuses, &state.gateway_recovery_declines);
     }
-    state.gateway_recovery_declines.record(declined);
 
     for shard in shards {
         recover_one_gateway(state, &store, shard).await;
     }
+}
+
+/// Report the sessions a recovery could not attribute to any gateway.
+///
+/// Three things happen to each of them, and the point is that all three do:
+///
+/// 1. It is logged at `error` with its session id as a field, because a
+///    `Running` sandbox whose gateway nobody will rebuild is not a warning.
+/// 2. It is marked [`NetworkingStatus::Degraded`], because the map's absent
+///    entry reads as healthy (see [`macos_networking_status_from`]) — so
+///    declining a session and writing nothing would have it report healthy
+///    networking while its gateway stayed down.
+/// 3. It goes into the `/diagnostics` report, which is recorded on every run
+///    that reaches this point, including the empty case: an empty record is how
+///    a run that placed everything clears a previous run's report. A run that
+///    cannot read the session list returns before reaching it, and so leaves
+///    the previous run's report standing.
+///
+/// The Degraded tag clears the way any other does — a later run that *can*
+/// attribute the session puts it in a shard, and a successful recovery drops
+/// its entry, which reads as healthy again. Nothing here clears it, because
+/// nothing here fixed it. Like every entry in this in-memory map it is also
+/// lost across a daemon restart, which is the map's existing property and not
+/// something a decline should try to work around.
+///
+/// Takes the locked status map and the report rather than `AppState`, so what
+/// a declined session then reports is testable without a daemon.
+#[cfg(target_os = "macos")]
+fn report_declined_sessions(
+    declined: Vec<sandbox_core::UnresolvedSessionOperator>,
+    statuses: &mut HashMap<SessionId, NetworkingStatus>,
+    report: &sandbox_core::GatewayRecoveryDeclines,
+) {
+    for d in &declined {
+        error!(
+            session_id = %d.session_id,
+            owner = %d.owner_username,
+            reason = %d.reason,
+            "gateway Lima recovery: no gateway to recover this session against; its gateway \
+             container is not rebuilt. The session is marked Degraded and stays that way until a \
+             later recovery can attribute it."
+        );
+        statuses.insert(d.session_id, NetworkingStatus::Degraded);
+    }
+    report.record(declined);
 }
 
 /// Recover one gateway VM and the sessions that run through it.
@@ -13220,18 +13284,51 @@ async fn recover_one_gateway(
     .await;
 }
 
+/// How often `gateway_lima_monitor` probes the gateway instance.
+#[cfg(target_os = "macos")]
+const GATEWAY_LIMA_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many consecutive failing probes `gateway_lima_monitor` needs before it
+/// triggers a recovery.
+#[cfg(target_os = "macos")]
+const GATEWAY_LIMA_FAILURE_THRESHOLD: u32 = 3;
+
+/// How long a failed recovery leaves its sessions Degraded before the monitor
+/// tries again.
+///
+/// Derived rather than written down, so it cannot drift from the loop's two
+/// figures: the counter is reset before the recovery call, so the next trigger
+/// is a whole threshold of failing probes away. A floor, not a promise — a
+/// probe that errors is not counted as a failure, which pushes the retry out
+/// further.
+#[cfg(target_os = "macos")]
+fn gateway_lima_retry_delay() -> Duration {
+    GATEWAY_LIMA_PROBE_INTERVAL * GATEWAY_LIMA_FAILURE_THRESHOLD
+}
+
 /// Background task that monitors the gateway Lima instance for crashes and
 /// drives full recovery when the instance Docker daemon becomes unreachable.
 ///
-/// Polls every 10 seconds. Three **consecutive** `probe_docker_health() ==
-/// Ok(false)` results trigger `recover_gateway_lima` (the consecutive-failure
-/// counter resets on any healthy probe). Probe errors are logged but treated
-/// conservatively — they do not increment the failure counter — so a single
-/// transient blip does not trigger a full instance recovery.
+/// Polls every [`GATEWAY_LIMA_PROBE_INTERVAL`]. [`GATEWAY_LIMA_FAILURE_THRESHOLD`]
+/// **consecutive** `probe_docker_health() == Ok(false)` results trigger
+/// `recover_gateway_lima` (the consecutive-failure counter resets on any healthy
+/// probe). Probe errors are logged but treated conservatively — they do not
+/// increment the failure counter — so a single transient blip does not trigger a
+/// full instance recovery.
+///
+/// ## What a failed recovery costs
+///
+/// The counter is reset *before* the call, so a recovery that fails — including
+/// one that times out waiting for the instance to become ready — is not retried
+/// on the next poll. It is retried after a full threshold of failing probes
+/// again, i.e. [`gateway_lima_retry_delay`] later. That is the delay the
+/// sessions this leaves Degraded spend waiting: `run_gateway_recovery`'s
+/// restart-failure path returns rather than retrying, so this loop is what
+/// retries.
 #[cfg(target_os = "macos")]
 async fn gateway_lima_monitor(state: Arc<AppState>) {
-    let poll_interval = Duration::from_secs(10);
-    let failure_threshold: u32 = 3;
+    let poll_interval = GATEWAY_LIMA_PROBE_INTERVAL;
+    let failure_threshold: u32 = GATEWAY_LIMA_FAILURE_THRESHOLD;
     let mut consecutive_failures: u32 = 0;
 
     loop {
@@ -13267,6 +13364,14 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
                     );
                     consecutive_failures = 0;
                     recover_gateway_lima(&state).await;
+                    // Logged whether that pass fixed anything or not: the
+                    // counter is reset above, so this is the earliest the
+                    // instance can be recovered again, and it is what a
+                    // session left Degraded by a failed pass is waiting for.
+                    debug!(
+                        earliest_retry_secs = gateway_lima_retry_delay().as_secs(),
+                        "gateway Lima monitor: recovery pass complete; failure counter reset"
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -17921,6 +18026,112 @@ mod tests {
             assert_eq!(
                 dead_vm_state_for_source(ReconcileSource::Startup, epoch),
                 SessionState::Stopped
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS gateway-recovery declines and retry cadence
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    mod gateway_recovery_reporting {
+        use super::*;
+        use sandbox_core::{GatewayRecoveryDeclines, UnresolvedSessionOperator};
+
+        /// A `Running` Lima session — the shape `sessions_to_recover` selects,
+        /// and so the shape a decline can happen to.
+        fn recovery_candidate() -> Session {
+            let mut session = Session::new(None);
+            session.state = SessionState::Running;
+            session.backend = sandbox_core::backend::BackendKind::Lima;
+            session.owner_username = "ghost".to_string();
+            session
+        }
+
+        fn decline(session: &Session) -> UnresolvedSessionOperator {
+            UnresolvedSessionOperator {
+                session_id: session.id,
+                owner_username: session.owner_username.clone(),
+                reason: "owner account 'ghost' does not resolve on this host".to_string(),
+            }
+        }
+
+        /// A session recovery declined to place reports Degraded networking,
+        /// not Healthy.
+        ///
+        /// It is `Running` with, as far as this daemon knows, live egress, and
+        /// no shard holds it — so nothing will rebuild its gateway container.
+        /// The status map's absent entry reads as Healthy, which is the
+        /// answer that would be given if declining wrote nothing.
+        #[test]
+        fn a_declined_session_reports_degraded_networking() {
+            let session = recovery_candidate();
+            let mut statuses = HashMap::new();
+
+            assert_eq!(
+                macos_networking_status_from(&session, &statuses),
+                Some(NetworkingStatus::Healthy),
+                "the untagged session must start out reporting Healthy, or this test would \
+                 pass without the tagging it is about"
+            );
+
+            report_declined_sessions(
+                vec![decline(&session)],
+                &mut statuses,
+                &GatewayRecoveryDeclines::new(),
+            );
+
+            assert_eq!(
+                macos_networking_status_from(&session, &statuses),
+                Some(NetworkingStatus::Degraded),
+                "a session no gateway will be rebuilt for must not report healthy networking"
+            );
+        }
+
+        /// Declining also puts the session in the `/diagnostics` report, and a
+        /// run that declined nothing clears what an earlier run reported.
+        #[test]
+        fn declines_are_reported_and_a_later_run_replaces_them() {
+            let session = recovery_candidate();
+            let mut statuses = HashMap::new();
+            let report = GatewayRecoveryDeclines::new();
+
+            report_declined_sessions(vec![decline(&session)], &mut statuses, &report);
+            let lines = report.describe();
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].contains(&session.id.to_string()),
+                "the report must name the session: {}",
+                lines[0]
+            );
+
+            report_declined_sessions(Vec::new(), &mut statuses, &report);
+            assert!(
+                report.describe().is_empty(),
+                "a run that declined nothing must clear the previous run's report"
+            );
+        }
+
+        /// A failed recovery is not retried on the monitor's next poll.
+        ///
+        /// The monitor resets its consecutive-failure counter before calling
+        /// in, so the next trigger is a whole threshold of failing probes
+        /// away. This is the delay the sessions a failed recovery leaves
+        /// Degraded actually wait, and the figure `run_gateway_recovery`'s
+        /// restart-failure path defers to.
+        #[test]
+        fn a_failed_recovery_waits_a_full_threshold_of_probes_to_be_retried() {
+            assert_eq!(
+                gateway_lima_retry_delay(),
+                Duration::from_secs(30),
+                "reset counter + {GATEWAY_LIMA_FAILURE_THRESHOLD} probes at \
+                 {GATEWAY_LIMA_PROBE_INTERVAL:?} is the retry delay"
+            );
+            assert_ne!(
+                gateway_lima_retry_delay(),
+                GATEWAY_LIMA_PROBE_INTERVAL,
+                "the retry delay is not one poll interval"
             );
         }
     }

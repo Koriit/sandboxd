@@ -421,6 +421,48 @@ Each line names the session, the slot it held and why it could not be routed.
 Remedy: stop the session (`sandbox session stop <id>`), which releases the
 slot for real, or restore the account the session was created under.
 
+### Sessions a gateway recovery could not place
+
+A second, differently-caused decline, reported under its own `/diagnostics`
+field:
+
+| Field | What it holds |
+|---|---|
+| `gateway_recovery_declined_sessions` | one line per session the last gateway recovery could not attribute to any gateway |
+
+When the gateway VM's Docker daemon goes unreachable, the daemon restarts the
+instance and re-creates each running session's gateway container against it.
+Which gateway a session recovers against follows from its operator, so a
+session with no operator uid persisted on the session or its network record,
+and an owner name that is empty or no longer resolves to an account, is
+**declined** rather than recovered against a guessed gateway.
+
+That leaves a running sandbox whose gateway container is not rebuilt, which is
+reported three ways rather than one:
+
+- logged at `error` with the session id, the owner name and the reason;
+- the session reports `"networking_status": "degraded"` on `GET /sessions` and
+  `GET /sessions/<id>`, and keeps reporting it until a later recovery can
+  attribute the session and rebuild its gateway;
+- it appears here, one line per session:
+
+```bash
+curl --unix-socket /var/run/sandbox/sandboxd.sock \
+  http://localhost/diagnostics | python3 -m json.tool \
+  | grep -A5 gateway_recovery_declined
+```
+
+Each recovery run that reads the session list replaces this report rather than
+adding to it, so an empty list means the last such run placed every session —
+not that no recovery has run. Both the report and the `degraded` status live in
+the daemon's memory, so a daemon restart also clears them; they come back on
+the next recovery that declines something.
+
+Remedy: restore the account the session was created under, so the next recovery
+can attribute it. Failing that, stop the session (`sandbox session stop <id>`):
+nothing is rebuilding its gateway, so stopping it is the only way to be sure
+its egress is down.
+
 ### Preconditions this does not cover
 
 - **Operators must not be able to become root**, as in any multi-user isolation
