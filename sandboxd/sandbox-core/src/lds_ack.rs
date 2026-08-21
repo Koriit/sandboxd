@@ -14,9 +14,10 @@
 //!
 //! In that window, VM connections that the daemon has already
 //! observed as propagated land on a stale or missing listener and
-//! are reset / refused at the gateway. The cargo and github-repo
-//! E2Es reproduce this reliably (see
-//! `.tasks/handoffs/20260423-m10-s6-e2e-regression.md` hypothesis 1).
+//! are reset / refused at the gateway.
+//! `test_cargo_preset_allows_cargo_fetch` and
+//! `test_github_repo_preset_scopes_to_one_repo` in
+//! `tests/e2e/test_presets.py` reproduce this reliably.
 //!
 //! # What
 //!

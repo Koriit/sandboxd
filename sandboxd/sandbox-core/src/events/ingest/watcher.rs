@@ -595,9 +595,8 @@ mod tests {
         let vm_ip_map = VmIpSessionMap::new();
 
         // client_ip=10.209.0.2 mimics the real-world failure: that is
-        // the gateway container's bridge IP on the VM-facing bridge
-        // (see handoff in .tasks/handoffs/20260423-061500-* for the
-        // root cause). Not bound, must still be attributed.
+        // the gateway container's bridge IP on the VM-facing bridge.
+        // Not bound, must still be attributed.
         let line = r#"{"timestamp":"2026-04-22T09:45:00.000Z","layer":"mitmproxy","event":"request_allowed","host":"registry.npmjs.org","port":443,"method":"GET","path":"/leftpad","client_ip":"10.209.0.2"}"#;
 
         dispatch_line(&watcher_session, &bus, &vm_ip_map, Layer::Mitmproxy, line);

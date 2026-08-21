@@ -1444,9 +1444,10 @@ COSIGN_SHA256_DARWIN_ARM64 = (
 # stands in for the production Fulcio + Rekor + CT-log trio so install.sh
 # (and ``sandbox update``) can exercise the real cosign verify-blob path
 # against locally-signed tarballs. See the README.md alongside
-# ``docker-compose.yml`` for operator notes; the architectural
-# rationale (DNS interception, TLS CA injection, JWT minting strategy)
-# is recorded in the stack's bring-up handoff in ``.tasks/handoffs/``.
+# ``docker-compose.yml`` for operator notes and for how the stack
+# impersonates the production OIDC issuer: DNS interception, a local
+# TLS CA whose PEM is injected into Fulcio's ``ca-cert`` field, and
+# the OIDC signing key ``mint_token.py`` uses to mint test JWTs.
 
 SIGSTORE_STACK_DIR = HERE / "sigstore-stack"
 

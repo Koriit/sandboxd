@@ -13,12 +13,11 @@
 //!   parallel runs (`cargo nextest -j`) and partial failures cannot
 //!   leak state.
 //!
-//! Phase 3A scope (handoff
-//! `.tasks/handoffs/20260427-200000-implementer-m11-s3-phase3a-container-runtime.md`):
-//! these tests do **not** exercise the route helper (Phase 3D) and do
+//! Scope: these tests do **not** exercise the route helper and do
 //! **not** depend on `users.conf`. They use a tiny inline-built test
-//! image (`sandboxd-test-sleep:latest` — ENTRYPOINT `sleep 3600`) since
-//! the production lite image is built in Phase 3B.
+//! image (`sandboxd-test-sleep:latest` — ENTRYPOINT `sleep 3600`)
+//! rather than the production lite image, so the suite does not
+//! require `make lite-image` to have been run first.
 
 use std::process::{Command, Stdio};
 use std::sync::Once;
