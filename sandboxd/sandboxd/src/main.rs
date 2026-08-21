@@ -11424,21 +11424,27 @@ async fn get_proxy(
     Path(id): Path<String>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // The proxy's `docker exec` byte pump takes the same route as every
-    // other Docker operation: the host daemon on Linux, the operator's VM on
-    // macOS. It holds no socket path of its own, so it cannot disagree with
-    // the route about which Docker daemon the session's container lives in.
+    // The proxy's `docker exec` byte pump resolves its route through the same
+    // function every other container operation does — `ContainerRuntime::
+    // route_for` — so there is one answer to "which Docker daemon does this
+    // session's container live in" rather than two that have to agree.
     //
-    // It is handed the factory rather than a finished route because the route
-    // depends on which session the tunnel is for, and that is not known yet —
-    // the proxy resolves the session itself, and builds the route from the
-    // owner recorded on the row. Handing it a route built from the requester's
-    // uid would aim a long-lived SSH pump at whichever Docker daemon that uid
-    // happens to name.
+    // It is handed the runtime rather than a finished route because the route
+    // depends on which session the tunnel is for, and that is not known yet:
+    // the proxy resolves the session itself and resolves from the *operator*
+    // recorded on the row, which `route_for` then collapses to the uid that
+    // holds that operator's gateway. Handing it a route built from the
+    // requester's uid would aim a long-lived SSH pump at whichever Docker
+    // daemon that uid happens to name.
+    //
+    // Not the `gateway_docker_route` factory, which is what used to be cloned
+    // in here. That one is owner-keyed and would have been called with an
+    // operator uid, and nothing about the resulting route's type or the
+    // gateway's name would have said so.
     let proxy_state = Arc::new(sandboxd::proxy_http::ProxyState {
         store: Arc::clone(&state.store),
         lima_registry: Arc::clone(state.lima_runtime.registry()),
-        docker_route: Arc::clone(&state.gateway_docker_route),
+        container_runtime: Arc::clone(&state.container_runtime),
     });
     match sandboxd::proxy_http::handle_proxy(proxy_state, operator.name, id, ws).await {
         Ok(resp) => resp.into_response(),
@@ -16212,15 +16218,34 @@ mod tests {
     /// assertion that they stay that way.
     #[cfg(target_os = "macos")]
     fn container_runtime_wired_as_startup_wires_it() -> Arc<ContainerRuntime> {
-        let gateway_docker_route: Arc<
-            dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
-        > = Arc::new(|owner_uid| sandbox_core::docker::DockerRoute::Vm {
+        container_runtime_wired_as_startup_wires_it_over(gateway_route_naming_its_owner())
+    }
+
+    /// The gateway-route factory startup builds on macOS, reduced to the part
+    /// these tests read: a route that names the uid it was asked for.
+    #[cfg(target_os = "macos")]
+    fn gateway_route_naming_its_owner()
+    -> Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync> {
+        Arc::new(|owner_uid| sandbox_core::docker::DockerRoute::Vm {
             op_uid: owner_uid,
             executor: Arc::new(sandbox_core::docker::LocalSocketDockerExecutor::new(
                 "/nonexistent/gateway-docker.sock",
                 "/nonexistent/lima",
             )),
-        });
+        })
+    }
+
+    /// [`container_runtime_wired_as_startup_wires_it`] over a caller-supplied
+    /// gateway-route factory, so a test can watch which uid reaches it.
+    ///
+    /// The split is the whole point: `container_docker_route_resolver` is the
+    /// collapse, and a test that supplied its own already-resolving factory
+    /// would be asserting against its own arithmetic rather than against the
+    /// one startup applies.
+    #[cfg(target_os = "macos")]
+    fn container_runtime_wired_as_startup_wires_it_over(
+        gateway_docker_route: Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
+    ) -> Arc<ContainerRuntime> {
         ContainerRuntime::with_vm_route(
             "sandboxd-lite:test",
             1024,
@@ -16321,6 +16346,187 @@ mod tests {
                  uid {daemon_uid}'s route; naming {operator_uid} instead means \
                  the operator-to-owner collapse was skipped when the runtime \
                  was wired"
+            );
+        }
+
+        match prior {
+            Some(value) => unsafe {
+                std::env::set_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV) },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Which gateway the proxy's container byte pump lands on.
+    //
+    // `sandbox exec` and `sandbox ssh` reach the same container by different
+    // routes — exec through the guest-agent transport, ssh through this
+    // proxy — and only the first of them resolves through the container
+    // runtime. These two tests exist because that asymmetry is invisible
+    // everywhere else: both resolutions have type `Fn(u32) -> DockerRoute`,
+    // and while per-operator gateways are off both name the same gateway
+    // *instance*.
+    // -----------------------------------------------------------------------
+
+    /// A [`sandboxd::proxy_http::ProxyState`] wired the way `get_proxy` wires
+    /// one, over a gateway-route factory the caller supplies and can watch.
+    ///
+    /// The store and the Lima registry are inert here: the container arm
+    /// derives its container name from the session id and never touches
+    /// either, and the route is decided before any of it is dispatched over.
+    /// They are constructed rather than faked because `ProxyState` is the
+    /// thing under test and a stand-in for it would be a second definition of
+    /// the wiring — which is the defect these tests are about.
+    ///
+    /// The Lima executor panics rather than stubs quietly: the container arm of
+    /// the proxy never reaches the registry, so an invocation would mean the
+    /// test had wandered onto the Lima path and stopped measuring what it
+    /// claims to.
+    #[cfg(target_os = "macos")]
+    struct ProxyUnusedLimaExecutor;
+
+    #[cfg(target_os = "macos")]
+    #[async_trait::async_trait]
+    impl sandbox_core::lima::LimaExecutor for ProxyUnusedLimaExecutor {
+        fn run(
+            &self,
+            _op_uid: u32,
+            _op: sandbox_core::lima::LimaOp<'_>,
+            _timeout: Duration,
+            label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            unreachable!("the container proxy path issues no limactl op; got {label}");
+        }
+
+        async fn guest_socat(
+            &self,
+            _op_uid: u32,
+            _vm: &str,
+        ) -> Result<Box<dyn sandbox_core::backend::AsyncReadWrite + Send + Unpin>, SandboxError>
+        {
+            unreachable!("the container proxy path opens no guest stream");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn proxy_state_wired_as_get_proxy_wires_it(
+        gateway_docker_route: Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
+        dir: &std::path::Path,
+    ) -> sandboxd::proxy_http::ProxyState {
+        let (store, _orphans) = SessionStore::new(dir.to_path_buf()).expect("open session store");
+        let executor: Arc<dyn sandbox_core::lima::LimaExecutor> = Arc::new(ProxyUnusedLimaExecutor);
+        sandboxd::proxy_http::ProxyState {
+            store: Arc::new(store),
+            lima_registry: Arc::new(LimaManagerRegistry::new(
+                "sandbox-base-test".to_string(),
+                executor,
+                "10.209.0.0/16".to_string(),
+                true,
+            )),
+            container_runtime: container_runtime_wired_as_startup_wires_it_over(
+                gateway_docker_route,
+            ),
+        }
+    }
+
+    /// With the switch **off**, an SSH tunnel opened for any operator must run
+    /// over the daemon's own gateway — the same route every other Docker
+    /// operation for that session takes.
+    ///
+    /// This is the one test in this file that can see the proxy resolving an
+    /// operator uid by a route of its own. Its on-switch sibling below cannot:
+    /// on, `gateway_owner_uid` is the identity, so a proxy that collapses and
+    /// one that does not return the same answer for every uid. Off, they differ
+    /// for every uid except the daemon's own — which is why the sweep carries
+    /// `daemon_uid.wrapping_add(7)` and not just the literals. A sweep of one
+    /// uid that happened to equal the daemon's would satisfy both readings at
+    /// once, exactly as it would for the runtime tests above.
+    ///
+    /// The assertion watches the uid that reaches the gateway-route factory
+    /// rather than comparing two `DockerRoute`s: the macOS variant carries an
+    /// `Arc<dyn DockerExecutor>` and is not comparable, and the uid is the part
+    /// that would be wrong anyway.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_proxys_container_route_is_the_daemons_own_while_the_switch_is_off() {
+        let prior = std::env::var_os(sandbox_core::PER_OPERATOR_GATEWAY_ENV);
+        unsafe { std::env::remove_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV) };
+        assert!(
+            !sandbox_core::per_operator_gateway_enabled(),
+            "this test describes the switched-off state"
+        );
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let recorded = Arc::clone(&seen);
+        let gateway_docker_route: Arc<
+            dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
+        > = Arc::new(move |owner_uid| {
+            recorded.lock().unwrap().push(owner_uid);
+            sandbox_core::docker::DockerRoute::Host
+        });
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = proxy_state_wired_as_get_proxy_wires_it(gateway_docker_route, tmp.path());
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        for session_operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
+            let _ = state.container_docker_route(session_operator_uid);
+            assert_eq!(
+                seen.lock().unwrap().pop().expect("the factory ran"),
+                daemon_uid,
+                "with per-operator gateways off there is one gateway and the \
+                 daemon owns it, so an SSH tunnel for a session recorded \
+                 against operator uid {session_operator_uid} must run over uid \
+                 {daemon_uid}'s route; naming {session_operator_uid} instead \
+                 means the proxy skipped the operator-to-owner collapse and \
+                 aimed a long-lived pump at a Docker daemon in a VM that does \
+                 not exist"
+            );
+        }
+
+        match prior {
+            Some(value) => unsafe {
+                std::env::set_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV) },
+        }
+    }
+
+    /// With the switch **on**, an SSH tunnel must run over the gateway of the
+    /// operator the session was created under.
+    ///
+    /// Stated plainly: this test **cannot** detect the missing collapse — on,
+    /// collapsing and not collapsing agree. It is here for the other way the
+    /// proxy's route can be wrong, which is the shape the pre-existing
+    /// WebSocket test had: a resolution that ignores the uid it is handed. Such
+    /// a resolution passes the off-switch test above (the daemon's uid is what
+    /// it would answer anyway) and fails here for every operator but one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_proxys_container_route_names_the_sessions_operator_while_the_switch_is_on() {
+        let prior = std::env::var_os(sandbox_core::PER_OPERATOR_GATEWAY_ENV);
+        unsafe { std::env::set_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV, "1") };
+        assert!(
+            sandbox_core::per_operator_gateway_enabled(),
+            "this test describes the switched-on state and must set it up before \
+             asserting"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state =
+            proxy_state_wired_as_get_proxy_wires_it(gateway_route_naming_its_owner(), tmp.path());
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        for session_operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
+            assert_eq!(
+                state.container_docker_route(session_operator_uid).op_uid(),
+                Some(session_operator_uid),
+                "with per-operator gateways on, an SSH tunnel for a session \
+                 recorded against operator uid {session_operator_uid} must run \
+                 over uid {session_operator_uid}'s own gateway VM; a route \
+                 naming any other uid opens that operator's shell inside \
+                 someone else's VM"
             );
         }
 

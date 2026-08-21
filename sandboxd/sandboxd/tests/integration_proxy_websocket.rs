@@ -58,7 +58,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_core::SshKeypair;
 use sandbox_core::backend::{
-    BackendKind, LITE_IMAGE_REPOSITORY, ensure_image, stage_ssh_credentials,
+    BackendKind, ContainerRuntime, LITE_IMAGE_REPOSITORY, ensure_image, stage_ssh_credentials,
 };
 use sandbox_core::lima::{LimaExecutor, SetuidHelperExecutor};
 use sandbox_core::{LimaManagerRegistry, SessionConfig, SessionStore};
@@ -449,12 +449,27 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
         "test-pool".to_string(),
         false, // is_macos: Linux test environment
     ));
+    // The real container runtime, not a stand-in for the part of it this test
+    // depends on. Its `route_for` is what the proxy resolves through, and a
+    // closure standing in for it here would be a second definition of the
+    // resolution the handler is supposed to share — which is the shape the
+    // proxy's own routing bug had. On Linux `ContainerRuntime::new` installs
+    // the host-daemon route for every uid, so the route this test runs over is
+    // unchanged; what changes is that it now comes from the production
+    // resolver. The resource and identity arguments are inert: the proxy asks
+    // this runtime for a route and nothing else.
+    let container_runtime = ContainerRuntime::new(
+        format!("{LITE_IMAGE_REPOSITORY}:test"),
+        1024,
+        1.0,
+        CROSS_USER_DAEMON_UID,
+        CROSS_USER_DAEMON_GID,
+        "/nonexistent/sandbox-guest",
+    );
     let proxy_state = Arc::new(ProxyState {
         store,
         lima_registry,
-        // Linux test environment: the host docker daemon, reached in-process,
-        // whichever operator the session names.
-        docker_route: Arc::new(|_op_uid| sandbox_core::docker::DockerRoute::Host),
+        container_runtime,
     });
     let app = build_router(proxy_state, operator.to_string());
 

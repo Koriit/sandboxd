@@ -126,6 +126,20 @@ violation, only by a KNOWN SPELLING appearing more often than it did.  A new
 free-form field under an unwatched name passes it silently.  It is a regression
 guard on shapes that have gone wrong before, not a check of the property.
 
+C9 sits across the C1/C2 and C3/C4 split rather than on one side of it, and
+saying which half it belongs to is the whole of what it is worth.  It is
+name-anchored like C1/C2 -- it knows the two F3 sinks by their spellings, and a
+sink reached through a third name (a local alias, an accessor returning the
+factory) is invisible to it.  But the defect it goes red on is a real contract
+violation with every identifier correct and current, like C3/C4: the shipped one
+at 7e5fa0c named the field correctly, passed no uid at all, and moved the
+resolution a crate away.  What it measures is the SHAPE OF THE REFERENCE -- is
+the sink being consumed here, or handed onward -- which is a question none of
+C1-C8 asks, and which C5 structurally cannot ask, because C5's subject is the
+argument at a call and a borrow has no argument.  It is also the only clause
+here whose RED demonstration exists at a real commit rather than only under
+injection: `--rev 6f6247a`.
+
 NO SHELL SEARCH TOOLS ARE USED HERE, DELIBERATELY.  `grep`, `rg` and `find` can
 be shell *functions* rather than the programs they name, and a function silently
 becomes a different program -- or vanishes -- inside a nested shell, which a
@@ -452,6 +466,53 @@ F3_SINK_CALL = re.compile(
     r"\bgateway_lima_managers\b\s*\.?\s*(?:\n\s*)?\.?\s*get_or_create\s*\(|"
     r"\bgateway_docker_route\s*\)?\s*\(")
 
+# --- C9: the same sinks, BORROWED instead of called --------------------------
+#
+# C5 reads the argument at the call.  A borrow has no argument to read.  It
+# hands the sink itself to somebody else, and the resolution then happens at a
+# site C5 will never inspect -- so the shape C5 cannot see is not a subtler
+# version of the shape it can, it is the strictly worse one.  A bad call gets
+# the uid class wrong once, in a place the clause is standing.  A borrow moves
+# the decision out of the clause's field of view entirely and takes the whole
+# call site with it.
+#
+# NOT HYPOTHETICAL, and not found by reasoning about the pattern.  It is how the
+# defect this clause was written for got in.  MEASURED at 6f6247a (the last
+# commit before the fix), main.rs:11412, inside `get_proxy`, which is classified
+# serving via `Extension<OperatorIdentity>`:
+#
+#     docker_route: Arc::clone(&state.gateway_docker_route),
+#
+# The factory went into `ProxyState`, and `proxy_http` then called it on a RAW
+# operator uid, one crate away.  C5 saw an `Arc::clone` and had nothing to say;
+# every SSH-shaped surface on macOS resolved through a second, uncollapsed
+# resolution function for as long as that stood.
+#
+# The attribution is measured too, not assumed: `--rev 6f6247a` reports 2
+# violations under the clause set that shipped without C9 -- the two expected
+# C1 reds in `create_session` / `create_session_macos_lite`, neither in
+# `get_proxy` -- and 3 with C9 present, the third being the line above.  So the
+# RED is this clause's and not an older mechanism firing under a new name.
+#
+# The acceptance is the contract question again, not a function list: a serving
+# function MAY name a sink if it hands it straight into an F1 call, because that
+# is the collapse being applied rather than deferred.  `docker_route_for_operator`
+# does exactly this -- `resolve_docker_route(self.gateway_docker_route.as_ref(),
+# operator_uid)` -- and it is the only such site on the fixed tree, so it is the
+# clause's whole live denominator.  Accepted sites are PRINTED, and the
+# acceptance has a matched-pair control in `--self-test`: the same sink, in the
+# same serving function, with and without the F1 handoff.  Injection alone
+# cannot test an acceptance term, because injection only ever reaches the terms
+# that raise.
+#
+# The statement scan behind that acceptance is a heuristic and is stated as one:
+# it reads back to the nearest `;`, `{` or `}` and asks whether an F1 name
+# appears before the match.  It does not parse, so a serving function that calls
+# an F1 function and then separately borrows a sink inside the same statement
+# would be accepted wrongly.  No such site exists; the direction of the error is
+# recorded here rather than left to be rediscovered.
+F3_SINK_NAME = re.compile(r"\bgateway_docker_route\b|\bgateway_lima_managers\b")
+
 # --- the THIRD F3 sink: the gateway-recovery latch ---------------------------
 #
 # C7 is the second thing ported before a retirement, and it came from asking
@@ -671,6 +732,20 @@ def blind_region(lines, spans, served, tstart):
         if re.search(r"\b" + re.escape(fn) + r"\s*\(", bodies):
             n += 1
     return n
+
+
+def statement_before(text, pos):
+    """The text from the nearest preceding `;`, `{` or `}` up to `pos`.
+
+    C9's acceptance needs to know what a sink read is being handed TO, and the
+    answer is to its left, not inside a paren it owns -- so `arg_text` (which
+    reads forwards from an open paren) is the wrong instrument.  `,` is
+    deliberately NOT a boundary: it would cut a multi-argument F1 call in half
+    and turn `resolve_docker_route(factory, operator_uid)` into a violation the
+    moment the sink stopped being the first argument.
+    """
+    start = max(text.rfind(c, 0, pos) for c in (";", "{", "}"))
+    return text[start + 1:pos]
 
 
 def arg_text(text, open_paren):
@@ -1263,6 +1338,20 @@ DENOM_EXPECTED = {
           "wire file -- wrong file, or every spelling has moved",
     "C8 wire lines scanned": "the wire file read as empty, or the test-region "
                              "boundary swallowed the whole file",
+    "C9": "neither F3 sink is NAMED anywhere in the scanned region -- the "
+          "sinks have been renamed, or the name pattern has collapsed",
+    # Listed here rather than in DENOM_ZERO_OK, unlike its C1/C2 counterparts,
+    # because it is 1 today and that one site is the clause's ONLY live
+    # decision: the F1 handoff in `docker_route_for_operator`.  A zero would be
+    # a defensible state of the CODE -- no serving function naming a sink
+    # outside a call is the success state -- while being a real regression in
+    # the MEASUREMENT, because it leaves the --self-test matched pair as the
+    # only thing keeping C9 apart from a dead pattern.  That is worth a scope
+    # warning, so it gets one.
+    "C9 in a serving fn":
+        "no serving fn names an F3 sink outside a call -- good for the tree, "
+        "but C9 then decides nothing here and only --self-test separates it "
+        "from a dead clause",
     # A zero here would be GOOD NEWS if true -- C1/C2 would have no blind
     # region -- which is exactly why it is listed as unexplained rather than
     # exempted.  On a tree with 31 serving and 107 non-serving functions the
@@ -1338,6 +1427,7 @@ DENOM_KEYS = (
      "C4 derived wrappers", "C5", "C6", "C7",
      "C7 GatewayOwnership::Shared", "C7 GatewayOwnership::PerOperator",
      "C8", "C8 wire lines scanned",
+     "C9", "C9 in a serving fn",
      "blind region: non-serving fns called from a serving fn"]
     + ["alt C8/" + lbl for _rx, lbl in WIRE_PASSTHRU]
     + ["alt " + cid + "/" + n
@@ -1346,6 +1436,7 @@ DENOM_KEYS = (
     + ["alt C4/" + n for n in F1_NAMES]
     + ["alt C5/gateway_lima_managers.get_or_create",
        "alt C5/gateway_docker_route"]
+    + ["alt C9/gateway_docker_route", "alt C9/gateway_lima_managers"]
     + ["alt C7/for_owner", "alt C7/is_recovering"]
     + ["alt NON_CALLER_UID/" + n for n, _ in NON_CALLER_UID_ALTS]
 )
@@ -1520,6 +1611,36 @@ def run(path, quiet=False):
         if not ok:
             viol.append(("C5", lno, fn,
                          f"F3 sink <- uncollapsed {arg!r}"[:70]))
+
+    # C9 -- the same two F3 sinks, BORROWED rather than called.  See F3_SINK_NAME
+    # for the defect this was written from and for why the borrow is the worse
+    # violation.  The two clauses PARTITION the occurrences rather than overlap:
+    # every C5 match starts at the sink's own name, so a name match at a start
+    # C5 already claimed is a call and belongs to C5.  Neither a gap nor a
+    # double report is possible by construction.
+    c5_starts = {m.start() for m in F3_SINK_CALL.finditer(raw)}
+    for mo in F3_SINK_NAME.finditer(raw):
+        lno = lno_of(mo.start())
+        if (lno >= tstart or commentish(lines[lno - 1])
+                or mo.start() in c5_starts):
+            continue
+        name = mo.group(0)
+        sites["C9"] += 1
+        sites["alt C9/" + name] += 1
+        fn = enclosing_fn(spans, lno)
+        # Counted at two depths for the reason C1/C2 are: a clause gone vacuous
+        # and a tree with nothing left to decide print the identical zero at the
+        # child, and only the parent tells them apart.
+        if fn not in served:
+            continue
+        sites["C9 in a serving fn"] += 1
+        handoff = F1_CALL.search(statement_before(raw, mo.start()))
+        if handoff:
+            accepted.append(("C9", lno, fn, f"{name} named, not called",
+                             f"handed straight into `{handoff.group(1)}`"))
+        else:
+            viol.append(("C9", lno, fn,
+                         f"F3 sink `{name}` escapes uncalled"[:70]))
 
     # C6 -- every F1 function must actually perform the collapse, or delegate
     # to another F1 function that does.  Without this the whole contract can be
@@ -1753,6 +1874,33 @@ INJECTIONS = [
     ("C7", "    let bad = state.gateway_recovering.is_recovering(operator.uid);",
      "recovery latch READ under a raw operator uid -- the mirror direction, "
      "also GREEN under C1-C6"),
+    # These two are the shape that shipped.  The first is a transcription of
+    # main.rs:11412 at 6f6247a with the struct literal stripped away; see
+    # F3_SINK_NAME.  Unlike every injection above it, this one does not need the
+    # "measured GREEN before the clause existed" claim to be taken on trust --
+    # `--rev 6f6247a` runs it against the real commit.
+    ("C9", "    let bad = std::sync::Arc::clone(&state.gateway_docker_route);",
+     "F3 route factory BORROWED out of AppState while serving a caller -- the "
+     "sink escapes and is resolved later, somewhere C5 has no argument to "
+     "read; this is the shape the proxy defect shipped in"),
+    ("C9", "    let bad = state.gateway_lima_managers.clone();",
+     "F3 gateway registry MOVED out of AppState, the mirror direction -- and "
+     "not a C5 site, because C5's registry spelling requires get_or_create"),
+]
+
+# C9's acceptance term, as a MATCHED PAIR with the injection above.  Injection
+# reaches only the terms that RAISE: a suppressor bolted onto a clause is
+# invisible to every demonstration in INJECTIONS, because a wrongly-suppressed
+# site and a correctly-quiet one are the same silence.  So the acceptance gets
+# the other half -- the same sink, in the same serving function, differing only
+# in whether it is handed into an F1 call.  If this went RED the clause would be
+# flagging `docker_route_for_operator`, which is the correct code C5's header
+# says a check must never flag.
+ACCEPT_CONTROLS = [
+    ("C9", "    let ok_probe = resolve_docker_route("
+           "state.gateway_docker_route.as_ref(), operator.uid);",
+     "the same borrow, handed straight into an F1 call -- must be ACCEPTED and "
+     "printed, not raised"),
 ]
 
 # C8's demonstrations mutate the WIRE file, not main.rs, so they get their own
@@ -2194,6 +2342,34 @@ def self_test(main_rs):
                   "that is what 'they measure spelling' means, shown rather than asserted")
         main_rs.write_text(original)
 
+    # --- acceptance controls: the half of the pair injection cannot reach ----
+    print()
+    for cid, good, why in ACCEPT_CONTROLS:
+        inj = lines[:brace] + [good] + lines[brace:]
+        main_rs.write_text("\n".join(inj))
+        all_v, all_a = run(main_rs, quiet=True)
+        fresh = new_since(base_counter, all_v)
+        gained = [a for a in all_a if a[0] == cid and a[1] == brace + 1]
+        print(f"{cid} acceptance control: injected into fn {INJECT_FN} -- {why}")
+        print(f"    {good.strip()[:88]}")
+        if any(v[0] == cid for v in fresh):
+            hit = next(v for v in fresh if v[0] == cid)
+            print(f"  -> RAISED at main.rs:{hit[1]} -- {cid} is flagging the "
+                  "collapse being APPLIED, which is correct code")
+            ok = False
+        elif not gained:
+            # The failure mode that matters most here.  A clause that never
+            # reached the site is silent in exactly the way a satisfied
+            # acceptance is, so "not raised" on its own would certify nothing.
+            print(f"  -> NEITHER raised NOR accepted -- {cid} did not reach "
+                  "this site, so its acceptance term is untested and the "
+                  "injection above proves less than it appears to")
+            ok = False
+        else:
+            print(f"  -> ACCEPTED at main.rs:{gained[0][1]} in fn "
+                  f"{gained[0][2]}: {gained[0][4]}")
+        main_rs.write_text(original)
+
     # --- deletion-shaped defects ---------------------------------------------
     for cid, present, replaced, why in DELETIONS:
         if present not in original:
@@ -2216,12 +2392,27 @@ def self_test(main_rs):
     # A carve-out that cannot fail is an allowlist wearing a predicate's
     # clothes.  Take each accepted site and give its binding one use outside
     # HOST_SCOPED_QUERIES; C4 must stop accepting it and start flagging it.
+    # SCOPED TO C4 ON BOTH SIDES, and neither filter is cosmetic.  This loop
+    # reads a binding name out of the `why` text and asserts that C4 --
+    # specifically C4 -- starts flagging it, so it was silently assuming every
+    # accepted entry in the file was C4's.  That assumption held for exactly as
+    # long as C4 was the only clause with a carve-out.  C9 has one too, and the
+    # `not a2` term below is the half that bites: written as "no site is
+    # accepted anywhere", it fails the instant an UNRELATED clause accepts an
+    # UNRELATED site, and reports the failure as "the C4 carve-out is an
+    # allowlist" -- a true-sounding sentence about the wrong clause.  MEASURED:
+    # adding C9 turned this control red on a tree where C4's carve-out was
+    # withdrawn correctly.  C9's own acceptance is falsified by ACCEPT_CONTROLS
+    # above, which is the matched pair this loop is the C4 half of.
     for cid, lno, fn, site, why in acc:
+        if cid != "C4":
+            continue
         bind = re.search(r"`([A-Za-z0-9_]+)`", why).group(1)
         inj = lines[:lno] + [f"    let _ = {bind}.start_gateway();"] + lines[lno:]
         main_rs.write_text("\n".join(inj))
         v2, a2 = run(main_rs, quiet=True)
         v2 = new_since(base_counter, v2)
+        a2 = [x for x in a2 if x[0] == "C4"]
         print(f"\ncarve-out negative control at main.rs:{lno} (fn {fn}):")
         print(f"    gave `{bind}` a non-host-scoped use -- let _ = {bind}.start_gateway();")
         if any(x[0] == "C4" for x in v2) and not a2:

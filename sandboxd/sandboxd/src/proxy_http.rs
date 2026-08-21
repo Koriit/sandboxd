@@ -14,9 +14,13 @@
 //!   the route spawns that child in-process with async stdio, which is the
 //!   same byte mover the cross-user sshd integration test (`tests/
 //!   integration_lite_image_sshd_cross_user.rs`) used as a `ProxyCommand`;
-//!   on macOS it names the operator whose VM the container lives in, and
-//!   once that VM is theirs the `docker exec` runs in their agent and the
-//!   daemon holds a socket to it.
+//!   on macOS it names whichever uid holds the gateway that serves the
+//!   session's operator — the daemon's own while per-operator gateways are
+//!   off, the operator's own once the switch is on — and once that VM is
+//!   theirs the `docker exec` runs in their agent and the daemon holds a
+//!   socket to it. The route is resolved through
+//!   [`sandbox_core::backend::ContainerRuntime::route_for`], which is what
+//!   makes that distinction rather than leaving it to this module.
 //! * **Lima** — discover the host-side TCP port Lima forwards to the
 //!   in-VM sshd's port 22 via `limactl list --json`'s `sshLocalPort`
 //!   field, then open a `tokio::net::TcpStream` to
@@ -96,20 +100,50 @@ pub mod close_codes {
 pub struct ProxyState {
     pub store: Arc<SessionStore>,
     pub lima_registry: Arc<LimaManagerRegistry>,
-    /// Builds where the container path's `docker exec` goes: the host daemon
-    /// on Linux (argv byte-identical to the historical shape), or the VM whose
-    /// operator owns the container on macOS. The proxy never holds a socket
-    /// path of its own — the route decides whether the child is spawned here
-    /// or asked for over the broker channel.
+    /// The container runtime, held for the one thing this module asks of it:
+    /// [`ContainerRuntime::route_for`], which decides where the container
+    /// path's `docker exec` goes — the host daemon on Linux, the gateway VM of
+    /// the operator who owns the container on macOS. The proxy never holds a
+    /// socket path of its own; the route decides whether the child is spawned
+    /// here or asked for over the broker channel.
     ///
-    /// A factory rather than a finished route, because which gateway a tunnel
-    /// belongs to depends on the session it is for, and the session is not
-    /// known until this handler resolves it. The uid it is called with is the
-    /// one recorded on the session's row, never the requester's: the two
-    /// diverge when an owner name has been reused, and an SSH pump aimed at
-    /// the wrong Docker daemon is held open for the life of the editor
-    /// session.
-    pub docker_route: Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
+    /// Resolved per tunnel rather than fixed at startup, because which gateway
+    /// a tunnel belongs to depends on the session it is for, and the session is
+    /// not known until this handler resolves it. The uid it is resolved from is
+    /// the one recorded on the session's row, never the requester's: the two
+    /// diverge when an owner name has been reused, and an SSH pump aimed at the
+    /// wrong Docker daemon is held open for the life of the editor session.
+    ///
+    /// The runtime rather than a route factory, and that is the whole point.
+    /// Two things turn a uid into a container route — the runtime's resolver
+    /// and the daemon's raw owner-keyed factory — and they are both
+    /// `Fn(u32) -> DockerRoute`, so handing this the wrong one type-checked.
+    /// The raw factory expects an already-collapsed *owner* uid and this
+    /// handler has an *operator* uid; the difference is invisible while
+    /// per-operator gateways are off, because the gateway instance name
+    /// collapses too, and it aimed every SSH tunnel at a Docker daemon in a VM
+    /// that does not exist. A typed runtime cannot be confused with the
+    /// factory, and there is now one function in the process that answers this
+    /// question for containers.
+    pub container_runtime: Arc<sandbox_core::backend::ContainerRuntime>,
+}
+
+impl ProxyState {
+    /// The Docker route this session's container byte pump runs over.
+    ///
+    /// `session_operator_uid` is the *operator* recorded on the session's row;
+    /// [`ContainerRuntime::route_for`] owns the collapse to the uid that
+    /// actually holds the gateway. A named seam rather than an expression at
+    /// the call site so the question "which uid reaches the gateway-route
+    /// factory" can be asked without a store, a registry, a VM or a docker
+    /// daemon — the same move the daemon's `resolve_docker_route` free
+    /// function was extracted for, one struct over.
+    pub fn container_docker_route(
+        &self,
+        session_operator_uid: u32,
+    ) -> sandbox_core::docker::DockerRoute {
+        self.container_runtime.route_for(session_operator_uid)
+    }
 }
 
 /// Entry point for `GET /sessions/{id}/proxy`.
@@ -163,8 +197,11 @@ pub async fn handle_proxy(
         }));
     }
 
-    // The operator whose gateway this session's container lives on, taken from
-    // the row rather than from the requester.
+    // The operator this session was created under, taken from the row rather
+    // than from the requester. Which gateway that operator's container lives on
+    // is a separate question, and not one this handler answers: the collapse
+    // from operator to gateway owner belongs to `ContainerRuntime::route_for`,
+    // and the Lima arm below needs the operator uncollapsed.
     //
     // The lookup above matched on owner *name*, which says the requester owns
     // the session — not that the name still resolves to the uid the session
@@ -186,7 +223,7 @@ pub async fn handle_proxy(
     // The upgrade closure may not borrow state captures (it outlives
     // the handler future), so hand it owned clones.
     let lima_registry_for_upgrade = Arc::clone(&state.lima_registry);
-    let docker_for_upgrade = (state.docker_route)(op_uid);
+    let docker_for_upgrade = state.container_docker_route(op_uid);
     Ok(ws.on_upgrade(move |socket| async move {
         run_proxy(
             socket,
@@ -241,9 +278,16 @@ async fn run_proxy(
             }
         }
         BackendKind::Lima => {
-            // `op_uid` is the session row's operator, resolved by the caller —
-            // the same uid the container path's route was built from, so both
-            // backends reach the gateway the session was created under.
+            // `op_uid` is the session row's operator, resolved by the caller.
+            // The container arm above starts from the same value and does not
+            // end at it: the Lima registry is keyed by operator and takes the
+            // uid raw, while a container route is keyed by gateway *owner* and
+            // `ContainerRuntime::route_for` collapses the operator into one
+            // first. That the two arms are handed the same uid is therefore not
+            // the reason they agree, and reading it as one is what let the
+            // container arm ship aimed at the wrong Docker daemon: each arm is
+            // correct because it applies its own backend's keying to the
+            // session's operator, not because the uids match.
             let lima = match lima_registry.get_or_create(op_uid) {
                 Ok(m) => m,
                 Err(e) => {

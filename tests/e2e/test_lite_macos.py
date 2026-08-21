@@ -643,13 +643,20 @@ class TestLiteMacosEgressInterception:
                 _sandbox("stop", name, check=False)
                 _sandbox("rm", name, check=False)
 
-    def test_ssh_access_works_over_forwarded_socket(self, lite_session):
-        """SSH into the lite session must work without a login-session agent.
+    def test_exec_reaches_the_container_over_the_guest_agent(self, lite_session):
+        """``sandbox exec`` must run a command inside a lite session.
 
-        This is the headline lite-on-macOS promise: an SSH-only (no GUI, no
-        per-operator LaunchAgent) operator can use lite sessions. The CLI
-        proxy path uses the forwarded Docker socket for the socat transport
-        instead of a limactl shell into a per-operator VM.
+        This is the guest-agent transport, not SSH: ``exec`` reaches the
+        container through ``ContainerRuntime``'s guest-agent stream and never
+        opens an SSH connection or a proxy WebSocket. The distinction is not
+        pedantic — the two paths resolved their Docker route through different
+        functions, and for a while only this one was correct, so an operator on
+        a stock macOS install saw ``exec`` work and every SSH-shaped operation
+        fail. A test that runs ``exec`` and is named for SSH reports the working
+        path under the broken path's name; that is what this test used to do.
+
+        ``test_ssh_reaches_the_container_over_the_proxy_websocket`` below is the
+        SSH-shaped counterpart.
         """
         result = _sandbox(
             "exec",
@@ -662,6 +669,51 @@ class TestLiteMacosEgressInterception:
             f"sandbox exec failed:\n{result.stderr}"
         )
         assert "hello-from-lite-macos" in result.stdout
+
+    def test_ssh_reaches_the_container_over_the_proxy_websocket(self, lite_session):
+        """``sandbox ssh`` must open a real SSH connection into a lite session.
+
+        NEVER EXECUTED. This test has not been run — not on this host, not
+        anywhere. It was written from the daemon side while diagnosing the
+        route-resolution defect described in
+        ``test_exec_reaches_the_container_over_the_guest_agent`` and could not
+        be run where it was written: it needs a live lite session, which needs
+        the gateway Lima VM, which was a protected fixture in that session. It
+        is therefore an unverified claim in a test's clothing. Do not cite it
+        as evidence that the SSH path works until it has gone green somewhere;
+        the first person to run it should delete this paragraph, and should
+        expect to debug the test itself before concluding anything about the
+        code.
+
+        What it covers that its sibling does not: ``exec`` and ``ssh`` reach
+        the same container by different routes. ``exec`` uses the guest-agent
+        stream; ``ssh`` tunnels through ``GET /sessions/{id}/proxy``, which
+        opens ``docker exec -i <ctr> socat - TCP:127.0.0.1:22`` on the
+        session's Docker route and pumps bytes over a WebSocket. On macOS that
+        route is resolved from the session's operator uid, and resolving it
+        wrongly aims the tunnel at a Docker daemon in a VM that does not exist
+        — a failure with no ``exec``-side symptom at all.
+
+        Asserts the connection succeeded, not merely that a command ran: a
+        non-zero exit from the remote ``true`` is indistinguishable in stdout
+        from a tunnel that never came up, so the exit status is the assertion.
+        """
+        result = _sandbox(
+            "ssh",
+            lite_session,
+            "--",
+            "true",
+            check=False,
+            timeout=120,
+        )
+        assert result.returncode == 0, (
+            "sandbox ssh into a lite session must succeed. A non-zero exit here "
+            "is the signature of a proxy tunnel that never carried bytes — most "
+            "likely the container Docker route was resolved from the wrong uid, "
+            "so `docker exec` ran against a gateway VM that does not exist.\n"
+            f"exit: {result.returncode}\n"
+            f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+        )
 
 
 class TestLiteMacosBypassResistance:

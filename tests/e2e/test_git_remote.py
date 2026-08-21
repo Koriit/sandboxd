@@ -15,10 +15,20 @@ Run with generous timeouts:
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. ``sandbox ssh`` (the transport the remote
-helper tunnels through) dispatches per-backend internally — to Lima's
-SSH for VM sessions and to ``docker exec -it`` for lite container
-sessions — so the remote helper protocol is identical from git's
-point of view. ``test_lite.py::test_lite_git_remote_sandbox`` already
+helper tunnels through) does no backend dispatch of its own: both
+backends tunnel through the daemon's ``GET /sessions/{id}/proxy``
+WebSocket, reached via ``ProxyCommand sandbox proxy <id>``. It is the
+*daemon* that picks the per-backend transport behind that one endpoint —
+``docker exec -i <ctr> socat - TCP:127.0.0.1:22`` on the container arm, a
+TCP stream to the VM's forwarded sshd port on the Lima arm — so the
+remote helper protocol is identical from git's point of view.
+
+That the container backend goes through the proxy is worth stating
+plainly, because the previous wording here described it as bypassing the
+proxy for a direct ``docker exec``, which made a routing defect in the
+proxy's container arm look unreachable from this suite. It is not: this
+file exercises that arm on every ``container`` parametrization.
+``test_lite.py::test_lite_git_remote_sandbox`` already
 covers a single push/fetch round-trip on the container backend; this
 parametrization extends the broader push and fetch contracts.
 """
