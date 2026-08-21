@@ -97,7 +97,7 @@ def test_install_refuses_when_preexisting(
 ):
     """Same-version re-install short-circuits (exit 0). Different-version refuses (exit 1).
 
-    
+    Pre-existing install detection skips if the installed
     version equals the target; otherwise it refuses and points the user
     at `sandbox update`.
     """

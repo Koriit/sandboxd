@@ -259,7 +259,7 @@ sudo rm -f "$BASE_DIR/.update.lock"
         "SUID=$(id -u sandbox); sudo test -e /var/lib/sandboxd/$SUID/.update.lock"
     ).returncode != 0, "lock file should be removed by rollback recipe"
 
-    # 
+    # The rollback recipe ends with sandbox doctor;
     # doctor must pass regardless of install_state/version skew. The
     # rollback leaves install_state.installed_version pointing at the
     # bumped version while /version (and the binary on disk) report

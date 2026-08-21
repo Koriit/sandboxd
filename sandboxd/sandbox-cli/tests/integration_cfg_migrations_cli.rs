@@ -258,7 +258,7 @@ fn integration_dump_migration_set_exits_zero_with_documented_json_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// dump-proto-version
+// dump-proto-version — pre-flight per-session classification
 // ---------------------------------------------------------------------------
 
 /// `sandbox dump-proto-version` exits 0 and emits the documented

@@ -133,7 +133,7 @@ def test_update_backup_retention_prunes_oldest(
             f"got {ok_pairs}\nraw:\n{manifests}"
         )
         # Total manifest count must equal the expected `ok_pairs`
-        # length. 
+        # length. keep=2 prunes successful sets to two;
         # the only manifests that ride past the prune are (a) the
         # two most recent successful sets, (b) forensic
         # `completed_ok != true` sets (preserved indefinitely).

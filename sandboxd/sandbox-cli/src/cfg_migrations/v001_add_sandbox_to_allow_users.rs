@@ -1,11 +1,11 @@
-//! V001 adapter: applies the documented contract
+//! V001 adapter: applies the pure `migrate_v001` transform to
 //! `/etc/sandboxd/users.conf` via the framework's [`ConfigMigration`]
 //! trait.
 //!
 //! The pure transform (which adds `"sandbox"` to every subnet's
 //! `allow_users` and stamps `_schema_version: 1`) lives in
 //! `sandbox_core::users_conf::migrate_v001` together with the
-//! `UsersConfig` schema struct —.1 deliberately keeps the
+//! `UsersConfig` schema struct — this deliberately keeps the
 //! content-level invariant next to the schema definition that tests it.
 //! This adapter wraps that transform with serde-driven byte ↔ value
 //! round-trip plumbing so the framework's apply loop can drive it.

@@ -187,7 +187,7 @@ exit $RC
         and "update" in r.stderr
         and "in progress" in r.stderr
     ), (
-        f"refusal message must land on stderr (.2 — error rendering via "
+        f"refusal message must land on stderr (error rendering via "
         f"eprintln!); missing 'another ... update ... in progress' marker.\n"
         f"stderr:\n{r.stderr}\nstdout (for diagnostic context only):\n{r.stdout}"
     )

@@ -5173,7 +5173,7 @@ fn release_workspace_lock_blocking(socket_path: &str, session: &str, lock_token:
 /// the `tokio::select!` race release inline before exiting with the
 /// conventional `128 + signo` exit code; they then forget the guard so
 /// the cleanup does not double-fire. Release failures degrade to a
-/// stderr warning per the design
+/// stderr warning — never masking the
 /// rsync exit code. Operators have `sandbox workspace unlock --force`
 /// as the manual recovery path if the daemon was unreachable.
 #[allow(clippy::too_many_arguments)] // each arg maps to a distinct clap flag
@@ -5208,9 +5208,8 @@ async fn run_workspace_push_or_pull(
                 };
                 // Existing-file rejection: `--dest` must name a
                 // directory (existing or to-be-created), never a
-                // regular file.
-                // --dest → Rejected with an error before rsync is
-                // spawned`.
+                // regular file. Existing file at `--dest` → rejected
+                // with an error before rsync is spawned.
                 let dest_path = Path::new(&expanded);
                 if let Ok(meta) = std::fs::metadata(dest_path) {
                     if meta.is_file() {
@@ -5223,8 +5222,6 @@ async fn run_workspace_push_or_pull(
                 }
                 // `create_dir_all(dirname(dest))` lets rsync create
                 // the leaf itself.
-                // create_dir_all(dirname(<--dest>)) before spawning
-                // rsync; rsync creates the leaf itself."
                 if let Some(parent) = dest_path.parent() {
                     if !parent.as_os_str().is_empty() {
                         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -5636,10 +5633,9 @@ async fn handle_workspace_pull(
 /// mismatch and returns 409 if the lock is currently held — the
 /// operator must `--force` to clear an orphan lock. With `--force`,
 /// the daemon releases unconditionally. The already-unlocked case is
-/// a 200 idempotent no-op per the design
-/// already-unlocked.
+/// a 200 idempotent no-op.
 ///
-/// Per
+/// The empty-string lock_token
 /// is the documented sentinel for `unlock` without `--force`; the
 /// daemon's `LockToken::from_str` rejects it as unparseable and
 /// adjudicates as "wrong token".
@@ -6549,7 +6545,7 @@ async fn dispatch_create_preflight(
     }
 
     // `--force-rootless-docker` is the operator's per-invocation
-    // opt-in to allow session-create on a rootless Docker host
+    // opt-in to allow session-create on a rootless Docker host;
     // it is only meaningful for the
     // container backend. Combining it with a resolved Lima backend
     // is operator confusion the CLI rejects up-front so the daemon

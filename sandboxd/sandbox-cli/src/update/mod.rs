@@ -1330,7 +1330,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
     if let Err(msg) = args.validate() {
         // Log the arg-validation refusal so the operator's audit
         // trail names the rejected combination before the eprintln
-        // exit.
+        // exit. A `step=parse_args` line is logged
         // regardless of outcome.
         log_step(
             "parse_args",

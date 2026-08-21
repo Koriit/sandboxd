@@ -15577,7 +15577,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dyn-trait object.
     let (default_memory_mb, default_cpus) = compute_default_resource_limits();
     let daemon_gid = nix::unistd::Gid::current().as_raw();
-    // ; non-1000
+    // Root degrades to the 1000:1000 floor; non-1000
     // host uids pass through for workspace bind-mount alignment.
     let (container_uid, container_gid) = map_container_uid_gid(daemon_uid, daemon_gid);
     // The runtime's image tag must match the one `ensure_image`

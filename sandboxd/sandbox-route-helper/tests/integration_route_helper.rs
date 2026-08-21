@@ -427,7 +427,7 @@ fn integration_route_helper_denies_when_caller_not_in_allow_users() {
         stderr.contains("pair-check failed"),
         "stderr must contain 'pair-check failed'; got: {stderr}"
     );
-    //
+    // stderr must name BOTH identities (caller and for-user)
     // for forensic clarity.
     assert!(
         stderr.contains(&format!("caller={runner}")),
