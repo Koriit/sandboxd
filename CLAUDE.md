@@ -197,10 +197,21 @@ find sandboxd/target/debug/deps -type f -exec stat -f '%l' {} + \
   | sort -rn | head -1
 ```
 
-`65535` is the fault; a healthy tree reads `2`. **Free space is not a
-signal in either direction** — both instances had hundreds of GB free
-throughout, so `df` reports the disk is fine, and that report is true
-and useless.
+`65535` is the fault; a healthy tree reads `2`.
+
+**The reason this goes undiagnosed is that the obvious instrument is
+live, correct, and blind.** `df` read 653 GiB free before the fix and
+678 GiB after, and would have read healthy at every instant in between.
+It never lies and never wobbles — it measures a quantity uncorrelated
+with the failure, so it emits a steady, accurate green throughout, and
+a steady green is more persuasive than a fluctuating one. Free space is
+not a signal here in either direction.
+
+The instrument gets picked from the *name* of the failure. "The tree
+got too big" files itself under disk space, and size and link count are
+the same phrase in English while having nothing to do with each other
+in the kernel. Run the probe above, which reads the cause directly and
+costs nothing when the answer is no.
 
 This is **not** covered by the `make test` self-signing step — signing
 and this are separate failures that present almost identically, so
