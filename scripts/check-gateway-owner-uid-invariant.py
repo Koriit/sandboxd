@@ -688,6 +688,103 @@ def split_args(s):
     return out
 
 
+# --- the derived wrapper set: C4's reach beyond a direct F1 call -------------
+#
+# C4 anchors on a call to an F1 name.  A function that takes a uid parameter and
+# forwards it, unmodified, into an F1 sink defeats that anchor completely: the
+# wrong uid is supplied at the WRAPPER's call site, and by the time control
+# reaches the F1 call the argument is spelled with the wrapper's own parameter
+# name, which matches nothing.  MEASURED: injecting a daemon uid at such a call
+# site produced ZERO changed output lines across the whole report.
+#
+# WHY THIS IS DERIVED AND NOT A LIST OF NAMES.  The measured class was four
+# members -- two wrappers and two functions wrapping those.  A list of four names
+# would close those four and leave the shape open, which is worse than leaving it
+# open honestly: a checker whose known gaps are patched reads as complete.  The
+# second hop is what makes it a shape rather than a coincidence -- a wrapper that
+# wraps a wrapper acquires new members without anyone deciding to add one.  So
+# the set is recomputed from the tree on every run, seeded from F1_NAMES.
+#
+# WHAT COUNTS AS FORWARDING.  A `u32` parameter passed as a BARE top-level
+# argument.  `sink(uid)` yes; `sink(uid + 1)`, `sink(other)` and `sink(f(uid))`
+# no.  Argument lists come from `arg_text`/`split_args`, the same two helpers C4
+# itself uses, so the wrapper scan and the clause cannot disagree about where an
+# argument ends.
+#
+# WHAT THIS CANNOT SEE, all three measured rather than assumed:
+#
+#   * A uid stored on a struct and read back as `self.x` -- forwarding through a
+#     FIELD rather than within one function body.  This is the real open hole and
+#     it stays open deliberately; closing it is call-graph and data-flow work.
+#     Measured mitigation, not a fix: the current class needs no such path -- all
+#     four members forward a parameter directly, so nothing today hides there.
+#   * A rebinding, `let x = uid;` then `sink(x)`.  Measured at raw 3, adjudicated
+#     0: two were `let _ = operator_uid;` in a `cfg(not(macos))` arm, and the
+#     third was `resolve_docker_route`'s Linux arm, where NOT collapsing is
+#     correct because there is no gateway VM there.
+#   * A parameter whose type is not the literal token `u32`.  MEASURED over the
+#     daemon and sandbox-core: 233 parameters accepted; the excluded forms total
+#     8 (`Option<u32>` x7, `Vec<u32>` x1) and NONE of them sits in a function
+#     that calls a sink, so the fixpoint did not converge on a subset.  There are
+#     zero `&u32` params, zero tuples carrying one, and zero `struct X(u32)`
+#     newtypes, so there is no aliasing route in at present.
+#
+# The derivation runs over the scanned file only.  That is sufficient rather than
+# lucky: workspace-wide, only two files contain a call to any F1 sink -- this one
+# and gateway_lima.rs -- and every measured member is here.
+WRAPPER_U32_PARAM = re.compile(r"\b([a-z_][a-z0-9_]*)\s*:\s*u32\b")
+
+# A ceiling on the fixpoint, not an expectation.  The tree converges at hop 2;
+# this exists so a pathological cycle cannot spin, and if it is ever REACHED the
+# scope line will show a set far larger than four and that is the signal.
+WRAPPER_MAX_HOPS = 6
+
+
+def derive_wrappers(lines, spans, tstart):
+    """{name: {hop, line, param, sink}} -- uid-forwarding wrappers, to fixpoint.
+
+    Seeded from F1_NAMES and iterated: hop 1 forwards into an F1 sink, hop 2
+    into a hop-1 member, and so on until a pass adds nothing.  Returning an
+    EMPTY dict is the failure this set has to make visible, so `run` prints the
+    size on every run and the self-test injects at a member's call site.
+    """
+    sinks = {n: 0 for n in F1_NAMES}
+    members = {}
+    for hop in range(1, WRAPPER_MAX_HOPS + 1):
+        fresh = {}
+        for fn, ranges in spans.items():
+            if fn in sinks or fn in members:
+                continue
+            for a, b in ranges:
+                if a >= tstart:
+                    continue
+                params = WRAPPER_U32_PARAM.findall(signature_of(lines, a, b))
+                if not params:
+                    continue
+                body = []
+                for l in lines[a - 1:min(b, len(lines))]:
+                    if commentish(l):
+                        continue
+                    body.append(l.split("//")[0])
+                body = "\n".join(body)
+                for sink, shop in sinks.items():
+                    if shop != hop - 1:
+                        continue
+                    for mo in re.finditer(
+                            r"\b" + re.escape(sink) + r"\s*\(", body):
+                        args = split_args(arg_text(body, mo.end() - 1))
+                        hit = next((x for x in args if x in params), None)
+                        if hit is not None:
+                            fresh.setdefault(fn, dict(
+                                name=fn, hop=hop, line=a, param=hit, sink=sink))
+        if not fresh:
+            break
+        members.update(fresh)
+        for n in fresh:
+            sinks[n] = hop
+    return members
+
+
 def line_index(lines):
     starts, off = [], 0
     for l in lines:
@@ -1159,6 +1256,17 @@ DENOM_EXPECTED = {
     "blind region: non-serving fns called from a serving fn":
         "no non-serving function is called from a serving one -- implausible "
         "at this size; the name matching has collapsed",
+    # The two counters that make the derived set falsifiable.  Both were
+    # non-zero when the derivation was folded in (4 members, 15 call sites), so
+    # a zero in either is a regression in the DERIVATION, not a clean tree --
+    # and it is precisely the state in which the widening silently becomes a
+    # no-op while every other number still looks healthy.
+    "C4 derived wrappers":
+        "the fixpoint returned no members -- seeded from F1_NAMES, so either "
+        "those names have moved or the forwarding scan has collapsed",
+    "C4 wrapper call sites":
+        "the derived members exist but none is called anywhere -- the call "
+        "scan collapsed, or the wrappers are now dead code",
 }
 # Counters that are legitimately zero today, each with the reason. Anything
 # zero and NOT in this map is reported as a scope warning.
@@ -1211,7 +1319,8 @@ DENOM_ZERO_OK = {
 # forces every one of them to be printed and adjudicated.
 DENOM_KEYS = (
     ["C1", "C2", "C1 in a serving fn", "C2 in a serving fn",
-     "C3", "C4", "C4 F1 call sites", "C5", "C6", "C7",
+     "C3", "C4", "C4 F1 call sites", "C4 wrapper call sites",
+     "C4 derived wrappers", "C5", "C6", "C7",
      "C7 GatewayOwnership::Shared", "C7 GatewayOwnership::PerOperator",
      "C8", "C8 wire lines scanned",
      "blind region: non-serving fns called from a serving fn"]
@@ -1277,6 +1386,17 @@ def run(path, quiet=False):
     # gives.
     sites = collections.Counter({k: 0 for k in DENOM_KEYS})
 
+    # The derived wrapper set. Recomputed from the tree, never listed -- see the
+    # section comment on `derive_wrappers`. Its per-member counters are seeded
+    # here for the same reason every other counter is: a member whose call sites
+    # all vanished must print a zero rather than disappear from the report.
+    wrappers = derive_wrappers(lines, spans, tstart)
+    for _n in wrappers:
+        sites["alt C4/" + _n] = 0
+    sites["C4 derived wrappers"] = len(wrappers)
+    c4_call = re.compile(
+        r"\b(" + "|".join(list(F1_NAMES) + sorted(wrappers)) + r")\s*\(")
+
     def count_non_caller(arg):
         for name, rx in NON_CALLER_UID_ALTS:
             if rx.search(arg):
@@ -1321,13 +1441,21 @@ def run(path, quiet=False):
     # function that has a caller.  This is the clause that measures the contract
     # rather than the spelling: it fires on correctly-named, currently-spelled
     # code whose only fault is the uid CLASS being passed.
-    for mo in F1_CALL.finditer(raw):
+    # `c4_call` is F1_NAMES PLUS the derived wrapper set, so a wrong uid handed
+    # to a wrapper is the same violation as one handed to the sink it forwards
+    # to. The two populations are counted apart: folding wrappers into the
+    # existing `C4 F1 call sites` figure would move a number for an instrument
+    # reason and make it unreadable as a measurement of anything.
+    for mo in c4_call.finditer(raw):
         lno = lno_of(mo.start())
         if lno >= tstart or commentish(lines[lno - 1]):
             continue
         if re.match(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s", lines[lno - 1]):
             continue  # the definition, not a call
-        sites["C4 F1 call sites"] += 1
+        if mo.group(1) in F1_NAMES:
+            sites["C4 F1 call sites"] += 1
+        else:
+            sites["C4 wrapper call sites"] += 1
         sites["alt C4/" + mo.group(1)] += 1
         fn = enclosing_fn(spans, lno)
         if fn not in served:
@@ -1493,6 +1621,28 @@ def run(path, quiet=False):
     sites["blind region: non-serving fns called from a serving fn"] = \
         blind_region(lines, spans, served, tstart)
 
+    # The derived wrapper set, printed as a SCOPE FIGURE: computed every run,
+    # compared to nothing, gating nothing. A derived set that silently collapses
+    # to empty is how a widened check becomes a no-op that reports success, and
+    # the only defence is that its size is visible in ordinary output. There is
+    # deliberately no baseline to edit -- if these names or counts move, that is
+    # the tree changing, not a check to repair.
+    if wrappers:
+        banner.append(
+            "  scope: derived wrapper set (seeded from F1_NAMES, to fixpoint): "
+            + "; ".join(
+                "%s hop%d/%d sites" % (m["name"], m["hop"],
+                                       sites["alt C4/" + m["name"]])
+                for m in sorted(wrappers.values(),
+                                key=lambda d: (d["hop"], d["name"])))
+            + " -- %d member(s), %d call site(s)"
+            % (len(wrappers),
+               sum(sites["alt C4/" + n] for n in wrappers)))
+    else:
+        banner.append(
+            "  scope: derived wrapper set is EMPTY -- C4 covers direct F1 calls "
+            "only; the derivation found nothing and may have collapsed")
+
     wviol, wnotes = wire_op_set(path, sites)
     viol.extend(wviol)
     banner.append("  wire op set (found/baseline): " + "; ".join(wnotes)
@@ -1554,6 +1704,19 @@ INJECTIONS = [
     ("C4", "    let bad = state.docker_route_for_operator(0);",
      "F1 handed a LITERAL uid -- exercises the bare-literal alternative of "
      "NON_CALLER_UID, also at zero on the clean tree"),
+    # The aliveness buy-back for the DERIVED wrapper set.  Every other injection
+    # here targets a name the file holds as a constant; this one targets a name
+    # the file computes.  `gateway_for_probes` is never listed -- it has to be
+    # rediscovered from the tree on every run -- so if the derivation collapses
+    # to empty, C4 stops covering it and this goes GREEN where it must be RED.
+    # A silent no-op is precisely what a widened check degrades into, and this
+    # is the only thing standing between that and a clean-looking report.
+    # MEASURED: injecting exactly this produced ZERO changed output lines before
+    # the derivation existed.
+    ("C4", "    let bad = gateway_for_probes(&state, state.daemon_uid);",
+     "a DERIVED wrapper handed the daemon's uid while serving a caller -- the "
+     "wrapper forwards it into F1 under its own parameter name, so the direct "
+     "F1 anchor never sees it; RED here proves the derived set is live"),
     ("C5", "    let bad = (state.gateway_docker_route)(operator.uid);",
      "F3 route factory reached directly with a RAW operator uid "
      "(measured GREEN under C1-C4 before this clause existed)"),
