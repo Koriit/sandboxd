@@ -1155,7 +1155,7 @@ where
              `sudo setcap cap_setuid+ep {env_path}`. To use the canonical \
              install instead, unset ${env}; the resolver then looks up \
              {install} (installed by `make install-lima-helper-prod-cap`). \
-             See docs/guides/installation.md § \"sandbox-lima-helper\".",
+             See docs/start/installation.md § \"sandbox-lima-helper\".",
             env_path = env_path.display(),
             env = LIMA_HELPER_PATH_ENV,
             install = install_path.display(),
@@ -1170,7 +1170,7 @@ where
          the cap_setuid file capability (effective). Install it with: \
          `make install-lima-helper-prod-cap` (production) or set \
          ${LIMA_HELPER_PATH_ENV} to a custom path. See \
-         docs/guides/installation.md § \"sandbox-lima-helper\".",
+         docs/start/installation.md § \"sandbox-lima-helper\".",
         install = install_path.display(),
     )))
 }
@@ -4667,6 +4667,7 @@ async fn create_session_macos_lima(
     let nic_name = match sandbox_core::nic_from_verified_map(
         gateway_lima.nic_map().as_ref(),
         vmnet_slot.index,
+        gateway_lima.instance_name(),
     ) {
         Ok(name) => name,
         Err(e) => {
@@ -6673,6 +6674,7 @@ async fn start_session_macos_lima(
     let nic_name = match sandbox_core::nic_from_verified_map(
         gateway_lima.nic_map().as_ref(),
         vmnet_slot.index,
+        gateway_lima.instance_name(),
     ) {
         Ok(name) => name,
         Err(e) => {
@@ -10647,6 +10649,7 @@ async fn restore_session_networking(
             gateway_lima.nic_map().as_ref(),
             slot_idx,
             &network_info.bridge_name,
+            gateway_lima.instance_name(),
         )?;
         let sid = *session_id;
         let ni = network_info.clone();
@@ -12897,8 +12900,9 @@ async fn reconcile_operator_vms(
 /// reconciled lazily on next agent check-in; their VMs are down anyway
 /// (login-scoped, per the macOS per-operator model).
 ///
-/// Live failure recovery (gateway crash poll, agent crash respawn) is deferred
-/// to M21-S1/S2.
+/// Live failure recovery is out of scope here: this runs once, at startup, and
+/// reconciles the state it finds. Nothing in it watches for a gateway that
+/// crashes afterwards or an agent that dies while the daemon stays up.
 #[cfg(target_os = "macos")]
 async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistry) {
     use sandbox_core::macos_session::teardown_macos_gateway;
@@ -12994,9 +12998,11 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
 
     // Remove orphaned gateway containers: containers named `sandbox-gw-*` in
     // the gateway VM with no matching session in the store.
-    // This is deferred: requires listing docker containers via the forwarded
-    // socket, which is an extra docker command at startup. The teardown loop
-    // above already handles known sessions. Orphan reap is M21-S1 (live recovery).
+    // Not done here: it requires listing docker containers via the forwarded
+    // socket, which is an extra docker command on every startup. The teardown
+    // loop above already handles every session the store knows about, so what
+    // this would add is reaping containers whose session record is gone —
+    // which belongs with live failure recovery, not with startup reconcile.
 
     info!(
         cleaned_gateway = cleaned_gw_6a,
@@ -13579,6 +13585,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
                                 sandbox_core::nic_from_verified_map(
                                     state.gateway_lima_manager.nic_map().as_ref(),
                                     slot,
+                                    state.gateway_lima_manager.instance_name(),
                                 )
                             }) {
                                 Ok(name) => name,
@@ -14018,7 +14025,11 @@ async fn recover_one_gateway(
                 // and visibly failed is the safer half of that trade.
                 let nic_name = match sandbox_core::slot_for_persisted_session(&network_info)
                     .and_then(|slot| {
-                        sandbox_core::nic_from_verified_map(mgr.nic_map().as_ref(), slot)
+                        sandbox_core::nic_from_verified_map(
+                            mgr.nic_map().as_ref(),
+                            slot,
+                            mgr.instance_name(),
+                        )
                     }) {
                     Ok(name) => name,
                     Err(e) => return (sid, owner, Err(e.to_string())),

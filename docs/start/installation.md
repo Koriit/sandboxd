@@ -689,6 +689,36 @@ The route helper runs with `cap_net_admin,cap_sys_ptrace,cap_sys_admin=eip`. Hon
 
 The daemon itself continues to honor `SANDBOX_USERS_CONF` unconditionally because the daemon is not the privilege boundary — only the cap'd helper is.
 
+### sandbox-lima-helper
+
+`sandbox-lima-helper` is the second privileged binary. It is a Linux-only artifact — on macOS the same job is done by the per-operator `sandbox-agent` LaunchAgent, and the crate builds there only as an inert stub that exits with `error: this binary runs on Linux only`. The production install path is `/usr/local/libexec/sandboxd/sandbox-lima-helper`, alongside the route helper and for the same FHS reason. It carries exactly one capability: `cap_setuid+ep`.
+
+The helper exists because Lima VMs belong to the **operator**, not to the daemon. Each operator's VMs, configs, and SSH key live under `/var/lib/sandboxd/<daemon-uid>/<operator-uid>/lima/`, owned by that operator's uid, and `limactl` has to run as that uid to read them. The daemon runs as the unprivileged `sandbox` user and cannot become another user on its own, so it **never invokes `limactl` directly**. Every Lima control-plane operation goes through this helper, which validates the request, pivots to the operator's uid via `setresuid(2)`, drops its capabilities, and only then execs `limactl`.
+
+Install and cap the binary:
+
+```bash
+sudo install -D -m 0755 \
+    sandboxd/target/release/sandbox-lima-helper \
+    /usr/local/libexec/sandboxd/sandbox-lima-helper
+sudo setcap cap_setuid+ep /usr/local/libexec/sandboxd/sandbox-lima-helper
+```
+
+The flags differ from the route helper's `=eip`, and the difference is deliberate: this helper does **not** put `cap_setuid` in the Inheritable set. The route helper needs Inheritable so it can raise `CAP_NET_ADMIN` into the ambient set for the `ip(8)` it spawns. This helper needs the opposite — `limactl` must run as an ordinary operator process holding nothing, so the helper clears permitted, effective, inheritable, and ambient after the `setresuid` and before the exec.
+
+As with the route helper, capabilities do not survive a binary copy and must be re-applied after every reinstall; `make install-lima-helper-prod-cap` automates both steps and is a no-op when the installed copy is already current. If you only built in debug mode, swap `release` for `debug` in the source path.
+
+Verify the capability is set:
+
+```bash
+getcap /usr/local/libexec/sandboxd/sandbox-lima-helper
+# Expected: /usr/local/libexec/sandboxd/sandbox-lima-helper cap_setuid=ep
+```
+
+**The daemon will not start without it.** On Linux, sandboxd resolves this path during startup — unconditionally, whichever backend you intend to use — and aborts if the file is missing or not cap'd, logging `ERROR sandbox-lima-helper not usable; daemon cannot start`. The remedy is `make install-lima-helper-prod-cap` (or the `install`/`setcap` pair above) followed by a daemon restart. A `SANDBOX_LIMA_HELPER_PATH` environment variable overrides the canonical path for development installs. That override is fail-closed: an unusable file at the overridden path is an error, not a reason to fall back to `/usr/local/libexec/sandboxd/`.
+
+Both sides of the uid pivot are gated before it happens. On the caller side the helper checks that its own `getuid()` is the `sandbox` user's — kernel-supplied, and the real gate — plus sandbox-group membership as a sanity check. On the target side, the `--op-uid` it is asked to become must be non-zero, must resolve through `getpwuid_r(3)`, and must itself be in the sandbox group; all three are checked before the `setresuid`. There is **no argv pass-through**: every flag that reaches `limactl` is hardcoded in the helper per subcommand, and the daemon contributes only typed values by position, so a compromised daemon cannot turn the helper into a general "run anything as any operator" primitive. `limactl` itself is resolved by absolute path from a fixed three-candidate list — `~/.local/bin/limactl` under the operator's home, then `/usr/local/bin/limactl`, then `/usr/bin/limactl` — with no `PATH` lookup. A `limactl` installed anywhere else is reported as not found rather than searched for.
+
 ## Dev-mode vs operator-mode coexistence
 
 The two install paths produce different layouts:

@@ -1815,8 +1815,9 @@ fi
 /// 6. **Marker file** — the wrapper records the final rewritten `-netdev`
 ///    token to `$SANDBOX_RESTRICT_MARKER` (an absolute path in the instance
 ///    dir, set by the daemon before the limactl start invocation). The
-///    broker-mediated post-boot verification reads this as fallback evidence
-///    (M20-S6 prefers a live QMP query).
+///    broker-mediated post-boot verification reads this as fallback evidence,
+///    used only when a live QMP `query-netdev` against the instance is
+///    unavailable.
 ///
 /// The rewrite algorithm (identical to the Linux wrapper):
 /// Scan argv for every `-netdev user,...` token (both split and single-arg
@@ -7745,10 +7746,10 @@ mod tests {
 
     /// verify_restrict_on must return Err when the wrapper marker file is absent.
     ///
-    /// This is the mandated negative test from M20-S6: a missing marker means
-    /// the qemu-wrapper did not run or failed, and the daemon must refuse to mark
-    /// the session Running. Any weakening of this check would be a security
-    /// regression — the test failing means the egress promise is broken.
+    /// A missing marker means the qemu-wrapper did not run or failed, and the
+    /// daemon must refuse to mark the session Running. Any weakening of this
+    /// check would be a security regression — the test failing means the egress
+    /// promise is broken.
     ///
     /// Uses a session ID that is unlikely to exist in the system LIMA_HOME so
     /// the test reliably sees an absent marker on macOS (where the executor reads

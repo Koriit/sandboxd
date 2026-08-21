@@ -38,11 +38,13 @@
 /// host cannot handle two HVF guests concurrently. The `integration` nextest
 /// profile also sets `retries = 0` so failures surface immediately.
 ///
-/// ## Deferred to M20-S6 (Python E2E)
+/// ## Left to the Python E2E suite
 ///
 /// - The egress-traffic proof (delete-the-gateway-route regression: assert
-///   `eth0` cannot reach the internet after `restrict=on` is applied). M20-S4
-///   proves the VM BOOTS with the wrapper; M20-S6 proves traffic is blocked.
+///   `eth0` cannot reach the internet after `restrict=on` is applied). What
+///   this file proves is that the VM boots with the wrapper applied; that the
+///   resulting traffic is actually blocked needs a live network and belongs
+///   in E2E.
 /// - The full cross-user daemon+broker+agent path (requires a running daemon
 ///   and an enrolled operator agent; this test file exercises only the
 ///   degenerate single-uid dev path).
@@ -138,15 +140,14 @@ mod integration_macos_session_lifecycle {
     /// Return `true` if the given gateway-image tag is loaded in the gateway VM's
     /// Docker daemon. Returns `false` (prints a SKIP message) when absent.
     ///
-    /// The gateway image (`sandbox-gateway:<version>`) is loaded inside the
-    /// gateway Lima VM at M22-S5; until then this guard skips image-dependent
-    /// tests cleanly.
+    /// The gateway image (`sandbox-gateway:<version>`) has to be loaded into the
+    /// gateway VM's Docker daemon before any image-dependent test can run. This
+    /// guard lets those tests skip cleanly rather than fail when it is absent.
     fn require_gateway_image(tag: &str) -> bool {
         let out = docker_gateway(&["image", "inspect", tag]);
         if !out.status.success() {
             eprintln!(
-                "SKIP: gateway image `{tag}` not loaded in the gateway VM \
-                 (deferred to M22-S5; the full test runs at M20-S6 e2e bring-up). \
+                "SKIP: gateway image `{tag}` not loaded in the gateway VM. \
                  To enable: `docker -H unix://<gateway-sock> load < gateway-image.tar`"
             );
             return false;
@@ -157,10 +158,10 @@ mod integration_macos_session_lifecycle {
     /// Return `true` if `setfacl` is available on this host.
     ///
     /// The macOS operator-LIMA_HOME path uses `ensure_operator_lima_home`, which
-    /// internally calls `setfacl` (Linux-only for POSIX ACL support). On macOS
-    /// this is absent until the minimal M21 slice lands (todo #236). Tests that
-    /// call `registry.get_or_create(op_uid)` → `ensure_operator_lima_home` will
-    /// fail with "failed to spawn setfacl" when it's missing.
+    /// internally calls `setfacl` — a Linux tool for POSIX ACL support, not
+    /// present on a stock macOS host. Tests that call
+    /// `registry.get_or_create(op_uid)` → `ensure_operator_lima_home` fail with
+    /// "failed to spawn setfacl" when it is missing, so they gate on this.
     fn setfacl_available() -> bool {
         std::process::Command::new("which")
             .arg("setfacl")
@@ -192,8 +193,9 @@ mod integration_macos_session_lifecycle {
     /// - sandbox-gateway:0.1.10 (or whatever the package version is) loaded
     ///   inside the gateway VM
     ///
-    /// DEFERRED TO M20-S6: the egress traffic proof (delete gateway route,
-    /// confirm eth0 blocked). This test proves the VM boots with restrict=on.
+    /// Not proved here: the egress traffic proof (delete the gateway route,
+    /// confirm `eth0` is blocked), which needs a live network. What this test
+    /// proves is that the VM boots with `restrict=on` applied.
     #[test]
     fn integration_macos_create_start_stop_rm() {
         // Guard 1: gateway socket must be reachable.
@@ -217,14 +219,13 @@ mod integration_macos_session_lifecycle {
             return;
         }
 
-        // Guard 3: setfacl must be available (ensure_operator_lima_home requires it on
-        // macOS until the M21 minimal slice lands; todo #236).
+        // Guard 3: setfacl must be available — `ensure_operator_lima_home` uses
+        // it to provision the per-operator LIMA_HOME ACLs on macOS.
         if !setfacl_available() {
             eprintln!(
                 "SKIP integration_macos_create_start_stop_rm: \
                  `setfacl` not available on this host — ensure_operator_lima_home \
-                 requires it for the macOS operator-LIMA_HOME path (deferred to M21, \
-                 todo #236). The full live HVF boot runs at M20-S6 e2e bring-up."
+                 requires it for the macOS operator-LIMA_HOME path."
             );
             return;
         }
@@ -234,8 +235,7 @@ mod integration_macos_session_lifecycle {
         if !require_gateway_image(&gateway_tag) {
             eprintln!(
                 "SKIP integration_macos_create_start_stop_rm: \
-                 requires the sandbox-gateway image loaded into the gateway VM (M22-S5); \
-                 the full live HVF boot runs at M20-S6 e2e bring-up."
+                 requires the sandbox-gateway image loaded into the gateway VM."
             );
             return;
         }
@@ -344,7 +344,7 @@ mod integration_macos_session_lifecycle {
             &nic_name,
             &gateway_docker_route(),
             &gateway_tag,
-            None, // ca_dir (deferred to M20-S6+)
+            None, // ca_dir — no TLS interception in this test
             None, // initial_dns_policy
             None, // owner_pool
         )
@@ -460,16 +460,14 @@ mod integration_macos_session_lifecycle {
             return;
         }
 
-        // Guard 3: the gateway image must be loaded inside the gateway VM.
-        // The image load is deferred to M22-S5; until then this test skips
-        // cleanly and auto-activates when the image is available at M20-S6
-        // e2e bring-up.
+        // Guard 3: the gateway image must be loaded inside the gateway VM. The
+        // test skips cleanly when it is absent and activates on its own once
+        // the image is loaded — no edit here is needed to enable it.
         let gateway_tag = gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
         if !require_gateway_image(&gateway_tag) {
             eprintln!(
                 "SKIP integration_macos_gateway_side_lifecycle: \
-                 requires the sandbox-gateway image loaded into the gateway VM (M22-S5); \
-                 the full gateway-side exercise runs at M20-S6 e2e bring-up."
+                 requires the sandbox-gateway image loaded into the gateway VM."
             );
             return;
         }

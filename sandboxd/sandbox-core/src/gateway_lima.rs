@@ -597,12 +597,19 @@ impl NicMap {
 /// and restarting a stopped session, both of which claim a *new* slot so the old
 /// `bridge_name` names the wrong one), and gateway recovery. A map miss is a
 /// refusal — there is nothing else to consult.
+///
+/// `gateway_instance` names the instance the map was read from, for the refusal
+/// message. Pass the `instance_name()` of the manager that supplied `nic_map`.
 #[cfg(target_os = "macos")]
-pub fn nic_from_verified_map(nic_map: Option<&NicMap>, slot: u16) -> Result<String, SandboxError> {
+pub fn nic_from_verified_map(
+    nic_map: Option<&NicMap>,
+    slot: u16,
+    gateway_instance: &str,
+) -> Result<String, SandboxError> {
     nic_map
         .and_then(|m| m.interface_for_slot(slot))
         .map(|s| s.to_string())
-        .ok_or_else(|| nic_map_miss_error(slot))
+        .ok_or_else(|| nic_map_miss_error(slot, gateway_instance))
 }
 
 /// Resolve a restored session's gateway NIC, preferring its durable record.
@@ -617,18 +624,22 @@ pub fn nic_from_verified_map(nic_map: Option<&NicMap>, slot: u16) -> Result<Stri
 /// So the record wins; the map only fills a blank record. A disagreement is a
 /// refusal rather than a re-parent: moving a running session's macvlan to a
 /// different segment is a worse answer than declining to touch it.
+///
+/// `gateway_instance` names the instance the map was read from, for the refusal
+/// message. Pass the `instance_name()` of the manager that supplied `nic_map`.
 #[cfg(target_os = "macos")]
 pub fn nic_from_record_or_map(
     nic_map: Option<&NicMap>,
     slot: u16,
     persisted_bridge_name: &str,
+    gateway_instance: &str,
 ) -> Result<String, SandboxError> {
     let mapped = nic_map.and_then(|m| m.interface_for_slot(slot));
     if persisted_bridge_name.is_empty() {
         // No record to restore from — the map is the only authority left.
         return mapped
             .map(|s| s.to_string())
-            .ok_or_else(|| nic_map_miss_error(slot));
+            .ok_or_else(|| nic_map_miss_error(slot, gateway_instance));
     }
     if let Some(mapped) = mapped
         && mapped != persisted_bridge_name
@@ -674,21 +685,21 @@ pub fn slot_for_persisted_session(
 /// observed in the gateway VM, so a miss means either the map is not yet
 /// populated or the VM does not have that NIC.
 ///
-/// The remediation names both spellings of the instance rather than deriving the
-/// right one, because the resolvers that reach this carry a slot and no owner.
-/// Deriving it would mean threading an owner through both of them and every
-/// caller. Until that happens, spelling out both is what keeps the advice
-/// correct instead of correct-only-while-one-gateway-per-host holds — a reader
-/// who is handed a single instance name has no way to tell it is the wrong one.
+/// `gateway_instance` is the name of the instance whose map came up empty, and
+/// it is taken from the manager that produced the map rather than re-derived
+/// from an owner uid. Those two are the same value today, but only the first
+/// stays true at a caller still holding a daemon-wide manager: re-deriving from
+/// the requesting operator's uid there would print an instance name whose map
+/// was never consulted, which is a worse diagnostic than the ambiguity it
+/// replaced. Naming the instance the lookup actually used cannot drift from it.
 #[cfg(target_os = "macos")]
-fn nic_map_miss_error(slot: u16) -> SandboxError {
+fn nic_map_miss_error(slot: u16, gateway_instance: &str) -> SandboxError {
     SandboxError::Gateway(format!(
-        "no verified gateway NIC for vmnet slot {slot} (expected `{}` in the gateway VM). \
-         Refusing rather than parenting the session's macvlan on a guessed interface, which \
-         would place it on an unknown L2 segment. Check that the gateway Lima instance is up \
-         and was created with this slot. `limactl list` names it: `{GATEWAY_INSTANCE_NAME}` \
-         for a daemon-owned gateway, or `{GATEWAY_INSTANCE_NAME}-<owner uid>` where each \
-         operator owns one. Then: `limactl shell <instance> ip -json link show`.",
+        "no verified gateway NIC for vmnet slot {slot} (expected `{}` in gateway Lima instance \
+         `{gateway_instance}`). Refusing rather than parenting the session's macvlan on a \
+         guessed interface, which would place it on an unknown L2 segment. Check that the \
+         instance is up and was created with this slot: `limactl list`, then \
+         `limactl shell {gateway_instance} ip -json link show`.",
         slot_interface_name(slot),
     ))
 }
@@ -3690,21 +3701,56 @@ mod tests {
         }
     }
 
+    /// A gateway instance name in the per-owner spelling, so a test asserting
+    /// on it fails if the refusal ever falls back to the unsuffixed default
+    /// instead of naming the instance it was handed.
+    #[cfg(target_os = "macos")]
+    const TEST_GATEWAY_INSTANCE: &str = "sandboxd-gateway-4242";
+
     /// The create and recovery sites: a NIC-map miss is an error, never a
     /// `lima<slot>` guess.
     #[test]
     fn nic_from_verified_map_refuses_a_miss() {
         let map = verified_map(&[0, 1]);
-        assert_eq!(nic_from_verified_map(Some(&map), 1).unwrap(), "lima1");
+        assert_eq!(
+            nic_from_verified_map(Some(&map), 1, TEST_GATEWAY_INSTANCE).unwrap(),
+            "lima1"
+        );
 
         // Slot outside the map — the VM has no verified interface for it.
-        let err = nic_from_verified_map(Some(&map), 5).unwrap_err();
+        let err = nic_from_verified_map(Some(&map), 5, TEST_GATEWAY_INSTANCE).unwrap_err();
         assert!(
             err.to_string().contains("no verified gateway NIC"),
             "unexpected error: {err}"
         );
         // Map not populated at all.
-        assert!(nic_from_verified_map(None, 0).is_err());
+        assert!(nic_from_verified_map(None, 0, TEST_GATEWAY_INSTANCE).is_err());
+    }
+
+    /// A miss names the instance whose map was consulted, in both the
+    /// diagnosis and the `limactl shell` the operator is told to run.
+    ///
+    /// The caller passes the name from the manager that supplied the map, so
+    /// an operator running the suggested command inspects the same VM the
+    /// daemon just failed to find the NIC in. Naming a different instance —
+    /// or naming none — sends them to inspect a VM whose state is irrelevant.
+    #[test]
+    fn a_nic_map_miss_names_the_instance_it_consulted() {
+        let err = nic_from_verified_map(None, 2, TEST_GATEWAY_INSTANCE).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(TEST_GATEWAY_INSTANCE),
+            "the refusal must name the instance it consulted: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("limactl shell {TEST_GATEWAY_INSTANCE}")),
+            "the suggested command must target that same instance: {msg}"
+        );
+        assert!(
+            !msg.contains("<owner uid>") && !msg.contains("<instance>"),
+            "the refusal must name one instance, not a spelling the reader has \
+             to resolve: {msg}"
+        );
     }
 
     /// The restart site keeps working from the durable record when the map is
@@ -3714,14 +3760,14 @@ mod tests {
     #[test]
     fn nic_from_record_survives_an_unpopulated_map() {
         assert_eq!(
-            nic_from_record_or_map(None, 3, "lima3").unwrap(),
+            nic_from_record_or_map(None, 3, "lima3", TEST_GATEWAY_INSTANCE).unwrap(),
             "lima3",
             "an unpopulated map must not defeat a session's persisted NIC"
         );
         // Also when the map is populated but does not cover the slot.
         let map = verified_map(&[0, 1]);
         assert_eq!(
-            nic_from_record_or_map(Some(&map), 3, "lima3").unwrap(),
+            nic_from_record_or_map(Some(&map), 3, "lima3", TEST_GATEWAY_INSTANCE).unwrap(),
             "lima3"
         );
     }
@@ -3729,14 +3775,17 @@ mod tests {
     /// …but with no record either, there is nothing left to trust.
     #[test]
     fn nic_from_record_refuses_when_the_record_is_also_empty() {
-        let err = nic_from_record_or_map(None, 3, "").unwrap_err();
+        let err = nic_from_record_or_map(None, 3, "", TEST_GATEWAY_INSTANCE).unwrap_err();
         assert!(
             err.to_string().contains("no verified gateway NIC"),
             "unexpected error: {err}"
         );
         // A populated map fills a blank record rather than refusing.
         let map = verified_map(&[3]);
-        assert_eq!(nic_from_record_or_map(Some(&map), 3, "").unwrap(), "lima3");
+        assert_eq!(
+            nic_from_record_or_map(Some(&map), 3, "", TEST_GATEWAY_INSTANCE).unwrap(),
+            "lima3"
+        );
     }
 
     /// Record and map disagreeing is a refusal, not a re-parent: the running
@@ -3744,7 +3793,8 @@ mod tests {
     #[test]
     fn nic_from_record_refuses_a_disagreement() {
         let map = verified_map(&[3]);
-        let err = nic_from_record_or_map(Some(&map), 3, "lima7").unwrap_err();
+        let err =
+            nic_from_record_or_map(Some(&map), 3, "lima7", TEST_GATEWAY_INSTANCE).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("lima7") && msg.contains("lima3"),
