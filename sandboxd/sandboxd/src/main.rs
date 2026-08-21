@@ -14935,7 +14935,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let executor = Arc::clone(broker_executor.as_ref().expect("set by the executor block"))
             as Arc<dyn sandbox_core::docker::DockerExecutor>;
         Arc::new(move |owner_uid| sandbox_core::docker::DockerRoute::Vm {
-            op_uid: owner_uid,
+            owner_uid,
             executor: Arc::clone(&executor),
         })
     };
@@ -15459,7 +15459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sandbox_core::lima::operator_lima_home(owner_uid),
                     Arc::clone(&executor) as Arc<dyn sandbox_core::lima::LimaExecutor>,
                     sandbox_core::docker::DockerRoute::Vm {
-                        op_uid: owner_uid,
+                        owner_uid,
                         executor: Arc::clone(&executor)
                             as Arc<dyn sandbox_core::docker::DockerExecutor>,
                     },
@@ -15757,7 +15757,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &reachable_operators,
                     &|owner_uid| {
                         Arc::new(RoutedDockerOps::vm(sandbox_core::docker::DockerRoute::Vm {
-                            op_uid: owner_uid,
+                            owner_uid,
                             executor: Arc::clone(&executor),
                         })) as Arc<dyn sandbox_core::backend::DockerOps>
                     },
@@ -16227,7 +16227,7 @@ mod tests {
     fn gateway_route_naming_its_owner()
     -> Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync> {
         Arc::new(|owner_uid| sandbox_core::docker::DockerRoute::Vm {
-            op_uid: owner_uid,
+            owner_uid,
             executor: Arc::new(sandbox_core::docker::LocalSocketDockerExecutor::new(
                 "/nonexistent/gateway-docker.sock",
                 "/nonexistent/lima",
@@ -16296,7 +16296,7 @@ mod tests {
 
         for operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
             assert_eq!(
-                runtime.route_for(operator_uid).op_uid(),
+                runtime.route_for(operator_uid).owner_uid(),
                 Some(operator_uid),
                 "with per-operator gateways on, a container operation for \
                  operator uid {operator_uid} must run against uid \
@@ -16339,7 +16339,7 @@ mod tests {
 
         for operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
             assert_eq!(
-                runtime.route_for(operator_uid).op_uid(),
+                runtime.route_for(operator_uid).owner_uid(),
                 Some(daemon_uid),
                 "with per-operator gateways off there is one gateway and the \
                  daemon owns it, so operator uid {operator_uid} must resolve to \
@@ -16520,7 +16520,9 @@ mod tests {
 
         for session_operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
             assert_eq!(
-                state.container_docker_route(session_operator_uid).op_uid(),
+                state
+                    .container_docker_route(session_operator_uid)
+                    .owner_uid(),
                 Some(session_operator_uid),
                 "with per-operator gateways on, an SSH tunnel for a session \
                  recorded against operator uid {session_operator_uid} must run \

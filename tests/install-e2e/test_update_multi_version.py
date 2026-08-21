@@ -92,7 +92,7 @@ def test_update_fresh_install_to_next_version(
     # `from.is_file()` is true, so a directory short-circuits the
     # cosign call. Going through `--from <tarball>` would route
     # through cosign verify-blob and add noise that obscures the
-    # multi-version contract under test .
+    # multi-version contract under test.
     bumped_tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_tarball_in_vm)
     assert bumped_ver != base_ver, (

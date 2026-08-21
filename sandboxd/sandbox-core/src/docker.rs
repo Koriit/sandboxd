@@ -21,8 +21,9 @@
 //!
 //! A call site holds a [`DockerRoute`], not a socket path. `Host` is the
 //! Linux shape and runs `docker` locally, with the ambient environment left
-//! alone. `Vm` carries the operator uid and an executor; whether that
-//! executor runs `docker` itself (the daemon is the operator) or forwards the
+//! alone. `Vm` carries a gateway-*owner* uid — an operator uid that has been
+//! through the owner collapse, not a raw one — and an executor; whether that
+//! executor runs `docker` itself (the daemon owns the gateway) or forwards the
 //! op to the operator's agent is the executor's business, not the call site's.
 //!
 //! The two routes treat the environment differently on purpose — see the
@@ -472,8 +473,19 @@ pub enum DockerRoute {
     /// Invocations on this route name their target with `-H` and run with a
     /// scrubbed environment, per the rule on this enum.
     Vm {
-        /// The operator whose VM hosts the daemon.
-        op_uid: u32,
+        /// The gateway-owner uid an operator uid was collapsed to by
+        /// `gateway_owner_uid` — never one that has not been through that
+        /// collapse.
+        ///
+        /// This names the collapse rather than the value it ends up holding,
+        /// because the two differ on the default path: with per-operator
+        /// gateways off, every operator collapses to the daemon's own
+        /// `getuid()`, so the raw and collapsed uids are different numbers and
+        /// both are plausible here. A caller consults this field to decide
+        /// which uid to pass onward, so a route built from the un-collapsed
+        /// uid names a VM that does not exist — and fails at the socket,
+        /// nowhere near here.
+        owner_uid: u32,
         executor: Arc<dyn DockerExecutor>,
     },
 }
@@ -482,8 +494,8 @@ impl std::fmt::Debug for DockerRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DockerRoute::Host => f.write_str("DockerRoute::Host"),
-            DockerRoute::Vm { op_uid, .. } => {
-                write!(f, "DockerRoute::Vm {{ op_uid: {op_uid} }}")
+            DockerRoute::Vm { owner_uid, .. } => {
+                write!(f, "DockerRoute::Vm {{ owner_uid: {owner_uid} }}")
             }
         }
     }
@@ -502,7 +514,10 @@ impl DockerRoute {
     ) -> Result<std::process::Output, SandboxError> {
         match self {
             DockerRoute::Host => run_docker_locally(None, op, timeout, label),
-            DockerRoute::Vm { op_uid, executor } => executor.run(*op_uid, op, timeout, label),
+            DockerRoute::Vm {
+                owner_uid,
+                executor,
+            } => executor.run(*owner_uid, op, timeout, label),
         }
     }
 
@@ -518,7 +533,10 @@ impl DockerRoute {
     ) -> Result<DockerStreamConn, SandboxError> {
         match self {
             DockerRoute::Host => open_stream_locally(None, stream).await,
-            DockerRoute::Vm { op_uid, executor } => executor.open_stream(*op_uid, stream).await,
+            DockerRoute::Vm {
+                owner_uid,
+                executor,
+            } => executor.open_stream(*owner_uid, stream).await,
         }
     }
 
@@ -527,11 +545,17 @@ impl DockerRoute {
         matches!(self, DockerRoute::Vm { .. })
     }
 
-    /// The operator uid this route runs as, or `None` for the host daemon.
-    pub fn op_uid(&self) -> Option<u32> {
+    /// The gateway-owner uid this route runs its ops as, or `None` for the
+    /// host daemon.
+    ///
+    /// Owner, not operator: this returns [`DockerRoute::Vm`]'s field verbatim,
+    /// and carries that field's precondition with it. A caller feeding the
+    /// result back into anything that expects an operator uid has crossed the
+    /// collapse in the wrong direction.
+    pub fn owner_uid(&self) -> Option<u32> {
         match self {
             DockerRoute::Host => None,
-            DockerRoute::Vm { op_uid, .. } => Some(*op_uid),
+            DockerRoute::Vm { owner_uid, .. } => Some(*owner_uid),
         }
     }
 }
@@ -1014,7 +1038,7 @@ mod tests {
 
     #[test]
     fn the_host_route_reports_no_operator_uid() {
-        assert_eq!(DockerRoute::Host.op_uid(), None);
+        assert_eq!(DockerRoute::Host.owner_uid(), None);
         assert!(!DockerRoute::Host.is_vm());
     }
 

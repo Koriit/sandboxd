@@ -358,8 +358,10 @@ impl GatewayManager {
     /// Create a `GatewayManager` whose operations all take `docker`.
     ///
     /// On macOS the gateway containers run inside the `sandboxd-gateway`
-    /// Lima VM, so the route is a [`DockerRoute::Vm`] naming the operator
-    /// whose VM that is.
+    /// Lima VM, so the route is a [`DockerRoute::Vm`] naming the gateway
+    /// *owner* whose VM that is — the uid an operator was collapsed to, not
+    /// the operator. With per-operator gateways off, which is the default,
+    /// that is the daemon's own uid for every operator.
     pub fn with_route(docker: DockerRoute) -> Self {
         Self { docker }
     }
@@ -1959,7 +1961,7 @@ mod tests {
     #[test]
     fn create_gateway_refuses_a_vm_route() {
         let manager = GatewayManager::with_route(DockerRoute::Vm {
-            op_uid: 501,
+            owner_uid: 501,
             executor: std::sync::Arc::new(crate::docker::LocalSocketDockerExecutor::new(
                 "/nonexistent/gateway-docker.sock",
                 "/nonexistent",
@@ -1989,7 +1991,7 @@ mod tests {
     #[test]
     fn the_default_manager_takes_the_host_route() {
         assert!(!GatewayManager::new().route().is_vm());
-        assert!(GatewayManager::new().route().op_uid().is_none());
+        assert!(GatewayManager::new().route().owner_uid().is_none());
     }
 
     // -- Naming tests -------------------------------------------------------

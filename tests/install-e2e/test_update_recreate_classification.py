@@ -225,8 +225,8 @@ def test_update_classifies_stopped_session_with_zero_proto_as_recreate(
     )
 
     # 3. No mutation: install state's installed_version is still v.
-    # The prompt-abort path runs entirely in the read-only pre-flight
-    # ; no lock acquisition, no install-state write.
+    # The prompt-abort path runs entirely in the read-only pre-flight;
+    # no lock acquisition, no install-state write.
     post_state = vm.shell(
         "SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json",
         check=True, timeout=10,

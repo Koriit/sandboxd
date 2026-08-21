@@ -1112,7 +1112,7 @@ mod tests {
             !ops.route.is_vm(),
             "the host constructor must not produce a VM route"
         );
-        assert_eq!(ops.route.op_uid(), None);
+        assert_eq!(ops.route.owner_uid(), None);
     }
 
     /// Every listing the reaper performs filters on the owner label. Losing

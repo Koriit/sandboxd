@@ -130,7 +130,7 @@ mod tests {
             .join(sandbox_core::GATEWAY_INSTANCE_NAME)
             .join("gateway-docker.sock");
         let docker = sandbox_core::docker::DockerRoute::Vm {
-            op_uid: daemon_uid,
+            owner_uid: daemon_uid,
             executor: Arc::new(sandbox_core::docker::LocalSocketDockerExecutor::new(
                 gateway_socket,
                 lima_home.clone(),

@@ -22,7 +22,7 @@
 //! - `deny` / `allow` payload (traffic event for `deny-logger`,
 //!   identical for the allow variant): `orig_dst_ip`, `orig_dst_port`,
 //!   `protocol` (`"tcp"` / `"udp"`), `src_ip`, `src_port`.
-//! - `rate_limited` summary payload (
+//! - `rate_limited` summary payload:
 //!   `rate_limited_count`, `since_ts`.
 //!
 //! # Layer / event pairing

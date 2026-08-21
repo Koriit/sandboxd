@@ -186,7 +186,7 @@ impl SessionStore {
             .run(&mut conn)
             .map_err(|e| SandboxError::Internal(format!("migration error (V006+): {e}")))?;
 
-        // V006 substrate-orphan scan .
+        // V006 substrate-orphan scan.
         // Fires exactly once: on the boot where refinery just applied
         // V006. The refinery report tells us which versions ran this
         // pass; cross-checking against `applied_before` would be

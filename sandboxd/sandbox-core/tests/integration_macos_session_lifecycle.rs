@@ -96,7 +96,7 @@ mod integration_macos_session_lifecycle {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         sandbox_core::docker::DockerRoute::Vm {
-            op_uid: nix::unistd::Uid::current().as_raw(),
+            owner_uid: nix::unistd::Uid::current().as_raw(),
             executor: std::sync::Arc::new(sandbox_core::docker::LocalSocketDockerExecutor::new(
                 sock, staging,
             )),

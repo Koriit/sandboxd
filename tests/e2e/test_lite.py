@@ -1,6 +1,6 @@
 """E2E tests for the lite-mode container backend.
 
-Covers the design § "E2E tests" lite-specific assertions: feature
+Covers the lite-specific E2E assertions: feature
 rejection, hardening posture, resource defaults, gateway parity,
 git-remote-sandbox parity, and the β home-volume lifecycle. These
 assertions exercise the *container* backend end-to-end through the

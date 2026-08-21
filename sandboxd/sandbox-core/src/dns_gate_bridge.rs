@@ -454,7 +454,7 @@ mod tests {
 
         let opens = Arc::new(AtomicUsize::new(0));
         let route = DockerRoute::Vm {
-            op_uid: 501,
+            owner_uid: 501,
             executor: Arc::new(RefusingExecutor {
                 opens: Arc::clone(&opens),
             }),
@@ -498,7 +498,7 @@ mod tests {
         let accept_task = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
 
         let route = DockerRoute::Vm {
-            op_uid: 501,
+            owner_uid: 501,
             executor: Arc::new(EmptyStreamExecutor),
         };
 

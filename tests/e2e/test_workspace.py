@@ -737,7 +737,7 @@ def test_shared_mount(sandbox_cli, backend):
 
     Rootless-Docker handling lives daemon-side: the daemon
     refuses container session-create on rootless hosts by default
-    (
+    (`RootlessDockerRefused`, mapped to
     HTTP 400). The previous in-body `is_rootless_docker()` skip is no
     longer needed — on a rootless rig the `sandbox create` call below
     fails loudly with the daemon's rejection text, which is the

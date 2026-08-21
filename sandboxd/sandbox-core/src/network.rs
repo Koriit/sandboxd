@@ -1861,7 +1861,7 @@ mod tests {
         }
 
         DockerRoute::Vm {
-            op_uid: 501,
+            owner_uid: 501,
             executor: std::sync::Arc::new(UnusedExecutor),
         }
     }

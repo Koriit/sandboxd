@@ -878,7 +878,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn unreachable_route() -> DockerRoute {
         DockerRoute::Vm {
-            op_uid: TEST_OPERATOR_UID,
+            owner_uid: TEST_OPERATOR_UID,
             executor: std::sync::Arc::new(crate::docker::LocalSocketDockerExecutor::new(
                 "/nonexistent/gateway-docker.sock",
                 "/nonexistent",
@@ -1030,7 +1030,7 @@ mod tests {
             refuse_connect_with: Some("unknown flag: --gw-priority\n".to_string()),
         });
         let route = DockerRoute::Vm {
-            op_uid: TEST_OPERATOR_UID,
+            owner_uid: TEST_OPERATOR_UID,
             executor: executor.clone(),
         };
         let session_id = SessionId::parse("aabbccddeeff").unwrap();

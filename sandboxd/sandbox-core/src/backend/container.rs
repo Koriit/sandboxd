@@ -2120,9 +2120,9 @@ mod tests {
     /// A route that names a VM without being able to reach one. Unit tests
     /// never run docker; what they assert is which shape the runtime takes,
     /// and the executor is never invoked.
-    fn unreachable_vm_route(op_uid: u32) -> DockerRoute {
+    fn unreachable_vm_route(owner_uid: u32) -> DockerRoute {
         DockerRoute::Vm {
-            op_uid,
+            owner_uid,
             executor: Arc::new(crate::docker::LocalSocketDockerExecutor::new(
                 "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
                 "/var/lib/sandboxd/501/501/lima",

@@ -300,7 +300,7 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
         f"got {rec.get('reason')!r}\nfull record: {rec!r}"
     )
     # The caller field falls back to ``uid:<n>`` since no name resolves
-    # (
+    # (the deny-record-completeness invariant: include as much
     # identity as the helper could establish, never silently drop).
     assert rec.get("caller") == f"uid:{TEST_UID_NOPASSWD}", (
         f"audit record caller: expected 'uid:{TEST_UID_NOPASSWD}', "
@@ -654,7 +654,7 @@ def test_session_isolation_404_on_foreign_id(
         filter rejects foreign-owner rows from every per-id endpoint
         (H3, H5, H6, ...; for this test we exercise H3 ``GET /sessions/{id}``).
       * The 404 body matches ``{"error":"session not found: <id>"}``
-        verbatim (
+        verbatim (the wire shape is indistinguishable from a truly
         nonexistent id, so bob cannot infer existence-but-not-owned).
       * No 403 leaks through — the design is explicit that the response
         is 404, not 403, to avoid telegraphing whether the id exists.

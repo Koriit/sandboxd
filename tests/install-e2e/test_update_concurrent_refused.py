@@ -90,7 +90,7 @@ def test_update_concurrent_refused(
     #
     # `started_at` is rendered dynamically as "5 minutes ago" so the
     # payload appears RECENT against the lock's 24-hour staleness
-    # threshold (
+    # threshold (`AdoptStale` fires for payloads older
     # than 24h). A fixed timestamp like "2026-05-12T00:00:00Z" was
     # safe when first written but drifts past 24h as the calendar
     # advances, eventually crossing the adopt-vs-adopt-stale

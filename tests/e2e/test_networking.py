@@ -187,9 +187,8 @@ def _probe_gateway_tcp(sandbox_cli, name: str, ip: str, port: int = 53,
     rely on. ``ping`` relies on raw ICMP sockets, which
     require ``CAP_NET_RAW`` — but the lite container backend's
     required hardening posture drops every Linux capability
-    and § "What this
-    breaks" line 561-562 explicitly enumerates ``ping`` as a
-    by-design forbidden tool: *"Raw network sockets. ``CAP_NET_RAW``
+    (``--cap-drop ALL``), which makes ``ping`` a by-design
+    forbidden tool: *"Raw network sockets. ``CAP_NET_RAW``
     dropped; ``ping`` and similar tools fail."* The Lima backend
     runs an unhardened guest where ICMP is fine, but the test must
     work on both backends, so we replace the L3 ICMP probe with an
@@ -1053,8 +1052,8 @@ def test_stop_start_with_networking(sandbox_cli, backend):
         #    pair of `delete_network`/`ensure_network` calls), so any
         #    drift here is a daemon-side regression. The reachability
         #    probe targets gateway TCP/53 (CoreDNS) instead of ICMP
-        #    ping; the lite container backend drops `CAP_NET_RAW` per
-        #    , so ping is by-design
+        #    ping; the lite container backend drops `CAP_NET_RAW`,
+        #    so ping is by-design
         #    unavailable there. See `_probe_gateway_tcp` for the
         #    rationale.
         post_restart_net = inspect_session_network(sandbox_cli, "net-restart-test")
@@ -1220,8 +1219,8 @@ def test_concurrent_sessions(sandbox_cli):
         #    by the gateway's prerouting nftables ruleset
         #    (``sandbox-core/src/gateway.rs:1462-1486``), so a Lima ping
         #    cleanly observes the no-route-to-host outcome. The
-        #    container backend drops ``CAP_NET_RAW`` (
-        #    line 561-562) and DNATs every TCP/UDP packet from the
+        #    container backend drops ``CAP_NET_RAW`` and DNATs
+        #    every TCP/UDP packet from the
         #    session's saddr — making this leg untestable there, which
         #    is why the whole test is Lima-marked at the top.
         cross_ping = sandbox_cli(
@@ -1451,8 +1450,8 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
 
         # Verify the session can reach its gateway after crash recovery.
         # Backend-neutral TCP probe to gateway TCP/53 (CoreDNS) — replaces
-        # the prior backend-conditional ping (skipped on container per
-        # , ping
+        # the prior backend-conditional ping (skipped on container:
+        # `CAP_NET_RAW` is dropped, so ping
         # by-design fails on the lite container backend). The TCP probe
         # works on both backends without raw sockets; see
         # `_probe_gateway_tcp` for the rationale.

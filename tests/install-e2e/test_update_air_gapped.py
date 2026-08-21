@@ -5,7 +5,7 @@ network with strict egress policy). They've fetched the release
 tarball + sigstore bundle out of band; ``sandbox update --from
 <tarball>`` should complete without any outbound network call.
 
-Network access points the flow could touch :
+Network access points the flow could touch:
   * GitHub Releases API — opt-out via ``--from``.
   * GitHub Releases tarball CDN — opt-out via ``--from``.
   * Sigstore Rekor / cosign verify — wired in a later milestone but

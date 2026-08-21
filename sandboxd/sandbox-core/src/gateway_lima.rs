@@ -4102,7 +4102,7 @@ mod tests {
             crate::lima::operator_lima_home(owner_uid),
             Arc::new(UnusedLimaExecutor),
             DockerRoute::Vm {
-                op_uid: owner_uid,
+                owner_uid,
                 executor: Arc::new(UnusedDockerExecutor),
             },
             InVmRoute::new(owner_uid, RecordingInVmExecutor::ok()),
@@ -4115,7 +4115,7 @@ mod tests {
     fn docker_route_uid(route: &DockerRoute) -> Option<u32> {
         match route {
             DockerRoute::Host => None,
-            DockerRoute::Vm { op_uid, .. } => Some(*op_uid),
+            DockerRoute::Vm { owner_uid, .. } => Some(*owner_uid),
         }
     }
 
@@ -5209,7 +5209,7 @@ mod tests {
             lima_home.clone(),
             Arc::new(UnusedLimaExecutor),
             DockerRoute::Vm {
-                op_uid: 501,
+                owner_uid: 501,
                 executor: docker,
             },
             InVmRoute::new(501, RecordingInVmExecutor::ok()),

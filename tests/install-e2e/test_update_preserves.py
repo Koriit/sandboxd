@@ -236,10 +236,10 @@ def test_update_preserves_customized_users_conf(
         f"custom subnet dropped during update; post subnets: {post!r}"
     )
 
-    # 
+    # Post-update doctor green-light. The
     # customized users.conf must still validate against the daemon's
     # schema — doctor's daemon-startup check is the post-update
-    # signal that the schema-mismatch refusal  did
+    # signal that the schema-mismatch refusal did
     # NOT fire.
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
