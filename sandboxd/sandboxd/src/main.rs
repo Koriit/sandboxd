@@ -6455,9 +6455,7 @@ async fn start_session_macos_lite(
             Ok(pid) => pid,
             Err(e) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime
-                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
-                    .await;
+                let _ = runtime.stop(&handle, operator_uid).await;
                 let _ = state
                     .store
                     .update_state(&session_id, &operator.name, SessionState::Error);
@@ -6478,9 +6476,7 @@ async fn start_session_macos_lite(
                 Ok(ip) => ip,
                 Err(e) => {
                     let runtime = runtime_for(&state, BackendKind::Container);
-                    let _ = runtime
-                        .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
-                        .await;
+                    let _ = runtime.stop(&handle, operator_uid).await;
                     let _ =
                         state
                             .store
@@ -6494,9 +6490,7 @@ async fn start_session_macos_lite(
             },
             Ok(None) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime
-                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
-                    .await;
+                let _ = runtime.stop(&handle, operator_uid).await;
                 let _ = state
                     .store
                     .update_state(&session_id, &operator.name, SessionState::Error);
@@ -6508,9 +6502,7 @@ async fn start_session_macos_lite(
             }
             Err(e) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime
-                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
-                    .await;
+                let _ = runtime.stop(&handle, operator_uid).await;
                 let _ = state
                     .store
                     .update_state(&session_id, &operator.name, SessionState::Error);
@@ -6535,9 +6527,7 @@ async fn start_session_macos_lite(
             }
             Ok(Err(e)) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime
-                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
-                    .await;
+                let _ = runtime.stop(&handle, operator_uid).await;
                 let _ = state
                     .store
                     .update_state(&session_id, &operator.name, SessionState::Error);
@@ -6549,9 +6539,7 @@ async fn start_session_macos_lite(
             }
             Err(e) => {
                 let runtime = runtime_for(&state, BackendKind::Container);
-                let _ = runtime
-                    .stop(&handle, session.operator_uid.unwrap_or(operator.uid))
-                    .await;
+                let _ = runtime.stop(&handle, operator_uid).await;
                 let _ = state
                     .store
                     .update_state(&session_id, &operator.name, SessionState::Error);
@@ -7125,12 +7113,29 @@ async fn get_session(
     // are treated as "no-op" here — the daemon's authoritative state
     // is in the store and we don't overwrite it on a non-matching
     // runtime status.
+    //
+    // Skipped rather than defaulted when the session records no operator,
+    // because this block does not only read: both arms below call
+    // `update_state_reconcile`. A uid taken from the requester instead of the
+    // session aims the probe at that requester's resources — on Lima, their
+    // LIMA_HOME and their helper pivot — and the verdict about a session those
+    // do not hold gets written to this session's row. So a wrong uid here does
+    // not degrade the response, it corrupts the record, and it corrupts it
+    // toward `Stopped`, since a LIMA_HOME that never held the VM reports
+    // exactly that. Leaving the stored state untouched is the honest outcome:
+    // the caller still gets the row, carrying the last state something
+    // authoritative set.
+    //
+    // The session's own uid, not `gateway_operator_for_session`: that resolver
+    // answers which *gateway* serves a session, and on Linux it collapses to
+    // the daemon's own uid because no gateway VM exists there. The uid below
+    // selects the session's own runtime resources, which on Linux + Lima are
+    // per-operator and would not be found under the daemon's.
     let mut session = session;
-    {
+    if let Some(operator_uid) = session.operator_uid {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
-        let op_uid = session.operator_uid.unwrap_or(operator.uid);
-        if let Ok(rt_status) = runtime.status(&handle, op_uid).await {
+        if let Ok(rt_status) = runtime.status(&handle, operator_uid).await {
             match (&session.state, &rt_status) {
                 (SessionState::Running, sandbox_core::backend::RuntimeStatus::Stopped) => {
                     session.state = SessionState::Stopped;
@@ -7687,6 +7692,23 @@ async fn stop_session(
         .into_response();
     };
 
+    // The uid the session's *own* runtime is keyed by, which is a different
+    // question from the gateway resolved above and has a different answer on
+    // Linux, where that resolver collapses to the daemon's uid because there
+    // is no gateway VM. Stopping a Lima session reaches its LIMA_HOME and
+    // pivots the helper to its operator, both per-operator on either platform.
+    //
+    // Refused rather than defaulted, and refused here for the same reason the
+    // gateway is: before the first mutation, so a refusal changes nothing.
+    let Some(session_operator_uid) = session.operator_uid else {
+        return error_response(SandboxError::Internal(format!(
+            "session {} records no operator, so its runtime cannot be located and it was not \
+             stopped. Its containers are still running and nothing was torn down.",
+            session.id
+        )))
+        .into_response();
+    };
+
     info!(session_id = %session.id, "stopping session");
 
     // Mark this session as "stopping" so the gateway monitor doesn't restart
@@ -7801,8 +7823,7 @@ async fn stop_session(
         // Dispatch through the trait, keyed off the persisted backend.
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
-        let op_uid = session.operator_uid.unwrap_or(operator.uid);
-        match runtime.stop(&handle, op_uid).await {
+        match runtime.stop(&handle, session_operator_uid).await {
             Ok(()) => {}
             Err(e) if params.force => {
                 // Best-effort: log the VM stop failure but continue to the
@@ -7895,6 +7916,19 @@ async fn remove_session(
         .into_response();
     };
 
+    // The session's own runtime uid, distinct from the gateway above — see
+    // `stop_session` for why the two questions diverge on Linux. Remove is
+    // again the worse half: `runtime.delete` against the wrong LIMA_HOME finds
+    // no VM, reports nothing to do, and the row is deleted anyway.
+    let Some(session_operator_uid) = session.operator_uid else {
+        return error_response(SandboxError::Internal(format!(
+            "session {} records no operator, so its runtime cannot be located and it was not \
+             removed. Its containers and its record are both still there.",
+            session.id
+        )))
+        .into_response();
+    };
+
     info!(
         session_id = %session.id,
         name = ?session.name,
@@ -7948,8 +7982,7 @@ async fn remove_session(
     {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
-        let op_uid_for_delete = session.operator_uid.unwrap_or(operator.uid);
-        let _ = runtime.delete(&handle, op_uid_for_delete).await;
+        let _ = runtime.delete(&handle, session_operator_uid).await;
 
         #[cfg(target_os = "macos")]
         {
@@ -9236,11 +9269,41 @@ async fn gateway_operator_or_decline(
 /// keeps the Linux behaviour identical to what it was before any of this took
 /// a uid.
 ///
-/// Call sites holding an authenticated `OperatorIdentity` deliberately do not
-/// come through here. `operator.uid` is kernel-supplied from the peer
-/// credential and resolved strictly at accept time, so it exists by
-/// construction; re-deriving the same identity from the session's stored rows
-/// would only add a way for it to fail.
+/// Holding an authenticated `OperatorIdentity` is not a reason to skip this.
+/// Several callers that have one come through here anyway, and they are right
+/// to. But this answers exactly one of three questions a uid can be asked
+/// here, and the other two have different answers on Linux:
+///
+/// 1. **Who is asking** — the store's per-caller filter, ownership checks,
+///    audit lines. `operator.uid` is kernel-supplied from the peer credential
+///    and resolved at accept time, so it exists by construction and is the
+///    correct answer. Do not come through here.
+/// 2. **Whose gateway serves this session** — the Docker route, the gateway
+///    Lima manager, the gateway health and policy probes. **This function.**
+/// 3. **Whose runtime holds this session** — `SessionRuntime::start`, `stop`,
+///    `delete`, `status`, and the guest transport. Read `session.operator_uid`
+///    and refuse when it is `None`; do **not** use this function.
+///
+/// 2 and 3 give the same answer on macOS and different answers on Linux, which
+/// is the trap. On Linux this function cannot decline and always returns the
+/// daemon's own uid — correct for 2, because no gateway VM exists there and
+/// the manager built from the uid never consults it. It is wrong for 3:
+/// `LimaManagerRegistry::get_or_create` keys `LIMA_HOME` at
+/// `/var/lib/sandboxd/<daemon_uid>/<op_uid>/lima/` and carries `op_uid` as
+/// `sandbox-lima-helper`'s pivot target, and both stay per-operator on Linux.
+/// Substituting the daemon's uid there looks in a directory the session's VM
+/// was never in, so the operation reports nothing to do and succeeds.
+///
+/// The conditions under which a wrong uid nonetheless reaches the right place,
+/// and so survives review and testing: for 1-vs-2, the requester is the
+/// session's creator and their account has not been renumbered; for 2-vs-3, on
+/// macOS both resolve from the session's own records, and on Linux with the
+/// container backend the host route factory ignores the uid entirely. Add
+/// `SANDBOX_PER_OPERATOR_GATEWAY` being unset — the default — and every uid
+/// collapses to one gateway, so 2 is uid-independent too. A call site added
+/// and tested under those defaults passes; it is misrouted on Linux + Lima, or
+/// the moment that switch goes on. If you are reaching for whichever uid is
+/// already in scope, that is this case.
 async fn gateway_operator_for_session(
     session_id: &SessionId,
     state: &AppState,
@@ -11116,17 +11179,35 @@ async fn session_health(
     // health-payload consumers (CLI, `tests/e2e`) stay backwards
     // compatible — they already accept arbitrary lower-case status
     // strings.
-    let vm_status = {
-        let runtime = runtime_for(&state, session.backend);
-        let handle = RuntimeHandle::from_session_id(&session.id);
-        let op_uid = session.operator_uid.unwrap_or(operator.uid);
-        match runtime.status(&handle, op_uid).await {
-            Ok(sandbox_core::backend::RuntimeStatus::Running) => "running".to_string(),
-            Ok(sandbox_core::backend::RuntimeStatus::Stopped) => "stopped".to_string(),
-            Ok(sandbox_core::backend::RuntimeStatus::Creating) => "creating".to_string(),
-            Ok(sandbox_core::backend::RuntimeStatus::Error) => "error".to_string(),
-            Ok(sandbox_core::backend::RuntimeStatus::Unknown(s)) => s,
-            Err(e) => format!("error: {e}"),
+    //
+    // Keyed on the session's own uid rather than the requester's, and
+    // deliberately not on `gateway_operator` below: that resolver answers
+    // which *gateway* serves the session, and on Linux it collapses to the
+    // daemon's own uid because no gateway VM exists there. This uid selects
+    // the session's own runtime resources instead — on Lima its LIMA_HOME and
+    // the helper's pivot target, both per-operator on Linux as well as macOS.
+    // The two questions have the same answer on macOS and different answers on
+    // Linux, so they are asked separately.
+    let vm_status = match session.operator_uid {
+        Some(operator_uid) => {
+            let runtime = runtime_for(&state, session.backend);
+            let handle = RuntimeHandle::from_session_id(&session.id);
+            match runtime.status(&handle, operator_uid).await {
+                Ok(sandbox_core::backend::RuntimeStatus::Running) => "running".to_string(),
+                Ok(sandbox_core::backend::RuntimeStatus::Stopped) => "stopped".to_string(),
+                Ok(sandbox_core::backend::RuntimeStatus::Creating) => "creating".to_string(),
+                Ok(sandbox_core::backend::RuntimeStatus::Error) => "error".to_string(),
+                Ok(sandbox_core::backend::RuntimeStatus::Unknown(s)) => s,
+                Err(e) => format!("error: {e}"),
+            }
+        }
+        // Same `error:`-prefixed shape this field already uses for a probe
+        // that came back with no verdict, which is what this is: there was
+        // nowhere to send it. Its own wording rather than
+        // `GATEWAY_STATUS_OPERATOR_UNRESOLVED`, because that names a *gateway*
+        // and this field reports the session's own runtime.
+        None => {
+            "error: the session records no operator, so its runtime cannot be located".to_string()
         }
     };
 
