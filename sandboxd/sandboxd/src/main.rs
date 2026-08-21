@@ -10033,11 +10033,12 @@ async fn prewarm_guest_dns(guest: &GuestConnector, session_id: &SessionId, host:
 /// Spawn (or re-spawn) the session's JSONL ingest task.
 ///
 /// Called after every successful `create_gateway` / `restart_gateway` so
-/// the tailers catch up with any records the three in-container producers
-/// (Envoy access log, CoreDNS plugin, mitmproxy addon) have already
-/// appended. Any previously-spawned ingestor for this session is aborted
-/// first, so a gateway bounce cleanly reseats the watcher and tailers —
-/// on fresh boot and on crash recovery alike.
+/// the tailers catch up with any records the five in-container producers
+/// (Envoy access log, CoreDNS plugin, mitmproxy addon, nft-deny-logger,
+/// nft-allow-logger) have already appended. Any previously-spawned
+/// ingestor for this session is aborted first, so a gateway bounce
+/// cleanly reseats the watcher and tailers — on fresh boot and on crash
+/// recovery alike.
 ///
 /// The events directory is created eagerly (it is the bind-mount target
 /// used by `GatewayManager::create_gateway`) so the notify watcher has a

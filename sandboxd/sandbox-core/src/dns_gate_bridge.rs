@@ -10,7 +10,8 @@
 //! daemon's host [`tokio::net::UnixListener`] — same inode, no bridge.
 //!
 //! On macOS the gateway container runs **inside the gateway Lima VM** with
-//! **no host bind-mounts** ([`crate::macos_session::build_macos_gateway_docker_args`]).
+//! **no host bind-mounts** (built by `gateway_container_run_op` in
+//! [`crate::macos_session`]; pinned by its `test_macos_gateway_hardening_args`).
 //! The daemon still binds the gate UDS on the macOS host
 //! ([`crate::dns_gate::dns_gate_socket_host_path`]), but the in-container
 //! Corefile path `/var/log/gateway/events/dns-gate.sock` is an empty tmpfs

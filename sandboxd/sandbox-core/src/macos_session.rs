@@ -1212,7 +1212,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_gateway_hardening_args() {
-        // Assert the gateway container's hardened config via `build_macos_gateway_docker_args`:
+        // Assert the gateway container's hardened config as built by
+        // `gateway_container_run_op`:
         // - No `--privileged` (shared-gateway-VM blast-radius control).
         // - `--read-only` rootfs.
         // - Exactly one `--cap-add` and it is `NET_ADMIN` (required for in-container

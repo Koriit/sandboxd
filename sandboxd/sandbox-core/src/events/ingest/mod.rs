@@ -1,21 +1,23 @@
 //! JSONL ingest pipeline — the sandboxd-side consumer of structured event
-//! files written by the three policy-enforcing subcomponents inside the
-//! gateway container.
+//! files written by the five event producers inside the gateway
+//! container.
 //!
-//! The three producers — Envoy (access log), the CoreDNS plugin, and the
-//! mitmproxy addon — each write one JSONL record per decision. Session-ID
-//! attribution is sandboxd's responsibility, not each component's; it
-//! is stamped here at ingest time.
+//! The five producers — Envoy (access log), the CoreDNS plugin, the
+//! mitmproxy addon, the nft-deny-logger and the nft-allow-logger — each
+//! write one JSONL record per decision. Session-ID attribution is
+//! sandboxd's responsibility, not each component's; it is stamped here
+//! at ingest time.
 //!
 //! # Shape
 //!
 //! `create_gateway` bind-mounts a per-session host directory
 //! [`crate::events::session_events_host_dir`] into
-//! [`crate::events::EVENTS_DIR_IN_CONTAINER`]. The three producers inside
+//! [`crate::events::EVENTS_DIR_IN_CONTAINER`]. The five producers inside
 //! the container — Envoy (access log as JSON), the CoreDNS plugin
-//! (`EventWriter`), the mitmproxy addon (`EventEmitter`) — append one
-//! JSON record per line to `envoy.jsonl`, `coredns.jsonl`, and
-//! `mitmproxy.jsonl` respectively.
+//! (`EventWriter`), the mitmproxy addon (`EventEmitter`), the
+//! nft-deny-logger and the nft-allow-logger — append one JSON record per
+//! line to `envoy.jsonl`, `coredns.jsonl`, `mitmproxy.jsonl`,
+//! `nft-deny.jsonl` and `nft-allow.jsonl` respectively.
 //!
 //! Sandboxd spawns one [`SessionIngestor`] per session after the gateway
 //! has finished starting. The ingestor runs a background task that:
@@ -23,11 +25,12 @@
 //! 1. Watches the events directory for create/modify/moved-to
 //!    notifications via `notify::RecommendedWatcher` (inotify on Linux).
 //! 2. For every known file name (`envoy.jsonl`, `coredns.jsonl`,
-//!    `mitmproxy.jsonl`) spawns a [`jsonl_reader::JsonlTailer`] that
-//!    reads from the current offset to EOF on every wake, parses each
-//!    complete line, and forwards the resulting [`crate::events::Event`]
-//!    to the shared [`crate::events::EventBus`] after stamping
-//!    `session_id` via the [`crate::events::VmIpSessionMap`].
+//!    `mitmproxy.jsonl`, `nft-deny.jsonl`, `nft-allow.jsonl`) spawns a
+//!    [`jsonl_reader::JsonlTailer`] that reads from the current offset
+//!    to EOF on every wake, parses each complete line, and forwards the
+//!    resulting [`crate::events::Event`] to the shared
+//!    [`crate::events::EventBus`] after stamping `session_id` via the
+//!    [`crate::events::VmIpSessionMap`].
 //! 3. Ticks a 2-second fallback timer that re-scans all active tailers
 //!    even in the absence of inotify events. Virtiofs / 9p propagate
 //!    notifications unreliably under some hypervisor configurations,
@@ -35,9 +38,10 @@
 //!
 //! # Per-layer parsers
 //!
-//! Each layer owns a module (`envoy`, `coredns`, `mitmproxy`) that
-//! parses the on-disk JSON record into a [`crate::events::TrafficEvent`]
-//! and returns the originating `src_ip` (Envoy) / `client_ip`
+//! Each layer owns a module (`envoy`, `coredns`, `mitmproxy`,
+//! `nft_logger` — the last shared by both nft-loggers) that parses the
+//! on-disk JSON record into a [`crate::events::TrafficEvent`] and
+//! returns the originating `src_ip` (Envoy, nft-loggers) / `client_ip`
 //! (CoreDNS / mitmproxy) for [`crate::events::VmIpSessionMap::lookup`].
 //! Records we cannot attribute (unknown VM IP) are dropped with a
 //! `tracing::warn!` line rather than published to a fabricated session:

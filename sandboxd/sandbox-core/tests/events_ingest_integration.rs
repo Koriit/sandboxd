@@ -4,8 +4,8 @@
 //! Covers the full read-parse-stamp-publish path without a real
 //! gateway container: a test-owned tempdir stands in for the
 //! bind-mounted events directory, and the test writes JSONL lines
-//! directly to the three producer files (`envoy.jsonl`,
-//! `coredns.jsonl`, `mitmproxy.jsonl`).
+//! directly to four of the five producer files (`envoy.jsonl`,
+//! `coredns.jsonl`, `mitmproxy.jsonl`, `nft-deny.jsonl`).
 //!
 //! What the test pins:
 //!

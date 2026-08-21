@@ -39,10 +39,10 @@ pub use vm_ip_map::VmIpSessionMap;
 
 /// Return the root directory on the host under which per-session event
 /// directories live. `sandboxd` bind-mounts `${root}/<session-id>/` into
-/// each gateway container at [`EVENTS_DIR_IN_CONTAINER`] so the three
-/// JSONL producers (Envoy access log, CoreDNS plugin, mitmproxy addon)
-/// can write structured events that sandboxd's ingest layer tails via
-/// `inotify`.
+/// each gateway container at [`EVENTS_DIR_IN_CONTAINER`] so the five
+/// JSONL producers (Envoy access log, CoreDNS plugin, mitmproxy addon,
+/// nft-deny-logger, nft-allow-logger) can write structured events that
+/// sandboxd's ingest layer tails via `inotify`.
 ///
 /// Resolution order mirrors
 /// [`crate::atomic_listener_writer::listener_host_root`] (the canonical
@@ -77,10 +77,11 @@ pub fn events_host_root() -> PathBuf {
     PathBuf::from("/tmp/sandboxd-events")
 }
 
-/// Directory inside the gateway container where the three JSONL producers
-/// (Envoy access log, CoreDNS plugin, mitmproxy addon) write their event
-/// files. `sandboxd` bind-mounts [`session_events_host_dir`] onto this
-/// path when starting the gateway container.
+/// Directory inside the gateway container where the five JSONL producers
+/// (Envoy access log, CoreDNS plugin, mitmproxy addon, nft-deny-logger,
+/// nft-allow-logger) write their event files. `sandboxd` bind-mounts
+/// [`session_events_host_dir`] onto this path when starting the gateway
+/// container.
 ///
 /// Kept narrower than the image-wide `/var/log` tmpfs so unstructured
 /// per-component text logs (`envoy.log`, `mitmproxy.log`, `coredns.log`)
@@ -91,9 +92,10 @@ pub const EVENTS_DIR_IN_CONTAINER: &str = "/var/log/gateway/events";
 /// Return the host-side events directory for `session_id`.
 ///
 /// This directory is bind-mounted into the gateway container as
-/// [`EVENTS_DIR_IN_CONTAINER`]. The three JSONL producers inside the
-/// container write `envoy.jsonl`, `coredns.jsonl`, and `mitmproxy.jsonl`
-/// into this directory; sandboxd's ingest layer tails them via `inotify`.
+/// [`EVENTS_DIR_IN_CONTAINER`]. The five JSONL producers inside the
+/// container write `envoy.jsonl`, `coredns.jsonl`, `mitmproxy.jsonl`,
+/// `nft-deny.jsonl`, and `nft-allow.jsonl` into this directory;
+/// sandboxd's ingest layer tails them via `inotify`.
 pub fn session_events_host_dir(session_id: &SessionId) -> PathBuf {
     events_host_root().join(session_id.to_string())
 }

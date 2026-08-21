@@ -969,9 +969,9 @@ fn integration_wait_for_lds_ack_observes_real_envoy_ack() {
 }
 
 /// The gateway container must expose a per-session events bind mount
-/// into which the three JSONL producers (Envoy access log, CoreDNS
-/// plugin, mitmproxy addon) append structured event lines that
-/// sandboxd tails via `inotify`.
+/// into which the five JSONL producers (Envoy access log, CoreDNS
+/// plugin, mitmproxy addon, nft-deny-logger, nft-allow-logger) append
+/// structured event lines that sandboxd tails via `inotify`.
 ///
 /// This test asserts three lifecycle properties of that bind:
 ///   1. `create_gateway` creates the host-side events dir.

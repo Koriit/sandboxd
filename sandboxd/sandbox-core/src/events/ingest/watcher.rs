@@ -9,9 +9,9 @@
 //! 1. Open a [`notify::RecommendedWatcher`] (inotify on Linux) in
 //!    non-recursive mode on `events_dir`. We do not need recursion —
 //!    producers only ever write to the directory root.
-//! 2. Glob the directory immediately for any of the three known file
-//!    names (`envoy.jsonl`, `coredns.jsonl`, `mitmproxy.jsonl`) and
-//!    spawn a [`JsonlTailer`] for each already-present file. This is
+//! 2. Glob the directory immediately for any of the known file names
+//!    (`KNOWN_FILES`, one per producer) and spawn a [`JsonlTailer`] for
+//!    each already-present file. This is
 //!    the "seek-to-EOF at session re-ingest" case (see
 //!    [`JsonlTailer::new_at_eof`]).
 //! 3. Run a `tokio::select!` loop that:

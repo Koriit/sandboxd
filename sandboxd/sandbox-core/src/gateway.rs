@@ -532,11 +532,12 @@ impl GatewayManager {
         );
 
         // Pre-setup: ensure the per-session events host directory exists
-        // and is empty before `docker run`. The three JSONL producers
+        // and is empty before `docker run`. The five JSONL producers
         // inside the container (Envoy access log, CoreDNS plugin,
-        // mitmproxy addon) append to envoy.jsonl / coredns.jsonl /
-        // mitmproxy.jsonl inside this directory, which sandboxd tails
-        // via `inotify` in the ingest layer.
+        // mitmproxy addon, nft-deny-logger, nft-allow-logger) append to
+        // envoy.jsonl, coredns.jsonl, mitmproxy.jsonl, nft-deny.jsonl
+        // and nft-allow.jsonl inside this directory, which sandboxd
+        // tails via `inotify` in the ingest layer.
         //
         // Mirrors the listener host-dir handling above: best-effort
         // cleanup of any leftover dir from a crashed previous session
@@ -601,10 +602,10 @@ impl GatewayManager {
                 LISTENER_DIR_IN_CONTAINER,
             ),
             // Bind-mount the per-session events host directory into
-            // [`EVENTS_DIR_IN_CONTAINER`]. The three JSONL producers
+            // [`EVENTS_DIR_IN_CONTAINER`]. The five JSONL producers
             // inside the container append structured events to this
-            // path; sandboxd's Phase 7 ingest layer tails the files
-            // via `inotify`.
+            // path; sandboxd's ingest layer tails the files via
+            // `inotify`.
             //
             // This bind sits *underneath* the `/var/log` tmpfs mount
             // above — Docker applies mounts in path-length order, so
@@ -888,7 +889,7 @@ impl GatewayManager {
         }
 
         // Step 5: Remove the per-session events host directory that
-        // held the three JSONL producer files. Same best-effort
+        // held the five JSONL producer files. Same best-effort
         // posture as the listener dir above — the ingest layer stops
         // tailing as part of session teardown so the files are no
         // longer referenced after `docker rm`.
