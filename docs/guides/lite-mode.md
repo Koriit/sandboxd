@@ -154,6 +154,8 @@ The cost is one extra hop (WebSocket-to-socat) in the SSH datapath. That hop is 
 
 Lite mode requires Docker 24.0+ on the host. That is already a sandboxd prerequisite; see [Installation](/sandboxd/start/installation/) for the install steps. If you only intend to use lite mode and never spin up a Lima VM, the Lima/QEMU/KVM stack is not needed at runtime — but you still build the workspace via `make build`, which compiles every crate.
 
+One exception, despite its name: on Linux the `sandbox-lima-helper` setcap binary **is** required for lite-only installs. The daemon resolves it during startup regardless of which backend your sessions will use, and aborts if it is missing or un-cap'd. `install.sh` installs it for you; if you are installing by hand, see [`sandbox-lima-helper`](/sandboxd/start/installation/#sandbox-lima-helper).
+
 The first lite session on a fresh daemon-version triggers a Docker build of the lite image (a few minutes, one time). Subsequent lite sessions reuse the cached image and start in seconds.
 
 ## Rebuilding the lite image
