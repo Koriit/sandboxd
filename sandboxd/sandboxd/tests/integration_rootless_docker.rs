@@ -459,7 +459,7 @@ impl<'a> Drop for SessionCleanupGuard<'a> {
 ///
 /// The probe must run *before* any docker artifact allocation — Wave
 /// 2 confirmed this ordering by placing the gate immediately after
-/// the design validation pass and before the per-session network
+/// the spec validation pass and before the per-session network
 /// allocation. This test pins that ordering by snapshotting the
 /// docker artifact namespace before the create call and asserting it
 /// is unchanged afterwards.

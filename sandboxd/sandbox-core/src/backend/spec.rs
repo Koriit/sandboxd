@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(err, UnsupportedFeature::Hardening);
     }
 
-    /// Hardening flag is irrelevant when the design asks for
+    /// Hardening flag is irrelevant when the spec asks for
     /// `hardened: false` — even on caps with hardening disabled the
     /// validate succeeds.
     #[test]

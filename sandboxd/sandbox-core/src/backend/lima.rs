@@ -7,7 +7,7 @@
 //! uid; the daemon never invokes `limactl` directly.
 //!
 //! - [`LimaRuntime::create`] dispatches to `LimaManager::create_vm`
-//!   (or `create_vm_with_custom_template` when the design carries a
+//!   (or `create_vm_with_custom_template` when the spec carries a
 //!   template).
 //! - [`LimaRuntime::start`] consumes [`RuntimeStartArgs`] for
 //!   docker bridge / MAC / `SessionConfig` populated by the daemon

@@ -299,7 +299,7 @@ async fn integration_create_stamps_owner_from_peercred() {
     let daemon = Daemon::spawn_with_base_dir(tmp, base_dir.clone());
 
     // Request a Lima session so the (always-built-into-the-daemon)
-    // capability matrix accepts the design without requiring docker
+    // capability matrix accepts the spec without requiring docker
     // probe responses. The persisted row's `owner_username` stamp
     // happens *before* `create_network` or `LimaManager::start_vm` —
     // see `create_session` handler in `sandboxd/src/main.rs`, where

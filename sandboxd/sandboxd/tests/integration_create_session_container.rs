@@ -799,7 +799,7 @@ fn integration_create_session_container_rejects_no_cache() {
 ///
 /// The hole this test closes: a non-CLI HTTP client posting
 /// `{"backend":"lima","cpus":1.5}` was silently downsized to a 1-CPU
-/// session via the `as u32` cast at the design-projection site — a
+/// session via the `as u32` cast at the spec-projection site — a
 /// classic "I asked for X, got Y" bug invisible to operators. The
 /// daemon now refuses such requests with HTTP 400; the CLI's path
 /// (which never reaches the daemon with a fractional Lima value)
