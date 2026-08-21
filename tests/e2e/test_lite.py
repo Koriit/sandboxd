@@ -745,7 +745,7 @@ def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
 def test_lite_orphan_cleanup_on_daemon_restart(
     lite_harness, sandbox_binaries, sandbox_daemon
 ):
-    """"Orphan cleanup on daemon start" / 
+    """Orphan cleanup on daemon start:
     "kill the daemon mid-create, restart, assert orphan container and
     volume are reaped".
 

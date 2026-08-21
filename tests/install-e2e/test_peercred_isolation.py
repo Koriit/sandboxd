@@ -19,9 +19,9 @@ install-e2e Lima VM harness rather than the host-level
   aware acceptor; no panic, no response body, no leaked socket.
 
 * ``test_session_isolation_404_on_foreign_id``
-  (closes #151, pins the documented contract.5 / § 9.2) — a session owned
+  (closes #151) — a session owned
   by operator alice returns 404 when operator bob queries it by id.
-  Wire shape matches the documented contract, body
+  Wire shape is status 404, body
   ``{"error":"session not found: <id>"}``.
 
 The harness pieces (peercred-connector helper, alice/bob users,
@@ -258,14 +258,14 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
 
-    # 
+    # Substring match — the helper formats the
     # numeric uid into the string, so we anchor on the verbatim
     # prefix and the explicit "does not resolve to a username" suffix.
     expected_substring = (
         f"caller uid {TEST_UID_NOPASSWD} does not resolve to a username"
     )
     assert expected_substring in r.stderr, (
-        f"stderr did not contain "
+        f"stderr did not contain {expected_substring!r}:\n"
         f"stderr:\n{r.stderr}"
     )
 
@@ -292,7 +292,7 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
         f"audit record decision: expected 'denied', got {rec.get('decision')!r}\n"
         f"full record: {rec!r}"
     )
-    # Per 
+    # The reason tag for an unresolvable caller uid is
     # ``caller-uid-unresolvable`` (matching the route-helper's literal
     # at sandbox-route-helper/src/main.rs).
     assert rec.get("reason") == "caller-uid-unresolvable", (
@@ -763,7 +763,7 @@ def test_session_isolation_404_on_foreign_id(
     body = body_split[1]
     body_json = json.loads(body)
     assert body_json == {"error": f"session not found: {session_id}"}, (
-        f"body did not match "
+        f"body did not match; got: {body_json!r}"
     )
 
     # ---------------- Sanity: bob ALSO cannot see it via list ----------------
@@ -1014,5 +1014,5 @@ def test_non_owner_sequential_requests_share_kept_alive_connection(
     )
     body_b_json = json.loads(body_b)
     assert body_b_json == {"error": f"session not found: {session_id}"}, (
-        f"second response body did not match "
+        f"second response body did not match: {body_b_json!r}"
     )

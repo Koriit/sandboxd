@@ -175,7 +175,7 @@ exit $RC
         f"`sandbox update` should have refused while flock was held; "
         f"got exit 0\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
-    # 
+    # `LockError::HeldByLivePid` surfaces via `eprintln!`
     # (the CLI's standard error-rendering path), so the refusal
     # message must land on STDERR only — stdout should be empty
     # modulo any `log_step` lines that fire before the lock probe.

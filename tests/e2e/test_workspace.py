@@ -11,8 +11,8 @@ Run with generous timeouts:
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. ``--repo``, ``sandbox cp``, and
-``--workspace shared:`` are required behaviours on both backends
-; ``test_lite.py`` already covers
+``--workspace shared:`` are required behaviours on both backends;
+``test_lite.py`` already covers
 ``--workspace shared:`` for the container backend, and this
 parametrization extends the rest to the matrix.
 """

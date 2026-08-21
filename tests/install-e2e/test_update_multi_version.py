@@ -191,6 +191,6 @@ def test_update_fresh_install_to_next_version(
             )
     vm.shell("sudo rm -f /tmp/sessions.db.inspect", check=True, timeout=10)
 
-    # 4. 
+    # 4. Post-update green-light gate: doctor
     # passes against the running v' daemon.
     assert_doctor_passes(vm)

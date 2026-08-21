@@ -139,7 +139,7 @@ def test_update_air_gapped(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
-    # 
+    # The post-update green-light gate: run
     # `sandbox doctor` and assert all checks pass. Doctor's checks
     # run against the local unix socket (egress is blocked but
     # loopback is allowed by the iptables fixture above), so the
