@@ -4012,13 +4012,31 @@ mod tests {
         // and moves the socket under it. Without this half the equality above
         // would also hold for a manager that had stopped reading its uid at
         // all, which is the other way to make it true and the wrong one.
+        //
+        // Swept over the same uids as the off half, rather than checked at one
+        // literal. A single-uid check here is vacuous on any host whose own uid
+        // is that literal: a manager answering `Uid::current()` in place of its
+        // owner would derive the identical name and socket, so the assertion
+        // passes for the wrong reason — and it does so on the only platform
+        // that runs this test. The sweep removes the coincidence rather than
+        // relying on the host not to supply it.
         unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, "1") };
-        let mgr = manager_owned_by(lima_home, 501);
-        assert_eq!(mgr.instance_name(), "sandboxd-gateway-501");
-        assert_eq!(
-            mgr.gateway_docker_socket(),
-            lima_home.join("sandboxd-gateway-501/gateway-docker.sock")
-        );
+        for uid in NAMING_UIDS {
+            let mgr = manager_owned_by(lima_home, uid);
+            assert_eq!(
+                mgr.instance_name(),
+                format!("sandboxd-gateway-{uid}"),
+                "with the switch on, owner uid {uid} must name its own instance; \
+                 a name derived from any other uid means the manager stopped \
+                 reading the owner it was built for"
+            );
+            assert_eq!(
+                mgr.gateway_docker_socket(),
+                lima_home.join(format!("sandboxd-gateway-{uid}/gateway-docker.sock")),
+                "with the switch on, owner uid {uid} must forward its Docker \
+                 socket under its own instance directory"
+            );
+        }
 
         match prior {
             Some(value) => unsafe { std::env::set_var(PER_OPERATOR_GATEWAY_ENV, value) },
