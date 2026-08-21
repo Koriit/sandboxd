@@ -1083,11 +1083,26 @@ table inet sandboxd-gateway-eth0 {
     ip protocol udp udp dport 53 accept
     ip protocol tcp tcp dport 53 accept
 
-    # HTTPS: Docker daemon pulls gateway images from registries; Lima agents
-    # communicate over HTTPS.
+    # HTTPS: Lima agents communicate over HTTPS. That is now this rule's
+    # whole justification, and it is inherited — it predates this change and
+    # was not re-verified here. Weigh it on its own merits before narrowing
+    # the rule.
+    #
+    # The rule also used to cite the Docker daemon pulling gateway images
+    # from registries. That was wrong rather than merely obsolete: both
+    # image repositories are bare local names carrying no registry host,
+    # this tree has no publish step for either, and the images in this VM's
+    # Docker are put there by docker load from a staged tarball. Container
+    # creation now pins --pull never, which guarantees only that no registry
+    # fetch happens on the image path — it says nothing about any other
+    # traffic on 443.
     ip protocol tcp tcp dport 443 accept
 
-    # HTTP: apt-get package updates; some Docker registries use plain HTTP.
+    # HTTP: apt-get package updates inside the VM. Inherited on the same
+    # terms as the HTTPS reason above, and likewise all this rule now rests
+    # on.
+    #
+    # It also used to cite plain-HTTP registries; wrong for the same reason.
     ip protocol tcp tcp dport 80 accept
 
     # Drop invalid/untracked packets.

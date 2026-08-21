@@ -10,7 +10,7 @@ use crate::atomic_listener_writer::{
     AtomicListenerWriter, session_listener_host_dir, session_listener_host_path,
 };
 use sandbox_docker_argv::container::{
-    ContainerCommand, GatewayComponent, InspectFlag, InspectFormat, RemoveForce,
+    ContainerCommand, GatewayComponent, InspectFlag, InspectFormat, RemoveForce, pull_policy_args,
 };
 use sandbox_docker_argv::gateway::{EnvoyStat, GatewayFile, StdinCommand};
 
@@ -667,6 +667,12 @@ impl GatewayManager {
             args.push("--label".to_string());
             args.push(format!("sandboxd.owner={pool}"));
         }
+
+        // Same pull policy as the argv crate's container-creating builders.
+        // This argv is hand-built rather than composed there — it interpolates
+        // host bind-mount sources, which only exist on the host route — so the
+        // flag has to be added here too, from the same constant.
+        args.extend(pull_policy_args());
 
         args.push(gateway_image_tag_for_version(env!("CARGO_PKG_VERSION")));
 

@@ -18,6 +18,39 @@ pub const PIDS_LIMIT: u32 = 512;
 /// Stable in-container path of the per-session sandbox CA.
 pub const SANDBOX_CA_CONTAINER_PATH: &str = "/etc/ssl/certs/sandbox-ca.pem";
 
+/// The image-pull policy every container-creating invocation pins.
+///
+/// Docker's default is `missing`, which contacts a registry whenever the
+/// named image is absent locally. Neither production image is publishable
+/// that way: both repositories are bare local names (`sandbox-gateway`,
+/// `sandboxd-lite`), which Docker resolves to `docker.io/library/*`, and
+/// both are produced by a local build or a `docker load` of a staged
+/// tarball. So the default policy buys a guaranteed-failing network round
+/// trip, and pays for it twice — once in latency, and once in the error the
+/// operator reads: a registry authentication failure, or a name-resolution
+/// timeout, in place of the local `No such image: <tag>` that says what is
+/// actually wrong.
+///
+/// One tag reaching these builders is overridable: a `test-env-override`
+/// build resolves the gateway tag through `gateway_image_tag_for_daemon`,
+/// and that value travels into `gateway_container_run_argv` via the macOS
+/// gateway setup and recovery paths. The lite override does not — it is
+/// wired only to the `/diagnostics` presence probe, never to a create. Both
+/// in-tree callers of the gateway override point it at a tag that
+/// deliberately does not exist, because they are testing the absent-image
+/// branch; `never` changes nothing for them but the error they read, which
+/// is the point of the flag.
+///
+/// `never` is therefore not a restriction on anything the daemon does; it
+/// is the policy that reports the real fault.
+pub const PULL_POLICY: &str = "never";
+
+/// The `--pull <policy>` pair, emitted immediately before the image tag it
+/// governs at every container-creating call site.
+pub fn pull_policy_args() -> Vec<String> {
+    vec!["--pull".to_string(), PULL_POLICY.to_string()]
+}
+
 /// HTTPS-client trust env var names that must point at the per-session CA
 /// file inside the container, in the order the argv emits them.
 pub const SANDBOX_CA_ENV_VARS: &[&str] = &[
@@ -195,6 +228,8 @@ pub fn container_create_argv(spec: &ContainerCreateSpec) -> Result<Vec<String>, 
 
     args.extend(ca_mount_args(spec.ca_host_path.as_deref()));
     args.extend(ssh_mount_args(spec.ssh_host_dir.as_deref()));
+
+    args.extend(pull_policy_args());
 
     // Trailing positional: image tag — must come last so subsequent
     // entrypoint args (none here) line up with the docker CLI grammar.
@@ -409,7 +444,7 @@ pub fn home_chown_run_argv(
     operator_gid: u32,
 ) -> Vec<String> {
     let home_volume = home_volume_name(session_id);
-    vec![
+    let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--user".to_string(),
@@ -418,11 +453,15 @@ pub fn home_chown_run_argv(
         format!("type=volume,src={home_volume},dst=/home/sandbox"),
         "--entrypoint".to_string(),
         "chown".to_string(),
+    ];
+    args.extend(pull_policy_args());
+    args.extend([
         image_tag.to_string(),
         "-R".to_string(),
         format!("{operator_uid}:{operator_gid}"),
         "/home/sandbox".to_string(),
-    ]
+    ]);
+    args
 }
 
 /// The gateway container name for a session id (`sandbox-gw-<id>`).
@@ -491,6 +530,8 @@ pub fn gateway_container_run_argv(
         args.push("--label".to_string());
         args.push(format!("sandboxd.owner={pool}"));
     }
+
+    args.extend(pull_policy_args());
 
     args.push(image_tag.to_string());
     args
@@ -1023,6 +1064,73 @@ mod tests {
                 .any(|a| a.starts_with("SANDBOX_COREDNS_UPSTREAM="))
         );
         assert!(!argv.iter().any(|a| a.starts_with("sandboxd.owner=")));
+    }
+
+    /// The `--pull <policy>` pair sits immediately before the image tag it
+    /// governs, exactly once. The position is what makes it reviewable: the
+    /// flag and the tag it applies to are adjacent, so a reader never has to
+    /// scan a 40-element argv to find out which image the policy covers.
+    fn assert_pull_policy_precedes_the_image(argv: &[String], image_tag: &str) {
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--pull").count(),
+            1,
+            "exactly one --pull expected: {argv:?}"
+        );
+        let flag = argv
+            .iter()
+            .position(|a| a == "--pull")
+            .expect("--pull is present");
+        assert_eq!(
+            argv.get(flag + 1).map(String::as_str),
+            Some(PULL_POLICY),
+            "the flag must carry the pinned policy: {argv:?}"
+        );
+        assert_eq!(
+            argv.get(flag + 2).map(String::as_str),
+            Some(image_tag),
+            "the policy must sit immediately before its image tag: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn the_pinned_pull_policy_is_the_one_that_never_reaches_a_registry() {
+        // `missing` (docker's default) and `always` both contact a registry.
+        // Neither image this project runs can exist in one, so either would
+        // trade the local `No such image` for a registry auth failure.
+        assert_eq!(PULL_POLICY, "never");
+        assert_eq!(pull_policy_args(), vec!["--pull", "never"]);
+    }
+
+    #[test]
+    fn create_argv_pins_the_pull_policy() {
+        let argv = container_create_argv(&minimal_spec()).expect("minimal spec must build");
+        assert_pull_policy_precedes_the_image(&argv, "sandboxd-lite:0.1.0");
+    }
+
+    #[test]
+    fn home_chown_run_argv_pins_the_pull_policy() {
+        let argv = home_chown_run_argv("abc", "sandboxd-lite:0.1.0", 501, 20);
+        assert_pull_policy_precedes_the_image(&argv, "sandboxd-lite:0.1.0");
+        // The chown arguments are positional after the image, so the pair
+        // must not have displaced them.
+        assert_eq!(argv.last().map(String::as_str), Some("/home/sandbox"));
+    }
+
+    #[test]
+    fn gateway_run_argv_pins_the_pull_policy() {
+        let argv = gateway_container_run_argv(
+            "abc",
+            "sandbox-gateway:test",
+            "sandboxd-egress",
+            Some("10.209.128.0/24"),
+            Some("8.8.8.8 1.1.1.1"),
+        );
+        assert_pull_policy_precedes_the_image(&argv, "sandbox-gateway:test");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("sandbox-gateway:test"),
+            "the image tag stays the trailing positional: {argv:?}"
+        );
     }
 
     #[test]
