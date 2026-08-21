@@ -1338,20 +1338,6 @@ struct AppState {
     /// shows the actually-resolved pool rather than expecting the
     /// operator to grep journald.
     users_conf_pool: sandbox_core::users_conf::SubnetEntry,
-    /// The route to the gateway the **daemon itself** owns —
-    /// [`AppState::gateway_docker_route`] evaluated at the daemon's own uid.
-    ///
-    /// On Linux this is the host daemon and the calls run in-process. On
-    /// macOS it names the daemon's uid and the executor that reaches its VM,
-    /// which the executor short-circuits to a direct invocation.
-    ///
-    /// A handler serving a request must not read this: the gateway a request
-    /// belongs to is the *caller's*, which is
-    /// [`AppState::docker_route_for_operator`]. What is left here are the
-    /// daemon's own background paths — startup reconcile, the monitors, the
-    /// recovery loop — which act on no operator's behalf and are converted
-    /// separately.
-    docker: sandbox_core::docker::DockerRoute,
     /// Builds the Docker route for the gateway owned by a given uid.
     ///
     /// A gateway owner's route is not interchangeable with another's: on macOS
@@ -1370,7 +1356,7 @@ struct AppState {
     /// is no gateway VM to own, and the uid is accepted and ignored — the same
     /// shape `sandbox-core`'s gateway accessors take while per-operator
     /// gateways are off.
-    gateway_docker_route: Box<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
+    gateway_docker_route: Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
     /// macOS only: socket_vmnet NIC slot pools, one per operator.
     ///
     /// Tracks which slots are in use by running Lima sessions and enforces
@@ -1533,9 +1519,10 @@ impl AppState {
     ///
     /// While per-operator gateways are off, `gateway_owner_uid` answers
     /// `getuid()` for every operator, so every caller gets the daemon's own
-    /// route. That it is the *same* route [`AppState::docker`] holds is not a
-    /// coincidence to be checked: startup builds that field by calling this
-    /// same factory at the daemon's uid, so the two are one expression's value.
+    /// route. That is a property of the collapse, not somewhere a caller may
+    /// start: there is no pre-built route to reach for instead, because a
+    /// route that named no owner is exactly the one an unconverted site would
+    /// keep using without ever failing to compile.
     ///
     /// On Linux there is no gateway VM: every sandbox container lives on the
     /// host Docker daemon, and the uid reaches a factory that ignores it.
@@ -4351,11 +4338,15 @@ async fn probe_agent_status(state: &AppState, session: &Session) -> Option<Strin
 ///
 /// Returns `None` when the session is not `Running`.
 ///
-/// `operator_uid` names the gateway to probe. Every caller is an authenticated
-/// handler that reached this session through the per-caller store filter, so
-/// the session's owner *is* the connected operator and the uid is the one the
-/// kernel reported for the connection — there is no resolution to do and no
-/// way for it to be unavailable.
+/// `operator_uid` names the gateway to probe, and the right value depends on
+/// where the caller got the session.
+///
+/// A caller that just *created* this session passes the connected operator's
+/// uid: the row was written for that operator moments ago, so the caller is
+/// the owner by construction. A caller that *read* an existing row must not,
+/// and calls [`probe_gateway_status_for_stored_session`] instead — the
+/// per-caller store filter matches on owner *name*, which does not establish
+/// that the name still resolves to the uid the row was created under.
 async fn probe_gateway_status(
     state: &AppState,
     session: &Session,
@@ -4376,6 +4367,39 @@ async fn probe_gateway_status(
             .await
             .unwrap_or_else(|_| "error: task join failed".to_string()),
     )
+}
+
+/// [`probe_gateway_status`] for a session read back from the store rather than
+/// one the caller just created.
+///
+/// The gateway is resolved from the session's own records, through the full
+/// precedence in [`sandbox_core::resolve_session_operator`]: the network
+/// record first, then the create-time column, and only last the owner name.
+/// The name is last there because a name that has been reused answers with a
+/// uid confidently and wrongly, and that is exactly the quantity an
+/// authenticated handler has in hand — so the connected operator's uid is the
+/// one thing here that must not be substituted for the session's.
+///
+/// The two coincide on every host where no account has been renumbered or
+/// removed and recreated, which is why passing the caller's uid read as
+/// correct for as long as it did.
+///
+/// A session whose operator does not resolve names no gateway to probe, and
+/// says so in the field's own vocabulary rather than reporting a verdict it
+/// got from some other operator's gateway.
+async fn probe_gateway_status_for_stored_session(
+    state: &AppState,
+    session: &Session,
+) -> Option<String> {
+    if session.state != SessionState::Running {
+        return None;
+    }
+    let Some(operator_uid) =
+        gateway_operator_for_session(&session.id, state, "gateway status probe").await
+    else {
+        return Some(GATEWAY_STATUS_OPERATOR_UNRESOLVED.to_string());
+    };
+    probe_gateway_status(state, session, operator_uid).await
 }
 
 /// Look up the transient networking health for a macOS Lima session.
@@ -6228,12 +6252,27 @@ async fn start_session_macos_lite(
 
     let session_id = session.id;
 
-    // The gateway serving this operator, resolved once for the whole handler,
+    // The gateway serving this session, resolved once for the whole handler,
     // for the reason the create path resolves it once: the bridge, the staged
     // files, the gateway container and the container's route all have to land
     // on one gateway.
-    let gateway_lima = state.gateway_lima_manager_for_operator(operator.uid);
-    let docker_route = state.docker_route_for_operator(operator.uid);
+    //
+    // Resolved from the session's records rather than from the requester. The
+    // create path may read the caller's uid because it is writing the row it
+    // would otherwise read; a restart is reading one written earlier, and the
+    // owner name it was found by does not establish the uid it was created
+    // under. A start refuses rather than declines for the same reason stop and
+    // remove do — it reports a lifecycle outcome the caller then acts on.
+    let Some(operator_uid) =
+        gateway_operator_for_session(&session.id, &state, "session start").await
+    else {
+        return error_response(SandboxError::Internal(format!(
+            "no gateway can be attributed to session {session_id}, so it was not started."
+        )))
+        .into_response();
+    };
+    let gateway_lima = state.gateway_lima_manager_for_operator(operator_uid);
+    let docker_route = state.docker_route_for_operator(operator_uid);
 
     // Step 1: Recreate the per-session Docker bridge network inside the gateway VM.
     // This is a no-op if the network already exists; if it was removed on stop, it
@@ -6543,7 +6582,7 @@ async fn start_session_macos_lite(
     };
 
     let agent_status = probe_agent_status(&state, &refreshed).await;
-    let gateway_status = probe_gateway_status(&state, &refreshed, operator.uid).await;
+    let gateway_status = probe_gateway_status_for_stored_session(&state, &refreshed).await;
     let policy_opt = {
         let policies = state.session_policies.lock().await;
         policies.get(&refreshed.id).cloned()
@@ -6570,17 +6609,32 @@ async fn start_session_macos_lima(
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
     use sandbox_core::macos_session::{setup_macos_gateway, teardown_macos_gateway};
 
-    // The gateway serving this operator, resolved once for the whole handler,
+    // The gateway serving this session, resolved once for the whole handler,
     // for the reason the create path resolves it once: the NIC map, the gateway
     // container and the rollback arm all have to name one gateway.
-    let gateway_lima = state.gateway_lima_manager_for_operator(operator.uid);
-    let docker_route = state.docker_route_for_operator(operator.uid);
-
+    //
+    // Resolved from the session's records rather than from the requester — see
+    // `start_session_macos_lite` for why a restart differs from a create here,
+    // and why it refuses rather than declines.
     let session_id = session.id;
-    // A restart re-claims from the operator's pool, so a range reassigned
+    let Some(operator_uid) =
+        gateway_operator_for_session(&session_id, &state, "session start").await
+    else {
+        return error_response(SandboxError::Internal(format!(
+            "no gateway can be attributed to session {session_id}, so it was not started."
+        )))
+        .into_response();
+    };
+    let gateway_lima = state.gateway_lima_manager_for_operator(operator_uid);
+    let docker_route = state.docker_route_for_operator(operator_uid);
+
+    // A restart re-claims from the session owner's pool, so a range reassigned
     // while the session was stopped takes effect here rather than silently
-    // handing back the old slot.
-    let vmnet_pool = match state.vmnet_pools.pool_for(operator.uid) {
+    // handing back the old slot. The pool is a per-operator quota, so it has to
+    // be the owner's and not the requester's: claiming from the wrong one both
+    // charges a quota the session does not belong to and leaves the owner's
+    // over-available by a slot.
+    let vmnet_pool = match state.vmnet_pools.pool_for(operator_uid) {
         Ok(pool) => pool,
         Err(e) => return error_response(e).into_response(),
     };
@@ -6618,7 +6672,13 @@ async fn start_session_macos_lima(
     let docker_network_name = format!("sandbox-net-{session_id}");
     let network_info = NetworkInfo {
         gateway_egress_ip: None,
-        operator_uid: Some(operator.uid),
+        // The owner this claim was made for, carried forward rather than
+        // re-derived from the requester. This field is the resolver's first
+        // hint, so writing the requester's uid here would not merely route one
+        // restart wrongly — it would overwrite the record every later
+        // resolution reads, turning a divergence that lasted one request into
+        // the stored answer.
+        operator_uid: Some(operator_uid),
         bridge_name: nic_name.clone(),
         subnet: subnet_cidr,
         gateway_ip: gateway_ip.to_string(),
@@ -6986,7 +7046,7 @@ async fn list_sessions(
     let mut enriched: Vec<SessionDto> = Vec::with_capacity(reconciled.len());
     for session in reconciled {
         let agent_status = probe_agent_status(&state, &session).await;
-        let gateway_status = probe_gateway_status(&state, &session, operator.uid).await;
+        let gateway_status = probe_gateway_status_for_stored_session(&state, &session).await;
         #[cfg(target_os = "macos")]
         let networking_status = macos_networking_status_for(&state, &session).await;
         #[cfg(not(target_os = "macos"))]
@@ -7046,7 +7106,7 @@ async fn get_session(
 
     // Probe guest agent and gateway for running sessions.
     let agent_status = probe_agent_status(&state, &session).await;
-    let gateway_status = probe_gateway_status(&state, &session, operator.uid).await;
+    let gateway_status = probe_gateway_status_for_stored_session(&state, &session).await;
 
     // Look up the currently applied policy in the in-memory map. The
     // map is the source of truth at runtime; on-disk persistence
@@ -7464,7 +7524,7 @@ async fn start_session(
     };
 
     let agent_status = probe_agent_status(&state, &refreshed).await;
-    let gateway_status = probe_gateway_status(&state, &refreshed, operator.uid).await;
+    let gateway_status = probe_gateway_status_for_stored_session(&state, &refreshed).await;
     let policy_opt = {
         let policies = state.session_policies.lock().await;
         policies.get(&refreshed.id).cloned()
@@ -7536,6 +7596,29 @@ async fn stop_session(
         }
     }
 
+    // Which gateway this session's containers are on is resolved from its own
+    // records, and a stop that cannot answer it refuses outright.
+    //
+    // Declining the way the background paths do would be wrong here. They
+    // remove rules, so declining leaves a session less reachable than it was;
+    // this reports a lifecycle outcome the caller then acts on. A stop that
+    // tore down against some other gateway would find none of this session's
+    // resources, report success, and leave the containers running with egress
+    // and nothing left watching them — the caller believes the session is
+    // stopped and stops looking.
+    //
+    // Resolved before the first mutation below, so a refusal changes nothing.
+    let Some(operator_uid) =
+        gateway_operator_for_session(&session.id, &state, "session stop").await
+    else {
+        return error_response(SandboxError::Internal(format!(
+            "no gateway can be attributed to session {}, so it was not stopped. Its containers \
+             are still running and nothing was torn down.",
+            session.id
+        )))
+        .into_response();
+    };
+
     info!(session_id = %session.id, "stopping session");
 
     // Mark this session as "stopping" so the gateway monitor doesn't restart
@@ -7578,11 +7661,9 @@ async fn stop_session(
     // Everything else (Linux Lima + Container on all platforms): host Docker.
     #[cfg(target_os = "macos")]
     {
-        // The gateway this session was built on is the caller's — session
-        // lookup is owner-scoped, so the requester is that operator. Resolved
-        // once for both arms: tearing down against a different gateway finds
-        // none of this session's resources and reports success.
-        let docker_route = state.docker_route_for_operator(operator.uid);
+        // Resolved above, from the session's own records rather than from the
+        // requester's identity. Used by both arms.
+        let docker_route = state.docker_route_for_operator(operator_uid);
         if session.backend == BackendKind::Lima {
             let sid = session.id;
             let vmnet_pool = state.vmnet_pools.clone();
@@ -7728,6 +7809,24 @@ async fn remove_session(
         return error_response(e).into_response();
     }
 
+    // Same refusal as `stop_session`, and for the same reason — see the
+    // comment there. Remove is the worse half of it: a remove that finds
+    // nothing on the gateway it was pointed at reports the session gone and
+    // deletes the row, so the containers outlive the only record that they
+    // exist. Nothing sweeps them afterwards, because nothing knows to.
+    //
+    // Resolved before the first mutation below, so a refusal changes nothing.
+    let Some(operator_uid) =
+        gateway_operator_for_session(&session.id, &state, "session removal").await
+    else {
+        return error_response(SandboxError::Internal(format!(
+            "no gateway can be attributed to session {}, so it was not removed. Its containers \
+             and its record are both still there.",
+            session.id
+        )))
+        .into_response();
+    };
+
     info!(
         session_id = %session.id,
         name = ?session.name,
@@ -7786,11 +7885,9 @@ async fn remove_session(
 
         #[cfg(target_os = "macos")]
         {
-            // The caller's gateway — the one this session was built on, since
-            // session lookup is owner-scoped — resolved once for both arms.
-            // A remove aimed at a different gateway finds nothing to remove
-            // and leaves the real resources behind, reporting success.
-            let docker_route = state.docker_route_for_operator(operator.uid);
+            // Resolved above, from the session's own records rather than from
+            // the requester's identity. Used by both arms.
+            let docker_route = state.docker_route_for_operator(operator_uid);
             if session.backend == BackendKind::Lima {
                 // macOS Lima: tear down via the forwarded gateway socket + release the vmnet slot.
                 let sid = session.id;
@@ -7815,12 +7912,15 @@ async fn remove_session(
             } else {
                 // Container (lite) backend on macOS: tear down via forwarded
                 // gateway socket + release the session-count token.
-                let glm = state.gateway_lima_manager_for_operator(operator.uid);
+                let glm = state.gateway_lima_manager_for_operator(operator_uid);
                 let vmnet_pool = state.vmnet_pools.clone();
                 // A token is a count, so releasing one needs the operator
-                // whose quota it came out of. Session access is owner-scoped,
-                // so the requester is that operator.
-                let op_uid = operator.uid;
+                // whose quota it came out of. That is whoever the session was
+                // created for, which the row records — not whoever is asking
+                // now. Releasing against the requester would decrement a quota
+                // the token never came out of and leave the real one short by
+                // one for as long as the daemon runs.
+                let op_uid = operator_uid;
                 let network = state.network.clone();
                 let base_dir = state.base_dir.clone();
                 let sid = session.id;
@@ -10331,15 +10431,12 @@ async fn reapply_session_policy(session_id: &SessionId, caller_username: &str, s
     // The gateway holding this session's policy is the one its operator owns.
     // Resolved before anything is read or written so a decline does nothing at
     // all, including the write in the no-stored-policy branch below.
-    #[cfg(target_os = "macos")]
-    let route =
-        match gateway_operator_or_decline(session_id, state, "session policy re-application").await
-        {
-            Some(operator_uid) => state.docker_route_for_operator(operator_uid),
-            None => return,
-        };
-    #[cfg(not(target_os = "macos"))]
-    let route = state.docker.clone();
+    let Some(operator_uid) =
+        gateway_operator_for_session(session_id, state, "session policy re-application").await
+    else {
+        return;
+    };
+    let route = state.docker_route_for_operator(operator_uid);
 
     let container = gateway_container_name(session_id);
 
@@ -10901,10 +10998,11 @@ async fn restore_session_networking_lite(
 /// emits — an `error:` prefix carrying a reason — rather than as a new token,
 /// so the decline needs no new field on the health payload.
 ///
-/// Nothing in this tree branches on the value. The `gateway_status` the CLI
-/// renders is `SessionDto`'s, a different field filled by
-/// [`probe_gateway_status`], and it is printed verbatim rather than compared;
-/// this endpoint's `gateways[].gateway_status` has no in-tree reader at all.
+/// Nothing in this tree branches on the value. It reaches two fields — this
+/// endpoint's `gateways[].gateway_status`, which has no in-tree reader at all,
+/// and `SessionDto`'s, which the CLI prints verbatim rather than comparing.
+/// Neither is matched against a token, so widening it to a second field cannot
+/// break a consumer that was switching on the first.
 /// So the audience is a human or an external monitor, and matching the
 /// existing shape is what makes the line legible to them: an `error:` prefix
 /// is already how this field says a probe did not come back with a verdict,
@@ -10980,15 +11078,37 @@ async fn session_health(
         "not_checked".to_string()
     };
 
+    // Which gateway this session's health lives on, resolved once and shared
+    // by the gateway probe and the bridge check below so the two cannot end up
+    // describing different gateways in one payload.
+    //
+    // Resolved from the session's own records. The per-caller store filter
+    // this row came through matches on owner *name*, which establishes that
+    // the requester owns the session — not that the name still resolves to the
+    // uid the session was created under. Those diverge when an account is
+    // renumbered, or removed and recreated reusing the name, and the resolver
+    // ranks the name last for exactly that reason.
+    //
+    // Unlike stop, start and remove, this endpoint only reports. So an
+    // unresolvable operator is answered in the payload rather than refused:
+    // the gateway and bridge fields say what could not be determined, and
+    // every field that needs no gateway is still filled.
+    let gateway_operator =
+        gateway_operator_for_session(&session.id, &state, "session health probe").await;
+
     // Gateway health.
-    let (container_status, envoy, mitmproxy, coredns) = if session.state == SessionState::Running {
+    let (container_status, envoy, mitmproxy, coredns) = if session.state != SessionState::Running {
+        (
+            "not_checked".to_string(),
+            "not_checked".to_string(),
+            "not_checked".to_string(),
+            "not_checked".to_string(),
+        )
+    } else if let Some(operator_uid) = gateway_operator {
         // `gateway_for_probes` targets the forwarded gateway-VM socket on
         // macOS so lite/Lima gateway containers are observed inside the VM
-        // (Linux: byte-identical to `state.gateway`). The operator whose
-        // gateway that is, is the one on the other end of this request: the
-        // session was fetched through the per-caller filter, so it is theirs.
-        // The bridge check further down already routes on the same uid.
-        let gateway = gateway_for_probes(&state, operator.uid);
+        // (Linux: byte-identical to the host-socket manager).
+        let gateway = gateway_for_probes(&state, operator_uid);
         let sid = session.id;
         let gw_result = tokio::task::spawn_blocking(move || gateway.gateway_status(&sid))
             .await
@@ -11026,12 +11146,8 @@ async fn session_health(
             }
         }
     } else {
-        (
-            "not_checked".to_string(),
-            "not_checked".to_string(),
-            "not_checked".to_string(),
-            "not_checked".to_string(),
-        )
+        let msg = GATEWAY_STATUS_OPERATOR_UNRESOLVED.to_string();
+        (msg.clone(), msg.clone(), msg.clone(), msg)
     };
 
     // Network health: check if the Docker bridge exists.
@@ -11042,29 +11158,32 @@ async fn session_health(
         .get_network_info(&session.id, &operator.name)
         .ok()
         .flatten();
-    let bridge_exists = if let Some(ref info) = network_info {
-        let docker_network_name = info.docker_network_name.clone();
-        // On macOS the per-session bridge lives inside the gateway VM, so the
-        // inspect goes wherever the route points; a host `docker network
-        // inspect` would never find it.
-        let route = state.docker_route_for_operator(operator.uid);
-        tokio::task::spawn_blocking(move || {
-            route
-                .run(
-                    sandbox_core::docker::DockerOp::NetworkInspect {
-                        name: docker_network_name,
-                    },
-                    NETWORK_INSPECT_TIMEOUT,
-                    "docker network inspect (health)",
-                )
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        })
-        .await
-        .unwrap_or(false)
-    } else {
-        false
-    };
+    let bridge_exists =
+        if let (Some(info), Some(operator_uid)) = (network_info.as_ref(), gateway_operator) {
+            let docker_network_name = info.docker_network_name.clone();
+            // On macOS the per-session bridge lives inside the gateway VM, so the
+            // inspect goes wherever the route points; a host `docker network
+            // inspect` would never find it. The same operator the gateway probe
+            // above used — an inspect on another gateway would not find this
+            // session's bridge and would report it missing.
+            let route = state.docker_route_for_operator(operator_uid);
+            tokio::task::spawn_blocking(move || {
+                route
+                    .run(
+                        sandbox_core::docker::DockerOp::NetworkInspect {
+                            name: docker_network_name,
+                        },
+                        NETWORK_INSPECT_TIMEOUT,
+                        "docker network inspect (health)",
+                    )
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        } else {
+            false
+        };
     // TAP is owned by QEMU; report as present when the VM is running.
     let tap_exists = vm_status == "running";
 
@@ -11241,15 +11360,16 @@ async fn get_proxy(
     // macOS. It holds no socket path of its own, so it cannot disagree with
     // the route about which Docker daemon the session's container lives in.
     //
-    // Resolving the route here is what keeps that true. The proxy receives an
-    // operator *name*, not a uid, so it cannot resolve a gateway itself — it
-    // uses whatever route it was handed. Handing it the caller's own gateway
-    // route is therefore the only place the pump can be pointed at the Docker
-    // daemon actually hosting the session's container.
+    // It is handed the factory rather than a finished route because the route
+    // depends on which session the tunnel is for, and that is not known yet —
+    // the proxy resolves the session itself, and builds the route from the
+    // owner recorded on the row. Handing it a route built from the requester's
+    // uid would aim a long-lived SSH pump at whichever Docker daemon that uid
+    // happens to name.
     let proxy_state = Arc::new(sandboxd::proxy_http::ProxyState {
         store: Arc::clone(&state.store),
         lima_registry: Arc::clone(state.lima_runtime.registry()),
-        docker: state.docker_route_for_operator(operator.uid),
+        docker_route: Arc::clone(&state.gateway_docker_route),
     });
     match sandboxd::proxy_http::handle_proxy(proxy_state, operator.name, id, ws).await {
         Ok(resp) => resp.into_response(),
@@ -12798,7 +12918,19 @@ async fn reconcile_macos(state: &AppState, agent_registry: &broker::AgentRegistr
         let is_running = session.state == SessionState::Running;
         if !is_running {
             // Teardown gateway container + macvlan (idempotent).
-            let route = state.docker.clone();
+            //
+            // The leftovers this sweep is clearing sit on the gateway the
+            // session's operator owns, so the route is resolved from the row.
+            // The sweep runs over every session in the store, not just one
+            // caller's, so there is no operator identity here to stand in for
+            // the row's — and a teardown aimed at the wrong gateway finds none
+            // of these resources and reports the cleanup done.
+            let Some(operator_uid) =
+                gateway_operator_for_session(&session.id, state, "startup gateway reconcile").await
+            else {
+                continue;
+            };
+            let route = state.docker_route_for_operator(operator_uid);
             let sid = session.id;
             let tear_result =
                 tokio::task::spawn_blocking(move || teardown_macos_gateway(&sid, &route)).await;
@@ -13168,33 +13300,6 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 continue;
             }
 
-            // macOS only: while the gateway Lima instance is being recovered by
-            // `recover_gateway_lima`, skip per-session re-creates — the instance
-            // monitor holds exclusive recovery responsibility during that window.
-            //
-            // Both sides key the latch by the gateway the work lands on, and
-            // that is the whole rule. `recover_one_gateway` takes the shard's
-            // owner because that names the gateway it restarts; this read takes
-            // the daemon's own because every re-create below runs over
-            // `state.docker`, which names the daemon's uid. The two agree today
-            // because one gateway serves every session, so the shard's owner
-            // *is* the daemon's — not because either side was pinned to match
-            // the other. When the route below becomes per-session, this key
-            // moves with it, and a key naming one owner while the work lands on
-            // another's gateway would skip the wrong sessions and re-create
-            // containers a recovery is rebuilding.
-            #[cfg(target_os = "macos")]
-            if state
-                .gateway_recovering
-                .is_recovering(sandbox_core::gateway_owner_uid(state.daemon_uid))
-            {
-                debug!(
-                    session_id = %session.id,
-                    "gateway monitor: skipping session (gateway instance recovery in progress)"
-                );
-                continue;
-            }
-
             // The gateway this session's health lives on is the one its
             // operator owns. Resolved once per session per tick and reused by
             // every probe below, so a decline is reported once rather than
@@ -13217,6 +13322,35 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 Some(uid) => uid,
                 None => continue,
             };
+
+            // macOS only: while the gateway Lima instance is being recovered by
+            // `recover_gateway_lima`, skip per-session re-creates — the instance
+            // monitor holds exclusive recovery responsibility during that window.
+            //
+            // Both sides key the latch by the gateway the work lands on, and
+            // that is the whole rule. `recover_one_gateway` takes the shard's
+            // owner because that names the gateway it restarts; this read takes
+            // the session's operator because that is what the re-create below
+            // routes on. A key naming one owner while the work lands on
+            // another's gateway would skip the wrong sessions and re-create
+            // containers a recovery is rebuilding.
+            //
+            // Keying it requires knowing the owner, so this check sits below
+            // the resolution rather than with the other skips above. The cost
+            // is that a session whose operator does not resolve is reported
+            // even while a recovery is running — which is the right way round,
+            // since that session is not one the recovery will reach either.
+            #[cfg(target_os = "macos")]
+            if state
+                .gateway_recovering
+                .is_recovering(sandbox_core::gateway_owner_uid(operator_uid))
+            {
+                debug!(
+                    session_id = %session.id,
+                    "gateway monitor: skipping session (gateway instance recovery in progress)"
+                );
+                continue;
+            }
 
             // Poll per-component health and emit transitions.
             // Only components that *flipped* since
@@ -13484,7 +13618,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         };
                         let ca_for_setup = ca_dir.clone();
 
-                        let recreate_route = state.docker.clone();
+                        let recreate_route = state.docker_route_for_operator(operator_uid);
                         let recreate_result = tokio::task::spawn_blocking(move || {
                             sandbox_core::teardown_macos_gateway(&sid, &recreate_route)?;
                             let ca_opt = if ca_for_setup.join("cert.pem").exists() {
@@ -13913,8 +14047,24 @@ async fn recover_one_gateway(
                     }
                 };
 
+                // The gateway being rebuilt is the session's operator's. The
+                // closure is handed the owner's *name*, which is not the same
+                // quantity — a name is resolved to a uid only as the resolver's
+                // last hint, behind the network record and the session row,
+                // because a reused name answers with the wrong uid rather than
+                // failing. Resolving here goes through that full precedence.
+                let Some(operator_uid) =
+                    gateway_operator_for_session(&sid, &state, "gateway Lima recovery").await
+                else {
+                    return (
+                        sid,
+                        owner,
+                        Err("no gateway can be attributed to this session".into()),
+                    );
+                };
+
                 let ni = network_info;
-                let recover_route = state.docker.clone();
+                let recover_route = state.docker_route_for_operator(operator_uid);
                 let join_result = tokio::task::spawn_blocking(move || {
                     let result = (|| -> Result<(), sandbox_core::error::SandboxError> {
                         sandbox_core::teardown_macos_gateway(&sid, &recover_route)?;
@@ -14651,12 +14801,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it is handed, so one instance serves every gateway owner and the uid is
     // the only thing that varies between their routes.
     #[cfg(target_os = "macos")]
-    let gateway_docker_route: Box<
+    let gateway_docker_route: Arc<
         dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
     > = {
         let executor = Arc::clone(broker_executor.as_ref().expect("set by the executor block"))
             as Arc<dyn sandbox_core::docker::DockerExecutor>;
-        Box::new(move |owner_uid| sandbox_core::docker::DockerRoute::Vm {
+        Arc::new(move |owner_uid| sandbox_core::docker::DockerRoute::Vm {
             op_uid: owner_uid,
             executor: Arc::clone(&executor),
         })
@@ -14664,15 +14814,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // On Linux there is no gateway VM and nothing to own one: every route is
     // the host daemon's, and the uid is ignored.
     #[cfg(not(target_os = "macos"))]
-    let gateway_docker_route: Box<
+    let gateway_docker_route: Arc<
         dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
-    > = Box::new(|_owner_uid| sandbox_core::docker::DockerRoute::Host);
+    > = Arc::new(|_owner_uid| sandbox_core::docker::DockerRoute::Host);
 
     // The daemon's own route: the same construction, for the uid this process
-    // runs as. Deriving it here rather than building a second one is what makes
-    // it impossible for the two to disagree — while per-operator gateways are
-    // off, `gateway_owner_uid` answers `getuid()` for every operator, which is
-    // this uid, so every handler's route is this very expression's value.
+    // runs as. It is startup wiring for the two things the daemon owns
+    // outright — the manager for its own gateway VM and the container runtime
+    // — and it is deliberately not handed to `AppState`. A route sitting in
+    // shared state names no owner, so a handler that reached for it would
+    // compile whether or not it had been converted; every route a request runs
+    // over is built from an operator uid instead, via
+    // `AppState::docker_route_for_operator`.
     let docker_route = gateway_docker_route(daemon_uid);
 
     // Build the per-operator LimaManager registry. One LimaManager per
@@ -15566,7 +15719,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_dir,
         store,
         runtimes,
-        docker: docker_route.clone(),
         gateway_docker_route,
         lima_runtime,
         container_runtime,
@@ -19441,8 +19593,10 @@ mod tests {
         fn the_decline_says_what_could_not_be_determined() {
             assert!(
                 GATEWAY_STATUS_OPERATOR_UNRESOLVED.contains("operator"),
-                "whoever reads `/health` gets only this string; a bare `error:` would leave \
-                 them with a fault and no name for it: {GATEWAY_STATUS_OPERATOR_UNRESOLVED}"
+                "this string is the whole of what a caller learns, on every path that reports a \
+                 gateway status — session list and fetch as well as health. A bare `error:` \
+                 would leave them with a fault and no name for it: \
+                 {GATEWAY_STATUS_OPERATOR_UNRESOLVED}"
             );
         }
     }

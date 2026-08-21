@@ -96,12 +96,20 @@ pub mod close_codes {
 pub struct ProxyState {
     pub store: Arc<SessionStore>,
     pub lima_registry: Arc<LimaManagerRegistry>,
-    /// Where the container path's `docker exec` goes: the host daemon on
-    /// Linux (argv byte-identical to the historical shape), or the VM whose
+    /// Builds where the container path's `docker exec` goes: the host daemon
+    /// on Linux (argv byte-identical to the historical shape), or the VM whose
     /// operator owns the container on macOS. The proxy never holds a socket
     /// path of its own — the route decides whether the child is spawned here
     /// or asked for over the broker channel.
-    pub docker: sandbox_core::docker::DockerRoute,
+    ///
+    /// A factory rather than a finished route, because which gateway a tunnel
+    /// belongs to depends on the session it is for, and the session is not
+    /// known until this handler resolves it. The uid it is called with is the
+    /// one recorded on the session's row, never the requester's: the two
+    /// diverge when an owner name has been reused, and an SSH pump aimed at
+    /// the wrong Docker daemon is held open for the life of the editor
+    /// session.
+    pub docker_route: Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
 }
 
 /// Entry point for `GET /sessions/{id}/proxy`.
@@ -155,14 +163,35 @@ pub async fn handle_proxy(
         }));
     }
 
+    // The operator whose gateway this session's container lives on, taken from
+    // the row rather than from the requester.
+    //
+    // The lookup above matched on owner *name*, which says the requester owns
+    // the session — not that the name still resolves to the uid the session
+    // was created under. Post-V009 every row carries the uid, so the `None`
+    // arm is a row written before that migration or a store that has been
+    // edited by hand; either way there is no gateway to name, and refusing
+    // before the upgrade reports it as the server-side problem it is rather
+    // than as a backend that would not dial.
+    let Some(op_uid) = session.operator_uid else {
+        error!(
+            session = %session_id,
+            "proxy: session has no operator_uid; refusing tunnel"
+        );
+        return Err(ProxyHttpError::Store(SandboxError::Internal(format!(
+            "session {session_id} has no recorded operator, so no gateway can be attributed to it"
+        ))));
+    };
+
     // The upgrade closure may not borrow state captures (it outlives
     // the handler future), so hand it owned clones.
     let lima_registry_for_upgrade = Arc::clone(&state.lima_registry);
-    let docker_for_upgrade = state.docker.clone();
+    let docker_for_upgrade = (state.docker_route)(op_uid);
     Ok(ws.on_upgrade(move |socket| async move {
         run_proxy(
             socket,
             session,
+            op_uid,
             lima_registry_for_upgrade,
             docker_for_upgrade,
         )
@@ -196,6 +225,7 @@ impl axum::response::IntoResponse for ProxyHttpError {
 async fn run_proxy(
     socket: WebSocket,
     session: Session,
+    op_uid: u32,
     lima_registry: Arc<LimaManagerRegistry>,
     docker: sandbox_core::docker::DockerRoute,
 ) {
@@ -211,23 +241,9 @@ async fn run_proxy(
             }
         }
         BackendKind::Lima => {
-            // Operator uid from the session row (post-V009, always Some).
-            let op_uid = match session.operator_uid {
-                Some(uid) => uid,
-                None => {
-                    error!(
-                        session = %session_id,
-                        "Lima proxy: session has no operator_uid (pre-V009 row?); closing"
-                    );
-                    close_with_code(
-                        socket,
-                        close_codes::BACKEND_ERROR,
-                        "session has no operator_uid",
-                    )
-                    .await;
-                    return;
-                }
-            };
+            // `op_uid` is the session row's operator, resolved by the caller —
+            // the same uid the container path's route was built from, so both
+            // backends reach the gateway the session was created under.
             let lima = match lima_registry.get_or_create(op_uid) {
                 Ok(m) => m,
                 Err(e) => {
