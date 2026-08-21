@@ -158,10 +158,13 @@ def test_session_allocates_from_e2e_test_pool(sandbox_cli, backend):
             f"({E2E_TEST_POOL_CIDR}). The production route helper reads "
             f"this file unconditionally (it ignores SANDBOX_USERS_CONF "
             f"in the hardened build) and would reject the test daemon's "
-            f"authorization request for a test-pool gateway IP. Re-run "
+            f"authorization request for a test-pool gateway IP. That "
+            f"override is deliberately test-build-only: a cap'd binary "
+            f"that honored a caller-supplied path would let the caller "
+            f"name its own authorization file, so the canonical file is "
+            f"the one that has to list both pools. Re-run "
             f"`make setup-users-conf` to idempotently append the test "
-            f"pool entry, then re-run this test. See "
-            f"docs/internal/milestones/M12.md § S13 for the rationale."
+            f"pool entry, then re-run this test."
         )
 
     test_pool = ipaddress.ip_network(E2E_TEST_POOL_CIDR, strict=False)
