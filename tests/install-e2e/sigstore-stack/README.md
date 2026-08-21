@@ -94,3 +94,17 @@ sign-blob + verify-blob, and tears the stack down at the end.
 
 Seven containers; cold bring-up ~30s, tear-down ~12s. Resident memory
 ~1-1.5 GB. The smoke test runs in ~35s wall time on a 9.7 GB host.
+
+## Trust-root reroute
+
+cosign normally fetches its trust root from the public-good Sigstore
+TUF repository. Nothing in this stack is in that trust root, so every
+root cosign would otherwise fetch is supplied explicitly instead:
+``--fulcio-url`` and ``--rekor-url`` point at the local services,
+``--certificate-chain`` supplies the generated Fulcio root,
+``SIGSTORE_CT_LOG_PUBLIC_KEY_FILE`` supplies the CT-log signing key,
+and ``SIGSTORE_REKOR_PUBLIC_KEY`` supplies Rekor's. They are one set,
+not five independent knobs: each replaces a public-good default that
+would not accept a certificate issued by this stack's own Fulcio root,
+so a command that drops one of them is not a weaker version of the
+same check — it is checking against the wrong trust root.
