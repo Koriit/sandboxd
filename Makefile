@@ -1636,8 +1636,7 @@ setup-bridge-conf:
 # the test pool, but the production route helper continues reading
 # the canonical file — so the canonical file must list the test pool
 # too, or route-helper authorization for the test pool's gateway IP
-# fails. See `docs/internal/milestones/M12.md` § S13 for the
-# rationale.
+# fails.
 #
 # Mutation rule: only ever *append* the test-pool entry. Never
 # remove, reorder, or rewrite any existing entry the operator has

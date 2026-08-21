@@ -7,8 +7,11 @@ with ``SANDBOX_USERS_CONF`` pointing at a tempfile users.conf that
 lists only the test pool — but the production route helper continues
 reading the canonical ``/etc/sandboxd/users.conf``, which after
 ``make setup-users-conf`` lists *both* pools so authorization for
-the test pool's gateway IP succeeds. See
-``docs/internal/milestones/M12.md`` § S13 for the full rationale.
+the test pool's gateway IP succeeds. The helper reads that canonical
+path unconditionally by design — a cap'd binary honouring a
+caller-supplied path would let the caller name its own authorization
+file — so the canonical file, not the harness tempfile, is what has
+to carry the test pool.
 
 If the operator has not re-run ``make setup-users-conf`` since the
 dual-pool change landed, the canonical file still lists only the
