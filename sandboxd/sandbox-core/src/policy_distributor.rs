@@ -675,8 +675,8 @@ mod tests {
 
     // -- Artifact identity ---------------------------------------------------
 
-    /// §3.4 step 6: the Envoy bootstrap written into the container is the
-    /// compiler's output, and it survives the trip to the write op intact.
+    /// The Envoy bootstrap written into the container is the compiler's
+    /// output, and it survives the trip to the write op intact.
     /// A drifted bootstrap is a gateway whose Envoy either refuses to start
     /// or starts pointed at the wrong listener directory.
     #[test]
@@ -693,9 +693,9 @@ mod tests {
         );
     }
 
-    /// §3.4 step 7: the seeded listener is the deny-all initial listener,
-    /// byte for byte. Seeding anything else would open the window this
-    /// artifact exists to close.
+    /// The seeded listener is the deny-all initial listener, byte for byte.
+    /// Seeding anything else would open the window this artifact exists to
+    /// close.
     #[test]
     fn the_listener_seed_is_the_deny_all_initial_listener() {
         let (file, content) = envoy_initial_listener_artifact();
@@ -718,9 +718,9 @@ mod tests {
         assert_eq!(seeds[1], envoy_initial_listener_artifact());
     }
 
-    /// §3.4 step 8: the CoreDNS policy the distributor writes is the
-    /// compiled policy's, unchanged. This is the artifact that decides
-    /// which names resolve at all.
+    /// The CoreDNS policy the distributor writes is the compiled policy's,
+    /// unchanged. This is the artifact that decides which names resolve at
+    /// all.
     #[test]
     fn the_coredns_write_carries_the_compiled_policy() {
         let compiled = "example.com\nrewrite stop {\n  name exact \"a.b\" c.d\n}\n";

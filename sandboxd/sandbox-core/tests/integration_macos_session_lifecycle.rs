@@ -906,7 +906,7 @@ mod integration_macos_session_lifecycle {
     }
 
     // ---------------------------------------------------------------------------
-    // Test: slot reclaimed when a confirmed-dead session is released (#247 / §4)
+    // Test: slot reclaimed when a confirmed-dead session is released
     // ---------------------------------------------------------------------------
 
     /// A vmnet slot held by a confirmed-dead (non-Running) session is released

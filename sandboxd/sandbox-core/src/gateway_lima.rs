@@ -19,8 +19,8 @@
 ///
 /// ## Lifecycle (startup)
 ///
-/// `ensure_ready` drives the full gateway-init sequence described in
-/// § Daemon startup sequence (macOS) step 4:
+/// `ensure_ready` drives the full gateway-init sequence, which is the fourth
+/// stage of daemon startup on macOS:
 ///
 /// 1. If absent: generate template → `limactl create` → `limactl start`
 /// 2. If present and stopped: `limactl start`
@@ -138,6 +138,24 @@ pub const GATEWAY_INSTANCE_NAME: &str = "sandboxd-gateway";
 /// different kinds of object once the suffix exists — a Lima instance on the
 /// host and an nft table inside the VM. They cannot collide (an owner uid is a
 /// `u32` and can never spell `eth0`), but a bare grep returns both.
+///
+/// # What must be settled before this is turned on
+///
+/// Setting this variable moves only the daemon's half of the name. The operator
+/// agent never takes a gateway VM name off the wire — it picks one locally —
+/// and it does not depend on `sandbox-core`, so it cannot read this variable
+/// however it is spelled or exported. There is no mechanism today by which it
+/// learns the mode at all. Turn the switch on and the daemon starts naming a
+/// per-owner instance while the agent's in-VM and Docker paths go on addressing
+/// the unsuffixed name they hold as a constant, which is two halves acting on
+/// different VMs rather than a configuration that fails and says so.
+///
+/// What makes that survivable right now is only that the daemon never asks the
+/// agent to create or start a gateway; it still does both through its own
+/// direct path. So the mechanism by which the agent learns the mode has to be
+/// decided and built before this is set anywhere, and before any daemon-side
+/// sender for those ops is wired. The agent records the same prerequisite from
+/// its own side, at the naming divergence documented on its gateway-op helpers.
 #[cfg(target_os = "macos")]
 pub const PER_OPERATOR_GATEWAY_ENV: &str = "SANDBOX_PER_OPERATOR_GATEWAY";
 
@@ -655,26 +673,39 @@ pub fn slot_for_persisted_session(
 /// The map holds an entry only for slots whose pinned `lima<slot>` interface was
 /// observed in the gateway VM, so a miss means either the map is not yet
 /// populated or the VM does not have that NIC.
+///
+/// The remediation names both spellings of the instance rather than deriving the
+/// right one, because the resolvers that reach this carry a slot and no owner.
+/// Deriving it would mean threading an owner through both of them and every
+/// caller. Until that happens, spelling out both is what keeps the advice
+/// correct instead of correct-only-while-one-gateway-per-host holds — a reader
+/// who is handed a single instance name has no way to tell it is the wrong one.
 #[cfg(target_os = "macos")]
 fn nic_map_miss_error(slot: u16) -> SandboxError {
     SandboxError::Gateway(format!(
         "no verified gateway NIC for vmnet slot {slot} (expected `{}` in the gateway VM). \
          Refusing rather than parenting the session's macvlan on a guessed interface, which \
          would place it on an unknown L2 segment. Check that the gateway Lima instance is up \
-         and was created with this slot: `limactl list` and \
-         `limactl shell {GATEWAY_INSTANCE_NAME} ip -json link show`.",
+         and was created with this slot. `limactl list` names it: `{GATEWAY_INSTANCE_NAME}` \
+         for a daemon-owned gateway, or `{GATEWAY_INSTANCE_NAME}-<owner uid>` where each \
+         operator owns one. Then: `limactl shell <instance> ip -json link show`.",
         slot_interface_name(slot),
     ))
 }
 
 /// The in-VM interface name that belongs to a pool slot.
 ///
-/// Single source of truth for the `slot n ⇔ lima<n>` correspondence. The
-/// template generator pins it into every `networks:` entry, NIC verification
-/// looks for exactly this name, and §1.1a's agent-side validator re-derives it
-/// from the socket path. Lima honours whatever name it is given and never warns
-/// about a non-positional one, so this correspondence is ours to hold, not
-/// Lima's.
+/// Single source of truth for the `slot n ⇔ lima<n>` correspondence *on this
+/// side*. The template generator pins it into every `networks:` entry and NIC
+/// verification looks for exactly this name. Lima honours whatever name it is
+/// given and never warns about a non-positional one, so this correspondence is
+/// ours to hold, not Lima's.
+///
+/// The operator agent re-derives the same correspondence from the socket path
+/// when it validates a template it has been handed. It keeps its own copy of
+/// this function rather than calling this one, because it deliberately does not
+/// depend on this crate — so a change to the format here has to be made there
+/// too, and nothing in the build will say so.
 #[cfg(target_os = "macos")]
 pub fn slot_interface_name(slot: u16) -> String {
     format!("lima{slot}")
@@ -799,9 +830,9 @@ pub fn discover_nics_from_ip_json(json: &str, slots: &[u16]) -> Result<NicMap, S
 ///
 /// The guard cannot fire on any input this function accepts — a `u16` always
 /// round-trips — which is the point: it is here so that a later edit that
-/// decouples the two halves stops being silent. §1.1a's agent-side validator
-/// makes the same check from outside the daemon's trust boundary, where a
-/// compromised daemon cannot skip it.
+/// decouples the two halves stops being silent. The operator agent makes the
+/// same check on the rendered template, outside the daemon's trust boundary,
+/// where a compromised daemon cannot skip it.
 #[cfg(target_os = "macos")]
 fn gateway_network_entry(slot: u16) -> String {
     let socket = crate::network::vmnet_slot_socket_path(slot);
@@ -1613,9 +1644,19 @@ impl GatewayLimaManager {
         let image_tag = lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
         let tarball = self.daemon_lima_home.join(LITE_IMAGE_TARBALL_FILENAME);
 
-        // No staged-copy fallback here, unlike the gateway tarball:
-        // `make stage-lite-image` writes straight into daemon_lima_home, so
-        // there is no second location to look in.
+        // No staged-copy fallback here, unlike the gateway tarball, and the
+        // consequence is the part worth knowing: this load succeeds only for
+        // the owner into whose LIMA_HOME the tarball was staged. The staging
+        // target writes into the daemon's own `…/{daemon_uid}/{daemon_uid}/lima`,
+        // so with per-operator gateways on, a gateway owned by anyone else
+        // looks in `…/{daemon_uid}/{owner_uid}/lima`, does not find a tarball,
+        // and fails. Lite is supported against a daemon-owned gateway only.
+        //
+        // Giving this the gateway tarball's two-levels-up fallback does not
+        // fix that. The gateway tarball is staged per daemon, which is why a
+        // fixed offset finds it for any owner; the lite tarball is staged per
+        // owner into one owner's directory, so the same offset would point at
+        // a location nothing writes.
         let plan = plan_image_load(
             ImagePresence::from_probe(self.lite_image_present_inside_lima()),
             || tarball.exists(),
@@ -5341,12 +5382,17 @@ mod tests {
         assert!(!msg.contains("is not present"), "{msg}");
     }
 
-    /// The lite loader has no install-staged fallback, and must not acquire
-    /// one by accident: `make stage-lite-image` writes straight into
-    /// `daemon_lima_home`, so a tarball two levels up is not a lite tarball.
+    /// The lite loader reads one directory — the LIMA_HOME of the gateway it
+    /// was built for — so a tarball staged anywhere else does not satisfy the
+    /// load. That is what confines lite to a daemon-owned gateway, since the
+    /// staging target writes into the daemon's own home.
+    ///
+    /// This pins where the loader looks, not a rule that it may never look
+    /// anywhere else. If the staging target is ever made owner-aware, this
+    /// test should move with it rather than read as forbidding the change.
     #[cfg(target_os = "macos")]
     #[test]
-    fn lite_loader_does_not_look_two_levels_up_for_a_tarball() {
+    fn lite_load_fails_when_the_tarball_is_outside_the_lima_home_it_reads() {
         let root = tempfile::tempdir().unwrap();
         let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
         let (mgr, _home) = manager_for_image_load(root.path(), Arc::clone(&docker));

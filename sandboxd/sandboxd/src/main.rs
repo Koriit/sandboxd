@@ -6261,8 +6261,18 @@ async fn start_session_macos_lite(
     // create path may read the caller's uid because it is writing the row it
     // would otherwise read; a restart is reading one written earlier, and the
     // owner name it was found by does not establish the uid it was created
-    // under. A start refuses rather than declines for the same reason stop and
-    // remove do — it reports a lifecycle outcome the caller then acts on.
+    // under.
+    //
+    // Unresolved refuses here, but not for the reason stop and remove refuse.
+    // Those two refuse because declining is fail-open: their container is
+    // already up with egress, and skipping the work leaves it up. Nothing is
+    // unsafe here — this returns before `runtime.start`, so the container stays
+    // stopped whether the handler refuses or declines, and the session is
+    // fail-closed either way. What a decline would cost is honesty. It would
+    // report a session started when nothing can say whose gateway is meant to
+    // serve it, and a false success is one the caller then acts on. Deriving
+    // the rule from the fail-open argument alone gets the start paths wrong,
+    // because that argument does not reach them.
     let Some(operator_uid) =
         gateway_operator_for_session(&session.id, &state, "session start").await
     else {
@@ -6615,7 +6625,10 @@ async fn start_session_macos_lima(
     //
     // Resolved from the session's records rather than from the requester — see
     // `start_session_macos_lite` for why a restart differs from a create here,
-    // and why it refuses rather than declines.
+    // and why an unresolved owner refuses rather than declines. The honesty
+    // argument given there transfers directly: this is the first thing the
+    // handler does, so the VM is still stopped on both branches and a decline
+    // would buy nothing but a success the caller cannot rely on.
     let session_id = session.id;
     let Some(operator_uid) =
         gateway_operator_for_session(&session_id, &state, "session start").await

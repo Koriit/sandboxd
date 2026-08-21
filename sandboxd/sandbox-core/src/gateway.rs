@@ -1513,8 +1513,9 @@ pub fn container_name(session_id: &SessionId) -> String {
 /// admits traffic the next step was supposed to constrain.
 ///
 /// Named rather than inlined so a test can assert which generator each step
-/// of the create flow is paired with. The pairing is what §3.4's table maps,
-/// and it is invisible from outside once the ops are running.
+/// of the create flow is paired with. Once the ops are running that pairing
+/// is invisible from outside — the argv carries the rendered ruleset, not the
+/// identity of what rendered it — so the test is the only place it is pinned.
 fn dnat_rulesets(network_info: &NetworkInfo, container_ip: &str) -> Vec<(&'static str, String)> {
     vec![
         (
@@ -1881,8 +1882,8 @@ mod tests {
     }
 
     /// Step 12 of the create flow, and the two rulesets applied alongside
-    /// it: each is the output of the generator §3.4's table names for it,
-    /// in the order the enforcement pipeline needs them.
+    /// it: each is the output of the generator it is paired with, in the
+    /// order the enforcement pipeline needs them.
     #[test]
     fn the_dnat_step_is_paired_with_its_generators() {
         let network_info = NetworkInfo {

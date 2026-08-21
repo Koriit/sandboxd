@@ -325,9 +325,9 @@ impl NftTable {
 
 /// The closed set of commands the daemon may feed a body to on stdin.
 ///
-/// These are the two shapes §5.3 of the design calls out as not fitting a
-/// plain request/response op: a multi-KB artifact goes to the child's
-/// standard input rather than into its argv.
+/// These are the two shapes that do not fit a plain request/response op: a
+/// multi-KB artifact goes to the child's standard input rather than into its
+/// argv, which no argv-shaped op can express.
 ///
 /// # Adding a variant is a security change
 ///
