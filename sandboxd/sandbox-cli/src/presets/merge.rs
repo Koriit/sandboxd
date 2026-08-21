@@ -401,10 +401,10 @@ mod tests {
         let err = merge_effective(Some(&file), Some(&file_path), &catalog, &expansions)
             .expect_err("file/preset overlap must error");
 
-        // Golden-string assertion — the exact wording (lines 140-150 of the
-        // policy-rule spec) pins the error shape, with file
-        // path first (it was the first-seen source) and built-in
-        // preset invocation second.
+        // Golden-string assertion — pins the exact error wording. Sources
+        // render in first-seen order (`fmt_duplicate_block` walks
+        // `sources` unsorted), so the policy file leads here and the
+        // built-in preset invocation follows.
         assert_eq!(
             err.to_string(),
             "policy validation failed: duplicate destination (api.github.com, 443)\n  - declared by policy file /etc/sandboxd/policy.json\n  - declared by preset invocation 'github' (built-in 'github')"

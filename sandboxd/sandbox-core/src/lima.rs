@@ -3389,7 +3389,8 @@ provision:
         // SECURITY NOTE: 9p adds a virtio-9p device to the VM, which
         // expands the attack surface compared to a fully isolated VM.  The
         // host directory is writable by the guest.  This is a documented
-        // trade-off — see docs/workspaces.md.
+        // trade-off — see the "9p shared mounts" section of
+        // docs/guides/hardening.md.
         let mounts_section = match &config.workspace_mode {
             Some(WorkspaceMode::Shared {
                 host_path,

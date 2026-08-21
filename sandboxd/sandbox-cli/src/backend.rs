@@ -499,10 +499,9 @@ pub fn render_feature_mismatch(
 /// Render the per-create isolation warning for the container
 /// backend.
 ///
-/// Lines 751-762 of the isolation-warning design mandate the **exact**
-/// two-line shape below, character-for-character. Note the leading
-/// `lite:` token, the em dash (`—`, U+2014) on line 1, and the **six**
-/// spaces of indentation on line 2:
+/// The two-line shape below is exact, character-for-character. Note
+/// the leading `lite:` token, the em dash (`—`, U+2014) on line 1, and
+/// the **six** spaces of indentation on line 2:
 ///
 /// ```text
 /// lite: container-backed session — container-level isolation only (not VM-grade)

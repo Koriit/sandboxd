@@ -1,9 +1,8 @@
 //! Integration tests: the per-create isolation warning fires for the
 //! container backend (and only the container backend).
 //!
-//! Lines 751-762 of the isolation-warning design mandate that **every**
-//! `--lite` / `--backend container` create prints a fixed two-line
-//! warning to stderr **before** the daemon round-trip, and that
+//! **Every** `--lite` / `--backend container` create prints a fixed
+//! two-line warning to stderr **before** the daemon round-trip, and
 //! `--backend lima` does **not** print anything. The byte-equality
 //! contract for the warning text itself is pinned by the unit test in
 //! `backend.rs`; this test exercises the wire-up — that the warning
