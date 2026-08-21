@@ -501,11 +501,17 @@ impl SessionStore {
     /// rather than relying on the SQL `DEFAULT 'lima'`.
     ///
     /// `operator_uid` / `operator_gid` (V008) carry the operator's
-    /// kernel-supplied `SO_PEERCRED` pair. `None` for both is the
-    /// legacy spawn-as-daemon path; `Some(uid)`/`Some(gid)` engages the
-    /// supervisor-fork pattern (container `--user <uid>:<gid>`, Lima
-    /// spawn-helper + cloud-init usermod). Tests that pre-date V008
-    /// keep passing `None`/`None` to opt into the legacy shape.
+    /// kernel-supplied `SO_PEERCRED` pair. `Some(uid)`/`Some(gid)`
+    /// drives operator alignment: the container `--user <uid>:<gid>`
+    /// argv, the Lima cloud-init usermod step, the `sandbox-lima-helper`
+    /// pivot target, and the selection of which operator's Docker route
+    /// an operation lands in.
+    ///
+    /// `None` for both writes a row that **cannot later be served** —
+    /// it is not a lighter-weight mode. Nothing downstream substitutes
+    /// a uid, because the daemon's own identity is the wrong answer
+    /// rather than a neutral one. Only test callers pass it; every
+    /// production caller has a peer credential by construction.
     #[allow(clippy::too_many_arguments)] // Each arg is a load-bearing
     // slot — collapsing into a struct hides the V006/V007/V008-shape
     // additions at the call site, which is exactly where readers
@@ -621,8 +627,9 @@ impl SessionStore {
                 session.guest_protocol_version as i64,
                 session.guest_binary_version,
                 ssh_keypair_json,
-                // V008: nullable; None routes through the legacy spawn-as-daemon
-                // path (no `--user <uid>:<gid>` argv; no Lima cloud-init usermod).
+                // V008: nullable so rows written by an older daemon still
+                // read back. A NULL is not a mode the daemon can run in —
+                // it is refused at use, not defaulted.
                 session.operator_uid.map(|u| u as i64),
                 session.operator_gid.map(|g| g as i64),
                 // V010: nullable; None = "probe not yet run / Lima / pre-V010 row".
@@ -2037,10 +2044,11 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     // the daemon DB.
     let ssh_keypair_json: Option<String> = row.get(10)?;
     // Columns 11..=12 (`operator_uid`, `operator_gid`) were introduced
-    // by V008. Both are nullable so pre-V008 rows read back with
-    // `None` for both — the daemon routes those through the legacy
-    // spawn-as-daemon path (no `--user <uid>:<gid>` argv on the
-    // container backend, no Lima cloud-init usermod step). i64 here
+    // by V008. Both are nullable, so a row written before the column
+    // carried a contract reads back as `None` for both rather than
+    // failing to load. Loading is as far as it gets: the daemon has no
+    // mode that runs without an operator uid, and refuses such a row
+    // at the point of use rather than supplying one. i64 here
     // because rusqlite's `INTEGER` type maps to that; we narrow via
     // `try_from` to keep the surfaced u32 honest.
     let operator_uid_raw: Option<i64> = row.get(11)?;
@@ -4906,9 +4914,9 @@ mod tests {
     /// store. Pinned alongside the V007 ssh_keypair round-trip so a
     /// regression that drops either column from the SELECT-list or
     /// INSERT-list surfaces immediately. Tests both the `Some(_)` path
-    /// (the supervisor-fork happy path stamping the operator's
-    /// `SO_PEERCRED` pair) and the `None` path (the legacy
-    /// spawn-as-daemon fallback that pre-V008 rows take).
+    /// (the happy path, stamping the operator's `SO_PEERCRED` pair)
+    /// and the `None` path — which pins *persistence* only, not that
+    /// such a row is usable. It is not.
     #[test]
     fn test_operator_uid_gid_round_trip_with_values() {
         let (store, _dir) = test_store();
@@ -4942,10 +4950,13 @@ mod tests {
     }
 
     /// `None` for both operator fields persists as SQLite NULL and
-    /// reads back as `None`. This is the legacy-rollback path: a
-    /// pre-V008 daemon (or a session created before the supervisor-fork
-    /// pattern shipped) carries `None` for both fields and routes
-    /// through the legacy spawn-as-daemon code path.
+    /// reads back as `None`.
+    ///
+    /// This pins the round-trip, which is what
+    /// `SessionStore::operatorless_session_ids` depends on to find such
+    /// rows and report them at startup. It deliberately does **not**
+    /// assert that anything will run afterwards: a row in this state is
+    /// refused at use.
     #[test]
     fn test_operator_uid_gid_round_trip_with_none() {
         let (store, _dir) = test_store();
@@ -4979,10 +4990,12 @@ mod tests {
     /// The `create_session` back-compat shim stamps `None` for both
     /// operator-uid fields. Pinned so any future refactor that
     /// reverses the default — e.g. silently inheriting the daemon's
-    /// own uid — surfaces immediately. The supervisor-fork pattern
-    /// requires kernel-supplied `SO_PEERCRED` uids; falling back to
-    /// the daemon's identity would re-introduce the spawn-as-daemon
-    /// bug the supervisor-fork is built to fix.
+    /// own uid — surfaces immediately. Operator alignment requires a
+    /// kernel-supplied `SO_PEERCRED` uid; falling back to the daemon's
+    /// identity would run the session as the daemon, which is the
+    /// exact defect the operator-uid contract exists to prevent. A
+    /// `None` that is honestly recorded can be detected and refused;
+    /// one quietly replaced by the daemon's uid cannot.
     #[test]
     fn test_create_session_shim_stamps_none_for_operator_pair() {
         let (store, _dir) = test_store();

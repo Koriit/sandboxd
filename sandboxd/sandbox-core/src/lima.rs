@@ -5189,11 +5189,17 @@ mod tests {
     }
 
     /// `generate_template` is the source of truth for the per-session
-    /// Lima YAML. When the daemon stamps `operator_identity = None`
-    /// (pre-V008 records, fixture-test rows that did not capture
-    /// peercred), the resulting YAML must NOT carry the operator-uid
-    /// cloud-init step — the legacy "in-VM sandbox stays at uid 1000"
-    /// path applies. This pins the omit-on-None invariant.
+    /// Lima YAML. Given `operator_identity = None` the resulting YAML
+    /// must NOT carry the operator-uid cloud-init step, leaving the
+    /// in-VM sandbox user at uid 1000. This pins the omit-on-None
+    /// invariant at the template layer.
+    ///
+    /// It is a statement about template generation, not about session
+    /// creation: `LimaRuntime::create` rejects a `None` operator
+    /// identity before any template is generated, so a session never
+    /// reaches this arm. Keeping generation total rather than
+    /// panicking is what lets the check live at the boundary instead
+    /// of here.
     #[test]
     fn generate_template_omits_operator_uid_step_when_identity_is_none() {
         let mgr = LimaManager::with_helper_path(

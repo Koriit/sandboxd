@@ -450,8 +450,11 @@ mod tests {
         // Records predating the `operator_identity` field round-trip
         // with `None` — the field is daemon-stamped at handler time,
         // so a record authored by an older daemon (or read back from
-        // a persisted blob) must default to None and let the legacy
-        // spawn-as-daemon path keep working.
+        // a persisted blob) must deserialize rather than error. What
+        // happens to that `None` afterwards is the consumer's call,
+        // and is not uniform: `LimaRuntime` refuses it, the container
+        // runtime defaults it. This assertion covers deserialization
+        // only.
         assert!(parsed.operator_identity.is_none());
     }
 

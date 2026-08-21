@@ -2377,10 +2377,11 @@ async fn create_session(
         // step into the per-session YAML; `ContainerRuntime::create`
         // reads it to resolve which operator's Docker daemon to reach,
         // and reads the parallel `ContainerNetwork.operator_identity`
-        // field for the uid the container runs as. Pre-V008 /
-        // fixture-test rows that did not capture peercred default to
-        // `None` here and route through the legacy spawn-as-daemon
-        // path.
+        // field for the uid the container runs as. This site always
+        // has a peer credential — it is inside the `POST /sessions`
+        // handler — so it stamps `Some(..)` unconditionally; the
+        // `None` shape exists for fixtures, and is refused rather than
+        // defaulted wherever a route or pivot target depends on it.
         Some((operator.uid, operator.gid)),
     );
     let runtime_for_validation = runtime_for(&state, backend_kind);
@@ -2485,10 +2486,15 @@ async fn create_session(
         // onto the new row. The container backend reads these back to
         // build the `--user <uid>:<gid>` argv on `docker create`; the
         // Lima backend reads them back to drive the cloud-init usermod
-        // step. Both halves travel together because the
-        // supervisor-fork `setresuid`/`setresgid` primitive consumes
-        // them as a pair. Pre-V008 rows have `None` for both and
-        // continue to route through the legacy spawn-as-daemon path.
+        // step. Both halves travel together because
+        // `sandbox-lima-helper`'s `setresuid`/`setresgid` pivot
+        // consumes them as a pair.
+        //
+        // A row with `None` for both is not a supported mode: it can
+        // still be written (the columns are nullable, so older records
+        // load), but nothing will start it. See
+        // `Session::operator_uid` for why the daemon refuses such a
+        // row instead of substituting its own uid.
         Some(operator.uid),
         Some(operator.gid),
     ) {
@@ -3734,11 +3740,11 @@ async fn create_session(
                 lima_mac: Some(vm_mac.clone()),
                 lima_config: Some(config.clone()),
                 for_user: Some(operator.name.clone()),
-                // Operator identity drives `limactl start` through the
-                // spawn-helper (`setresuid(operator_uid)`) when the
-                // runtime has a resolved helper path. `None` means the
-                // runtime drops back to the legacy spawn-as-daemon
-                // shape — pre-V008 rows or fixture-test paths.
+                // Operator identity drives `limactl start` through
+                // `sandbox-lima-helper` (`setresuid(operator_uid)`).
+                // `None` does not select a different shape —
+                // `LimaRuntime::start` returns an internal error
+                // rather than starting the VM as the daemon.
                 operator_identity: Some((operator.uid, operator.gid)),
                 lima_unrestricted_slirp_for_provisioning: false,
             };
@@ -7342,9 +7348,25 @@ async fn start_session(
             );
             let runtime = runtime_for(&state, session.backend);
             let handle = RuntimeHandle::from_session_id(&session.id);
-            // operator_uid is required by the Lima backend to dispatch through
-            // sandbox-lima-helper; post-V009 every session carries one.
-            let op_uid_for_refresh = session.operator_uid.unwrap_or(operator.uid);
+            // The refresh dispatches through `sandbox-lima-helper`, which
+            // pivots to this uid and derives the per-operator LIMA_HOME
+            // from it. `operator.uid` is the *caller*, who need not be the
+            // operator that created the session — a restart is routinely
+            // issued by someone else. Defaulting to it would pivot into the
+            // wrong account and look for this session's VM in a LIMA_HOME
+            // that does not contain it, so refuse instead.
+            let op_uid_for_refresh = match session.operator_uid {
+                Some(uid) => uid,
+                None => {
+                    return error_response(SandboxError::Internal(format!(
+                        "session {} carries no operator uid; refusing to refresh \
+                         its guest binary rather than dispatching the helper pivot \
+                         against the calling operator's identity",
+                        session.id
+                    )))
+                    .into_response();
+                }
+            };
             match runtime
                 .refresh_guest_binary(&handle, op_uid_for_refresh)
                 .await
@@ -7446,8 +7468,15 @@ async fn start_session(
         // re-spawn the VM/container under the original operator's uid
         // — the per-session uid is what the workspace bind-mount
         // ownership and the synthetic /etc/passwd line are pinned to.
-        // Pre-V008 rows return `(None, None)` and route through the
-        // legacy spawn-as-daemon path.
+        //
+        // This is the one production path on which a NULL
+        // `sessions.operator_uid` reaches a runtime, because it is the
+        // one that reads the column rather than the live peer
+        // credential. Such a row yields `(None, None)` here and is
+        // then refused by `LimaRuntime::start` — it does not fall back
+        // to anything. `SessionStore::operatorless_session_ids` lists
+        // these rows at startup so the refusal is explicable when it
+        // happens.
         let args = RuntimeStartArgs {
             lima_bridge: bridge_name.clone(),
             lima_mac: vm_mac.clone(),

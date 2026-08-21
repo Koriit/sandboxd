@@ -131,9 +131,14 @@ pub struct RuntimeStartArgs {
     /// through the per-operator `LimaManager` (keyed by uid), so uid
     /// alignment for `limactl start` is implicit.
     ///
-    /// `None` means the operator identity is unavailable — either a
-    /// pre-V008 record where the daemon didn't yet capture peercred, or
-    /// a fixture-test row that omits it. A VM-hosted container runtime
+    /// `None` means the operator identity is unavailable. On the
+    /// restart path this field is read off the persisted row, so a
+    /// NULL `sessions.operator_uid` reaches here directly — by
+    /// rollback to a binary predating the V008 contract, by a restored
+    /// backup, or by direct SQL. (V009 deleted the rows that were NULL
+    /// when it ran; being a one-shot `DELETE`, it constrains nothing
+    /// written afterwards.) A fixture-test row that omits the field
+    /// produces the same `None`. A VM-hosted container runtime
     /// rejects `None`: each operator's containers live in their own
     /// gateway VM, so proceeding would run this session's containers in
     /// whichever VM a made-up uid resolves to — in practice the daemon's

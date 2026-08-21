@@ -329,17 +329,20 @@ pub struct ContainerNetwork {
     /// session-create time from the daemon socket's `SO_PEERCRED`
     /// and threaded through the per-session registry rather than
     /// pulled from the daemon-wide [`ContainerRuntime::user_uid`] /
-    /// [`ContainerRuntime::user_gid`] defaults, because the
-    /// supervisor-fork pattern aligns the container's runtime
-    /// identity with the *caller* of `POST /sessions` rather than the
-    /// daemon's own uid.
+    /// [`ContainerRuntime::user_gid`] defaults, so the container's
+    /// runtime identity aligns with the *caller* of `POST /sessions`
+    /// rather than with the daemon's own uid.
     ///
-    /// `None` means "no operator identity captured" — the daemon row
-    /// pre-dates V008 (legacy spawn-as-daemon path) or the synthetic
-    /// fixture used by an integration test does not exercise the
-    /// supervisor-fork. In both cases the runtime falls back to its
-    /// constructor-time `user_uid` / `user_gid` defaults, preserving
-    /// the existing behaviour for legacy sessions and tests.
+    /// `None` means "no operator identity captured", and in practice
+    /// that means a test fixture: this field is set at
+    /// `register_session` time and is never read back from the
+    /// `sessions` table, so no database row can put a `None` here —
+    /// both production registration sites pass `Some(..)`
+    /// unconditionally. The runtime then falls back to its
+    /// constructor-time `user_uid` / `user_gid` defaults; see
+    /// `effective_container_user` for why defaulting is safe on this
+    /// field and refused on the persisted column it is often confused
+    /// with.
     ///
     /// The pair is required to travel together: the
     /// `--user <uid>:<gid>` flag and the synthetic `/etc/passwd`
@@ -781,12 +784,28 @@ fn capabilities_for_container() -> Capabilities {
 /// Decision rule: the operator identity (captured at session-create
 /// time from `SO_PEERCRED` and threaded through the per-session
 /// [`ContainerNetwork::operator_identity`] field) wins when present.
-/// When the network registry carries `None` — pre-V008 sessions, or
-/// integration-test fixtures that do not exercise the supervisor-fork
-/// — fall back to the runtime's constructor-time defaults
-/// ([`ContainerRuntime::user_uid`] / [`ContainerRuntime::user_gid`]),
-/// preserving the legacy spawn-as-daemon shape for existing sessions
-/// and tests.
+/// When the network registry carries `None`, fall back to the
+/// runtime's constructor-time defaults
+/// ([`ContainerRuntime::user_uid`] / [`ContainerRuntime::user_gid`]).
+///
+/// **The fallback is not reachable in production, and the reason is
+/// worth stating because the obvious guess is wrong.** It is tempting
+/// to read `None` as "a session row whose `operator_uid` column is
+/// NULL". It cannot be: [`ContainerNetwork::operator_identity`] is an
+/// in-memory field populated at `register_session` time and is never
+/// loaded from the database, so no property of any row — pre-V008,
+/// post-V009, or hand-edited — can produce a `None` here. Both
+/// production registration sites pass
+/// `Some((operator.uid, operator.gid))` unconditionally. The `None`
+/// arm therefore serves unit and integration fixtures that construct
+/// a network without an operator, which is why it defaults rather
+/// than refusing.
+///
+/// Contrast [`crate::session::Session::operator_uid`], the persisted
+/// column of the same name: a `None` *there* is refused rather than
+/// defaulted, because that value selects an operator's Docker route
+/// and the helper's pivot target. The two fields are easy to conflate
+/// and have opposite handling; only this one is safe to default.
 ///
 /// Extracted into a pure function so the
 /// `effective_container_user_*` unit tests pin the decision rule
@@ -3333,11 +3352,15 @@ mod tests {
 
     /// `effective_container_user` falls back to the runtime's
     /// constructor-time defaults when the per-session registry carries
-    /// no operator identity. This is the legacy-rollback path: a
-    /// pre-V008 session row (or an integration-test fixture not
-    /// exercising the supervisor-fork) deserialises with
-    /// `operator_identity = None` and the container still runs under
-    /// the daemon's `user_uid`/`user_gid` pair.
+    /// no operator identity.
+    ///
+    /// The reachable source of that `None` is a fixture, not a session
+    /// row: `ContainerNetwork::operator_identity` is populated at
+    /// `register_session` time and never read from the database, and
+    /// both production registration sites pass `Some(..)`. So this
+    /// pins the decision rule of a pure function, and deliberately
+    /// makes no claim that a NULL `sessions.operator_uid` ends up
+    /// running under the daemon's uid — it does not; it is refused.
     #[test]
     fn effective_container_user_falls_back_to_defaults_when_absent() {
         let (uid, gid) = effective_container_user(None, 1000, 1000);

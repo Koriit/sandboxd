@@ -1139,16 +1139,41 @@ pub struct Session {
     pub ssh_keypair: Option<crate::ssh::SshKeypair>,
     /// Numeric uid of the operator who created this session, captured
     /// at `POST /sessions` time via `SO_PEERCRED`. Persisted in the
-    /// `sessions.operator_uid` column (V008 migration) so the
-    /// supervisor-fork spawn path can recover the operator identity
-    /// after a daemon restart without re-resolving via NSS.
+    /// `sessions.operator_uid` column (V008 migration) so a restart
+    /// issued by a *different* operator still re-spawns the session
+    /// under the uid that originally created it, without re-resolving
+    /// via NSS.
     ///
-    /// `None` on pre-V008 rows (the column is nullable; the migration
-    /// does not backfill). Sessions with `None` route through the
-    /// legacy spawn-as-daemon path — no operator-uid alignment, no
-    /// `--user <uid>:<gid>` flag on `docker create`, no Lima cloud-init
-    /// usermod step. Newly created sessions on V008+ daemons always
-    /// carry `Some(uid)`.
+    /// The column is nullable and the migration does not backfill, so
+    /// `None` is representable. **A `None` here is not serviceable and
+    /// is not defaulted.** The uid selects which operator's Docker
+    /// route an operation lands in and is the pivot target handed to
+    /// `sandbox-lima-helper`; substituting one does not neutralise the
+    /// field, it silently resolves it against the daemon's own
+    /// identity instead of the session owner's. Every path that would
+    /// act on such a row refuses it — see `LimaRuntime::create` /
+    /// `start` and `GuestConnector::send_request`.
+    ///
+    /// **Do not read the V009 migration as a guarantee that this is
+    /// always `Some`.** V009 is a one-shot
+    /// `DELETE FROM sessions WHERE operator_uid IS NULL`, and its
+    /// header states that afterwards "the daemon-side assertion
+    /// `session.operator_uid must be Some` is unconditionally
+    /// satisfied". That is a property of the rows which survived *at
+    /// the instant the migration ran*, not an invariant of the column:
+    /// a `DELETE` constrains no subsequent write. A row can carry
+    /// `None` again by rollback to a binary predating the V008
+    /// contract, by a restored backup, or by direct SQL — none of
+    /// which V009 can reach. The migration is applied and therefore
+    /// checksummed by refinery, so that sentence cannot be corrected
+    /// in place; this is where the correction lives.
+    ///
+    /// The daemon reports the two cases separately, because a `None`
+    /// is indistinguishable *as data* from any other and only its
+    /// timing identifies the cause: rows already `None` at startup are
+    /// listed by `SessionStore::operatorless_session_ids`, while one
+    /// appearing later is a defect in this daemon and surfaces
+    /// per-request as an internal error.
     ///
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
     /// keeps the JSON envelope omitted when absent so an older daemon
@@ -1162,10 +1187,10 @@ pub struct Session {
     /// captured alongside [`Self::operator_uid`]. Persisted in the
     /// `sessions.operator_gid` column (V008 migration).
     ///
-    /// Travels with `operator_uid` because the supervisor-fork's
-    /// `setresuid` + container `--user <uid>:<gid>` flag both need
-    /// the full pair. `None` semantics match [`Self::operator_uid`]
-    /// (pre-V008 row, route through the legacy spawn path).
+    /// Travels with `operator_uid` because both consumers need the
+    /// full pair: `sandbox-lima-helper`'s `setresuid` pivot and the
+    /// container `--user <uid>:<gid>` flag. `None` semantics match
+    /// [`Self::operator_uid`] — refused, not defaulted.
     ///
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
     /// per the forward-compat convention.

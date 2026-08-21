@@ -202,7 +202,9 @@ impl SessionRuntime for LimaRuntime {
         let op_uid = spec.operator_identity.map(|(u, _)| u).ok_or_else(|| {
             SandboxError::Internal(
                 "LimaRuntime::create called without operator_identity; \
-                 post-V009 sessions must carry operator_uid"
+                 the uid is the sandbox-lima-helper pivot target and \
+                 selects the per-operator LIMA_HOME, so there is no \
+                 safe substitute for it"
                     .into(),
             )
         })?;
@@ -240,7 +242,9 @@ impl SessionRuntime for LimaRuntime {
         let op_uid = args.operator_identity.map(|(u, _)| u).ok_or_else(|| {
             SandboxError::Internal(
                 "LimaRuntime::start called without operator_identity; \
-                 post-V009 sessions must carry operator_uid"
+                 the uid is the sandbox-lima-helper pivot target and \
+                 selects the per-operator LIMA_HOME, so there is no \
+                 safe substitute for it"
                     .into(),
             )
         })?;
