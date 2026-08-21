@@ -1890,6 +1890,48 @@ fn container_image_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Refuse a lite-image `docker build` aimed at the macOS host's Docker daemon.
+///
+/// On macOS the lite backend's containers run *inside* the gateway Lima VM and
+/// are reached through its forwarded Docker socket. A `docker build` started
+/// here has no route to that daemon: [`build_lite_image`] pins `HOME` and
+/// `DOCKER_CONFIG` to a daemon-owned directory precisely so the client cannot
+/// inherit an operator's config, which also means it cannot pick up an
+/// operator's context. It falls back to the `default` context — the host's
+/// `/var/run/docker.sock`. Anything built there lands in a daemon no session
+/// will ever consult.
+///
+/// The reason to refuse rather than let it fail on its own is that **it does
+/// not fail the same way on every host**. Where no host socket exists (a
+/// colima install exposes its endpoint through a context, not that path) the
+/// build fails with a message naming the missing socket, which sends the
+/// reader after Docker's installation rather than after the wrong target.
+/// Where a host socket *does* exist — Docker Desktop — the build succeeds, the
+/// operator is told the image was rebuilt, and every session goes on using the
+/// old image inside the VM. Refusing is what makes those two hosts report the
+/// same thing.
+///
+/// There is a correct route and the message names it: `make stage-lite-image`
+/// writes `lite-image.tar` into the daemon's `LIMA_HOME`, and
+/// `GatewayLimaManager::load_lite_image_into_gateway` loads it into the VM's
+/// Docker daemon on the lite create path.
+///
+/// Always returns `Err`. The `Result` return — rather than handing back a bare
+/// [`SandboxError`] for the caller to `return Err(..)` — is what keeps the rest
+/// of each caller reachable in the compiler's view on macOS, so gating a
+/// function does not turn its whole body into dead code.
+#[cfg(target_os = "macos")]
+fn refuse_host_lite_image_build(tag: &str) -> Result<(), SandboxError> {
+    Err(SandboxError::Gateway(format!(
+        "refusing to build lite image {tag} against the macOS host's Docker daemon: \
+         lite containers run inside the gateway Lima VM and use the Docker daemon \
+         there, which a host `docker build` cannot reach — the image would be built \
+         where no session looks for it. Stage it into the VM instead: \
+         `make stage-lite-image` writes lite-image.tar into the daemon's LIMA_HOME, \
+         and the gateway manager loads it into the VM on the lite create path."
+    )))
+}
+
 /// Build the `sandboxd-lite:<daemon_version>` image if it is missing.
 ///
 /// Synchronous (`fn`, not `async fn`) so callers from sync contexts
@@ -1924,6 +1966,16 @@ pub fn ensure_image(
     docker_home: &Path,
 ) -> Result<EnsureImageOutcome, SandboxError> {
     let tag = lite_image_tag_for_version(daemon_version);
+
+    // Refuse before the lock and before any subprocess: on macOS this path has
+    // no route to the daemon that actually runs the containers. The daemon's
+    // own create path never reaches here (it is `cfg(not(target_os =
+    // "macos"))`), so on macOS this is a guard against a future caller rather
+    // than a live refusal — which is exactly why it belongs next to the
+    // rebuild path's, instead of being left as the asymmetry that produced the
+    // defect.
+    #[cfg(target_os = "macos")]
+    refuse_host_lite_image_build(&tag)?;
 
     let _guard = container_image_lock()
         .lock()
@@ -2081,6 +2133,13 @@ pub fn rebuild_lite_image(
     docker_home: &Path,
 ) -> Result<(), SandboxError> {
     let tag = lite_image_tag_for_version(daemon_version);
+
+    // The live half of the gate. Unlike the create path, the daemon's
+    // rebuild-image handler dispatches to this on every platform, so on macOS
+    // an operator running `sandbox rebuild-image --backend container` arrives
+    // here and would otherwise build against the host daemon.
+    #[cfg(target_os = "macos")]
+    refuse_host_lite_image_build(&tag)?;
 
     let _guard = container_image_lock()
         .lock()
@@ -3784,5 +3843,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Assert a lite-image entry point refused *for the reason the gate
+    /// exists*, not merely that it returned an error.
+    ///
+    /// The distinction is the whole test. Both entry points shell out to
+    /// `docker`, so on a host without a usable `/var/run/docker.sock` they
+    /// return `Err` whether or not the gate is present — an `is_err()`
+    /// assertion passes identically against the defect it is supposed to
+    /// catch, and passes for a *third* reason on a host where docker is
+    /// simply broken. So this checks the message, and checks both
+    /// directions: it must name the VM route, and it must not be one of the
+    /// subprocess failures the ungated path produces.
+    #[cfg(target_os = "macos")]
+    fn assert_refused_host_daemon(result: Result<(), SandboxError>, entry_point: &str) {
+        let err = match result {
+            Err(e) => e,
+            Ok(()) => panic!(
+                "{entry_point} must refuse on macOS: a host `docker build` targets the \
+                 default context, not the gateway VM's Docker daemon, so success here \
+                 means an image was built where no session will look for it"
+            ),
+        };
+        assert!(
+            matches!(err, SandboxError::Gateway(_)),
+            "{entry_point} must refuse as SandboxError::Gateway so the daemon maps it \
+             to the same status as other gateway faults; got {err:?}"
+        );
+        let msg = err.to_string();
+        for needle in ["gateway Lima VM", "stage-lite-image"] {
+            assert!(
+                msg.contains(needle),
+                "{entry_point}'s refusal must name {needle:?} so the operator is pointed \
+                 at the route that does work; got: {msg}"
+            );
+        }
+        // The discriminator, taken from a run with the gate removed rather
+        // than from a guess about what that run would say. Both entry points
+        // ungated report `docker build for <tag> failed: ... failed to connect
+        // to the docker API at unix:///var/run/docker.sock`. The socket path
+        // is the sharpest of the two needles because it *is* the defect: it
+        // names the daemon the build should never have been aimed at.
+        //
+        // An earlier draft asserted the absence of "failed to spawn" and
+        // "failed unexpectedly". Neither string is produced by this path, so
+        // both assertions were inert — they would have held no matter what the
+        // code did.
+        for absent in ["docker build for", "/var/run/docker.sock"] {
+            assert!(
+                !msg.contains(absent),
+                "{entry_point} reported {absent:?}, which is the ungated path reaching for \
+                 the host daemon rather than the gate refusing to try; got: {msg}"
+            );
+        }
+    }
+
+    /// The live half: the daemon's rebuild-image handler dispatches to
+    /// `rebuild_lite_image` on every platform, so on macOS an operator running
+    /// `sandbox rebuild-image --backend container` reaches it and must be
+    /// refused rather than served a build against the wrong daemon.
+    ///
+    /// `docker_home` is a path that does not exist. The gate is expected to
+    /// fire before anything consults it, so a refusal proves the ordering as
+    /// well as the outcome — an implementation that staged the build context
+    /// first would fail differently and trip the discriminator above.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rebuild_lite_image_refuses_the_host_docker_daemon_on_macos() {
+        let missing = Path::new("/nonexistent/sandboxd-lite-image-gate-test");
+        assert_refused_host_daemon(
+            rebuild_lite_image("gate-test-version", false, missing),
+            "rebuild_lite_image",
+        );
+        // `no_cache` selects a `docker build` flag far downstream of the gate;
+        // both values must refuse, or the refusal is reachable by flag choice.
+        assert_refused_host_daemon(
+            rebuild_lite_image("gate-test-version", true, missing),
+            "rebuild_lite_image(no_cache)",
+        );
+    }
+
+    /// The guard half. `ensure_image` is unreachable on macOS today — the
+    /// daemon's create path and even its import are `cfg(not(target_os =
+    /// "macos"))` — so this pins a gate that currently refuses nothing.
+    ///
+    /// It is here because the asymmetry between the two entry points is what
+    /// produced the defect in the first place: one path was gated at its call
+    /// site in the daemon and the other was not, and nothing in the library
+    /// recorded that the host daemon is the wrong target. Gating only the
+    /// reachable half would rebuild that asymmetry one layer down.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_image_refuses_the_host_docker_daemon_on_macos() {
+        let missing = Path::new("/nonexistent/sandboxd-lite-image-gate-test");
+        assert_refused_host_daemon(
+            ensure_image("gate-test-version", missing).map(|_| ()),
+            "ensure_image",
+        );
     }
 }
