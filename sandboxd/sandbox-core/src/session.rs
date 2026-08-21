@@ -918,8 +918,8 @@ impl FromStr for SessionState {
 pub struct SessionConfig {
     /// Number of CPU cores allocated, integer-valued for backward
     /// compatibility with the persisted `config_json` blob (a daemon
-    /// rollback to a pre-todo-#67 build must still be able to read
-    /// the integer field). On the container backend this carries the
+    /// rollback to a build that predates fractional CPUs must still be
+    /// able to read the integer field). On the container backend this carries the
     /// floored representation of the operator-supplied fractional
     /// value; the precise value lives in [`Self::cpus_decimal`] and
     /// is the authoritative one for HTTP and runtime consumers when

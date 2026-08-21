@@ -75,7 +75,7 @@ impl DnsCache {
     ///
     /// Returns a list of domains whose IPs changed (added, removed, or modified).
     ///
-    /// **UNION semantics for in-window rotations (todo #40).** When the
+    /// **UNION semantics for in-window rotations.** When the
     /// gateway's CoreDNS upstream returns a *different* slot of a
     /// rotating multi-IP A-record (think `github.com` →
     /// `140.82.112.0/20`, TTL ≤ 60s), naively replacing the cache entry
@@ -129,7 +129,7 @@ impl DnsCache {
 
             // Always UNION the new observation with any existing entry
             // (regardless of TTL state). The DNS rotation race that
-            // motivated this design (todo #40) is precisely a case
+            // motivated this design is precisely a case
             // where the gateway and the VM resolve the SAME domain to
             // DIFFERENT slots of the same authoritative pool within
             // the same wall-clock second — and many CDN hosts ship
@@ -615,7 +615,7 @@ mod tests {
         // Within the TTL window, a fresh observation that brings a
         // disjoint IP must UNION (not replace) the existing IP set —
         // this prevents a previously-allowed IP from being evicted
-        // mid-rotation. (todo #40 root-cause fix.)
+        // mid-rotation.
         let mut cache = DnsCache::new();
 
         let report1 = ResolvedReport {
@@ -890,8 +890,8 @@ mod tests {
     fn rotation_race_listener_carries_both_ips() {
         // Pin the end-to-end behaviour the UNION fix is designed to
         // protect: when CoreDNS observes slot .4 then slot .3 of a
-        // rotating multi-IP A record (the exact pattern observed in
-        // the todo #40 baseline log against `github.com`), the
+        // rotating multi-IP A record (the exact pattern observed
+        // against `github.com`), the
         // post-update Envoy listener YAML must carry BOTH IPs in the
         // rule's `prefix_ranges` so the in-flight VM connection to
         // .3 is not RST'd while a freshly-resolved .4 is being
@@ -920,9 +920,9 @@ mod tests {
         cache.update(&report1);
 
         // Observation 2: a few seconds later, CoreDNS gets a different
-        // rotation slot — this is the pattern the todo #40 baseline
-        // captured between gateway-side resolution and VM-side
-        // resolution within the same TTL window.
+        // rotation slot — this is the pattern observed between
+        // gateway-side resolution and VM-side resolution within the
+        // same TTL window.
         let report2 = ResolvedReport {
             mappings: vec![ResolvedMapping {
                 domain: "github.com".to_string(),

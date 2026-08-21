@@ -1,6 +1,7 @@
 //! Wire-facing DTOs for the unified event stream.
 //!
-//! Serialized JSON shape matches the event wire format exactly:
+//! These types are the definition of the event wire format. The
+//! serialized JSON shape is:
 //!
 //! ```json
 //! {

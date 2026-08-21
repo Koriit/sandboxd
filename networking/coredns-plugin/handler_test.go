@@ -295,9 +295,9 @@ func TestHandler_HTTPSQuery_StripsECHParam(t *testing.T) {
 	}
 }
 
-// TestHandler_SVCBQuery_NonECHPassesThrough asserts the positive case
-// the plan calls out: a SVCB record with no ECH SvcParam is delivered to
-// the VM completely unchanged. Locks in the strip-only semantics so a
+// TestHandler_SVCBQuery_NonECHPassesThrough asserts the positive case:
+// a SVCB record with no ECH SvcParam is delivered to the VM completely
+// unchanged. Locks in the strip-only semantics so a
 // future regression to blanket-deny would fail this test.
 func TestHandler_SVCBQuery_NonECHPassesThrough(t *testing.T) {
 	sp := &SandboxPolicy{

@@ -204,6 +204,11 @@ impl TestImage {
         // tests in the same process do not collide. UNIX_EPOCH nanos
         // give us the inter-process uniqueness when nextest runs many
         // copies.
+        //
+        // The `phase3d-` prefix is an identifier, not a label that has
+        // gone stale: it namespaces the docker resources these tests
+        // create so a teardown can find them. Its job is uniqueness,
+        // so leave it alone — renaming it changes behaviour.
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -239,6 +244,11 @@ impl Drop for TestImage {
 /// surface. Mirrors Phase 3A's `sandboxd-test-sleep:latest` image
 /// (alpine + `sleep 3600` ENTRYPOINT) so the container stays running
 /// long enough for the status-after-start assertion to hold.
+///
+/// The `phase3d` segment is part of a docker image tag — `docker`
+/// builds, runs and removes the image under this exact name. It is an
+/// identifier, not a stale label, and editing it is a behavioural
+/// change rather than a comment edit.
 const ROUND_TRIP_IMAGE_TAG: &str = "sandboxd-phase3d-test-sleep:latest";
 const ROUND_TRIP_DOCKERFILE: &str =
     "FROM alpine:latest\nENTRYPOINT [\"sh\", \"-c\", \"exec sleep 3600\"]\n";

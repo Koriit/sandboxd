@@ -342,7 +342,7 @@ async fn integration_mitmproxy_event_attributes_via_watcher_session_even_with_un
 }
 
 /// End-to-end: `nft-deny.jsonl` records are parsed and surface on the
-/// session bus. Covers both event shapes prescribed by the event wire format:
+/// session bus. Covers both event shapes the deny-logger emits:
 ///
 /// 1. A TCP `deny` record — the 5-tuple drives a `vm_ip_map.lookup` on
 ///    the VM's bridge IP, stamping the same session as the other

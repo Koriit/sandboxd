@@ -924,7 +924,7 @@ mod tests {
     /// scoped to the consume-only methods the preset is intended to
     /// allow.
     ///
-    /// **Invariant (chosen path A — see todo #59).** Each domain host
+    /// **Invariant.** Each domain host
     /// in the preset's expansion appears in the fixture with a
     /// `methods` array, and the set of methods emitted by the preset
     /// for that host is exactly equal to the fixture's set. Catches

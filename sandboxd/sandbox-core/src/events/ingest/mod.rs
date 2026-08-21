@@ -40,8 +40,8 @@
 //! and returns the originating `src_ip` (Envoy) / `client_ip`
 //! (CoreDNS / mitmproxy) for [`crate::events::VmIpSessionMap::lookup`].
 //! Records we cannot attribute (unknown VM IP) are dropped with a
-//! `tracing::warn!` line rather than published to a fabricated session —
-//! see the "drop events on vm_ip miss" note in the plan.
+//! `tracing::warn!` line rather than published to a fabricated session:
+//! stamping an event with the wrong session is worse than losing it.
 //!
 //! # Shutdown
 //!

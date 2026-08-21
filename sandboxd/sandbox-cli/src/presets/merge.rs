@@ -11,7 +11,7 @@
 //!
 //! # Semantics
 //!
-//! Merge semantics (lines 344-362 of the event wire format spec):
+//! Merge semantics, in order:
 //!
 //! 1. Start with an empty `Vec<PolicyRule>`.
 //! 2. Extend with the policy file's rules (if any).

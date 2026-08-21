@@ -4333,7 +4333,7 @@ mod tests {
             listener.contains("cluster: mitmproxy"),
             "L3 domain chain must route to mitmproxy cluster:\n{listener}"
         );
-        // Per-port aggregation (todo #40): two domain rules sharing
+        // Per-port aggregation: two domain rules sharing
         // IPs at the same port collapse into one chain named
         // `level3_p{port}` to satisfy Envoy's
         // unique-`(prefix_ranges, destination_port)` invariant.

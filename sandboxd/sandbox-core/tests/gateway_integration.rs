@@ -1465,7 +1465,7 @@ fn integration_apply_policy_through_real_gateway() {
     net_mgr.delete_network(&session_id).unwrap();
 }
 
-/// Pins the fatal-create contract (todo #16, todo #46) end-to-end.
+/// Pins the fatal-create contract end-to-end.
 ///
 /// `fail_explicit_policy_apply_marks_session_error_and_returns_5xx`
 /// (in `sandboxd/src/main.rs` tests) is the hermetic unit test for the
@@ -1607,7 +1607,7 @@ fn integration_distribute_returns_err_when_gateway_rejects_policy() {
     let err = result.expect_err(
         "PolicyDistributor::distribute must return Err when nft rejects the ruleset \
          (overlapping CIDR intervals); production code's apply_policy depends on this Err \
-         to trigger fail_explicit_policy_apply (todo #16)",
+         to trigger fail_explicit_policy_apply",
     );
 
     // Contract 2: variant is `SandboxError::Gateway`. We pin on the
@@ -1621,7 +1621,8 @@ fn integration_distribute_returns_err_when_gateway_rejects_policy() {
     assert!(
         matches!(err, sandbox_core::SandboxError::Gateway(_)),
         "distribute must surface nft rejection as SandboxError::Gateway so error_response \
-         maps it to 500 (the variant the todo #16 unit test pins); got: {err:?}"
+         maps it to 500 — the variant that fail_explicit_policy_apply's own \
+         unit test pins; got: {err:?}"
     );
 }
 

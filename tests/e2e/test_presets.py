@@ -194,7 +194,8 @@ def _wait_policy_propagated(
     # flips propagated=true, but multi-host cases still race against Envoy
     # cluster DNS resolution / nftables enforcement settling (~sub-second
     # window). 8s settle matches the legacy timing baseline (sleep(5) +
-    # warm_dns + sleep(5) that passed 5/5 on e18baa2) until todo #40 lands.
+    # warm_dns + sleep(5) that passed 5/5 on e18baa2). Remove once the
+    # DNS-rotation race is closed at the source.
     time.sleep(8)
 
 

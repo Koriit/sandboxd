@@ -377,8 +377,9 @@ pub fn event_to_jsonl_line(event: &Event) -> Result<String, serde_json::Error> {
 // DTO wire-shape assertions
 // ---------------------------------------------------------------------------
 //
-// These tests pin the on-wire contract (event wire format "Event shape" /
-// "Event categories"). A failing assertion here is a signal that some
+// These tests pin the on-wire contract that `super::event_dto` defines —
+// the event shape and the layer/event categories it can carry. A failing
+// assertion here is a signal that some
 // downstream consumer (CLI filter flag, HTTP endpoint, E2E test) will
 // need coordinated updates — do not adjust these tests without
 // corresponding changes to the other consumers.
@@ -469,9 +470,8 @@ mod tests {
 
     #[test]
     fn dto_session_is_empty_string_when_prelifecycle() {
-        // `gateway_booting` precedes session attribution (the event wire format,
-        // "Event shape"). The envelope's `session` is None; the wire
-        // renders it as `""`.
+        // `gateway_booting` precedes session attribution, so the
+        // envelope's `session` is None; the wire renders it as `""`.
         let event = Event::Lifecycle {
             envelope: EventEnvelope {
                 timestamp: Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap(),

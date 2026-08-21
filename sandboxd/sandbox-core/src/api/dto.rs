@@ -233,8 +233,8 @@ pub struct SessionRootlessDocker {
 /// the VM's `eth1` IP in `session_ip`; container carries the
 /// container's IP on `sandbox-net-<id>` in the same field. Operators
 /// (and tests) read `session_ip` regardless of backend, which is the
-/// whole point of surfacing this — todo #72 was filed because
-/// `test_networking` hard-coded the Lima `10.209.x.x/28` shape
+/// whole point of surfacing this. The failure it prevents has been
+/// seen: `test_networking` hard-coded the Lima `10.209.x.x/28` shape
 /// and skipped the container parameterization in-body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionNetworkInfo {

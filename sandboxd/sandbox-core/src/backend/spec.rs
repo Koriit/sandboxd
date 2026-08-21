@@ -339,12 +339,12 @@ mod tests {
 
     /// Round-trip: serialise → deserialise reconstructs the original
     /// value for both variants. The container variant's `cpus` field
-    /// must round-trip a 1-decimal value (todo #67) without precision
-    /// drift — the regression that this test pins is `1.5 → 1` (the
-    /// pre-todo-#67 `u32` truncation bug).
+    /// must round-trip a 1-decimal value without precision drift — the
+    /// regression this test pins is `1.5 → 1`, the truncation the
+    /// earlier `u32` representation caused.
     #[test]
     fn backend_specific_roundtrip() {
-        // Lima fixture: integer cores, unchanged from pre-todo-#67.
+        // Lima fixture: integer cores, unchanged by the move to `f32`.
         let lima = BackendSpecific::Lima {
             hardened: false,
             memory_mb: 8192,
@@ -354,8 +354,8 @@ mod tests {
         let parsed: BackendSpecific = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, lima, "json={json}");
 
-        // Container fixture: a fractional value that the pre-todo-#67
-        // `u32` shape would have truncated. Round-trip must preserve it
+        // Container fixture: a fractional value that the earlier `u32`
+        // shape would have truncated. Round-trip must preserve it
         // exactly — `f32` represents `1.5` exactly so `assert_eq!`
         // (PartialEq) is safe here.
         let container = BackendSpecific::Container {

@@ -15,8 +15,8 @@ pitch.
 Notes:
 
 - The workload is **TCP-only on port 80**.  UDP would be a cleaner
-  match for the deny-logger's bare-IP path, but todo #29 tracks a
-  post-DNAT destination bug on UDP that makes UDP assertions flaky.
+  match for the deny-logger's bare-IP path, but an unfixed post-DNAT
+  destination bug on UDP makes UDP assertions flaky.
   Do NOT flip this to UDP.
 
 - curl targets the **resolved IP** of each host (not the hostname) via
@@ -168,8 +168,8 @@ def _is_deny_for_target(
     target IPs on the target port.
 
     Accepts the deny-logger ``deny`` variant (the primary expectation)
-    OR the alternative layers mentioned in the plan (``dns.query_denied``,
-    ``envoy.connection_denied``).  The real assertion is "at least one
+    OR either alternative layer, ``dns.query_denied`` and
+    ``envoy.connection_denied``.  The real assertion is "at least one
     deny event per target host" — the exact layer is not fixed.
     """
     layer = event.get("layer")

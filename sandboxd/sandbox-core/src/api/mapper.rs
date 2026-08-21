@@ -613,7 +613,7 @@ mod tests {
         let dto = SessionDto::from(&session);
 
         // Stored values pass through untouched. `cpus` is `f32`
-        // post-todo-#67; `0` parses on the wire as `0.0_f32`.
+        // on the wire, so `0` parses as `0.0_f32`.
         assert_eq!(dto.config.cpus, 0.0_f32);
         assert_eq!(dto.config.memory_mb, 0);
 
@@ -673,7 +673,7 @@ mod tests {
         let session = Session::new(Some("lima-default".into()));
         let dto = SessionDto::from(&session);
         assert_eq!(dto.backend, crate::backend::BackendKind::Lima);
-        // `cpus` is `f32` post-todo-#67; widened to f64 for the
+        // `cpus` is `f32` on the wire; widened to f64 for the
         // resolved-field comparison.
         assert!(
             (dto.config.cpus as f64 - dto.config.resolved_cpus).abs() < f64::EPSILON,

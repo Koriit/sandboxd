@@ -16,7 +16,7 @@
 //! is captured by the `event` discriminator on the bus rather than a
 //! separate domain pipeline ("additive change, not a new pipeline").
 //!
-//! The on-disk shape follows the event wire format / "Deny-logger component":
+//! The on-disk shape is:
 //!
 //! - Common envelope fields `timestamp`, `layer`, `event`.
 //! - `deny` / `allow` payload (traffic event for `deny-logger`,

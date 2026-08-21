@@ -1725,7 +1725,7 @@ fn display_session(session: &SessionDto) {
 ///
 /// `f32` formatting omits a trailing `.0` for integer-valued
 /// fractions (e.g. `2.0` → `2`) so Lima sessions render the same
-/// way as before todo #67. The `:.1` formatting on container
+/// way they did when `cpus` was an integer. The `:.1` on container
 /// fractions preserves the 1-decimal grammar.
 fn format_cpus_field(config: &sandbox_core::SessionConfigDto) -> String {
     if config.cpus == 0.0 {
@@ -1737,8 +1737,8 @@ fn format_cpus_field(config: &sandbox_core::SessionConfigDto) -> String {
     } else if config.cpus.fract() == 0.0 {
         // Integer-valued fraction: render without trailing ".0" so
         // Lima sessions ("CPUs:     2") and explicit container
-        // sessions ("CPUs:     4") produce the same output as
-        // pre-todo-#67 builds.
+        // sessions ("CPUs:     4") produce the same output as they
+        // did when `cpus` was an integer.
         format!("{}", config.cpus as u32)
     } else {
         format!("{:.1}", config.cpus)
@@ -9134,7 +9134,7 @@ mod tests {
 
     /// Operator-supplied integer ceiling (e.g. Lima default `2`):
     /// render without trailing `.0` so the display matches the
-    /// pre-todo-#67 shape Lima operators are used to.
+    /// integer shape Lima operators are used to.
     #[test]
     fn format_cpus_field_integer_value_renders_without_trailing_dot_zero() {
         let dto_config = sandbox_core::SessionConfigDto {

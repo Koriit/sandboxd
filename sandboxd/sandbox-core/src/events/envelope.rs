@@ -105,8 +105,8 @@ impl Event {
 
 /// Per-layer traffic event.
 ///
-/// Variants correspond 1:1 to the `Layer` column of the event wire format
-/// / "Traffic events".
+/// Variants correspond 1:1 to the `layer` discriminator carried on the
+/// wire by [`crate::api::event_dto`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrafficEvent {
     /// CoreDNS policy-plugin decision on a client DNS query.

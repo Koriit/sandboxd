@@ -121,7 +121,7 @@ def _get_session_json(socket_path: str, session_id: str, timeout: float = 5.0) -
     ``httpx`` / ``aiohttp``); used by the resource-defaults assertion
     so the test can read the daemon's authoritative wire shape rather
     than the CLI describe/inspect surface (which currently shows the
-    persisted ``0`` sentinel — todo #69 tracks the cosmetic fix).
+    persisted ``0`` sentinel, a known cosmetic defect).
     """
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
@@ -275,7 +275,7 @@ def test_lite_resource_defaults_match_host_80pct(lite_harness, sandbox_daemon):
     The assertion path: read the resolved values from the daemon's
     ``GET /sessions/<id>`` JSON (not from ``sandbox describe -v``,
     which currently surfaces the persisted ``0`` sentinel as
-    ``CPUs: 0, Memory: 0 MB`` — todo #69 tracks the cosmetic fix).
+    ``CPUs: 0, Memory: 0 MB``, a known cosmetic defect).
     Compare against ``HostResources.from_host()``, which mirrors the
     daemon's ``compute_default_resource_limits`` formula.
     """
@@ -736,7 +736,7 @@ def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
 
 # ---------------------------------------------------------------------------
 # 3.11 — orphan reaper cleans stranded container + home volume on daemon
-# restart (todo #71 — pytest equivalent of the Phase 5B Rust integration test
+# restart (pytest equivalent of the Phase 5B Rust integration test
 # `integration_orphan_reaper_removes_orphans_and_preserves_live_resources`)
 # ---------------------------------------------------------------------------
 

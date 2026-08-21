@@ -1,8 +1,8 @@
 //! End-to-end integration test for the cross-user SSH proxy
 //! substrate.
 //!
-//! Proves the load-bearing claim that decision (b) on todo #221 (the
-//! synthetic `/etc/passwd` overlay) is sufficient to let sshd start
+//! Proves the load-bearing claim that the synthetic `/etc/passwd`
+//! overlay is sufficient to let sshd start
 //! and accept the daemon-staged `authorized_keys` when the container
 //! runs under a daemon uid that is NOT the in-image `sandbox` user's
 //! uid (1000). Without this, the cross-user CLI access design
@@ -211,8 +211,8 @@ fn wait_for(container: &str, deadline: Duration, mut pred: impl FnMut(&str) -> b
 ///    (`/run/sandbox/authorized_keys`, `/etc/passwd`, `/etc/group`)
 ///    line up with the lite-image's sshd config (`AuthorizedKeysFile
 ///    /run/sandbox/authorized_keys`) and OpenSSH's lookup paths.
-/// 4. The synthetic `/etc/passwd` overlay (todo #221 decision (b))
-///    resolves `getpwuid(9876)` so sshd starts at all.
+/// 4. The synthetic `/etc/passwd` overlay resolves `getpwuid(9876)`
+///    so sshd starts at all.
 ///
 /// All four together are what the cross-user CLI proxy substrate
 /// promises; if the test passes the daemon-side WebSocket proxy and
