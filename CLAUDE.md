@@ -176,10 +176,31 @@ Do **not** blanket `docker system prune -a` mid-session — it evicts the tagged
 ### `target/` bloat stalls exec on macOS (distinct from ENOSPC)
 
 A `target/` dir that has grown without a `cargo clean` for a long time
-stops binaries from *starting*, independently of free disk space. The
-symptom is a freshly-built binary hanging at `_dyld_start`, which hangs
-`make test` with no useful output. Sessions have hit ~150 GB / ~1.4 M
-files with `target/debug/deps` at the 65535 hard-link cap.
+stops binaries from *starting*, independently of free disk space. It has
+two presentations, and the second is routinely misattributed:
+
+- A freshly-built binary hangs at `_dyld_start`, which hangs `make test`
+  with no useful output.
+- A test run exits **144 with an empty run phase** after a clean build,
+  and fails to reproduce on a retry.
+
+**The observable is the hard-link count, not the size.** Two instances
+of the identical failure measured ~150 GB / ~1.4 M files and ~25 GB /
+~489 k files — a sixfold spread in size and a threefold spread in file
+count. Any size threshold you carry in your head will therefore talk you
+out of the diagnosis on the smaller one. What is invariant is
+`target/debug/deps` reaching the 65535 hard-link cap, so measure that
+directly instead of eyeballing `du`:
+
+```bash
+find sandboxd/target/debug/deps -type f -exec stat -f '%l' {} + \
+  | sort -rn | head -1
+```
+
+`65535` is the fault; a healthy tree reads `2`. **Free space is not a
+signal in either direction** — both instances had hundreds of GB free
+throughout, so `df` reports the disk is fine, and that report is true
+and useless.
 
 This is **not** covered by the `make test` self-signing step — signing
 and this are separate failures that present almost identically, so
@@ -193,8 +214,21 @@ the host, and they are usually not the cause.
 
 **Fix:** `cargo clean` (in `sandboxd/`), then rebuild. Worth doing
 periodically on a long-lived dev host rather than waiting for the hang —
-`du -sh sandboxd/target` climbing into the tens of GB is the early
-signal.
+run the link-count probe above as the early signal, not a size check.
+
+`cargo clean` will report a byte total much larger than the space the
+filesystem gives back: one run printed `Removed 485938 files, 55.0GiB
+total` while free space moved by 25 GiB. **That disagreement is the
+fingerprint of this bug, not a discrepancy to reconcile** — cargo sums
+file sizes, the filesystem counts a hard-linked file once, and the gap
+is exactly the duplication that caused the failure. Do not repeat
+cargo's figure as space reclaimed.
+
+Confirming the fix is a different operation from diagnosing it. The
+`/tmp` copy above diagnoses; only running a binary **in place** under
+`target/` shows the failure is gone, because that is where it happened.
+On a shared tree, tell the other agents afterwards — their next compile
+is a full cold rebuild, not a new fault.
 
 ## Rust workspace
 
