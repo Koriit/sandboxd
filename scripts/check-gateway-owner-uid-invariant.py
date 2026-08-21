@@ -811,10 +811,33 @@ MIN_SCANNED_FRACTION = 0.60
 # The collapsed selector covered NONE of them.  Nothing about "0 violations"
 # would ever have shown that; the ratio shows it on the first line of output.
 #
-# It is a FLOOR, not an equality, and the two exceptions are why: `health_check`
-# takes only `State`, and `version_handler` takes no parameters at all. Neither
-# can name a caller, so neither is misclassified -- excluding them is correct,
-# and a rule demanding 17/17 would be a false rule.
+# It is a FLOOR, not an equality, and the two exceptions are why.  Re-measured
+# against the committed revision rather than inherited from the line above, and
+# the set difference is computed, not recalled: of 17 registered handlers, the
+# two outside `served` are `health_check` and `version_handler`.  Both are
+# legitimately out, for reasons that are properties of the endpoints:
+#
+#   version_handler  -- takes no parameters at all and returns
+#                       env!("CARGO_PKG_VERSION").  There is no caller identity
+#                       in scope to carry, in any spelling.
+#   health_check     -- takes only `State`.  It is daemon-wide in *which
+#                       sessions it lists* on purpose (it reads every row, not
+#                       the caller's), so a caller identity in its signature
+#                       would be the wrong shape.  Note this does NOT mean it
+#                       probes a daemon-wide gateway: it derives a per-session
+#                       operator from each row via
+#                       `gateway_operator_for_session` and probes that one.  It
+#                       is already converted; it is simply converted per row
+#                       rather than per caller.
+#
+# So neither is a selector miss and neither is unconverted work.  A rule
+# demanding 17/17 would be a false rule, and 15/17 is the correct ceiling until
+# a route is added that takes a caller identity.
+#
+# What this ratio does NOT bound: it counts handlers the clauses APPLY to, not
+# sinks the clauses COVER.  A handler inside `served` can still perform an
+# owner-keyed call that no clause reads.  Being in the 15 is necessary for
+# C1/C2/C4 to reach a site, never sufficient.
 ROUTE_HANDLER = re.compile(
     r"\.route\s*\([^)]*?\b(?:get|post|delete|put|patch)\s*\(\s*([A-Za-z0-9_]+)")
 MIN_HANDLER_COVERAGE = 0.50
