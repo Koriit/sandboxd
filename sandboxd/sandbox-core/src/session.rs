@@ -1150,9 +1150,15 @@ pub struct Session {
     /// route an operation lands in and is the pivot target handed to
     /// `sandbox-lima-helper`; substituting one does not neutralise the
     /// field, it silently resolves it against the daemon's own
-    /// identity instead of the session owner's. Every path that would
-    /// act on such a row refuses it — see `LimaRuntime::create` /
-    /// `start` and `GuestConnector::send_request`.
+    /// identity instead of the session owner's. Consumers take one of
+    /// three dispositions, keyed on what they do rather than on where
+    /// they sit: anything that mutates or locates a runtime **refuses**
+    /// the row, health reporting **reports** it as an error state
+    /// without refusing, and read-only enrichment **skips** the
+    /// operator-derived fields and serves the rest. No consumer
+    /// substitutes a uid. The dispositions are named here rather than
+    /// enumerated as call sites, because a locator list decays while
+    /// the property does not.
     ///
     /// **Do not read the V009 migration as a guarantee that this is
     /// always `Some`.** V009 is a one-shot
@@ -1172,8 +1178,15 @@ pub struct Session {
     /// is indistinguishable *as data* from any other and only its
     /// timing identifies the cause: rows already `None` at startup are
     /// listed by `SessionStore::operatorless_session_ids`, while one
-    /// appearing later is a defect in this daemon and surfaces
-    /// per-request as an internal error.
+    /// appearing later is a defect in this daemon.
+    ///
+    /// How a later one becomes visible depends on which disposition
+    /// the request happens to hit — an internal error from a refusing
+    /// path, a reported error state from health, and **nothing at all**
+    /// from read-only enrichment, which serves the row minus its
+    /// operator-derived fields. So no single request shape observes
+    /// every such row, and the startup scan is the only surface that
+    /// does.
     ///
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
     /// keeps the JSON envelope omitted when absent so an older daemon

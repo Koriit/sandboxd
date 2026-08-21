@@ -1116,6 +1116,29 @@ mod tests {
     /// `ContainerRuntime::guest_transport` builds its `DockerRoute` from it.
     /// Pinning the container case keeps that correction from silently
     /// regressing.
+    ///
+    /// **What this test does not establish.** The commit that added it
+    /// (`0ffd88e`) concluded that substituting 0 "resolved it against the
+    /// daemon's own identity instead of the session owner's — and the
+    /// substitution was silent, so a row that should have been refused was
+    /// served instead". A `git blame` lands a reader on that message, and it
+    /// cannot be corrected where it is written, so the correction lives here.
+    ///
+    /// The second half holds and is what this fixture measures: the row **was
+    /// served**. The first half does not follow from it. This test runs
+    /// against `StubRuntime::guest_transport`, which binds the uid to
+    /// `_operator_uid` and discards it; there is no `ContainerNetwork` and no
+    /// `route_for` anywhere in the fixture. So the pre-fix `Pong` proves the
+    /// refusal was absent and the request reached the transport seam, and
+    /// proves nothing about which identity a route would have resolved to.
+    ///
+    /// Establishing the stronger claim needs a route actually built, and on
+    /// macOS it additionally needs `SANDBOX_PER_OPERATOR_GATEWAY` on:
+    /// `gateway_owner_uid_in_mode` returns `Uid::current().as_raw()` for every
+    /// operator uid while the switch is off, so with it off a substituted uid
+    /// and the true one yield the *identical* route — the claim is not merely
+    /// unproven there but unfalsifiable. The Lima path does not depend on that
+    /// switch: `sandbox-lima-helper` rejects an `--op-uid` of 0 outright.
     #[tokio::test]
     async fn guest_connector_refuses_session_without_operator_uid() {
         let (_temp, store, runtimes, observed) = build_dispatch_fixture();
