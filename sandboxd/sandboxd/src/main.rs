@@ -4299,7 +4299,7 @@ async fn create_session(
     // shape returned by `GET /sessions/{id}`.  `policy` is populated from
     // the in-memory map if the caller supplied an initial policy.
     let agent_status = probe_agent_status(&state, &created).await;
-    let gateway_status = probe_gateway_status(&state, &created).await;
+    let gateway_status = probe_gateway_status(&state, &created, operator.uid).await;
 
     let policy_opt = {
         let policies = state.session_policies.lock().await;
@@ -4350,7 +4350,17 @@ async fn probe_agent_status(state: &AppState, session: &Session) -> Option<Strin
 /// the `SessionDto.gateway_status` field.
 ///
 /// Returns `None` when the session is not `Running`.
-async fn probe_gateway_status(state: &AppState, session: &Session) -> Option<String> {
+///
+/// `operator_uid` names the gateway to probe. Every caller is an authenticated
+/// handler that reached this session through the per-caller store filter, so
+/// the session's owner *is* the connected operator and the uid is the one the
+/// kernel reported for the connection — there is no resolution to do and no
+/// way for it to be unavailable.
+async fn probe_gateway_status(
+    state: &AppState,
+    session: &Session,
+    operator_uid: u32,
+) -> Option<String> {
     if session.state != SessionState::Running {
         return None;
     }
@@ -4359,7 +4369,7 @@ async fn probe_gateway_status(state: &AppState, session: &Session) -> Option<Str
     // manager could not see gateway containers running inside the VM and
     // reported `not_running` even when the gateway was `Up (healthy)`. On Linux
     // `gateway_for_probes` returns `state.gateway` — byte-identical behaviour.
-    let gateway = gateway_for_probes(state);
+    let gateway = gateway_for_probes(state, operator_uid);
     let sid = session.id;
     Some(
         tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
@@ -4411,27 +4421,46 @@ fn macos_networking_status_from(
     )
 }
 
-/// Return a `GatewayManager` suitable for health probes against the given session.
+/// Return a `GatewayManager` suitable for health probes against the given
+/// session, on the gateway belonging to `operator_uid`.
 ///
 /// On Linux, returns the system-socket manager held in `AppState::gateway`
-/// (unchanged from existing behaviour). On macOS, builds one on the VM route
-/// so that probes reach the Docker daemon inside the gateway VM rather than
-/// the host's (which has no knowledge of the Lima gateway containers).
+/// (unchanged from existing behaviour). On macOS, builds one on that
+/// operator's VM route so that probes reach the Docker daemon inside the
+/// gateway VM rather than the host's (which has no knowledge of the Lima
+/// gateway containers).
+///
+/// `operator_uid` is the *operator's* uid, not the gateway owner's — the
+/// collapse to an owner is [`AppState::docker_route_for_operator`]'s, applied
+/// once there rather than at each call site.
+///
+/// The parameter is required rather than optional on purpose. An `Option`
+/// would let a call site spell "no operator" for two unrelated reasons — a
+/// gateway that really is daemon-wide, and one nobody has converted yet — and
+/// nothing at the site would say which. A required uid makes every caller
+/// answer the question, and a caller that has to resolve one is a caller whose
+/// answer can be read.
 ///
 /// Centralising the platform branch here keeps `gateway_monitor` and
 /// `poll_and_emit_component_health` free of scattered `cfg!` blocks while
-/// keeping the Linux code path byte-identical.
-fn gateway_for_probes(state: &AppState) -> Arc<GatewayManager> {
+/// keeping the Linux code path byte-identical: there is no gateway VM on
+/// Linux, so the uid reaches a manager that does not consult it.
+fn gateway_for_probes(state: &AppState, operator_uid: u32) -> Arc<GatewayManager> {
     #[cfg(target_os = "macos")]
     {
         // The `return` is required so the compiler does not see the
         // `#[cfg(not(target_os = "macos"))]` expression below as unreachable on
         // macOS builds, while the Linux build only compiles the cfg(not) arm.
         #[allow(clippy::needless_return)]
-        return Arc::new(GatewayManager::with_route(state.docker.clone()));
+        return Arc::new(GatewayManager::with_route(
+            state.docker_route_for_operator(operator_uid),
+        ));
     }
     #[cfg(not(target_os = "macos"))]
-    Arc::clone(&state.gateway)
+    {
+        let _ = operator_uid;
+        Arc::clone(&state.gateway)
+    }
 }
 
 /// Record the gateway container's address on the shared egress bridge.
@@ -4461,23 +4490,35 @@ fn record_gateway_egress_ip(
 
 /// Return a `GatewayManager` suitable for the policy/DNS distribution plane
 /// (policy apply, DNS propagation, the synchronous DNS gate) against the
-/// given session's gateway.
+/// gateway belonging to `operator_uid`.
 ///
 /// Mirrors [`gateway_for_probes`] — the two are the same construction and
-/// differ only in which consumer asks. Threading this into the
-/// distributor / propagation loop / gate makes their policy-file writes, nft
-/// injection and in-container listener delivery reach the gateway container
-/// running inside the VM (a host `docker exec` reports `No such container`).
+/// differ only in which consumer asks, including the required-uid argument
+/// and its reasons. Threading this into the distributor / propagation loop /
+/// gate makes their policy-file writes, nft injection and in-container
+/// listener delivery reach the gateway container running inside the VM (a
+/// host `docker exec` reports `No such container`).
+///
 /// Kept separate from [`gateway_for_probes`] because the two answer different
 /// questions and a future divergence belongs on one of them, not on a `bool`.
-fn gateway_for_policy(state: &AppState) -> Arc<GatewayManager> {
+///
+/// The uid matters more here than it does for a probe. A probe aimed at the
+/// wrong gateway reports the wrong health; a policy write aimed at the wrong
+/// gateway either fails loudly (no such container) or, worse, lands an
+/// allow-list on containers it was never compiled for.
+fn gateway_for_policy(state: &AppState, operator_uid: u32) -> Arc<GatewayManager> {
     #[cfg(target_os = "macos")]
     {
         #[allow(clippy::needless_return)]
-        return Arc::new(GatewayManager::with_route(state.docker.clone()));
+        return Arc::new(GatewayManager::with_route(
+            state.docker_route_for_operator(operator_uid),
+        ));
     }
     #[cfg(not(target_os = "macos"))]
-    Arc::clone(&state.gateway)
+    {
+        let _ = operator_uid;
+        Arc::clone(&state.gateway)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5107,7 +5148,7 @@ async fn create_session_macos_lima(
         Err(e) => return error_response(e).into_response(),
     };
     let agent_status = probe_agent_status(&state, &created).await;
-    let gateway_status = probe_gateway_status(&state, &created).await;
+    let gateway_status = probe_gateway_status(&state, &created, operator.uid).await;
     let networking_status = macos_networking_status_for(&state, &created).await;
     let policy_opt = {
         state
@@ -6146,7 +6187,7 @@ async fn create_session_macos_lite(
         Err(e) => return error_response(e).into_response(),
     };
     let agent_status = probe_agent_status(&state, &created).await;
-    let gateway_status = probe_gateway_status(&state, &created).await;
+    let gateway_status = probe_gateway_status(&state, &created, operator.uid).await;
     let policy_opt = {
         state
             .session_policies
@@ -6502,7 +6543,7 @@ async fn start_session_macos_lite(
     };
 
     let agent_status = probe_agent_status(&state, &refreshed).await;
-    let gateway_status = probe_gateway_status(&state, &refreshed).await;
+    let gateway_status = probe_gateway_status(&state, &refreshed, operator.uid).await;
     let policy_opt = {
         let policies = state.session_policies.lock().await;
         policies.get(&refreshed.id).cloned()
@@ -6945,7 +6986,7 @@ async fn list_sessions(
     let mut enriched: Vec<SessionDto> = Vec::with_capacity(reconciled.len());
     for session in reconciled {
         let agent_status = probe_agent_status(&state, &session).await;
-        let gateway_status = probe_gateway_status(&state, &session).await;
+        let gateway_status = probe_gateway_status(&state, &session, operator.uid).await;
         #[cfg(target_os = "macos")]
         let networking_status = macos_networking_status_for(&state, &session).await;
         #[cfg(not(target_os = "macos"))]
@@ -7005,7 +7046,7 @@ async fn get_session(
 
     // Probe guest agent and gateway for running sessions.
     let agent_status = probe_agent_status(&state, &session).await;
-    let gateway_status = probe_gateway_status(&state, &session).await;
+    let gateway_status = probe_gateway_status(&state, &session, operator.uid).await;
 
     // Look up the currently applied policy in the in-memory map. The
     // map is the source of truth at runtime; on-disk persistence
@@ -7423,7 +7464,7 @@ async fn start_session(
     };
 
     let agent_status = probe_agent_status(&state, &refreshed).await;
-    let gateway_status = probe_gateway_status(&state, &refreshed).await;
+    let gateway_status = probe_gateway_status(&state, &refreshed, operator.uid).await;
     let policy_opt = {
         let policies = state.session_policies.lock().await;
         policies.get(&refreshed.id).cloned()
@@ -8302,6 +8343,28 @@ async fn clear_session_policy(
     caller_username: &str,
     state: &AppState,
 ) -> Result<(), SandboxError> {
+    // The gateway holding this session's policy is the one its operator owns.
+    // Resolved before anything is read, written or deleted, so a decline
+    // leaves the session exactly as it was.
+    //
+    // A decline is an error rather than a quiet skip because this function's
+    // caller answers the operator `policy cleared; session is now fail-closed`
+    // on `Ok(())`. Returning `Ok` without having reached a gateway would say
+    // that while the previous allow-list is still installed on one — telling
+    // the operator a session is closed at the moment it is not. Every other
+    // way this function fails already leaves the old policy in place and says
+    // so; this is that same case.
+    let operator_uid =
+        match gateway_operator_for_session(session_id, state, "session policy clear").await {
+            Some(uid) => uid,
+            None => {
+                return Err(SandboxError::Internal(format!(
+                    "no gateway can be attributed to session {session_id}, so its policy was not \
+                     cleared. Whatever policy was last applied is still installed on its gateway."
+                )));
+            }
+        };
+
     let network_info = state
         .store
         .get_network_info(session_id, caller_username)?
@@ -8330,7 +8393,7 @@ async fn clear_session_policy(
     // gateway container; `compiled` is moved into the closure since it has
     // no further use on this path.
     {
-        let gw = gateway_for_policy(state);
+        let gw = gateway_for_policy(state, operator_uid);
         let sid = *session_id;
         match tokio::task::spawn_blocking(move || {
             PolicyDistributor::distribute(&sid, &compiled, &gw)
@@ -8496,6 +8559,30 @@ async fn apply_policy_inner(
     policy: &Policy,
     state: &AppState,
 ) -> Result<(), SandboxError> {
+    // The gateway this policy belongs on is the one the session's operator
+    // owns. Resolved before the policy is compiled, persisted or published, so
+    // a decline leaves no half-applied state behind.
+    //
+    // A decline is an error rather than a quiet skip because the caller turns
+    // `Ok(())` into a `policy_applied` / `policy_updated` event and a success
+    // response. An allow-list that never reached a gateway must not be
+    // announced as applied — the session would keep enforcing the policy it
+    // already had while every consumer believed it had the new one. Returning
+    // `Err` is fail-closed in the direction that matters: the unapplied rules
+    // are the *permissive* ones, so the session stays at least as closed as it
+    // was, and the failure is on the wire instead of only in the log.
+    let operator_uid =
+        match gateway_operator_for_session(session_id, state, "session policy apply").await {
+            Some(uid) => uid,
+            None => {
+                return Err(SandboxError::Internal(format!(
+                    "no gateway can be attributed to session {session_id}, so the policy was not \
+                     applied. The session continues to enforce whatever policy was last \
+                     distributed to it."
+                )));
+            }
+        };
+
     // Look up network info for this session.
     let network_info = state
         .store
@@ -8519,7 +8606,7 @@ async fn apply_policy_inner(
     // `compiled` is moved into the closure since it has no further use
     // on this path.
     {
-        let gw = gateway_for_policy(state);
+        let gw = gateway_for_policy(state, operator_uid);
         let sid = *session_id;
         match tokio::task::spawn_blocking(move || {
             PolicyDistributor::distribute(&sid, &compiled, &gw)
@@ -8593,7 +8680,18 @@ async fn apply_policy_inner(
 /// Start (or restart) the DNS propagation background loop for a session.
 ///
 /// If a loop is already running for this session, it is cancelled first.
+///
+/// Fail-closed on a decline: the loop's only effect is to turn resolved
+/// domains into nftables *allow* rules, so a loop that never starts adds no
+/// reachability. Resolved before the existing loop is cancelled, so a decline
+/// is a no-op rather than a teardown with no replacement.
 async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
+    let Some(operator_uid) =
+        gateway_operator_for_session(session_id, state, "DNS propagation loop start").await
+    else {
+        return;
+    };
+
     // Cancel any existing loop for this session (but preserve the policy).
     {
         let mut handles = state.dns_loop_handles.lock().await;
@@ -8610,7 +8708,7 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     // On Linux this is `state.gateway` (host socket, unchanged). On macOS
     // it routes the loop's listener rewrite + nft injection through the
     // forwarded gateway-VM socket so they reach the in-VM gateway container.
-    let gateway = gateway_for_policy(state);
+    let gateway = gateway_for_policy(state, operator_uid);
     let propagation_states = Arc::clone(&state.propagation_states);
     let event_bus = state.event_bus.clone();
 
@@ -8713,6 +8811,20 @@ async fn drop_dns_cache(state: &AppState, session_id: &SessionId) {
 /// (the events host directory is created by `create_gateway` itself, so
 /// this should run after `create_gateway` returns).
 async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
+    // The gate answers "may this domain be reached", and it answers it against
+    // a gateway — resolved up front so a decline leaves the prior listener
+    // serving instead of aborting it and then having nothing to re-bind.
+    //
+    // Fail-closed on a decline: a session with no gate listener is a session
+    // whose CoreDNS gate query cannot be answered, and an unanswered gate is a
+    // denied domain. This is the same arm as the bind failure below, which the
+    // existing code already treats as "synchronous DNS gating disabled".
+    let Some(operator_uid) =
+        gateway_operator_for_session(session_id, state, "DNS-gate listener start").await
+    else {
+        return;
+    };
+
     // Cancel any prior listener for this session before re-binding.
     {
         let mut handles = state.dns_gate_handles.lock().await;
@@ -8773,7 +8885,7 @@ async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
         // gateway-VM-socket manager on macOS so the gate's
         // `propagate_dns_changes` (listener rewrite + nft) reaches the
         // in-VM gateway container.
-        gateway: gateway_for_policy(state),
+        gateway: gateway_for_policy(state, operator_uid),
         session_policies: Arc::clone(&state.session_policies),
         dns_cache: cache,
         network_info,
@@ -8936,6 +9048,45 @@ async fn gateway_operator_or_decline(
             );
             None
         }
+    }
+}
+
+/// The operator uid whose gateway a session's work belongs on, for the call
+/// sites that hold a session id and no operator identity.
+///
+/// macOS delegates to [`gateway_operator_or_decline`] and adds nothing: same
+/// resolution, same `error!` line, same `Degraded` marking, same entry in the
+/// decline report, same `None`-is-the-decline contract. It exists so the
+/// callers that are *not* macOS-only — the gateway monitor, the daemon health
+/// endpoint, the policy plane — do not each carry their own copy of the
+/// platform branch.
+///
+/// On Linux there is no gateway VM and so no operator to resolve: every
+/// gateway container lives on the host Docker daemon that the daemon itself
+/// talks to, the manager built from this uid does not consult it, and the
+/// answer is the daemon's own uid. It can never decline there, which is what
+/// keeps the Linux behaviour identical to what it was before any of this took
+/// a uid.
+///
+/// Call sites holding an authenticated `OperatorIdentity` deliberately do not
+/// come through here. `operator.uid` is kernel-supplied from the peer
+/// credential and resolved strictly at accept time, so it exists by
+/// construction; re-deriving the same identity from the session's stored rows
+/// would only add a way for it to fail.
+async fn gateway_operator_for_session(
+    session_id: &SessionId,
+    state: &AppState,
+    declined_operation: &str,
+) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        #[allow(clippy::needless_return)]
+        return gateway_operator_or_decline(session_id, state, declined_operation).await;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session_id, declined_operation);
+        Some(state.daemon_uid)
     }
 }
 
@@ -10743,6 +10894,24 @@ async fn restore_session_networking_lite(
     Ok(())
 }
 
+/// The gateway status reported by `GET /health` for a session whose owning
+/// operator does not resolve, and whose gateway therefore cannot be named.
+///
+/// Deliberately spelled in the vocabulary [`format_gateway_status`] already
+/// emits — an `error:` prefix carrying a reason — rather than as a new token,
+/// so the decline needs no new field on the health payload.
+///
+/// Nothing in this tree branches on the value. The `gateway_status` the CLI
+/// renders is `SessionDto`'s, a different field filled by
+/// [`probe_gateway_status`], and it is printed verbatim rather than compared;
+/// this endpoint's `gateways[].gateway_status` has no in-tree reader at all.
+/// So the audience is a human or an external monitor, and matching the
+/// existing shape is what makes the line legible to them: an `error:` prefix
+/// is already how this field says a probe did not come back with a verdict,
+/// and this is that case — there was no gateway to ask.
+const GATEWAY_STATUS_OPERATOR_UNRESOLVED: &str =
+    "error: no gateway can be attributed to this session (its operator does not resolve)";
+
 /// Format a `GatewayStatus` into a human-readable string for the API response.
 fn format_gateway_status(gateway: &GatewayManager, session_id: &SessionId) -> String {
     match gateway.gateway_status(session_id) {
@@ -10815,8 +10984,11 @@ async fn session_health(
     let (container_status, envoy, mitmproxy, coredns) = if session.state == SessionState::Running {
         // `gateway_for_probes` targets the forwarded gateway-VM socket on
         // macOS so lite/Lima gateway containers are observed inside the VM
-        // (Linux: byte-identical to `state.gateway`).
-        let gateway = gateway_for_probes(&state);
+        // (Linux: byte-identical to `state.gateway`). The operator whose
+        // gateway that is, is the one on the other end of this request: the
+        // session was fetched through the per-caller filter, so it is theirs.
+        // The bridge check further down already routes on the same uid.
+        let gateway = gateway_for_probes(&state, operator.uid);
         let sid = session.id;
         let gw_result = tokio::task::spawn_blocking(move || gateway.gateway_status(&sid))
             .await
@@ -11230,9 +11402,28 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         if session.state != SessionState::Running {
             continue;
         }
+        // This endpoint is daemon-wide in *which sessions it lists* — it reads
+        // every row, not the caller's. That is not a claim about which gateway
+        // to probe: each listed session's gateway is the one its own operator
+        // owns, and the row to derive that from is in hand right here. Probing
+        // the daemon's own gateway for all of them would, under per-operator
+        // gateways, report every operator-owned session's health by asking a
+        // gateway that hosts none of it.
+        let operator_uid =
+            match gateway_operator_for_session(&session.id, &state, "gateway health probe").await {
+                Some(uid) => uid,
+                None => {
+                    statuses.push(serde_json::json!({
+                        "session_id": session.id,
+                        "name": session.name,
+                        "gateway_status": GATEWAY_STATUS_OPERATOR_UNRESOLVED,
+                    }));
+                    continue;
+                }
+            };
         // `gateway_for_probes` routes through the forwarded gateway-VM socket
         // on macOS (Linux: byte-identical to `state.gateway`).
-        let gateway = gateway_for_probes(&state);
+        let gateway = gateway_for_probes(&state, operator_uid);
         let sid = session.id;
         let gw_status = tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
             .await
@@ -12878,9 +13069,19 @@ const MONITORED_COMPONENTS: &[(&str, HealthComponent)] = &[
 /// Runs inside the gateway monitor loop, so `component_health` —
 /// which shells out to `docker exec` — is wrapped in
 /// `spawn_blocking`.
-async fn poll_and_emit_component_health(state: &AppState, session_id: &SessionId) {
+///
+/// `operator_uid` names the gateway whose components are polled. It is a
+/// parameter rather than something resolved here because the monitor loop has
+/// already resolved it for this session on this tick: resolving again inside
+/// the component loop would repeat the same lookup once per component and
+/// could report a decline five times for one session.
+async fn poll_and_emit_component_health(
+    state: &AppState,
+    session_id: &SessionId,
+    operator_uid: u32,
+) {
     for (label, component) in MONITORED_COMPONENTS {
-        let gw = gateway_for_probes(state);
+        let gw = gateway_for_probes(state, operator_uid);
         let sid = *session_id;
         let label_owned = (*label).to_string();
         let health = match tokio::task::spawn_blocking(move || {
@@ -12994,6 +13195,29 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 continue;
             }
 
+            // The gateway this session's health lives on is the one its
+            // operator owns. Resolved once per session per tick and reused by
+            // every probe below, so a decline is reported once rather than
+            // once per component and once per fallback.
+            //
+            // Resolved after the skip checks above so sessions this tick was
+            // never going to touch do not produce decline reports.
+            //
+            // A decline skips the session. That is the same shape as every
+            // other `continue` in this loop: the monitor's only powers are to
+            // observe and to re-create, so skipping leaves a broken gateway
+            // broken rather than rebuilding one on a gateway nothing chose.
+            let operator_uid = match gateway_operator_for_session(
+                &session.id,
+                &state,
+                "gateway health monitoring",
+            )
+            .await
+            {
+                Some(uid) => uid,
+                None => continue,
+            };
+
             // Poll per-component health and emit transitions.
             // Only components that *flipped* since
             // the last tick produce events, so the bus stays sparse
@@ -13003,7 +13227,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
             // down — and so a deny-logger flap inside the start-period
             // still produces a `health_degraded` event even before
             // Docker has flipped the container to unhealthy.
-            poll_and_emit_component_health(&state, &session.id).await;
+            poll_and_emit_component_health(&state, &session.id, operator_uid).await;
 
             // First-pass: read Docker's native per-container health
             // verdict (`docker inspect --format
@@ -13019,7 +13243,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
             // The contract: "Docker marks the container unhealthy.
             // sandboxd's existing gateway health polling observes this
             // and restarts the gateway container."
-            let gw = gateway_for_probes(&state);
+            let gw = gateway_for_probes(&state, operator_uid);
             let sid = session.id;
             let docker_health =
                 match tokio::task::spawn_blocking(move || gw.container_health_status(&sid)).await {
@@ -13074,7 +13298,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     // Fall back to the full `gateway_status` probe —
                     // it re-runs `/healthcheck.sh` and also returns
                     // `NotRunning` if `.State.Running == false`.
-                    let gw = gateway_for_probes(&state);
+                    let gw = gateway_for_probes(&state, operator_uid);
                     let sid = session.id;
                     let status_result =
                         tokio::task::spawn_blocking(move || gw.gateway_status(&sid)).await;
@@ -19150,6 +19374,75 @@ mod tests {
                 lines.iter().any(|l| l.contains(&first.id.to_string()))
                     && lines.iter().any(|l| l.contains(&second.id.to_string())),
                 "the report must name both sessions: {lines:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gateway-status vocabulary for a session with no attributable gateway
+    // -----------------------------------------------------------------------
+    //
+    // `GET /health` reports a declined session through the same free-form
+    // `gateway_status` string it uses for every other session, which is what
+    // lets the decline reach the wire without the health payload growing a
+    // field. Nothing in this tree branches on that string, so no other test
+    // constrains its shape and no consumer would break if it drifted — the
+    // reader it has to stay legible to is a human, and these are the only
+    // thing standing between the constant and a rewrite that loses that.
+    //
+    // What they catch is the change that breaks the argument: rewriting the
+    // constant into a bare new token, or into one of the words that means a
+    // gateway *was* reached. They cannot catch the mirror-image change —
+    // `format_gateway_status` growing a token of its own — because the two
+    // share no definition to check against. That is the cost of the field
+    // being free-form, and it is why the tokens below are restated rather
+    // than imported.
+
+    mod gateway_status_for_an_unattributable_gateway {
+        use super::*;
+
+        /// The tokens `format_gateway_status` emits for a gateway it *could*
+        /// name. Copied from that function rather than derived from it: it
+        /// builds them from a `GatewayManager`, which would have to reach a
+        /// real Docker daemon to produce one.
+        const REACHABLE_GATEWAY_TOKENS: &[&str] = &["healthy", "starting", "not_running"];
+
+        #[test]
+        fn a_session_whose_operator_is_unknown_never_reads_as_healthy() {
+            assert_ne!(
+                GATEWAY_STATUS_OPERATOR_UNRESOLVED, "healthy",
+                "`healthy` is what this field says when a gateway was probed and passed; a \
+                 session whose gateway cannot even be named must not say it"
+            );
+        }
+
+        #[test]
+        fn the_decline_is_not_confusable_with_a_probe_that_reached_a_gateway() {
+            for token in REACHABLE_GATEWAY_TOKENS {
+                assert_ne!(
+                    &GATEWAY_STATUS_OPERATOR_UNRESOLVED, token,
+                    "each of these means a gateway was found and asked; the decline means none \
+                     was found to ask"
+                );
+            }
+        }
+
+        #[test]
+        fn the_decline_reports_in_the_formatters_error_class() {
+            assert!(
+                GATEWAY_STATUS_OPERATOR_UNRESOLVED.starts_with("error: "),
+                "`format_gateway_status` renders a failed probe as `error: <reason>`. Sharing \
+                 that prefix is what puts the decline in a shape this field already uses for \
+                 `no verdict`, and is why it needs no new field: {GATEWAY_STATUS_OPERATOR_UNRESOLVED}"
+            );
+        }
+
+        #[test]
+        fn the_decline_says_what_could_not_be_determined() {
+            assert!(
+                GATEWAY_STATUS_OPERATOR_UNRESOLVED.contains("operator"),
+                "whoever reads `/health` gets only this string; a bare `error:` would leave \
+                 them with a fault and no name for it: {GATEWAY_STATUS_OPERATOR_UNRESOLVED}"
             );
         }
     }
