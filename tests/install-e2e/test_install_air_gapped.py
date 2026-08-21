@@ -85,7 +85,7 @@ def test_install_air_gapped(
     # Confirm install.sh will accept this binary (sha256 matches the pin).
     vm.shell("test -x /usr/local/bin/cosign", check=True, timeout=10)
 
-    # Comprehensive egress block per.6: drop ALL NEW outbound
+    # Comprehensive egress block: drop ALL NEW outbound
     # except loopback. ESTABLISHED/RELATED is kept so the limactl shell
     # session (a connection initiated from the host BEFORE the block
     # was installed) survives — without that exemption iptables would

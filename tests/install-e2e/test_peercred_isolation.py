@@ -648,7 +648,7 @@ def test_session_isolation_404_on_foreign_id(
 ):
     """A session owned by alice returns 404 when queried by bob.
 
-    Behavior pinned (the documented contract.5 + § 9.2):
+    Behavior pinned:
       * A session row owned by ``owner_username = alice`` is invisible
         to a peercred caller resolved as ``bob`` — the SessionStore
         filter rejects foreign-owner rows from every per-id endpoint

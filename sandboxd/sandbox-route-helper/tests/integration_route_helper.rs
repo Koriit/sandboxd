@@ -777,7 +777,7 @@ fn assert_audit_record_shape(
         Some(expected_pid as i64),
         "audit record pid mismatch: {r}"
     );
-    // `reason` field presence is decision-conditional per.5.
+    // `reason` field presence is decision-conditional.
     match expected_decision {
         "allowed" => assert!(
             r.get("reason").is_none(),
@@ -956,7 +956,7 @@ fn integration_route_helper_denies_for_user_mismatch() {
 // ---------------------------------------------------------------------------
 
 /// Helper runs WITHOUT `--for-user`; the flag defaults to the caller's
-/// name per.1, so pair-check is `(runner, runner)` against
+/// name, so pair-check is `(runner, runner)` against
 /// `[runner]` and succeeds. Otherwise identical to the explicit-flag
 /// allow-path test.
 #[test]
@@ -1054,7 +1054,7 @@ fn integration_route_helper_denies_when_caller_not_in_pool_even_with_valid_for_u
 // ---------------------------------------------------------------------------
 
 /// `--for-user` is a sentinel name that does not exist on the host.
-/// Per.4 this is a strict deny path — the helper denies
+/// This is a strict deny path — the helper denies
 /// before reaching pair-check (it cannot even establish the
 /// for-user's numeric uid).
 #[test]
@@ -1262,7 +1262,7 @@ fn integration_route_helper_writes_audit_log_on_allowed() {
         &runner,
         fixture.container_pid,
     );
-    // All.5 fields present on the allowed record (sans
+    // All audit-record fields present on the allowed record (sans
     // `reason`, asserted absent inside assert_audit_record_shape).
     assert_eq!(record["pool"].as_str(), Some(subnet));
     assert_eq!(record["gateway_ip"].as_str(), Some(gateway_ip));

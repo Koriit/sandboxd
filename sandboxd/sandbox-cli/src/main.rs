@@ -10509,7 +10509,7 @@ mod tests {
     fn version_handshake_refuses_on_skew_with_verbatim_stderr() {
         // The four tokens `version mismatch`, `CLI is`, `daemon is`,
         // and `both must match` are load-bearing — the integration
-        // test in.6 greps for them, and downstream scripts
+        // test greps for them, and downstream scripts
         // may match the wording to surface a friendly upgrade hint.
         let err = check_daemon_version_equality("1.0.3", "1.0.4")
             .expect_err("skewed pair must fail the equality predicate");
@@ -10536,7 +10536,7 @@ mod tests {
         // routes the `Err` to stderr and then exits.
         assert_eq!(
             CLI_VERSION_MISMATCH_EXIT_CODE, 2,
-            "version-mismatch exit code is pinned to 2 by.3"
+            "version-mismatch exit code is pinned to 2"
         );
     }
 
@@ -10645,8 +10645,8 @@ mod tests {
     // `sandbox --version` output format pin.
     //
     // The format is `sandbox <semver>\n` — exactly two space-separated
-    // tokens, with the semver in column 2. the documented contract.5's
-    // half-installed-state detection parses the output with
+    // tokens, with the semver in column 2. Half-installed-state
+    // detection parses the output with
     // `awk '{print $2}'`; a regression that adds a trailing token
     // (build SHA, commit hash, ...) would silently break that parse.
     // -----------------------------------------------------------------------
@@ -10655,7 +10655,7 @@ mod tests {
     fn sandbox_version_flag_produces_pinned_two_token_line() {
         // clap derives the `--version` output from `#[command(name,
         // version)]` — we render it here through the same builder and
-        // assert the exact `<name> <semver>\n` shape.6 pins.
+        // assert the exact `<name> <semver>\n` shape.
         use clap::CommandFactory;
         let rendered = Cli::command().render_version();
         assert_eq!(

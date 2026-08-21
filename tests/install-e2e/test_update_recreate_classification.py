@@ -1,4 +1,4 @@
-"""`sandbox update` confirmation prompt classifies stopped sessions — the install framework.1.7.
+"""`sandbox update` confirmation prompt classifies stopped sessions.
 
 When an operator runs ``sandbox update`` and the target binary's
 ``DAEMON_GUEST_PROTO_VERSION`` is incompatible with a stopped

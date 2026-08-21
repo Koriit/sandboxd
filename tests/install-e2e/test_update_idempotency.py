@@ -1,4 +1,4 @@
-"""`sandbox update` idempotency + partial-failure tests — the install framework.2, 9.1.
+"""`sandbox update` idempotency + partial-failure tests.
 
 Three end-to-end cases against a Lima VM:
 
@@ -250,7 +250,7 @@ def test_update_partial_failure_backup_set_preserved(
 ):
     """A real failure mid-update leaves the backup set with
     completed_ok=false and that set is preserved across the subsequent
-    successful run's retention prune. the install framework.2.19, 3.2.24, 5.2.
+    successful run's retention prune.
 
     Strategy:
       * Install base version.

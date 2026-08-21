@@ -2682,7 +2682,7 @@ pub(crate) fn render_report<W: std::io::Write>(
 
     // Default mode: when failures are present and we suppressed the
     // dependent-skips, the report can render with only the root-cause
-    // failure followed by the summary. The.3 partial-fail
+    // failure followed by the summary. The partial-fail
     // example shows the skipped rows present in non-verbose mode
     // *only* for the daemon-down case where they cascade. Emit a
     // blank line between the last printed row and the summary in
@@ -2912,8 +2912,7 @@ mod tests {
         );
     }
 
-    /// C4 — sandbox group absent → Skip with dev-mode annotation
-    /// per.2.
+    /// C4 — sandbox group absent → Skip with dev-mode annotation.
     #[cfg(target_os = "linux")]
     #[test]
     fn group_check_skips_when_sandbox_group_absent() {

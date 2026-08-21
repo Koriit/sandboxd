@@ -20,8 +20,7 @@
 //!    — defensive: if a handler ever reaches `ContainerRuntime::start`
 //!    with `for_user = None` AND a helper path configured, the runtime
 //!    returns `SandboxError::Internal` rather than silently dropping the
-//!    pair-check assertion. Pins.3's "programming error"
-//!    contract.
+//!    pair-check assertion. Pins the "programming error" contract.
 //!
 //! Profile selection: every test name is prefixed `integration_` so the
 //! `integration` nextest profile picks them up.
@@ -457,7 +456,7 @@ async fn integration_route_helper_for_user_falls_through_lima() {
     );
 }
 
-/// Defensive test for.3: if a handler ever dispatches through
+/// Defensive test: if a handler ever dispatches through
 /// `ContainerRuntime::start` with `for_user = None` AND the session
 /// has a `route_helper_path` configured, the runtime must surface an
 /// `Internal` error rather than silently invoking the helper with a
@@ -495,7 +494,7 @@ async fn integration_route_helper_missing_for_user_with_helper_path_errors() {
         .expect("runtime.create");
 
     // for_user is deliberately None even though route_helper_path is
-    // configured. This is the failure shape.3 names: a
+    // configured. This is the failure shape under test: a
     // programming error where a handler forgot the operator extension.
     let args = RuntimeStartArgs {
         for_user: None,

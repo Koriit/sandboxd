@@ -137,8 +137,8 @@ pub fn read_bridge_conf_schema_version(bytes: &[u8]) -> Result<u32, std::str::Ut
 ///
 /// A **missing** `bridge.conf` is **not** an error: the daemon does not
 /// require the file to exist (operators without QEMU/Lima never create
-/// it). This matches.7's text "the daemon reads bridge.conf
-/// for this check only; it does not otherwise parse the file."
+/// it). The daemon reads `bridge.conf` for this check only; it does
+/// not otherwise parse the file.
 pub fn validate_schema_version() -> Result<(), BridgeConfigError> {
     let path = bridge_conf_path();
     validate_schema_version_at(&path)

@@ -10,8 +10,8 @@ exists.
 This test guards against silent drift: any cosign bump that updates
 lib.sh without updating install.sh (or vice-versa) fails the build.
 
-the install framework.1.9 prescribes "Any future cosign pin bump touches exactly
-one file — scripts/lib.sh." This test reduces install.sh to a regenerated
+The cosign pin is meant to live in exactly one file — ``scripts/lib.sh``
+— so a bump touches only that file. This test reduces install.sh to a regenerated
 mirror: edit lib.sh, run this test, copy any mismatch into install.sh
 in one diff.
 """

@@ -627,7 +627,7 @@ def release_tarball_x86_64_bumped_chain(
     """Build a chain of N successively bumped release tarballs.
 
     ``test_update_backup_retention`` needs three real bumped binaries
-    in sequence (v → v+1 → v+2 → v+3) to verify the install framework.2's keep=2
+    in sequence (v → v+1 → v+2 → v+3) to verify the keep=2
     retention prune. The synthesised MANIFEST-only fake-bump path
     can't satisfy this: ``verify_version`` in the update flow queries
     the daemon's ``/version`` post-restart and aborts on mismatch.
@@ -1279,7 +1279,7 @@ def assert_doctor_passes(vm, *, user=None, timeout=60, sock_path=None):
     """Run `sandbox doctor` and assert it reports zero failures.
 
     The CLI's doctor command exit code is 0 on green; we also assert
-    the ``"checks passed, 0 failed"`` token per.2 — exit code
+    the ``"checks passed, 0 failed"`` token — exit code
     alone is insufficient because a broken doctor might silently exit 0
     without performing checks.
 

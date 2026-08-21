@@ -1,4 +1,4 @@
-"""`sandbox update` preserves operator-owned files — the install framework.5, 9.1.
+"""`sandbox update` preserves operator-owned files.
 
 Two preservation contracts are exercised end-to-end:
 
@@ -52,7 +52,7 @@ def test_update_preserves_systemd_drop_in(
 ):
     """A systemd drop-in survives the update bit-for-bit.
 
-    The drop-in is content the operator wrote — the install framework.5 commits
+    The drop-in is content the operator wrote — the update flow commits
     to never touching ``*.service.d``. ``§ 3.2.23 install systemd
     unit`` writes only ``sandboxd.service`` (the unit itself); the
     drop-in directory is operator territory.
@@ -151,10 +151,9 @@ def test_update_preserves_customized_users_conf(
 ):
     """A custom subnet added to users.conf survives the update.
 
-    The post-update file contains the operator's custom line. the documented design
-    § 5.5 + the install framework.5: the config-migration framework rewrites
-    structurally (schema_version stamp + canonical key order) but
-    preserves operator-added entries.
+    The post-update file contains the operator's custom line: the
+    config-migration framework rewrites structurally (schema_version
+    stamp + canonical key order) but preserves operator-added entries.
 
     Single-version-tarball caveat: with no actual schema migration
     pending, the framework's apply chain is a no-op and the file is
@@ -205,8 +204,7 @@ def test_update_preserves_customized_users_conf(
     # `from.is_file()` is true, so a directory short-circuits the
     # cosign call. Going through `--from <tarball>` would route
     # through cosign verify-blob and add noise that obscures the
-    # users.conf-preservation contract under test (the documented contract,
-    # the install framework.5).
+    # users.conf-preservation contract under test.
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_in_vm)
     stage_dir = "/tmp/sandbox-update-preserves-users-stage"

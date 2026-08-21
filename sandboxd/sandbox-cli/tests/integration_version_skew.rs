@@ -241,8 +241,8 @@ async fn integration_cli_version_subcommand_bypasses_handshake() {
     assert_eq!(
         stdout.trim_end_matches('\n'),
         format!("sandbox {}", env!("CARGO_PKG_VERSION")),
-        "`sandbox version` must print exactly `sandbox <CARGO_PKG_VERSION>\\n` \
-         per.6; got stdout = {stdout:?}"
+        "`sandbox version` must print exactly `sandbox <CARGO_PKG_VERSION>\\n`; \
+         got stdout = {stdout:?}"
     );
 
     // Most-important canary: the local-answer path never opens a

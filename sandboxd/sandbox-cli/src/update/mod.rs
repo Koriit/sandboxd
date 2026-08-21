@@ -843,7 +843,7 @@ pub struct PendingMigration {
 
 /// Convert a `ConfigMigration::name()` slug (snake_case module suffix
 /// such as `add_sandbox_to_allow_users`) into the human-friendly
-/// rendering.2 pins for `--check` output. Underscores
+/// rendering used for `--check` output. Underscores
 /// become spaces; everything else is left verbatim so existing
 /// migration names that already read naturally (e.g. a future
 /// `add per-pool rate limit metadata`-style slug) round-trip through
@@ -4610,7 +4610,7 @@ mod tests {
 
     /// `pending_migration_human_description` translates the
     /// snake_case migration slug used in `ConfigMigration::name()`
-    /// into the human-friendly rendering.2 pins for
+    /// into the human-friendly rendering used for
     /// `--check`. Underscores become spaces; everything else is
     /// verbatim. The default migration name shipped in the design
     /// (`add per-pool rate limit metadata`) already reads as a
@@ -4889,7 +4889,7 @@ mod tests {
 
     /// `render_confirmation_summary` renders the operator-visible
     /// three-bucket breakdown when the per-session classification was
-    /// computed; this pins the prompt shape.4
+    /// computed; this pins the prompt shape the
     /// recreate-classification contract calls for.
     #[test]
     fn confirmation_summary_renders_three_bucket_breakdown() {

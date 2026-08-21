@@ -1,4 +1,4 @@
-"""`sandbox update` + manual rollback per the install framework.2.
+"""`sandbox update` + manual rollback.
 
 the install framework ships only the documented manual rollback recipe; there is no
 automated ``sandbox rollback`` subcommand (§ 12 out of scope). This
@@ -37,7 +37,7 @@ def test_update_then_manual_rollback(
     release_tarball_x86_64_bumped,
     sigstore_stack,
 ):
-    """End-to-end rollback recipe from the install framework.2.
+    """End-to-end rollback recipe.
 
     Steps:
       1. Install base version v.

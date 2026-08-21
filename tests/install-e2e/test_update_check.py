@@ -1,4 +1,4 @@
-"""`sandbox update --check` no-mutation contract — the install framework.2, 6.4.
+"""`sandbox update --check` no-mutation contract.
 
 The `--check` and `--dry-run` modes are read-only: they must never
 acquire the lock, must not mutate the install state, and must not

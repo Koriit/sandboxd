@@ -11765,7 +11765,7 @@ async fn version_handler() -> impl IntoResponse {
 /// the per-session endpoints use — an operator cannot infer another
 /// operator's session ids from this surface.
 ///
-/// Authentication: yes (per.2). The endpoint extracts
+/// Authentication: yes. The endpoint extracts
 /// `Extension<OperatorIdentity>` from the request; the
 /// `unresolvable peer-cred close-on-failure` policy applies as on
 /// every other endpoint, so a handler reach implies a resolved
@@ -18855,8 +18855,7 @@ mod tests {
     //
     // The function is synchronous and operates on `std::fs::*` only;
     // we drive it against a tempdir per test so no two cases share
-    // filesystem state. The four cases pin the four behaviors
-    // documented in the daemon-productionization.4:
+    // filesystem state. The four cases pin these behaviors:
     //   1. missing subdir → created at mode 0700
     //   2. wrong mode → corrected in place
     //   3. correct mode → no-op
@@ -19018,7 +19017,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // bind_socket — socket mode pin.
     //
-    // The daemon-productionization.1 fixes
+    // The daemon fixes
     // `/run/sandbox/sandboxd.sock` at mode `0660`, and doctor check C5
     // reads `stat(sock).mode & 0o777` against that constant. The
     // umask of the invoking process is unconstrained (dev shells run
@@ -19197,7 +19196,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // `sandboxd --version` output format pin.
     //
-    // the documented contract.5's half-installed-state detection parses the output
+    // Half-installed-state detection parses the output
     // with `awk '{print $2}'`, which depends on the format being exactly
     // two space-separated tokens (`sandboxd <semver>`) followed by a
     // single newline. A regression that adds a trailing token (build

@@ -17,9 +17,6 @@
 //! - The api-session-isolation subsystem stamps `OperatorIdentity::name` as
 //!   the `owner_username` column on every newly-created session and uses
 //!   it as the per-caller filter on every `SessionStore` read.
-//!
-//! See the helper-identity-assertion design.2 for the wire
-//! contract.
 
 /// Resolved identity of an operator on the other end of the daemon's
 /// Unix-socket connection.

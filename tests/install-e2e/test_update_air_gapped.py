@@ -1,4 +1,4 @@
-"""`sandbox update` completes with all network egress blocked — the install framework.3, 9.1.
+"""`sandbox update` completes with all network egress blocked.
 
 Operator scenario: a host with no internet access (e.g. enterprise
 network with strict egress policy). They've fetched the release

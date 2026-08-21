@@ -10,9 +10,7 @@
 //!    it at the daemon's version. After session-create returns
 //!    successfully, the image is observable via `docker image
 //!    inspect`. The test re-uses the lite-image build contract
-//!    already pinned by `integration_lite_image_build_*` but renames
-//!    it to align with the daemon-productionization.6
-//!    naming.
+//!    already pinned by `integration_lite_image_build_*`.
 //!
 //! 2. **Missing gateway image is a hard refusal.** A daemon started
 //!    with `sandbox-gateway:<daemon-version>` absent still starts

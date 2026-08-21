@@ -1329,7 +1329,7 @@ mod tests {
     /// finalize call.
     ///
     /// In the production flow the atomic write happens through
-    /// `sudo install -m 0644 <tmp> <dst>` (the migration framework.3 — no torn
+    /// `sudo install -m 0644 <tmp> <dst>` (no torn
     /// writes possible because `install` uses rename(2)); the test
     /// stages the post-rename "new" state directly via `std::fs::write`
     /// and asserts the manifest parses and is routed into `kept` (not

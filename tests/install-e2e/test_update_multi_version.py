@@ -1,4 +1,4 @@
-"""the install framework.1 tests that require a multi-version tarball harness.
+"""Tests that require a multi-version tarball harness.
 
 These tests depend on a v' tarball whose binaries' compiled-in
 `CARGO_PKG_VERSION` differs from the v tarball's. The
@@ -57,7 +57,7 @@ def test_update_fresh_install_to_next_version(
       by the update flow from the MANIFEST, which the build wrote with
       the bumped version too).
 
-    Together these pin the multi-version-aware fields of the install framework.1's
+    Together these pin the multi-version-aware fields of the
     fresh-install-to-next-version contract.
     """
     vm = vm_factory(distro_template)
@@ -135,7 +135,7 @@ def test_update_fresh_install_to_next_version(
         f"the same binary as base (multi-version harness skipped)."
     )
 
-    # 2. Install-state advanced to v'. the install framework.2.29.
+    # 2. Install-state advanced to v'.
     state = json.loads(
         vm.shell(
             "SUID=$(id -u sandbox); sudo cat /var/lib/sandboxd/$SUID/.install-state.json",

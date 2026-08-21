@@ -151,7 +151,7 @@ pub fn apply_file_chain(target: cfg_migrations::TargetFile) -> Result<ApplyOutco
 /// Invoke the hidden `--apply-config-migration` subcommand against the
 /// canonical CLI binary. Production resolves the binary via
 /// `/proc/self/exe` (so a half-replaced binary keeps running its own
-/// code per.3) but for the production `sandbox update`
+/// code) but for the production `sandbox update`
 /// path we want the **new** binary — the binary swap has already
 /// landed at this point of the flow. We invoke `/usr/local/bin/sandbox`
 /// directly.

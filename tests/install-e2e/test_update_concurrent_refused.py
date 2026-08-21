@@ -1,5 +1,5 @@
 """Two concurrent `sandbox update` runs — second refuses with the
-"another update is in progress" message — the install framework.2, 9.1.
+"another update is in progress" message.
 
 The first invocation acquires the kernel ``flock`` on the lock file
 under the per-uid base-dir and writes the JSON payload (PID,
@@ -85,8 +85,8 @@ def test_update_concurrent_refused(
     extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
 
     # Synthesise a held lock: a background `flock -n <lock> sleep 60`
-    # holds the kernel flock. We write the payload first (mode 0664
-    # owner sandbox:sandbox per the install framework.1), then hand the FD to flock.
+    # holds the kernel flock. We write the payload first (mode 0664,
+    # owner sandbox:sandbox), then hand the FD to flock.
     #
     # `started_at` is rendered dynamically as "5 minutes ago" so the
     # payload appears RECENT against the lock's 24-hour staleness

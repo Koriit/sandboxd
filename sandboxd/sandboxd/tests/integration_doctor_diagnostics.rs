@@ -328,8 +328,8 @@ fn integration_subdir_mode_correction_at_startup() {
 ///
 /// - exit code is `1` (C7 hard-failed),
 /// - C7 row renders the `✗` glyph and names the gateway-image check,
-/// - the row carries the remediation hint substring.5
-///   mandates (`sandbox update` and/or `make gateway-image`).
+/// - the row carries a remediation hint naming `sandbox update`
+///   and/or `make gateway-image`.
 ///
 /// We additionally probe `GET /diagnostics` to pin the wire-level
 /// answer the doctor's C7 check trips on: `gateway_image_present`
@@ -518,10 +518,10 @@ async fn integration_doctor_full_pass_against_running_daemon() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let exit_code = output.status.code().expect("exited normally");
 
-    // Header line — load-bearing token from.3.
+    // Header line — load-bearing output token.
     assert!(
         stdout.contains("sandbox doctor \u{2014} checking deployment"),
-        "header line must match.3; got: {stdout}"
+        "header line must match the pinned header text; got: {stdout}"
     );
 
     // The first three rows all show up in verbose mode regardless

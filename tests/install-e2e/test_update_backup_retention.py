@@ -1,4 +1,4 @@
-"""`sandbox update` backup-set retention — the install framework.2.25, 5.2.
+"""`sandbox update` backup-set retention.
 
 The retention policy keeps the 2 most recent ``completed_ok: true``
 sets; sets with ``completed_ok: false`` are preserved forensically and
@@ -43,7 +43,7 @@ def test_update_backup_retention_prunes_oldest(
 ):
     """Three consecutive updates leave 2 successful backup sets on disk.
 
-    the install framework.2 keep=2 retention. After the 3rd update, the oldest
+    Pins keep=2 retention. After the 3rd update, the oldest
     successful set (the v→v.1 transition) is pruned.
     """
     vm = vm_factory(distro_template)
