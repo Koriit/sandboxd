@@ -425,11 +425,19 @@ this class is macOS-only and why it is perfectly stable.
 `std::env::current_exe()` does not resolve a symlink — was measured standalone,
 with no daemon, Lima, Docker or session involved: a binary that prints
 `current_exe()`, a symlink beside it under a second name, and exec through each.
-On `rustc 1.96.0`, Darwin arm64, all three symlink invocation forms — relative,
-absolute, and PATH lookup, which is the form git uses — return `current_exe()`
-equal to the **symlink path**, basename `git-remote-probe`. The negative control
+On Darwin arm64, all three symlink invocation forms — relative, absolute, and
+PATH lookup, which is the form git uses — return `current_exe()` equal to the
+**symlink path**, basename `git-remote-probe`. The negative control
 discriminates: exec through the real path returns the real basename, so the
 probe is not reporting the symlink name unconditionally.
+
+**The toolchain is not an unvaried factor here.** All four arms were run under
+both `rustc 1.96.0`, the host's default `stable`, and `rustc 1.88.0`, the
+version `sandboxd/rust-toolchain.toml` pins and therefore the one the daemon is
+actually built with. The output was identical. That agreement is the
+load-bearing fact rather than either version alone: `current_exe()` is std
+behaviour and could differ across releases, so a single-toolchain result would
+leave the std implementation silently scoping the conclusion.
 
 A child spawned as `Command::new(current_exe())` therefore carries `argv[0]`
 whose basename is the symlink's name, which is exactly the predicate
