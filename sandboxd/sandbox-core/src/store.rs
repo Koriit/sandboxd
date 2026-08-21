@@ -678,14 +678,19 @@ impl SessionStore {
     /// row by id without an HTTP caller in scope. **Not for handler
     /// code.** Use [`Self::get_session`] from any request path so the
     /// per-caller filter is enforced; this entry point exists only for
-    /// the `GuestConnector`, the propagation tracker, and the lifecycle
-    /// reconciler — all daemon-internal subsystems that operate on
-    /// sessions previously authorized by a per-caller lookup at the
-    /// handler boundary.
-    pub(crate) fn get_session_unfiltered(
-        &self,
-        id: &SessionId,
-    ) -> Result<Option<Session>, SandboxError> {
+    /// the `GuestConnector`, the propagation tracker, the lifecycle
+    /// reconciler, and the session-networking helpers that must name the
+    /// operator whose gateway a session lives on — all daemon-internal
+    /// subsystems that operate on sessions previously authorized by a
+    /// per-caller lookup at the handler boundary.
+    ///
+    /// Exposed as `pub` (not `pub(crate)`) for the reason
+    /// [`Self::get_network_info_unfiltered`] gives: the last of those
+    /// consumers lives in the `sandboxd` crate, and it needs the row a
+    /// session's operator is derived from on paths that have no caller
+    /// name to filter by — teardown and the DNS-gate bridge take a session
+    /// id and nothing else.
+    pub fn get_session_unfiltered(&self, id: &SessionId) -> Result<Option<Session>, SandboxError> {
         let conn = self
             .conn
             .lock()

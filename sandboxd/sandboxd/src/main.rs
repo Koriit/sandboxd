@@ -1466,6 +1466,24 @@ struct AppState {
     #[cfg(target_os = "macos")]
     gateway_recovery_declines: Arc<sandbox_core::GatewayRecoveryDeclines>,
 
+    /// macOS only: the sessions a session-networking helper declined to act on
+    /// because their operator did not resolve, held so `GET /diagnostics` can
+    /// report them.
+    ///
+    /// The ordinary-path counterpart to `gateway_recovery_declines`, and a
+    /// second holder rather than the same one because the two lists are
+    /// re-answered on different schedules —
+    /// [`report_declined_operation`] carries that reasoning.
+    ///
+    /// Also empty while one gateway serves every session, and for the same
+    /// reason: with one owner, every session that has an owner at all resolves
+    /// to it. It fills for a session whose owner account no longer exists on
+    /// this host, which is reachable today.
+    ///
+    /// Not accessed on Linux (cfg-gated).
+    #[cfg(target_os = "macos")]
+    session_operator_declines: Arc<sandbox_core::SessionOperatorDeclines>,
+
     /// macOS only: per-operator agent broker registry.
     ///
     /// The same live `AgentRegistry` the broker listener and the
@@ -8776,6 +8794,151 @@ async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
     start_dns_gate_bridge(session_id, state).await;
 }
 
+/// The operator whose gateway a session's networking lives on, resolved from
+/// the session's own persisted rows.
+///
+/// The five session-networking helpers below open with this rather than taking
+/// an owner uid from their callers. Those callers include the reconcilers, the
+/// gateway monitor and the crash-recovery path, none of which holds an operator
+/// identity — threading a uid through the helpers would have made each of them
+/// invent one, which is the guess this whole resolution exists to prevent.
+///
+/// Reads unfiltered because these paths have no HTTP caller in scope: teardown
+/// and the gate bridge are handed a session id and nothing else. Every session
+/// they act on was either authorized by a per-caller lookup at the handler
+/// boundary or selected by the daemon itself from an unfiltered listing.
+///
+/// The resolution order and why it is that order belong to
+/// [`sandbox_core::resolve_session_operator`]; this supplies the rows and the
+/// host's name-to-uid lookup and nothing else. A missing or unreadable session
+/// row is unresolved for the same reason a missing account is: there is no row
+/// to derive an owner from, and the alternative to declining is picking one.
+///
+/// Takes the store and the name lookup rather than `AppState` so what a row in
+/// a given shape resolves to is testable without a daemon — the row shapes that
+/// matter here are the ones nothing writes deliberately (an absent row, an
+/// owner with no account), which no live daemon can be asked to produce.
+#[cfg(target_os = "macos")]
+fn session_gateway_operator(
+    session_id: &SessionId,
+    store: &SessionStore,
+    resolve_uid: &dyn Fn(&str) -> Option<u32>,
+) -> sandbox_core::SessionOperator {
+    let unresolved = |reason: String| {
+        sandbox_core::SessionOperator::Unresolved(sandbox_core::UnresolvedSessionOperator {
+            session_id: *session_id,
+            owner_username: String::new(),
+            reason,
+        })
+    };
+
+    let session = match store.get_session_unfiltered(session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return unresolved(
+                "no session row: the session was removed while an operation on its networking \
+                 was still in flight"
+                    .to_string(),
+            );
+        }
+        Err(e) => return unresolved(format!("session row could not be read: {e}")),
+    };
+
+    let network = store.get_network_info_unfiltered(session_id).ok().flatten();
+
+    sandbox_core::resolve_session_operator(&session, network.as_ref(), resolve_uid)
+}
+
+/// Report a session-networking operation declined for want of a resolvable
+/// operator, in the shape [`report_declined_sessions`] reports a recovery's
+/// declines.
+///
+/// The same three things happen, for the same reasons: an `error` log carrying
+/// the session id, its owner and the reason; a [`NetworkingStatus::Degraded`]
+/// entry, because the status map's absent entry reads as healthy (see
+/// [`macos_networking_status_from`]), so declining and writing nothing would
+/// have the session report healthy networking; and a line in `/diagnostics`,
+/// because a log entry from whenever the decline happened is not somewhere an
+/// administrator can find it later.
+///
+/// # Why the `/diagnostics` line goes somewhere else
+///
+/// [`sandbox_core::GatewayRecoveryDeclines`] replaces its whole list on every
+/// record, which is right for a pass that re-answers "which sessions can
+/// recovery not place" in full each time it runs, and wrong for a single
+/// session: recording through it would erase the last recovery's report on the
+/// first declined teardown, and erase that teardown's entry on the next
+/// decline. [`sandbox_core::SessionOperatorDeclines`] supersedes only the entry
+/// for the session it was told about, which is the strongest thing a
+/// per-session decline knows.
+///
+/// Takes the locked status map and the report rather than `AppState`, so what a
+/// declined operation then reports is testable without a daemon.
+#[cfg(target_os = "macos")]
+fn report_declined_operation(
+    declined: sandbox_core::UnresolvedSessionOperator,
+    statuses: &mut HashMap<SessionId, NetworkingStatus>,
+    report: &sandbox_core::SessionOperatorDeclines,
+    declined_operation: &str,
+) {
+    error!(
+        session_id = %declined.session_id,
+        owner = %declined.owner_username,
+        reason = %declined.reason,
+        declined_operation,
+        "no gateway can be attributed to this session, so nothing was done against one. The \
+         session is marked Degraded and stays that way until its operator resolves."
+    );
+    statuses.insert(declined.session_id, NetworkingStatus::Degraded);
+    report.record(declined);
+}
+
+/// The operator uid a session-networking operation must act as, or `None` when
+/// the caller must not act at all.
+///
+/// `None` is the decline: it is reported through [`report_declined_operation`]
+/// before it is returned, so a caller that simply stops has already logged,
+/// marked and published the fact.
+///
+/// # Why not acting is the safe half
+///
+/// Every caller below reaches a gateway through the uid this returns, so an
+/// unresolved operator leaves no gateway to name. Acting anyway would mean
+/// naming one, and the only one in reach is the daemon's own, which under
+/// per-operator gateways hosts none of that session's containers. Not acting
+/// leaves the session with *no* gateway rather than the wrong one: a gateway
+/// never created is no route off the session's segment (the sandbox VM's
+/// management NIC carries `restrict=on`, and the lite bridge is created with
+/// Docker's masquerade off), and a gateway never torn down is a leak rather
+/// than a hole — teardown removes rules, it never installs them.
+#[cfg(target_os = "macos")]
+async fn gateway_operator_or_decline(
+    session_id: &SessionId,
+    state: &AppState,
+    declined_operation: &str,
+) -> Option<u32> {
+    match session_gateway_operator(session_id, &state.store, &resolve_name_to_uid) {
+        sandbox_core::SessionOperator::Uid(operator_uid) => {
+            // Resolving now retires any line an earlier decline left in
+            // `/diagnostics` for this session — see
+            // `SessionOperatorDeclines::clear` for what that does and does not
+            // claim.
+            state.session_operator_declines.clear(session_id);
+            Some(operator_uid)
+        }
+        sandbox_core::SessionOperator::Unresolved(unresolved) => {
+            let mut statuses = state.networking_status.lock().await;
+            report_declined_operation(
+                unresolved,
+                &mut statuses,
+                &state.session_operator_declines,
+                declined_operation,
+            );
+            None
+        }
+    }
+}
+
 /// macOS only: (re)start the per-session DNS-gate bridge that makes the
 /// host-bound gate UDS reachable from the in-VM gateway container.
 ///
@@ -8788,10 +8951,22 @@ async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
 /// Fail-closed: if the bridge cannot be started or dies, CoreDNS's
 /// in-container dial fails → the plugin fails OPEN → the daemon injects
 /// nothing → allow stays closed (deny holds; nothing leaks). The bridge
-/// only ever *enables* a correct allow; it can never open a hole.
+/// only ever *enables* a correct allow; it can never open a hole. A session
+/// whose operator does not resolve is declined here, which is the same case:
+/// the bridge is never started, so it is the "fails to start" arm of that
+/// argument and not a new one.
 async fn start_dns_gate_bridge(session_id: &SessionId, state: &AppState) {
     #[cfg(target_os = "macos")]
     {
+        // Resolved before the prior bridge is aborted, so a decline leaves the
+        // session exactly as it was instead of tearing down a working bridge
+        // and then declining to replace it.
+        let Some(operator_uid) =
+            gateway_operator_or_decline(session_id, state, "DNS-gate bridge start").await
+        else {
+            return;
+        };
+
         // Abort any prior bridge before re-arming.
         {
             let mut handles = state.dns_gate_bridge_handles.lock().await;
@@ -8804,10 +8979,12 @@ async fn start_dns_gate_bridge(session_id: &SessionId, state: &AppState) {
             }
         }
 
-        // The bridge's `docker exec` goes on the same route as every other
-        // Docker operation, so it follows the gateway VM's ownership without
-        // this call site changing.
-        let handle = sandbox_core::start_gate_bridge(*session_id, state.docker.clone());
+        // The bridge's `docker exec` has to land in the gateway VM that hosts
+        // this session's gateway container, which is the one its operator owns.
+        let handle = sandbox_core::start_gate_bridge(
+            *session_id,
+            state.docker_route_for_operator(operator_uid),
+        );
         let mut handles = state.dns_gate_bridge_handles.lock().await;
         handles.insert(*session_id, handle);
         info!(
@@ -9951,12 +10128,21 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
     // reclaims the VM network (otherwise the bridge leaks). The subsequent
     // host-docker `_parts` call stays a harmless no-op on macOS and is
     // byte-identical on Linux.
+    //
+    // Only this half needs the operator: it names a gateway VM. The listener
+    // and cache above and the host-docker `_parts` call below act on daemon-owned
+    // resources that no gateway hosts, so a decline leaves them alone to be
+    // released. What a decline does leave behind is the gateway container and
+    // the VM's session bridge — a leak, which is what teardown declining costs
+    // and the whole of it: teardown removes rules and never installs any, so
+    // skipping it cannot leave a session reachable under a policy it should not
+    // have.
     #[cfg(target_os = "macos")]
+    if let Some(operator_uid) =
+        gateway_operator_or_decline(session_id, state, "session networking teardown").await
     {
-        let gw = Arc::new(sandbox_core::GatewayManager::with_route(
-            state.docker.clone(),
-        ));
-        let route = state.docker.clone();
+        let route = state.docker_route_for_operator(operator_uid);
+        let gw = Arc::new(sandbox_core::GatewayManager::with_route(route.clone()));
         let network = state.network.clone();
         let sid = *session_id;
         let _ = tokio::task::spawn_blocking(move || {
@@ -9982,8 +10168,28 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
 /// policy so every DNS query receives NXDOMAIN until a policy is installed.
 ///
 /// Policy re-application is best-effort: failures are logged but do not
-/// propagate, matching the non-fatal semantics of initial policy setup.
+/// propagate, matching the non-fatal semantics of initial policy setup. A
+/// session whose operator does not resolve is declined rather than re-applied
+/// against whichever gateway happened to be in reach. Every caller reaches here
+/// having just created, restarted or recreated the gateway container, and a
+/// fresh container denies everything — nft deny-all and a deny-all Envoy
+/// listener, plus the empty NXDOMAIN CoreDNS policy when the session has no
+/// stored one. So a declined re-application leaves the session denied, never
+/// allowed under a policy that is not its own.
 async fn reapply_session_policy(session_id: &SessionId, caller_username: &str, state: &AppState) {
+    // The gateway holding this session's policy is the one its operator owns.
+    // Resolved before anything is read or written so a decline does nothing at
+    // all, including the write in the no-stored-policy branch below.
+    #[cfg(target_os = "macos")]
+    let route =
+        match gateway_operator_or_decline(session_id, state, "session policy re-application").await
+        {
+            Some(operator_uid) => state.docker_route_for_operator(operator_uid),
+            None => return,
+        };
+    #[cfg(not(target_os = "macos"))]
+    let route = state.docker.clone();
+
     let container = gateway_container_name(session_id);
 
     // The in-memory map is cleared on stop, so fall back to the persistent
@@ -10039,7 +10245,7 @@ async fn reapply_session_policy(session_id: &SessionId, caller_username: &str, s
         // on macOS, so the write lands where the gateway container is.
         let empty = CoreDnsConfig::empty_policy_file_content();
         let empty_write = write_gateway_file(
-            &state.docker,
+            &route,
             &container,
             sandbox_docker_argv::gateway::GatewayFile::CorednsPolicy,
             &empty,
@@ -10085,6 +10291,23 @@ async fn restore_session_networking(
             );
             return Ok(());
         }
+    };
+
+    // The gateway this session is restored against is the one its operator
+    // owns. Resolved here — before the CA is regenerated and before
+    // `gateway_booting` is published — so a decline leaves no side effect and
+    // no unmatched half of a booting/ready pair behind.
+    //
+    // A declined restore returns `Ok(())` rather than an error: the caller
+    // learns through the Degraded status, not through an HTTP failure. What it
+    // leaves is a sandbox VM with no gateway container on its segment, and so
+    // with no route off it — the VM's Lima management NIC carries
+    // `restrict=on`, verified post-boot, so the segment is its only uplink.
+    #[cfg(target_os = "macos")]
+    let Some(operator_uid) =
+        gateway_operator_or_decline(session_id, state, "session networking restore").await
+    else {
+        return Ok(());
     };
 
     // 1. Get or regenerate the CA certificate.
@@ -10158,8 +10381,9 @@ async fn restore_session_networking(
         // keep using it — see `nic_from_record_or_map` for why the record wins
         // and why an unpopulated map here is not a fault.
         let slot_idx = sandbox_core::slot_for_persisted_session(&network_info)?;
+        let gateway_lima = state.gateway_lima_manager_for_operator(operator_uid);
         let nic_name = sandbox_core::nic_from_record_or_map(
-            state.gateway_lima_manager.nic_map().as_ref(),
+            gateway_lima.nic_map().as_ref(),
             slot_idx,
             &network_info.bridge_name,
         )?;
@@ -10173,7 +10397,7 @@ async fn restore_session_networking(
             state.users_conf_pool.cidr.prefix_len()
         );
         let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
-        let setup_route = state.docker.clone();
+        let setup_route = state.docker_route_for_operator(operator_uid);
         match tokio::task::spawn_blocking(move || {
             setup_macos_gateway(
                 &sid,
@@ -10191,7 +10415,7 @@ async fn restore_session_networking(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 let net = state.network.clone();
-                let drop_route = state.docker.clone();
+                let drop_route = state.docker_route_for_operator(operator_uid);
                 let sid = *session_id;
                 let _ = tokio::task::spawn_blocking(move || {
                     net.remove_docker_network_on_route(&sid, &drop_route)
@@ -10201,7 +10425,7 @@ async fn restore_session_networking(
             }
             Err(e) => {
                 let net = state.network.clone();
-                let drop_route = state.docker.clone();
+                let drop_route = state.docker_route_for_operator(operator_uid);
                 let sid = *session_id;
                 let _ = tokio::task::spawn_blocking(move || {
                     net.remove_docker_network_on_route(&sid, &drop_route)
@@ -10325,6 +10549,18 @@ async fn restore_session_networking_lite(
         }
     };
 
+    // Same resolution, and same placement, as the Lima restore: before any side
+    // effect and before `gateway_booting` is published. What a declined lite
+    // restore leaves is a sandbox container on a session bridge created with
+    // Docker's masquerade off and no gateway container to route through, so it
+    // has no path off the bridge rather than an unpoliced one.
+    #[cfg(target_os = "macos")]
+    let Some(operator_uid) =
+        gateway_operator_or_decline(session_id, state, "lite session networking restore").await
+    else {
+        return Ok(());
+    };
+
     // 1. Reuse existing CA material — it was generated in
     // create_session step 0 and persists across stop / start. The lite
     // image trusts whatever was injected at build time, so we don't
@@ -10398,7 +10634,7 @@ async fn restore_session_networking_lite(
             state.users_conf_pool.cidr.prefix_len()
         );
         let gateway_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
-        let setup_route = state.docker.clone();
+        let setup_route = state.docker_route_for_operator(operator_uid);
         match tokio::task::spawn_blocking(move || {
             setup_macos_lite_gateway(
                 &sid,
@@ -10432,7 +10668,7 @@ async fn restore_session_networking_lite(
             }
             Ok(Err(e)) => {
                 let net = state.network.clone();
-                let drop_route = state.docker.clone();
+                let drop_route = state.docker_route_for_operator(operator_uid);
                 let sid = *session_id;
                 let _ = tokio::task::spawn_blocking(move || {
                     net.remove_docker_network_on_route(&sid, &drop_route)
@@ -10442,7 +10678,7 @@ async fn restore_session_networking_lite(
             }
             Err(e) => {
                 let net = state.network.clone();
-                let drop_route = state.docker.clone();
+                let drop_route = state.docker_route_for_operator(operator_uid);
                 let sid = *session_id;
                 let _ = tokio::task::spawn_blocking(move || {
                     net.remove_docker_network_on_route(&sid, &drop_route)
@@ -11492,6 +11728,19 @@ async fn diagnostics_handler(
         fields.push((
             "gateway_recovery_declined_sessions",
             serde_json::json!(state.gateway_recovery_declines.describe()),
+        ));
+
+        // The same list for the ordinary session paths — teardown, restore,
+        // policy re-application, the DNS-gate bridge. Separate from the
+        // recovery list above because the two are re-answered on different
+        // schedules, not because they mean different things: each line is a
+        // session this daemon cannot attribute to a gateway and therefore did
+        // not act on. A session here has had *something* not happen to its
+        // networking, which the session's own status can say is Degraded but
+        // cannot say what.
+        fields.push((
+            "operator_declined_sessions",
+            serde_json::json!(state.session_operator_declines.describe()),
         ));
 
         // Who holds which slots, for the administrator reading a 409 that
@@ -15129,6 +15378,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         gateway_recovery_declines: Arc::new(sandbox_core::GatewayRecoveryDeclines::new()),
         #[cfg(target_os = "macos")]
+        session_operator_declines: Arc::new(sandbox_core::SessionOperatorDeclines::new()),
+        #[cfg(target_os = "macos")]
         agent_registry: agent_registry.clone(),
     });
 
@@ -18724,6 +18975,181 @@ mod tests {
                 gateway_lima_retry_backoff(u32::MAX),
                 Duration::from_secs(600),
                 "the cap is ten minutes"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS operator attribution on the ordinary session-networking paths
+    // -----------------------------------------------------------------------
+
+    /// The declines the five session-networking helpers make when they cannot
+    /// name the operator whose gateway a session lives on.
+    ///
+    /// Kept apart from the recovery module above because the two report
+    /// through separate holders on purpose — `report_declined_operation` says
+    /// why.
+    #[cfg(target_os = "macos")]
+    mod session_operator_decline_reporting {
+        use super::*;
+        use sandbox_core::UnresolvedSessionOperator;
+
+        /// A `Running` Lima session whose owner has no account on this host
+        /// — the shape the five session-networking helpers act on, and so the
+        /// shape a decline can happen to.
+        fn running_lima_session() -> Session {
+            let mut session = Session::new(None);
+            session.state = SessionState::Running;
+            session.backend = sandbox_core::backend::BackendKind::Lima;
+            session.owner_username = "ghost".to_string();
+            session
+        }
+
+        fn unresolved_operator(session: &Session) -> UnresolvedSessionOperator {
+            UnresolvedSessionOperator {
+                session_id: session.id,
+                owner_username: session.owner_username.clone(),
+                reason: "owner account 'ghost' does not resolve on this host".to_string(),
+            }
+        }
+
+        /// A store holding one session owned by `owner`, and that session's id.
+        fn store_with_session_owned_by(
+            owner: &str,
+        ) -> (tempfile::TempDir, Arc<SessionStore>, SessionId) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (store, _orphans) =
+                SessionStore::new(tmp.path().to_path_buf()).expect("open session store");
+            let session = store
+                .create_session(SessionConfig::default(), None, owner, 0, "")
+                .expect("create session");
+            let id = session.id;
+            // The `TempDir` is returned so it outlives the store; dropping it
+            // here would delete the database out from under the caller.
+            (tmp, Arc::new(store), id)
+        }
+
+        /// A resolver that knows exactly one account.
+        fn resolve_only_known_operator(name: &str) -> Option<u32> {
+            match name {
+                "known-operator" => Some(505),
+                _ => None,
+            }
+        }
+
+        /// A session whose operator resolves is not declined — the control for
+        /// the two tests below, which would both pass against a resolver that
+        /// answered `None` for everything.
+        #[test]
+        fn a_session_whose_owner_has_an_account_resolves_to_its_uid() {
+            let (_tmp, store, id) = store_with_session_owned_by("known-operator");
+
+            assert_eq!(
+                session_gateway_operator(&id, &store, &resolve_only_known_operator),
+                sandbox_core::SessionOperator::Uid(505)
+            );
+        }
+
+        /// A session whose owner has no account on this host is unresolved,
+        /// rather than falling back to any uid the daemon has in reach.
+        #[test]
+        fn a_session_whose_owner_has_no_account_is_unresolved() {
+            let (_tmp, store, id) = store_with_session_owned_by("ghost");
+
+            assert!(
+                matches!(
+                    session_gateway_operator(&id, &store, &resolve_only_known_operator),
+                    sandbox_core::SessionOperator::Unresolved(_)
+                ),
+                "an owner with no account must not resolve to an operator"
+            );
+        }
+
+        /// A session id with no row behind it is unresolved too.
+        ///
+        /// Reachable: teardown and the gate bridge are handed an id and read
+        /// the row themselves, so a session removed while an operation on its
+        /// networking is in flight arrives here with nothing to resolve from.
+        #[test]
+        fn a_session_id_with_no_row_is_unresolved() {
+            let (_tmp, store, _id) = store_with_session_owned_by("known-operator");
+            let absent = Session::new(None).id;
+
+            assert!(
+                matches!(
+                    session_gateway_operator(&absent, &store, &resolve_only_known_operator),
+                    sandbox_core::SessionOperator::Unresolved(_)
+                ),
+                "a session id with no row must not resolve to an operator"
+            );
+        }
+
+        /// A declined *operation* marks the session Degraded, exactly as a
+        /// declined recovery does.
+        ///
+        /// Same reason: the status map's absent entry reads as Healthy, so a
+        /// helper that declined and wrote nothing would leave the session
+        /// reporting healthy networking after the daemon had refused to touch
+        /// it.
+        #[test]
+        fn a_declined_operation_reports_degraded_networking() {
+            let session = running_lima_session();
+            let mut statuses = HashMap::new();
+
+            assert_eq!(
+                macos_networking_status_from(&session, &statuses),
+                Some(NetworkingStatus::Healthy),
+                "the untagged session must start out reporting Healthy, or this test would \
+                 pass without the tagging it is about"
+            );
+
+            report_declined_operation(
+                unresolved_operator(&session),
+                &mut statuses,
+                &sandbox_core::SessionOperatorDeclines::new(),
+                "session networking teardown",
+            );
+
+            assert_eq!(
+                macos_networking_status_from(&session, &statuses),
+                Some(NetworkingStatus::Degraded),
+                "a session the daemon declined to act on must not report healthy networking"
+            );
+        }
+
+        /// A declined operation is also reported in `/diagnostics`, and one
+        /// session's decline does not clear another's.
+        ///
+        /// The second half is what makes this holder a different one from the
+        /// recovery report: recording a per-session decline through that
+        /// report's replace-the-whole-list semantics would have each decline
+        /// erase the last.
+        #[test]
+        fn a_declined_operation_is_reported_without_clearing_another_session() {
+            let first = running_lima_session();
+            let second = running_lima_session();
+            let mut statuses = HashMap::new();
+            let report = sandbox_core::SessionOperatorDeclines::new();
+
+            report_declined_operation(
+                unresolved_operator(&first),
+                &mut statuses,
+                &report,
+                "session networking restore",
+            );
+            report_declined_operation(
+                unresolved_operator(&second),
+                &mut statuses,
+                &report,
+                "session networking teardown",
+            );
+
+            let lines = report.describe();
+            assert_eq!(lines.len(), 2, "both declines must be reported: {lines:?}");
+            assert!(
+                lines.iter().any(|l| l.contains(&first.id.to_string()))
+                    && lines.iter().any(|l| l.contains(&second.id.to_string())),
+                "the report must name both sessions: {lines:?}"
             );
         }
     }

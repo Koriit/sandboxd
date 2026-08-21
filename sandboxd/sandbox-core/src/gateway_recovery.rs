@@ -451,6 +451,115 @@ impl Default for GatewayRecoveryDeclines {
 }
 
 // ---------------------------------------------------------------------------
+// SessionOperatorDeclines
+// ---------------------------------------------------------------------------
+
+/// The sessions a single operation declined to act on for want of a resolvable
+/// operator, held so `GET /diagnostics` can report them.
+///
+/// The sibling of [`GatewayRecoveryDeclines`] for the ordinary session paths —
+/// teardown, restore, policy re-application, the DNS-gate bridge — rather than
+/// for a recovery pass. Both answer the same administrator question ("which
+/// sessions is this daemon unable to place against a gateway") and render the
+/// same way, one `describe()` line per session.
+///
+/// # Why this is a second holder and not the same one
+///
+/// [`GatewayRecoveryDeclines`] replaces its whole list on every record, because
+/// a recovery re-answers its question in full each time it runs. A per-session
+/// helper answers only for the session it was called about, so recording
+/// through the recovery holder would erase a recovery's report on the first
+/// declined teardown, and erase the previous helper's entry on the second.
+/// Neither list can express the other's semantics, so each keeps its own.
+///
+/// # Why the newest entry per session wins
+///
+/// Keyed by session so a session that is declined twice appears once, with the
+/// latest reason: the entries are a description of the session's present state,
+/// not a history of attempts against it. Entries for *different* sessions
+/// accumulate, because nothing here re-answers for a session it was not asked
+/// about — the property that separates this from the recovery holder.
+///
+/// # What clears an entry
+///
+/// One thing: a later operation on the same session whose operator *does*
+/// resolve. The entry describes a session this daemon cannot attribute to a
+/// gateway, and that stops being true the moment one resolves — an owner
+/// account recreated off-daemon surfaces here as the next operation on that
+/// session dropping its line. Clearing says that and only that: it makes no
+/// claim that the work the earlier decline skipped was done, and it does not
+/// reach the gateway container a declined teardown left behind.
+///
+/// Nothing else clears one — a decline is not fixed by another decline, and no
+/// pass here re-answers for sessions it was not asked about. Like every
+/// in-memory report it is lost across a daemon restart.
+pub struct SessionOperatorDeclines {
+    declined: std::sync::Mutex<HashMap<SessionId, UnresolvedSessionOperator>>,
+}
+
+impl SessionOperatorDeclines {
+    /// Nothing has been declined.
+    pub fn new() -> Self {
+        Self {
+            declined: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record one declined session, superseding any earlier entry for it.
+    ///
+    /// A poisoned lock is recovered rather than propagated, for the reason
+    /// [`GatewayRecoveryDeclines::record`] gives.
+    pub fn record(&self, declined: UnresolvedSessionOperator) {
+        self.declined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(declined.session_id, declined);
+    }
+
+    /// Drop the entry for a session whose operator resolves again.
+    ///
+    /// Called from the resolving arm of the same call that records declines,
+    /// so the report describes the sessions that are unattributable *now*
+    /// rather than every session that ever was — which would leave a line
+    /// standing for a session long since deleted, and grow without bound for
+    /// as long as the daemon runs.
+    ///
+    /// Clearing an entry deliberately does not touch the session's networking
+    /// status: that a gateway can be named again is not that one was rebuilt,
+    /// and the status is owned by the paths that do the rebuilding.
+    pub fn clear(&self, session_id: &SessionId) {
+        self.declined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+    }
+
+    /// One human-readable line per declined session, for `/diagnostics`.
+    ///
+    /// Sorted, because the map is not: each line opens with its session id, so
+    /// sorting the rendered lines orders the report by session. A diagnostics
+    /// field that reshuffled between two reads of an unchanged daemon would
+    /// read as a changing report.
+    pub fn describe(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .declined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|declined| declined.describe())
+            .collect();
+        lines.sort();
+        lines
+    }
+}
+
+impl Default for SessionOperatorDeclines {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // run_bounded_recovery
 // ---------------------------------------------------------------------------
 
@@ -1518,6 +1627,138 @@ mod tests {
             declines.describe().is_empty(),
             "a run that placed every session must clear the previous run's report"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionOperatorDeclines (the per-session sibling)
+    // -----------------------------------------------------------------------
+
+    /// The `UnresolvedSessionOperator` a partition would produce for `owner`,
+    /// without going through a partition to get it.
+    fn decline_for(owner: &str) -> (SessionId, UnresolvedSessionOperator) {
+        let session = attributable_session(owner, None);
+        let id = session.id;
+        let declined = match resolve_session_operator(&session, None, &resolve_alice) {
+            SessionOperator::Unresolved(unresolved) => unresolved,
+            SessionOperator::Uid(uid) => {
+                panic!("owner '{owner}' was meant to be unresolvable but answered uid {uid}")
+            }
+        };
+        (id, declined)
+    }
+
+    #[test]
+    fn nothing_is_declined_before_any_operation_has_been() {
+        assert!(SessionOperatorDeclines::new().describe().is_empty());
+    }
+
+    /// Declines for different sessions accumulate.
+    ///
+    /// This is the property that separates this holder from
+    /// [`GatewayRecoveryDeclines`]: a helper called about one session has
+    /// answered for that session and for no other, so a second session's
+    /// decline must not read as an answer about the first.
+    #[test]
+    fn declines_for_different_sessions_accumulate() {
+        let (first_id, first) = decline_for("ghost");
+        let (second_id, second) = decline_for("phantom");
+
+        let declines = SessionOperatorDeclines::new();
+        declines.record(first);
+        declines.record(second);
+
+        let lines = declines.describe();
+        assert_eq!(lines.len(), 2, "both sessions must be reported: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains(&first_id.to_string()))
+                && lines.iter().any(|l| l.contains(&second_id.to_string())),
+            "the report must name both sessions: {lines:?}"
+        );
+    }
+
+    /// A second decline for the *same* session supersedes the first rather
+    /// than doubling it — the entries describe the session's present state,
+    /// not the history of attempts against it.
+    #[test]
+    fn a_second_decline_for_one_session_supersedes_the_first() {
+        let (_, first) = decline_for("ghost");
+        let session_id = first.session_id;
+        let second = UnresolvedSessionOperator {
+            session_id,
+            owner_username: first.owner_username.clone(),
+            reason: "a later and different reason".to_string(),
+        };
+
+        let declines = SessionOperatorDeclines::new();
+        declines.record(first);
+        declines.record(second);
+
+        let lines = declines.describe();
+        assert_eq!(lines.len(), 1, "one session must yield one line: {lines:?}");
+        assert!(
+            lines[0].contains("a later and different reason"),
+            "the latest reason must be the one reported: {}",
+            lines[0]
+        );
+    }
+
+    /// The report is ordered, so two reads of an unchanged daemon render the
+    /// same list.
+    #[test]
+    fn the_report_is_ordered_by_session() {
+        let declines = SessionOperatorDeclines::new();
+        for owner in ["ghost", "phantom", "spectre", "wraith"] {
+            declines.record(decline_for(owner).1);
+        }
+
+        let lines = declines.describe();
+        let mut sorted = lines.clone();
+        sorted.sort();
+        assert_eq!(lines, sorted, "describe() must return an ordered report");
+    }
+
+    /// A session whose operator resolves again leaves the report, and takes
+    /// nobody else with it.
+    #[test]
+    fn a_session_that_resolves_again_leaves_the_report() {
+        let declines = SessionOperatorDeclines::new();
+        let (resolved_again, first) = decline_for("ghost");
+        let (still_declined, second) = decline_for("phantom");
+        declines.record(first);
+        declines.record(second);
+        assert_eq!(declines.describe().len(), 2);
+
+        declines.clear(&resolved_again);
+
+        let lines = declines.describe();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the cleared session may leave: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(&still_declined.to_string()),
+            "the surviving line must be the session that is still declined: {lines:?}"
+        );
+    }
+
+    /// Clearing a session that was never declined is not an error, because the
+    /// resolving path cannot know whether an earlier operation declined.
+    #[test]
+    fn clearing_a_session_that_was_never_declined_does_nothing() {
+        let declines = SessionOperatorDeclines::new();
+        let (declined_id, declined) = decline_for("ghost");
+        declines.record(declined);
+
+        declines.clear(&decline_for("phantom").0);
+
+        let lines = declines.describe();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the unrelated entry must survive: {lines:?}"
+        );
+        assert!(lines[0].contains(&declined_id.to_string()));
     }
 
     // -----------------------------------------------------------------------
