@@ -2363,7 +2363,7 @@ async fn create_session(
     // Daemon-side authoritative validation: the documented contract
     // requires the daemon to repeat the capability check the CLI did.
     // The runtime is the single source of truth for its capability
-    // matrix. Threading `req.no_cache` through the design projection
+    // matrix. Threading `req.no_cache` through the spec projection
     // ensures a non-CLI HTTP client posting
     // `{"backend":"container","no_cache":true}` is refused by
     // `SessionSpec::validate` rather than silently honoured.
@@ -3123,8 +3123,8 @@ async fn create_session(
         let initial_dns_policy: Option<&str> = Some(initial_dns_policy_owned.as_str());
 
         // Step 1: register session with the event bus and bind the
-        // container IP for event attribution. Mirrors lines 3484-3497
-        // of `setup_session_networking`.
+        // container IP for event attribution. Mirrors the event-bus
+        // registration and IP bind in `setup_session_networking`.
         state.event_bus.register_session(session_id);
         match network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
             Ok(ip) => {

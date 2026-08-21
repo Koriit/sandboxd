@@ -49,7 +49,7 @@
 //!
 //! # Lifecycle
 //!
-//! - [`SessionRuntime::create`]: validates the design, looks up the
+//! - [`SessionRuntime::create`]: validates the spec, looks up the
 //!   per-session network info registered via
 //!   [`ContainerRuntime::register_session`], then `docker create`s the
 //!   container with the hardening flags + network attachment + DNS
@@ -1624,8 +1624,8 @@ fn read_host_ram_mb_or_default() -> u64 {
 /// pair.
 ///
 /// Branch logic:
-/// - `daemon_uid == 0` → `(1000, 1000)`. requires non-root
-///   (line 281); root degrades to the design floor 1000:1000 so a
+/// - `daemon_uid == 0` → `(1000, 1000)`. The container must never run
+///   as root; root degrades to the floor 1000:1000 so a
 ///   `sudo sandboxd` / `User=root` systemd unit cannot leak root into
 ///   the container or root-own bind-mounted writes.
 /// - `daemon_uid == 1000` → `(1000, 1000)`. Primary branch; uid
@@ -2615,7 +2615,7 @@ mod tests {
         // The workspace bind appears as an adjacent `--mount` / spec
         // pair. Find every `--mount` flag, look for the one whose value
         // matches the expected workspace spec, and assert the pair is
-        // adjacent (i.e. the design follows the flag).
+        // adjacent (i.e. the spec follows the flag).
         let expected_spec = "type=bind,src=/tmp/h,dst=/srv/g";
         let mount_idx = args
             .iter()
@@ -2833,7 +2833,7 @@ mod tests {
         let rt = test_runtime();
         let sid = SessionId::generate();
         // Register a network entry so we get past the session lookup
-        // before reaching the design-shape check; otherwise the test
+        // before reaching the spec-shape check; otherwise the test
         // would conflate two failure modes.
         rt.register_session(
             sid,
@@ -2881,7 +2881,7 @@ mod tests {
     }
 
     /// `resource_ceilings` falls back to the runtime's defaults when
-    /// the design carries `0`/`0.0`; passes through non-zero values
+    /// the spec carries `0`/`0.0`; passes through non-zero values
     /// unchanged with f32→f64 lossless widening.
     ///
     /// The historical shape was `cpus: u32` with `as f64` widening
