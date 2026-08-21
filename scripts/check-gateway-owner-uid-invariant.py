@@ -348,6 +348,37 @@ COLLAPSE_CALL = re.compile(r"^(?:sandbox_core::)?gateway_owner_uid\s*\(")
 # change by someone deciding the weaker property is not worth watching at all,
 # not by carving out the two sites that currently exercise it.
 #
+# APPENDED, NOT AMENDED: THERE IS NOW A THIRD SITE, AND THE PARAGRAPH ABOVE DOES
+# NOT COVER IT.  `get_proxy` reads `state.container_runtime` and hands it to the
+# SSH proxy, which resolves a Docker route from it per session.  So unlike the
+# two above it IS A ROUTE SITE, and every sentence of the justification above
+# turns on those two not being one.  That paragraph is not wrong; it is now
+# INCOMPLETE IN A WAY THAT READS AS COMPLETE, which is the more expensive
+# failure, because a reader who runs C1, sees red, checks the two sites it
+# accounts for, and stops has been talked out of looking at the third by a
+# rationale that never mentions it.  Hence this note rather than an edit up
+# there: the original must keep saying exactly what it said, or the record of
+# what was justified when becomes unreadable.
+#
+# THE THIRD SITE IS NOT JUSTIFIED AND IS DELIBERATELY LEFT RED.  It is not
+# exempted, not accepted, not suppressed, and nothing here lowers C1's count:
+# the clause reports THREE violations and must continue to.  The site is correct
+# code -- handing the proxy the typed `ContainerRuntime` is what gives the
+# daemon ONE route-resolution function instead of two that were supposed to
+# agree and did not -- and C1 flags it anyway, because C1 matches a spelling.
+# That is C1 behaving as the header says it behaves, not a defect in the fix.
+#
+# WHAT WAS DELIBERATELY NOT DONE, since each looks like a fix and is worse than
+# the red.  Renaming the read behind an accessor (`state.proxy_container_
+# runtime()`) would clear it BY CHANGING THE SPELLING C1 MATCHES -- blinding the
+# instrument to the exact class it exists to catch, and every later violation of
+# that class inherits the blindness.  An accepted-violations list is forbidden
+# four lines above.  Rewriting the two-site paragraph to bless a third would be
+# the author of the change editing the check's account of the tree so the change
+# passes.  The real repair is the call-graph reachability the gap note below
+# already names -- until it exists, C1 flags this site and this note explains
+# why nobody should clear it.
+#
 # TO CHECK C1 IS NOT MERELY OVER-BROAD, do not read it -- run it.  Extract the
 # workspace (`git archive HEAD sandboxd | tar -x -C <dir>`; do NOT `cp -R` the
 # workspace, `target/` makes that take minutes), rewrite the two reads as an
@@ -504,6 +535,28 @@ F3_SINK_CALL = re.compile(
 # same serving function, with and without the F1 handoff.  Injection alone
 # cannot test an acceptance term, because injection only ever reaches the terms
 # that raise.
+#
+# C9 MUST BE ABLE TO RETURN A THIRD ANSWER, AND THAT IS NOT AN EDGE CASE TO BE
+# TIDIED AWAY.  Both counters below are registered in DENOM_EXPECTED rather than
+# DENOM_ZERO_OK, so a run in which C9 evaluated nothing prints DECIDED NOTHING
+# instead of a zero that reads as absence-of-defect.  Do not move them to
+# DENOM_ZERO_OK to quiet a report.
+#
+# WHY, CONCRETELY.  This clause was first pointed at a revision that turned out
+# to be the wrong one -- a start-of-session snapshot naming a commit 211 behind
+# the tree it was believed to name.  C9 answered "DECIDED NOTHING -- neither F3
+# sink is NAMED anywhere in the scanned region", and that is the only answer
+# that could have caught it.  Walk the alternatives: GREEN would have meant "the
+# defect postdates this commit, nothing to see"; RED would have meant "the
+# reference is right, here is the defect".  BOTH ARE WRONG HERE, IN OPPOSITE
+# DIRECTIONS, AND BOTH ARE SELF-CONSISTENT -- a binary clause cannot report that
+# its INPUT was bad, only what it found in whatever it was handed.  Only "I
+# could not evaluate this" points at the question instead of answering it.
+#
+# The generalisation is the file's, not this clause's: every counter here exists
+# so that a verdict cannot be told apart from an absence of one.  C9 is recorded
+# as the case where that machinery caught a bad input rather than a bad tree,
+# which is a use nothing else in this file had yet demonstrated.
 #
 # The statement scan behind that acceptance is a heuristic and is stated as one:
 # it reads back to the nearest `;`, `{` or `}` and asks whether an F1 name
