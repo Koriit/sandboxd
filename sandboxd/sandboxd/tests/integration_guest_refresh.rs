@@ -70,7 +70,7 @@ use tempfile::TempDir;
 // Hermetic tests — no Docker daemon
 // ---------------------------------------------------------------------------
 
-///
+/// Refuse arm: assert the daemon's `error_response` helper
 /// maps `GuestProtocolIncompatible` to HTTP 409 with both load-bearing
 /// message tokens (`refresh is not viable`, `recreate the session`) in
 /// the JSON body's `error` field. Drives the same code path
@@ -107,7 +107,7 @@ fn integration_guest_refresh_refuses_when_unsalvageable() {
     );
 }
 
-///
+/// Fast path: the compat predicate accepts the daemon's own
 /// proto version, so a freshly-stamped session takes the no-refresh
 /// arm. This pins the decision the `start_session` handler makes and
 /// rules out a regression that would silently call
@@ -123,7 +123,7 @@ fn integration_guest_refresh_fast_path_skips_refresh() {
     assert!(!can_refresh_in_place(0));
 }
 
-/// , the daemon
+/// Storage half: after a refresh + start, the daemon
 /// calls `SessionStore::update_guest_versions` to atomically stamp the
 /// new versions. This test exercises the store API directly: insert a
 /// session with stale (`proto = 0`, `bin = ""`) versions, call
@@ -422,7 +422,7 @@ fn read_in_container_guest_bytes(container_name: &str) -> Vec<u8> {
     std::fs::read(&host_dst).expect("read host tempfile")
 }
 
-///
+/// Bind-mount design: exercise the container
 /// backend's `refresh_guest_binary` end-to-end against the
 /// production-shape `--read-only` lite image
 /// (`sandboxd-lite:<workspace_version>`, the same image `make
@@ -516,8 +516,7 @@ async fn integration_guest_refresh_container_backend() {
         in_container, on_host,
         "post-refresh in-container `/usr/local/bin/sandbox-guest` must be \
          bit-identical to the daemon's host-side staged file — that's the \
-         load-bearing property of the bind-mount design (api-session-isolation \
-        .8.1)"
+         load-bearing property of the bind-mount design"
     );
 
     // Idempotency: re-running refresh against the same container is a
@@ -533,7 +532,7 @@ async fn integration_guest_refresh_container_backend() {
         "second refresh must leave the bind-mount source intact",
     );
 
-    // , the daemon stamps
+    // After refresh + start succeed, the daemon stamps
     // the current versions on the row. Mirror the orchestrator's
     // call here so the integration coverage includes the store-side
     // write (the existing hermetic test
