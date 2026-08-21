@@ -94,9 +94,3 @@ sign-blob + verify-blob, and tears the stack down at the end.
 
 Seven containers; cold bring-up ~30s, tear-down ~12s. Resident memory
 ~1-1.5 GB. The smoke test runs in ~35s wall time on a 9.7 GB host.
-
-## Architectural notes
-
-See ``.tasks/handoffs/20260516-161203-m16-s11-sigstore-stack-design.md``
-for the design doc covering DNS interception, TLS/CA strategy, cosign
-trust-root reroute, and dex bypass via static JWKS.

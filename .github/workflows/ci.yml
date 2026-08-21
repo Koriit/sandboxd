@@ -173,8 +173,7 @@ jobs:
   #
   # We deliberately do NOT silently degrade this job to container-only:
   # that would defeat the policy and lose the Lima coverage that the
-  # matrix exists to preserve. See the runner-provisioning handoff
-  # in `.tasks/handoffs/`.
+  # matrix exists to preserve.
   e2e-matrix:
     if: false
     runs-on: [self-hosted, kvm]
