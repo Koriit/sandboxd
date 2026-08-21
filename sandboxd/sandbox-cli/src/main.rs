@@ -2288,7 +2288,7 @@ async fn fetch_sessions_parallel(
 /// that prevented the lookup. The describe renderer surfaces the error
 /// inline ("<capability matrix unavailable: ...>") rather than failing
 /// — describe's primary contract is showing session data, capability
-/// info is an enhancement (handoff Task 2 plumbing-note).
+/// info is an enhancement.
 #[derive(Debug, Clone)]
 enum CapabilitiesLookup {
     Available(sandbox_core::Capabilities),

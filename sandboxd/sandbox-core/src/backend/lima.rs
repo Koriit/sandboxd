@@ -574,8 +574,7 @@ mod tests {
     }
 
     /// Golden test for `Capabilities::for_lima()` — pins each field
-    /// independently. This is the canonical regression guard called
-    /// out in the Phase 1B handoff (Task 5 / Verification 9): if any
+    /// independently. This is the canonical regression guard: if any
     /// field flips, a future maintainer must consciously update the
     /// expectations here and update the capabilities model design doc
     /// at the same time.

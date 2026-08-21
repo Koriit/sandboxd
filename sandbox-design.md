@@ -160,7 +160,7 @@ This requires 2-3 independent vulnerabilities chained across different software 
 
 #### Sysbox was evaluated and rejected
 
-Sysbox enables Docker-in-Docker without `--privileged` by providing an alternate OCI runtime with user namespaces, virtualized `/proc`/`/sys`, and relaxed seccomp/AppArmor profiles. It was evaluated as the container-based approach (see [research report](.tasks/handoffs/chatgpt-dind.md)). It was rejected for four reasons:
+Sysbox enables Docker-in-Docker without `--privileged` by providing an alternate OCI runtime with user namespaces, virtualized `/proc`/`/sys`, and relaxed seccomp/AppArmor profiles. It was evaluated as the container-based approach and rejected for four reasons:
 
 1. **Blocks gVisor.** Both Sysbox and gVisor are OCI runtimes. They cannot be composed — you cannot run a Sysbox container inside gVisor or vice versa. This eliminates the possibility of adding a syscall-filtering layer.
 

@@ -269,7 +269,7 @@ fn docker_inspect(container: &str, format: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Phase 3A handoff Task 4 / test 1 — full container lifecycle.
+/// Full container lifecycle.
 /// Asserts the runtime walks `created -> running -> stopped` and the
 /// container is gone after `delete()`. The route helper is not
 /// exercised (no `route_helper_path` registered) so this test runs
@@ -327,8 +327,8 @@ async fn integration_container_runtime_create_start_stop_delete_round_trip() {
     assert_eq!(status, RuntimeStatus::Stopped);
 }
 
-/// Phase 3A handoff Task 4 / test 2 — every the documented contract flag is
-/// reflected in `docker inspect` HostConfig output. Pinned per flag so
+/// Every documented contract flag is reflected in `docker inspect`
+/// HostConfig output. Pinned per flag so
 /// a silent regression in `create()` (e.g. a typo'd flag, a re-ordered
 /// arg slice that drops one) fails this test rather than silently
 /// shipping a softer container.
@@ -450,8 +450,8 @@ async fn integration_container_runtime_hardening_flags_match_spec() {
     drop(net);
 }
 
-/// Phase 3A handoff Task 4 / test 3 — `runtime.status()` reflects the
-/// container's actual state, even when state changes happen out-of-band
+/// `runtime.status()` reflects the container's actual state, even
+/// when state changes happen out-of-band
 /// (e.g. an operator runs `docker stop` directly).
 #[tokio::test]
 async fn integration_container_runtime_status_reflects_docker_state() {
@@ -505,7 +505,7 @@ async fn integration_container_runtime_status_reflects_docker_state() {
     drop(net);
 }
 
-/// Phase 3A handoff Task 4 / test 4 — `delete()` is idempotent.
+/// `delete()` is idempotent.
 /// Calling it on a session that has already been deleted (and whose
 /// home volume has already been removed) must succeed quietly.
 #[tokio::test]

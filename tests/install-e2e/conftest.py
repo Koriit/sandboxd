@@ -2067,8 +2067,7 @@ def tart_vm_factory(request, built_scripts, tart_ssh_key):
         run_log.parent.mkdir(parents=True, exist_ok=True)
         # Boot with --nested when the host supports it (M3+) so the daemon's
         # gateway QEMU VM (accel=hvf) can boot inside the guest. On M1/M2 the
-        # daemon can never reach "healthy" inside a Tart guest (see the
-        # nested-virt note in the M22-S8 findings handoff).
+        # daemon can never reach "healthy" inside a Tart guest.
         proc = tart_run_headless(name, run_log, nested=host_supports_nested_virt())
         created[-1][1] = proc
 
@@ -2123,9 +2122,9 @@ def _install_prereqs_tart(vm):
       * curl, shasum, tar (present in the base macOS install)
     cosign is auto-bootstrapped by install.sh (pinned download).
 
-    **qemu** is NOT in install.sh's prereq check (see GAP #5 in the M22-S8
-    findings), but the daemon's macOS full backend boots a *QEMU* gateway Lima
-    VM at startup — without ``qemu-system-aarch64`` on PATH the daemon can
+    **qemu** is NOT in install.sh's prereq check, but the daemon's macOS
+    full backend boots a *QEMU* gateway Lima VM at startup — without
+    ``qemu-system-aarch64`` on PATH the daemon can
     never reach "healthy". We install it here so the harness reflects the
     daemon's real runtime needs; the gap itself is reported for an install.sh
     fix.

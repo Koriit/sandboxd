@@ -851,10 +851,10 @@ fn integration_session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_polic
 /// the side container, `curl` an allowed destination and assert it
 /// works."
 ///
-/// Budget rationale (verbatim from the handoff): "Docker HEALTHCHECK
-/// interval=10s × retries=3 = ~30s until Docker flips, plus ~30s
-/// `gateway_monitor` poll tick, plus restart duration, plus CI jitter
-/// headroom. Use a retry loop with a 120s deadline, not a single sleep."
+/// Budget rationale: Docker HEALTHCHECK interval=10s × retries=3 =
+/// ~30s until Docker flips, plus ~30s `gateway_monitor` poll tick,
+/// plus restart duration, plus CI jitter headroom. Use a retry loop
+/// with a 120s deadline, not a single sleep.
 ///
 /// `gateway_monitor` and `poll_and_emit_component_health` are private
 /// `async fn` in `sandboxd::main`; we cannot call them directly from
