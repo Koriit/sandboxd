@@ -112,13 +112,13 @@ struct Args {
     /// filename-embedded `YYYY-MM-DD` is strictly older than
     /// `today - retention_days` are removed by an hourly pruner.
     ///
-    /// Default of 14 days matches the event wire format / "Retention"
-    /// suggested value and covers roughly two sprint cycles of traffic
-    /// for post-incident review. Overridable via
+    /// Default of 14 days covers roughly two sprint cycles for
+    /// post-incident review, costing ~170 MB/session on disk at the
+    /// modeled event rate. Overridable via
     /// `SANDBOX_EVENTS_PERSIST_RETENTION_DAYS` (clap env-var fallback).
-    /// Final defaults are measurement-driven — see
-    /// `docs/internal/measurement-defaults-m10-s6.md` for the
-    /// rationale and revision policy.
+    /// The value is modeled, not measured — no measurement pass has
+    /// been run. See `docs/internal/measurement-defaults-m10-s6.md`
+    /// § "Methodology" and § "Revision policy".
     #[arg(
         long,
         env = "SANDBOX_EVENTS_PERSIST_RETENTION_DAYS",
@@ -2832,14 +2832,13 @@ async fn create_session(
             // design exists to fix), OpenSSH's `getpwuid(geteuid())`
             // lookup fails inside the container because the in-image
             // `sandbox` user is uid 1000 but the container runs under
-            // the daemon's uid. todo #221's decision (b) overlays a
-            // single-entry passwd file that maps the runtime uid to
-            // the `sandbox` account, reusing the same tmpfs bind-mount
-            // surface as the authorized_keys injection. The
-            // alternatives — forcing `--user 1000:1000` and
-            // re-architecting workspace bind-mount ownership (option
-            // a), or rebuilding the lite image per uid (option c) —
-            // were rejected for higher blast radius.
+            // the daemon's uid. The overlay is a single-entry passwd
+            // file mapping the runtime uid to the `sandbox` account,
+            // reusing the same tmpfs bind-mount surface as the
+            // authorized_keys injection. The alternatives — forcing
+            // `--user 1000:1000` and re-architecting workspace
+            // bind-mount ownership, or rebuilding the lite image per
+            // uid — were rejected for higher blast radius.
             let ssh_host_dir = state
                 .base_dir
                 .join("sessions")

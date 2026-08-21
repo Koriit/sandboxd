@@ -306,12 +306,12 @@ pub struct ContainerNetwork {
     ///   file mapping the container's runtime uid (which may be the
     ///   daemon's uid rather than the in-image 1000 when host-side
     ///   bind-mount uid alignment is required) to the `sandbox`
-    ///   account. The cross-user CLI access todo #221 decision was
-    ///   option (b): a synthetic `/etc/passwd` overlay reuses the
-    ///   tmpfs surface we already need for the authorized_keys
-    ///   bind-mount, so sshd's `getpwuid(geteuid())` call succeeds
-    ///   under any daemon uid without breaking the workspace
-    ///   bind-mount uid-alignment contract.
+    ///   account. A synthetic `/etc/passwd` overlay is used for
+    ///   cross-user CLI access because it reuses the tmpfs surface we
+    ///   already need for the authorized_keys bind-mount, so sshd's
+    ///   `getpwuid(geteuid())` call succeeds under any daemon uid
+    ///   without breaking the workspace bind-mount uid-alignment
+    ///   contract.
     /// * `group` → `/etc/group` — symmetric one-entry group file for
     ///   sshd's `getgrgid` lookup.
     ///
@@ -623,8 +623,8 @@ impl ContainerRuntime {
 
     /// In-container runtime uid (the `--user <uid>:<gid>` flag's
     /// uid half). Exposed so the daemon's session-create path can
-    /// stamp the synthetic `/etc/passwd` overlay (todo #221, decision
-    /// (b)) with the same uid the container will actually run under.
+    /// stamp the synthetic `/etc/passwd` overlay with the same uid the
+    /// container will actually run under.
     pub fn user_uid(&self) -> u32 {
         self.user_uid
     }
@@ -685,10 +685,10 @@ impl ContainerRuntime {
     /// and this is where we substitute the daemon's host-80% defaults).
     ///
     /// Returns `(memory_mb, cpus)` with `cpus` widened to `f64` for
-    /// the consumer (`format_cpus` formats with `{:.1}`). Pre-todo-#67
-    /// the `cpus` input was `u32` and the widening was a `as f64` on
-    /// every call; the f32 source eliminates the truncation that
-    /// previously dropped fractional values like `1.5` to `1`.
+    /// the consumer (`format_cpus` formats with `{:.1}`). The `f32`
+    /// source is what makes fractional values survive: when the input
+    /// was a `u32`, values like `1.5` were truncated to `1` before the
+    /// widening ever ran.
     fn resource_ceilings(&self, spec: &SessionSpec) -> Result<(u32, f64), SandboxError> {
         let (memory_mb, cpus) = match &spec.backend_specific {
             BackendSpecific::Container { memory_mb, cpus } => (*memory_mb, *cpus),
@@ -1654,10 +1654,10 @@ pub fn map_container_uid_gid(daemon_uid: u32, daemon_gid: u32) -> (u32, u32) {
 ///   bind-mount's loose ownership).
 /// * `passwd` — synthetic one-entry passwd file mapping the daemon's
 ///   `daemon_uid` to the `sandbox` account at `/home/sandbox`,
-///   `/bin/bash`. This is the todo-#221 decision (b): an in-container
-///   `/etc/passwd` overlay so OpenSSH's `getpwuid(geteuid())` lookup
-///   succeeds under any daemon uid, without breaking the workspace
-///   bind-mount uid-alignment contract.
+///   `/bin/bash`. The overlay exists so OpenSSH's
+///   `getpwuid(geteuid())` lookup succeeds under any daemon uid,
+///   without breaking the workspace bind-mount uid-alignment
+///   contract.
 /// * `group` — synthetic one-entry group file for the symmetric
 ///   `getgrgid` lookup.
 ///
@@ -2924,10 +2924,10 @@ mod tests {
         assert_eq!(mem, 4096);
         assert!((cpus - 4.0).abs() < f64::EPSILON);
 
-        // Fractional value: pre-todo-#67 the `as f64` widening lost
-        // precision because the source was `u32`. With `f32` source
-        // the widening is exact, and `format_cpus` will render `1.5`
-        // verbatim into the `--cpus` flag.
+        // Fractional value: when the source was a `u32` the `as f64`
+        // widening lost precision. With an `f32` source the widening is
+        // exact, and `format_cpus` will render `1.5` verbatim into the
+        // `--cpus` flag.
         let spec_fractional = SessionSpec {
             backend_specific: BackendSpecific::Container {
                 memory_mb: 4096,
@@ -3218,8 +3218,7 @@ mod tests {
     /// the staging directory with the right contents and permissions.
     /// The synthetic `/etc/passwd` entry must carry the daemon's uid
     /// so OpenSSH's `getpwuid(geteuid())` lookup succeeds in the
-    /// container under any `--user <uid>:<gid>` setting (todo #221,
-    /// decision (b)).
+    /// container under any `--user <uid>:<gid>` setting.
     #[test]
     fn stage_ssh_credentials_writes_three_files() {
         use std::os::unix::fs::PermissionsExt;
