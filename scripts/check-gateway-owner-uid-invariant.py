@@ -1717,6 +1717,15 @@ INJECTIONS = [
      "a DERIVED wrapper handed the daemon's uid while serving a caller -- the "
      "wrapper forwards it into F1 under its own parameter name, so the direct "
      "F1 anchor never sees it; RED here proves the derived set is live"),
+    ("C4", "    let bad = probe_gateway_status(&state, &session, "
+           "state.daemon_uid).await;",
+     "the same defect at HOP 2 -- probe_gateway_status forwards into "
+     "gateway_for_probes, which forwards into F1.  The case above proves only "
+     "that the derived set is NON-EMPTY and contains a hop-1 member: a "
+     "derivation that computed gateway_for_probes and stopped would pass it "
+     "identically while silently dropping 5 of 15 call sites.  This case is "
+     "what makes the difference between a one-hop scan and a fixpoint a "
+     "RED/GREEN rather than an asserted 'hops 3-5 added zero' in a log line"),
     ("C5", "    let bad = (state.gateway_docker_route)(operator.uid);",
      "F3 route factory reached directly with a RAW operator uid "
      "(measured GREEN under C1-C4 before this clause existed)"),
