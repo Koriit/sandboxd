@@ -211,7 +211,7 @@ mod tests {
     use super::*;
 
     /// The canonical tempfile path lives next to the destination so a
-    /// rename across the same FS is atomic..4.
+    /// rename across the same FS is atomic.
     #[test]
     fn tempfile_path_lives_next_to_destination() {
         let p = tempfile_path_for(cfg_migrations::TargetFile::UsersConf, 1);

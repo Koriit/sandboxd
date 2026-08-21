@@ -857,7 +857,7 @@ pub fn pending_migration_human_description(name: &str) -> String {
     name.replace('_', " ")
 }
 
-/// Render the `--check` report to a sink..2 output shape.
+/// Render the `--check` report to a sink.
 pub fn render_check_report<W: Write>(out: &mut W, r: &CheckReport<'_>) -> std::io::Result<()> {
     match r.compare {
         VersionCompare::UpToDate => {
@@ -1068,7 +1068,7 @@ pub fn render_dry_run<W: Write>(
 /// Project the per-step idempotency check onto the read-only
 /// `--dry-run` inputs. Returns `"would skip"` when the step is
 /// projected to be a no-op against the current install, `"would
-/// execute"` otherwise..3.
+/// execute"` otherwise.
 ///
 /// `up_to_date` is `current_installed_version == target_version`:
 /// the pre-condition under which every sha256-compared file copy

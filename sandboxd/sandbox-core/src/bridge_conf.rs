@@ -1,7 +1,7 @@
 //! Daemon-side schema-version validator for `/etc/qemu/bridge.conf`.
 //!
 //! The daemon does **not** otherwise parse this file — it is QEMU's,
-//! consumed only by `qemu-bridge-helper`..7 layers a small
+//! consumed only by `qemu-bridge-helper`. The daemon layers a small
 //! schema-mismatch refusal on top so the convergence property of the
 //! update flow extends to both managed config files. v1 ships with
 //! `bridge.conf` at version `0` (no migration applies to it yet);

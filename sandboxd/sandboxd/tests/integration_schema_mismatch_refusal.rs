@@ -100,7 +100,7 @@ fn spawn_and_wait(users_conf: &str, deadline_secs: u64) -> (String, i32) {
 // ---------------------------------------------------------------------------
 
 /// `users.conf` at `_schema_version: 99` (ahead of the binary's max of
-/// 1) refuses startup..7 names the substring `users.conf
+/// 1) refuses startup with the substring `users.conf
 /// schema version 99 is newer`.
 #[test]
 fn integration_daemon_refuses_start_on_schema_too_new() {
@@ -135,7 +135,7 @@ fn integration_daemon_refuses_start_on_schema_too_new() {
 
 /// `users.conf` at `_schema_version: 0` (below the binary's min of 1)
 /// refuses startup with the `is older than this binary supports`
-/// substring..7's MIN-side behaviour.
+/// substring — the MIN-side behaviour.
 #[test]
 fn integration_daemon_refuses_start_on_schema_too_old() {
     // `_schema_version` field set explicitly to 0 (operators with
