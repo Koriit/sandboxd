@@ -5722,15 +5722,16 @@ fn parse_remote_helper_url(url: &str) -> Result<(String, Option<String>), String
 /// remote-helper URL given the session's `workspace_mode_detail`.
 ///
 /// - `Shared { guest_path, .. }` and `Local { guest_path, .. }`
-///   → use that guest_path (M17 made the guest mount point
+///   → use that guest_path (the guest mount point is
 ///   operator-configurable, so we must read it from the DTO rather
 ///   than assume `/home/sandbox/workspace`).
 /// - `Clone { .. }` and `None` (no workspace, or an older daemon
 ///   that doesn't populate the detail field) → fall back to
 ///   `/home/sandbox/workspace`. Clone-mode sessions land the repo at
 ///   that path by convention, and an older daemon that omits the
-///   field could have been a pre-M17 session in shared-mode at the
-///   historical default — falling back preserves backward
+///   field could have been created before the mount point became
+///   configurable — i.e. a shared-mode session sitting at the
+///   historical default — so falling back preserves backward
 ///   compatibility in both shapes.
 fn resolve_default_repo_path(detail: Option<&WorkspaceModeDetailDto>) -> String {
     match detail {
@@ -5779,12 +5780,11 @@ async fn run_remote_helper() {
         .unwrap_or_else(default_socket_path);
 
     // For slash-less URLs (`sandbox::<session>` with no path), resolve the
-    // default repo path from the session's workspace configuration. M17
-    // made the guest mount point operator-configurable, so we can no
-    // longer assume `/home/sandbox/workspace`. On daemon error (404,
-    // network, parse) we print a helpful message and exit non-zero —
-    // never silently fall back, since that would surface the wrong
-    // directory to git.
+    // default repo path from the session's workspace configuration. The
+    // guest mount point is operator-configurable, so we cannot assume
+    // `/home/sandbox/workspace`. On daemon error (404, network, parse)
+    // we print a helpful message and exit non-zero — never silently
+    // fall back, since that would surface the wrong directory to git.
     let repo_path = match repo_path_opt {
         Some(p) => p,
         None => {
@@ -8089,7 +8089,7 @@ mod tests {
     fn parse_remote_helper_url_session_only() {
         // No slash — the path is left unresolved (None) so the caller
         // can derive the default from the session's workspace
-        // configuration via the daemon. M17 made the guest mount point
+        // configuration via the daemon. The guest mount point is
         // operator-configurable, so the parser must not bake in the
         // `/home/sandbox/workspace` default.
         let (session, repo_path) = parse_remote_helper_url("my-session").unwrap();

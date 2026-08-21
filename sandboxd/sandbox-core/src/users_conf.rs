@@ -4,9 +4,8 @@
 //! binary (per invocation, to authorize a caller's request to install a
 //! default route inside a target container's netns).
 //!
-//! The file is JSON, root-owned, mode `0644`. See the M11 lite-mode
-//! container backend spec for the canonical shape; the design example is reproduced in
-//! [`UsersConfig`].
+//! The file is JSON, root-owned, mode `0644`. The canonical shape, with a
+//! worked example, is documented on [`UsersConfig`].
 //!
 //! # Path resolution
 //!

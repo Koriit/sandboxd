@@ -31,7 +31,7 @@ pub enum BackendKind {
     /// QEMU/Lima virtual-machine backend (today's only backend).
     #[default]
     Lima,
-    /// Docker container backend (introduced by M11 lite mode).
+    /// Docker container backend — the "lite mode" backend.
     Container,
 }
 

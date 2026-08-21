@@ -3582,7 +3582,7 @@ mod tests {
     /// test instead of leaking to the runtime.
     #[test]
     fn mitmproxy_config_matches_e2e_failing_policies() {
-        // M4 test_level3_method_restriction: `{GET /*}` — POST must deny.
+        // `test_level3_method_restriction`: `{GET /*}` — POST must deny.
         let method_policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
@@ -3595,7 +3595,7 @@ mod tests {
                 reason: None,
             }],
         };
-        // M4 test_level3_path_restriction: `{ANY /api/*}` — `/other/path`
+        // `test_level3_path_restriction`: `{ANY /api/*}` — `/other/path`
         // must deny.
         let path_policy = Policy {
             version: SCHEMA_VERSION.to_string(),

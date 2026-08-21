@@ -52,9 +52,10 @@
 //!   -E 'test(integration_macos_daemon_startup)'
 //! ```
 //!
-//! ## Live cross-user 6b test
-//! The full cross-user 6b live test (real agent, real VM) is deferred to M21.
-//! The agent-gated gate is unit-tested in `broker.rs` without a live agent.
+//! ## Not covered here: the live cross-user path
+//! Nothing in this file exercises a real agent against a real VM, so the
+//! cross-user path is only covered up to the broker bind. The agent-gated
+//! check itself is unit-tested in `broker.rs` without a live agent.
 
 #[cfg(not(target_os = "macos"))]
 #[test]
