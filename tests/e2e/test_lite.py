@@ -207,7 +207,7 @@ def test_no_cache_rejected_for_lite(sandbox_cli):
     assert "--no-cache" in rejection_stderr, (
         f"stderr must mention --no-cache.\nstderr: {result.stderr}"
     )
-    # the documented designwording: "`--no-cache` is not supported with `--lite` /
+    # Expected wording: "`--no-cache` is not supported with `--lite` /
     # container backend"
     assert "not supported" in rejection_stderr, (
         f"stderr must say 'not supported'.\nstderr: {result.stderr}"

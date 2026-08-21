@@ -20,7 +20,7 @@ representative workload (for example, an agent session running
 `npm install` + `git clone` of a small repo + a `curl` loop for a
 minute) with metrics capture. That measurement has not been
 performed — the project ships without production traffic of that
-shape. The values above are **measurement-driven defaults**, chosen so
+shape. The values above are **spec-suggested defaults**, chosen so
 that:
 
 - **`ring_buffer_size = 10 000`** covers ~10 minutes at ~15 events/s

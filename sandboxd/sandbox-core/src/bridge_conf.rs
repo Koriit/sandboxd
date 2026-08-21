@@ -10,7 +10,7 @@
 //!
 //! Version detection: first-line comment of the form
 //! `# sandbox-schema-version: <int>`. QEMU's bridge-helper parser
-//! ignores `#`-prefixed lines (verified this works, so the marker
+//! ignores `#`-prefixed lines, so the marker
 //! is transparent to QEMU. A file with no marker is treated as
 //! version `0`.
 
