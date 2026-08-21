@@ -1505,6 +1505,27 @@ fn resolve_docker_route(
     route(owner_uid)
 }
 
+/// The route factory [`ContainerRuntime`] is built with: [`resolve_docker_route`]
+/// bound to the daemon's gateway-route factory.
+///
+/// The runtime resolves a route per operation from that operation's operator,
+/// and this is what turns an *operator* uid into the route for the gateway that
+/// serves them. Handing the runtime `gateway_docker_route` directly instead
+/// would skip the collapse — and while per-operator gateways are off that is
+/// silent, because the instance name collapses too: every operator would be
+/// aimed at their own agent rather than at the daemon, and neither the route's
+/// type nor the gateway's name would differ.
+///
+/// A named function rather than a closure at the construction site so both
+/// sides of the switch can be exercised against the thing production actually
+/// builds.
+#[cfg(target_os = "macos")]
+fn container_docker_route_resolver(
+    gateway_docker_route: Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync>,
+) -> Arc<dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync> {
+    Arc::new(move |operator_uid| resolve_docker_route(gateway_docker_route.as_ref(), operator_uid))
+}
+
 impl AppState {
     /// The Docker route for the gateway that serves `operator_uid`'s sessions.
     ///
@@ -2353,11 +2374,13 @@ async fn create_session(
         // Operator identity captured from `SO_PEERCRED` on the
         // connecting socket. The Lima backend reads this back through
         // `LimaRuntime::create` to interpolate the cloud-init `usermod`
-        // step into the per-session YAML; the container backend reads
-        // it through its parallel `ContainerNetwork.operator_identity`
-        // field. Pre-V008 / fixture-test rows that did not capture
-        // peercred default to `None` here and route through the legacy
-        // spawn-as-daemon path.
+        // step into the per-session YAML; `ContainerRuntime::create`
+        // reads it to resolve which operator's Docker daemon to reach,
+        // and reads the parallel `ContainerNetwork.operator_identity`
+        // field for the uid the container runs as. Pre-V008 /
+        // fixture-test rows that did not capture peercred default to
+        // `None` here and route through the legacy spawn-as-daemon
+        // path.
         Some((operator.uid, operator.gid)),
     );
     let runtime_for_validation = runtime_for(&state, backend_kind);
@@ -2970,12 +2993,14 @@ async fn create_session(
                 lima_mac: None,
                 lima_config: None,
                 for_user: Some(operator.name.clone()),
-                // Container backend doesn't read `operator_identity`
-                // off `RuntimeStartArgs` (it travels via the parallel
-                // `ContainerNetwork.operator_identity` field installed
-                // at `register_session` time). Populated here for
-                // symmetry with the Lima path and to keep the gate
-                // explicit at the call site.
+                // `ContainerRuntime::start` reads this to resolve which
+                // operator's Docker daemon the call must reach: on macOS
+                // their containers live in their own gateway VM, so the
+                // route is a property of this session's operator rather
+                // than of the daemon. It also travels separately as
+                // `ContainerNetwork.operator_identity`, installed at
+                // `register_session` time, which decides the uid the
+                // container runs as — a different question.
                 operator_identity: Some((operator.uid, operator.gid)),
                 lima_unrestricted_slirp_for_provisioning: false,
             };
@@ -14843,13 +14868,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     > = Arc::new(|_owner_uid| sandbox_core::docker::DockerRoute::Host);
 
     // The daemon's own route: the same construction, for the uid this process
-    // runs as. It is startup wiring for the two things the daemon owns
-    // outright — the manager for its own gateway VM and the container runtime
-    // — and it is deliberately not handed to `AppState`. A route sitting in
-    // shared state names no owner, so a handler that reached for it would
-    // compile whether or not it had been converted; every route a request runs
-    // over is built from an operator uid instead, via
-    // `AppState::docker_route_for_operator`.
+    // runs as. It is startup wiring for the one thing the daemon owns
+    // outright — the manager for its own gateway VM — and it is deliberately
+    // not handed to `AppState`. A route sitting in shared state names no
+    // owner, so a handler that reached for it would compile whether or not it
+    // had been converted; every route a request runs over is built from an
+    // operator uid instead, via `AppState::docker_route_for_operator`. The
+    // container runtime is not wired from this route either: one runtime
+    // serves every operator, so it takes the resolver and answers per call.
     let docker_route = gateway_docker_route(daemon_uid);
 
     // Build the per-operator LimaManager registry. One LimaManager per
@@ -15413,9 +15439,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // atomically renames the libexec file, so the bind-mount source is
     // always coherent without a daemon-side staging step.
     let guest_bind_source = sandbox_core::guest_agent_path()?;
-    // On macOS, sandbox containers run inside the gateway Lima VM's Docker daemon,
-    // so every docker call must be directed to the forwarded gateway socket.
-    // The with_macos_socket constructor wires that forwarding into the runtime.
+    // On macOS, sandbox containers run inside a gateway Lima VM's Docker daemon,
+    // so every docker call must be directed at the Docker daemon in the VM
+    // belonging to the operator whose session it is. The runtime is handed the
+    // resolver rather than a route: one instance serves every operator, and a
+    // route fixed here would name this process's uid and send every operator's
+    // containers to the daemon's own VM.
     // base_dir serves as the docker_home so the docker build client can write its
     // config dir to a writable daemon-owned path.
     #[cfg(target_os = "macos")]
@@ -15426,7 +15455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         container_uid,
         container_gid,
         &guest_bind_source,
-        docker_route.clone(),
+        container_docker_route_resolver(Arc::clone(&gateway_docker_route)),
         base_dir.clone(),
     );
     #[cfg(not(target_os = "macos"))]
@@ -16056,10 +16085,12 @@ mod tests {
     /// part that would be wrong anyway.
     ///
     /// The daemon's own leg calls the factory at `getuid()` because that is
-    /// literally how startup builds `AppState::docker`. Sweeping several
-    /// operator uids matters more than the specific answer: the property is
-    /// "the result did not depend on the operator", and a single uid that
-    /// happened to equal the daemon's would satisfy both readings at once.
+    /// literally how startup builds the daemon's own route: it applies
+    /// `gateway_docker_route` to the uid this process runs as. Sweeping
+    /// several operator uids matters more than the specific answer: the
+    /// property is "the result did not depend on the operator", and a single
+    /// uid that happened to equal the daemon's would satisfy both readings at
+    /// once.
     ///
     /// macOS-only, because the switch is. On Linux the factory ignores the
     /// uid and answers `DockerRoute::Host` for everyone, so no two legs of
@@ -16096,6 +16127,135 @@ mod tests {
                  served by the daemon's own gateway route, not by a route aimed at \
                  uid {operator_uid}'s own agent"
             );
+        }
+    }
+
+    /// A container runtime wired the way startup wires it: one instance, shared
+    /// by every operator, holding the resolver rather than a route.
+    ///
+    /// The executor names a socket that does not exist. Nothing here runs
+    /// docker — these tests read which route comes back, and a route is decided
+    /// before anything is dispatched over it — so an unreachable target is the
+    /// assertion that they stay that way.
+    #[cfg(target_os = "macos")]
+    fn container_runtime_wired_as_startup_wires_it() -> Arc<ContainerRuntime> {
+        let gateway_docker_route: Arc<
+            dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
+        > = Arc::new(|owner_uid| sandbox_core::docker::DockerRoute::Vm {
+            op_uid: owner_uid,
+            executor: Arc::new(sandbox_core::docker::LocalSocketDockerExecutor::new(
+                "/nonexistent/gateway-docker.sock",
+                "/nonexistent/lima",
+            )),
+        });
+        ContainerRuntime::with_vm_route(
+            "sandboxd-lite:test",
+            1024,
+            1.0,
+            501,
+            501,
+            "/nonexistent/sandbox-guest",
+            container_docker_route_resolver(gateway_docker_route),
+            "/nonexistent/base",
+        )
+    }
+
+    /// With per-operator gateways **on**, each operator's container operations
+    /// must resolve a route naming *that* operator — not the daemon, and not
+    /// another operator.
+    ///
+    /// This is the property the runtime holds a resolver for, and the state in
+    /// which it is observable. Its switched-off counterpart above cannot see
+    /// it: off, `gateway_owner_uid` answers the daemon's uid for everyone, so a
+    /// runtime that resolves per operator and one that captured a single route
+    /// at startup return the same thing for every input. Two operators is the
+    /// minimum that distinguishes "resolved from the operator" from "resolved
+    /// from something constant that happens to match".
+    ///
+    /// Asserted at `route_for` — the seam every docker operation on this
+    /// runtime resolves through — rather than at a fake docker client. No
+    /// container, image, VM or docker daemon is involved.
+    ///
+    /// This test mutates the process environment. `cargo nextest` — the runner
+    /// this workspace uses — gives each test its own process, which is what
+    /// keeps it from racing the switch-off test above. The prior value is
+    /// restored regardless, so a threaded runner degrades to a flake rather
+    /// than to a silent corruption of another test's view of the switch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn each_operators_container_route_names_that_operator_while_the_switch_is_on() {
+        let prior = std::env::var_os(sandbox_core::PER_OPERATOR_GATEWAY_ENV);
+        unsafe { std::env::set_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV, "1") };
+        assert!(
+            sandbox_core::per_operator_gateway_enabled(),
+            "this test describes the switched-on state and must set it up before \
+             asserting; with the switch off every operator collapses to the \
+             daemon and the assertions below would be asserting the wrong thing"
+        );
+
+        let runtime = container_runtime_wired_as_startup_wires_it();
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        for operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
+            assert_eq!(
+                runtime.route_for(operator_uid).op_uid(),
+                Some(operator_uid),
+                "with per-operator gateways on, a container operation for \
+                 operator uid {operator_uid} must run against uid \
+                 {operator_uid}'s own gateway VM; a route naming any other uid \
+                 sends that operator's containers into someone else's VM"
+            );
+        }
+
+        match prior {
+            Some(value) => unsafe {
+                std::env::set_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV) },
+        }
+    }
+
+    /// With the switch **off**, every operator's container operations resolve
+    /// to the daemon's own gateway.
+    ///
+    /// Not a restatement of the first test in this section: that one exercises
+    /// `resolve_docker_route` directly, while this one asks the runtime, and
+    /// the gap between them is exactly where the collapse can be dropped.
+    /// Building the runtime over the raw `gateway_docker_route` instead of
+    /// `container_docker_route_resolver` compiles, type-checks, and is wrong
+    /// only in the off state — on, the two are indistinguishable because
+    /// `gateway_owner_uid` is the identity there. So this is the only state in
+    /// which that mistake is visible, and the test above cannot see it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_operators_container_route_is_the_daemons_own_while_the_switch_is_off() {
+        let prior = std::env::var_os(sandbox_core::PER_OPERATOR_GATEWAY_ENV);
+        unsafe { std::env::remove_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV) };
+        assert!(
+            !sandbox_core::per_operator_gateway_enabled(),
+            "this test describes the switched-off state"
+        );
+
+        let runtime = container_runtime_wired_as_startup_wires_it();
+        let daemon_uid = nix::unistd::Uid::current().as_raw();
+
+        for operator_uid in [1_u32, 501, 502, 1000, daemon_uid.wrapping_add(7)] {
+            assert_eq!(
+                runtime.route_for(operator_uid).op_uid(),
+                Some(daemon_uid),
+                "with per-operator gateways off there is one gateway and the \
+                 daemon owns it, so operator uid {operator_uid} must resolve to \
+                 uid {daemon_uid}'s route; naming {operator_uid} instead means \
+                 the operator-to-owner collapse was skipped when the runtime \
+                 was wired"
+            );
+        }
+
+        match prior {
+            Some(value) => unsafe {
+                std::env::set_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(sandbox_core::PER_OPERATOR_GATEWAY_ENV) },
         }
     }
 

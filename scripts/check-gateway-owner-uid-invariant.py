@@ -284,41 +284,55 @@ COLLAPSE_CALL = re.compile(r"^(?:sandbox_core::)?gateway_owner_uid\s*\(")
 # are for.  Do not try to make C1 do it.  Make C1 loud about the direct reads
 # and state the limit, which is what this paragraph is.
 #
-# C1'S SUBJECT CHANGED, and the reason matters more than the change.  It used to
-# be `state.docker`, the daemon-wide Docker route hung off shared state.  That
-# field was deleted -- correctly: a route sitting in shared state names no owner,
-# so a handler reaching for it would compile whether or not it had been
-# converted.  C1 then went silently vacuous: the regex matched nothing, the
-# denominator printed 0, and the run still exited 0.
+# C1'S SUBJECT HAS CHANGED TWICE, and the reasons matter more than the changes.
+# It used to be `state.docker`, the daemon-wide Docker route hung off shared
+# state.  That field was deleted -- correctly: a route sitting in shared state
+# names no owner, so a handler reaching for it would compile whether or not it
+# had been converted.  C1 then went silently vacuous: the regex matched nothing,
+# the denominator printed 0, and the run still exited 0.
 #
 # The question that repaired it was NOT "is C1's assertion still true" -- it was,
 # trivially and uselessly.  It was "what REGION did C1 guard, and is that region
 # still occupied".  C1 guarded *a daemon-built Docker route reaching a
 # caller-serving function*.  Deleting the field removed one SPELLING of that, not
-# the region.  The daemon's own route is still built at startup
-# (`gateway_docker_route(daemon_uid)`) and still handed to two long-lived
-# objects -- the container runtime and the gateway Lima manager -- and both are
-# still reachable while serving a caller.  C2 already watches the second.  C1
-# now watches the first.
+# the region, so C1 was re-aimed at `state.container_runtime`, which at the time
+# held the daemon's own route inside it.
+#
+# THAT SECOND SUBJECT IS ALSO GONE, and this time the region went with it.  The
+# container runtime no longer carries a route.  It carries a per-operator
+# resolver (`Arc<dyn Fn(u32) -> DockerRoute>`) and answers per call, from the
+# operator on the spec or the start args.  There is no daemon-built route inside
+# the object for a handler to reach any more, so the property C1 was re-aimed at
+# in its second life is one this clause can no longer observe -- not because the
+# check weakened, but because the thing it watched for stopped existing.
+#
+# WHAT C1 DETECTS, STATED AS THE WEAKER THING IT IS: a caller-serving function
+# that NAMES a startup-owned singleton directly.  That is the whole property.  It
+# does not follow the value, it does not know what the singleton carries, and it
+# cannot tell a handler that misroutes from one that does not.  Do not read this
+# clause as a route check; it has not been one since the resolver landed.
 #
 # `state.runtimes` is in C1's scope as a second name for the same object: it is
 # the dispatch table holding that one `Arc<ContainerRuntime>`, so a handler
-# reaching the table directly is the same defect in different words.
+# reaching the table directly names the same singleton in different words.
 #
 # WHY NOT C5.  C5 checks the uid handed to an F3 FACTORY -- that
 # `gateway_docker_route(..)` and `gateway_lima_managers.get_or_create(..)`
-# receive an already-collapsed owner.  It says nothing about what happens to the
-# route afterwards, and the startup call it does see is the legitimate one.  The
-# route travelling INSIDE `ContainerRuntime` to a handler is invisible to it.
-# The two clauses do not overlap here.
+# receive an already-collapsed owner.  It says nothing about what a long-lived
+# object does with what it was built from, and the startup call it does see is
+# the legitimate one.  The two clauses do not overlap here.
 #
-# EXPECT C1 TO BE RED ON A TREE WHERE THIS IS UNFINISHED.  Both
-# `state.container_runtime` reads sit in create-session handlers and neither is
-# converted; the conversion has no compile-time tripwire, because the route lives
-# inside the object and a half-conversion behaves identically while per-operator
-# gateways are off.  A red C1 there is a true finding about outstanding work, not
-# a checker defect, and there is deliberately nowhere to put it -- this file has
-# no accepted-violations list and must not grow one.
+# EXPECT C1 TO BE RED ON THIS TREE, AND DO NOT READ THE RED AS ROUTE DEBT.  The
+# two `state.container_runtime` reads sit in create-session handlers and both
+# reach the startup-owned runtime, which is the weaker property above, and is
+# true of them.  NEITHER IS A ROUTE SITE: both call `register_session`, which
+# reads the route zero times.  A correct and complete per-operator route
+# conversion therefore leaves both of these firing, and that is the expected
+# steady state rather than a signal of outstanding work.  They are not exempted
+# and there is deliberately nowhere to put them -- this file has no
+# accepted-violations list and must not grow one.  If that is to change it must
+# change by someone deciding the weaker property is not worth watching at all,
+# not by carving out the two sites that currently exercise it.
 #
 # TO CHECK C1 IS NOT MERELY OVER-BROAD, do not read it -- run it.  Extract the
 # workspace (`git archive HEAD sandboxd | tar -x -C <dir>`; do NOT `cp -R` the
@@ -327,9 +341,9 @@ COLLAPSE_CALL = re.compile(r"^(?:sandbox_core::)?gateway_owner_uid\s*\(")
 # GREEN while `--self-test` still PASSES.  Green-on-converted plus red-on-
 # unconverted is the pair; either half alone is consistent with a dead clause.
 # That pair also puts `alt C1/state.container_runtime` at zero and prints it as
-# UNEXPLAINED, which is correct and is the point: whoever does the real
-# conversion should have to look at that line and say whether the spelling went
-# away on purpose.
+# UNEXPLAINED, which is correct and is the point: whoever removes the last
+# spelling should have to look at that line and say whether it went away on
+# purpose.
 #
 # ---------------------------------------------------------------------------
 # A KNOWN GAP, NAMED RATHER THAN FIXED.  C1 counts a match unconditionally but
@@ -376,7 +390,8 @@ C2_ALTS = (
 )
 FIELD_CLAUSES = [
     ("C1", re.compile(r"\bstate\s*\.\s*(?:container_runtime|runtimes)\b"),
-     "daemon-built container runtime", C1_ALTS),
+     "startup-owned container-runtime singleton named in a serving fn",
+     C1_ALTS),
     ("C2", re.compile(r"\bstate\s*\.\s*gateway_lima_manager\b"),
      "singleton gateway Lima manager", C2_ALTS),
 ]
@@ -1678,8 +1693,8 @@ def run(path, quiet=False):
 INJECT_FN = "stop_session"
 INJECTIONS = [
     ("C1", "    let bad_rt = state.container_runtime.clone();",
-     "F3 output (the daemon-built container runtime, which carries the daemon's "
-     "own Docker route inside it) reached while serving a caller"),
+     "F3 output (the startup-owned container-runtime singleton) named while "
+     "serving a caller"),
     ("C2", "    let bad_mgr = state.gateway_lima_manager.clone();",
      "F3 output (daemon-built gateway manager) used while serving a caller"),
     ("C3", "    let bad = state.lima_runtime.manager_for("

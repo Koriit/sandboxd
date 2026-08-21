@@ -124,7 +124,8 @@ pub struct RuntimeStartArgs {
     /// `Some((uid, gid))` is set by the daemon's session-create handler
     /// for every backend whenever the operator identity has been
     /// resolved (post-V008). The container runtime uses it for
-    /// `docker create --user <uid>:<gid>`; the Lima runtime uses it to
+    /// `docker create --user <uid>:<gid>` and to resolve which operator's
+    /// Docker daemon the call must reach; the Lima runtime uses it to
     /// interpolate the operator's uid/gid into the per-session cloud-init
     /// `usermod` provision step. All Lima limactl operations are dispatched
     /// through the per-operator `LimaManager` (keyed by uid), so uid
@@ -132,7 +133,14 @@ pub struct RuntimeStartArgs {
     ///
     /// `None` means the operator identity is unavailable — either a
     /// pre-V008 record where the daemon didn't yet capture peercred, or
-    /// a fixture-test row that omits it.
+    /// a fixture-test row that omits it. A VM-hosted container runtime
+    /// rejects `None`: each operator's containers live in their own
+    /// gateway VM, so proceeding would run this session's containers in
+    /// whichever VM a made-up uid resolves to — in practice the daemon's
+    /// own. A host-routed runtime accepts it, because
+    /// [`DockerRoute::Host`](crate::docker::DockerRoute::Host) names no
+    /// owner to select. That is a claim about the route only, and does
+    /// not mean an absent identity has no effect elsewhere.
     pub operator_identity: Option<(u32, u32)>,
     /// Lima: allow the management slirp NIC to stay unrestricted for this
     /// start. Used only for first-boot `limactl create` sessions whose
@@ -266,6 +274,15 @@ pub trait SessionRuntime: Send + Sync {
     /// Networking, gateway, and policy work happen outside the
     /// runtime.
     ///
+    /// [`SessionSpec::operator_identity`] carries the owning operator's
+    /// `(uid, gid)`. The container runtime resolves its Docker route from
+    /// the uid — on macOS an operator's containers live in that operator's
+    /// gateway VM — and separately takes the pair the container itself runs
+    /// as from `ContainerNetwork::operator_identity`, stamped by the daemon
+    /// at the call site of `ContainerRuntime::register_session`. The two are
+    /// assigned from the same operator by every current caller; nothing in
+    /// the type system requires that.
+    ///
     /// The session id is assigned by the daemon before dispatch and passed
     /// explicitly here, mirroring `LimaManager::create_vm` and the
     /// deterministic-handle convention: handles are not persisted by the
@@ -293,21 +310,27 @@ pub trait SessionRuntime: Send + Sync {
     ///
     /// `operator_uid` is the numeric uid of the operator that owns the
     /// session. The Lima runtime dispatches through `sandbox-lima-helper
-    /// stop --op-uid`; the container runtime accepts and ignores it.
+    /// stop --op-uid`; the container runtime resolves its Docker route from
+    /// it — on macOS an operator's containers live in that operator's
+    /// gateway VM.
     async fn stop(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError>;
 
     /// Delete a stopped session and its artefacts. Idempotent.
     ///
     /// `operator_uid` is the numeric uid of the operator that owns the
     /// session. The Lima runtime dispatches through `sandbox-lima-helper
-    /// delete --op-uid`; the container runtime accepts and ignores it.
+    /// delete --op-uid`; the container runtime resolves its Docker route from
+    /// it — on macOS an operator's containers live in that operator's
+    /// gateway VM.
     async fn delete(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError>;
 
     /// Query the current state of a session.
     ///
     /// `operator_uid` is the numeric uid of the operator that owns the
     /// session. The Lima runtime dispatches through `sandbox-lima-helper
-    /// list-json --op-uid`; the container runtime accepts and ignores it.
+    /// list-json --op-uid`; the container runtime resolves its Docker route
+    /// from it — on macOS an operator's containers live in that operator's
+    /// gateway VM.
     async fn status(
         &self,
         handle: &RuntimeHandle,
@@ -320,9 +343,9 @@ pub trait SessionRuntime: Send + Sync {
     ///
     /// `operator_uid` is the numeric uid of the operator that owns the session.
     /// The Lima runtime uses it to pivot to the operator's uid via
-    /// `sandbox-lima-helper guest-socat`; the container runtime accepts
-    /// and ignores it (Docker's `--user` mediation handles cross-user
-    /// isolation there).
+    /// `sandbox-lima-helper guest-socat`; the container runtime resolves its
+    /// Docker route from it, so the transport is opened against the Docker
+    /// daemon that hosts that operator's containers.
     fn guest_transport(&self, handle: &RuntimeHandle, operator_uid: u32)
     -> Arc<dyn GuestTransport>;
 
@@ -333,7 +356,8 @@ pub trait SessionRuntime: Send + Sync {
     /// `operator_uid` is the numeric uid of the operator that owns the
     /// session. The Lima runtime dispatches through `sandbox-lima-helper`
     /// (`start` → `install-guest-agent` → `stop`); the container runtime
-    /// accepts and ignores it (Docker handles cross-user isolation).
+    /// resolves its Docker route from it, so the push reaches the Docker
+    /// daemon that hosts that operator's containers.
     ///
     /// Implementations are responsible for the order of operations
     /// within their own substrate (start the runtime if it was stopped,

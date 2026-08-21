@@ -154,9 +154,11 @@ pub struct SessionSpec {
     /// Consumed by the Lima backend's per-session cloud-init `usermod`
     /// provision step (the YAML is generated at `create` time, so the
     /// pair must be available before `LimaManager::create_vm` runs).
-    /// The container backend consumes the same pair via the separate
-    /// `ContainerNetwork.operator_identity` field, also stamped by the
-    /// daemon at the call site of `ContainerRuntime::register_session`.
+    /// The container backend reads this pair directly, to resolve which
+    /// operator's Docker daemon `create` must reach; it separately
+    /// consumes `ContainerNetwork.operator_identity`, stamped by the
+    /// daemon at the call site of `ContainerRuntime::register_session`,
+    /// for the uid the container runs as.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_identity: Option<(u32, u32)>,
     // Forward-compat: new fields go here as Option<T> with

@@ -115,6 +115,21 @@ const REFRESH_STOP_GRACE_SECS: u32 = 5;
 /// blocked indefinitely on a hung CLI.
 const DOCKER_CMD_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Placeholder uid handed to a host-routed runtime's route factory.
+///
+/// [`DockerRoute::Host`] names no owner, so *for the purpose of choosing a
+/// route* this argument selects nothing. The constant exists so the one call
+/// site with no operator uid to offer says which question it is declining to
+/// answer, rather than passing an unexplained `0` a later reader would have to
+/// re-derive. It never reaches a VM route:
+/// [`ContainerRuntime::route_for_identity`] errors instead.
+///
+/// Scope, because the name would otherwise overreach: this says the *route*
+/// does not turn on the uid. It does not say an absent operator identity is
+/// inert. Other consumers of that identity exist and have their own behaviour
+/// when it is missing; nothing here licenses an inference about them.
+const HOST_ROUTE_PLACEHOLDER_UID: u32 = 0;
+
 /// Test-fixture tag for the lite image. Production builds construct
 /// the runtime with `format!("{LITE_IMAGE_REPOSITORY}:{daemon_version}")`
 /// so the tag matches what [`ensure_image`] actually builds; this `:latest`
@@ -388,10 +403,30 @@ pub struct ContainerRuntime {
     /// Where this runtime's `docker` operations go: the host daemon on
     /// Linux, or a typed op seam into the operator's VM on macOS.
     ///
-    /// Linux behaviour is byte-for-byte identical to the pre-seam code —
-    /// [`DockerRoute::Host`] renders the same argv and inherits the same
-    /// environment. Use [`Self::is_macos`] to test which shape is in play.
-    docker: DockerRoute,
+    /// A factory rather than a route, because one runtime instance serves
+    /// every operator. On macOS an operator's containers live in *their*
+    /// gateway VM, so which VM a call must reach is a property of that call's
+    /// operator, not of the daemon that built the runtime. A resolved route
+    /// stored here would name whichever uid startup happened to hold — the
+    /// daemon's — and every operator's operations would land on the daemon's
+    /// VM while naming the right gateway *instance*, which is why nothing
+    /// about the type or the name would reveal it. Resolve per operation via
+    /// [`Self::route_for`].
+    ///
+    /// Linux behaviour is byte-for-byte identical to the pre-seam code — the
+    /// factory does not consult the uid and answers [`DockerRoute::Host`],
+    /// which renders the same argv and inherits the same environment. Use
+    /// [`Self::is_macos`] to test which shape is in play.
+    route: Arc<dyn Fn(u32) -> DockerRoute + Send + Sync>,
+    /// Whether this runtime's containers live inside a VM (macOS) rather than
+    /// on the host's own Docker daemon (Linux).
+    ///
+    /// Stored rather than asked of [`Self::route`]: that factory now answers
+    /// per operator, so asking it would mean inventing a uid to ask about.
+    /// Not `cfg!(target_os = "macos")` either — [`Self::with_vm_route`] is
+    /// deliberately non-`cfg` so both shapes stay constructible, and hence
+    /// testable, on whichever host runs the tests.
+    vm_hosted: bool,
     /// Pinned HOME / DOCKER_CONFIG root for the Docker client config dir.
     /// The Docker build client creates its config dir under `$HOME`; a
     /// daemon running as a system user with a non-writable HOME would abort
@@ -442,20 +477,27 @@ impl ContainerRuntime {
             user_uid,
             user_gid,
             guest_bind_source: guest_bind_source.into(),
-            docker: DockerRoute::Host,
+            route: Arc::new(|_| DockerRoute::Host),
+            vm_hosted: false,
             docker_home: PathBuf::from("/tmp"),
             sessions: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Construct a container runtime that routes all `docker` calls through the
-    /// specified forwarded socket path, and pins `HOME` / `DOCKER_CONFIG` for
-    /// the docker client to `docker_home`.
+    /// Construct a container runtime whose `docker` calls are routed into a
+    /// VM, and pin `HOME` / `DOCKER_CONFIG` for the docker client to
+    /// `docker_home`.
     ///
-    /// On macOS, sandbox containers run inside the `sandboxd-gateway` Lima VM.
-    /// Every docker command must be directed to the forwarded socket via
-    /// `-H unix://<path>`. This constructor wires that socket into every docker
-    /// call the runtime makes.
+    /// On macOS, sandbox containers run inside a `sandboxd-gateway` Lima VM.
+    /// Every docker command must be directed at the Docker daemon inside the
+    /// VM belonging to the operator whose session it is — so `route` is a
+    /// factory from operator uid to route, not a single route. It is applied
+    /// once per operation, against the uid that operation carries.
+    ///
+    /// The caller owns the operator-to-gateway-owner collapse. Handing this a
+    /// factory that skips it would aim every request at that operator's own
+    /// agent while per-operator gateways are off, and nothing about the
+    /// resulting route's shape would say so.
     ///
     /// `docker_home` is typically the daemon `base_dir` (`/var/lib/sandboxd/<uid>`),
     /// which is the writable, daemon-owned directory the launchd plist already
@@ -473,7 +515,7 @@ impl ContainerRuntime {
         user_uid: u32,
         user_gid: u32,
         guest_bind_source: impl Into<PathBuf>,
-        docker: DockerRoute,
+        route: Arc<dyn Fn(u32) -> DockerRoute + Send + Sync>,
         docker_home: impl Into<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -484,7 +526,8 @@ impl ContainerRuntime {
             user_uid,
             user_gid,
             guest_bind_source: guest_bind_source.into(),
-            docker,
+            route,
+            vm_hosted: true,
             docker_home: docker_home.into(),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -493,7 +536,67 @@ impl ContainerRuntime {
     /// Return `true` when this runtime's containers live inside a VM
     /// (macOS). `false` on Linux (host daemon).
     pub fn is_macos(&self) -> bool {
-        self.docker.is_vm()
+        self.vm_hosted
+    }
+
+    /// The Docker route an operation on behalf of `operator_uid` must take.
+    ///
+    /// Every `docker` call this runtime makes goes through here, so that which
+    /// gateway a request lands on is decided in one place from the operation's
+    /// own operator rather than from whatever the runtime was built with. On a
+    /// host-routed runtime the uid is not route-bearing and the answer is
+    /// always [`DockerRoute::Host`].
+    pub fn route_for(&self, operator_uid: u32) -> DockerRoute {
+        (self.route)(operator_uid)
+    }
+
+    /// [`Self::route_for`] for the two operations that carry the operator as an
+    /// `Option` — `create` and `start` — where absence has to be adjudicated
+    /// rather than passed on.
+    ///
+    /// Absent is an error on a VM-hosted runtime and accepted on a host-routed
+    /// one, and the asymmetry is the point.
+    ///
+    /// On a VM route the uid *selects the gateway*. There is no defensible
+    /// default: the only alternative to erroring is to serve the operator from
+    /// whichever VM the factory answers for a made-up uid — in practice the
+    /// daemon's own — which is exactly the failure this seam exists to remove.
+    /// So the error is justified by the consequence of proceeding, not by how
+    /// unlikely the input is. A session row carrying no operator uid after V009
+    /// is a corrupted invariant; erroring reports it, and the alternative
+    /// silently launders it into the daemon's identity.
+    ///
+    /// On the host route there is no owner to select — [`DockerRoute::Host`]
+    /// names none — so this answers with a route instead of demanding a uid it
+    /// would not use to choose one. That is a claim about the *route* only. It
+    /// does not make an absent identity inert: other consumers of that identity
+    /// have their own behaviour when it is missing, and nothing here should be
+    /// read as saying the value goes unconsumed.
+    ///
+    /// The `!self.vm_hosted` test is sound only because the flag and the route
+    /// factory are set together, and that coupling lives in the constructors
+    /// rather than here: [`Self::new`] hard-codes both the host factory and
+    /// `vm_hosted: false` (it does not accept a factory at all),
+    /// [`Self::with_vm_route`] hard-codes `true`, the field is private with no
+    /// setter, and no struct literal builds this type. A future constructor
+    /// pairing a uid-bearing factory with `vm_hosted: false` would disable this
+    /// guard silently, with every test still green — keep the pairing inside
+    /// the constructor.
+    fn route_for_identity(
+        &self,
+        operator_identity: Option<(u32, u32)>,
+        method: &str,
+    ) -> Result<DockerRoute, SandboxError> {
+        match operator_identity.map(|(uid, _)| uid) {
+            Some(operator_uid) => Ok(self.route_for(operator_uid)),
+            None if !self.vm_hosted => Ok(self.route_for(HOST_ROUTE_PLACEHOLDER_UID)),
+            None => Err(SandboxError::Internal(format!(
+                "{method} called without operator_identity on a VM-hosted \
+                 runtime; refusing to fall back to the daemon's own gateway, \
+                 which would run this session's containers in the wrong \
+                 operator's VM"
+            ))),
+        }
     }
 
     /// The pinned `HOME` / `DOCKER_CONFIG` root for the Docker client.
@@ -788,6 +891,13 @@ impl SessionRuntime for ContainerRuntime {
         let network = self.lookup_session(session_id)?;
         let (memory_mb, cpus) = self.resource_ceilings(spec)?;
 
+        // Resolved once and reused by all three docker calls below, so a
+        // session cannot have its volume created on one gateway and its
+        // container on another. Placed after the shape checks above so a
+        // malformed spec still reports the malformation rather than the
+        // missing identity.
+        let route = self.route_for_identity(spec.operator_identity, "ContainerRuntime::create")?;
+
         let (effective_uid, effective_gid) =
             effective_container_user(network.operator_identity, self.user_uid, self.user_gid);
 
@@ -817,7 +927,7 @@ impl SessionRuntime for ContainerRuntime {
         {
             let volume_name = home_volume_name(session_id);
             run_docker(
-                self.docker.clone(),
+                route.clone(),
                 DockerOp::VolumeCreate {
                     name: volume_name.clone(),
                     session_id: Some(session_id.to_string()),
@@ -866,7 +976,7 @@ impl SessionRuntime for ContainerRuntime {
                  (operator uid {effective_uid} != image baked uid {LITE_IMAGE_HOME_UID})"
             );
             run_docker(
-                self.docker.clone(),
+                route.clone(),
                 DockerOp::HomeVolumeChown {
                     session_id: session_id.to_string(),
                     image_tag: self.image_tag.clone(),
@@ -886,7 +996,7 @@ impl SessionRuntime for ContainerRuntime {
         );
 
         run_docker(
-            self.docker.clone(),
+            route,
             DockerOp::ContainerCreate { spec: create_spec },
             "docker create (container runtime)",
         )
@@ -916,9 +1026,14 @@ impl SessionRuntime for ContainerRuntime {
         let session_id = Self::session_id_from_handle(handle)?;
         let network = self.lookup_session(&session_id)?;
         let container_name = handle.as_str().to_string();
+        // The start and the pid inspection below must reach the same Docker
+        // daemon: a pid read from a different one would name a process in the
+        // wrong VM, and the route helper would then install a default route
+        // into some other container's netns.
+        let route = self.route_for_identity(args.operator_identity, "ContainerRuntime::start")?;
 
         run_docker(
-            self.docker.clone(),
+            route.clone(),
             DockerOp::ContainerStart {
                 name: container_name.clone(),
             },
@@ -935,7 +1050,7 @@ impl SessionRuntime for ContainerRuntime {
                         .to_string(),
                 )
             })?;
-            let pid = inspect_container_pid(&container_name, self.docker.clone()).await?;
+            let pid = inspect_container_pid(&container_name, route).await?;
             invoke_route_helper(helper, pid, network.gateway_ip, for_user).await?;
         } else {
             debug!(
@@ -955,11 +1070,11 @@ impl SessionRuntime for ContainerRuntime {
     /// recognisable "is not running" / "No such container" stderr.
     /// Both shapes map to `Ok(())` so callers do not need to special-
     /// case the redundant-stop path.
-    async fn stop(&self, handle: &RuntimeHandle, _operator_uid: u32) -> Result<(), SandboxError> {
+    async fn stop(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError> {
         let container_name = handle.as_str().to_string();
 
         match run_docker(
-            self.docker.clone(),
+            self.route_for(operator_uid),
             DockerOp::ContainerStop {
                 name: container_name,
                 grace_secs: DOCKER_STOP_GRACE_SECS,
@@ -993,12 +1108,12 @@ impl SessionRuntime for ContainerRuntime {
     /// `NetworkManager::delete_network` or `remove_docker_network`) AFTER
     /// this method returns, so the network rm never races a still-attached
     /// container endpoint.
-    async fn delete(&self, handle: &RuntimeHandle, _operator_uid: u32) -> Result<(), SandboxError> {
+    async fn delete(&self, handle: &RuntimeHandle, operator_uid: u32) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
         let container_name = handle.as_str().to_string();
 
         match run_docker(
-            self.docker.clone(),
+            self.route_for(operator_uid),
             DockerOp::ContainerRemove {
                 name: container_name.clone(),
                 force: RemoveForce::Short,
@@ -1013,7 +1128,7 @@ impl SessionRuntime for ContainerRuntime {
         }
 
         match run_docker(
-            self.docker.clone(),
+            self.route_for(operator_uid),
             DockerOp::VolumeRemove {
                 name: home_volume_name(&session_id),
             },
@@ -1034,12 +1149,12 @@ impl SessionRuntime for ContainerRuntime {
     async fn status(
         &self,
         handle: &RuntimeHandle,
-        _operator_uid: u32,
+        operator_uid: u32,
     ) -> Result<RuntimeStatus, SandboxError> {
         let container_name = handle.as_str().to_string();
 
         match run_docker(
-            self.docker.clone(),
+            self.route_for(operator_uid),
             DockerOp::ContainerInspect {
                 name: container_name,
                 format: InspectFormat::StateStatus,
@@ -1071,11 +1186,14 @@ impl SessionRuntime for ContainerRuntime {
     fn guest_transport(
         &self,
         handle: &RuntimeHandle,
-        _operator_uid: u32,
+        operator_uid: u32,
     ) -> Arc<dyn GuestTransport> {
         Arc::new(ContainerTransport {
             container_name: handle.as_str().to_string(),
-            docker: self.docker.clone(),
+            // Resolved here, not re-resolved per stream: a transport belongs
+            // to one session and therefore to one operator, so the route it
+            // carries is settled the moment it is built.
+            docker: self.route_for(operator_uid),
         })
     }
 
@@ -1102,16 +1220,19 @@ impl SessionRuntime for ContainerRuntime {
     async fn refresh_guest_binary(
         &self,
         handle: &RuntimeHandle,
-        _operator_uid: u32,
+        operator_uid: u32,
     ) -> Result<(), SandboxError> {
         let container_name = handle.as_str().to_string();
+        // The defensive stop and the restart below are two halves of one
+        // operation; resolving once keeps them on the same daemon.
+        let route = self.route_for(operator_uid);
 
         // 1. Defensive stop. Idempotent — `start_session` only invokes
         //    this method when `session.state == Stopped`, but a future
         //    caller (e.g. an admin re-running refresh against a hot
         //    container) should not trip on "container is running".
         match run_docker(
-            self.docker.clone(),
+            route.clone(),
             DockerOp::ContainerStop {
                 name: container_name.clone(),
                 grace_secs: REFRESH_STOP_GRACE_SECS,
@@ -1137,7 +1258,7 @@ impl SessionRuntime for ContainerRuntime {
         //    atomically renames that file so the source is always
         //    current.
         run_docker(
-            self.docker.clone(),
+            route,
             DockerOp::ContainerRestart {
                 name: container_name.clone(),
             },
@@ -1980,14 +2101,21 @@ mod tests {
     /// A route that names a VM without being able to reach one. Unit tests
     /// never run docker; what they assert is which shape the runtime takes,
     /// and the executor is never invoked.
-    fn unreachable_vm_route() -> DockerRoute {
+    fn unreachable_vm_route(op_uid: u32) -> DockerRoute {
         DockerRoute::Vm {
-            op_uid: 501,
+            op_uid,
             executor: Arc::new(crate::docker::LocalSocketDockerExecutor::new(
                 "/var/lib/sandboxd/501/501/lima/sandboxd-gateway/gateway-docker.sock",
                 "/var/lib/sandboxd/501/501/lima",
             )),
         }
+    }
+
+    /// The VM-route factory a test runtime is built with: it answers for
+    /// whichever operator it is asked about, which is what the daemon's own
+    /// factory does once the operator-to-owner collapse has been applied.
+    fn unreachable_vm_route_factory() -> Arc<dyn Fn(u32) -> DockerRoute + Send + Sync> {
+        Arc::new(unreachable_vm_route)
     }
 
     fn test_runtime_macos() -> Arc<ContainerRuntime> {
@@ -1998,7 +2126,7 @@ mod tests {
             1000,
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
-            unreachable_vm_route(),
+            unreachable_vm_route_factory(),
             "/var/lib/sandboxd/501",
         )
     }
@@ -2119,7 +2247,7 @@ mod tests {
             500,
             500,
             "/tmp/guest",
-            unreachable_vm_route(),
+            unreachable_vm_route_factory(),
             "/tmp/home",
         );
         assert!(rt.is_macos());
@@ -2852,7 +2980,7 @@ mod tests {
             1000,
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
-            unreachable_vm_route(),
+            unreachable_vm_route_factory(),
             "/var/lib/sandboxd/501",
         );
 
