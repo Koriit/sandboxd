@@ -197,8 +197,7 @@ pub enum MitmproxyEvent {
 /// kinds that share a common envelope and flow through the same
 /// daemon-side ingest pipeline:
 ///
-/// - **`Deny`** — emitted by `sandbox-nft-deny-logger`.
-///   / "Deny-logger component" + "Traffic events" row for layer
+/// - **`Deny`** — emitted by `sandbox-nft-deny-logger` for layer
 ///   `deny-logger`. Pre-DNAT 5-tuple recovered via `SO_ORIGINAL_DST`
 ///   (TCP) or NFLOG payload parse (UDP). Same wire shape as `Allow`.
 /// - **`Allow`** — emitted by `sandbox-nft-allow-logger`: one record

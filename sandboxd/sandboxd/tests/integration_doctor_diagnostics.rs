@@ -386,7 +386,7 @@ async fn integration_doctor_hard_fails_on_missing_gateway_image() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let exit_code = output.status.code().expect("exited normally");
 
-    // ;
+    // Missing gateway image → C7 is a hard failure;
     // doctor's process exit code flips to 1.
     assert_eq!(
         exit_code, 1,

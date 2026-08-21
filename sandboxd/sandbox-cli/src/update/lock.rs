@@ -660,7 +660,7 @@ mod tests {
         }
     }
 
-    /// . When the prior PID
+    /// The dead-PID retry branch. When the prior PID
     /// is reported dead, the helper sleeps briefly and retries
     /// `flock` once. If a *competing* adopter takes the flock during
     /// the sleep, the retry also fails — surfaced as

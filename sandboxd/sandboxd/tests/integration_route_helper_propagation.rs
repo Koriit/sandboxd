@@ -264,7 +264,7 @@ fn guest_bind_source_for_tests() -> std::path::PathBuf {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// , test 1: the container backend's `runtime.start` invokes
+/// Test 1: the container backend's `runtime.start` invokes
 /// the configured helper with `--for-user <operator-name>` placed
 /// between the binary name and the two positional args (matching the
 /// wire-shape pin).
@@ -353,7 +353,7 @@ async fn integration_route_helper_for_user_propagated() {
     drop(stub_dir);
 }
 
-/// , test 2: `LimaRuntime::start` never invokes the route
+/// Test 2: `LimaRuntime::start` never invokes the route
 /// helper. We assert this hermetically — without a real Lima VM — by
 /// observing that the stub helper's argv-capture file does NOT exist
 /// after the Lima backend's invocation site is the only one that ran.

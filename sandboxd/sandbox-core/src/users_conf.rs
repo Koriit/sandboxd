@@ -1581,10 +1581,10 @@ mod tests {
     // -----------------------------------------------------------------
     // Migration V001 — pure transform.
     //
-    // Inputs and outputs follow the documented contract verbatim. The transform is
+    // Each row below is one input/output pair. The transform is
     // pure (no I/O), so each row is a single `assert_eq!` between
     // `serde_json::Value` trees. `Value` equality is structural — key
-    // order inside an object is not part of the comparison, so the design
+    // order inside an object is not part of the comparison, so the
     // examples' textual order is incidental to the test contract.
     // -----------------------------------------------------------------
 
@@ -1596,7 +1596,7 @@ mod tests {
 
     #[test]
     fn v001_adds_sandbox_to_single_user_pool() {
-        // .
+        // Single-user pool: `sandbox` is prepended, never appended.
         let input = json(
             r#"{
                 "subnets": [
@@ -1617,7 +1617,7 @@ mod tests {
 
     #[test]
     fn v001_adds_sandbox_to_multiple_pools_independently() {
-        // . Each pool is migrated
+        // Multiple pools: each pool is migrated
         // independently; the operator's `comment` field rides through.
         let input = json(
             r#"{
@@ -1641,7 +1641,7 @@ mod tests {
 
     #[test]
     fn v001_noops_pool_already_containing_sandbox() {
-        // . Operator hand-added `sandbox`
+        // Pool already containing `sandbox`: operator hand-added it
         // in a different order; V001 must not shuffle.
         let input = json(
             r#"{
@@ -1663,7 +1663,7 @@ mod tests {
 
     #[test]
     fn v001_noops_when_schema_version_already_one() {
-        // . Bit-equal output.
+        // Already at schema version 1. Bit-equal output.
         let input = json(
             r#"{
                 "_schema_version": 1,

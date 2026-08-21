@@ -637,7 +637,7 @@ fn container_spec() -> SessionSpec {
     }
 }
 
-/// .
+/// Container-backend pull: guest tree → host path.
 ///
 /// Seed contents inside the guest by `docker exec`-ing `mkdir` +
 /// `tee`. Then invoke the host-side `rsync` client against
@@ -760,7 +760,7 @@ async fn integration_container_local_pull() {
 // the existing daemon-spawning tests claim (see comment block on the
 // other integration_local_workspace test in this crate).
 
-/// .
+/// A held push lock blocks a concurrent pull with 409.
 ///
 /// 1. Acquire `op=push` against the seeded `Running` session → 200,
 ///    body carries a `lock_token`.
@@ -830,7 +830,7 @@ async fn integration_workspace_lock_push_blocks_pull() {
     );
 }
 
-/// .
+/// A held workspace lock blocks session stop with 409.
 ///
 /// Phase 4 atomicity contract: while a workspace operation holds the
 /// lock, `POST /sessions/<id>/stop` must refuse with HTTP 409 and the
@@ -905,7 +905,7 @@ async fn integration_workspace_lock_blocks_stop() {
     );
 }
 
-/// .
+/// A held workspace lock blocks session delete with 409.
 ///
 /// Phase 4 atomicity contract mirror for the remove path. While a
 /// workspace operation holds the lock, `DELETE /sessions/<id>` must
@@ -964,7 +964,7 @@ async fn integration_workspace_lock_blocks_delete() {
     );
 }
 
-/// .
+/// `force=true` releases the lock without a matching token.
 ///
 /// Operator escape hatch: `force=true` skips the token-match check.
 /// Acquire push (token T1), release with a deliberately different
@@ -1010,7 +1010,7 @@ async fn integration_workspace_lock_force_release() {
     let _ = parse_lock_token(&body);
 }
 
-/// .
+/// Release against an already-unlocked session is idempotent.
 ///
 /// Two contracts:
 ///

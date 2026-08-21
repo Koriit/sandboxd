@@ -329,7 +329,7 @@ async fn start_container(
 // Test 1: happy-path mirror — container backend
 // ---------------------------------------------------------------------------
 
-/// .
+/// Happy-path mirror on the container backend: host tree → guest path.
 ///
 /// Create a host source tree with known nested files. Boot a
 /// container. Call `run_initial_push(Container, …, no_gitignore=false)`
@@ -398,7 +398,7 @@ async fn integration_container_local_create_and_push() {
 // Test 2: `.gitignore` filter respected by default, dropped on opt-in
 // ---------------------------------------------------------------------------
 
-/// .
+/// `.gitignore` is respected by default and dropped on opt-in.
 ///
 /// Same host source, two pushes against two fresh containers (one
 /// container per push so neither test sees the other's leftover
@@ -498,7 +498,7 @@ async fn integration_local_gitignore_filter() {
 // Test 3: rsync failure surfaces as SandboxError::Internal w/ stderr
 // ---------------------------------------------------------------------------
 
-/// .
+/// An rsync failure surfaces as `SandboxError::Internal` carrying stderr.
 ///
 /// Library-level: assert the function returns the documented error
 /// shape on rsync failure. The orphan-cleanup half of the design ("no

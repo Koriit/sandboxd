@@ -1321,7 +1321,7 @@ fn integration_route_helper_writes_audit_log_on_denied() {
 // Audit-log write failure on deny still denies
 // ---------------------------------------------------------------------------
 
-/// , the
+/// When the audit-log write fails on a deny path, the
 /// helper still exits `DENY_EXIT` AND escalates to stderr — the deny
 /// itself is unconditional and the forensic-record-availability
 /// invariant gains explicit escalation.

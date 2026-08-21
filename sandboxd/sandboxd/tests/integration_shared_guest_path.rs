@@ -205,7 +205,7 @@ fn container_spec() -> SessionSpec {
             memory_mb: 256,
             cpus: 1.0,
         },
-        // The workspace_mode field on the SessionSpecis informational
+        // The workspace_mode field on the `SessionSpec` is informational
         // at the runtime layer; the actual bind comes from
         // `ContainerNetwork.workspace_bind`. We leave it as None here
         // so the runtime takes the same code path the daemon does
@@ -240,7 +240,7 @@ fn docker_exec_capture(container_name: &str, argv: &[&str]) -> String {
 // Test: container backend honours operator-supplied `:<guest_path>`
 // ---------------------------------------------------------------------------
 
-/// .
+/// The container backend honours an operator-supplied `:<guest_path>`.
 ///
 /// Create a host tempdir with known contents. Boot a container with
 /// `ContainerNetwork.workspace_bind = Some(WorkspaceBind { host_path:
@@ -583,7 +583,7 @@ async fn integration_container_rejects_security_model() {
             panic!("rejection body must have a top-level `error` string; got: {parsed}")
         });
 
-    //  — the rejection
+    // The container backend has no 9p layer, so the rejection
     // message must name the offending field so the operator can map
     // the error back to their `--workspace shared:…:<model>` invocation.
     assert!(

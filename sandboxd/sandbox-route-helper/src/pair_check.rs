@@ -95,7 +95,7 @@ pub(crate) fn pair_check_with_resolver(
 
 #[cfg(test)]
 mod tests {
-    //! .
+    //! Pair-check unit tests.
     //!
     //! Eight rows, one per `(pool, caller, for_user)` shape. The
     //! resolver fixes the test universe: alice=1001, bob=1002,

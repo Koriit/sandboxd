@@ -269,7 +269,7 @@ fn read_original_dst(socket: &TcpStream) -> io::Result<SocketAddrV4> {
 /// Apply `SO_LINGER {onoff=1, linger=0}` so the subsequent `close(2)`
 /// sends RST instead of the normal FIN handshake.
 ///
-///  / "Hardening rules". Failure here is non-fatal:
+/// Failure here is non-fatal:
 /// without LINGER the close falls back to FIN, but the deny event is
 /// already emitted so the audit trail is intact.
 fn apply_linger_zero(socket: &TcpStream) {

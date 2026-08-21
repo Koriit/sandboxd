@@ -278,7 +278,7 @@ async fn integration_session_create_refused_on_missing_gateway_image() {
     let (status, body_bytes) =
         http_post_json(&daemon.socket, "/sessions", body, Duration::from_secs(15)).await;
 
-    // .
+    // Refusal status maps via `error_response` to 500.
     assert_eq!(
         status,
         hyper::StatusCode::INTERNAL_SERVER_ERROR,

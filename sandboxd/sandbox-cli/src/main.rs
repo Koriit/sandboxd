@@ -6588,7 +6588,7 @@ async fn dispatch_create_preflight(
         }
     };
 
-    // Project the args into a SessionSpecfor validation.
+    // Project the args into a `SessionSpec` for validation.
     let workspace_mode = workspace.and_then(|raw| {
         // The full validation of `--workspace` (path exists, is
         // absolute, etc.) lives later in `build_request` to preserve
@@ -6991,7 +6991,7 @@ async fn main() {
     // Create has a dedicated dispatch path because the request body
     // depends on a backend choice that is the output
     // of an async preflight (config load → resolver → /backends fetch
-    // → SessionSpecvalidation). Running it here keeps `build_request`
+    // → `SessionSpec` validation). Running it here keeps `build_request`
     // sync for every other command and confines the new logic to one
     // explicit branch.
     let req = if let Command::Create {
@@ -8540,7 +8540,7 @@ mod tests {
         assert_eq!(calls.len(), 2, "all → two HTTP calls");
         assert_eq!(calls[0].0, sandbox_core::backend::BackendKind::Lima);
         assert_eq!(calls[1].0, sandbox_core::backend::BackendKind::Container);
-        // : JSON wire body carries the resolved
+        // `rebuild-image` wire shape: the JSON body carries the resolved
         // backend kind plus no_cache.
         let lima_body: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
         assert_eq!(lima_body["backend"], serde_json::json!("lima"));
