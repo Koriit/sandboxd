@@ -350,10 +350,28 @@ impl GuestConnector {
         })?;
 
         let handle = RuntimeHandle::from_session_id(session_id);
-        // operator_uid drives sandbox-lima-helper guest-socat --op-uid.
-        // Post-V009 every session row carries a non-None operator_uid;
-        // fall back to 0 only for test rows (container runtime ignores it).
-        let op_uid = session.operator_uid.unwrap_or(0);
+        // `operator_uid` is route-bearing on *both* backends, so there is no
+        // uid that is safe to invent here. Lima pivots to it via
+        // `sandbox-lima-helper guest-socat --op-uid`; the container runtime
+        // resolves its `DockerRoute` from it, and on a VM-hosted route the uid
+        // selects which operator's gateway the exec lands in.
+        //
+        // `ContainerRuntime::route_for_identity` already adjudicates absence
+        // for `create` and `start`, and refuses: substituting a uid serves the
+        // session from whichever VM the factory answers for it — in practice
+        // the daemon's own — which launders a corrupted row into the daemon's
+        // identity rather than reporting it. That reasoning applies unchanged
+        // here. This seam only escaped it because `guest_transport` takes a
+        // `u32` rather than an `Option`, so absence had to be resolved before
+        // the call and a default was the path of least resistance.
+        let op_uid = session.operator_uid.ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "session {session_id} carries no operator uid; refusing to open a \
+                 guest transport rather than substituting one, which would resolve \
+                 it against the daemon's own identity instead of the session \
+                 owner's"
+            ))
+        })?;
         let transport = runtime.guest_transport(&handle, op_uid);
 
         debug!(
@@ -1041,8 +1059,8 @@ mod tests {
                 "test-operator",
                 0,
                 "",
-                None,
-                None,
+                Some(1000),
+                Some(1000),
             )
             .unwrap();
 
@@ -1068,8 +1086,8 @@ mod tests {
                 "test-operator",
                 0,
                 "",
-                None,
-                None,
+                Some(1000),
+                Some(1000),
             )
             .unwrap();
 
@@ -1082,6 +1100,55 @@ mod tests {
         assert!(matches!(response, GuestResponse::Pong));
         let observed = observed.lock().unwrap();
         assert_eq!(*observed, vec![BackendKind::Container]);
+    }
+
+    /// A session row with no operator uid is refused rather than served
+    /// under a substituted one.
+    ///
+    /// The uid selects the Docker route and the Lima pivot target, so the
+    /// only alternative to refusing is to resolve the transport against
+    /// whichever identity a made-up uid answers for — in practice the
+    /// daemon's own. That is the failure this refusal exists to prevent, so
+    /// the assertion is on the refusal, not on any particular substitute.
+    ///
+    /// Backend is `Container` deliberately: the comment this replaced
+    /// asserted the container runtime ignores the uid, and it does not —
+    /// `ContainerRuntime::guest_transport` builds its `DockerRoute` from it.
+    /// Pinning the container case keeps that correction from silently
+    /// regressing.
+    #[tokio::test]
+    async fn guest_connector_refuses_session_without_operator_uid() {
+        let (_temp, store, runtimes, observed) = build_dispatch_fixture();
+        let session = store
+            .create_session_with_backend(
+                SessionConfig::default(),
+                None,
+                BackendKind::Container,
+                "test-operator",
+                0,
+                "",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let connector = GuestConnector::new(runtimes, Arc::clone(&store));
+        let err = connector
+            .send_request(&session.id, GuestRequest::Ping)
+            .await
+            .expect_err("a row with no operator uid must not be served");
+
+        assert!(
+            matches!(err, SandboxError::Internal(ref m) if m.contains("no operator uid")),
+            "expected an Internal error naming the missing operator uid, got: {err:?}"
+        );
+
+        // The refusal has to happen before the transport is built, or the
+        // exec has already been routed by the time it is reported.
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "no transport should have been constructed"
+        );
     }
 
     #[tokio::test]

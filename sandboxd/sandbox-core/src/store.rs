@@ -755,6 +755,46 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    /// Ids of session rows carrying a NULL `operator_uid`.
+    ///
+    /// Intended to be called once, at daemon startup, before any request is
+    /// served. The timing is the whole point and is not incidental: the
+    /// daemon has no way to tell *from a row* how its NULL got there, because
+    /// by the time it is read the causes are indistinguishable. It can tell
+    /// them apart by **when** the NULL is observed. Nothing this daemon does
+    /// writes one — every write path stamps the accepting socket's
+    /// `SO_PEERCRED` — so a NULL present before the daemon has served a
+    /// request came from outside it (a rollback to a binary predating the
+    /// column's contract, a restored backup, or direct SQL), whereas one that
+    /// appears later is this daemon's own defect.
+    ///
+    /// Returning ids rather than a count is what makes that discrimination
+    /// exact. A count taken at startup cannot distinguish a pre-existing NULL
+    /// from a fresh one on a daemon that started with some already present;
+    /// a set of ids can, at no extra cost.
+    ///
+    /// Ids are returned as raw strings, deliberately unparsed: this is a
+    /// diagnostic, and a malformed id is itself a thing the operator needs to
+    /// see rather than a reason for the check to fail.
+    pub fn operatorless_session_ids(&self) -> Result<Vec<String>, SandboxError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sessions WHERE operator_uid IS NULL ORDER BY created_at ASC",
+        )?;
+
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
     pub fn list_sessions(&self, caller_username: &str) -> Result<Vec<Session>, SandboxError> {
         let conn = self
             .conn
@@ -2087,6 +2127,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::BackendKind;
     use tempfile::TempDir;
 
     /// Create a `SessionStore` in a fresh temporary directory.
@@ -2196,6 +2237,86 @@ mod tests {
         assert!(ids.contains(&s1.id));
         assert!(ids.contains(&s2.id));
         assert!(ids.contains(&s3.id));
+    }
+
+    /// The scan returns exactly the operatorless rows, and returns ids rather
+    /// than a bare count.
+    ///
+    /// Both halves are asserted because a scan that returned *every* row would
+    /// also satisfy a nonzero-count check on a fixture that contains a NULL —
+    /// the uid-bearing row is here as the negative control, not as filler.
+    #[test]
+    fn operatorless_session_ids_returns_only_uidless_rows() {
+        let (store, _dir) = test_store();
+
+        // Written the way this daemon writes: uid stamped from SO_PEERCRED.
+        let with_uid = store
+            .create_session_with_backend(
+                SessionConfig::default(),
+                Some("has-operator".into()),
+                BackendKind::Container,
+                TEST_CALLER,
+                0,
+                "",
+                Some(1000),
+                Some(1000),
+            )
+            .expect("create uid-bearing session");
+
+        // Written the way nothing in this daemon writes.
+        let without_uid = store
+            .create_session_with_backend(
+                SessionConfig::default(),
+                Some("no-operator".into()),
+                BackendKind::Container,
+                TEST_CALLER,
+                0,
+                "",
+                None,
+                None,
+            )
+            .expect("create operatorless session");
+
+        let ids = store.operatorless_session_ids().expect("scan failed");
+
+        assert_eq!(
+            ids,
+            vec![without_uid.id.to_string()],
+            "scan must return the operatorless row and only it"
+        );
+        assert!(
+            !ids.contains(&with_uid.id.to_string()),
+            "a uid-bearing row must not be reported"
+        );
+    }
+
+    /// A store with no operatorless rows reports an empty set, not an error.
+    ///
+    /// This is the case that holds on every healthy daemon, so it is the one
+    /// whose cost is paid on every startup — and an empty result has to be
+    /// distinguishable from a failed scan, which the caller logs differently.
+    #[test]
+    fn operatorless_session_ids_is_empty_when_every_row_carries_a_uid() {
+        let (store, _dir) = test_store();
+
+        store
+            .create_session_with_backend(
+                SessionConfig::default(),
+                None,
+                BackendKind::Container,
+                TEST_CALLER,
+                0,
+                "",
+                Some(1000),
+                Some(1000),
+            )
+            .expect("create uid-bearing session");
+
+        let ids = store.operatorless_session_ids().expect("scan failed");
+        assert!(
+            ids.is_empty(),
+            "expected no operatorless rows, got: {ids:?}"
+        );
     }
 
     #[test]

@@ -14714,6 +14714,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Deref<Target = SessionStore>`.
     let (store, reset_orphans) = SessionStore::new(base_dir.clone())?;
     let store = Arc::new(store);
+
+    // Operatorless-row check, deliberately here: after the store is open and
+    // before a single request has been served.
+    //
+    // A NULL `operator_uid` is indistinguishable *as data* from any other —
+    // the row cannot say how it lost its uid. What separates the causes is
+    // timing. Every write path in this daemon stamps the accepting socket's
+    // `SO_PEERCRED`, so a NULL that is already present at startup was not
+    // produced here: the row predates the column's contract and arrived by
+    // rollback to an older binary, by a restored backup, or by direct SQL.
+    // A NULL that appears after this point is a defect in this daemon, and
+    // `GuestConnector::send_request` reports that one per-request as an
+    // internal error.
+    //
+    // So this is not a duplicate of the per-request guard, and neither
+    // replaces the other: they answer different questions and only their
+    // combination attributes a NULL to a cause. Logged rather than fatal
+    // because refusing to start would strand an operator whose other
+    // sessions are fine, and every path that would act on such a row already
+    // refuses it.
+    match store.operatorless_session_ids() {
+        Ok(ids) if !ids.is_empty() => {
+            warn!(
+                count = ids.len(),
+                session_ids = %ids.join(", "),
+                "session rows present at startup with no operator uid; this daemon \
+                 never writes one, so these arrived from outside it — a rollback to \
+                 a binary predating the operator-uid contract, a restored backup, or \
+                 direct SQL. They cannot be started, exec'd into or reached over SSH, \
+                 because the operator uid selects the Docker route and the Lima pivot \
+                 target and no substitute is safe. Delete them, or restore the uid \
+                 from the backup the rows came from."
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // A diagnostic failing is not a reason to refuse to boot, but it
+            // does mean the attribution above is unavailable for this run.
+            warn!(
+                error = %e,
+                "could not scan for operatorless session rows; a NULL operator uid \
+                 seen later in this run cannot be attributed to a cause"
+            );
+        }
+    }
     let base_vm_name = match resolve_base_vm_name() {
         Ok(name) => name,
         Err(err) => {
