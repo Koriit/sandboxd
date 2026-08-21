@@ -133,7 +133,7 @@ def test_update_preserves_systemd_drop_in(
         f"sudo grep -q 'SANDBOX_TEST_MARKER=operator-owned' {drop_in_path}",
     ).returncode == 0
 
-    # 
+    # Post-update doctor green-light. Waits for
     # the daemon socket first (the update restarts the unit at
     # § 3.2.26; the unit may still be activating when the CLI returns).
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
