@@ -7,11 +7,10 @@ assertions rely on the unified event stream (``sandbox events <sid>``)
 which exposes DNS, Envoy, mitmproxy, deny-logger, and lifecycle layers —
 so the tests also act as a cross-layer smoke test for events plumbing.
 
-Deviation from the plan (Phase 7 of
-``.tasks/handoffs/20260423-m10-s5-implementation-plan.md``)
+Why the npm/cargo presets are driven with ``curl``
 --------------------------------------------------------------------------
 
-The plan's happy-path narratives run ``npm init && npm install leftpad``
+The natural happy path would run ``npm init && npm install leftpad``
 and ``cargo new && cargo add && cargo fetch`` *inside* the VM to exercise
 the npm/cargo presets. The golden base image
 (``sandbox-core/src/lima.rs``) only installs ``socat``, ``git``, and
@@ -20,10 +19,10 @@ no apt-source host is part of the ``npm:`` or ``cargo:`` preset allow-list
 (so we cannot ``apt-get install nodejs`` inside the VM without widening
 the session policy and thereby defeating the purpose of the preset test).
 
-To honour the spirit of the plan without extending the base image, we use
-``curl`` (already in the base Ubuntu image) to issue the exact HTTP
-requests that ``npm`` and ``cargo`` would issue against the preset-allowed
-hosts. This is a faithful test of the preset's network-policy coverage
+So rather than extend the base image, we use ``curl`` (already in the
+base Ubuntu image) to issue the exact HTTP requests that ``npm`` and
+``cargo`` would issue against the preset-allowed hosts. This is a
+faithful test of the preset's network-policy coverage
 (the actual security-relevant surface of the preset): the HTTP method,
 host, port, and path pattern are what the policy enforces, not the client
 binary. The github-repo test, by contrast, uses a real ``git clone`` —
@@ -41,10 +40,9 @@ seconds.
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. Preset expansion is host-side; policy
 enforcement runs through the gateway container, which is shared
-between both backends per the M11 gap-#70 closure. The
-``test_preset_expand_round_trip`` test does still boot a session to
-verify the daemon accepts the expanded policy, so it is also
-parametrized.
+between both backends. The ``test_preset_expand_round_trip`` test
+does still boot a session to verify the daemon accepts the expanded
+policy, so it is also parametrized.
 """
 
 from __future__ import annotations

@@ -47,8 +47,8 @@ Runs with generous timeouts; a single iteration boots a VM so budget
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. The deny-logger / events ring / Envoy
 filter-chain machinery is shared between backends (the gateway
-container is wired into both per the M11 gap-#70 closure), so the
-discovery contract holds in both shapes.
+container is wired into both), so the discovery contract holds in
+both shapes.
 """
 
 from __future__ import annotations

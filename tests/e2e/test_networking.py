@@ -1,4 +1,4 @@
-"""E2E tests for M3 networking: gateway traffic flow, nftables enforcement,
+"""E2E tests for networking: gateway traffic flow, nftables enforcement,
 DNS interception, stop/start with networking, concurrent sessions, daemon
 restart recovery, and gateway crash recovery.
 
@@ -13,8 +13,8 @@ Run with generous timeouts:
 Backend coverage: most tests in this file take the ``backend`` fixture
 and parametrize over ``[lima, container]``. The gateway container,
 nftables ruleset, CoreDNS interception, and daemon / gateway crash-
-recovery monitors are shared between backends per the M11 gap-#70
-closure. ``test_concurrent_sessions`` is Lima-only
+recovery monitors are shared between backends. ``test_concurrent_sessions``
+is Lima-only
 (``@pytest.mark.lima``): the cross-session L4 isolation observation
 relies on ICMP, which the lite container backend's hardened profile
 does not expose (CAP_NET_RAW dropped); the structural disjoint-subnet
@@ -51,8 +51,8 @@ from conftest import (
 
 
 def _networking_smoke_policy_file() -> str:
-    """Write a minimal v2 policy covering the hosts these M3 networking
-    tests nslookup / curl from inside the VM, and return the file path.
+    """Write a minimal v2 policy covering the hosts the tests in this
+    file nslookup / curl from inside the VM, and return the file path.
 
     The ``--unrestricted`` discovery escape hatch has been removed; tests
     that previously used it to get "any working session" must now carry
@@ -183,8 +183,8 @@ def _probe_gateway_tcp(sandbox_cli, name: str, ip: str, port: int = 53,
                        timeout: int = 30):
     """Backend-neutral L3+L4 reachability probe to the per-session gateway.
 
-    Replaces the legacy ``ping <gateway_ip>`` check used across the
-    M3 networking suite. ``ping`` relies on raw ICMP sockets, which
+    Replaces the legacy ``ping <gateway_ip>`` check this file used to
+    rely on. ``ping`` relies on raw ICMP sockets, which
     require ``CAP_NET_RAW`` — but the lite container backend's
     required hardening posture drops every Linux capability
     and § "What this

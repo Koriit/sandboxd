@@ -1,4 +1,4 @@
-"""E2E tests for M2 guest agent: exec, ssh, and health checks.
+"""E2E tests for the guest agent: exec, ssh, and health checks.
 
 These tests boot real Lima/QEMU VMs and are SLOW (1-5 minutes per test).
 Run with generous timeouts:

@@ -1,4 +1,4 @@
-"""E2E tests for the M11 lite-mode container backend.
+"""E2E tests for the lite-mode container backend.
 
 Covers the design § "E2E tests" lite-specific assertions: feature
 rejection, hardening posture, resource defaults, gateway parity,
@@ -444,8 +444,9 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
     denied destination is blocked.
 
     The shape matches ``test_policy.py::test_level1_transport_tcp``
-    plus a deny probe — kept narrow because the full M4 matrix is
-    parametrised separately; this test is the lite-specific smoke gate.
+    plus a deny probe — kept narrow because the full policy matrix in
+    ``test_policy.py`` is parametrised over both backends separately;
+    this test is the lite-specific smoke gate.
     The gateway is wired into the container backend so
     ``create_session`` performs the same 8-step gateway sequence
     as ``setup_session_networking`` for lite sessions.

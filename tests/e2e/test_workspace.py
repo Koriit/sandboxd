@@ -1,4 +1,4 @@
-"""E2E tests for M5 workspace features: git clone mode, boot command,
+"""E2E tests for workspace features: git clone mode, boot command,
 file copy (sandbox cp), and directory sync (sandbox sync) between host
 and VM.
 

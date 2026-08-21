@@ -1,4 +1,4 @@
-"""E2E tests for M6 QEMU hardening: device lockdown, cgroup resource
+"""E2E tests for QEMU hardening: device lockdown, cgroup resource
 limits, and the --no-hardening escape hatch.
 
 These tests boot real Lima/QEMU VMs and are SLOW (3-10 minutes per test).

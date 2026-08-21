@@ -1,4 +1,4 @@
-"""E2E tests for the golden base image / clone-path (M8.5).
+"""E2E tests for the golden base image / clone-path.
 
 Backend coverage: **Lima only**. The golden-image / clone-path machinery
 (``sandbox-base`` Lima VM, ``base-image-meta.json``, ``rebuild-image``)

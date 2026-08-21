@@ -1,4 +1,4 @@
-"""E2E tests for M1 VM lifecycle: create, stop, start, destroy.
+"""E2E tests for VM lifecycle: create, stop, start, destroy.
 
 These tests boot real Lima/QEMU VMs and are SLOW (1-5 minutes per test).
 Run with generous timeouts:

@@ -1,4 +1,4 @@
-"""E2E tests for M4 policy enforcement: deny-all default, transport passthrough,
+"""E2E tests for policy enforcement: deny-all default, transport passthrough,
 TLS-verified passthrough, full MITM inspection, HTTP constraints, policy
 updates, and DNS policy enforcement.
 
@@ -12,12 +12,12 @@ and are SLOW (3-10 minutes per test).  Run with generous timeouts:
 Backend coverage: **agnostic** — every test in this file is parametrized
 over ``[lima, container]`` via the ``backend`` fixture. Policy
 enforcement runs through the shared gateway container (Envoy +
-mitmproxy + CoreDNS + nftables) which is wired into both backends per
-the M11 gap-#70 closure, so the deny / transport / TLS / HTTP
-contracts hold identically. The fail-closed-before-DNS-propagation
-contract (``test_l3_fail_closed_before_dns_propagation``) likewise
-holds on both backends because it depends on the gateway's L1
-materialisation order, not on the session-runtime kind.
+mitmproxy + CoreDNS + nftables) which is wired into both backends, so
+the deny / transport / TLS / HTTP contracts hold identically. The
+fail-closed-before-DNS-propagation contract
+(``test_l3_fail_closed_before_dns_propagation``) likewise holds on
+both backends because it depends on the gateway's L1 materialisation
+order, not on the session-runtime kind.
 """
 
 from __future__ import annotations
@@ -2752,7 +2752,7 @@ def test_svcb_record_without_ech_reaches_vm(sandbox_cli, backend):
         wait_for_state(sandbox_cli, "pol-svcb-noech", "Running", timeout=10)
 
         # Warm A first so DNS-driven IP propagation can race in;
-        # mirrors `test_dns_ip_propagation` and similar M4 tests.
+        # mirrors `test_dns_ip_propagation` and similar tests in this file.
         sandbox_cli(
             "ssh", "pol-svcb-noech", "--",
             "nslookup", "cloudflare.com",
