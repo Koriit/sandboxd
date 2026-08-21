@@ -233,7 +233,7 @@ sudo rm -f "$BASE_DIR/.update.lock"
         f"rollback recipe phase 2 (systemctl start) failed:\n{r.stdout}\n{r.stderr}"
     )
     # install_state still says v' (rollback recipe does NOT rewrite
-    # install_state — the design § 7.2 deliberately leaves operator audit
+    # install_state — it deliberately leaves operator audit
     # at v', since the v' artifacts have technically been applied and
     # then reverted). The next `sandbox update` flow will see this
     # state and may attempt to "upgrade" again; that's the documented

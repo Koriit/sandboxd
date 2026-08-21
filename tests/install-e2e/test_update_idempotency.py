@@ -97,8 +97,8 @@ def test_update_interrupted_then_resumed(
     # executed by the base v binary on disk, keeping a clean "the
     # running CLI is v, not v'" invariant for the test. The remaining
     # three binary swaps still emit `action=skip` for the install_binary
-    # step on resume, which is what the design § 9.1 idempotency
-    # assertion below pins.
+    # step on resume, which is what the idempotency assertion below
+    # pins.
     stage_dir = "/tmp/sandbox-update-prestage"
     vm.shell(
         f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
