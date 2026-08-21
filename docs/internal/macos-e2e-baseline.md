@@ -419,10 +419,24 @@ So the observed error entails that on macOS `current_exe()` yields the
 re-enters remote-helper mode and parses `--socket`'s argument as its URL. On
 Linux `/proc/self/exe` resolves to the real `sandbox` binary, the basename test
 fails as intended, clap parses the subcommand, and the path works. That is why
-this class is macOS-only and why it is perfectly stable. The chain from
-observation to mechanism is deductive rather than directly instrumented, so mark
-it **[I]** pending the one-line confirmation: log `current_exe()` at the re-exec
-site on macOS and check whether the basename is `git-remote-sandbox`.
+this class is macOS-only and why it is perfectly stable.
+
+**Confirmed by direct probe. [M]** The premise that step rests on — that Darwin's
+`std::env::current_exe()` does not resolve a symlink — was measured standalone,
+with no daemon, Lima, Docker or session involved: a binary that prints
+`current_exe()`, a symlink beside it under a second name, and exec through each.
+On `rustc 1.96.0`, Darwin arm64, all three symlink invocation forms — relative,
+absolute, and PATH lookup, which is the form git uses — return `current_exe()`
+equal to the **symlink path**, basename `git-remote-probe`. The negative control
+discriminates: exec through the real path returns the real basename, so the
+probe is not reporting the symlink name unconditionally.
+
+A child spawned as `Command::new(current_exe())` therefore carries `argv[0]`
+whose basename is the symlink's name, which is exactly the predicate
+`invoked_as_remote_helper()` tests. Linux cannot reproduce this: `current_exe()`
+reads `/proc/self/exe`, a kernel-maintained link to the resolved inode of the
+running image, so it is structurally incapable of reporting the symlink used to
+launch. That asymmetry is the whole of the platform difference.
 
 Fix at the spawn, not in the parser. Resolve the symlink before re-exec'ing, or
 pass an explicit marker that suppresses helper-mode detection in the child. A
