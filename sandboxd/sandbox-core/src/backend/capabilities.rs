@@ -2,8 +2,8 @@
 //!
 //! Each backend declares
 //! a single [`Capabilities`] value which is consulted at request time by
-//! [`super::SessionSpec::validate`] and surfaced (in a future phase) on
-//! the `GET /backends` HTTP endpoint.
+//! [`super::SessionSpec::validate`] and surfaced on the `GET /backends`
+//! HTTP endpoint.
 //!
 //! The types here are the request-time validation surface. Runtime
 //! implementations live in `lima.rs` / `container.rs`.
@@ -28,7 +28,7 @@ use crate::session::WorkspaceModeKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
-    /// QEMU/Lima virtual-machine backend (today's only backend).
+    /// QEMU/Lima virtual-machine backend — the "full" backend.
     #[default]
     Lima,
     /// Docker container backend — the "lite mode" backend.
