@@ -253,6 +253,110 @@ pub const GATEWAY_IMAGE_TARBALL_FILENAME: &str = "gateway-image.tar";
 #[cfg(target_os = "macos")]
 pub const LITE_IMAGE_TARBALL_FILENAME: &str = "lite-image.tar";
 
+// ---------------------------------------------------------------------------
+// Image load predicate
+// ---------------------------------------------------------------------------
+
+/// A three-state answer to "is this image in the gateway VM's Docker?".
+///
+/// The third state is not a nicety. `Absent` and `Unknown` call for different
+/// operator actions — populate the tarball, versus look at the Docker daemon —
+/// and collapsing them yields a message that sends the reader to the wrong
+/// place. It is the same three-state contract the presence probes carry.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum ImagePresence {
+    Present,
+    Absent,
+    /// The probe could not reach a verdict; carries the probe error text.
+    Unknown(String),
+}
+
+#[cfg(target_os = "macos")]
+impl ImagePresence {
+    fn from_probe(probe: Result<bool, SandboxError>) -> Self {
+        match probe {
+            Ok(true) => Self::Present,
+            Ok(false) => Self::Absent,
+            Err(e) => Self::Unknown(e.to_string()),
+        }
+    }
+}
+
+/// What a loader should do about an image.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum ImageLoadPlan {
+    /// Already usable — nothing to do, tarball or not. A loaded image does
+    /// not stop being loaded because the tarball it came from was removed.
+    AlreadyPresent,
+    /// Run `docker load` from the tarball.
+    Load,
+    /// The image cannot be made usable: it is absent (or cannot be shown to
+    /// be present) and no tarball exists to supply it. `None` is the
+    /// demonstrably-absent case, `Some(err)` the unverifiable one.
+    Unavailable(Option<String>),
+}
+
+/// The load predicate both image loaders share.
+///
+/// The condition that matters is a conjunction: an image is unavailable only
+/// when it is absent **and** no tarball can supply it. Neither half decides
+/// alone — a present image needs no tarball, and a missing tarball is
+/// harmless whenever the image is already loaded.
+///
+/// `tarball_available` is a closure rather than a `bool` because answering it
+/// can copy a several-hundred-megabyte file in from the install-staged
+/// location. An already-present image must not pay for that, so the
+/// `Present` arm never calls it.
+#[cfg(target_os = "macos")]
+fn plan_image_load(
+    presence: ImagePresence,
+    tarball_available: impl FnOnce() -> bool,
+) -> ImageLoadPlan {
+    match presence {
+        ImagePresence::Present => ImageLoadPlan::AlreadyPresent,
+        ImagePresence::Absent => {
+            if tarball_available() {
+                ImageLoadPlan::Load
+            } else {
+                ImageLoadPlan::Unavailable(None)
+            }
+        }
+        ImagePresence::Unknown(err) => {
+            if tarball_available() {
+                ImageLoadPlan::Load
+            } else {
+                ImageLoadPlan::Unavailable(Some(err))
+            }
+        }
+    }
+}
+
+/// Render an [`ImageLoadPlan::Unavailable`] as the message the operator reads.
+///
+/// The two lead-ins are the point: "is not present" and "could not determine
+/// whether it is present" are different faults with different first moves.
+#[cfg(target_os = "macos")]
+fn image_unavailable_message(
+    probe_error: Option<String>,
+    image_tag: &str,
+    tarball: &Path,
+    populate_hint: &str,
+) -> String {
+    let lead = match probe_error {
+        None => format!("image {image_tag} is not present in the gateway VM's Docker"),
+        Some(err) => format!(
+            "could not determine whether image {image_tag} is present in the \
+             gateway VM's Docker ({err})"
+        ),
+    };
+    format!(
+        "{lead}, and there is no tarball to load it from at {} — populate it with: {populate_hint}",
+        tarball.display()
+    )
+}
+
 /// Timeout for the route-helper provisioning steps (probe, `limactl copy` of
 /// the binary, install, setcap).
 #[cfg(target_os = "macos")]
@@ -1309,9 +1413,10 @@ impl GatewayLimaManager {
         // Docker daemon if it is not already present. The image is cached as a
         // tarball at `{daemon_lima_home}/gateway-image.tar` (populated via
         // `make gateway-image && docker save <tag> -o <path>` by the operator
-        // before starting the daemon). If the tarball is absent, we skip and
-        // let the session-create check catch the missing image later.
-        self.load_gateway_image_if_needed();
+        // before starting the daemon). Fatal only when the image is absent
+        // *and* no tarball can supply it — a state in which no session can get
+        // a gateway, reported here where the reason is still in hand.
+        self.load_gateway_image_if_needed()?;
 
         // Step 4e: verify the slot→NIC map against the VM and cache it.
         //
@@ -1368,99 +1473,36 @@ impl GatewayLimaManager {
     ///   docker save sandbox-gateway:$(cat sandboxd/Cargo.toml | grep '^version' | cut -d'"' -f2) \
     ///     -o {daemon_lima_home}/gateway-image.tar
     ///
-    /// If the tarball is absent this is a best-effort no-op — the session-create
-    /// check will catch the missing image and return an actionable error.
-    ///
-    /// Non-fatal: failures are logged at `warn!` but do not abort `ensure_ready`.
-    fn load_gateway_image_if_needed(&self) {
-        let tarball = self.daemon_lima_home.join(GATEWAY_IMAGE_TARBALL_FILENAME);
-        if !tarball.exists() {
-            // The tarball is not yet in daemon_lima_home.  Check whether
-            // install.sh staged it at the daemon base dir
-            // (`{state_root}/{daemon_uid}/gateway-image.tar`), which is two
-            // levels above daemon_lima_home (`…/{daemon_uid}/{owner_uid}/lima`)
-            // whichever uid owns the instance — the staged tarball is per
-            // daemon, not per owner.
-            // If it is there, copy it into daemon_lima_home so that the path
-            // the Docker-load code below expects is satisfied.
-            let staged = self
-                .daemon_lima_home
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|base| base.join(GATEWAY_IMAGE_TARBALL_FILENAME));
-            let copied = if let Some(ref staged_path) = staged {
-                if staged_path.exists() {
-                    // Ensure daemon_lima_home exists (ensure_ready creates it, but
-                    // belt-and-suspenders before the copy).
-                    if let Err(e) = std::fs::create_dir_all(&self.daemon_lima_home) {
-                        warn!(
-                            error = %e,
-                            dir = %self.daemon_lima_home.display(),
-                            "failed to create daemon_lima_home for tarball copy; skipping"
-                        );
-                        false
-                    } else {
-                        match std::fs::copy(staged_path, &tarball) {
-                            Ok(_) => {
-                                info!(
-                                    from = %staged_path.display(),
-                                    to = %tarball.display(),
-                                    "gateway image tarball copied from staged location"
-                                );
-                                true
-                            }
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    from = %staged_path.display(),
-                                    to = %tarball.display(),
-                                    "failed to copy staged gateway tarball; skipping docker load"
-                                );
-                                false
-                            }
-                        }
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if !copied {
-                info!(
-                    tarball = %tarball.display(),
-                    "gateway image tarball not found; skipping docker load \
-                     (populate it with: make gateway-image && docker save <tag> -o {})",
-                    tarball.display()
-                );
-                return;
-            }
-        }
-
-        // Check if the image is already loaded in the gateway VM's Docker daemon.
+    /// Fails when the image is neither present nor loadable. A tarball that is
+    /// absent is only a problem when the image is absent too — see
+    /// [`plan_image_load`] for the conjunction and why each half alone decides
+    /// nothing.
+    fn load_gateway_image_if_needed(&self) -> Result<(), SandboxError> {
         let image_tag = gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
-        let inspect = self.docker.run(
-            DockerOp::ImageInspect {
-                tag: image_tag.clone(),
-            },
-            DOCKER_OP_TIMEOUT,
-            "docker image inspect (gateway)",
+        let tarball = self.daemon_lima_home.join(GATEWAY_IMAGE_TARBALL_FILENAME);
+
+        let plan = plan_image_load(
+            ImagePresence::from_probe(self.gateway_image_present_inside_lima()),
+            || tarball.exists() || self.copy_staged_gateway_tarball(&tarball),
         );
-        match inspect {
-            Ok(ref out) if out.status.success() => {
+
+        match plan {
+            ImageLoadPlan::AlreadyPresent => {
                 info!(tag = %image_tag, "gateway image already loaded in gateway VM");
-                return;
+                return Ok(());
             }
-            Ok(_) => {
-                // Image not present — proceed to load.
+            ImageLoadPlan::Unavailable(probe_error) => {
+                return Err(SandboxError::Gateway(image_unavailable_message(
+                    probe_error,
+                    &image_tag,
+                    &tarball,
+                    &format!(
+                        "make gateway-image && docker save {image_tag} -o {}",
+                        tarball.display()
+                    ),
+                )));
             }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "docker image inspect in gateway VM failed; attempting load anyway"
-                );
-            }
+            ImageLoadPlan::Load => {}
         }
 
         // Load the tarball via stdin pipe into `docker load`.
@@ -1475,29 +1517,79 @@ impl GatewayLimaManager {
         // The tarball is streamed rather than carried in the op: which
         // tarball is named by the op, and the side that runs `docker load`
         // opens it in its own staging directory.
-        let load_result = match self.docker.run(
+        let load_result = self.docker.run(
             DockerOp::ImageLoad {
                 image: StagedImage::Gateway,
             },
             DOCKER_LOAD_TIMEOUT,
             "docker load (gateway image)",
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, "docker load for gateway image failed");
-                return;
-            }
-        };
+        )?;
 
         if load_result.status.success() {
             info!(tag = %image_tag, "gateway image loaded into gateway VM");
+            Ok(())
         } else {
+            // Same variant the lite loader uses for the same situation: a
+            // `docker load` that ran and failed is Docker's fault to report,
+            // distinct from the operator-actionable `Gateway` above.
+            Err(SandboxError::Internal(format!(
+                "docker load for gateway image returned non-zero (tag={image_tag}): {}",
+                String::from_utf8_lossy(&load_result.stderr).trim()
+            )))
+        }
+    }
+
+    /// Copy the install-staged gateway tarball into `daemon_lima_home`.
+    ///
+    /// install.sh stages it at the daemon base dir
+    /// (`{state_root}/{daemon_uid}/gateway-image.tar`), two levels above
+    /// `daemon_lima_home` (`…/{daemon_uid}/{owner_uid}/lima`) whichever uid
+    /// owns the instance — the staged tarball is per daemon, not per owner.
+    ///
+    /// Returns whether `dest` is now a tarball the load path can read. Every
+    /// failure is a `false` rather than an error: the caller's next move is
+    /// the same either way, and the reason is logged here where the path that
+    /// failed is in hand.
+    fn copy_staged_gateway_tarball(&self, dest: &Path) -> bool {
+        let Some(staged_path) = self
+            .daemon_lima_home
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|base| base.join(GATEWAY_IMAGE_TARBALL_FILENAME))
+        else {
+            return false;
+        };
+        if !staged_path.exists() {
+            return false;
+        }
+        // Ensure daemon_lima_home exists (ensure_ready creates it, but
+        // belt-and-suspenders before the copy).
+        if let Err(e) = std::fs::create_dir_all(&self.daemon_lima_home) {
             warn!(
-                tag = %image_tag,
-                stderr = %String::from_utf8_lossy(&load_result.stderr).trim(),
-                "docker load for gateway image returned non-zero; \
-                 gateway sessions may fail if image is missing"
+                error = %e,
+                dir = %self.daemon_lima_home.display(),
+                "failed to create daemon_lima_home for tarball copy"
             );
+            return false;
+        }
+        match std::fs::copy(&staged_path, dest) {
+            Ok(_) => {
+                info!(
+                    from = %staged_path.display(),
+                    to = %dest.display(),
+                    "gateway image tarball copied from staged location"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    from = %staged_path.display(),
+                    to = %dest.display(),
+                    "failed to copy staged gateway tarball"
+                );
+                false
+            }
         }
     }
 
@@ -1509,47 +1601,40 @@ impl GatewayLimaManager {
     ///   make lite-image && make stage-lite-image
     ///
     /// Idempotent: skips the load when the image is already present in the
-    /// gateway VM's Docker daemon (checked via `docker image inspect`).
+    /// gateway VM's Docker daemon.
     ///
-    /// Non-fatal: on tarball absence the function returns `Ok(())` — the
-    /// subsequent `docker create` in `create_session_macos_lite` will fail
-    /// with a clear "No such image" error, surfacing an actionable message
-    /// to the operator.  On load failure the error is propagated so the
-    /// caller can surface it before allocating any session resources.
+    /// Fails when the image is neither present nor loadable, on the same
+    /// predicate as [`Self::load_gateway_image_if_needed`] — the caller
+    /// surfaces it before allocating any session resources, which is where it
+    /// can still be explained. Reporting it here rather than letting the
+    /// subsequent `docker create` fail is the difference between naming the
+    /// tarball the operator has to populate and a bare "No such image".
     pub fn load_lite_image_into_gateway(&self) -> Result<(), SandboxError> {
-        let tarball = self.daemon_lima_home.join(LITE_IMAGE_TARBALL_FILENAME);
-        if !tarball.exists() {
-            info!(
-                tarball = %tarball.display(),
-                "lite image tarball not found; skipping docker load \
-                 (populate it with: make lite-image && make stage-lite-image)"
-            );
-            return Ok(());
-        }
-
         let image_tag = lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
-        // Idempotence check: skip if the image is already present.
-        let inspect = self.docker.run(
-            DockerOp::ImageInspect {
-                tag: image_tag.clone(),
-            },
-            DOCKER_OP_TIMEOUT,
-            "docker image inspect (lite)",
+        let tarball = self.daemon_lima_home.join(LITE_IMAGE_TARBALL_FILENAME);
+
+        // No staged-copy fallback here, unlike the gateway tarball:
+        // `make stage-lite-image` writes straight into daemon_lima_home, so
+        // there is no second location to look in.
+        let plan = plan_image_load(
+            ImagePresence::from_probe(self.lite_image_present_inside_lima()),
+            || tarball.exists(),
         );
-        match inspect {
-            Ok(ref out) if out.status.success() => {
+
+        match plan {
+            ImageLoadPlan::AlreadyPresent => {
                 info!(tag = %image_tag, "lite image already loaded in gateway VM");
                 return Ok(());
             }
-            Ok(_) => {
-                // Image not present — proceed to load.
+            ImageLoadPlan::Unavailable(probe_error) => {
+                return Err(SandboxError::Gateway(image_unavailable_message(
+                    probe_error,
+                    &image_tag,
+                    &tarball,
+                    "make lite-image && make stage-lite-image",
+                )));
             }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "docker image inspect for lite image in gateway VM failed; attempting load anyway"
-                );
-            }
+            ImageLoadPlan::Load => {}
         }
 
         info!(
@@ -4784,5 +4869,491 @@ mod tests {
             1,
             "a failure is reported, not retried"
         );
+    }
+
+    // -- Image load predicate (pure, hermetic) --------------------------------
+
+    /// Whether the closure ran is the observable that matters: determining
+    /// tarball availability can copy hundreds of megabytes, so an
+    /// already-present image must never ask.
+    #[cfg(target_os = "macos")]
+    fn plan_recording_the_tarball_question(
+        presence: ImagePresence,
+        available: bool,
+    ) -> (ImageLoadPlan, bool) {
+        let asked = std::cell::Cell::new(false);
+        let plan = plan_image_load(presence, || {
+            asked.set(true);
+            available
+        });
+        (plan, asked.get())
+    }
+
+    /// A present image is satisfied whether or not a tarball exists, and the
+    /// tarball is never even consulted. This is the half the old code got
+    /// backwards in the other direction: it made tarball absence decisive.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_present_image_needs_no_tarball_and_never_asks_for_one() {
+        for available in [true, false] {
+            let (plan, asked) =
+                plan_recording_the_tarball_question(ImagePresence::Present, available);
+            assert_eq!(plan, ImageLoadPlan::AlreadyPresent);
+            assert!(
+                !asked,
+                "a present image must not pay for the tarball question \
+                 (tarball_available={available})"
+            );
+        }
+    }
+
+    /// An absent image with a tarball is the load case, and an absent image
+    /// without one is the failure the loaders used to report as success.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_absent_image_loads_with_a_tarball_and_fails_without_one() {
+        let (plan, asked) = plan_recording_the_tarball_question(ImagePresence::Absent, true);
+        assert_eq!(plan, ImageLoadPlan::Load);
+        assert!(asked, "an absent image must consult the tarball");
+
+        let (plan, asked) = plan_recording_the_tarball_question(ImagePresence::Absent, false);
+        assert_eq!(plan, ImageLoadPlan::Unavailable(None));
+        assert!(asked);
+    }
+
+    /// A probe that could not reach a verdict is not treated as "absent". With
+    /// a tarball it loads anyway — the load makes the question moot. Without
+    /// one it fails, but carrying the probe error so the message can say
+    /// "could not determine" rather than "missing".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unverifiable_image_keeps_its_probe_error_when_no_tarball_exists() {
+        let plan = plan_image_load(ImagePresence::Unknown("socket refused".into()), || true);
+        assert_eq!(plan, ImageLoadPlan::Load);
+
+        let plan = plan_image_load(ImagePresence::Unknown("socket refused".into()), || false);
+        assert_eq!(
+            plan,
+            ImageLoadPlan::Unavailable(Some("socket refused".to_string()))
+        );
+    }
+
+    /// The three-state probe contract survives the conversion — in particular
+    /// `Ok(false)` and `Err(_)` must not collapse into one state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn presence_conversion_keeps_absent_and_unverifiable_apart() {
+        assert!(matches!(
+            ImagePresence::from_probe(Ok(true)),
+            ImagePresence::Present
+        ));
+        assert!(matches!(
+            ImagePresence::from_probe(Ok(false)),
+            ImagePresence::Absent
+        ));
+        let unknown =
+            ImagePresence::from_probe(Err(SandboxError::Internal("socket refused".into())));
+        match unknown {
+            ImagePresence::Unknown(err) => assert!(
+                err.contains("socket refused"),
+                "the probe error must survive into the message: {err}"
+            ),
+            other => panic!("Err must not be read as a presence verdict: {other:?}"),
+        }
+    }
+
+    /// The two lead-ins send the reader to different places, so they must not
+    /// be interchangeable prose.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_unavailable_message_distinguishes_missing_from_unverifiable() {
+        let tarball = PathBuf::from("/var/lib/sandboxd/60/60/lima/gateway-image.tar");
+
+        let absent = image_unavailable_message(
+            None,
+            "sandbox-gateway:1.2.3",
+            &tarball,
+            "make gateway-image && docker save …",
+        );
+        assert!(absent.contains("is not present"), "{absent}");
+        assert!(!absent.contains("could not determine"), "{absent}");
+
+        let unverifiable = image_unavailable_message(
+            Some("docker socket refused".into()),
+            "sandbox-gateway:1.2.3",
+            &tarball,
+            "make gateway-image && docker save …",
+        );
+        assert!(
+            unverifiable.contains("could not determine"),
+            "{unverifiable}"
+        );
+        assert!(
+            unverifiable.contains("docker socket refused"),
+            "the probe error is the actionable part: {unverifiable}"
+        );
+
+        // Both name the tag, the path to populate, and how to populate it.
+        for msg in [&absent, &unverifiable] {
+            assert!(msg.contains("sandbox-gateway:1.2.3"), "{msg}");
+            assert!(
+                msg.contains("/var/lib/sandboxd/60/60/lima/gateway-image.tar"),
+                "{msg}"
+            );
+            assert!(msg.contains("make gateway-image"), "{msg}");
+        }
+    }
+
+    // -- Image loaders end to end (scripted Docker, hermetic) -----------------
+
+    /// What a scripted `docker image inspect` reports.
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    enum InspectAnswer {
+        /// Exit 0 — image present.
+        Present,
+        /// Exit 1 with the stderr Docker emits for a missing image, which the
+        /// presence probes classify as a definite absence.
+        Absent,
+        /// Exit 1 with a stderr the probes cannot classify, so the probe
+        /// returns `Err` rather than a verdict.
+        Unclassifiable,
+    }
+
+    /// A [`DockerExecutor`](crate::docker::DockerExecutor) that answers the two
+    /// ops an image loader issues from a script and records every op it saw.
+    /// Any other op panics: a loader that reached for one would be doing
+    /// something this test cannot vouch for.
+    #[cfg(target_os = "macos")]
+    struct ScriptedDockerExecutor {
+        seen: Mutex<Vec<DockerOp>>,
+        inspect: InspectAnswer,
+        load_succeeds: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ScriptedDockerExecutor {
+        fn new(inspect: InspectAnswer, load_succeeds: bool) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                inspect,
+                load_succeeds,
+            })
+        }
+
+        fn ops(&self) -> Vec<DockerOp> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+
+        fn issued_a_load(&self) -> bool {
+            self.ops()
+                .iter()
+                .any(|op| matches!(op, DockerOp::ImageLoad { .. }))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[async_trait::async_trait]
+    impl crate::docker::DockerExecutor for ScriptedDockerExecutor {
+        fn run(
+            &self,
+            _op_uid: u32,
+            op: DockerOp,
+            _timeout: Duration,
+            label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            use std::os::unix::process::ExitStatusExt;
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(op.clone());
+
+            let (code, stderr) = match op {
+                DockerOp::ImageInspect { ref tag } => match self.inspect {
+                    InspectAnswer::Present => (0, String::new()),
+                    InspectAnswer::Absent => (1, format!("Error: No such image: {tag}\n")),
+                    InspectAnswer::Unclassifiable => {
+                        (1, "Cannot connect to the Docker daemon\n".to_string())
+                    }
+                },
+                DockerOp::ImageLoad { .. } => {
+                    if self.load_succeeds {
+                        (0, String::new())
+                    } else {
+                        (1, "open /…/image.tar: permission denied\n".to_string())
+                    }
+                }
+                other => panic!("an image loader must not issue {other:?} (label={label})"),
+            };
+
+            Ok(std::process::Output {
+                // Wait-status encoding: the exit code is the high byte.
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            })
+        }
+
+        async fn open_stream(
+            &self,
+            _op_uid: u32,
+            _stream: crate::docker::DockerStream,
+        ) -> Result<crate::docker::DockerStreamConn, SandboxError> {
+            unreachable!("an image loader opens no docker stream")
+        }
+    }
+
+    /// A manager whose `daemon_lima_home` is a real directory under `root`,
+    /// laid out the way the daemon lays it out (`{state}/{daemon_uid}/{op_uid}/
+    /// lima`) so the gateway loader's two-levels-up staged path resolves inside
+    /// the tempdir rather than at `/`.
+    #[cfg(target_os = "macos")]
+    fn manager_for_image_load(
+        root: &Path,
+        docker: Arc<ScriptedDockerExecutor>,
+    ) -> (GatewayLimaManager, PathBuf) {
+        let lima_home = root.join("60").join("501").join("lima");
+        std::fs::create_dir_all(&lima_home).expect("tempdir is writable");
+        let mgr = GatewayLimaManager::new(
+            lima_home.clone(),
+            Arc::new(UnusedLimaExecutor),
+            DockerRoute::Vm {
+                op_uid: 501,
+                executor: docker,
+            },
+            InVmRoute::new(501, RecordingInVmExecutor::ok()),
+            60,
+        );
+        (mgr, lima_home)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_tarball(path: &Path) {
+        std::fs::write(path, b"not really a tarball").expect("tempdir is writable");
+    }
+
+    /// A gateway image that is already in the VM's Docker is fine with no
+    /// tarball anywhere. Before this predicate, a missing tarball short-circuited
+    /// the whole function — the image being present was never consulted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_loader_succeeds_with_a_present_image_and_no_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Present, true);
+        let (mgr, _home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        mgr.load_gateway_image_if_needed()
+            .expect("a loaded image needs no tarball");
+        assert!(
+            !docker.issued_a_load(),
+            "nothing to load: {:?}",
+            docker.ops()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_loader_succeeds_with_a_present_image_and_a_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Present, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        write_tarball(&home.join(GATEWAY_IMAGE_TARBALL_FILENAME));
+
+        mgr.load_gateway_image_if_needed()
+            .expect("a loaded image is not reloaded");
+        assert!(
+            !docker.issued_a_load(),
+            "a present image is not reloaded just because a tarball exists: {:?}",
+            docker.ops()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_loader_loads_an_absent_image_from_its_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        write_tarball(&home.join(GATEWAY_IMAGE_TARBALL_FILENAME));
+
+        mgr.load_gateway_image_if_needed()
+            .expect("an absent image with a tarball loads");
+        assert!(docker.issued_a_load(), "{:?}", docker.ops());
+    }
+
+    /// The case the change exists for: no image and no tarball is a failure,
+    /// reported here rather than as a bare "No such image" from a later step.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_loader_fails_when_the_image_and_the_tarball_are_both_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        let err = mgr
+            .load_gateway_image_if_needed()
+            .expect_err("no image and no tarball is not a success");
+        let msg = err.to_string();
+        assert!(msg.contains("is not present"), "{msg}");
+        assert!(
+            msg.contains(
+                &home
+                    .join(GATEWAY_IMAGE_TARBALL_FILENAME)
+                    .display()
+                    .to_string()
+            ),
+            "the message must name the path to populate: {msg}"
+        );
+        assert!(msg.contains("make gateway-image"), "{msg}");
+        assert!(!docker.issued_a_load(), "{:?}", docker.ops());
+    }
+
+    /// An unreachable Docker daemon must not be reported as a missing image:
+    /// the operator's first move differs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_loader_reports_an_unverifiable_probe_as_such() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Unclassifiable, true);
+        let (mgr, _home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        let err = mgr
+            .load_gateway_image_if_needed()
+            .expect_err("an unverifiable image with no tarball is not a success");
+        let msg = err.to_string();
+        assert!(msg.contains("could not determine"), "{msg}");
+        assert!(!msg.contains("is not present"), "{msg}");
+    }
+
+    /// The install-staged tarball two levels above `daemon_lima_home` still
+    /// satisfies the load — the conditional predicate did not drop that path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_loader_falls_back_to_the_install_staged_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        // install.sh writes `{state_root}/{daemon_uid}/gateway-image.tar`.
+        write_tarball(&root.path().join("60").join(GATEWAY_IMAGE_TARBALL_FILENAME));
+
+        mgr.load_gateway_image_if_needed()
+            .expect("the staged tarball satisfies the load");
+        assert!(docker.issued_a_load(), "{:?}", docker.ops());
+        assert!(
+            home.join(GATEWAY_IMAGE_TARBALL_FILENAME).exists(),
+            "the staged tarball is copied where the load path reads it"
+        );
+    }
+
+    /// A `docker load` that ran and failed leaves no usable image, so it is an
+    /// error rather than a warning — the same as the lite loader.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_loader_fails_when_the_load_itself_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, false);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        write_tarball(&home.join(GATEWAY_IMAGE_TARBALL_FILENAME));
+
+        let err = mgr
+            .load_gateway_image_if_needed()
+            .expect_err("a failed load is not a success");
+        assert!(err.to_string().contains("permission denied"), "{err}");
+    }
+
+    /// The lite loader answers the same four combinations the same way. The
+    /// divergence between the two was accidental; these are the gateway tests
+    /// with the image swapped.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_loader_succeeds_with_a_present_image_and_no_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Present, true);
+        let (mgr, _home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        mgr.load_lite_image_into_gateway()
+            .expect("a loaded image needs no tarball");
+        assert!(!docker.issued_a_load(), "{:?}", docker.ops());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_loader_succeeds_with_a_present_image_and_a_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Present, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        write_tarball(&home.join(LITE_IMAGE_TARBALL_FILENAME));
+
+        mgr.load_lite_image_into_gateway()
+            .expect("a loaded image is not reloaded");
+        assert!(!docker.issued_a_load(), "{:?}", docker.ops());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_loader_loads_an_absent_image_from_its_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        write_tarball(&home.join(LITE_IMAGE_TARBALL_FILENAME));
+
+        mgr.load_lite_image_into_gateway()
+            .expect("an absent image with a tarball loads");
+        assert!(docker.issued_a_load(), "{:?}", docker.ops());
+    }
+
+    /// The doc comment on this function used to promise that a later
+    /// `docker create` would surface "a clear No such image error". It named
+    /// behaviour the code did not produce, and the actionable message is the
+    /// one below.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_loader_fails_when_the_image_and_the_tarball_are_both_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        let err = mgr
+            .load_lite_image_into_gateway()
+            .expect_err("no image and no tarball is not a success");
+        let msg = err.to_string();
+        assert!(msg.contains("is not present"), "{msg}");
+        assert!(
+            msg.contains(&home.join(LITE_IMAGE_TARBALL_FILENAME).display().to_string()),
+            "the message must name the path to populate: {msg}"
+        );
+        assert!(msg.contains("make stage-lite-image"), "{msg}");
+        assert!(!docker.issued_a_load(), "{:?}", docker.ops());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_loader_reports_an_unverifiable_probe_as_such() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Unclassifiable, true);
+        let (mgr, _home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        let err = mgr
+            .load_lite_image_into_gateway()
+            .expect_err("an unverifiable image with no tarball is not a success");
+        let msg = err.to_string();
+        assert!(msg.contains("could not determine"), "{msg}");
+        assert!(!msg.contains("is not present"), "{msg}");
+    }
+
+    /// The lite loader has no install-staged fallback, and must not acquire
+    /// one by accident: `make stage-lite-image` writes straight into
+    /// `daemon_lima_home`, so a tarball two levels up is not a lite tarball.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lite_loader_does_not_look_two_levels_up_for_a_tarball() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, _home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        write_tarball(&root.path().join("60").join(LITE_IMAGE_TARBALL_FILENAME));
+
+        mgr.load_lite_image_into_gateway()
+            .expect_err("a tarball outside daemon_lima_home does not satisfy the lite load");
+        assert!(!docker.issued_a_load(), "{:?}", docker.ops());
     }
 }
