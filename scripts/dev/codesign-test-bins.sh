@@ -11,7 +11,7 @@
 #
 # NOTE: whether this fully eliminates the sleep/wake deadlock needs live
 # verification (sleep/wake cycle, then `make test`). The code change is bounded
-# and safe; effectiveness is a follow-on live-verify item (todo #294).
+# and safe; effectiveness is a follow-on live-verify item.
 #
 # Usage: codesign-test-bins.sh [GREEN_ESCAPE] [RESET_ESCAPE]
 #   The two optional arguments are ANSI escapes forwarded from the Makefile's
@@ -92,4 +92,4 @@ done < "$_tmp_bins"
 
 echo "${GREEN}✓ codesign-test-bins: ${bin_count} test binaries ad-hoc signed${RESET}"
 echo "  NOTE: effectiveness against the syspolicyd/Gatekeeper sleep-wake stall"
-echo "  requires a live verification (sleep then wake, then make test); see todo #294."
+echo "  requires a live verification (sleep then wake, then make test)."

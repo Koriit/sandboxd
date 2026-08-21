@@ -142,10 +142,9 @@ pub enum DnsEvent {
 ///
 /// Harmonized across L1, L2, L3 filter chains; `connect_authority` is
 /// present only on L3 records (CONNECT-tunnel `REQUESTED_SERVER_NAME`).
-/// Named fields follow the plan's JSON field map (plan Phase 4, line 102):
-/// the event wire format Table names `matched_chain`, `cluster`; plan adds the
-/// remaining access-log-standard fields so ingestion does not have to drop
-/// data that operators will want.
+/// `matched_chain` and `cluster` are the named wire fields; the
+/// remaining access-log-standard fields are carried too, so ingestion
+/// does not have to drop data that operators will want.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvoyEvent {
     ConnectionAllowed(EnvoyConnection),

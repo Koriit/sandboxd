@@ -678,7 +678,7 @@ def test_preset_expand_round_trip(sandbox_cli, tmp_path, backend):
     """``sandbox policy preset expand`` produces a policy document that
     the daemon accepts verbatim when passed as ``--policy``.
 
-    This is the plan's "round trip" test: the CLI's preset machinery must
+    This is the round-trip test: the CLI's preset machinery must
     be bit-for-bit compatible with the daemon's policy parser, so an
     operator can use ``expand`` as a dry-run step and feed its stdout to
     ``create``/``policy update`` unchanged.

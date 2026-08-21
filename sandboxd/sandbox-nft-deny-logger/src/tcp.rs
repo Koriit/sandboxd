@@ -129,7 +129,7 @@ fn try_reserve(counter: &Arc<AtomicU32>, cap: u32) -> Option<ConnGuard> {
 /// Concurrency cap: a shared
 /// `AtomicU32` counts live handler tasks. Accepts past `conn_cap` are
 /// RST-closed immediately and counted into the periodic
-/// `rate_limited` summary (plan Phase 3) without emitting a deny
+/// `rate_limited` summary without emitting a deny
 /// line. Admissions under the cap are dispatched to a per-connection
 /// task so a slow handler never stalls the accept loop; each task
 /// holds a [`ConnGuard`] whose Drop decrements the counter.
@@ -367,7 +367,7 @@ mod tests {
 
     /// Synchronous unit test for the reservation logic: `try_reserve`
     /// must refuse the `cap+1`th caller and release slots on guard
-    /// drop. Exercises plan Phase 3 / `tcp_respects_concurrency_cap`
+    /// drop. Exercises the concurrency cap
     /// deterministically — the loopback-burst variant below covers
     /// the same invariant through the full accept loop but can't pin
     /// the exact deny/drop split without artificially slowing the
@@ -431,9 +431,6 @@ mod tests {
     ///    "server-rejected, counted into rate_limited summary";
     ///    everything else panics. No retries, no error-kind heuristics
     ///    around what counts as transient.
-    ///
-    /// Plan Phase 3 / `tcp_respects_concurrency_cap`.  /
-    /// "Hardening rules".
     #[tokio::test]
     async fn integration_tcp_respects_concurrency_cap() {
         let dir = tempfile::tempdir().unwrap();

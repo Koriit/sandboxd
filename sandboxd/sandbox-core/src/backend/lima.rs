@@ -576,8 +576,7 @@ mod tests {
     /// Golden test for `Capabilities::for_lima()` — pins each field
     /// independently. This is the canonical regression guard: if any
     /// field flips, a future maintainer must consciously update the
-    /// expectations here and update the capabilities model design doc
-    /// at the same time.
+    /// expectations here.
     #[test]
     fn capabilities_for_lima_returns_expected_values() {
         let caps = Capabilities::for_lima();

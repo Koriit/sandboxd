@@ -222,7 +222,6 @@ mod tests {
 
     /// Fire `cap + overflow` admissions inside a single window and
     /// assert the drop is counted and surfaced on the next rollover.
-    /// Covers plan Phase 3 / `rate_cap_produces_summary_event`.
     #[test]
     fn rate_cap_produces_summary_event() {
         let dir = tempfile::tempdir().unwrap();

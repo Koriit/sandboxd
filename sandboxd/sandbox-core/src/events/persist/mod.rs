@@ -26,8 +26,8 @@
 //! `try_send`. When the channel is full (the sink task is not draining
 //! fast enough), `try_send` returns `TrySendError::Full` and the relay
 //! drops the incoming (newest) event, preserving the queue contents,
-//! and logs a `warn!` with a running drop counter. The rationale —
-//! per Phase 0 Q8 — is that persistent logging must never stall the
+//! and logs a `warn!` with a running drop counter. The rationale is
+//! that persistent logging must never stall the
 //! in-memory bus; a burst that outruns the disk is observable via the
 //! counter and the warn stream rather than backpressuring producers.
 //!
@@ -77,7 +77,7 @@ use rotator::{RotatingWriterMap, SystemClock};
 
 /// Bounded capacity of the relay→sink mpsc channel.
 ///
-/// Phase 0 Q8: oversized (100k) so a burst up to ~10 seconds of
+/// Oversized (100k) so a burst up to ~10 seconds of
 /// 10 000 events/s is absorbed without drops. When the buffer
 /// genuinely fills, the relay drops the event and logs `warn!` with
 /// the running counter — the persistent sink is best-effort and
@@ -99,9 +99,9 @@ pub struct PersistConfig {
     pub base_dir: PathBuf,
     /// How many days of JSONL files to keep. A file whose filename-
     /// embedded date is strictly older than `today - retention_days`
-    /// is removed by the pruner. Phase 0 Q10 pins the default to
-    /// 14 days in the daemon-side CLI; this struct stays value-
-    /// neutral and accepts whatever operators configure.
+    /// is removed by the pruner. The daemon-side CLI defaults this to
+    /// 14 days; this struct stays value-neutral and accepts whatever
+    /// operators configure.
     pub retention_days: u32,
 }
 

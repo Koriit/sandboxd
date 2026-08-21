@@ -453,11 +453,11 @@ fn allow_10_over_8_443() -> Policy {
 // Test 1: TCP connect to non-allowlisted destination emits deny event
 // ---------------------------------------------------------------------------
 
-/// Phase 8 exit criterion 1: "Start a gateway for one session with
-/// policy allowing `10.0.0.0/8:443` only. From a side container,
-/// `curl -v -4 --connect-timeout 5 http://203.0.113.1:8080`. Assert
-/// curl sees RST; assert a `deny` event lands with the correct
-/// 5-tuple and `protocol: tcp`."
+/// Starts a gateway for one session with policy allowing
+/// `10.0.0.0/8:443` only. From a side container, runs
+/// `curl -v -4 --connect-timeout 5 http://203.0.113.1:8080`. Asserts
+/// curl sees RST, and that a `deny` event lands with the correct
+/// 5-tuple and `protocol: tcp`.
 ///
 /// This pins the deny-logger TCP path end-to-end: nft
 /// `sandbox_policy` chain → `sandbox_dnat` fallback DNAT to
@@ -597,10 +597,10 @@ async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event
 // Test 2: UDP send to non-allowlisted destination emits deny event
 // ---------------------------------------------------------------------------
 
-/// Phase 8 exit criterion 2: "Same setup as (1), but from the side
-/// container: `echo hello | nc -u -w1 203.0.113.1 9999`. Assert no UDP
-/// response observed. Assert a `deny` event lands with `protocol: udp`,
-/// `orig_dst_ip`, `orig_dst_port`, `src_ip`, `src_port`, `layer` as above."
+/// Same setup as the TCP deny test, but from the side container runs
+/// `echo hello | nc -u -w1 203.0.113.1 9999`. Asserts no UDP response
+/// is observed, and that a `deny` event lands with `protocol: udp`,
+/// `orig_dst_ip`, `orig_dst_port`, `src_ip`, `src_port` and `layer`.
 ///
 /// UDP has no three-way handshake, so the gateway's deny path is
 /// different from TCP. Per
@@ -763,10 +763,10 @@ fn nft_tables(gw_container: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Phase 8 exit criterion 3: "Start a gateway with any v2 policy
-/// (e.g., `example.com:443` allow). `docker exec ... nft list tables
-/// inet` — assert exactly three `table inet` entries, sorted:
-/// `sandbox`, `sandbox_dnat`, `sandbox_policy`. No others."
+/// Starts a gateway with any v2 policy (e.g. `example.com:443` allow),
+/// runs `docker exec ... nft list tables inet`, and asserts exactly
+/// three `table inet` entries, sorted: `sandbox`, `sandbox_dnat`,
+/// `sandbox_policy`. No others.
 ///
 /// Also asserts `sandbox_policy` contains only `chain output` — no
 /// VM-egress filter chain (`forward`, `prerouting`, etc.). This is

@@ -82,7 +82,7 @@ TARGET_PORT = 80
 
 # Seconds to wait after a workload burst so the deny-logger parser task
 # (watcher.rs) has time to read the JSONL tail and publish the domain
-# event to the ring. 3s is the plan's suggested propagation budget.
+# event to the ring. 3s is a budget, not a measured bound.
 EVENT_PROPAGATION_S = 3
 
 # Seconds to wait between launching the background `sandbox events`

@@ -2712,7 +2712,7 @@ setup-darwin-sandbox-shared:
 # scan on subsequent executions from the same inode.
 #
 # NOTE: whether this fully eliminates the deadlock needs live verification after a
-# sleep/wake cycle (todo #294 / NEEDS_LIVE_E2E). The code change itself is bounded
+# sleep/wake cycle. The code change itself is bounded
 # and safe; effectiveness is a follow-on live-verify item.
 #
 # Only runs on Darwin; no-op on Linux (codesign is not available / not needed).

@@ -1494,12 +1494,11 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
 # - macOS host with Lima ≥ 1.2.0, QEMU, socket_vmnet pool daemons.
 # - The sandboxd-gateway Lima instance running.
 # - A macOS full-backend session that can reach Running state
-#   (gated on todo #249 first-boot timeout fix; skip via the macos marker
+#   (gated on the first-boot timeout fix; skip via the macos marker
 #   if the agent LaunchAgent is absent).
 #
 # Assertions are connectivity/status-based (not event-ingest-based) per
-# the design spec: the macOS inotify→kqueue/FSEvents watcher is deferred
-# (todo #246).
+# the design spec: the macOS inotify→kqueue/FSEvents watcher is deferred.
 # ---------------------------------------------------------------------------
 
 def _daemon_lima_home() -> str:
@@ -1611,11 +1610,11 @@ def test_macos_gateway_lima_crash_recovery(sandbox_cli):
 
     Assertions are connectivity-based (TCP/53 probe) rather than
     event-ingest-based because the macOS inotify→kqueue/FSEvents watcher
-    is deferred (todo #246).
+    is deferred.
 
     Gated on @pytest.mark.macos_only: skips on non-macOS and when the operator
     LaunchAgent is not loaded (SSH-only / no-Aqua mode). Also gated on
-    todo #249 (first-boot timeout); if sessions cannot reach Running the
+    the first-boot timeout; if sessions cannot reach Running the
     test will fail at ``wait_for_state`` rather than producing a false
     pass — this surfaces the blocker without needing explicit skip logic.
     """
@@ -1784,7 +1783,8 @@ def test_macos_gateway_lima_recovery_one_session_errors_others_continue(sandbox_
     create time (not at recovery time in this harness), this test focuses on
     the observable contract: after the gateway Lima crash and recovery cycle,
     a healthy session reaches Healthy and an Error session does not transition
-    to Healthy. Gated on todo #249; skips if sessions cannot reach Running.
+    to Healthy. Gated on the first-boot timeout; skips if sessions cannot
+    reach Running.
     """
     policy_path = None
     session_id = None
@@ -1885,7 +1885,7 @@ def test_macos_slot_reclaimed_after_vm_death(sandbox_cli, sandbox_binaries, sand
     The slot-availability assertion (new session create succeeds) is the
     primary exit criterion for this test.
 
-    Gated on @pytest.mark.macos_only; also gated on todo #249 (first-boot timeout).
+    Gated on @pytest.mark.macos_only; also gated on the first-boot timeout.
     """
     policy_path = None
     session_id_dead = None

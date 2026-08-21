@@ -551,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_broadcast_delivers_cross_session() {
-        // Q6 (Phase 0 decision): every `publish` fans out to both the
+        // Every `publish` fans out to both the
         // per-session sink and the global sink. A single
         // `subscribe_global` sees events from every registered session,
         // while per-session subscribers continue to see only their

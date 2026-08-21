@@ -22,14 +22,14 @@
 //!    event that touches a file we are already tailing, wake the
 //!    tailer and drain new bytes.
 //!    b. Fires a `tokio::time::interval(2s)` fallback poll that wakes
-//!    every active tailer, independent of inotify. This is the
-//!    "virtiofs / 9p inotify propagation unreliable under some
-//!    hypervisor configurations" safety net called out in the plan.
+//!    every active tailer, independent of inotify. This is the safety
+//!    net for virtiofs / 9p inotify propagation being unreliable under
+//!    some hypervisor configurations.
 //! 4. For every parsed line, look up `session_id` via
 //!    [`VmIpSessionMap::lookup`] on the per-layer `client_ip` /
 //!    `src_ip`. On miss, warn + drop — publishing to a fabricated or
-//!    wrong session is worse than dropping (the event wire format / plan Phase
-//!    7 "drop events on vm_ip miss").
+//!    wrong session is worse than dropping: an event whose `client_ip`
+//!    / `src_ip` does not resolve is dropped.
 //!
 //! # Why mpsc + select, not just `tokio::sync::watch`
 //!
@@ -75,8 +75,8 @@ const KNOWN_FILES: &[&str] = &[
     ALLOW_LOGGER_JSONL,
 ];
 
-/// Fallback-poll interval. Matches the plan's "2-second poll even in
-/// the absence of inotify events" requirement. Not configurable — the
+/// Fallback-poll interval: every active tailer wakes on this cadence
+/// even in the absence of inotify events. Not configurable — the
 /// value is a compromise between responsiveness and idle CPU wake-ups.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -464,11 +464,10 @@ fn dispatch_line(
         Some(client_ip) => {
             let Some(sid) = vm_ip_map.lookup(client_ip) else {
                 // Dropping unattributable events is a deliberate design
-                // choice (the event wire format, plan Phase 7): a fabricated /
-                // wrong session on the envelope would be silently
-                // misleading, whereas a dropped event surfaces as a
-                // clear gap that operators can investigate via the warn
-                // log.
+                // choice: a fabricated / wrong session on the envelope
+                // would be silently misleading, whereas a dropped event
+                // surfaces as a clear gap that operators can
+                // investigate via the warn log.
                 warn!(
                     watcher_session = %watcher_session,
                     layer = ?layer,

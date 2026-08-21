@@ -106,9 +106,9 @@ async fn next_event(
     }
 }
 
-/// Phase 8 exit criterion 4: "apply policy, trigger one flow per layer,
-/// three events appear in ring buffer with `session` stamped via vm_ip
-/// map and envelope fields present."
+/// Applies a policy, triggers one flow per layer, and asserts three
+/// events appear in the ring buffer with `session` stamped via the
+/// vm_ip map and envelope fields present.
 ///
 /// Drives the full sandboxd-side ingest pipeline:
 ///
@@ -298,8 +298,8 @@ fn sample_http_policy() -> Policy {
     }
 }
 
-/// Phase 8 exit criterion 5: "lifecycle events visible across
-/// `start → apply-policy → stop` cycle."
+/// Asserts lifecycle events are visible across the
+/// `start → apply-policy → stop` cycle.
 ///
 /// Exercises the exact builder + `bus.publish` sequence `sandboxd::main`
 /// drives at each emission site (see `setup_session_networking`,
@@ -374,8 +374,8 @@ async fn lifecycle_sequence_across_create_apply_stop() {
 
     // Step 4 — explicit session stop.  `sandboxd::stop_session`
     // publishes this with `reason = SessionStopped` before the
-    // `docker stop` call.  Daemon-wide SIGTERM does NOT emit this
-    // event (see Phase 5 design deviation #2).
+    // `docker stop` call.  Daemon-wide SIGTERM does not emit any
+    // `gateway_shutdown` event: `shutdown_signal` only logs.
     assert!(bus.publish(lifecycle_events::gateway_shutdown(
         sid,
         GatewayShutdownReason::SessionStopped,
@@ -538,8 +538,7 @@ fn seed_v003_db_with_v1_rules(db_path: &Path, sessions: &[(&str, u32)]) {
     }
 }
 
-/// Phase 8 exit criterion 5 (part 2): "`policy_reset_on_upgrade` on
-/// V004-seeded DB."
+/// Asserts `policy_reset_on_upgrade` fires on a V004-seeded DB.
 ///
 /// End-to-end flow under test:
 ///
