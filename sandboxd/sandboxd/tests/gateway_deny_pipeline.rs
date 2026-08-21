@@ -841,15 +841,15 @@ fn integration_session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_polic
 // Test 4: killing deny-logger emits health_degraded → restored
 // ---------------------------------------------------------------------------
 
-/// Phase 8 exit criterion 4: "Start a session through the full
-/// sandboxd lifecycle. Subscribe to `EventBus` for
-/// `lifecycle::HealthDegraded` + `lifecycle::HealthRestored`.
-/// `docker exec ... pkill sandbox-nft-deny-logger`. Assert
-/// `health_degraded` event appears within 120s. Assert sandboxd
-/// automatically triggers `restart_gateway`; after restart, assert
-/// `health_restored` event appears. Post-restart smoke test: from
-/// the side container, `curl` an allowed destination and assert it
-/// works."
+/// Starts a session through the full sandboxd lifecycle, subscribes to
+/// `EventBus` for `lifecycle::HealthDegraded` +
+/// `lifecycle::HealthRestored`, then kills the deny-logger with
+/// `docker exec ... pkill sandbox-nft-deny-logger`. Asserts the
+/// `health_degraded` event appears within 120s, that sandboxd
+/// automatically triggers `restart_gateway`, and that
+/// `health_restored` appears after the restart. Post-restart smoke
+/// test: from the side container, `curl` an allowed destination and
+/// assert it works.
 ///
 /// Budget rationale: Docker HEALTHCHECK interval=10s × retries=3 =
 /// ~30s until Docker flips, plus ~30s `gateway_monitor` poll tick,
