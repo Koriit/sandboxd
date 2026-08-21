@@ -376,7 +376,7 @@ class TestPassthroughMode:
         assert flow.response is None, "Pass-through mode should allow all requests"
 
 
-class TestLegacyPreM9S10ShapeIsRejected:
+class TestLegacyRuleShapesAreRejected:
     """Regression guard against wire-format drift across schema flips.
 
     Two historical hazards are pinned here:
