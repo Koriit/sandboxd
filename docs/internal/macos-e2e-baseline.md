@@ -268,6 +268,20 @@ assertion tripped keyword rules. Four labels still needed manual correction in
 the baseline pass (positions 51, 119, 120, 147); the table above is the
 corrected version.
 
+**Assertion text fixes a failure's signature reliably and its product-vs-harness
+attribution only by luck.** One string — a missing event, a failed `docker
+exec`, an unmet expectation — is emitted both by a daemon that is broken and by
+a test pointed at something this host does not have. A later pass re-derived
+three of these classes from the source rather than the log, and the answer moved
+each time: D15's signatures (`expected event absent`, `ring empty`) are exactly
+what a test looking in the wrong place produces, so assertion text alone files
+all 11 as test-side, while the code shows the events have no transport out of
+the container at all; D4's mechanism is not where its message points; and D9's
+remedy is inverted — the fix belongs in the test, not the daemon. The three
+worked examples are written up under their own entries below. Treat every
+product-vs-harness label in this document as provisional until someone has
+opened the code path it names. [M]
+
 ### D2 — Lima guest has no gateway default route (24)
 
 Fully described in §1. Two caveats stated rather than buried:
@@ -295,6 +309,50 @@ as *8 confirmed + 3 possibly-D2* until D2 is fixed. [M] on the counts, [I] on
 the split.
 
 Same territory as D3 — both are "enforcement holds, the event is lost".
+
+**Mechanism for the 8 `[container]` rows: the macOS gateway container is created
+with no bind-mounts at all, and the JSONL event files are the one artifact that
+never got a replacement transport.** [M]
+
+On Linux the gateway is started with `-v <events-host-dir>:/var/log/gateway/events`
+(`create_gateway` in `sandbox-core/src/gateway.rs`; the container-side constant
+is `EVENTS_DIR_IN_CONTAINER` in `sandbox-core/src/events/mod.rs`), and the
+daemon's inotify ingestor reads the host side of that mount. On macOS the
+gateway runs *inside the gateway Lima VM*, where a macOS host path would mount
+nothing — so the run args carry no `-v` at all. That is deliberate and pinned by
+a unit test: `test_macos_gateway_hardening_args` in
+`sandbox-core/src/macos_session.rs` asserts `gateway run args must NOT contain
+-v / --volume bind-mounts`.
+
+Two artifacts that crossed that boundary were each given a purpose-built
+replacement and work. The Envoy listener is written directly into the
+container's tmpfs (`write_gateway_file`, with the rationale in the comment above
+the Envoy seeding loop in `macos_session.rs`), and the DNS-gate socket is
+bridged (`sandbox-core/src/dns_gate_bridge.rs`, whose module doc states the
+no-bind-mount premise independently). The five JSONL producers — `envoy.jsonl`,
+`coredns.jsonl`, `mitmproxy.jsonl`, `nft-deny.jsonl`, `nft-allow.jsonl`, named
+as constants in `sandbox-core/src/events/ingest/watcher.rs` — got none. They are
+still written, inside the container, onto a tmpfs that nothing reads.
+
+The daemon arms the reader anyway: `create_session_macos_lite` in
+`sandboxd/src/main.rs` calls `spawn_session_ingestor` unconditionally, which
+creates the host events directory and starts an inotify watch on a directory no
+container will ever write to. Nothing errors, and nothing logs a warning.
+
+**The operator-visible consequence is wider than these 8 tests: `sandbox events`
+returns an empty stream for every macOS lite session, and reports no failure
+while doing it.** The tests are not the only thing this breaks; they are just
+the only thing currently noticing. [M]
+
+**Why this entry is load-bearing: the code's own record of the gap has already
+thinned.** The design comment in `macos_session.rs` previously covered "the
+listener **and events** host directories"; it now names only the listener. The
+gap did not close — a sentence narrowed, and the only in-code trace that the
+*events* transport was also missing went with it. Read on its own today, the
+remaining comment looks complete and correct, and the five orphaned producers
+read as an oversight nobody ever noticed rather than one that was noticed and
+recorded. That erosion is why the mechanism is written out here in full rather
+than left as a pointer to a comment. [M]
 
 ### D6 — tests query host Docker, not the gateway VM's (10)
 
@@ -338,6 +396,38 @@ Diagnose as one family before splitting it.
 `empty session name in URL: /var/lib/sandboxd/<daemon-uid>/sandboxd.sock`,
 rc=128. One code path in the git-remote URL parser. Stable at exactly 5 failures
 in every run of the series — one of the determinism control rows.
+
+**The defect is not in the URL parser, and the message points away from it.**
+(The sentence above, written from the assertion text, is the mis-attribution
+this entry corrects; it is left in place so the two readings can be compared.)
+Read the reported URL: it is the *daemon socket path*, not a `sandbox::` URL.
+The tests configure a well-formed remote (`sandbox::<session>/<path>`) and set
+`SANDBOX_SOCKET` rather than passing `--socket`, so the URL git hands the helper
+is correct. The socket path can only arrive at the parser from one place. [M]
+
+`run_remote_helper` (`sandbox-cli/src/main.rs`) takes its URL from `args[2]`.
+The helper's own re-exec spawns the binary with
+`["--socket", <socket>, "ssh", <session>, "--", <service>, <repo_path>]` — an
+argv whose `args[2]` *is* the socket path. That child is meant to take the
+ordinary clap path, and it does so only if `invoked_as_remote_helper()` returns
+false; that function tests whether the basename of `argv[0]` is
+`git-remote-sandbox`. The child's `argv[0]` is whatever
+`std::env::current_exe()` returned in the parent.
+
+So the observed error entails that on macOS `current_exe()` yields the
+**unresolved symlink** — basename `git-remote-sandbox` — and the child therefore
+re-enters remote-helper mode and parses `--socket`'s argument as its URL. On
+Linux `/proc/self/exe` resolves to the real `sandbox` binary, the basename test
+fails as intended, clap parses the subcommand, and the path works. That is why
+this class is macOS-only and why it is perfectly stable. The chain from
+observation to mechanism is deductive rather than directly instrumented, so mark
+it **[I]** pending the one-line confirmation: log `current_exe()` at the re-exec
+site on macOS and check whether the basename is `git-remote-sandbox`.
+
+Fix at the spawn, not in the parser. Resolve the symlink before re-exec'ing, or
+pass an explicit marker that suppresses helper-mode detection in the child. A
+parser-side fix would silence the message while leaving the child running in the
+wrong mode.
 
 ### D11 — golden-image family (3)
 
@@ -425,6 +515,29 @@ that the test asserts on. Worth stating that this test reads the **correct** log
 file (302,821 bytes of it), so unlike D11 this is not the log-source bug — the
 warning is genuinely absent.
 
+**It is absent because it was removed on purpose. The stale artifact is the
+test, not the daemon.** [M] Commit `bbd9d6f`, *"stop advising TCC avoidance
+after a lite shared: path is accepted"*, deleted it deliberately: the warning
+fired on the success path, after the shared-root check had already passed, so
+advising the operator to keep the source out of Desktop / Documents / Downloads
+was — in the commit's own words — *"both unactionable and wrong (a path under
+the shared root is in none of them)"*. The one fact worth keeping, that the
+host-side read runs as the daemon user rather than the operator, was retained
+and dropped from `warn!` to `debug!`.
+
+Two consequences, and the second is the one that costs an afternoon if missed.
+The asserted substring now appears nowhere in the Rust tree — only in
+`tests/e2e/test_lite_macos.py` and in this document. And because that commit
+rewrote the *wording* as well as lowering the level, **raising the daemon's log
+level would not turn this test green either**; the surviving line reads
+`host-side access runs as the sandboxd daemon user (gateway VM owner), not the
+operator`. The remedy is to update the test's expectation to the surviving line
+or drop the assertion.
+
+A reader who takes "the warning is genuinely absent" at face value will go
+looking for a bug that was removed intentionally. This entry is the correction
+to that reading, not a softening of it.
+
 ### D14 — CoreDNS log missing `example.com` (1)
 
 The gateway's CoreDNS log does not contain the queried name. Stable at 1 in
@@ -439,6 +552,48 @@ daemon's reconcile pass; it does. Surfaced by the slot-reclamation test.
 
 `create` with an unreadable host file in the workspace must fail and tear down;
 it returned rc=0 instead.
+
+Position 147 is the `[lima]` parametrization of
+`test_workspace_local_create_failure_tears_down`. **Its `[container]` sibling is
+green and carries no information** — see the next entry, which is about that
+green rather than about any failure.
+
+### A passing test that never reaches its own injection
+
+**`test_workspace_local_create_failure_tears_down[container]` passes, and passes
+without exercising the condition it injects.** It appears nowhere in the
+inventory above because it does not fail. It is recorded here because a green
+row carrying no information is worse than a red one: every red row in this
+document announces itself, and this does not. [M]
+
+The test injects `chmod 000` on a file inside a host source directory, then
+asserts (1) `sandbox create` exits non-zero and (2) the output contains
+`local-workspace rsync failed`. On macOS lite both assertions are satisfied by a
+**different failure than the injected one**. The source comes from
+`tempfile.mkdtemp(prefix="sandbox-local-failure-")` with no `dir=`, so it lands
+in the per-user private temp tree, which the daemon user cannot traverse; the
+rsync described in D12 above dies at the source root with exit 23 before it ever
+visits the unreadable file. Both assertions pass. The `chmod 000` is never
+reached.
+
+Its own docstring calls it *"its sole end-to-end pin"* for the daemon's
+`cleanup_and_return!` teardown path, noting that the integration test
+`integration_local_create_failure_tears_down` exercises only the library-level
+error variant. **So the only end-to-end coverage of that teardown path is green
+and testing nothing.**
+
+The evidence is a same-test comparison rather than an inference from the
+mechanism alone: across the run series the `[container]` parametrization passed
+8 times and never failed, while the `[lima]` parametrization of the same
+function is position 147 / D18 above, failing with `got rc=0` — the honest
+report of that same injection failing to produce a failure. One backend
+announces the gap; the other conceals it behind a pass. [M]
+
+The repair is the one D12 already needs — re-point the fixture at a directory
+the daemon user can traverse. Note what that repair will look like from
+outside: the result line does not change. It stays green, and silently starts
+meaning something. Nobody would learn it had been vacuous, which is the reason
+for writing it down here rather than folding it into D12.
 
 ### DNS-gate bridge retry spin (no test failures)
 
