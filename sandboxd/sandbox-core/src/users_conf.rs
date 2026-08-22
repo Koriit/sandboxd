@@ -56,8 +56,8 @@
 //!   (with its own uid) to pick its allocation CIDR, and by the route
 //!   helper at step 4 (with the caller's uid) to authorize.
 //!
-//! Per the design (line 406-408), `allow_users` entries are admin
-//! readability — the helper compares numeric uids internally so admin
+//! `allow_users` entries are for admin readability — the helper compares
+//! numeric uids internally so admin
 //! renames (`usermod`) take effect immediately. Username → uid
 //! resolution happens at lookup time via `getpwnam_r` (`nix`'s
 //! [`User::from_name`]); names not present on the host (`Ok(None)`) are
@@ -493,8 +493,8 @@ impl SubnetEntry {
 /// (e.g. a file with no `_schema_version` field, which would not yet
 /// satisfy the typed shape if the field were non-optional). The file-IO
 /// wrapper (atomic-rename write, lock file, backup folder) is owned by
-/// the migration framework in the install framework; this function is the content
-/// contribution
+/// the config migration framework; this function is the content
+/// contribution.
 ///
 /// # Idempotency
 ///
@@ -1521,7 +1521,7 @@ mod tests {
 
         // Other u32 values round-trip the same way — the field's typing
         // is `Option<u32>`, not a "must be 1" constraint (that policy
-        // belongs to the migration framework in the install framework, not the parser).
+        // belongs to the config migration framework, not the parser).
         let raw_v7 = r#"{
             "_schema_version": 7,
             "subnets": []

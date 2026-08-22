@@ -2363,9 +2363,9 @@ pub(crate) struct DiagnosticsPayload {
     pub lite_image_present: bool,
     /// `true` when the daemon's `docker image inspect` probe could
     /// not run to a verdict (docker daemon unreachable, fork
-    /// failure, unexpected stderr). the documented contract added the variant
-    /// so C7 can emit the "restart docker / sandboxd" hint instead
-    /// of the misleading "image missing" hint. `#[serde(default)]`
+    /// failure, unexpected stderr). The variant exists so C7 can emit
+    /// the "restart docker / sandboxd" hint instead of the misleading
+    /// "image missing" hint. `#[serde(default)]`
     /// keeps this readable against an older daemon that omits the
     /// field (in which case probe failure was conflated with absence
     /// — the pre-fix behaviour).

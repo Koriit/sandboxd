@@ -6620,7 +6620,7 @@ async fn dispatch_create_preflight(
         // The CLI runs its own dedicated `--no-cache`/Container reject
         // (`render_no_cache_rejection_for_container`) before this
         // `SessionSpec::validate` call, so threading the value through
-        // here would only duplicate that gate. Leave the design field as
+        // here would only duplicate that gate. Leave the spec field as
         // `None` — the daemon-side validate does the authoritative
         // check via the request's `no_cache` field.
         no_cache: None,
@@ -10898,8 +10898,8 @@ mod tests {
     // `--dump-migration-set`.
     // -----------------------------------------------------------------------
 
-    /// the install framework exit-criteria #9: `sandbox dump-migration-set` exits 0
-    /// and prints a JSON array. Unit-tested at the handler level
+    /// `sandbox dump-migration-set` exits 0 and prints a JSON array.
+    /// Unit-tested at the handler level
     /// here; the subprocess shape (which exercises `process::exit(0)`)
     /// lives in `tests/integration_cfg_migrations_cli.rs`.
     #[test]

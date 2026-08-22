@@ -2279,7 +2279,7 @@ async fn create_session(
     // `SessionDto.warnings` is reserved for post-success operator
     // notices (e.g. lite-image first-use), not for masking malformed
     // sizing requests — so we hard-reject with HTTP 400 to mirror the
-    // the documented contract pattern already used by `--hardened`
+    // validation-site rejection pattern already used by `--hardened`
     // on the container backend.
     if backend_kind == BackendKind::Lima && cpus_decimal_request.is_some_and(|c| c.fract() != 0.0) {
         return error_response(SandboxError::InvalidArgument(
