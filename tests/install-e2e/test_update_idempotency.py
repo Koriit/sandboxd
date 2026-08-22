@@ -184,8 +184,8 @@ def test_update_interrupted_then_resumed(
         f"resume run should have adopted the stale lock; log:\n{log}"
     )
 
-    # "the resume run mostly skips already-completed
-    # steps". Parse the install log and count `action=skip` lines. With
+    # The resume run mostly skips already-completed steps. Parse the
+    # install log and count `action=skip` lines. With
     # three of the four bumped binaries pre-staged (sandboxd, sandbox-
     # route-helper, sandbox-guest; see the rationale at pre-stage time),
     # all three of those `install_binary` entries must record

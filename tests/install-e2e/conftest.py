@@ -1211,8 +1211,8 @@ _TARBALL_VERSION_RE = re.compile(r"^sandboxd-([^-]+(?:\.[^-]+)*)-")
 def version_from_tarball(tarball_path):
     """Extract the version string encoded in the tarball filename.
 
-    Tarball naming convention is ``sandboxd-<version>-<arch>.tar.gz``
-   . install.sh's resolve_target_version step skips
+    Tarball naming convention is ``sandboxd-<version>-<arch>.tar.gz``.
+    install.sh's resolve_target_version step skips
     network lookup when ``--from`` is set but does NOT auto-derive the
     version from the tarball filename — operators are expected to pass
     ``--version`` alongside ``--from``. The harness mirrors that

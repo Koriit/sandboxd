@@ -18775,7 +18775,7 @@ mod tests {
 
     // -- RebuildImageRequest body deserialization -------------------------
 
-    /// : an empty body must decode as
+    /// An empty body must decode as
     /// `{ "backend": "lima", "no_cache": false }` so older CLIs that
     /// POST `/rebuild-image` with no body keep working (backwards-
     /// compat at the wire).

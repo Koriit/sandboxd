@@ -173,13 +173,13 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
     sigstore_stack,
 ):
     """A route-helper invocation from a uid with no /etc/passwd entry
-    must be denied at the caller-identity step (the documented contract), with
-    the deny landing in the audit log (the documented contract).
+    must be denied at the caller-identity step, with the deny landing in
+    the audit log.
 
     Behavior pinned:
       * Helper exits ``DENY_EXIT`` (1).
       * stderr contains ``caller uid <n> does not resolve to a username``
-        verbatim (the 
+        verbatim.
       * An audit-log JSON-Lines record is written with
         ``decision == "denied"``, ``reason == "caller-uid-unresolvable"``,
         and the caller field falls back to ``uid:<n>`` since there is
