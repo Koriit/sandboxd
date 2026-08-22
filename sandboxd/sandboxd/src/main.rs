@@ -14991,14 +14991,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // own uid. Both paths are the daemon's own — the socket its Lima
         // instance forwards, and the directory its own image tarballs are
         // staged in.
+        //
+        // Both name the instance through `gateway_instance_name(daemon_uid)`
+        // rather than the bare constant. `GatewayLimaManager` already derives
+        // its own name that way, so reading the constant here makes these two
+        // seams address a different instance than the one the manager creates
+        // the moment the per-operator switch is on — a forwarded socket path
+        // and a `limactl shell` target that resolve to nothing. With the
+        // switch off the two forms are the same string, so this is the form
+        // the call site keeps rather than a change in what it does today.
         let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
+        let daemon_gateway_instance = sandbox_core::gateway_instance_name(daemon_uid);
         let daemon_gateway_socket = daemon_lima_home
-            .join(sandbox_core::GATEWAY_INSTANCE_NAME)
+            .join(&daemon_gateway_instance)
             .join("gateway-docker.sock");
         broker_executor = Some(Arc::new(
             AgentBrokerExecutor::new(agent_registry.clone(), pending_streams, daemon_uid)
                 .with_local_docker(daemon_gateway_socket, daemon_lima_home.clone())
-                .with_local_in_vm(sandbox_core::GATEWAY_INSTANCE_NAME, daemon_lima_home),
+                .with_local_in_vm(daemon_gateway_instance, daemon_lima_home),
         ));
         Arc::clone(broker_executor.as_ref().expect("just set"))
             as Arc<dyn sandbox_core::lima::LimaExecutor>
