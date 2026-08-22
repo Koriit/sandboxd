@@ -39,6 +39,66 @@ reservation isolating them.
 | Docker daemon | Inside gateway VM only | Host Docker / Desktop / OrbStack |
 | `networks.yaml` | Never written | Managed by Lima/Colima |
 
+## Operator login is a prerequisite for VM operations
+
+On macOS the daemon does not run `limactl` or talk to Docker itself. Every VM
+operation it performs on your behalf is executed by `io.sandboxd.agent`, a
+LaunchAgent in your own login session, against a `LIMA_HOME` and a Docker
+socket the daemon account cannot reach. That is the privilege boundary. The
+operational consequence is that **anything needing a VM operation requires you
+to be logged in**, and it is worth checking the agent before diagnosing
+anything downstream of it:
+
+```bash
+launchctl print gui/$(id -u)/io.sandboxd.agent >/dev/null 2>&1 \
+    && echo loaded || echo "NOT loaded"
+```
+
+**Creating a session while logged out fails, and says why.** The message names
+the operator by username, falling back to the numeric uid when the account
+cannot be resolved:
+
+```
+session agent for bob is not running — the operator must be logged in for
+Lima VM operations
+```
+
+Remedy: log in. There is no daemon-side override, and adding one would mean
+giving the daemon a path to your VMs that does not go through your agent —
+which is the thing the boundary exists to prevent. There is likewise no
+supported way to keep the agent running across a logout: the deployment model
+assumes an operator with a login session, so on a host where sessions must
+outlive interactive logins the answer today is to keep that session logged in.
+
+**Sessions already running do not stop when you log out.** launchd tears down
+your GUI domain at logout and kills the agent with it, but a sandbox VM is a
+detached QEMU orphaned to pid 1 and is not a launchd-managed job, so it
+survives. It keeps running — and keeps egressing under whatever policy was
+last pushed to it — until the host goes down or the process is killed. In the
+meantime the daemon can neither stop, re-policy nor reap it, and orphan
+reaping cannot reach it either. This is an accepted trade-off rather
+than a defect; it is stated as one in
+[hardening → operator logout](/sandboxd/guides/hardening/#operator-logout-macos).
+
+**De-enrolling the operator does not end such a session either.** Membership
+is checked at `connect(2)`, so a QEMU that already holds its slot socket keeps
+it — the same reason [de-enrollment](#de-enrolling-an-operator) runs a residue
+check before releasing a range. Killing the process is what ends the session.
+The Lima instance name appears in the QEMU argv as a path segment, so it can
+be targeted without reaping every VM on the host:
+
+```bash
+# Confirm the match first — this prints the argv, kills nothing:
+/bin/ps -Ao pid,args | grep "lima/<instance-name>/disk" | grep -v grep
+
+sudo pkill -f "lima/<instance-name>/disk"
+```
+
+Killing QEMU leaves the session record behind and the slot still on the
+operator's ledger. Clear both with `sandbox rm <id>` once that operator is
+logged back in — the removal is itself a VM operation, so it cannot be done
+while they are away either.
+
 ## Resizing the session pool (`max_macos_sessions`)
 
 `max_macos_sessions` (env `SANDBOX_MAX_MACOS_SESSIONS`, default 8, range

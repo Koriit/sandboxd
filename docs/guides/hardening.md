@@ -270,6 +270,26 @@ The VM has two NICs. `eth1` is a TAP device on the per-session Docker bridge —
 
 Removing SLIRP would require replacing Lima's SSH provisioning; it is not currently configurable.
 
+### Operator logout (macOS)
+
+This one is not a knob. It is a property of the macOS execution model that you accept by running sessions there, and it is stated here because it is a real reduction in what the daemon can guarantee.
+
+On macOS the daemon never touches Lima or QEMU itself. Every VM operation it performs for you is executed by `io.sandboxd.agent`, a LaunchAgent in your own login session, against a `LIMA_HOME` the daemon account cannot read. That is the privilege boundary: the daemon account holds no credential that reaches your VMs — your agent is the only thing that does, and it exists only while you are logged in. The containment is real, and so is its cost: when your agent is gone, the daemon's reach is gone with it, and the VMs are not.
+
+**Logging out does not stop your sessions.** launchd tears down your GUI domain at logout and kills the agent with it, but a sandbox VM is not a launchd-managed job — `limactl` detaches QEMU and orphans it to pid 1, so it is not killed with the domain. This is measured, not assumed: across a real logout and re-login the same QEMU process survived, the guest kernel never restarted, and the VM's `socket_vmnet` segment stayed attached to the same kernel socket object.
+
+So between your logout and your next login:
+
+- **The session keeps running and keeps egressing**, under whatever policy was last pushed to it. That policy is frozen for the duration.
+- **The daemon cannot stop, re-policy or reap it.** Anything needing a VM operation fails loudly rather than silently doing nothing, and orphan reaping cannot reach the VM either. The daemon's view of the session and the session's actual network access can diverge — and only the second one matters to whatever is running inside it.
+- **No new sessions can start**, because bringing a VM up is itself a VM operation.
+
+Host shutdown is not this case — that takes QEMU with it and the sessions are genuinely gone. It is specifically logout with the host still up that leaves running sessions the daemon has no path to.
+
+**Revoking the operator's slot group does not end one of these sessions**, and is the wrong reflex: group membership is checked at `connect(2)`, so a QEMU that already holds its slot socket keeps it. Killing the QEMU process is what ends the session — see [macOS operations → operator login is a prerequisite for VM operations](/sandboxd/guides/macos-operations/#operator-login-is-a-prerequisite-for-vm-operations) for the command and the surrounding failure modes.
+
+If you need a session's egress to be revocable by someone other than its operator, do not rely on logging the operator out. Stop the session first.
+
 ## Related reading
 
 - [Networking](/sandboxd/concepts/networking/) — how the network-isolation layer actually works.
