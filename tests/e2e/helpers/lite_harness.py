@@ -174,9 +174,7 @@ class LiteBackendHarness:
     # ------------------------------------------------------------------ #
 
     def assert_rootfs_readonly(self, session_id: str) -> None:
-        """
-
-        Writes to ``/`` must fail with a "read-only file system"-shaped
+        """Writes to ``/`` must fail with a "read-only file system"-shaped
         error, both for the bare path and for typical system paths.
         Probe ``/test-write`` (caller cannot rely on any specific dir
         writability under ``/``).
@@ -205,9 +203,7 @@ class LiteBackendHarness:
         )
 
     def assert_no_dind(self, session_id: str) -> None:
-        """
-
-        Two complementary checks:
+        """Two complementary checks:
 
         1. ``/var/run/docker.sock`` is not bind-mounted into the
            session (``ls`` returns non-zero).
@@ -231,9 +227,7 @@ class LiteBackendHarness:
         )
 
     def assert_no_userns(self, session_id: str) -> None:
-        """
-
-        ``cap-drop=ALL`` removes ``CAP_SYS_ADMIN``, so creating a new
+        """``cap-drop=ALL`` removes ``CAP_SYS_ADMIN``, so creating a new
         user namespace fails with EPERM. Probe via ``unshare --user
         true``: a non-zero exit confirms the cap is dropped.
         """

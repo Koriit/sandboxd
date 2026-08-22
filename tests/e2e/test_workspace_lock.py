@@ -146,9 +146,7 @@ def _release_lock(
 def test_workspace_lock_blocks_stop_during_push(
     sandbox_cli, sandbox_daemon, tmp_path,
 ):
-    """
-
-    Create a ``local:`` session. Acquire the workspace lock directly
+    """Create a ``local:`` session. Acquire the workspace lock directly
     via HTTP (simulating an in-flight push). Try ``sandbox stop``.
     Assert:
 
@@ -242,9 +240,7 @@ def test_workspace_lock_blocks_stop_during_push(
 def test_workspace_lock_unlock_force_recovery(
     sandbox_cli, sandbox_daemon, tmp_path,
 ):
-    """
-
-    Acquire a lock via HTTP. Confirm ``sandbox stop`` is blocked. Run
+    """Acquire a lock via HTTP. Confirm ``sandbox stop`` is blocked. Run
     ``sandbox workspace unlock <session> --force``. Assert exit 0.
     Re-try ``sandbox stop``. Assert success.
 
@@ -324,9 +320,7 @@ def test_workspace_lock_unlock_force_recovery(
 def test_workspace_unlock_idempotent(
     sandbox_cli, sandbox_daemon, tmp_path,
 ):
-    """
-
-    Create a ``local:`` session (no lock held). Run ``sandbox workspace
+    """Create a ``local:`` session (no lock held). Run ``sandbox workspace
     unlock <session>`` without ``--force``. Assert exit 0 — the daemon
     treats release-on-Unlocked as idempotent regardless of token
     validity (the wrong-token vs. force=true / force=false adjudication

@@ -1,4 +1,4 @@
-"""`sandbox update` refuses on dev installs — the install framework.
+"""`sandbox update` refuses on dev installs.
 
 A dev install is detected by either:
 

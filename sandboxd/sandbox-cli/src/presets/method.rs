@@ -21,10 +21,10 @@ use sandbox_core::{HttpFilter, HttpMethod};
 
 /// The consume-only posture: `[GET /**, HEAD /**]`.
 ///
-/// Recursive-wildcard path matcher: `/**` matches every request path under the host. The
-/// two-method split is deliberate — `HEAD` requests are used by
-/// package registries and CDN tooling for cheap existence / ETag
-/// probes, so allowing `HEAD` alongside `GET` matches the
+/// Recursive-wildcard path matcher: `/**` matches every request path
+/// under the host. The two-method split is deliberate — `HEAD` requests
+/// are used by package registries and CDN tooling for cheap existence /
+/// ETag probes, so allowing `HEAD` alongside `GET` matches the
 /// consume-only happy path without permitting writes.
 pub fn get_head() -> Vec<HttpFilter> {
     vec![

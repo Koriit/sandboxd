@@ -58,9 +58,7 @@ def _guest_path_for(backend: str) -> str:
 
 @pytest.mark.timeout(600)
 def test_workspace_shared_explicit_guest_path(sandbox_cli, backend, tmp_path):
-    """
-
-    Create a session with ``--workspace shared:<host>:<guest>``. Verify:
+    """Create a session with ``--workspace shared:<host>:<guest>``. Verify:
 
     1. The mount appears at the operator-supplied ``<guest>`` path
        inside the session.

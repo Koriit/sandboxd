@@ -221,8 +221,7 @@ def test_no_cache_rejected_for_lite(sandbox_cli):
 
 @pytest.mark.timeout(300)
 def test_lite_rootfs_is_readonly(lite_harness):
-    """
-    writes to ``/`` fail with EROFS. ``LiteBackendHarness`` captures
+    """Writes to ``/`` fail with EROFS. ``LiteBackendHarness`` captures
     the probe so this test can stay focused on the create + assert
     shape.
     """
@@ -237,9 +236,7 @@ def test_lite_rootfs_is_readonly(lite_harness):
 
 @pytest.mark.timeout(300)
 def test_lite_blocks_docker_in_docker(lite_harness):
-    """
-
-    Probe: ``ls /var/run/docker.sock`` returns non-zero (the path is
+    """Probe: ``ls /var/run/docker.sock`` returns non-zero (the path is
     absent inside the namespace).
     """
     sid = lite_harness.create("--name", "lite-no-dind")
@@ -253,8 +250,7 @@ def test_lite_blocks_docker_in_docker(lite_harness):
 
 @pytest.mark.timeout(300)
 def test_lite_blocks_user_namespace(lite_harness):
-    """
-    new user namespaces cannot be created. Probe via ``unshare --user
+    """New user namespaces cannot be created. Probe via ``unshare --user
     true``.
     """
     sid = lite_harness.create("--name", "lite-no-userns")
