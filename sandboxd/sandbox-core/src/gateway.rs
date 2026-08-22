@@ -981,11 +981,26 @@ impl GatewayManager {
     /// 2. If healthcheck.sh succeeded, query Envoy's
     ///    `listener_manager.total_listeners_active` gauge via
     ///    `gateway_listener_active_count` and log it at `debug` level for
-    ///    operator visibility. The nftables deny-all floor is in place from
-    ///    t0, so the container is safe to use as soon as step 1 passes —
-    ///    a listener count of zero does not indicate a policy gap. This
-    ///    method always returns `Healthy` once the healthcheck passes;
-    ///    `Starting` is never emitted.
+    ///    operator visibility. A listener count of zero does not on its own
+    ///    indicate a policy gap. This method always returns `Healthy` once
+    ///    the healthcheck passes; `Starting` is never emitted.
+    ///
+    /// # `Healthy` is a liveness verdict, not a policy one
+    ///
+    /// Step 1 runs five component probes and reads no ruleset, so nothing in
+    /// this method observes whether the container's nftables tables exist.
+    /// For a container this crate created that is fine — [`Self::create_gateway`]
+    /// injects the deny-all floor before the session is handed out. It does
+    /// not generalise to a container this crate did not start: the tables live
+    /// in the network namespace and are put there by `docker exec` from
+    /// outside, so a container Docker itself restarted under its
+    /// `unless-stopped` policy — after a gateway-VM reboot, say — comes back
+    /// with a fresh namespace, `net.ipv4.ip_forward=1` re-applied from its
+    /// `HostConfig`, and no tables at all. Read this verdict as "the five
+    /// components answered", and do not read a floor into it.
+    ///
+    /// [`Self::restart_gateway`] is the recorded consequence of the same fact:
+    /// it re-creates rather than `docker start`s for exactly this reason.
     pub fn gateway_status(&self, session_id: &SessionId) -> Result<GatewayStatus, SandboxError> {
         let container_name = container_name(session_id);
 
@@ -1040,11 +1055,11 @@ impl GatewayManager {
         }
 
         // Stage 2: log the Envoy active-listener count for diagnostics.
-        // The nftables deny-all floor is in place from t0, so the
-        // container is safe to use as soon as the healthcheck passes —
-        // listener count zero does not indicate a policy gap. We record
-        // the count at debug level for operator visibility and always
-        // return Healthy from this point.
+        // A listener count of zero does not on its own indicate a policy
+        // gap, so it is recorded at debug level for operator visibility
+        // and we always return Healthy from this point. What that verdict
+        // does and does not say about the ruleset is on the method's doc —
+        // it reads no tables, so it cannot speak for them.
         let listener_count = self.gateway_listener_active_count(session_id);
         debug!(
             session_id = %session_id,

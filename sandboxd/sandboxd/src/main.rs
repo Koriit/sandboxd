@@ -14483,6 +14483,38 @@ impl GatewayLimaTrigger {
 /// re-creates one it finds `NotRunning` or `Unhealthy`, without clearing the
 /// `Degraded` tag a failed pass left.
 ///
+/// ## What a Docker-restarted gateway container is doing
+///
+/// Reading the pieces settles most of it, and the answer is not reassuring.
+/// The gateway VM enables `docker` at boot and gateway containers carry
+/// `--restart unless-stopped`, so a VM reboot brings one back on its own. It
+/// returns with `net.ipv4.ip_forward=1` re-applied from its `HostConfig` and
+/// with none of its nftables tables: those live in the network namespace the
+/// exit destroyed, and they are put there by `docker exec` from this side —
+/// the image's entrypoint installs none. Nothing observes the absence either.
+/// The image `HEALTHCHECK` runs five component probes and reads no ruleset,
+/// and `GatewayManager::gateway_status` re-runs that same script.
+///
+/// What stops it short of a silent forever-open gateway is incidental rather
+/// than designed: the Envoy bootstrap is written into a tmpfs by `docker exec`
+/// after `docker run`, so a restart finds it wiped and nobody writing it. The
+/// entrypoint waits for that file, gives up, and — under `set -e` — exits, so
+/// the container crash-loops instead of settling into a healthy-looking
+/// forwarding state. Each cycle is still a window in which it forwards with no
+/// policy, and [`gateway_monitor`] acts on `NotRunning` and `Unhealthy` while
+/// treating `Starting` as a no-op, so whether the loop is escaped at all turns
+/// on which of those Docker reports for a container in that state.
+///
+/// Who is exposed in such a window is narrower than the mechanism suggests:
+/// lite sandbox containers are created `--restart no` and do not come back, so
+/// they have no traffic to forward. A full-backend sandbox VM runs on the host
+/// and outlives the gateway VM entirely — it is the one still sending.
+///
+/// Two things here are read off the code and one is not: what Docker reports
+/// for a crash-looping container's health, and whether a surviving sandbox
+/// VM's packets still traverse the restarted container's macvlan, both need a
+/// live gateway VM to answer.
+///
 /// `run_gateway_recovery` does not retry — this loop is what retries. It
 /// cannot schedule that from its probes, which go on answering healthy through
 /// half of the restart's failure exits, so it schedules from the pass's own
