@@ -159,7 +159,7 @@ def _get_session_json(socket_path: str, session_id: str, timeout: float = 5.0) -
 
 @pytest.mark.timeout(300)
 def test_hardened_rejected_for_lite(sandbox_cli):
-    """"CLI & UX → Feature-mismatch errors": ``--hardened`` ↔
+    """Feature-mismatch errors: ``--hardened`` ↔
     ``--lite`` is a CLI-side rejection (exit 2) with the design-shaped
     error wording. The daemon is never contacted; the rejection lives
     in ``render_feature_mismatch`` (sandbox-cli/src/backend.rs).
@@ -189,7 +189,7 @@ def test_hardened_rejected_for_lite(sandbox_cli):
 
 @pytest.mark.timeout(300)
 def test_no_cache_rejected_for_lite(sandbox_cli):
-    """"`sandbox create --no-cache` is forbidden on container":
+    """`sandbox create --no-cache` is forbidden on container:
     ``--lite --no-cache`` exits 2 with the design error wording. The
     rejection is the CLI-side gate in ``main.rs`` (runs before the
     daemon is contacted); the daemon-side mirror lives in
@@ -264,7 +264,7 @@ def test_lite_blocks_user_namespace(lite_harness):
 
 @pytest.mark.timeout(300)
 def test_lite_resource_defaults_match_host_80pct(lite_harness, sandbox_daemon):
-    """"Resource defaults — container only": creating a lite
+    """Resource defaults — container only: creating a lite
     session without ``--cpus`` / ``--memory`` applies the daemon's
     host-80% defaults at the runtime layer.
 
@@ -433,7 +433,7 @@ def test_lite_git_remote_sandbox(
 
 @pytest.mark.timeout(600)
 def test_lite_gateway_parity(lite_harness, sandbox_cli):
-    """"Gateway integration": the gateway container (Envoy +
+    """Gateway integration: the gateway container (Envoy +
     mitmproxy + CoreDNS) is attached to lite sessions exactly the same
     way it is attached to Lima sessions. Apply a policy that allows
     only ``example.com`` and verify the allow path succeeds while a
@@ -583,7 +583,7 @@ def _grant_traverse_to_sandbox(path: os.PathLike) -> None:
 
 @pytest.mark.timeout(300)
 def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
-    """"Workspace bind": mounting a host directory as
+    """Workspace bind: mounting a host directory as
     ``--workspace shared:<path>`` makes it available at
     ``CONTAINER_HOME/workspace/`` inside the lite container, and files
     written from inside the session land on the host with the *host*
@@ -664,7 +664,7 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
 
 @pytest.mark.timeout(600)
 def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
-    """"Home directory persistence (beta)": the named volume
+    """Home directory persistence (beta): the named volume
     ``sandbox-home-<id>`` is mounted at ``CONTAINER_HOME`` and survives
     ``stop`` + ``start``; ``rm`` removes the volume.
 

@@ -2825,9 +2825,9 @@ mod tests {
         );
         assert!(
             !argv.iter().any(|a| a == "cp"),
-            "refresh must not invoke `docker cp` — api-session-isolation \
-            .8.1 replaced cp with the bind-mount + restart \
-             design; got argv {argv:?}",
+            "refresh must not invoke `docker cp` — the guest binary is \
+             bind-mounted, so a restart against the already-current \
+             source replaces it; got argv {argv:?}",
         );
         assert_eq!(
             argv.last().map(String::as_str),
