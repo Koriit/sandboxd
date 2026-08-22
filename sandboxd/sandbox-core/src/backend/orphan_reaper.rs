@@ -600,6 +600,21 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
 /// `live` is the global union of every session row and stays that way however
 /// narrowly the owner set is scoped; see [`reap_orphans`], which does the
 /// classifying.
+///
+/// # What the macOS gate rests on
+///
+/// The reaper itself is platform-neutral, so the gate is not about the
+/// mechanism. It is that there is no operator→owner mapping to collapse on
+/// Linux, because there is no gateway VM: lite containers, volumes and
+/// networks sit on the host Docker daemon, which the daemon entry point
+/// sweeps once with [`reap_orphans`]. The one-pass-per-owner property this
+/// function is named for therefore has no referent there — absent rather than
+/// untested — and the three unit tests that pin it are gated for that reason
+/// and not because of the fake they use.
+///
+/// A Linux gateway VM would make the property real, and would make those
+/// tests compile and mean something on that platform. Un-gating them belongs
+/// in the change that ships it.
 #[cfg(target_os = "macos")]
 pub async fn reap_orphans_per_gateway_owner(
     operator_uids: &[u32],
