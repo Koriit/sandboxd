@@ -387,9 +387,9 @@ async fn get_events_unknown_session_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// `decision=reset` is not in the allowed set (`allow` / `deny`).  The
-/// the design says this must fail loud as a 400 with the offending value in
-/// the error body — no silent match-nothing.
+/// `decision=reset` is not in the allowed set (`allow` / `deny`).  This
+/// must fail loud as a 400 with the offending value in the error body —
+/// no silent match-nothing.
 #[tokio::test]
 async fn get_events_unknown_decision_returns_400() {
     let (store, _tmp) = fresh_store();

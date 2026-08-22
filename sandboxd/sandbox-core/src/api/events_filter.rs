@@ -11,9 +11,6 @@
 //! AND semantics across filter axes: every non-empty axis must be
 //! satisfied. An empty axis is "no constraint" for that dimension. An
 //! `EventsFilter::default()` matches every event.
-//!
-//! The enumeration of layer and event-name literals matches the event
-//! categories defined in the observability system.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -910,7 +907,7 @@ mod tests {
 
     #[test]
     fn since_millisecond_boundary_is_inclusive() {
-        // intent: `t >= since`. An event whose timestamp equals
+        // Intent: `t >= since`. An event whose timestamp equals
         // `since` must match (no off-by-one drop at the boundary).
         let boundary = ts();
         let f = EventsFilter {

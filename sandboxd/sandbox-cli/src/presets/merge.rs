@@ -140,8 +140,7 @@ pub fn merge_effective(
     }
 
     // 2. Uniqueness pass.  Keyed on the rule's `(host, port)` identity.
-    //    A `Vec<usize>`
-    //    preserves first-seen order — so the duplicate error lists
+    //    A `Vec<usize>` preserves first-seen order — so the duplicate error lists
     //    sources in the exact order they appeared in the merged list,
     //    which matches what the operator sees when they read the
     //    command-line arguments left-to-right.

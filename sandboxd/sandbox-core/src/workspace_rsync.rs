@@ -31,7 +31,7 @@
 //! The spawned `rsync` child is tagged `kill_on_drop(true)`. When the
 //! HTTP request future is dropped (operator Ctrl+C, daemon SIGTERM
 //! during graceful shutdown, CLI HTTP timeout), `tokio::process::Child`
-//! sends `SIGKILL` to the rsync process after a cancellation timeout.
+//! sends `SIGKILL` to the rsync process.
 //!
 //! ## Error mapping
 //!
@@ -365,9 +365,9 @@ pub async fn run_initial_push(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Request future drop ⇒ child killed.
-        // timeout: no daemon-side `tokio::time::timeout`; the operator-
-        // facing budget is the CLI's `CLI_HTTP_TIMEOUT`.
+        // Request future drop ⇒ child killed. There is no daemon-side
+        // `tokio::time::timeout`; the operator-facing budget is the
+        // CLI's `CLI_HTTP_TIMEOUT`.
         .kill_on_drop(true);
 
     let mut child = command.spawn().map_err(|e| {
@@ -867,10 +867,9 @@ mod tests {
     }
 
     /// `--mkpath` is present in the create-time-push argv (Phase 3
-    /// picks the rsync-driven parent-create path per the design
-    /// directory creation, since base + lite images ship rsync ≥
-    /// 3.2.7). Operator-driven push/pull opts out via
-    /// `mkpath: false` because the destination should already exist.
+    /// picks the rsync-driven parent-create path, since base + lite
+    /// images ship rsync ≥ 3.2.7). Operator-driven push/pull opts out
+    /// via `mkpath: false` because the destination should already exist.
     #[test]
     fn build_argv_always_includes_mkpath() {
         for backend in [BackendKind::Lima, BackendKind::Container] {

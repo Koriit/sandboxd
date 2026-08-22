@@ -7,8 +7,6 @@
 //! the concrete, validated effective policy plus a `source_presets`
 //! audit field.
 //!
-//! Presets are validated at load time (Part 2 of the observability design).
-//!
 //! # Current scope
 //!
 //! The preset infrastructure is live:

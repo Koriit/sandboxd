@@ -1,9 +1,8 @@
 //! Synchronous DNS-policy gate IPC.
 //!
 //! This module implements the sandboxd side of the synchronous DNS-policy
-//! gate handshake. The
-//! CoreDNS plugin holds the VM's DNS answer until sandboxd has applied
-//! the corresponding nft / Envoy state and acked.
+//! gate handshake. The CoreDNS plugin holds the VM's DNS answer until
+//! sandboxd has applied the corresponding nft / Envoy state and acked.
 //!
 //! # Wire format
 //!
