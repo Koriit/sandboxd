@@ -62,10 +62,9 @@ mod tests {
         serde_json::from_str(raw).expect("test json literal must parse")
     }
 
-    /// Table-driven coverage for the documented contract inputs A/B/C plus an
-    /// operator-customized row that exercises the "preserves unknown
-    /// keys" contract. Bytes-in / bytes-out path,
-    /// because the framework calls `apply(&[u8]) -> Vec<u8>`.
+    /// Table-driven coverage for inputs A/B/C plus an operator-customized row
+    /// that exercises the "preserves unknown keys" contract. Bytes-in /
+    /// bytes-out path, because the framework calls `apply(&[u8]) -> Vec<u8>`.
     #[test]
     fn migration_v001_round_trip() {
         struct Row {
@@ -81,7 +80,7 @@ mod tests {
                 expected: r#"{ "_schema_version": 1, "subnets": [] }"#,
             },
             Row {
-                name: "the documented contract Input A — single user pool",
+                name: "Input A — single user pool",
                 input: r#"{
                     "subnets": [
                         { "cidr": "10.209.0.0/24", "allow_users": ["alice"] }
@@ -95,7 +94,7 @@ mod tests {
                 }"#,
             },
             Row {
-                name: "the documented contract Input B — multi-user, multi-pool",
+                name: "Input B — multi-user, multi-pool",
                 input: r#"{
                     "subnets": [
                         { "cidr": "10.209.0.0/24", "allow_users": ["alice"], "comment": "alice prod" },
@@ -111,7 +110,7 @@ mod tests {
                 }"#,
             },
             Row {
-                name: "the documented contract Input C — sandbox already present",
+                name: "Input C — sandbox already present",
                 input: r#"{
                     "subnets": [
                         { "cidr": "10.209.0.0/24", "allow_users": ["alice", "sandbox"] }

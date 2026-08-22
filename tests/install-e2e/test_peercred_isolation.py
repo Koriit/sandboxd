@@ -481,7 +481,7 @@ def test_owner_isolation_uid_without_passwd_closes_connection(
     else:
         raise AssertionError(
             f"peercred-connector exited {r.returncode}; expected 0 "
-            f"(graceful FIN) or 4 (RST). Both satisfy the documented contract's "
+            f"(graceful FIN) or 4 (RST). Both satisfy the "
             f"'close without sending a response' invariant.\n"
             f"stdout:\n{r.stdout!r}\nstderr:\n{r.stderr!r}"
         )
