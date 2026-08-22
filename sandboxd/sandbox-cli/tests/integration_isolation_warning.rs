@@ -158,14 +158,14 @@ async fn integration_isolation_warning_fires_for_lite_flag() {
         status.code()
     );
     // The warning is the first two lines of stderr — assert the exact
-    // bytes per. A subsequent unit test in
-    // backend.rs pins this same string at the renderer level; the
-    // duplication here verifies the wiring (eprint! reaches the
-    // subprocess's stderr) without re-pinning the bytes a third time.
+    // bytes. A subsequent unit test in backend.rs pins this same string
+    // at the renderer level; the duplication here verifies the wiring
+    // (eprint! reaches the subprocess's stderr) without re-pinning the
+    // bytes a third time.
     let expected = "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see guides/lite-mode for the trade-off details\n";
     assert!(
         stderr.starts_with(expected),
-        "stderr must begin with the design warning bytes; got:\n{stderr}"
+        "stderr must begin with the isolation warning bytes; got:\n{stderr}"
     );
 }
 
