@@ -1,7 +1,7 @@
 //! End-to-end coverage for `sandbox doctor` + `GET /diagnostics`.
 //!
-//!
-//! for the daemon-productionization revision:
+//! Five doctor/diagnostics integration tests cover the
+//! daemon-productionization revision:
 //!
 //! - `integration_doctor_hard_fails_on_missing_gateway_image`
 //! - `integration_doctor_informational_on_missing_lite_image`
@@ -594,10 +594,9 @@ async fn integration_kvm_check_via_daemon_diagnostics() {
 
     // `GET /diagnostics` returns these keys. Pin them here so a
     // regression that renames or drops one fails this test loudly.
-    // The `*_probe_failed` / `*_probe_error` companions were added
-    // to the contract so doctor C7/C8 can
-    // `probe_failed` variant must also appear so doctor C7/C8 can
-    // distinguish "image absent" from "probe could not run".
+    // The `*_probe_failed` / `*_probe_error` companions must also
+    // appear, so doctor C7/C8 can distinguish "image absent" from
+    // "probe could not run".
     for key in [
         "daemon_uid",
         "daemon_user",

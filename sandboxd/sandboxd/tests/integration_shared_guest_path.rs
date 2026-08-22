@@ -11,7 +11,7 @@
 //!
 //! ## Why container-only at the runtime layer
 //!
-//!
+//! Two tests cover this contract:
 //! `integration_shared_guest_path_lima` and
 //! `integration_shared_guest_path_container`. The Lima half requires
 //! booting a real VM (the 9p mount is materialised at boot time, not

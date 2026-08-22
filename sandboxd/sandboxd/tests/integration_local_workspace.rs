@@ -20,7 +20,7 @@
 //!
 //! Container coverage at the runtime layer exercises every line of
 //! `run_initial_push`. The Lima half of the same exercise is left to
-//! E2E:.4 lists `integration_lima_local_create_and_push`,
+//! E2E: `integration_lima_local_create_and_push`,
 //! but the existing `sandbox-core/tests/lima_integration.rs` convention
 //! is "inert-VM tests only" — booting a Lima VM at the runtime layer
 //! requires `NetworkManager` plumbing from `AppState` (per the comment
@@ -75,7 +75,7 @@ use tokio::net::UnixStream;
 // Test fixture: rsync-equipped alpine sleep container
 // ---------------------------------------------------------------------------
 //
-// The lite image is `--read-only` per the design
+// The lite image is `--read-only` by design, and the
 // production daemon entrypoint expects route-helper scaffolding the
 // runtime-level tests deliberately avoid. We build a small alpine
 // image with `rsync` pre-installed and `sleep 3600` as the entrypoint

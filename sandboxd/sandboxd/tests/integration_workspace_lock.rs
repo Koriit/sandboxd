@@ -1087,11 +1087,8 @@ async fn integration_workspace_lock_idempotent_release() {
     );
 }
 
-///
-/// `integration_workspace_lock_acquire_rejected_when_not_running`.
-///
-/// Phase 3 state-gate: the acquire handler refuses with HTTP 400 when
-/// the session is not in `Running` state. The error wording is
+/// The acquire handler refuses with HTTP 400 when the session is not
+/// in `Running` state (Phase 3 state-gate). The error wording is
 /// pinned by the workspace-lock API contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_workspace_lock_acquire_rejected_when_not_running() {

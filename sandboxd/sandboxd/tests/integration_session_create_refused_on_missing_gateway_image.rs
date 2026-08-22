@@ -1,8 +1,8 @@
 //! HTTP-level coverage for the missing-gateway-image refusal on
 //! `POST /sessions`.
 //!
-//! the documented contract lists `integration_session_create_refused_on_missing_gateway_image`
-//! as the wire-shape complement to the primitive-level
+//! `integration_session_create_refused_on_missing_gateway_image` is
+//! the wire-shape complement to the primitive-level
 //! `integration_session_create_image_contracts.rs` test in
 //! `sandbox-core/tests/`. The primitive test pins the daemon-side
 //! helpers (`gateway_image_present` returns `Ok(false)` for the
@@ -219,7 +219,7 @@ async fn http_post_json(
 // Test
 // ---------------------------------------------------------------------------
 
-/// the documented contract — `integration_session_create_refused_on_missing_gateway_image`.
+/// `POST /sessions` refuses when the gateway image is absent.
 ///
 /// Spawn the daemon with `SANDBOX_GATEWAY_TAG_OVERRIDE` set to a
 /// guaranteed-absent tag (timestamp-suffixed so this run never depends
