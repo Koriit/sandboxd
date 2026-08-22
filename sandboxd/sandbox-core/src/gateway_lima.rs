@@ -1172,9 +1172,11 @@ provision:
 /// netns, which this table never touches.
 #[cfg(target_os = "macos")]
 pub fn generate_gateway_eth0_nft_policy() -> String {
-    // The ruleset is applied inside the gateway Lima VM via `nft -f` on a tempfile.
-    // It uses a sandboxd-specific table rather than modifying the filter table so
-    // it does not conflict with Docker's iptables/nft rules.
+    // The ruleset is applied inside the gateway Lima VM by feeding it to `nft -f -`
+    // on standard input — never through a file the VM's login user could rewrite
+    // between write and apply. It uses a sandboxd-specific table rather than
+    // modifying the filter table so it does not conflict with Docker's
+    // iptables/nft rules.
     //
     // Idempotency across daemon restarts (daemon restart against a still-running
     // gateway VM must not fail):
