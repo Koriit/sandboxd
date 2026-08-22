@@ -231,11 +231,10 @@ async fn spawn_test_server_with_skew() -> (TempDir, String, tokio::task::JoinHan
 /// wording and exit with `CLI_VERSION_MISMATCH_EXIT_CODE` (2) —
 /// matching the request/response path's contract.
 ///
-/// Before the an earlier fix the streaming path bypassed the
-/// equality gate entirely, so this test would have shown a successful
-/// stream against a skewed daemon. After the fix the gate fires
-/// immediately after the hyper handshake and the events handler is
-/// never reached.
+/// Before an earlier fix the streaming path bypassed the equality
+/// gate entirely, so this test would have shown a successful stream
+/// against a skewed daemon. After the fix the gate fires immediately
+/// after the hyper handshake and the events handler is never reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sandbox_events_refuses_on_version_skew() {
     let bin = env!("CARGO_BIN_EXE_sandbox");

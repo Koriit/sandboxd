@@ -27,7 +27,7 @@
 //! Envoy's `%RESPONSE_FLAGS%` is an opaque short-code string documented
 //! by Envoy's own access-log reference. The empty / dash form (`""` or
 //! `"-"`) indicates no failure bit set ⇒ the connection was allowed.
-//! Any other value is a failure code ⇒ the connection was denied. The
+//! Any other value is a failure code ⇒ the connection was denied.
 //! The ingestor folds all non-empty flag values into a single
 //! `connection_denied` variant rather than modeling each flag; the
 //! `response_flags` field is carried through to the domain event so

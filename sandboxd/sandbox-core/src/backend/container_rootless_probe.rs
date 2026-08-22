@@ -1,6 +1,6 @@
 //! Rootless-Docker probe for the container backend.
 //!
-//!
+//! Rootless Docker is out of scope for the lite backend:
 //! Lite's target is **default-hardened Docker**. An earlier audit
 //! caught the gap between this prose contract and the daemon's
 //! actual behavior — a polarity-inverted `is_rootless_docker()` skipif

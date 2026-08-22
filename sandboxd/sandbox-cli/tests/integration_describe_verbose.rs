@@ -3,8 +3,6 @@
 //!
 //! The human-readable detail view (the CLI's `describe` command) under
 //! `-v` shows the full capability matrix for each session's backend.
-//! Note: the CLI calls this "Capabilities" while the daemon endpoint is
-//! `/backends` — the naming is intentionally distinct.
 //!
 //! This test pins the end-to-end wiring: the CLI subprocess fetches
 //! `/backends`, threads the matching `Capabilities` value through

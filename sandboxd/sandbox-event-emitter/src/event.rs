@@ -351,7 +351,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(json["event"], "rate_limited");
         assert_eq!(json["layer"], "deny-logger");
-        // the canonical wire field name.
+        // `rate_limited_count` is the canonical wire field name.
         assert_eq!(json["rate_limited_count"], 42);
         assert!(
             json.get("dropped_events_count").is_none(),

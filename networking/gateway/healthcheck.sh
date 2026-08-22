@@ -32,19 +32,17 @@ fi
 # Both listeners are bound on the gateway bridge IP (see entrypoint:
 # `--bind-ip ${GATEWAY_IP}`), not 127.0.0.1 — PREROUTING DNAT to
 # loopback is dropped as a martian destination unless
-# `route_localnet=1` is set, which the gateway container does not
-# set.
+# `route_localnet=1` is set, which the gateway container does not set.
 # The probes therefore have to go through the bridge IP. Discover it
 # the same way the entrypoint does (`hostname -i`, first address) so
 # the two scripts stay consistent.
 #
 # A non-200 from either probe means a listener task has exited or
 # failed to bind; Docker's HEALTHCHECK treats the non-zero exit as
-# unhealthy, and sandboxd's gateway poller restarts the container
+# unhealthy, and sandboxd's gateway poller restarts the container.
 # Observability of denials and allow-flow audit are hard invariants
-# (no degraded mode). The two
-# loggers are independent failure domains: if either fails the
-# container is unhealthy.
+# (no degraded mode). The two loggers are independent failure
+# domains: if either fails the container is unhealthy.
 GATEWAY_IP_FOR_HEALTH="$(hostname -i | awk '{print $1}')"
 if [[ -z "${GATEWAY_IP_FOR_HEALTH}" ]]; then
     echo "UNHEALTHY: could not discover gateway bridge IP via 'hostname -i'"

@@ -1,11 +1,10 @@
 //! Integration tests: `sandbox create --no-cache` is rejected
 //! client-side when the resolved backend is the container backend.
 //!
-//!
-//! container" mandates that the CLI surface this mismatch with exit
-//! code 2 (clap-style misuse) *before* the daemon is contacted, so the
-//! operator never burns a Unix-socket roundtrip on a guaranteed-to-fail
-//! request. The three tests below pin the three reachable code paths:
+//! The CLI surfaces this mismatch with exit code 2 (clap-style misuse)
+//! *before* the daemon is contacted, so the operator never burns a
+//! Unix-socket roundtrip on a guaranteed-to-fail request. The three
+//! tests below pin the three reachable code paths:
 //!
 //! - `--lite --no-cache` — the `--lite` sugar resolves to container.
 //! - `--backend container --no-cache` — explicit selector.
