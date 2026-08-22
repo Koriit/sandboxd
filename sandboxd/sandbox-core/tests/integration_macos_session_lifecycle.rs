@@ -78,11 +78,16 @@ mod integration_macos_session_lifecycle {
     ///
     /// The gateway instance lives under the daemon uid's LIMA_HOME.
     /// In dev mode the daemon is the current user, so daemon_uid == current uid.
+    ///
+    /// The instance name is derived rather than spelled: with per-operator
+    /// gateways on it carries an owner suffix, and a literal here would name an
+    /// instance that does not exist. The derivation returns the bare name while
+    /// they are off, so the path is unchanged in that mode.
     fn gateway_docker_socket() -> PathBuf {
         let uid = nix::unistd::Uid::current().as_raw();
         let daemon_lima_home = operator_lima_home(uid);
         daemon_lima_home
-            .join("sandboxd-gateway")
+            .join(sandbox_core::gateway_instance_name(uid))
             .join("gateway-docker.sock")
     }
 
