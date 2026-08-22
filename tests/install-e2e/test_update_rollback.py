@@ -1,6 +1,6 @@
 """`sandbox update` + manual rollback.
 
-the install framework ships only the documented manual rollback recipe; there is no
+The install framework ships only the documented manual rollback recipe; there is no
 automated ``sandbox rollback`` subcommand (§ 12 out of scope). This
 test installs base version v, updates to a bumped v', then runs the
 verbatim recipe from § 7.2 and asserts the rolled-back state.
@@ -131,7 +131,7 @@ def test_update_then_manual_rollback(
         backup_manifest["files"].get("sessions.db-shm.bak", {}).get("sha256")
     )
 
-    # 3. Run the rollback recipe . The recipe is split
+    # 3. Run the rollback recipe. The recipe is split
     # into two phases here so the sessions.db sha256 can be sampled
     # AFTER the install but BEFORE `systemctl start sandboxd`. Without
     # the split, a parallel WAL checkpoint or any startup-time DB write

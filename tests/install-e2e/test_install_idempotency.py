@@ -1,6 +1,6 @@
 """Idempotency + partial-failure recovery tests for install.sh.
 
-
+Two cases:
 
 - ``test_install_idempotent_double_run`` — second run is all-skip.
 - ``test_install_partial_failure_recovery`` — kill install mid-privileged-step,

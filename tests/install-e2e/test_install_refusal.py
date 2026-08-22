@@ -1,6 +1,6 @@
 """Refusal-path tests for install.sh.
 
-
+Covers:
 
 - ``test_install_refuses_wrong_arch_tarball`` — aarch64 MANIFEST on
   x86_64 host. Expect non-zero exit + clear error.

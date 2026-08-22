@@ -1634,7 +1634,7 @@ def pinned_cosign_binary() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Multi-uid peercred test harness (the documented contract, the documented contract).
+# Multi-uid peercred test harness.
 # ---------------------------------------------------------------------------
 #
 # The peercred-connector helper lives at
@@ -1803,8 +1803,7 @@ def provision_peercred_connector_in_vm(vm, host_binary):
 # - ``bob`` (uid 4002)   — second operator, attempts cross-user reads
 # - uid 7777             — synthetic uid with NO ``/etc/passwd`` entry,
 #                          used by tests that pin the unresolvable-uid
-#                          deny/close behavior (the documented contract #148 and
-#                          the documented contract / 7.5 #150)
+#                          deny/close behavior (#148 and #150)
 #
 # alice and bob both join the ``sandbox`` group so they can traverse
 # the socket's 0660 sandbox:sandbox parent dir / socket node. The
@@ -1934,8 +1933,8 @@ def read_route_helper_audit_log(vm, audit_log_path):
 
     Returns a list of dicts (one per record). Empty list if the file
     does not exist (the helper writes to the resolved path on demand;
-    an absent file means no record was ever appended). Per the documented design
-    § 3.5 every invocation writes exactly one record.
+    an absent file means no record was ever appended). Every
+    invocation writes exactly one record.
 
     The audit-log path inside the VM depends on the helper's
     ``audit_log_path()`` resolution: usually

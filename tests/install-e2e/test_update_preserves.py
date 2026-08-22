@@ -17,8 +17,8 @@ Two preservation contracts are exercised end-to-end:
   not a Cargo.toml that registers a new V002 migration, so the
   framework's apply chain is a no-op across this update. The test
   pins the *observable* invariant — the operator's custom subnet
-  line survives the update — which is the user-facing contract the documented design
-  § 5.5 commits to. V001→V002 chaining is exercised by the unit and
+  line survives the update — which is the user-facing contract.
+  V001→V002 chaining is exercised by the unit and
   integration migration tests.
 """
 
@@ -157,7 +157,7 @@ def test_update_preserves_customized_users_conf(
 
     Single-version-tarball caveat: with no actual schema migration
     pending, the framework's apply chain is a no-op and the file is
-    bit-for-bit identical. The real the documented contract contract — V0 file
+    bit-for-bit identical. The real contract — V0 file
     with operator subnet → V1 file with stamp + subnet preserved —
     is exercised by ``migration_v001_round_trip`` (unit test) and
     ``integration_config_migration_applies_v001_to_legacy_file``. This
@@ -180,9 +180,8 @@ def test_update_preserves_customized_users_conf(
         "sudo cat /etc/sandboxd/users.conf", check=True, timeout=10,
     ).stdout
     parsed = json.loads(original)
-    # The schema's `subnets` array is operator-tunable per the documented design
-    # § 5.5; injecting an extra row mirrors the brainstorm case
-    # ("operator-added subnet").
+    # The schema's `subnets` array is operator-tunable; injecting an
+    # extra row mirrors the brainstorm case ("operator-added subnet").
     parsed.setdefault("subnets", []).append({
         "comment": "operator-added subnet — must survive update",
         "cidr": "192.168.99.0/24",

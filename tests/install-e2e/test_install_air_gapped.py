@@ -1,6 +1,6 @@
 """Air-gapped install path.
 
-
+The air-gapped flow has two parts:
 
 1. Pre-stage cosign at /usr/local/bin/cosign (the script's fallback).
 2. Drop network egress between the cosign-staging step and the rest of

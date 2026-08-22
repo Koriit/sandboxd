@@ -8,13 +8,13 @@ install-e2e Lima VM harness rather than the host-level
 ``cargo nextest`` profile:
 
 * ``test_route_helper_uid_without_passwd_denies_cleanly``
-  (closes #148, pins the documented contract / § 3.4) — a uid that does not
+  (closes #148) — a uid that does not
   resolve in ``/etc/passwd`` is denied at the route-helper's
   pair-check step before any netns work, and the deny lands in the
   JSON-Lines audit log per the documented contract.
 
 * ``test_owner_isolation_uid_without_passwd_closes_connection``
-  (closes #150, pins the documented contract / § 7.5) — a connection from a uid
+  (closes #150) — a connection from a uid
   with no passwd entry is closed cleanly by the daemon's peercred-
   aware acceptor; no panic, no response body, no leaked socket.
 
@@ -688,8 +688,8 @@ def test_session_isolation_404_on_foreign_id(
     )
 
     # Synthesize a session id alice owns. The id format is 12 lowercase
-    # hex chars per "session id format"; we generate one fresh
-    # for the test so we never collide with anything else in the DB.
+    # hex chars; we generate one fresh for the test so we never collide
+    # with anything else in the DB.
     session_id = uuid.uuid4().hex[:12]
     _inject_synthetic_session(
         vm,
@@ -752,7 +752,7 @@ def test_session_isolation_404_on_foreign_id(
         f"full response:\n{r.stdout!r}"
     )
 
-    # Body shape per "error":"session not found: <id>"}``.
+    # Body shape: ``{"error":"session not found: <id>"}``.
     # The body is at the tail of the response after the blank line
     # separating headers from body. ``_parse_http_status`` normalised
     # CRLF -> LF, so the blank-line separator is now ``\n\n``.
@@ -768,8 +768,7 @@ def test_session_isolation_404_on_foreign_id(
 
     # ---------------- Sanity: bob ALSO cannot see it via list ----------------
 
-    # 
-    # ``sandbox ps`` must not surface alice's row. Re-using the CLI
+    # bob's ``sandbox ps`` must not surface alice's row. Re-using the CLI
     # path because it's the operator-visible surface for the list
     # endpoint.
     #
@@ -878,7 +877,7 @@ def test_non_owner_sequential_requests_share_kept_alive_connection(
       * Request 2: ``GET /sessions/<alice-owned id>`` with
         ``Connection: close``. Daemon's per-caller storage filter
         rejects the foreign-owner row and responds 404 with the
-        "error":"session not found: <id>"}`` body.
+        ``{"error":"session not found: <id>"}`` body.
 
     The peercred-connector writes both requests in one ``write_all``
     (HTTP/1.1 pipelining), then reads until EOF; the daemon emits both
@@ -1002,8 +1001,8 @@ def test_non_owner_sequential_requests_share_kept_alive_connection(
     )
 
     # Request 2: GET /sessions/<alice-owned> as bob → 404 with the
-    # 
-    # bearing part of this test: if the connector half-closed the
+    # expected error wording. The body matching here is the load-bearing
+    # part of this test: if the connector half-closed the
     # write side prematurely, the second response would never land
     # (hyper aborts before sending it). Receiving the full 404 body
     # proves the kept-alive connection survived end-to-end.
