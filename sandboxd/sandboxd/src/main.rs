@@ -1371,33 +1371,25 @@ struct AppState {
     /// `teardown_macos_gateway`.
     #[cfg(target_os = "macos")]
     vmnet_pools: Arc<sandbox_core::vmnet_pool_registry::VmnetPoolRegistry>,
-    /// macOS only: gateway Lima instance manager. Manages the
-    /// `sandboxd-gateway` Lima VM that hosts all per-session gateway
-    /// containers. After `ensure_ready` succeeds at startup, exposes
-    /// the NIC map and the forwarded Docker socket path.
-    ///
-    /// The manager is constructed once at startup (in `main()`). Handlers no
-    /// longer read it — they resolve the caller's gateway through
-    /// `gateway_lima_managers` below — and what is left are the background and
-    /// recovery paths that have no operator in hand: the per-session gateway
-    /// monitor, gateway crash recovery, the gateway health monitor, the
-    /// startup health seed, and the session-networking restore. Each of those
-    /// still speaks for the one gateway the daemon owns, and each is converted
-    /// separately because "which gateway" has a different answer in each.
-    #[cfg(target_os = "macos")]
-    gateway_lima_manager: Arc<sandbox_core::GatewayLimaManager>,
     /// macOS only: one `GatewayLimaManager` per gateway-owning uid, built on
-    /// first lookup.
+    /// first lookup. Each manages a gateway Lima VM hosting that owner's
+    /// per-session gateway containers, and exposes the NIC map and forwarded
+    /// Docker socket path of the VM it owns.
     ///
     /// Every handler that acts for a caller reaches its gateway through here,
     /// via [`AppState::gateway_lima_manager_for_operator`] — never by handing
     /// an operator uid straight to `get_or_create`, which would resolve to a
     /// gateway that operator does not own while per-operator gateways are off.
+    /// Background and recovery paths have no operator in hand and so call
+    /// `get_or_create` directly, with an owner uid they already hold.
     ///
-    /// While they are off, every uid collapses to the daemon's, so the map
-    /// holds the single entry the singleton above also names, and the two are
-    /// built from identical inputs: the same LIMA_HOME, the same executor, the
-    /// same Docker and in-VM routes.
+    /// This registry is the only source of gateway managers, which is a
+    /// correctness requirement and not just tidiness: a manager caches its
+    /// verified slot→NIC map in itself and `ensure_ready` is what fills that
+    /// cache, so a second manager built over identical inputs answers
+    /// `nic_map()` with `None` and refuses every session whose slot the gateway
+    /// does in fact carry. Startup readies the manager it takes from here, so
+    /// there is one instance per owner and one cache behind it.
     #[cfg(target_os = "macos")]
     gateway_lima_managers: Arc<sandbox_core::GatewayLimaManagerRegistry>,
     /// macOS only: in-memory transient networking health per Running Lima session.
@@ -13731,12 +13723,20 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         // would otherwise be failing closed *and silent*. Tag the
                         // session Degraded so the condition reaches the operator on
                         // the wire, not only the log.
+                        //
+                        // Both reads come from this session's operator's
+                        // gateway, resolved once: a NIC name is only meaningful
+                        // paired with the instance it lives on, so taking the
+                        // map from one gateway and the instance name from
+                        // another would produce a plausible name for an
+                        // interface that does not exist.
+                        let gw_lima = state.gateway_lima_manager_for_operator(operator_uid);
                         let nic_name =
                             match sandbox_core::slot_for_persisted_session(&ni).and_then(|slot| {
                                 sandbox_core::nic_from_verified_map(
-                                    state.gateway_lima_manager.nic_map().as_ref(),
+                                    gw_lima.nic_map().as_ref(),
                                     slot,
-                                    state.gateway_lima_manager.instance_name(),
+                                    gw_lima.instance_name(),
                                 )
                             }) {
                                 Ok(name) => name,
@@ -13973,21 +13973,19 @@ async fn gateway_monitor(state: Arc<AppState>) {
 /// re-created against *its own* operator's gateway VM, and one pass over every
 /// session against one VM only happens to be right while there is one VM.
 ///
-/// Ownership is [`sandbox_core::GatewayOwnership::Shared`] here because this
-/// daemon holds one `GatewayLimaManager` and one Docker route, so there is
-/// exactly one gateway to drive whatever the per-operator-gateway switch says.
-/// It is a statement about what `state` holds, not about the switch, and it
-/// changes when the manager and the route below become per-owner rather than
-/// when the switch flips. Under `Shared` the split yields one shard holding
-/// every candidate, so this runs exactly as it did before the split existed.
+/// Ownership is [`sandbox_core::GatewayOwnership::Shared`] here, which yields a
+/// single shard holding every candidate — this runs exactly as it did before
+/// the split existed.
 ///
-/// Handing [`sandbox_core::GatewayOwnership::PerOperator`] a set of owners here
-/// is therefore not a one-line switch-over: it would produce a shard per owner
-/// while `recover_one_gateway` still drives the single
-/// `state.gateway_lima_manager`, force-stopping and restarting one VM once per
-/// shard and tearing down the sessions the previous shard had just recovered.
-/// The manager becoming per-owner is what makes that arm correct, and it is the
-/// same change that makes it necessary.
+/// What that is no longer saying is that only one gateway can be driven.
+/// `recover_one_gateway` selects its manager by `shard.owner_uid` and builds its
+/// Docker route per session's operator, so a shard per owner would restart that
+/// owner's own VM rather than the same one repeatedly. The remaining step to
+/// [`sandbox_core::GatewayOwnership::PerOperator`] is supplying the owner set it
+/// carries — deciding which owners this daemon can act on, which
+/// `sandbox_core::lima::enumerate_operator_uids_from_fs` can answer but is not
+/// wired to here — and validating the result against more than one live
+/// gateway. That is a behavioural change, not a one-line switch-over.
 ///
 /// ## What this function does NOT do
 ///
@@ -14105,9 +14103,11 @@ fn report_declined_sessions(
 /// iteration.
 ///
 /// `shard.owner_uid` is the uid owning the gateway this call acts on. It is the
-/// key for the latch, and it is what the manager and the Docker route below
-/// will be selected by once there is more than one of each — until then it is
-/// the daemon's own uid and every one of them agrees by construction.
+/// key for the latch and the key the manager below is selected by, so a
+/// recovery rebuilds the gateway its own shard's sessions run through rather
+/// than whichever one the daemon happens to own. While per-operator gateways
+/// are off every shard resolves to the daemon's own uid, so the selection is a
+/// no-op there and the behaviour is unchanged.
 #[cfg(target_os = "macos")]
 async fn recover_one_gateway(
     state: &Arc<AppState>,
@@ -14117,8 +14117,12 @@ async fn recover_one_gateway(
     use sandbox_core::NetworkInfo;
 
     let shard_deps = sandbox_core::RecoveryShardDeps::new(store, shard.sessions);
-    let mgr_restart = Arc::clone(&state.gateway_lima_manager);
-    let mgr_per_session = Arc::clone(&state.gateway_lima_manager);
+    // Keyed by the shard's owner, not by the daemon: `get_or_create` takes an
+    // owner uid and `shard.owner_uid` already is one, so it is passed straight
+    // through rather than back through `gateway_owner_uid`, which expects an
+    // operator uid and would re-resolve a value that has already been resolved.
+    let mgr_restart = state.gateway_lima_managers.get_or_create(shard.owner_uid);
+    let mgr_per_session = state.gateway_lima_managers.get_or_create(shard.owner_uid);
     // One gateway VM serves every operator's sessions and so carries a NIC on
     // every slot on the host, not on the share of whoever owns it — recovery
     // must rebuild all of them. A gateway VM per operator would carry NICs on
@@ -14533,7 +14537,21 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(poll_interval).await;
 
-        let mgr = Arc::clone(&state.gateway_lima_manager);
+        // Resolved through the registry under the same owner uid the recovery
+        // this loop triggers shards on, so the gateway being probed is the one
+        // a threshold breach would act on. Reading a manager the recovery pass
+        // does not use would let the two disagree about which VM is in trouble.
+        //
+        // That owner is the daemon's own in both modes, which makes this loop
+        // single-gateway by construction rather than by which handle it holds:
+        // `recover_gateway_lima` passes `GatewayOwnership::Shared`, so there is
+        // one pass covering every shard and nothing for a per-owner trigger to
+        // call. Giving the monitor per-owner probes and per-owner backoff is
+        // therefore blocked on that pass becoming per-owner first, not on
+        // anything here.
+        let mgr = state
+            .gateway_lima_managers
+            .get_or_create(sandbox_core::gateway_owner_uid(state.daemon_uid));
         let probe_result = tokio::task::spawn_blocking(move || mgr.probe_docker_health()).await;
 
         match probe_result {
@@ -15080,16 +15098,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dyn Fn(u32) -> sandbox_core::docker::DockerRoute + Send + Sync,
     > = Arc::new(|_owner_uid| sandbox_core::docker::DockerRoute::Host);
 
-    // The daemon's own route: the same construction, for the uid this process
-    // runs as. It is startup wiring for the one thing the daemon owns
-    // outright — the manager for its own gateway VM — and it is deliberately
-    // not handed to `AppState`. A route sitting in shared state names no
-    // owner, so a handler that reached for it would compile whether or not it
-    // had been converted; every route a request runs over is built from an
-    // operator uid instead, via `AppState::docker_route_for_operator`. The
-    // container runtime is not wired from this route either: one runtime
-    // serves every operator, so it takes the resolver and answers per call.
-    let docker_route = gateway_docker_route(daemon_uid);
+    // A manager per gateway-owning uid, the daemon's own included. The closure
+    // is the only place that knows how to compose one: an owner's LIMA_HOME,
+    // and the three seams aimed at that owner's uid rather than the daemon's.
+    // The broker executor is shared — it routes per call by the uid it is
+    // handed, so one instance serves every owner.
+    //
+    // Built here, ahead of the startup sequence, because the manager that
+    // sequence readies has to be the one every later reader gets. A
+    // `GatewayLimaManager` caches its verified slot→NIC map in itself, and
+    // `ensure_ready` is what fills that cache, so a second manager over
+    // identical inputs is not interchangeable with the first: it answers
+    // `nic_map()` with `None` and every session built through it is refused
+    // for a slot the gateway does in fact carry. Taking the startup manager
+    // out of this registry rather than constructing one beside it is what
+    // makes "the manager for this owner" a single object.
+    #[cfg(target_os = "macos")]
+    let gateway_lima_managers = {
+        let executor = Arc::clone(broker_executor.as_ref().expect("set by the executor block"));
+        Arc::new(sandbox_core::GatewayLimaManagerRegistry::new(
+            move |owner_uid| {
+                sandbox_core::GatewayLimaManager::new(
+                    sandbox_core::lima::operator_lima_home(owner_uid),
+                    Arc::clone(&executor) as Arc<dyn sandbox_core::lima::LimaExecutor>,
+                    sandbox_core::docker::DockerRoute::Vm {
+                        owner_uid,
+                        executor: Arc::clone(&executor)
+                            as Arc<dyn sandbox_core::docker::DockerExecutor>,
+                    },
+                    sandbox_core::in_vm::InVmRoute::new(
+                        owner_uid,
+                        Arc::clone(&executor) as Arc<dyn sandbox_core::in_vm::InVmExecutor>,
+                    ),
+                    owner_uid,
+                )
+            },
+        ))
+    };
 
     // Build the per-operator LimaManager registry. One LimaManager per
     // operator uid, created lazily on first session-create. All limactl
@@ -15115,10 +15160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The Linux startup path is unchanged. Any change that accidentally
     // touches Linux behaviour should be flagged and reviewed separately.
     #[cfg(target_os = "macos")]
-    let (vmnet_pools, gateway_lima_manager): (
-        Arc<sandbox_core::vmnet_pool_registry::VmnetPoolRegistry>,
-        Arc<sandbox_core::GatewayLimaManager>,
-    ) = {
+    let vmnet_pools: Arc<sandbox_core::vmnet_pool_registry::VmnetPoolRegistry> = {
         use sandbox_core::network::{
             STAGED_SOCKET_VMNET_PATH, VMNET_SOCKET_DIR, assert_root_exec_ancestry,
             vmnet_slot_socket_path,
@@ -15305,23 +15347,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // after which we re-discover and build the final pool at effective_n.
         // ---------------------------------------------------------------------------
         info!("macOS startup: step 4 — gateway Lima instance init");
-        let daemon_lima_home = sandbox_core::lima::operator_lima_home(daemon_uid);
 
-        // The in-VM seam alongside the Docker one: `limactl shell` / `limactl
-        // copy` work as typed ops for the uid that owns the gateway VM.
-        let in_vm_route = sandbox_core::in_vm::InVmRoute::new(
-            daemon_uid,
-            Arc::clone(broker_executor.as_ref().expect("set by the executor block"))
-                as Arc<dyn sandbox_core::in_vm::InVmExecutor>,
-        );
-
-        let manager_arc = Arc::new(sandbox_core::GatewayLimaManager::new(
-            daemon_lima_home,
-            lima_registry.executor().clone(),
-            docker_route.clone(),
-            in_vm_route,
-            daemon_uid,
-        ));
+        // Taken from the registry rather than built here, so the instance this
+        // step readies is the instance every later caller resolves. `daemon_uid`
+        // is passed straight through: it already is a gateway-owner uid, and
+        // `gateway_owner_uid` expects an operator's.
+        let manager_arc = gateway_lima_managers.get_or_create(daemon_uid);
 
         // The slot set this daemon's gateway instance owns. Supplied on every
         // call rather than held by the manager, so it can never be a stale copy
@@ -15572,38 +15603,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        let pools = Arc::new(sandbox_core::vmnet_pool_registry::VmnetPoolRegistry::new(
+        Arc::new(sandbox_core::vmnet_pool_registry::VmnetPoolRegistry::new(
             assignment,
-        ));
-
-        (pools, manager_arc)
-    };
-
-    // A manager per gateway-owning uid, alongside the daemon's own. The
-    // closure is the only place that knows how to compose one: an owner's
-    // LIMA_HOME, and the three seams aimed at that owner's uid rather than
-    // the daemon's. The broker executor is shared — it routes per call by the
-    // uid it is handed, so one instance serves every owner.
-    #[cfg(target_os = "macos")]
-    let gateway_lima_managers = {
-        let executor = Arc::clone(broker_executor.as_ref().expect("set by the executor block"));
-        Arc::new(sandbox_core::GatewayLimaManagerRegistry::new(
-            move |owner_uid| {
-                sandbox_core::GatewayLimaManager::new(
-                    sandbox_core::lima::operator_lima_home(owner_uid),
-                    Arc::clone(&executor) as Arc<dyn sandbox_core::lima::LimaExecutor>,
-                    sandbox_core::docker::DockerRoute::Vm {
-                        owner_uid,
-                        executor: Arc::clone(&executor)
-                            as Arc<dyn sandbox_core::docker::DockerExecutor>,
-                    },
-                    sandbox_core::in_vm::InVmRoute::new(
-                        owner_uid,
-                        Arc::clone(&executor) as Arc<dyn sandbox_core::in_vm::InVmExecutor>,
-                    ),
-                    owner_uid,
-                )
-            },
         ))
     };
 
@@ -16010,8 +16011,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         vmnet_pools,
         #[cfg(target_os = "macos")]
-        gateway_lima_manager,
-        #[cfg(target_os = "macos")]
         gateway_lima_managers,
         #[cfg(target_os = "macos")]
         networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -16105,42 +16104,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // macOS: startup health seed for the networking_status map.
     //
-    // After reconcile + pool restore, probe the gateway Lima Docker daemon for
-    // each Running Lima session and seed the map accordingly.  A session whose
-    // gateway is reachable gets no entry (= Healthy via macos_networking_status_for).
-    // An unreachable session gets Degraded so the gateway_lima_monitor picks up
-    // recovery on its first tick.
+    // After reconcile + pool restore, probe the gateway Lima Docker daemon each
+    // Running Lima session recovers against and seed the map accordingly. A
+    // session whose gateway is reachable gets no entry (= Healthy via
+    // macos_networking_status_for). An unreachable session gets Degraded so the
+    // gateway_lima_monitor picks up recovery on its first tick.
+    //
+    // Sharded by gateway owner rather than probing one gateway and applying its
+    // answer to every session, so an operator whose gateway is down does not
+    // decide the startup health of sessions running through a gateway that is
+    // up. The sharding uses the same primitive and the same `Shared` ownership
+    // the recovery pass does, so with per-operator gateways off there is one
+    // shard and the seeded map is identical to the pre-shard behaviour.
     //
     // CROSS-PLATFORM NOTE: cfg-gated on macos; Linux unchanged.
     #[cfg(target_os = "macos")]
     {
         use sandbox_core::{BackendKind, SessionState};
 
-        let reachable = {
-            let mgr = Arc::clone(&state.gateway_lima_manager);
-            tokio::task::spawn_blocking(move || mgr.probe_docker_health())
+        let store = Arc::clone(&state.store);
+        let running_lima: Vec<sandbox_core::Session> = store
+            .list_sessions_unfiltered()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima)
+            .collect();
+
+        let network_for = |session: &sandbox_core::Session| {
+            store
+                .get_network_info_unfiltered(&session.id)
+                .ok()
+                .flatten()
+        };
+        let (shards, declined) = sandbox_core::partition_by_gateway_owner(
+            running_lima,
+            sandbox_core::GatewayOwnership::Shared(sandbox_core::gateway_owner_uid(
+                state.daemon_uid,
+            )),
+            &network_for,
+            &resolve_name_to_uid,
+        )
+        .into_parts();
+
+        // Probed before the map lock is taken, not under it: a probe is a
+        // blocking Docker call and the map is read by every session-status
+        // request.
+        let mut degraded: Vec<SessionId> = Vec::new();
+        for shard in shards {
+            let mgr = state.gateway_lima_managers.get_or_create(shard.owner_uid);
+            let reachable = tokio::task::spawn_blocking(move || mgr.probe_docker_health())
                 .await
                 .ok()
                 .and_then(|r| r.ok())
-                .unwrap_or(false)
-        };
-
-        if !reachable {
-            // Gateway is down at startup: tag every Running Lima session Degraded.
-            let sessions = state.store.list_sessions_unfiltered().unwrap_or_default();
-            let mut map = state.networking_status.lock().await;
-            for session in sessions
-                .iter()
-                .filter(|s| s.state == SessionState::Running && s.backend == BackendKind::Lima)
-            {
-                map.insert(session.id, NetworkingStatus::Degraded);
+                .unwrap_or(false);
+            if reachable {
+                continue;
             }
             info!(
-                count = map.len(),
-                "startup: gateway unreachable; tagged Running Lima sessions Degraded"
+                owner_uid = shard.owner_uid,
+                count = shard.sessions.len(),
+                "startup: gateway unreachable; tagging its Running Lima sessions Degraded"
             );
+            degraded.extend(shard.sessions.iter().map(|s| s.id));
+        }
+
+        // A session no shard claimed has no gateway to be healthy against, so
+        // it is seeded Degraded rather than defaulting to Healthy by having no
+        // entry. Recovery reports the same sessions through
+        // `report_declined_sessions`; this is the startup half of that, and it
+        // is deliberately quieter — nothing has been attempted yet to fail.
+        for d in &declined {
+            error!(
+                session_id = %d.session_id,
+                owner = %d.owner_username,
+                reason = %d.reason,
+                "startup: cannot attribute this session to a gateway; seeded Degraded"
+            );
+            degraded.push(d.session_id);
+        }
+
+        if degraded.is_empty() {
+            info!("startup: every gateway reachable; all Running Lima sessions start Healthy");
         } else {
-            info!("startup: gateway reachable; all Running Lima sessions start Healthy");
+            let mut map = state.networking_status.lock().await;
+            for id in &degraded {
+                map.insert(*id, NetworkingStatus::Degraded);
+            }
         }
     }
 
