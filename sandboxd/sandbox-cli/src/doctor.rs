@@ -1416,26 +1416,33 @@ fn check_gateway_lima_instance(
     if !socket_reachable {
         return requires_daemon_skip("C18", "gateway Lima instance");
     }
+    // The daemon reports the instance name; this side never spells it. With
+    // per-operator gateways on it carries an owner suffix, so a constant here
+    // would name an instance the operator cannot find. A daemon that sends no
+    // name leaves the row describing the thing rather than naming it.
+    let instance = diagnostics
+        .and_then(|d| d.gateway_lima_instance.as_deref())
+        .unwrap_or("the gateway Lima instance");
     match diagnostics.and_then(|d| d.gateway_lima_state.as_deref()) {
         Some("running") => CheckRow {
             id: "C18",
             name: "gateway Lima instance",
             outcome: CheckOutcome::Pass {
-                detail: format!("{} running, docker reachable", "sandboxd-gateway"),
+                detail: format!("{instance} running, docker reachable"),
             },
         },
         Some(state @ ("stopped" | "absent" | "error")) => {
             let (detail, hint) = match state {
                 "stopped" => (
-                    "sandboxd-gateway stopped".to_string(),
+                    format!("{instance} stopped"),
                     "restart sandboxd to bring up the gateway Lima instance",
                 ),
                 "absent" => (
-                    "sandboxd-gateway absent".to_string(),
+                    format!("{instance} absent"),
                     "restart sandboxd to create the gateway Lima instance",
                 ),
                 _ => (
-                    "sandboxd-gateway running but docker socket unreachable".to_string(),
+                    format!("{instance} running but docker socket unreachable"),
                     "restart sandboxd; if it persists, inspect the gateway VM's docker daemon",
                 ),
             };
@@ -2424,6 +2431,12 @@ pub(crate) struct DiagnosticsPayload {
     #[serde(default)]
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub gateway_lima_state: Option<String>,
+    /// Lima instance name behind that verdict, as the daemon knows it. Carries
+    /// an owner suffix when per-operator gateways are on, so it is reported
+    /// rather than spelled from a constant on this side.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_lima_instance: Option<String>,
     /// Configured vmnet pool size (max concurrent macOS sessions).
     #[serde(default)]
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -3074,6 +3087,7 @@ mod tests {
             guest_version_drift: None,
             substrate_orphans: None,
             gateway_lima_state: None,
+            gateway_lima_instance: None,
             vmnet_pool_size: None,
             vmnet_pool_claimed: None,
             vmnet_pool_leaked_slots: None,
@@ -3739,6 +3753,48 @@ mod tests {
                 "state {state} must Fail"
             );
         }
+    }
+
+    /// Every C18 verdict names the instance the daemon reported, and none of
+    /// them spells one here.
+    ///
+    /// The verdict-shape test above cannot see this: it matches on `Pass` /
+    /// `Fail` and never reads the detail, so it stays green whatever name the
+    /// row prints. With per-operator gateways on the real name carries an
+    /// owner suffix, and a row that printed the bare constant would send an
+    /// operator looking for an instance that is not there — under a hint that
+    /// tells them to restart the daemon over it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c18_names_the_instance_the_daemon_reported() {
+        let mut d = diag_default();
+        d.gateway_lima_instance = Some("sandboxd-gateway-501".to_string());
+
+        for state in ["running", "stopped", "absent", "error"] {
+            d.gateway_lima_state = Some(state.to_string());
+            let detail = match check_gateway_lima_instance(Some(&d), true).outcome {
+                CheckOutcome::Pass { detail } => detail,
+                CheckOutcome::Fail { detail, .. } => detail,
+                other => panic!("state {state} produced {other:?}"),
+            };
+            assert!(
+                detail.contains("sandboxd-gateway-501"),
+                "state {state} did not name the instance the daemon reported: {detail}"
+            );
+        }
+
+        // A daemon that sends no name leaves the row describing the instance
+        // rather than inventing a spelling for it.
+        d.gateway_lima_instance = None;
+        d.gateway_lima_state = Some("absent".to_string());
+        let detail = match check_gateway_lima_instance(Some(&d), true).outcome {
+            CheckOutcome::Fail { detail, .. } => detail,
+            other => panic!("absent must Fail, got {other:?}"),
+        };
+        assert!(
+            !detail.contains("sandboxd-gateway"),
+            "no name was reported, yet the row spelled one: {detail}"
+        );
     }
 
     #[cfg(target_os = "macos")]

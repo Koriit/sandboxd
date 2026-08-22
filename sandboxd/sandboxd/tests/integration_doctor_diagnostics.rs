@@ -643,6 +643,7 @@ async fn integration_diagnostics_macos_fields_omitted_on_linux() {
 
     for key in [
         "gateway_lima_state",
+        "gateway_lima_instance",
         "vmnet_pool_size",
         "vmnet_pool_claimed",
         "vmnet_slot_assignment",

@@ -12111,6 +12111,12 @@ async fn diagnostics_handler(
         // sessions can run, which a verdict about a gateway they never touch
         // would answer wrongly in both directions.
         let glm = state.gateway_lima_manager_for_operator(operator.uid);
+        // Reported alongside the state because the doctor row that consumes
+        // it names the instance to the operator, and only the daemon knows
+        // what it is called: with per-operator gateways on the name carries
+        // an owner suffix, so a client that spelled it from a constant would
+        // print a hint pointing at an instance that does not exist.
+        let gateway_lima_instance = glm.instance_name().to_string();
         let gateway_lima_state = tokio::task::spawn_blocking(move || match glm.instance_state() {
             Ok(s) if s == "Running" => match glm.probe_docker_health() {
                 Ok(true) => "running".to_string(),
@@ -12125,6 +12131,10 @@ async fn diagnostics_handler(
         .await
         .unwrap_or_else(|_| "error".to_string());
         fields.push(("gateway_lima_state", serde_json::json!(gateway_lima_state)));
+        fields.push((
+            "gateway_lima_instance",
+            serde_json::json!(gateway_lima_instance),
+        ));
 
         // vmnet slot pool: host size + currently-claimed count across every
         // operator's pool. Claimed slots that no live session owns are leaks
