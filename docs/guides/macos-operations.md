@@ -351,13 +351,30 @@ checked at `connect(2)`, not continuously: a detached QEMU keeps the fd it
 already opened and stays on the segment, and a live login session keeps the
 supplementary groups it was granted at login until the operator logs out.
 
-If that check fails the command **stops before releasing the range**, and exits
-5. The group is then left with no operator member, which makes its slots
-unassignable — the half-done state surfaces as **lost capacity**, which is loud,
-rather than as shared access, which is silent. That is the behaviour to
-preserve; do not resolve a group with two operator members by picking the newer
-one. Stop the process, have the operator log out, and re-run the command — the
-sequence is resumable.
+If that check fails the command **stops before releasing the range**, and the
+exit code says which of two different problems it hit. **5** means a live
+process holds a slot socket: stop it, have the operator log out, and re-run.
+**6** means the check could not see the pool at all — no `socket_vmnet`
+endpoint was visible from where it ran, so a live holder and an idle pool look
+identical and it certified nothing. Re-run it somewhere those processes are
+visible; the remedy is to look from elsewhere, not to stop anything. The two
+are separated because treating 6 as 5 wastes time hunting a process that may
+not exist, and treating it as success is the silent-sharing outcome the check
+exists to prevent.
+
+The probe runs on its own, which is worth doing before committing to a
+de-enrollment rather than discovering the residue midway:
+
+```bash
+scripts/darwin-operator-group.sh check-holder <bob-uid>
+```
+
+Either way the range stays assigned. The group is then left with no
+operator member, which makes its slots unassignable — the half-done
+state surfaces as **lost capacity**, which is loud, rather than as shared
+access, which is silent. That is the behaviour to preserve; do not resolve a
+group with two operator members by picking the newer one. The sequence is
+resumable.
 
 Nothing deletes a departed operator's gateway VM. Stopping it is part of
 de-enrollment; removing it is a deliberate administrative act, because automatic
