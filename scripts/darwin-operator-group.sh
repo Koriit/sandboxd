@@ -708,7 +708,19 @@ _deenroll() {
     #    login session carrying the supplementary groups it was granted at
     #    login. Either keeps the departing operator on the segment.
     _step verify-no-live-holder "uid=$OPERATOR_UID"
-    if ! _no_live_slot_holder; then
+    _holder_rc=0
+    _no_live_slot_holder || _holder_rc=$?
+    if [ "$_holder_rc" -eq 2 ]; then
+        _err "cannot determine whether uid $OPERATOR_UID still holds a vmnet slot socket."
+        _err "  Slot sockets exist under $VMNET_SOCKET_DIR, but no socket_vmnet endpoint"
+        _err "  was visible to this process — so a live holder would look identical to an"
+        _err "  idle pool. The range is NOT released, because releasing it here would be"
+        _err "  certifying an absence that was never observed."
+        _err "  Resolve by re-running this command where the socket_vmnet processes are"
+        _err "  visible, then confirm the step reports no holder."
+        exit 5
+    fi
+    if [ "$_holder_rc" -ne 0 ]; then
         _err "a live process owned by uid $OPERATOR_UID still holds a vmnet slot socket."
         _err "  Membership is checked at connect(2), not continuously, so revoking it did"
         _err "  not evict them. The range is NOT released: it stays recorded against"
@@ -766,9 +778,23 @@ _stop_operator_vms() {
         _err "cannot resolve '$SANDBOXD_ACCT' — unable to locate the operator's LIMA_HOME."
         exit 1
     fi
-    _lima_home="/var/lib/sandboxd/$_daemon_uid/$OPERATOR_UID/lima"
-    if [ ! -d "$_lima_home" ]; then
-        echo "  no LIMA_HOME at $_lima_home — no VMs to stop"
+    # One state root per daemon account, and more than one daemon legitimately
+    # runs on a host — the e2e harness account owns a tree beside the
+    # production one. An operator can therefore hold VMs under a root that is
+    # not this daemon's, and looking only under "$_daemon_uid" would report
+    # "no VMs to stop" while they run. Search every root, preferring this
+    # daemon's so its tree is reported first.
+    _lima_homes=""
+    for _root in "/var/lib/sandboxd/$_daemon_uid" /var/lib/sandboxd/*; do
+        _candidate="$_root/$OPERATOR_UID/lima"
+        [ -d "$_candidate" ] || continue
+        case " $_lima_homes " in
+            *" $_candidate "*) continue ;;
+        esac
+        _lima_homes="${_lima_homes:+$_lima_homes }$_candidate"
+    done
+    if [ -z "$_lima_homes" ]; then
+        echo "  no LIMA_HOME for uid $OPERATOR_UID under /var/lib/sandboxd — no VMs to stop"
         return 0
     fi
     if ! command -v limactl >/dev/null 2>&1; then
@@ -777,14 +803,20 @@ _stop_operator_vms() {
         _err "  opened, and revoking membership would not evict it."
         exit 1
     fi
-    for _inst_dir in "$_lima_home"/*/; do
-        [ -d "$_inst_dir" ] || continue
-        _inst=$(basename "$_inst_dir")
-        echo "  stopping VM '$_inst'"
-        if [ "$DRY_RUN" -eq 0 ]; then
-            sudo -u "$OPERATOR" env LIMA_HOME="$_lima_home" limactl stop --force "$_inst" \
-                >/dev/null 2>&1 || true
-        fi
+    for _lima_home in $_lima_homes; do
+        for _inst_dir in "$_lima_home"/*/; do
+            [ -d "$_inst_dir" ] || continue
+            # A LIMA_HOME holds more than instances — "_config" carries the
+            # SSH keypair and networks.yaml. The manifest is what makes a
+            # directory an instance, so key on it rather than on the name.
+            [ -f "$_inst_dir/lima.yaml" ] || continue
+            _inst=$(basename "$_inst_dir")
+            echo "  stopping VM '$_inst' ($_lima_home)"
+            if [ "$DRY_RUN" -eq 0 ]; then
+                sudo -u "$OPERATOR" env LIMA_HOME="$_lima_home" limactl stop --force "$_inst" \
+                    >/dev/null 2>&1 || true
+            fi
+        done
     done
 }
 
@@ -796,11 +828,40 @@ _no_live_slot_holder() {
     fi
     [ -d "$VMNET_SOCKET_DIR" ] || return 0
     command -v lsof >/dev/null 2>&1 || return 0
-    # Match on the socket directory rather than on globbed socket paths: lsof's
-    # per-path lookup for unix sockets is unreliable, and the glob would not
-    # expand at all for a caller who cannot traverse the 0750 directory.
-    _held=$(lsof -u "$OPERATOR_UID" 2>/dev/null | grep -c "$VMNET_SOCKET_DIR" || true)
-    if [ "${_held:-0}" -gt 0 ]; then return 1; fi
+
+    # Ask the listener, not the client. The connected end of an AF_UNIX socket
+    # carries no path: lsof prints the client's fd as bare "->0x<peer>", so
+    # matching a client's own output against a socket path — or against this
+    # directory — cannot hit even while that client is attached. Measured on a
+    # host where uid 528's QEMU held four slots: the client-side count was 0.
+    # socket_vmnet's fds do carry the path, one row per accepted connection,
+    # and the address in that row is the endpoint the client peers to. So
+    # collect the endpoints from the listener side and look for them among the
+    # operator's peer addresses.
+    _endpoints=$(lsof -c socket_vmnet 2>/dev/null \
+        | awk -v d="$VMNET_SOCKET_DIR/" '$5 == "unix" && index($NF, d) == 1 { print $6 }')
+
+    # Every running slot job holds at least its own listening fd, so seeing no
+    # endpoints at all while slot sockets exist means we are looking at a view
+    # that cannot show them, not at an idle pool. Absence we cannot see is not
+    # absence; refuse rather than certify it.
+    if [ -z "$_endpoints" ]; then
+        for _sock in "$VMNET_SOCKET_DIR"/slot-*.sock; do
+            [ -e "$_sock" ] || continue
+            return 2
+        done
+        return 0
+    fi
+
+    _peers=$(lsof -u "$OPERATOR_UID" 2>/dev/null \
+        | awk '$5 == "unix" && substr($NF, 1, 2) == "->" { print substr($NF, 3) }')
+    for _peer in $_peers; do
+        for _endpoint in $_endpoints; do
+            if [ "$_peer" = "$_endpoint" ]; then
+                return 1
+            fi
+        done
+    done
     return 0
 }
 
