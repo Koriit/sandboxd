@@ -70,6 +70,24 @@ supported way to keep the agent running across a logout: the deployment model
 assumes an operator with a login session, so on a host where sessions must
 outlive interactive logins the answer today is to keep that session logged in.
 
+**Where the gateway is per-operator, the dependency reaches back further than
+session creation.** A host runs its gateway in one of two shapes, and
+`limactl list` names which one you have:
+
+| Instance | Shape |
+|---|---|
+| `sandboxd-gateway` | One gateway for the whole host, in the daemon's own `LIMA_HOME`. The daemon brings it up during its own startup, with no operator present. |
+| `sandboxd-gateway-<uid>` | One gateway per operator, in that operator's `LIMA_HOME`, brought up through that operator's agent. |
+
+In the second shape the gateway is itself a VM operation, which puts it under
+the same rule as everything else in this section: **an operator's sessions
+cannot exist before that operator has logged in.** The failure lands earlier
+than the one above — at gateway bring-up, before any session-specific work
+begins — and carries the same message, naming the operator whose agent is
+missing. Log in and retry. There is no supported way to pre-create a gateway
+on another operator's behalf, for the same reason there is no daemon-side
+override above: the path would not go through their agent.
+
 **Sessions already running do not stop when you log out.** launchd tears down
 your GUI domain at logout and kills the agent with it, but a sandbox VM is a
 detached QEMU orphaned to pid 1 and is not a launchd-managed job, so it
@@ -489,14 +507,14 @@ A second `/diagnostics` field, unrelated to the pool declines above:
 |---|---|
 | `gateway_recovery_declined_sessions` | one line per session the last gateway recovery could not attribute to any gateway |
 
-**In this build it is always `[]`, and no operator action can put a line in
-it.** The daemon holds one gateway VM, so a recovery has exactly one gateway to
-drive and every session it recovers goes to that one — there is no attribution
-to get wrong, and the code path that declines a session is not the path this
-daemon takes. The field ships ahead of per-operator gateways, where a
-session whose operator cannot be determined would have no gateway of its own to
-recover against and would be declined rather than recovered against a guessed
-one.
+**On a host with the shared `sandboxd-gateway` — the default — it is always
+`[]`, and no operator action can put a line in it.** The daemon holds one
+gateway VM, so a recovery has exactly one gateway to drive and every session it
+recovers goes to that one — there is no attribution to get wrong, and the code
+path that declines a session is not the path this daemon takes. The field is
+there for per-operator gateways, where a session whose operator cannot be
+determined would have no gateway of its own to recover against and would be
+declined rather than recovered against a guessed one.
 
 So the field is worth reading only to confirm it is empty:
 
@@ -550,7 +568,7 @@ clones share unchanged blocks with the base image at no extra cost.
 
 | Component | Typical size | Notes |
 |---|---|---|
-| `sandboxd-gateway` Lima VM | ~4–6 GB | One per host; shared across all operators |
+| Gateway Lima VM | ~4–6 GB | `sandboxd-gateway`: one per host, shared across all operators. `sandboxd-gateway-<uid>`: one per operator — budget one for each enrolled operator |
 | `sandbox-base` Lima VM (per operator) | ~4–6 GB | One per operator; clones diverge from here |
 | Session VM clone | < 1 GB initially | Grows as the session writes files |
 | Gateway image tarball | ~500 MB | Staged in the daemon base dir; copied into a gateway's LIMA_HOME on first load, so budget for two copies |
