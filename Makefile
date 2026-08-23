@@ -2793,6 +2793,15 @@ stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64 setup-da
 # operator's own membership has been granted but is not yet live in the invoking
 # login session.
 #
+# Every slot is read, not slot 0, and the distinct groups found are what the
+# account is added to. "The vmnet socket group" was a single thing only while
+# every slot carried the same one. Once a pool is partitioned per operator the
+# slots carry one group per operator range, and reading slot 0 grants access to
+# the first operator's range while leaving every other slot EACCES — a partial
+# grant that reports success, and whose failure surfaces much later as an e2e
+# daemon that can create a session only when the scheduler happens to hand it a
+# slot from the low range.
+#
 # Idempotence: dseditgroup membership check; sudo only when not yet a member.
 #
 # Depends on: setup-darwin-sandboxd-test-user (the account being enrolled) and
@@ -2812,42 +2821,63 @@ stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64 setup-da
 # for the cases that bypass the edge — `make -o setup-darwin-vmnet-daemons`,
 # DARWIN_VMNET_SLOTS=0, or a pool that dies between the two steps. An unreachable
 # branch that fails loudly costs nothing; one that exits 0 is a trap.
+#
+# DARWIN_VMNET_SLOTS=0 no longer reaches that branch — with no slots to walk the
+# loop body never runs — so it gets its own check ahead of the loop. An empty
+# pool must still fail here rather than fall through granting nothing, for the
+# same reason: the account is left without access and nothing says so.
 setup-darwin-sandboxd-test-vmnet-group-membership: setup-darwin-sandboxd-test-user setup-darwin-vmnet-daemons
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-sandboxd-test-vmnet-group-membership skipped (not macOS)$(RESET)"; \
 	  exit 0; \
 	fi
-	@_sock="/var/run/sandbox/vmnet/slot-0.sock"; \
-	_vmnet_group=$$(stat -f '%Sg' "$$_sock" 2>/dev/null || true); \
-	if [ -z "$$_vmnet_group" ]; then \
-	  _vmnet_group=$$(sudo stat -f '%Sg' "$$_sock" 2>/dev/null || true); \
-	fi; \
-	if [ -z "$$_vmnet_group" ]; then \
-	  echo "ERROR: could not read the group of $$_sock (absent, or unreadable even under sudo)."; \
-	  echo "  Without it '_sandboxd-test' cannot be granted vmnet access, and the e2e daemon"; \
-	  echo "  fails later with an opaque EACCES when it opens a slot."; \
-	  echo "  setup-darwin-vmnet-daemons is a prerequisite of this target and hard-fails on a"; \
-	  echo "  socket that never appears, so reaching this line means the pool went away after"; \
-	  echo "  that step ran, or the edge was bypassed (make -o, or DARWIN_VMNET_SLOTS=0)."; \
-	  echo "  Check: sudo ls -l /var/run/sandbox/vmnet/"; \
-	  echo "  Then:  make setup-darwin-vmnet-daemons"; \
+	@if [ "$(DARWIN_VMNET_SLOTS)" -lt 1 ]; then \
+	  echo "ERROR: DARWIN_VMNET_SLOTS is $(DARWIN_VMNET_SLOTS) — there is no pool to grant access to."; \
+	  echo "  '_sandboxd-test' would be left without vmnet access and the e2e daemon would fail"; \
+	  echo "  later with an opaque EACCES when it opens a slot. Failing here instead."; \
 	  exit 1; \
 	fi; \
-	if dseditgroup -o checkmember -m _sandboxd-test "$$_vmnet_group" >/dev/null 2>&1; then \
-	  echo "$(GREEN)✓ already configured: _sandboxd-test is in vmnet socket group '$$_vmnet_group'$(RESET)"; \
-	else \
-	  echo "[sudo] dseditgroup -o edit -a _sandboxd-test -t user $$_vmnet_group  (vmnet socket access)"; \
-	  sudo -k dseditgroup -o edit -a _sandboxd-test -t user "$$_vmnet_group" || { \
-	    echo "ERROR: dseditgroup failed to add '_sandboxd-test' to group '$$_vmnet_group'."; \
+	_groups=""; _i=0; \
+	while [ "$$_i" -lt "$(DARWIN_VMNET_SLOTS)" ]; do \
+	  _sock="/var/run/sandbox/vmnet/slot-$$_i.sock"; \
+	  _g=$$(stat -f '%Sg' "$$_sock" 2>/dev/null || true); \
+	  if [ -z "$$_g" ]; then \
+	    _g=$$(sudo stat -f '%Sg' "$$_sock" 2>/dev/null || true); \
+	  fi; \
+	  if [ -z "$$_g" ]; then \
+	    echo "ERROR: could not read the group of $$_sock (absent, or unreadable even under sudo)."; \
+	    echo "  Without it '_sandboxd-test' cannot be granted vmnet access, and the e2e daemon"; \
+	    echo "  fails later with an opaque EACCES when it opens a slot."; \
+	    echo "  setup-darwin-vmnet-daemons is a prerequisite of this target and hard-fails on a"; \
+	    echo "  socket that never appears, so reaching this line means the pool went away after"; \
+	    echo "  that step ran, or the edge was bypassed (make -o setup-darwin-vmnet-daemons)."; \
+	    echo "  Check: sudo ls -l /var/run/sandbox/vmnet/"; \
+	    echo "  Then:  make setup-darwin-vmnet-daemons"; \
 	    exit 1; \
-	  }; \
-	  dseditgroup -o checkmember -m _sandboxd-test "$$_vmnet_group" >/dev/null 2>&1 || { \
-	    echo "ERROR: '_sandboxd-test' is still not a member of group '$$_vmnet_group' after the add."; \
-	    echo "  Check: dseditgroup -o read $$_vmnet_group"; \
-	    exit 1; \
-	  }; \
-	  echo "$(GREEN)✓ added _sandboxd-test to group '$$_vmnet_group'$(RESET)"; \
-	fi
+	  fi; \
+	  case " $$_groups " in \
+	    *" $$_g "*) ;; \
+	    *) _groups="$${_groups:+$$_groups }$$_g";; \
+	  esac; \
+	  _i=$$((_i + 1)); \
+	done; \
+	for _g in $$_groups; do \
+	  if dseditgroup -o checkmember -m _sandboxd-test "$$_g" >/dev/null 2>&1; then \
+	    echo "$(GREEN)✓ already configured: _sandboxd-test is in vmnet socket group '$$_g'$(RESET)"; \
+	  else \
+	    echo "[sudo] dseditgroup -o edit -a _sandboxd-test -t user $$_g  (vmnet socket access)"; \
+	    sudo -k dseditgroup -o edit -a _sandboxd-test -t user "$$_g" || { \
+	      echo "ERROR: dseditgroup failed to add '_sandboxd-test' to group '$$_g'."; \
+	      exit 1; \
+	    }; \
+	    dseditgroup -o checkmember -m _sandboxd-test "$$_g" >/dev/null 2>&1 || { \
+	      echo "ERROR: '_sandboxd-test' is still not a member of group '$$_g' after the add."; \
+	      echo "  Check: dseditgroup -o read $$_g"; \
+	      exit 1; \
+	    }; \
+	    echo "$(GREEN)✓ added _sandboxd-test to group '$$_g'$(RESET)"; \
+	  fi; \
+	done
 
 # setup-darwin-sandbox-shared — create /tmp/sandbox-shared as drwxr-xr-x (0755)
 # for the shared workspace mount that QEMU (running as _sandboxd-test) must access.

@@ -167,10 +167,11 @@ def test_install_macos_fresh_then_doctor_passes(
 
     # ---------------- per-operator vmnet slot group ----------------
     #
-    # Every slot socket carries one group today and every operator is enrolled
-    # in it, so on a multi-operator host any of them can attach to any other's
-    # isolated segment. Enrollment therefore also creates a group scoped to
-    # this operator alone and records the slots they own.
+    # One socket group shared by every operator would put each of them on all
+    # the others' isolated segments. Enrollment therefore creates a group
+    # scoped to this operator alone and records the slots they own — and the
+    # slot plists are generated from that record afterwards, which is how the
+    # group reaches the kernel as the gid of the socket itself.
     #
     # Asserted against the group the install actually created, via
     # dseditgroup -o checkmember — not by reading the script, and not against
@@ -203,16 +204,22 @@ def test_install_macos_fresh_then_doctor_passes(
     assert slots.strip().endswith(f"0-{EXPECTED_VMNET_SLOTS - 1}"), (
         f"expected the single operator to hold the whole pool, got: {slots!r}"
     )
-    # Enforcement is not this phase's: the sockets keep the shared group until
-    # VM ownership moves, because until then the daemon's own gateway VM has to
-    # keep opening every slot.
+    # Where the partition is enforced, and the only place it can be observed.
+    # The group records, the install log and the drift check agree with each
+    # other whether or not the plists were generated after the group existed;
+    # the socket's gid is what disagrees, because it is what launchd was handed.
+    # This operator holds the whole pool (asserted just above), so every slot
+    # must carry their group — and the gateway VM still opens all of them
+    # because the daemon account is in that group (asserted above as well).
     for slot in range(EXPECTED_VMNET_SLOTS):
         sock_grp = vm.shell(
             f"sudo stat -f '%Sg' /var/run/sandbox/vmnet/slot-{slot}.sock", check=True
         ).stdout.strip()
-        assert sock_grp == "_sandboxd", (
-            f"slot-{slot}.sock moved onto {sock_grp!r}; the socket group must stay "
-            f"shared until the gateway VM is operator-owned"
+        assert sock_grp == op_group, (
+            f"slot-{slot}.sock carries {sock_grp!r}, not {op_group!r}. A slot left on "
+            f"the shared daemon account means its plist was generated before the group "
+            f"existed: the group name is written into the plist argv as a literal at "
+            f"generation time and nothing re-resolves it afterwards"
         )
 
     # ---------------- users.conf created ----------------
