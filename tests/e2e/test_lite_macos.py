@@ -46,7 +46,7 @@ from typing import Optional
 
 import pytest
 
-from conftest import PLATFORM, _SANDBOX_TEST_UID, _gateway_vm_docker_argv
+from conftest import PLATFORM, _gateway_vm_docker_argv, limactl_cmd
 
 # ---------------------------------------------------------------------------
 # Platform guard: skip entire file on Linux.
@@ -261,56 +261,91 @@ def _timed_curl(session_name: str, url: str, max_time: int) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def _gateway_vm_sees_path(host_path: str) -> bool:
-    """Return True if the daemon's gateway VM sees ``host_path`` via 9p.
+def _operator_gateway_instance() -> Optional[str]:
+    """Name this operator's own gateway Lima instance, or ``None`` if absent.
 
-    On macOS lite the sandbox container's Docker runs *inside* the daemon's
-    ``sandboxd-gateway`` Lima VM, so a ``shared:`` bind source is resolved
-    against the VM filesystem — specifically the read-write 9p mount of the
-    lite shared root (``/tmp/sandbox-shared``) that ``generate_gateway_template``
-    injects as a ``mounts:`` stanza (identity mount: host ``/tmp/sandbox-shared``
-    → VM ``/tmp/sandbox-shared``). A host path created under that root is only
-    visible in the VM when QEMU's virtfs 9p export is bound to the *current*
-    host inode.
+    Candidates are discovered from the operator's registry rather than assumed
+    into existence, then disambiguated by owner — both halves are load-bearing.
+    Discovery means this can only ever name a VM that actually exists in this
+    operator's ``LIMA_HOME``; the disambiguation means it names the right one.
 
-    There is a real macOS hazard here: macOS clears ``/private/tmp`` (``/tmp``
-    is a symlink to it) on reboot and periodically, so if the gateway VM
-    out-lived a ``/tmp/sandbox-shared`` recreation, QEMU holds a handle to the
-    now-deleted boot-time inode and the 9p mount is *stale* — host-side changes
-    (and even the directory's contents) are invisible in the VM, and a
-    ``docker create --mount src=<under-root>`` fails with
-    ``bind source path does not exist``. A gateway-VM restart rebinds the
-    export to the live inode. This probe distinguishes a live export (test can
-    proceed) from a stale one (test skips with a precise reason).
+    A bare prefix match is **not** sufficient, which is measurable rather than
+    theoretical: when the daemon uid and the operator uid coincide, one registry
+    holds both ``sandboxd-gateway`` (the shared, daemon-owned instance) and
+    ``sandboxd-gateway-<op_uid>`` (this operator's own). Taking the first match
+    there silently addresses whichever limactl happened to list first. So the
+    owner-suffixed form is preferred, and the unsuffixed form accepted only in
+    its absence — that ordering also spans the revert, where an operator's tree
+    legitimately holds only the shared instance.
 
-    The gateway VM lives under the *daemon's* own LIMA_HOME
-    (``/var/lib/sandboxd/<daemon_uid>/<daemon_uid>/lima``), owned 0600/0700 by
-    the daemon test user — the operator (this test process) cannot ``limactl
-    shell`` it directly. We therefore reach it via ``sudo -n -u
-    <daemon_test_user>`` (pre-authorized NOPASSWD by ``make setup-dev-env``),
-    with ``LIMA_HOME`` and ``HOME`` set to the daemon's paths — the exact
-    invocation the daemon itself uses for every gateway-VM control operation.
+    An instance matching the prefix but neither form is *not* returned. It
+    belongs to some other owner, and driving another operator's VM from this
+    harness is the failure this function exists to make impossible.
     """
-    daemon_uid = _SANDBOX_TEST_UID
-    daemon_home = f"/var/lib/sandboxd/{daemon_uid}"
-    lima_home = f"/var/lib/sandboxd/{daemon_uid}/{daemon_uid}/lima"
     result = subprocess.run(
-        [
-            "sudo",
-            "-n",
-            "-u",
-            PLATFORM.daemon_test_user,
-            "env",
-            f"LIMA_HOME={lima_home}",
-            f"HOME={daemon_home}",
-            "limactl",
-            "shell",
-            "sandboxd-gateway",
-            "--",
-            "test",
-            "-d",
-            host_path,
-        ],
+        limactl_cmd("list", "--json"),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return None
+    names: set[str] = set()
+    for line in (result.stdout or "").strip().splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        name = entry.get("name") or ""
+        if name:
+            names.add(name)
+    # Owner-suffixed first, shared instance second, nothing otherwise.
+    for candidate in (f"sandboxd-gateway-{os.getuid()}", "sandboxd-gateway"):
+        if candidate in names:
+            return candidate
+    return None
+
+
+def _operator_gateway_sees_path(host_path: str) -> bool:
+    """Return True if this operator's gateway VM sees ``host_path`` via 9p.
+
+    On macOS lite the sandbox container's Docker runs *inside* the gateway
+    Lima VM, so a ``shared:`` bind source is resolved against the VM
+    filesystem — specifically the read-write 9p mount of the lite shared root
+    (``/tmp/sandbox-shared``) injected as a ``mounts:`` stanza (identity mount:
+    host ``/tmp/sandbox-shared`` → VM ``/tmp/sandbox-shared``). A host path
+    created under that root is visible in the VM only while QEMU's virtfs 9p
+    export is bound to the *current* host inode.
+
+    The macOS hazard is real and **survives operator ownership** — measured,
+    not assumed. macOS clears ``/private/tmp`` (``/tmp`` symlinks to it) on
+    reboot and periodically, so a gateway VM that out-lived a
+    ``/tmp/sandbox-shared`` recreation leaves QEMU holding a handle to the
+    deleted boot-time inode. The export is then *stale*: host-side changes
+    (and the directory's own contents) are invisible in the VM, and
+    ``docker create --mount src=<under-root>`` fails with ``bind source path
+    does not exist``. Restarting that VM rebinds the export to the live inode.
+
+    Ownership does not touch either half of that mechanism — QEMU holds a host
+    inode, and the host clears the directory — and every operator's gateway VM
+    identity-mounts the *same* host-wide shared root. So the hazard is not
+    removed by the per-operator split; it is multiplied by it. Each operator's
+    VM can go stale independently, which is why this probe distinguishes a live
+    export (the test proceeds) from a stale one (the test skips with a precise,
+    actionable reason) rather than letting a VM-lifecycle state be reported as
+    a product regression.
+
+    What ownership *does* change is how the VM is reached. It lives in this
+    operator's own ``LIMA_HOME``, so the test process — which is the operator —
+    shells it directly. No pivot to the daemon user, and no ``sudo``: the
+    privilege that made the old daemon-owned probe necessary is exactly what
+    the operator-owned VM no longer requires.
+    """
+    instance = _operator_gateway_instance()
+    if instance is None:
+        return False
+    result = subprocess.run(
+        limactl_cmd("shell", instance, "--", "test", "-d", host_path),
         capture_output=True,
         text=True,
         timeout=30,
@@ -1243,8 +1278,8 @@ class TestLiteMacosWorkspace:
         "access runs as _sandboxd (gateway VM user)".
 
         Live-export guard: macOS clears ``/private/tmp`` (``/tmp`` symlinks to
-        it) on reboot / periodically, so if the daemon's gateway VM out-lived a
-        ``/tmp/sandbox-shared`` recreation, QEMU's virtfs 9p export is bound to
+        it) on reboot / periodically, so if this operator's gateway VM out-lived
+        a ``/tmp/sandbox-shared`` recreation, QEMU's virtfs 9p export is bound to
         a now-deleted inode and host-created sources are invisible in the VM —
         ``docker create --mount src=<under-root>`` then fails with
         ``bind source path does not exist``. That is an environment/VM-lifecycle
@@ -1268,19 +1303,22 @@ class TestLiteMacosWorkspace:
         # mount. If the export is stale (see the live-export guard note in the
         # docstring), skip with a precise, actionable reason — the source is
         # correctly provisioned on the host but the VM cannot resolve the bind.
-        if not _gateway_vm_sees_path(workspace):
+        if not _operator_gateway_sees_path(workspace):
+            instance = _operator_gateway_instance()
             pytest.skip(
                 "lite shared: source is provisioned on the host under "
-                f"{shared_root} but the gateway VM's 9p export cannot see it "
-                f"({workspace!r} is absent inside the VM). This is a stale QEMU "
-                "virtfs export: macOS cleared /private/tmp (/tmp -> /private/tmp) "
-                "after the daemon's sandboxd-gateway VM booted, so QEMU holds a "
+                f"{shared_root} but this operator's gateway VM ({instance!r}) "
+                f"cannot see it via 9p ({workspace!r} is absent inside the VM). "
+                "Either the operator has no gateway VM at all (instance None), "
+                "or its QEMU virtfs export is stale: macOS cleared /private/tmp "
+                "(/tmp -> /private/tmp) after that VM booted, so QEMU holds a "
                 "handle to the deleted boot-time /tmp/sandbox-shared inode. "
                 "docker-create in the VM would fail with 'bind source path does "
-                "not exist'. Fix: restart the gateway VM (it rebinds the export "
-                "to the live inode) — e.g. re-run make setup-dev-env after "
-                "ensuring /tmp/sandbox-shared exists, then bounce the daemon so "
-                "ensure_ready() restarts sandboxd-gateway."
+                "not exist'. Fix: ensure /tmp/sandbox-shared exists, then restart "
+                "this operator's gateway VM so it rebinds the export to the live "
+                "inode. Only this operator's VM needs restarting — each operator's "
+                "gateway VM binds the shared root independently, so a stale export "
+                "in one says nothing about the others."
             )
 
         # Distinctive, stable slice of the TCC ``warn!`` message emitted by the
