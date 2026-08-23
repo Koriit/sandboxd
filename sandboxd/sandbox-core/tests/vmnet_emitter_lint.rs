@@ -750,6 +750,63 @@ mod macos {
         );
     }
 
+    /// Drift cannot tell a partitioned pool from one that was never split.
+    ///
+    /// This is the scope of the instrument, and it matters because the
+    /// provisioning sequence is easy to run in the wrong order: generate the
+    /// plists before the per-operator groups exist and all eight name the
+    /// shared fallback, permanently, because the group is a literal in the
+    /// argv and nothing re-resolves it. Every slot then reports in sync — the
+    /// plist and the loaded argv agree, both carrying the fallback — so a
+    /// green sweep across the pool says the jobs are current, never that the
+    /// segments are separated. The sockets' gids are the only thing that
+    /// answers the second question, which is why the operator guide sends the
+    /// reader to `stat` rather than here.
+    ///
+    /// Asserting the two verdicts are equal rather than each being 0 is the
+    /// point: a difference would mean drift had started reading the group
+    /// records, and then the guide's warning would be stale rather than the
+    /// test being wrong.
+    #[test]
+    fn drift_cannot_distinguish_a_partitioned_pool_from_an_unpartitioned_one() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let label = vmnet_slot_daemon_label(0);
+
+        let verdict_for = |group: &str, dir: &str| -> Option<i32> {
+            let sub = tmp.path().join(dir);
+            fs::create_dir_all(&sub).expect("create fixture dir");
+            let plist = sub.join(format!("{label}.plist"));
+            fs::write(&plist, render_vmnet_plist(0, SANDBOXD_ACCOUNT, group)).expect("write plist");
+            let argv = plist_argv(&plist);
+            assert!(
+                argv.iter()
+                    .any(|a| a.contains(&format!("--socket-group={group} "))),
+                "the fixture for {group} does not carry that group in its argv"
+            );
+            let transcript = sub.join("print");
+            fs::write(&transcript, launchctl_transcript(&label, &argv)).expect("write transcript");
+            run_drift(&label, &plist, Some(&transcript)).status.code()
+        };
+
+        // The unmigrated state every host starts in: one group, and it is the
+        // one every operator is in.
+        let unpartitioned = verdict_for(SANDBOXD_ACCOUNT, "shared");
+        let partitioned = verdict_for(SAMPLE_SOCKET_GROUP, "split");
+
+        assert_eq!(
+            unpartitioned, partitioned,
+            "drift now answers differently for a partitioned and an unpartitioned \
+             pool; docs/guides/macos-operations.md tells operators this check \
+             cannot see the difference and must be corrected"
+        );
+        assert_eq!(
+            unpartitioned,
+            Some(0),
+            "both fixtures run exactly what their plist declares, so both must \
+             be in sync — otherwise this test proves nothing about the pool"
+        );
+    }
+
     /// A label nothing has ever bootstrapped is "not loaded" (4), which is a
     /// different answer from "loaded but stale" (3) — the caller bootstraps in
     /// one case and boots out first in the other. Read-only: `launchctl print`

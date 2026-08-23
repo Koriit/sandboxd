@@ -416,8 +416,14 @@ sudo -u bob env LIMA_HOME=/var/lib/sandboxd/<daemon-uid>/<bob-uid>/lima \
 daemon can run against old sockets for an unbounded period. The upgrade sequence
 is therefore:
 
-1. **Regenerate** the slot plists with their per-operator groups.
-2. **Reload** the pool jobs so the running argv matches what is on disk
+1. **Split membership**: enroll each operator into their own group, which
+   creates the group and records the slot range they own
+   (`scripts/darwin-operator-group.sh enroll --operator NAME --slots RANGE`).
+   No socket moves and no plist changes here — what changes is the answer the
+   plist generator will get in step 2.
+2. **Regenerate** the slot plists (`make setup-darwin-vmnet-plists`). They now
+   resolve to the per-operator groups.
+3. **Reload** the pool jobs so the running argv matches what is on disk
    (`make setup-darwin-vmnet-daemons`, then `scripts/darwin-vmnet-drift.sh` per
    slot to confirm — "loaded" is not "up to date"). ⚠️ A `bootout` followed
    immediately by a `bootstrap` of the same label fails with `Bootstrap failed:
@@ -426,10 +432,32 @@ is therefore:
    an errno naming nothing relevant — `plutil -lint` calls the plist fine, so
    the plist is the wrong place to look. Retrying the failed label seconds later
    succeeds. Read a slot that is down after a reload as un-bootstrapped rather
-   than as misconfigured, which is why step 2 confirms per slot instead of
+   than as misconfigured, which is why this step confirms per slot instead of
    trusting the reload's exit status.
-3. **Split membership**: enroll each operator into their own group.
 4. **Start the new daemon.**
+
+⚠️ **Enrolling first is the whole mechanism, not a convenience.** `--socket-group=`
+is written into the plist's argv as a literal when the plist is generated, and
+nothing re-resolves it afterwards. Regenerate before the groups exist and the
+generator answers with the shared fallback — correctly, since at that moment
+nothing claims the slot — and bakes it into all eight plists. Enrolling
+afterwards then records ranges no socket will ever carry.
+
+**That failure looks like success from every angle except one.** The records say
+the pool is partitioned, `status` agrees, and `darwin-vmnet-drift.sh` reports
+every slot in sync — plist and loaded argv match, because both are wrong in the
+same way. The one thing that disagrees is the socket itself:
+
+```
+stat -f '%N %Sg' /var/run/sandbox/vmnet/slot-*.sock
+```
+
+No `sudo`: the socket directory is `0750` owned by the daemon account's group,
+and every enrolled operator is in it — so anyone this concerns can already read
+the answer.
+
+Every slot still reading the shared group after an upgrade means steps 2 and 3
+have not happened yet, whatever the group records say. Re-run them in order.
 
 The in-between state is survivable rather than an outage because a slot still
 carrying the legacy shared group is treated as an unmigrated install: the daemon

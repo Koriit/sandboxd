@@ -1687,11 +1687,13 @@ _compute_plan_darwin() {
     # operator's sandbox traffic. Enrollment therefore also creates a group
     # scoped to this operator alone and records the slot range they own.
     #
-    # This install does NOT point the slot plists at that group. Until VM
-    # ownership moves to the operator, the daemon's own gateway VM holds a NIC
-    # on every slot and must keep opening all of them; switching the sockets now
-    # would stop the only gateway VM there is. What lands here is the assignment
-    # and the audit surface, not the kernel's access decision.
+    # This step runs before the slot plists are generated, and that ordering is
+    # the whole mechanism rather than an accident of layout. The group name is
+    # baked into a plist's argv as a literal at generation time; nothing
+    # re-resolves it afterwards. So a group created after the plists are written
+    # is a group no socket will ever carry — the plists would name the shared
+    # fallback, the records would say otherwise, and the two would disagree
+    # silently until someone regenerated again.
     PLAN_OPERATOR_SLOT_GROUP_NAME=""
     PLAN_OPERATOR_SLOT_RANGE=""
     if [ -z "$OPERATOR_NAME" ] || ! dscl . -read "/Users/$OPERATOR_NAME" >/dev/null 2>&1; then
@@ -3300,17 +3302,37 @@ while [ "\$_i" -lt "\$_vmnet_slots" ]; do
     fi
 
     # The bootstrap must have picked up the plist we just installed, and the
-    # socket it created must be group-owned by the daemon account — otherwise
-    # enrolled operators cannot connect to this slot.
+    # socket it created must carry the group that plist names — otherwise the
+    # operators that group scopes cannot connect to this slot.
+    #
+    # The expected group comes from the plist rather than from a constant.
+    # Naming the shared daemon account here was right only while every slot
+    # carried one group: on a pool partitioned per operator it rejects exactly
+    # the hosts that migrated correctly, and the diagnostic asserts the reverse
+    # of what happened. The plist is also the strictly better authority — it is
+    # what launchd was handed, so this compares the kernel's state against the
+    # configuration actually emitted rather than against a second opinion that
+    # can disagree with it.
     _loaded_argv=\$(_vmnet_loaded_argv "\$_label") || _loaded_argv=""
     _disk_argv=\$(_vmnet_plist_argv "\$_plist_dst")
     if [ "\$_loaded_argv" != "\$_disk_argv" ]; then
         _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=drift-after-bootstrap status=fail"
         _step_fail
     fi
+    _want_group=""
+    case "\$_disk_argv" in
+        *--socket-group=*)
+            _want_group=\${_disk_argv#*--socket-group=}
+            _want_group=\${_want_group%% *}
+            ;;
+    esac
+    if [ -z "\$_want_group" ]; then
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=plist-names-no-socket-group path=\$_plist_dst status=fail"
+        _step_fail
+    fi
     _sock_group=\$(stat -f '%Sg' "\$_socket_path" 2>/dev/null) || _sock_group=""
-    if [ "\$_sock_group" != "\$_sandboxd_acct" ]; then
-        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=socket-group group=\$_sock_group expected=\$_sandboxd_acct status=fail"
+    if [ "\$_sock_group" != "\$_want_group" ]; then
+        _log "step=bootstrap_vmnet_daemons slot=\$_slot action=fail reason=socket-group group=\$_sock_group expected=\$_want_group status=fail"
         _step_fail
     fi
     _log "step=bootstrap_vmnet_daemons slot=\$_slot socket=\$_socket_path group=\$_sock_group action=ready status=ok"

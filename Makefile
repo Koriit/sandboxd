@@ -786,7 +786,7 @@ endif
 endif
 
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-operator-slot-group setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-gateway-image stage-lite-image codesign-test-bins
+setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-operator-group-membership setup-darwin-operator-slot-group setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-gateway-image stage-lite-image codesign-test-bins
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1946,9 +1946,19 @@ setup-darwin-socket-vmnet-staging:
 # also covers `make setup-darwin-vmnet-plists` run on its own and any future
 # caller that skips the account step.
 #
+# The per-operator slot group is a prerequisite, and the direction matters more
+# than it looks. `--socket-group=` is written into the plist as a literal at
+# generation time and nothing re-resolves it afterwards, so a group created
+# after this step is a group no socket will ever carry: the plists name the
+# shared fallback, the group records claim a range, and the two disagree with
+# nothing on the host reporting it. Generating first and enrolling second reads
+# as harmless — it produces a pool that looks configured and is not partitioned.
+#
 # Depends on: setup-darwin-sandboxd-user (account must exist first),
-#             setup-darwin-socket-vmnet-staging (binary must be staged first).
-setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging setup-darwin-sandboxd-user
+#             setup-darwin-socket-vmnet-staging (binary must be staged first),
+#             setup-darwin-operator-slot-group (the group must exist before a
+#             plist names it).
+setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging setup-darwin-sandboxd-user setup-darwin-operator-slot-group
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-vmnet-plists skipped (not macOS)$(RESET)"; \
 	  exit 0; \
@@ -2092,11 +2102,27 @@ setup-darwin-vmnet-daemons: setup-darwin-vmnet-plists
 	    echo "ERROR: $$label still does not match $$plist_path after a bootout/bootstrap cycle."; \
 	    exit 1; \
 	  fi; \
+	  _want_group=""; \
+	  _i=0; \
+	  while [ $$_i -lt 8 ]; do \
+	    _a=$$(plutil -extract "ProgramArguments.$$_i" raw -o - "$$plist_path" 2>/dev/null) || break; \
+	    case "$$_a" in \
+	      *--socket-group=*) \
+	        _want_group=$${_a#*--socket-group=}; \
+	        _want_group=$${_want_group%% *} ;; \
+	    esac; \
+	    _i=$$((_i + 1)); \
+	  done; \
+	  if [ -z "$$_want_group" ]; then \
+	    echo "ERROR: $$plist_path names no --socket-group."; \
+	    echo "  Regenerate it:  make setup-darwin-vmnet-plists"; \
+	    exit 1; \
+	  fi; \
 	  _sock_group=$$(sudo stat -f '%Sg' "$$socket_path" 2>/dev/null); \
-	  if [ "$$_sock_group" != "$(DARWIN_SANDBOXD_ACCOUNT)" ]; then \
-	    echo "ERROR: $$socket_path is group '$$_sock_group', expected '$(DARWIN_SANDBOXD_ACCOUNT)'."; \
-	    echo "  The running socket_vmnet was started with a different --socket-group;"; \
-	    echo "  enrolled operators will not be able to connect to this slot."; \
+	  if [ "$$_sock_group" != "$$_want_group" ]; then \
+	    echo "ERROR: $$socket_path is group '$$_sock_group', but $$plist_path names '$$_want_group'."; \
+	    echo "  The running socket_vmnet was started with a different --socket-group,"; \
+	    echo "  so the operators this slot is scoped to cannot connect to it."; \
 	    exit 1; \
 	  fi; \
 	  echo "$(GREEN)✓ $$label started from $$plist_path, socket $$socket_path (group $$_sock_group) present$(RESET)"; \
@@ -2292,12 +2318,17 @@ setup-darwin-operator-group-membership: setup-darwin-sandboxd-group
 # other's isolated segment and become the next hop for that operator's sandbox
 # traffic. The per-operator group is what makes the partition real.
 #
-# This step does NOT move a socket or rewrite a plist. Until VM ownership moves
-# to the operator, the daemon's own gateway VM holds a NIC on every slot and
-# must keep opening all of them; pointing the sockets at per-operator groups now
-# would stop the only gateway VM there is. What lands here is the assignment and
-# the audit surface, not the kernel's access decision — so every host whose
-# sockets still carry the shared group keeps working exactly as it does today.
+# This step does NOT move a socket or rewrite a plist; it creates the group and
+# records the range. setup-darwin-vmnet-plists is what points the sockets at it,
+# and it runs after this one for a reason: the group name is baked into the
+# plist argv as a literal at generation time, so a group created afterwards is
+# one no socket ever carries.
+#
+# Until both have run the host is in the state every existing install is in —
+# sockets on the shared group — and that is deliberately survivable rather than
+# an error. The resolver treats a slot no per-operator group claims as an
+# unmigrated slot and answers with the shared group, so a half-migrated pool
+# keeps working instead of failing closed on the way through.
 #
 # A dev host has one operator, who therefore gets the whole pool: partitioning a
 # pool nobody else is using would be a straight concurrency regression. Enrolling
@@ -2307,9 +2338,12 @@ setup-darwin-operator-group-membership: setup-darwin-sandboxd-group
 # Idempotence: the script's own; a second run is an all-skip no-op and takes no
 # sudo path it did not need.
 #
-# Depends on: setup-darwin-sandboxd-user (the daemon account joins the group)
-#             and setup-darwin-vmnet-plists (the pool size is read from them).
-setup-darwin-operator-slot-group: setup-darwin-sandboxd-user setup-darwin-vmnet-plists
+# Depends on: setup-darwin-sandboxd-user (the daemon account joins the group).
+# NOT on setup-darwin-vmnet-plists, even though the script defaults its pool
+# size to the installed plists: depending on them would invert the ordering the
+# mechanism needs, so the size is passed explicitly instead. That also makes a
+# first-ever run work, where there are no plists to count.
+setup-darwin-operator-slot-group: setup-darwin-sandboxd-user
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-operator-slot-group skipped (not macOS)$(RESET)"; \
 	  exit 0; \
@@ -2322,7 +2356,7 @@ setup-darwin-operator-slot-group: setup-darwin-sandboxd-user setup-darwin-vmnet-
 	  echo "$(GREEN)✓ already configured: operator '$$USER' is in slot group '$$_grp'$(RESET)"; \
 	else \
 	  echo "[sudo] scripts/darwin-operator-group.sh enroll --operator $$USER  (creates $$_grp; moves no socket)"; \
-	  sudo -k ./scripts/darwin-operator-group.sh enroll --operator "$$USER" || { \
+	  sudo -k ./scripts/darwin-operator-group.sh enroll --operator "$$USER" --pool-size "$(DARWIN_VMNET_SLOTS)" || { \
 	    echo "ERROR: enrollment failed for operator '$$USER'."; \
 	    exit 1; \
 	  }; \
