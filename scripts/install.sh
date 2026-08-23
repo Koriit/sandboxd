@@ -3085,7 +3085,15 @@ _sandboxd_slot_group() {
     for _sg_g in \$(dscl . -list /Groups 2>/dev/null | awk '/^_sandboxd-op-/{print \$1}'); do
         _sg_range=\$(dscl . -read "/Groups/\$_sg_g" SandboxdSlots 2>/dev/null | awk '/^dsAttrTypeNative:SandboxdSlots: /{print \$2}')
         [ -n "\$_sg_range" ] || continue
-        echo "\$_sg_range" | awk -v s="\$_sg_slot" 'BEGIN{RS=","} {n=split(\$0,p,"-"); lo=p[1]+0; hi=(n>1?p[2]+0:lo); if (lo<=s && s<=hi) f=1} END{exit !f}' || continue
+        # printf rather than echo, and the p[2] test rather than n alone:
+        # macOS awk (BWK, 20200816) splits an extra empty field off a record's
+        # trailing newline, so with RS="," the *last* element of a range gets
+        # p[2]="" and hi=0, and matches nothing. Canonicalization ends a range
+        # in a singleton routinely ("0-3,7", or a one-slot operator), and that
+        # slot would then resolve to the fallback — the shared group every
+        # operator is in, on one slot, silently. gawk parses it correctly, so
+        # it fails only where this ships.
+        printf '%s' "\$_sg_range" | awk -v s="\$_sg_slot" 'BEGIN{RS=","} {n=split(\$0,p,"-"); lo=p[1]+0; hi=(n>1 && p[2]!="" ? p[2]+0 : lo); if (lo<=s && s<=hi) f=1} END{exit !f}' || continue
         _sg_found="\${_sg_found:+\$_sg_found, }\$_sg_g"
         _sg_n=\$((_sg_n + 1))
     done
