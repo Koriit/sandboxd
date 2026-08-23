@@ -1974,18 +1974,26 @@ setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging setup-darwin-sandbo
 	  socket_path="/var/run/sandbox/vmnet/slot-$$slot.sock"; \
 	  staged_binary="$(DARWIN_SOCKET_VMNET_STAGED)"; \
 	  acct="$(DARWIN_SANDBOXD_ACCOUNT)"; \
+	  socket_group=$$(scripts/darwin-vmnet-slot-group.sh "$$slot" "$$acct") || exit 1; \
+	  if ! dscl . -read "/Groups/$$socket_group" >/dev/null 2>&1; then \
+	    echo "ERROR: refusing to generate slot $$slot's plist naming socket group '$$socket_group': no such group."; \
+	    echo "  socket_vmnet exits 1 at bind on an unresolvable --socket-group, before vmnet.framework"; \
+	    echo "  initializes and with no fallback — the slot would die at the next boot, not now."; \
+	    echo "  Create the group and add its members first:  make setup-darwin-operator-slot-group"; \
+	    exit 1; \
+	  fi; \
 	  \
 	  network_id=$$(python3 -c "import sys,hashlib,struct; ns=bytes([0x6d,0x4f,0x6e,0x2b,0x95,0x8a,0x4f,0x1a,0xa2,0x31,0x7e,0x8c,0xd0,0x12,0x3e,0x5b]); h=hashlib.sha1(ns+struct.pack('>H',int(sys.argv[1]))).digest(); b=bytearray(h[:16]); b[6]=(b[6]&0x0f)|0x50; b[8]=(b[8]&0x3f)|0x80; print('%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x'%tuple(b))" $$slot); \
 	  \
 	  tmp=$$(mktemp -t io.sandboxd.vmnet); \
-	  exec_cmd="install -d -o $$acct -g $$acct -m 0750 /var/run/sandbox &amp;&amp; install -d -o $$acct -g $$acct -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict $$staged_binary || { echo 'sandboxd: codesign verify failed for $$staged_binary -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=$$acct $$socket_path"; \
+	  exec_cmd="install -d -o $$acct -g $$acct -m 0750 /var/run/sandbox &amp;&amp; install -d -o $$acct -g $$acct -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict $$staged_binary || { echo 'sandboxd: codesign verify failed for $$staged_binary -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec $$staged_binary --vmnet-mode=host --vmnet-network-identifier=$$network_id --socket-group=$$socket_group $$socket_path"; \
 	  python3 -c "import sys; label,exec_cmd,slot,uuid=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]; print('<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>'+label+'</string>\n\n    <key>ProgramArguments</key>\n    <array>\n        <string>/bin/sh</string>\n        <string>-c</string>\n        <string>'+exec_cmd+'</string>\n    </array>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n        <key>Crashed</key>\n        <true/>\n    </dict>\n\n    <key>ThrottleInterval</key>\n    <integer>5</integer>\n\n    <key>StandardOutPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stdout.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>/var/log/sandbox/vmnet-'+slot+'.stderr.log</string>\n</dict>\n</plist>')" "$$label" "$$exec_cmd" "$$slot" "$$network_id" > "$$tmp"; \
 	  \
 	  if [ -f "$$plist_path" ] && cmp -s "$$tmp" "$$plist_path" 2>/dev/null; then \
 	    echo "$(GREEN)✓ already configured: $$plist_path$(RESET)"; \
 	    rm -f "$$tmp"; \
 	  else \
-	    echo "[sudo] install -o root -g wheel -m 0644 <generated-plist> $$plist_path  (label=$$label, uuid=$$network_id)"; \
+	    echo "[sudo] install -o root -g wheel -m 0644 <generated-plist> $$plist_path  (label=$$label, uuid=$$network_id, socket-group=$$socket_group)"; \
 	    sudo -k install -o root -g wheel -m 0644 "$$tmp" "$$plist_path"; \
 	    rm -f "$$tmp"; \
 	  fi; \

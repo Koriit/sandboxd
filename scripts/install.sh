@@ -3070,6 +3070,33 @@ if ! id -u "\$_sandboxd_acct" >/dev/null 2>&1 || ! dscl . -read "/Groups/\$_sand
     _step_fail
 fi
 
+# Which group owns a slot. Inlined from scripts/darwin-vmnet-slot-group.sh
+# because install.sh is delivered by \`curl | bash\` and has no adjacent script
+# to call; scripts/check-vmnet-uuid-equivalence.py keeps the two byte-identical.
+# The rationale for answering from the group records rather than the socket's
+# current gid, and for falling back on an unmigrated host while refusing a
+# contested slot, is in that script's header.
+# --- resolver (mirrored in scripts/install.sh) ---
+_sandboxd_slot_group() {
+    _sg_slot="\$1"
+    _sg_fallback="\$2"
+    _sg_found=""
+    _sg_n=0
+    for _sg_g in \$(dscl . -list /Groups 2>/dev/null | awk '/^_sandboxd-op-/{print \$1}'); do
+        _sg_range=\$(dscl . -read "/Groups/\$_sg_g" SandboxdSlots 2>/dev/null | awk '/^dsAttrTypeNative:SandboxdSlots: /{print \$2}')
+        [ -n "\$_sg_range" ] || continue
+        echo "\$_sg_range" | awk -v s="\$_sg_slot" 'BEGIN{RS=","} {n=split(\$0,p,"-"); lo=p[1]+0; hi=(n>1?p[2]+0:lo); if (lo<=s && s<=hi) f=1} END{exit !f}' || continue
+        _sg_found="\${_sg_found:+\$_sg_found, }\$_sg_g"
+        _sg_n=\$((_sg_n + 1))
+    done
+    if [ "\$_sg_n" -gt 1 ]; then
+        echo "slot \$_sg_slot is recorded by more than one per-operator group (\$_sg_found); refusing to pick one" >&2
+        return 2
+    fi
+    if [ "\$_sg_n" -eq 1 ]; then echo "\$_sg_found"; else echo "\$_sg_fallback"; fi
+}
+# --- end resolver ---
+
 _i=0
 while [ "\$_i" -lt "\$_vmnet_slots" ]; do
     _slot="\$_i"
@@ -3092,9 +3119,22 @@ print('%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x' % t
         _step_fail
     }
 
+    # The slot's socket group, and the same refusal the account gets above:
+    # socket_vmnet exits 1 at bind on an unresolvable --socket-group, before
+    # vmnet.framework initializes and with no fallback to a default group, so a
+    # plist written ahead of its group takes the slot down at the next boot.
+    _socket_group=\$(_sandboxd_slot_group "\$_slot" "\$_sandboxd_acct") || {
+        _log "step=install_vmnet_plists action=fail reason=slot-contested slot=\$_slot status=fail"
+        _step_fail
+    }
+    if ! dscl . -read "/Groups/\$_socket_group" >/dev/null 2>&1; then
+        _log "step=install_vmnet_plists action=fail reason=socket-group-unresolvable group=\$_socket_group slot=\$_slot status=fail"
+        _step_fail
+    fi
+
     # Build the exec_cmd — must match generate_vmnet_plist in network.rs and
     # the Makefile Python generator exactly.
-    _exec_cmd="install -d -o \$_sandboxd_acct -g \$_sandboxd_acct -m 0750 /var/run/sandbox &amp;&amp; install -d -o \$_sandboxd_acct -g \$_sandboxd_acct -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict \$_svmnet_staged || { echo 'sandboxd: codesign verify failed for \$_svmnet_staged -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec \$_svmnet_staged --vmnet-mode=host --vmnet-network-identifier=\$_network_id --socket-group=\$_sandboxd_acct \$_socket_path"
+    _exec_cmd="install -d -o \$_sandboxd_acct -g \$_sandboxd_acct -m 0750 /var/run/sandbox &amp;&amp; install -d -o \$_sandboxd_acct -g \$_sandboxd_acct -m 0750 /var/run/sandbox/vmnet &amp;&amp; codesign --verify --strict \$_svmnet_staged || { echo 'sandboxd: codesign verify failed for \$_svmnet_staged -- binary may be tampered; refusing to exec'; exit 1; } &amp;&amp; exec \$_svmnet_staged --vmnet-mode=host --vmnet-network-identifier=\$_network_id --socket-group=\$_socket_group \$_socket_path"
 
     _tmp=\$(mktemp -t io.sandboxd.vmnet) || { _step_fail; }
     python3 -c "

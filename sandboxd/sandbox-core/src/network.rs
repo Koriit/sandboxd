@@ -1139,6 +1139,21 @@ pub fn ensure_vmnet_account_resolvable(account: &str) -> Result<(), SandboxError
 /// machine. [`generate_vmnet_plist`] is the emitter to call in anger — it
 /// refuses to produce a plist for an account that does not resolve.
 ///
+/// `account` and `socket_group` are two parameters because they answer two
+/// different questions, and collapsing them is the defect this split exists
+/// to close:
+///
+/// - `account` owns the socket *directory*. It stays the daemon account on
+///   every slot, because `/var/run/sandbox/vmnet` is `0750` and every
+///   operator has to traverse it to reach any slot they do own.
+/// - `socket_group` owns the *socket*, and is the entire admission control
+///   for that slot's L2 segment. Naming one shared group here puts every
+///   enrolled operator on every operator's segment, where they can be
+///   believed as the next hop — the victim's egress policy is void and their
+///   TLS is terminated by whoever attached. So this is the per-operator
+///   group when one records the slot, and the daemon account only as a
+///   fallback on a host that has not been migrated.
+///
 /// The generated plist is installed at
 /// `/Library/LaunchDaemons/io.sandboxd.vmnet.<n>.plist` as a root-owned
 /// LaunchDaemon. Key design properties:
@@ -1155,13 +1170,14 @@ pub fn ensure_vmnet_account_resolvable(account: &str) -> Result<(), SandboxError
 ///   (derived from the fixed sandboxd namespace + slot index) — each unique
 ///   identifier gets its own isolated L2 bridge, preventing cross-slot
 ///   traffic; deterministic so it is stable across daemon/host restarts.
-/// - `--socket-group=<account>`: overrides socket_vmnet's `staff` default;
-///   only the daemon account and enrolled operators can connect.
+/// - `--socket-group=<socket_group>`: overrides socket_vmnet's `staff`
+///   default; only the daemon account and the operator this slot belongs to
+///   can connect.
 /// - No `--vmnet-gateway`/`--vmnet-dhcp-end`: network-identifier mode
 ///   carries no DHCP; all addresses are assigned statically.
 /// - `RunAtLoad=true` + `KeepAlive`: start at boot, restart on crash.
 #[cfg(target_os = "macos")]
-pub fn render_vmnet_plist(slot: u16, account: &str) -> String {
+pub fn render_vmnet_plist(slot: u16, account: &str, socket_group: &str) -> String {
     let label = vmnet_slot_daemon_label(slot);
     let socket_path = vmnet_slot_socket_path(slot);
     let network_identifier = vmnet_slot_network_identifier(slot);
@@ -1189,7 +1205,7 @@ codesign --verify --strict {STAGED_SOCKET_VMNET_PATH} || {{ echo 'sandboxd: code
 exec {STAGED_SOCKET_VMNET_PATH} \
 --vmnet-mode=host \
 --vmnet-network-identifier={network_identifier} \
---socket-group={account} \
+--socket-group={socket_group} \
 {socket_path}"
     );
 
@@ -1239,10 +1255,74 @@ exec {STAGED_SOCKET_VMNET_PATH} \
 /// this host *before* rendering, so a plist that would break the whole pool at
 /// the next boot is never produced. See [`ensure_vmnet_account_resolvable`] for
 /// why deferring that failure is so expensive.
+///
+/// The socket group is resolved from the live per-operator group records, and
+/// the same refusal applies to it for the same reason: `socket_vmnet` given a
+/// `--socket-group` that does not resolve exits 1 at bind, before
+/// vmnet.framework initializes and with no fallback to a default group. A
+/// plist written ahead of its group therefore takes the slot down at the next
+/// boot — hours or days after the run that caused it. Create the group and add
+/// its members before regenerating any plist that names it.
 #[cfg(target_os = "macos")]
 pub fn generate_vmnet_plist(slot: u16) -> Result<String, SandboxError> {
+    use crate::vmnet_assignment::{
+        HostSlotDirectory, SlotDirectory, SlotSocketGroup, slot_socket_group,
+    };
+
     ensure_vmnet_account_resolvable(SANDBOXD_ACCOUNT)?;
-    Ok(render_vmnet_plist(slot, SANDBOXD_ACCOUNT))
+
+    let groups = HostSlotDirectory.operator_groups();
+    let socket_group = match slot_socket_group(&groups, slot) {
+        SlotSocketGroup::Assigned(group) => {
+            ensure_vmnet_group_resolvable(&group)?;
+            group
+        }
+        // Every host is in this state until it is migrated; warn and carry on.
+        SlotSocketGroup::Legacy => {
+            tracing::warn!(
+                slot,
+                group = SANDBOXD_ACCOUNT,
+                "no per-operator group records this slot; falling back to the shared group, \
+                 which lets any enrolled operator attach to this segment"
+            );
+            SANDBOXD_ACCOUNT.to_string()
+        }
+        SlotSocketGroup::Contested(groups) => {
+            return Err(SandboxError::Network(format!(
+                "refusing to generate a vmnet plist for slot {slot}: it is recorded by more \
+                 than one per-operator group ({}). Picking either would hand an operator a \
+                 segment that may not be theirs. This is what a half-finished de-enrollment \
+                 looks like — revoke the departing operator's group membership before the \
+                 range is reassigned.",
+                groups.join(", ")
+            )));
+        }
+    };
+
+    Ok(render_vmnet_plist(slot, SANDBOXD_ACCOUNT, &socket_group))
+}
+
+/// Refuse to name a group in a plist unless it resolves on this host.
+///
+/// The socket-group half of [`ensure_vmnet_account_resolvable`], and it fails
+/// the same way: not at generation time, but at the next boot, on a slot
+/// nobody was looking at.
+#[cfg(target_os = "macos")]
+fn ensure_vmnet_group_resolvable(group: &str) -> Result<(), SandboxError> {
+    if nix::unistd::Group::from_name(group)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(SandboxError::Network(format!(
+        "refusing to generate a vmnet plist naming socket group '{group}': no such group on \
+         this host. socket_vmnet given a --socket-group that does not resolve exits 1 at bind, \
+         before vmnet.framework initializes and with no fallback to a default group, so this \
+         plist would take the slot down at the next boot. Create the group and add its members \
+         first."
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2549,14 +2629,18 @@ mod tests {
 
         #[test]
         fn test_plist_contains_required_argv() {
-            let plist = render_vmnet_plist(2, SANDBOXD_ACCOUNT);
+            // A socket group deliberately unlike the account: if the two were
+            // rendered from one value the --socket-group assertion below would
+            // still pass with the account's name, and the collapse would go
+            // unseen.
+            let plist = render_vmnet_plist(2, SANDBOXD_ACCOUNT, "_sandboxd-op-sample");
             assert!(
                 plist.contains("--vmnet-mode=host"),
                 "plist must include --vmnet-mode=host"
             );
             assert!(
-                plist.contains("--socket-group=_sandboxd"),
-                "plist must include --socket-group=_sandboxd"
+                plist.contains("--socket-group=_sandboxd-op-sample"),
+                "plist must include --socket-group naming the group it was given"
             );
             assert!(
                 plist.contains("--vmnet-network-identifier="),
@@ -2574,7 +2658,7 @@ mod tests {
 
         #[test]
         fn test_plist_has_run_at_load_and_keep_alive() {
-            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
             assert!(plist.contains("<key>RunAtLoad</key>"));
             assert!(plist.contains("<true/>"));
             assert!(plist.contains("<key>KeepAlive</key>"));
@@ -2582,7 +2666,7 @@ mod tests {
 
         #[test]
         fn test_plist_has_pre_exec_dir_creation() {
-            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
             // The pre-exec wrapper must create /var/run/sandbox and
             // /var/run/sandbox/vmnet with _sandboxd ownership.
             assert!(
@@ -2601,7 +2685,7 @@ mod tests {
         #[test]
         fn test_plist_has_codesign_guard() {
             for slot in 0u16..4 {
-                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
                 let guard_fragment =
                     format!("codesign --verify --strict {STAGED_SOCKET_VMNET_PATH}");
                 assert!(
@@ -2618,7 +2702,7 @@ mod tests {
         #[test]
         fn test_plist_label_matches_slot() {
             for slot in 0u16..4 {
-                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
                 assert!(
                     plist.contains(&format!("io.sandboxd.vmnet.{slot}")),
                     "plist label must be io.sandboxd.vmnet.{slot}"
@@ -2628,15 +2712,15 @@ mod tests {
 
         #[test]
         fn test_plist_network_identifier_is_deterministic_across_calls() {
-            let plist_a = render_vmnet_plist(3, SANDBOXD_ACCOUNT);
-            let plist_b = render_vmnet_plist(3, SANDBOXD_ACCOUNT);
+            let plist_a = render_vmnet_plist(3, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
+            let plist_b = render_vmnet_plist(3, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
             assert_eq!(plist_a, plist_b, "plist generation must be deterministic");
         }
 
         #[test]
         fn test_plist_no_networks_yaml() {
             // The plist must NOT reference networks.yaml anywhere.
-            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
             assert!(
                 !plist.contains("networks.yaml"),
                 "plist must not reference networks.yaml"
@@ -2650,7 +2734,7 @@ mod tests {
         /// re-introduce exactly the split-brain this parameterization removes.
         #[test]
         fn test_plist_account_is_fully_parameterized() {
-            let plist = render_vmnet_plist(0, "nobody");
+            let plist = render_vmnet_plist(0, "nobody", "nobody");
             assert!(
                 !plist.contains(SANDBOXD_ACCOUNT),
                 "rendering for 'nobody' must not leak the default account name:\n{plist}"
@@ -2663,9 +2747,30 @@ mod tests {
                 plist.contains("install -d -o nobody -g nobody -m 0750 /var/run/sandbox/vmnet"),
                 "the vmnet dir preamble must name the account it was given:\n{plist}"
             );
+        }
+
+        /// The account and the socket group are two independent parameters.
+        ///
+        /// They answer different questions — the account owns the socket
+        /// *directory* and stays the daemon on every slot, the group owns the
+        /// *socket* and is the whole admission control for that slot's L2
+        /// segment. Rendering them from one value is the defect the split
+        /// exists to close, and it is invisible to any test that passes the
+        /// same string for both: the plist renders identically either way.
+        #[test]
+        fn test_plist_socket_group_is_independent_of_the_account() {
+            let plist = render_vmnet_plist(0, "nobody", "_sandboxd-op-sample");
             assert!(
-                plist.contains("--socket-group=nobody"),
-                "--socket-group must name the account it was given:\n{plist}"
+                plist.contains("install -d -o nobody -g nobody -m 0750 /var/run/sandbox/vmnet"),
+                "the dir preamble must name the account, not the socket group:\n{plist}"
+            );
+            assert!(
+                plist.contains("--socket-group=_sandboxd-op-sample"),
+                "--socket-group must name the group it was given:\n{plist}"
+            );
+            assert!(
+                !plist.contains("--socket-group=nobody"),
+                "--socket-group must not fall back to the account:\n{plist}"
             );
         }
 
@@ -2709,20 +2814,37 @@ mod tests {
         ///
         /// Only meaningful once the host is provisioned; before that the
         /// generator correctly refuses and there is nothing to compare.
+        ///
+        /// The expected socket group is resolved here the same way the
+        /// generator resolves it, because it depends on how *this* host is
+        /// enrolled. That makes the group itself unasserted — the point of the
+        /// comparison is the rest of the plist: that the generator adds,
+        /// drops and reorders nothing relative to the renderer.
         #[test]
         fn test_generate_matches_render_when_account_resolves() {
+            use crate::vmnet_assignment::{
+                HostSlotDirectory, SlotDirectory, SlotSocketGroup, slot_socket_group,
+            };
+
+            let expected_group = match slot_socket_group(&HostSlotDirectory.operator_groups(), 1) {
+                SlotSocketGroup::Assigned(group) => group,
+                SlotSocketGroup::Legacy => SANDBOXD_ACCOUNT.to_string(),
+                // The generator refuses outright, so there is nothing to compare.
+                SlotSocketGroup::Contested(_) => return,
+            };
+
             match generate_vmnet_plist(1) {
                 Ok(plist) => assert_eq!(
                     plist,
-                    render_vmnet_plist(1, SANDBOXD_ACCOUNT),
+                    render_vmnet_plist(1, SANDBOXD_ACCOUNT, &expected_group),
                     "the guarded emitter must return exactly what the renderer produces"
                 ),
                 Err(e) => {
                     let msg = e.to_string();
                     assert!(
-                        msg.contains(SANDBOXD_ACCOUNT),
-                        "on an unprovisioned host the refusal must name {SANDBOXD_ACCOUNT}, \
-                         got: {msg}"
+                        msg.contains(SANDBOXD_ACCOUNT) || msg.contains(&expected_group),
+                        "on an unprovisioned host the refusal must name whichever of \
+                         {SANDBOXD_ACCOUNT} / {expected_group} did not resolve, got: {msg}"
                     );
                 }
             }
@@ -2736,7 +2858,7 @@ mod tests {
         #[test]
         fn test_plist_ampersand_is_xml_escaped() {
             for slot in 0u16..4 {
-                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
 
                 // No bare & should appear in the XML (outside of &amp; etc.).
                 // Scan character by character: any `&` not followed by `amp;`
@@ -2785,7 +2907,7 @@ mod tests {
             }
 
             for slot in 0u16..2 {
-                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
+                let plist = render_vmnet_plist(slot, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
                 let mut f = NamedTempFile::with_suffix(".plist").unwrap();
                 f.write_all(plist.as_bytes()).unwrap();
                 f.flush().unwrap();
@@ -3493,7 +3615,7 @@ mod tests {
                 "slot socket path must not reference networks.yaml"
             );
             // Plist content must not reference networks.yaml.
-            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT);
+            let plist = render_vmnet_plist(0, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT);
             assert!(!plist.contains("networks.yaml"));
         }
 

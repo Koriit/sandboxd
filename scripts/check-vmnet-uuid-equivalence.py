@@ -51,6 +51,7 @@ Usage
 """
 
 import argparse
+import difflib
 import hashlib
 import pathlib
 import re
@@ -133,10 +134,31 @@ REGISTERED = {
 REGISTERED_EMITTERS = (NETWORK_RS, MAKEFILE, INSTALL_SH)
 
 # Canonical placeholders the three wrapper templates are normalized to.
+#
+# `{account}` and `{socket_group}` are separate on purpose and must stay
+# separate. The account owns the 0750 socket *directory*, which every operator
+# has to traverse to reach any slot; the socket group is the admission control
+# for one slot's L2 segment. An emitter that collapses them back into one
+# variable puts every enrolled operator on every operator's segment — the
+# defect this split closed — and normalizing both to `{account}` here would
+# make the three-way comparison agree that it had.
 PH_ACCOUNT = "{account}"
 PH_STAGED = "{staged}"
 PH_UUID = "{uuid}"
 PH_SOCKET = "{socket}"
+PH_SOCKET_GROUP = "{socket_group}"
+
+# The group name rendered into sample wrappers. Deliberately *not* the account:
+# an emitter that collapsed `--socket-group` back onto the account would render
+# byte-identically to a correct one if both placeholders expanded to the same
+# string, and every comparison below would agree that nothing had changed.
+SAMPLE_SOCKET_GROUP = "_sandboxd-op-sample"
+
+# The slot -> group resolver, carried in two places because install.sh is
+# delivered by `curl | bash` and cannot call a script from the repo.
+SLOT_GROUP_SH = "scripts/darwin-vmnet-slot-group.sh"
+RESOLVER_BEGIN = "# --- resolver (mirrored in scripts/install.sh) ---"
+RESOLVER_END = "# --- end resolver ---"
 
 
 class ExtractionError(Exception):
@@ -184,6 +206,7 @@ def extract_rust(root: pathlib.Path) -> dict:
     # `{{`/`}}` of the codesign guard cannot be mistaken for a placeholder.
     wrapper = (
         wrapper.replace("{account}", "\0A\0")
+        .replace("{socket_group}", "\0G\0")
         .replace("{STAGED_SOCKET_VMNET_PATH}", "\0S\0")
         .replace("{network_identifier}", "\0U\0")
         .replace("{socket_path}", "\0K\0")
@@ -212,7 +235,8 @@ def extract_makefile(root: pathlib.Path) -> dict:
     ).group(1)
 
     wrapper = (
-        raw.replace("$$acct", "\0A\0")
+        raw.replace("$$socket_group", "\0G\0")
+        .replace("$$acct", "\0A\0")
         .replace("$$staged_binary", "\0S\0")
         .replace("$$network_id", "\0U\0")
         .replace("$$socket_path", "\0K\0")
@@ -242,7 +266,8 @@ def extract_install_sh(root: pathlib.Path) -> dict:
     ).group(1)
 
     wrapper = (
-        raw.replace("\\$_sandboxd_acct", "\0A\0")
+        raw.replace("\\$_socket_group", "\0G\0")
+        .replace("\\$_sandboxd_acct", "\0A\0")
         .replace("\\$_svmnet_staged", "\0S\0")
         .replace("\\$_network_id", "\0U\0")
         .replace("\\$_socket_path", "\0K\0")
@@ -272,6 +297,7 @@ def _to_placeholders(s: str) -> str:
         .replace("\0S\0", PH_STAGED)
         .replace("\0U\0", PH_UUID)
         .replace("\0K\0", PH_SOCKET)
+        .replace("\0G\0", PH_SOCKET_GROUP)
     )
 
 
@@ -326,10 +352,13 @@ def derive_uuid(slot: int) -> str:
     )
 
 
-def render_wrapper(template: str, account: str, staged: str, slot: int) -> str:
+def render_wrapper(
+    template: str, account: str, staged: str, slot: int, socket_group: str
+) -> str:
     """Expand a normalized wrapper template for one slot."""
     return (
         template.replace(PH_ACCOUNT, account)
+        .replace(PH_SOCKET_GROUP, socket_group)
         .replace(PH_STAGED, staged)
         .replace(PH_UUID, derive_uuid(slot))
         .replace(PH_SOCKET, f"/var/run/sandbox/vmnet/slot-{slot}.sock")
@@ -585,7 +614,7 @@ def check_wrapper_structure(template: str, account: str, staged: str) -> int:
     """
     print()
     print("=== Wrapper structure ===")
-    sample = render_wrapper(template, account, staged, 0)
+    sample = render_wrapper(template, account, staged, 0, SAMPLE_SOCKET_GROUP)
     required = [
         f"install -d -o {account} -g {account} -m 0750 /var/run/sandbox &amp;&amp;",
         f"install -d -o {account} -g {account} -m 0750 /var/run/sandbox/vmnet &amp;&amp;",
@@ -593,7 +622,10 @@ def check_wrapper_structure(template: str, account: str, staged: str) -> int:
         "refusing to exec",
         f"exec {staged}",
         "--vmnet-mode=host",
-        f"--socket-group={account}",
+        # The group, never the account. These two are the whole point of the
+        # split: the account owns the traversable 0750 directory, the group is
+        # admission control for one slot's segment.
+        f"--socket-group={SAMPLE_SOCKET_GROUP}",
     ]
     failures = 0
     for fragment in required:
@@ -607,6 +639,60 @@ def check_wrapper_structure(template: str, account: str, staged: str) -> int:
     return failures
 
 
+def extract_resolver(path: pathlib.Path, source: str, deescape: bool) -> str:
+    """The slot -> group resolver, between its two marker comments."""
+    text = path.read_text()
+    begin = RESOLVER_BEGIN.replace("\\", "")
+    start = text.find(begin)
+    if start < 0:
+        raise ExtractionError(
+            f"{source}: could not find the resolver's opening marker.\n"
+            f"  marker: {begin}\n"
+            "  The two copies can only be compared if both are delimited."
+        )
+    end = text.find(RESOLVER_END, start)
+    if end < 0:
+        raise ExtractionError(f"{source}: the resolver's closing marker is missing.")
+    body = text[start + len(begin):end]
+    # install.sh carries its copy inside an unquoted heredoc, so every `$` is
+    # written `\$`. The privileged child sees a plain `$`; compare what it sees.
+    return body.replace("\\$", "$") if deescape else body
+
+
+def check_resolver_copies(root: pathlib.Path) -> int:
+    """The two copies of the slot -> group resolver must be identical.
+
+    A drifted copy is not a cosmetic problem. The installer's copy decides
+    which group each slot socket is handed to on a production host; if it
+    resolves differently from the canonical one, a slot is handed to the wrong
+    operator's group and the segment is open to them, with every other layer
+    still reporting the intended owner.
+    """
+    print()
+    print("=== Slot -> group resolver copies ===")
+    try:
+        canonical = extract_resolver(root / SLOT_GROUP_SH, SLOT_GROUP_SH, deescape=False)
+        installed = extract_resolver(root / INSTALL_SH, INSTALL_SH, deescape=True)
+    except (ExtractionError, OSError) as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    if canonical != installed:
+        print(
+            f"FAIL: the resolver in {INSTALL_SH} has drifted from {SLOT_GROUP_SH}.",
+            file=sys.stderr,
+        )
+        for line in difflib.unified_diff(
+            canonical.splitlines(), installed.splitlines(),
+            fromfile=SLOT_GROUP_SH, tofile=INSTALL_SH, lineterm="",
+        ):
+            print(f"  {line}", file=sys.stderr)
+        return 1
+
+    print(f"OK   {INSTALL_SH} carries {SLOT_GROUP_SH} verbatim ({len(canonical)} bytes)")
+    return 0
+
+
 def check_rendered_plists(make: dict, sh: dict, account: str, staged: str, slots) -> int:
     """Run both shell emitters' own XML generators and compare their output."""
     print()
@@ -614,10 +700,14 @@ def check_rendered_plists(make: dict, sh: dict, account: str, staged: str, slots
     failures = 0
     for slot in slots:
         make_plist = render_plist(
-            make["skeleton"], render_wrapper(make["wrapper"], account, staged, slot), slot
+            make["skeleton"],
+            render_wrapper(make["wrapper"], account, staged, slot, SAMPLE_SOCKET_GROUP),
+            slot,
         )
         sh_plist = render_plist(
-            sh["skeleton"], render_wrapper(sh["wrapper"], account, staged, slot), slot
+            sh["skeleton"],
+            render_wrapper(sh["wrapper"], account, staged, slot, SAMPLE_SOCKET_GROUP),
+            slot,
         )
         if make_plist != sh_plist:
             print(f"FAIL slot {slot}: the two generators render different plists.", file=sys.stderr)
@@ -651,6 +741,10 @@ def main() -> int:
         help="which emitter --emit-plist should render with (default: make)",
     )
     parser.add_argument("--slot", type=int, default=0, help="slot index for --emit-plist")
+    parser.add_argument(
+        "--socket-group", default=SAMPLE_SOCKET_GROUP,
+        help="group name --emit-plist renders into --socket-group=",
+    )
     parser.add_argument("--slots", type=int, default=8, help="how many slots to check")
     args = parser.parse_args()
 
@@ -674,7 +768,11 @@ def main() -> int:
                 render_plist(
                     emitter["skeleton"],
                     render_wrapper(
-                        emitter["wrapper"], emitter["account"], emitter["staged"], args.slot
+                        emitter["wrapper"],
+                        emitter["account"],
+                        emitter["staged"],
+                        args.slot,
+                        args.socket_group,
                     ),
                     args.slot,
                 )
@@ -688,6 +786,7 @@ def main() -> int:
     failures = check_uuids(slots)
     failures += check_emitter_inventory(root)
     failures += check_three_way(rust, make, sh)
+    failures += check_resolver_copies(root)
     failures += check_wrapper_structure(rust["wrapper"], rust["account"], rust["staged"])
     try:
         failures += check_rendered_plists(make, sh, rust["account"], rust["staged"], slots)

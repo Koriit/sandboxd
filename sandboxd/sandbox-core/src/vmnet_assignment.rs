@@ -479,6 +479,59 @@ fn resolve_slot<D: SlotDirectory + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------
+// Enforcement — which group a slot's socket is handed to
+// ---------------------------------------------------------------------------
+
+/// The group a slot socket must carry, decided from the recorded ranges.
+///
+/// This is the *enforcement* side of the two-source model in the module
+/// header, and it is deliberately a different question from
+/// [`resolve_slot`]. `resolve_slot` asks "who owns this slot, as things
+/// stand" and reads the socket's current gid as one of its inputs;
+/// this asks "what gid should the socket be given", and must therefore
+/// ignore the socket entirely — otherwise regeneration would perpetuate
+/// whatever the sockets already say and could never migrate a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotSocketGroup {
+    /// Exactly one per-operator group records this slot. Its socket goes to
+    /// that group, and only that operator (plus the daemon account, which
+    /// joins every per-operator group) can connect.
+    Assigned(String),
+    /// No per-operator group records this slot, so there is nothing to
+    /// narrow the socket to. Fall back to the shared daemon group and warn
+    /// — this is every host that has not been migrated yet, and refusing
+    /// would turn an upgrade into an outage. See the legacy fallback in the
+    /// module header.
+    Legacy,
+    /// More than one group records this slot. Refuse rather than pick: the
+    /// two candidates are indistinguishable from here, one of them is a
+    /// half-finished de-enrollment, and emitting either silently hands an
+    /// operator a segment that is not theirs.
+    Contested(Vec<String>),
+}
+
+/// Decide the socket group for one slot from the per-operator group records.
+///
+/// Takes the group set rather than a [`SlotDirectory`] so a caller emitting
+/// all eight slots reads the directory once.
+pub fn slot_socket_group(groups: &[OperatorGroup], slot: u16) -> SlotSocketGroup {
+    let mut claimants: Vec<String> = groups
+        .iter()
+        .filter(|g| g.slots.contains(&slot))
+        .map(|g| g.name.clone())
+        .collect();
+
+    match claimants.len() {
+        0 => SlotSocketGroup::Legacy,
+        1 => SlotSocketGroup::Assigned(claimants.pop().expect("length checked")),
+        _ => {
+            claimants.sort();
+            SlotSocketGroup::Contested(claimants)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
 
@@ -1136,6 +1189,89 @@ mod tests {
         assert!(
             assignment.legacy_slots().is_empty(),
             "a fully-assigned host has no shared remainder"
+        );
+    }
+
+    // -- slot_socket_group ---------------------------------------------------
+
+    fn groups(entries: &[(&str, u32, &[u16])]) -> Vec<OperatorGroup> {
+        entries
+            .iter()
+            .map(|(name, gid, slots)| OperatorGroup {
+                name: (*name).to_string(),
+                gid: *gid,
+                slots: slots.to_vec(),
+            })
+            .collect()
+    }
+
+    /// The only outcome that hands a slot to one operator.
+    #[test]
+    fn a_slot_recorded_by_one_group_is_handed_to_that_group() {
+        let g = groups(&[
+            ("_sandboxd-op-olek", 311, &[0, 1, 2, 3]),
+            ("_sandboxd-op-operator-b", 312, &[4, 5, 6, 7]),
+        ]);
+
+        assert_eq!(
+            slot_socket_group(&g, 5),
+            SlotSocketGroup::Assigned("_sandboxd-op-operator-b".to_string())
+        );
+    }
+
+    /// The state of every host that has not been migrated. It must fall back,
+    /// not refuse — an upgrade that took the whole pool down would be worse
+    /// than the shared group it is replacing.
+    #[test]
+    fn a_slot_no_group_records_falls_back_to_the_shared_group() {
+        let g = groups(&[("_sandboxd-op-olek", 311, &[0, 1, 2, 3])]);
+
+        assert_eq!(slot_socket_group(&g, 6), SlotSocketGroup::Legacy);
+        assert_eq!(
+            slot_socket_group(&[], 0),
+            SlotSocketGroup::Legacy,
+            "a host with no per-operator groups at all is the unmigrated case"
+        );
+    }
+
+    /// Two claimants is a half-finished de-enrollment. The candidates are
+    /// indistinguishable from here, and emitting either silently hands an
+    /// operator a segment that is not theirs, so this refuses and names both.
+    #[test]
+    fn a_slot_two_groups_record_is_contested_and_names_both() {
+        let g = groups(&[
+            ("_sandboxd-op-second", 312, &[2, 3]),
+            ("_sandboxd-op-first", 311, &[0, 1, 2]),
+        ]);
+
+        assert_eq!(
+            slot_socket_group(&g, 2),
+            SlotSocketGroup::Contested(vec![
+                "_sandboxd-op-first".to_string(),
+                "_sandboxd-op-second".to_string(),
+            ]),
+            "the claimants must be sorted so the diagnostic does not depend on \
+             directory enumeration order"
+        );
+    }
+
+    /// The decision reads the group records only.
+    ///
+    /// [`resolve_slot`] asks who owns a slot *as things stand* and takes the
+    /// socket's current gid as evidence; this asks what gid the socket should
+    /// be given. Were it to consult the socket, regeneration would perpetuate
+    /// whatever the sockets already carry and no host could ever be migrated
+    /// off the shared group.
+    #[test]
+    fn the_socket_gid_does_not_influence_the_group_a_slot_is_given() {
+        // Every socket on this host still carries the shared daemon group.
+        let dir = FakeDirectory::unmigrated(8).with_group("_sandboxd-op-olek", 311, &[0, 1, 2, 3]);
+
+        assert_eq!(
+            slot_socket_group(&dir.operator_groups(), 0),
+            SlotSocketGroup::Assigned("_sandboxd-op-olek".to_string()),
+            "a slot the records claim must be handed to that group even while its \
+             socket still carries the shared one — that transition is the migration"
         );
     }
 }

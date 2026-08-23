@@ -41,11 +41,17 @@ fn checker_path() -> PathBuf {
     repo_root().join("scripts/check-vmnet-uuid-equivalence.py")
 }
 
-/// Every file the checker reads. A perturbed copy needs exactly these.
-const EMITTER_FILES: [&str; 3] = [
+/// Every file the checker reads, copied into each perturbed repo.
+///
+/// The last entry is not an emitter — it is the canonical slot -> group
+/// resolver that `install.sh` carries a copy of. It has to be here anyway: the
+/// checker compares the two copies, and a temp repo missing the canonical one
+/// fails every test for the wrong reason.
+const EMITTER_FILES: [&str; 4] = [
     "Makefile",
     "scripts/install.sh",
     "sandboxd/sandbox-core/src/network.rs",
+    "scripts/darwin-vmnet-slot-group.sh",
 ];
 
 fn run_checker(root: &Path) -> Output {
@@ -154,7 +160,7 @@ fn checker_rejects_a_hardcoded_socket_group() {
     // instead of interpolating the one variable the repo agrees on.
     let tmp = perturbed_repo(&[(
         "Makefile",
-        "--socket-group=$$acct",
+        "--socket-group=$$socket_group",
         "--socket-group=_sandbox",
     )]);
 
@@ -169,6 +175,85 @@ fn checker_rejects_a_hardcoded_socket_group() {
     assert!(
         stderr.contains("wrapper templates differ"),
         "expected the failure to be attributed to the wrapper template.\n{}",
+        describe(&output)
+    );
+}
+
+/// A collapse the three-way comparison cannot see.
+///
+/// `--socket-group` and the socket directory's owner are two parameters
+/// because they are two decisions: the account owns the directory every
+/// operator must traverse, the group owns the socket and is the whole
+/// admission control for that slot's L2 segment. Collapse them back onto one
+/// value in *all three* emitters and the emitters still agree with each
+/// other — the drift check compares them against each other and stays green
+/// while the pool goes back to putting every enrolled operator on every
+/// segment. Only the structural check on a single rendered wrapper can see it,
+/// and only because the sample group is spelled unlike the account.
+#[test]
+fn checker_rejects_a_socket_group_collapsed_onto_the_account_everywhere() {
+    let tmp = perturbed_repo(&[
+        (
+            "Makefile",
+            "--socket-group=$$socket_group",
+            "--socket-group=$$acct",
+        ),
+        (
+            "scripts/install.sh",
+            "--socket-group=\\$_socket_group",
+            "--socket-group=\\$_sandboxd_acct",
+        ),
+        (
+            "sandboxd/sandbox-core/src/network.rs",
+            "--socket-group={socket_group}",
+            "--socket-group={account}",
+        ),
+    ]);
+
+    let output = run_checker(tmp.path());
+    assert!(
+        !output.status.success(),
+        "every emitter now hands the slot socket to the shared account, and the checker \
+         passed because they agree with each other.\n{}",
+        describe(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--socket-group"),
+        "expected the failure to be attributed to the socket group.\n{}",
+        describe(&output)
+    );
+}
+
+/// install.sh's inlined copy of the slot -> group resolver must not drift.
+///
+/// install.sh is delivered by `curl | bash` and has no adjacent script to
+/// call, so it carries a copy. A copy that answers differently from the
+/// canonical script is invisible to every other check here: the wrapper
+/// template is identical either way, and the difference only shows up on a
+/// host whose enrollment reaches the drifted branch.
+#[test]
+fn checker_rejects_a_drifted_resolver_copy_in_the_installer() {
+    // Silently pick a group when two record the slot, instead of refusing.
+    // That is the half-finished de-enrollment case, where picking either
+    // candidate hands an operator a segment that is not theirs.
+    let tmp = perturbed_repo(&[(
+        "scripts/install.sh",
+        "if [ \"\\$_sg_n\" -gt 1 ]; then",
+        "if [ \"\\$_sg_n\" -gt 99 ]; then",
+    )]);
+
+    let output = run_checker(tmp.path());
+    assert!(
+        !output.status.success(),
+        "install.sh's resolver copy no longer refuses a contested slot, and the checker \
+         passed anyway.\n{}",
+        describe(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("darwin-vmnet-slot-group.sh"),
+        "expected the failure to name the canonical resolver.\n{}",
         describe(&output)
     );
 }
@@ -488,6 +573,15 @@ mod macos {
         repo_root().join("scripts/darwin-vmnet-drift.sh")
     }
 
+    /// A socket group chosen to be unlike the account.
+    ///
+    /// The account and the socket group are two independent parameters of the
+    /// wrapper. If both rendered from the same string, an emitter that had
+    /// collapsed `--socket-group` back onto the account would render
+    /// byte-identically and every comparison below would agree nothing was
+    /// wrong. Keep this in step with the checker's own `SAMPLE_SOCKET_GROUP`.
+    const SAMPLE_SOCKET_GROUP: &str = "_sandboxd-op-sample";
+
     /// Ask a shell emitter to render slot `slot` and hand back its bytes.
     fn shell_emitter_plist(emitter: &str, slot: u16) -> String {
         let output = Command::new("python3")
@@ -499,6 +593,8 @@ mod macos {
             .arg(emitter)
             .arg("--slot")
             .arg(slot.to_string())
+            .arg("--socket-group")
+            .arg(SAMPLE_SOCKET_GROUP)
             .output()
             .expect("python3 must be on PATH");
         assert!(
@@ -515,7 +611,7 @@ mod macos {
     #[test]
     fn all_three_emitters_render_identical_plists() {
         for slot in 0..POOL_SLOTS {
-            let reference = render_vmnet_plist(slot, SANDBOXD_ACCOUNT);
+            let reference = render_vmnet_plist(slot, SANDBOXD_ACCOUNT, SAMPLE_SOCKET_GROUP);
             for emitter in ["make", "install-sh"] {
                 let rendered = shell_emitter_plist(emitter, slot);
                 assert_eq!(
@@ -577,7 +673,11 @@ mod macos {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let label = vmnet_slot_daemon_label(0);
         let plist = tmp.path().join(format!("{label}.plist"));
-        fs::write(&plist, render_vmnet_plist(0, SANDBOXD_ACCOUNT)).expect("write plist");
+        fs::write(
+            &plist,
+            render_vmnet_plist(0, SANDBOXD_ACCOUNT, SANDBOXD_ACCOUNT),
+        )
+        .expect("write plist");
         let argv = plist_argv(&plist);
         (tmp, plist, label, argv)
     }
