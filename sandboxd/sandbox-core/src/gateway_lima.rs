@@ -1807,21 +1807,17 @@ impl GatewayLimaManager {
         })?;
         info!(path = %template_path.display(), "gateway Lima template written");
 
+        // `CreateGateway`, not `Create`: a gateway is held to a different
+        // NIC-shape rule than a session VM, and the variant is what selects
+        // which rule applies. It also carries no `owner`, because the gateway
+        // is not tracked by the Lima orphan reaper's per-operator marker
+        // scheme. When the owner is not the daemon this reaches the operator's
+        // agent, which re-derives the instance name from its own uid.
         let result = self.executor.run(
             self.owner_uid,
-            LimaOp::Create {
+            LimaOp::CreateGateway {
                 vm: &self.instance_name,
                 yaml_path: &template_path,
-                // No per-operator owner marker for the gateway instance —
-                // it is daemon infrastructure, not tracked by the Lima orphan
-                // reaper's per-operator marker scheme.
-                owner: "",
-                // The gateway VM is daemon infrastructure; it always runs as the
-                // daemon uid and goes through run_limactl_direct, bypassing the
-                // agent's socket_vmnet check. The field is set to true here to
-                // reflect that the gateway template includes a socket_vmnet NIC,
-                // though the value is not inspected by run_limactl_direct.
-                is_hardened_session: true,
             },
             GATEWAY_CREATE_TIMEOUT,
             "gateway: limactl create",
@@ -1846,24 +1842,17 @@ impl GatewayLimaManager {
     fn start_instance(&self) -> Result<(), SandboxError> {
         let start_timeout_s = GATEWAY_START_TIMEOUT.as_secs() as u32;
 
+        // `StartGateway`, not `Start`: the gateway instance NEVER boots behind
+        // the qemu-wrapper (restrict=on applies to sandbox VMs only; the
+        // gateway VM's eth0 is the sanctioned egress uplink), and the op that
+        // says so is a distinct variant rather than an empty wrapper path that
+        // every executor has to test for. Sizing comes from the template this
+        // instance was created from, so no cpus/memory travels here either.
         let output = self.executor.run(
             self.owner_uid,
-            LimaOp::Start {
+            LimaOp::StartGateway {
                 vm: &self.instance_name,
-                // The gateway instance NEVER uses the qemu-wrapper (restrict=on
-                // applies to sandbox VMs only; the gateway VM's eth0 is the
-                // sanctioned egress uplink). Pass an empty path to signal
-                // "no wrapper" — run_limactl_direct checks for empty string.
-                qemu_wrapper: Path::new(""),
-                // The gateway VM is not a sandbox VM; no device lockdown.
-                hardened: false,
-                memory_mb: 2048,
-                cpus: 2,
                 start_timeout_s,
-                // No Docker bridge for the gateway VM itself (it connects via
-                // the forwarded socket, not via a bridge NIC).
-                bridge: None,
-                unrestricted_slirp_for_provisioning: false,
             },
             GATEWAY_START_TIMEOUT + Duration::from_secs(60),
             "gateway: limactl start",

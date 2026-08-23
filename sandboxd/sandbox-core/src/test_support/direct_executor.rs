@@ -162,6 +162,25 @@ fn run_limactl_direct(
                 }
             }
         }
+        // Same argv as Create/Start: the gateway ops differ from them in what
+        // an *agent* is allowed to do with them, and this executor is the
+        // degenerate path where the caller is already the right uid.
+        LimaOp::CreateGateway { vm, yaml_path } => {
+            cmd.args([
+                "create",
+                "--name",
+                vm,
+                &yaml_path.to_string_lossy(),
+                "--tty=false",
+            ]);
+        }
+        LimaOp::StartGateway {
+            vm,
+            start_timeout_s,
+        } => {
+            let timeout_flag = format!("--timeout={start_timeout_s}s");
+            cmd.args(["start", vm, &timeout_flag, "--tty=false"]);
+        }
         LimaOp::Stop { vm, force } => {
             if force {
                 cmd.args(["stop", "--force", vm, "--tty=false"]);

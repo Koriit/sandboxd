@@ -311,11 +311,11 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
 // Docker ops
 // ---------------------------------------------------------------------------
 
-/// The Lima instance hosting the operator's gateway containers.
+/// Name prefix of the Lima instance hosting the operator's gateway containers.
 ///
-/// An agent-side constant, not a field on the op. See
-/// [`own_gateway_docker_socket`] for why that distinction is the whole
-/// point.
+/// The instance name is this plus the agent's own uid — see [`own_gateway_vm`],
+/// which is the only reader. An agent-side constant, not a field on the op; see
+/// [`own_gateway_docker_socket`] for why that distinction is the whole point.
 const GATEWAY_VM_NAME: &str = "sandboxd-gateway";
 
 /// Filename of the gateway VM's forwarded Docker socket inside the instance
@@ -323,7 +323,7 @@ const GATEWAY_VM_NAME: &str = "sandboxd-gateway";
 const GATEWAY_DOCKER_SOCKET_FILENAME: &str = "gateway-docker.sock";
 
 /// The forwarded Docker socket for this agent's own gateway VM:
-/// `{lima_home}/sandboxd-gateway/gateway-docker.sock`.
+/// `{lima_home}/sandboxd-gateway-{uid}/gateway-docker.sock`.
 ///
 /// # Do not make this a parameter
 ///
@@ -354,8 +354,9 @@ const GATEWAY_DOCKER_SOCKET_FILENAME: &str = "gateway-docker.sock";
 /// production behaviour by one byte.
 fn own_gateway_docker_socket(ctx: &RunContext) -> String {
     format!(
-        "{}/{GATEWAY_VM_NAME}/{GATEWAY_DOCKER_SOCKET_FILENAME}",
-        ctx.lima_home
+        "{}/{}/{GATEWAY_DOCKER_SOCKET_FILENAME}",
+        ctx.lima_home,
+        own_gateway_vm(ctx)
     )
 }
 
@@ -690,47 +691,34 @@ async fn run_limactl_steps(ctx: &RunContext, steps: &[Vec<&str>]) -> Result<(), 
 // In-VM ops
 // ---------------------------------------------------------------------------
 
-/// The gateway Lima instance this agent drives.
+/// The gateway Lima instance this agent drives — created, started, executed
+/// inside, and addressed for its forwarded Docker socket.
 ///
-/// An agent-side constant, exactly like [`own_gateway_docker_socket`]'s two
-/// components, and for a reason that is sharper here. A `limactl shell` runs a
-/// command as the VM's login user, and Lima provisions that user with
-/// passwordless `sudo`. If the daemon named the instance, "the agent only runs
-/// reviewed operations" would become "the agent only runs reviewed operations,
-/// as root, in whichever VM it was told to" — and the review would be bounding
-/// nothing that matters.
-///
-/// If a test needs a different instance, give the test its own agent with its
-/// own `RunContext.lima_home`. That is the seam, and it widens no production
-/// behaviour.
-fn own_gateway_vm(_ctx: &RunContext) -> &'static str {
-    GATEWAY_VM_NAME
-}
-
-/// The instance name this agent creates its own gateway VM under.
-///
-/// Same doctrine as [`own_gateway_vm`] and for the same reason — the name is
-/// what `limactl create --name` acts on, so it is derived from the agent's own
-/// `getuid()` and never read off the wire. `BrokerOp::CreateGateway` carries no
-/// VM-name field at all; there is nothing for a daemon to get wrong.
+/// Derived from the agent's own `getuid()` and never read off the wire, for a
+/// reason that is sharper here than anywhere else in the op set. A `limactl
+/// shell` runs a command as the VM's login user, and Lima provisions that user
+/// with passwordless `sudo`. If the daemon named the instance, "the agent only
+/// runs reviewed operations" would become "the agent only runs reviewed
+/// operations, as root, in whichever VM it was told to" — and the review would
+/// be bounding nothing that matters. The same holds for `limactl create
+/// --name`, which is where a name first becomes a VM: `BrokerOp::CreateGateway`
+/// carries no VM-name field at all, so there is nothing for a daemon to get
+/// wrong.
 ///
 /// The uid suffix is not decoration. Gateway instances live in per-operator
 /// LIMA_HOMEs but are enumerated by a single `limactl list`-shaped view of the
 /// host, so an unsuffixed name is ambiguous the moment two operators are
 /// present, and "which operator's gateway is this" stops having an answer.
 ///
-/// # Known divergence from [`own_gateway_vm`]
+/// # One function, not two agreeing ones
 ///
-/// [`own_gateway_vm`] still returns the unsuffixed `sandboxd-gateway` — it, and
-/// the daemon-side constants it mirrors, predate the per-operator naming and
-/// have not been renamed yet. So a VM created or started through this function
-/// is not the VM the in-VM and Docker op paths currently address. That is
-/// survivable only because nothing invokes `CreateGateway` or `StartGateway`
-/// yet: the daemon still creates and starts the gateway through its own direct
-/// path under the unsuffixed name. Whoever wires the daemon to send them must
-/// rename the constants in the same change, or the two halves will name
-/// different instances.
-fn own_gateway_vm_instance_name(ctx: &RunContext) -> String {
+/// This was briefly two functions — an unsuffixed name for the in-VM and Docker
+/// ops and a suffixed one for create and start — and they named different
+/// instances. Nothing detected that, because nothing invoked the gateway ops
+/// yet; the moment the daemon began sending them, a VM would have been created
+/// under one name and executed in under another. Both halves derive from one
+/// function so that agreement is not something two call sites have to maintain.
+fn own_gateway_vm(ctx: &RunContext) -> String {
     format!("{GATEWAY_VM_NAME}-{}", ctx.own_uid)
 }
 
@@ -748,17 +736,15 @@ fn own_gateway_vm_instance_name(ctx: &RunContext) -> String {
 /// daemon that binds a session-shaped instance to a name a typed gateway op
 /// later acts on gets the permissive treatment applied to content it chose.
 ///
-/// So the two names this agent's own gateway ops act on are claimable only
-/// through those ops. Neither is decorative:
+/// So the one name this agent's own gateway ops act on is claimable only
+/// through those ops. [`own_gateway_vm`] is what `StartGateway` boots — with no
+/// qemu-wrapper and therefore no `restrict=on` rewrite of the management NIC —
+/// and it is also what the `InVm` and Docker ops execute inside, as root. The
+/// second of those is the sharper reason; see that function's doc.
 ///
-/// - [`own_gateway_vm_instance_name`] is what `StartGateway` boots, with no
-///   qemu-wrapper and therefore no `restrict=on` rewrite of the management NIC.
-/// - [`own_gateway_vm`] is what the `InVm` and Docker ops execute inside, as
-///   root — see that function's doc for why that is the sharper of the two.
-///
-/// The set is exactly those names and nothing that merely resembles them.
-/// Another operator's gateway lives in another operator's LIMA_HOME and is named
-/// by no op of this agent's, so refusing it would cost legitimate work and buy
+/// The set is exactly that name and nothing that merely resembles it. Another
+/// operator's gateway lives in another operator's LIMA_HOME and is named by no
+/// op of this agent's, so refusing it would cost legitimate work and buy
 /// nothing.
 ///
 /// # What this does not cover
@@ -771,7 +757,7 @@ fn own_gateway_vm_instance_name(ctx: &RunContext) -> String {
 /// than letting `limactl` invent one.
 fn validate_claimed_vm_name(ctx: &RunContext, vm: &str) -> Result<(), String> {
     validation::validate_vm_name(vm)?;
-    if vm == own_gateway_vm_instance_name(ctx) || vm == own_gateway_vm(ctx) {
+    if vm == own_gateway_vm(ctx) {
         return Err(format!(
             "vm name {vm:?} is reserved for this agent's own gateway; it can be \
              claimed only by the gateway ops, which validate the instance they create"
@@ -811,9 +797,10 @@ async fn handle_in_vm(ctx: &RunContext, op: crate::protocol::InVmOp) -> BrokerRe
     };
     let body = crate::protocol::in_vm_stdin_body(&op).map(|b| b.to_string());
 
+    let vm = own_gateway_vm(ctx);
     let mut last: Option<std::process::Output> = None;
     for step in &steps {
-        let argv = sandbox_invm_argv::shell_argv(own_gateway_vm(ctx), step);
+        let argv = sandbox_invm_argv::shell_argv(&vm, step);
         let output = match run_limactl_capture(ctx, &argv, body.as_deref()).await {
             Ok(o) => o,
             Err(result) => return result,
@@ -885,7 +872,7 @@ async fn run_in_vm_transfer(
         }
     }
 
-    let argv = sandbox_invm_argv::copy_argv(&source, own_gateway_vm(ctx), &transfer.destination);
+    let argv = sandbox_invm_argv::copy_argv(&source, &own_gateway_vm(ctx), &transfer.destination);
     let result = run_limactl_capture(ctx, &argv, None).await;
     if scratch {
         let _ = std::fs::remove_file(&source);
@@ -1109,17 +1096,17 @@ async fn handle_create(
 ///
 /// Differences from [`handle_create`], each with a reason:
 /// - The instance name is derived from the agent's own uid, not taken from the
-///   request ([`own_gateway_vm_instance_name`]).
+///   request ([`own_gateway_vm`]).
 /// - The YAML is validated by `validate_gateway_lima_yaml_shape` — one NIC per
 ///   pool slot, each pinned to its own slot's interface name.
-/// - No `sandboxd-owner` marker is written. The gateway is daemon-owned
-///   infrastructure with no per-operator owner; the daemon's existing direct
-///   gateway-create path writes no marker either.
+/// - No `sandboxd-owner` marker is written. The gateway is not tracked by the
+///   Lima orphan reaper's per-operator marker scheme; the daemon's own
+///   gateway-create path, for the gateway it owns itself, writes none either.
 /// - No `QEMU_SYSTEM_AARCH64` is set. The gateway VM runs without the
-///   `restrict=on` qemu-wrapper on its management NIC — again matching the
-///   direct path, which passes an empty wrapper for this instance.
+///   `restrict=on` qemu-wrapper on its management NIC — matching the daemon's
+///   own path, which sets no wrapper variable for a gateway at all.
 async fn handle_create_gateway(ctx: &RunContext, lima_yaml: String) -> BrokerResult {
-    let vm = own_gateway_vm_instance_name(ctx);
+    let vm = own_gateway_vm(ctx);
 
     // The name is agent-constructed, so this cannot fail today. It is called
     // anyway because the property it asserts — safe as a `limactl` positional,
@@ -1167,26 +1154,24 @@ async fn handle_create_gateway(ctx: &RunContext, lima_yaml: String) -> BrokerRes
 ///
 /// Differences from [`handle_start`], each with a reason:
 /// - The instance name is derived from the agent's own uid, not taken from the
-///   request — [`own_gateway_vm_instance_name`], the same function
-///   [`handle_create_gateway`] names the instance with, so the two brokered
-///   gateway ops address the same instance by construction rather than by two
-///   sites agreeing.
+///   request — [`own_gateway_vm`], the same function [`handle_create_gateway`]
+///   names the instance with, so the two brokered gateway ops address the same
+///   instance by construction rather than by two sites agreeing.
 /// - No wrapper is validated or exported, because a gateway has none. There is
 ///   no `QEMU_SYSTEM_AARCH64` in the environment at all rather than an empty
-///   one: the daemon's own direct gateway-start path omits the variable when
-///   the wrapper is empty, so omitting it here makes the brokered environment
-///   identical to the direct one instead of differing by an empty override.
+///   one, which is also what the daemon does for the gateway it owns itself:
+///   both halves of the gateway-start path set no wrapper variable, so the two
+///   environments are identical rather than differing by an empty override.
 /// - No `SANDBOX_RESTRICT_MARKER`. The marker records that the management NIC
 ///   was rewritten to `restrict=on`; nothing rewrites this one, so a marker
 ///   would be a claim no step in this path establishes.
 /// - No `SANDBOX_QEMU_*`. Their only reader is the **Linux** qemu-wrapper
 ///   (device lockdown, systemd cgroup limits); the macOS wrapper reads none of
-///   them, so they are inert here with or without a wrapper. The direct start
-///   path this op supersedes passes them as bare literals beside its empty
-///   wrapper, so nothing that acted is being dropped. The VM's sizing comes from
-///   its template.
+///   them, so they are inert here with or without a wrapper. The daemon's own
+///   gateway-start path drops them for the same reason. The VM's sizing comes
+///   from its template.
 async fn handle_start_gateway(ctx: &RunContext, start_timeout_s: u32) -> BrokerResult {
-    let vm = own_gateway_vm_instance_name(ctx);
+    let vm = own_gateway_vm(ctx);
 
     // Agent-constructed, so this cannot fail today — checked anyway because it
     // is a property of the argv built below. Same reasoning as
@@ -3066,7 +3051,7 @@ mod tests {
     async fn start_gateway_reaches_limactl_without_a_wrapper() {
         let home = tempfile::tempdir().expect("temp LIMA_HOME");
         let ctx = ctx_in(&home);
-        let dir = home.path().join(own_gateway_vm_instance_name(&ctx));
+        let dir = home.path().join(own_gateway_vm(&ctx));
         std::fs::create_dir_all(&dir).expect("instance dir");
         std::fs::write(dir.join("lima.yaml"), "# instance\n").expect("instance lima.yaml");
         let _path = ClearedPath::new();
@@ -3187,11 +3172,14 @@ mod tests {
     /// `restrict=on` rewrite. `handle_clone` reaches the same name the same way,
     /// and `Delete` frees it, so "the name is already taken" is not a defence.
     ///
-    /// Both names are reserved, and neither is merely defensive.
-    /// `own_gateway_vm_instance_name` is what `StartGateway` boots.
-    /// `own_gateway_vm` is what the `InVm` and Docker ops execute inside — as
-    /// root, per that function's own doc — so binding daemon-authored content to
-    /// it hands the daemon a root shell in a VM it shaped.
+    /// The reserved name is not merely defensive, and it is one name doing two
+    /// jobs: `own_gateway_vm` is what `StartGateway` boots, and it is also what
+    /// the `InVm` and Docker ops execute inside — as root, per that function's
+    /// own doc — so binding daemon-authored content to it hands the daemon a
+    /// root shell in a VM it shaped. The loop below iterates a one-element set
+    /// because the two names it used to hold have been collapsed into that
+    /// function; the shape stays so a second reserved name can be added to the
+    /// array rather than to the test.
     ///
     /// What this test can and cannot show: with `PATH` cleared, an op that clears
     /// every gate is turned away at `limactl` resolution, so "the agent does not
@@ -3204,10 +3192,7 @@ mod tests {
         let ctx = ctx_in(&home);
         let _path = ClearedPath::new();
 
-        let reserved = [
-            own_gateway_vm_instance_name(&ctx),
-            own_gateway_vm(&ctx).to_string(),
-        ];
+        let reserved = [own_gateway_vm(&ctx)];
 
         for vm in &reserved {
             let claims = [
@@ -3347,7 +3332,7 @@ mod tests {
 
         // And it starts once the instance exists, so the check gates on presence
         // rather than refusing outright.
-        let dir = home.path().join(own_gateway_vm_instance_name(&ctx));
+        let dir = home.path().join(own_gateway_vm(&ctx));
         std::fs::create_dir_all(&dir).expect("instance dir");
         std::fs::write(dir.join("lima.yaml"), "# instance\n").expect("instance lima.yaml");
         let result = dispatch_op(
@@ -3946,6 +3931,11 @@ mod tests {
     /// so whatever names a Docker daemon in it is the sole authority for
     /// which one the transfer reaches — and the container being synced into
     /// lives in this agent's VM, not on any host daemon.
+    ///
+    /// The uid suffix on the instance directory is spelled out rather than
+    /// derived: a test that rebuilt the expected path with the same function
+    /// the transport uses would agree with any name that function produced,
+    /// including a wrong one.
     #[test]
     fn the_container_rsync_transport_names_the_agents_own_socket() {
         let ctx = ctx(501);
@@ -3953,7 +3943,7 @@ mod tests {
         assert_eq!(
             transport,
             format!(
-                "docker -H unix://{}/sandboxd-gateway/gateway-docker.sock exec -i",
+                "docker -H unix://{}/sandboxd-gateway-501/gateway-docker.sock exec -i",
                 ctx.lima_home
             )
         );
@@ -3985,7 +3975,7 @@ mod tests {
                 "docker".to_string(),
                 "-H".to_string(),
                 format!(
-                    "unix://{}/sandboxd-gateway/gateway-docker.sock",
+                    "unix://{}/sandboxd-gateway-501/gateway-docker.sock",
                     ctx.lima_home
                 ),
                 "exec".to_string(),

@@ -2437,8 +2437,12 @@ impl sandbox_core::lima::LimaExecutor for AgentBrokerExecutor {
 /// Map a `LimaOp` to a `BrokerOp` for wire serialization.
 ///
 /// For ops that carry a `yaml_path`, the file is read from disk here so the
-/// full YAML content is available for inclusion in the `BrokerOp::Create`
-/// payload. All other ops are a straightforward field-for-field mapping.
+/// full YAML content travels in the payload instead of a path the agent would
+/// have to open. The two gateway ops additionally **drop** their `vm` field:
+/// the wire carries no gateway instance name because the agent derives it from
+/// its own uid, so this is where the daemon-side name stops travelling and
+/// starts being checked instead — see [`expect_agent_derived_gateway_name`].
+/// All other ops are a straightforward field-for-field mapping.
 fn lima_op_to_broker_op(
     op_uid: u32,
     op: sandbox_core::lima::LimaOp<'_>,
@@ -2504,6 +2508,26 @@ fn lima_op_to_broker_op(
             }),
             unrestricted_slirp_for_provisioning,
         },
+        LimaOp::CreateGateway { vm, yaml_path } => {
+            expect_agent_derived_gateway_name(op_uid, vm, label)?;
+            let lima_yaml = std::fs::read_to_string(yaml_path).map_err(|e| {
+                SandboxError::Lima(format!(
+                    "{label}: failed to read lima.yaml at {}: {e}",
+                    yaml_path.display()
+                ))
+            })?;
+            BrokerOp::CreateGateway { op_uid, lima_yaml }
+        }
+        LimaOp::StartGateway {
+            vm,
+            start_timeout_s,
+        } => {
+            expect_agent_derived_gateway_name(op_uid, vm, label)?;
+            BrokerOp::StartGateway {
+                op_uid,
+                start_timeout_s,
+            }
+        }
         LimaOp::Stop { vm, force } => BrokerOp::Stop {
             op_uid,
             vm: vm.to_string(),
@@ -2565,6 +2589,40 @@ fn lima_op_to_broker_op(
             vm: vm.to_string(),
         },
     })
+}
+
+/// Check that `vm` is the gateway instance name the agent will derive for
+/// `op_uid`, before sending an op that does not carry the name.
+///
+/// The brokered gateway ops deliberately have no VM-name field: the agent
+/// names its own gateway from its own `getuid()`, which is what keeps a
+/// gateway create or start from being aimed at an arbitrary instance. That
+/// removes the daemon's *control* over the name, not its *dependency* on it —
+/// every later op on this gateway (the forwarded Docker socket path, the
+/// in-VM steps, the state probe) addresses the instance by the name the
+/// daemon holds. If the two ever disagreed, both halves would succeed and
+/// operate on different VMs.
+///
+/// So this is checked rather than assumed, on the last line where both names
+/// are in hand. The comparison is against the literal suffixed form and not
+/// against `gateway_instance_name(op_uid)`, because the agent's derivation
+/// reads no configuration: it suffixes unconditionally. Reproducing that here
+/// makes the check independent of the daemon's own mode switch, which is the
+/// only way it can catch a mode-switch mistake rather than share it.
+fn expect_agent_derived_gateway_name(
+    op_uid: u32,
+    vm: &str,
+    label: &str,
+) -> Result<(), sandbox_core::error::SandboxError> {
+    let agent_derived = format!("{}-{op_uid}", sandbox_core::GATEWAY_INSTANCE_NAME);
+    if vm == agent_derived {
+        return Ok(());
+    }
+    Err(sandbox_core::error::SandboxError::Internal(format!(
+        "{label}: the daemon addresses this gateway as {vm:?}, but the operator's agent \
+         derives {agent_derived:?} from its own uid; the op carries no name, so the two \
+         halves would act on different instances"
+    )))
 }
 
 /// Map a `BrokerResult` from the agent back to a `std::process::Output`.
@@ -2720,11 +2778,13 @@ fn run_limactl_direct(
         LimaOp::Create { vm, yaml_path, .. } => {
             // The `owner` field is not used here: in the brokered path the
             // agent writes the `sandboxd-owner` marker file after a successful
-            // `limactl create`. In the direct (daemon-uid) path this arm is
-            // only reached for the gateway Lima instance — daemon-owned infra
-            // that does not require a per-operator owner marker (the gateway
-            // instance is managed exclusively by the daemon, not by any
-            // operator-uid recovery logic that would read the marker).
+            // `limactl create`, and nothing on this path does. This arm is
+            // reached only when a session VM's operator uid *is* the daemon
+            // uid — an install where the two accounts coincide — so the marker
+            // the orphan reaper reads to attribute a VM to an operator is
+            // absent for those VMs. The gateway does not come through here:
+            // it has its own variant, because it is held to a different
+            // NIC-shape rule.
             cmd.args([
                 "create",
                 "--name",
@@ -2750,9 +2810,16 @@ fn run_limactl_direct(
             // it instead of the system qemu binary. This mirrors the agent's
             // handle_start behaviour exactly: the wrapper is what injects
             // `restrict=on` into the management NIC, enforcing egress control.
-            // A non-empty wrapper path must always be set for session VMs —
-            // only the gateway instance passes an empty path (gateway infra
-            // deliberately omits restrict=on on its management NIC).
+            // No caller reaches this arm with an empty path any more: the
+            // gateway was the one VM that legitimately booted unwrapped, and
+            // `StartGateway` now says so by being a different variant rather
+            // than by an emptiness test here deciding it. Every remaining
+            // `LimaOp::Start` resolves a real wrapper, including the
+            // base-image build — which keeps its wrapper and opts out of the
+            // rewrite through `unrestricted_slirp_for_provisioning` instead.
+            // The branch stays because the field is a path and nothing in the
+            // type forbids an empty one; the brokered path already refuses
+            // that outright, and this one does not.
             let qemu_wrapper_str = qemu_wrapper.to_string_lossy().into_owned();
             if !qemu_wrapper_str.is_empty() {
                 cmd.env("QEMU_SYSTEM_AARCH64", &qemu_wrapper_str);
@@ -2787,6 +2854,38 @@ fn run_limactl_direct(
             if unrestricted_slirp_for_provisioning {
                 cmd.env("SANDBOX_UNRESTRICTED_SLIRP_FOR_PROVISIONING", "1");
             }
+        }
+        LimaOp::CreateGateway { vm, yaml_path } => {
+            // Identical argv to `LimaOp::Create`, and deliberately so: the two
+            // ops differ in what the *agent* is permitted to do with them, not
+            // in what `limactl` is asked. Here the daemon is the owner, so
+            // there is no permission question to answer — only the same
+            // create, under the name this daemon will keep addressing.
+            cmd.args([
+                "create",
+                "--name",
+                vm,
+                &yaml_path.to_string_lossy(),
+                "--tty=false",
+            ]);
+        }
+        LimaOp::StartGateway {
+            vm,
+            start_timeout_s,
+        } => {
+            // No `QEMU_SYSTEM_AARCH64`, so no wrapper and no restrict=on
+            // rewrite of the management NIC — that is what makes this the
+            // gateway's start and not a session VM's. No
+            // `SANDBOX_RESTRICT_MARKER` either: the marker records that the
+            // rewrite happened, and nothing here rewrites anything, so writing
+            // one would be a claim this path does not establish. The
+            // `SANDBOX_QEMU_*` trio is dropped for the reason recorded on
+            // `LimaOp::StartGateway` — only the Linux wrapper reads them, and
+            // there is no wrapper on this invocation at all. Dropping them
+            // makes this environment identical to the brokered one rather than
+            // differing from it by three inert variables.
+            let timeout_flag = format!("--timeout={start_timeout_s}s");
+            cmd.args(["start", vm, &timeout_flag, "--tty=false"]);
         }
         LimaOp::Stop { vm, force } => {
             if force {

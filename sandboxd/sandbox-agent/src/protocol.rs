@@ -288,12 +288,12 @@ pub enum BrokerOp {
     /// and a daemon that names the instance can point a reviewed operation at
     /// an arbitrary one. With no field there is nothing to get wrong.
     ///
-    /// Consequently there is also no `owner` field (the gateway is daemon-owned
-    /// infrastructure and gets no per-operator owner marker — this matches what
-    /// the existing daemon-uid direct path does today) and no `qemu_wrapper`
-    /// field (the gateway VM deliberately runs without the `restrict=on`
-    /// wrapper on its management NIC; `Create`'s wrapper field is already
-    /// empty on this path).
+    /// Consequently there is also no `owner` field (a gateway is not tracked by
+    /// the orphan reaper's per-operator marker scheme and gets no owner marker
+    /// — this matches what the daemon does for the gateway it owns itself) and
+    /// no `qemu_wrapper` field (the gateway VM deliberately runs without the
+    /// `restrict=on` wrapper on its management NIC, and the daemon's own
+    /// gateway path sets no wrapper variable either).
     CreateGateway {
         op_uid: u32,
         /// The complete rendered `lima.yaml` content. The agent validates it

@@ -84,6 +84,26 @@ mod tests {
                     let timeout_flag = format!("--timeout={start_timeout_s}s");
                     cmd.args(["start", vm, &timeout_flag, "--tty=false"]);
                 }
+                // The gateway manager issues these two rather than the general
+                // Create/Start; the argv is the same because the difference
+                // between the pairs is what an *agent* may do with them, and
+                // this executor is the daemon-uid path where there is no agent.
+                LimaOp::CreateGateway { vm, yaml_path } => {
+                    cmd.args([
+                        "create",
+                        "--name",
+                        vm,
+                        &yaml_path.to_string_lossy(),
+                        "--tty=false",
+                    ]);
+                }
+                LimaOp::StartGateway {
+                    vm,
+                    start_timeout_s,
+                } => {
+                    let timeout_flag = format!("--timeout={start_timeout_s}s");
+                    cmd.args(["start", vm, &timeout_flag, "--tty=false"]);
+                }
                 LimaOp::Stop { vm, force } => {
                     if force {
                         cmd.args(["stop", "--force", vm, "--tty=false"]);

@@ -948,6 +948,38 @@ pub enum LimaOp<'a> {
         bridge: Option<(&'a str, &'a str)>,
         unrestricted_slirp_for_provisioning: bool,
     },
+    /// Create the gateway Lima instance owned by `op_uid`.
+    ///
+    /// Split from [`LimaOp::Create`] because the two are different operations,
+    /// not one operation under two names. A session VM must carry a
+    /// `socket_vmnet` NIC and must boot behind the `restrict=on` qemu-wrapper;
+    /// a gateway VM legitimately does neither — its `eth0` is the sanctioned
+    /// uplink. Keeping them as separate variants means which rule set applies
+    /// is decided by *which variant the caller constructed*, so no field on a
+    /// request can move a VM from one to the other.
+    ///
+    /// `vm` is the instance name the daemon addresses for every later op on
+    /// this gateway. It is deliberately **not** carried on the wire when this
+    /// op is brokered: the operator's agent derives the name from its own
+    /// `getuid()`, so a brokered gateway create cannot be aimed at an
+    /// arbitrary instance. The macOS executor checks the name it holds against
+    /// the name the agent will derive before sending.
+    ///
+    /// macOS-only in practice. The Linux gateway is a container, not a Lima
+    /// instance, and `sandbox-lima-helper` has no subcommand for this.
+    CreateGateway {
+        vm: &'a str,
+        yaml_path: &'a std::path::Path,
+    },
+    /// Start the gateway Lima instance owned by `op_uid`.
+    ///
+    /// Split from [`LimaOp::Start`] for the reason given on
+    /// [`LimaOp::CreateGateway`], and carrying none of its fields. There is no
+    /// wrapper because a gateway has none, and no `hardened`/`memory_mb`/`cpus`
+    /// because those reach `limactl` as `SANDBOX_QEMU_*` and are read only by
+    /// the **Linux** qemu-wrapper; a gateway's sizing comes from the `cpus:`
+    /// and `memory:` lines of the template it was created from.
+    StartGateway { vm: &'a str, start_timeout_s: u32 },
     /// `sandbox-lima-helper stop --vm <vm> [--force]`
     Stop { vm: &'a str, force: bool },
     /// `sandbox-lima-helper delete --vm <vm>`
@@ -1201,6 +1233,16 @@ impl LimaExecutor for SetuidHelperExecutor {
                         cmd.arg("--unrestricted-slirp-for-provisioning");
                     }
                 }
+            }
+            LimaOp::CreateGateway { .. } | LimaOp::StartGateway { .. } => {
+                // No helper subcommand exists to flatten these to, and none
+                // should: on Linux the gateway is a container, so there is no
+                // gateway Lima instance for the helper to act on. Constructing
+                // one here is a routing mistake, not a missing feature.
+                return Err(SandboxError::Internal(format!(
+                    "{label}: gateway Lima ops have no sandbox-lima-helper subcommand \
+                     (the Linux gateway is a container, not a Lima instance)"
+                )));
             }
             LimaOp::Stop { vm, force } => {
                 cmd.arg("stop")
