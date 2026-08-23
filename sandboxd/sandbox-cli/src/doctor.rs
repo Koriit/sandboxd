@@ -463,6 +463,12 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
         // C25 — operator in '_sandboxd' group. Host-side getgrouplist
         // probe; no daemon dependency. Mirrors the Linux C4 check.
         set.spawn_blocking(check_group_membership_macos);
+        {
+            let diag = Arc::clone(&diagnostics);
+            set.spawn_blocking(move || {
+                check_gateway_vm_orphans(diag.as_ref().as_ref(), socket_reachable)
+            });
+        }
     }
 
     // Drain the JoinSet; a panicking task surfaces as a `JoinError`
@@ -1918,6 +1924,73 @@ fn resolve_macos_group_membership() -> Result<MacGroupMembership, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Individual checks — C26 (orphaned gateway VMs, macOS-only)
+// ---------------------------------------------------------------------------
+
+/// C26 — gateway VMs left behind by de-enrolled operators.
+///
+/// Nothing reclaims one. The Lima orphan reaper skips the gateway name
+/// grammar deliberately, recovery restarts rather than deletes, and deleting a
+/// VM that may still hold running sessions is not something to do
+/// automatically. Reclamation is therefore an administrative act, which makes
+/// visibility the whole job: the cost is a multi-GB disk image and its memory
+/// reservation, charged indefinitely to a host nobody is auditing.
+///
+/// **Fails rather than passing with a note**, because the cheap reading of an
+/// orphan — wasted disk — is the benign half. A *running* one still holds the
+/// slot-socket fd it opened before its owner was de-enrolled: membership is
+/// checked at `connect(2)` and not continuously, so it stays on a segment that
+/// may since have been reassigned to somebody else. That is the residue the
+/// de-enrollment sequence exists to prevent, and this row is what catches it
+/// having been skipped. The daemon reports presence and not run-state, so the
+/// verdict takes the safe direction for both.
+#[cfg(target_os = "macos")]
+fn check_gateway_vm_orphans(
+    diagnostics: Option<&DiagnosticsPayload>,
+    socket_reachable: bool,
+) -> CheckRow {
+    if !socket_reachable {
+        return requires_daemon_skip("C26", "orphaned gateway VMs");
+    }
+    let Some(orphans) = diagnostics.and_then(|d| d.gateway_vm_orphans.as_ref()) else {
+        return CheckRow {
+            id: "C26",
+            name: "orphaned gateway VMs",
+            outcome: CheckOutcome::Skip {
+                detail: "/diagnostics probe failed".to_string(),
+                hint: None,
+            },
+        };
+    };
+    if orphans.is_empty() {
+        return CheckRow {
+            id: "C26",
+            name: "orphaned gateway VMs",
+            outcome: CheckOutcome::Pass {
+                detail: "no gateway VM belongs to a de-enrolled operator".to_string(),
+            },
+        };
+    }
+    CheckRow {
+        id: "C26",
+        name: "orphaned gateway VMs",
+        outcome: CheckOutcome::Fail {
+            detail: format!(
+                "{} left by de-enrolled operators: {}",
+                orphans.len(),
+                orphans.join("; ")
+            ),
+            hint: Some(
+                "stop it first, then reclaim deliberately — it may still hold \
+                 sessions: sudo -u <operator> env LIMA_HOME=<the lima dir above> \
+                 limactl stop <instance> && ... limactl delete --force <instance>"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Individual checks — C9 (route-helper caps)
 // ---------------------------------------------------------------------------
 
@@ -2449,6 +2522,12 @@ pub(crate) struct DiagnosticsPayload {
     #[serde(default)]
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub vmnet_pool_leaked_slots: Option<Vec<u16>>,
+    /// Gateway VMs whose owning operator is no longer enrolled, one
+    /// operator-facing line each. Host-scoped rather than caller-scoped:
+    /// a departed operator is by definition never the caller.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub gateway_vm_orphans: Option<Vec<String>>,
     /// Version-pinned gateway image tag present inside the gateway Lima
     /// instance — `Some(tag)` only when the image is actually present.
     #[serde(default)]
@@ -3091,6 +3170,7 @@ mod tests {
             vmnet_pool_size: None,
             vmnet_pool_claimed: None,
             vmnet_pool_leaked_slots: None,
+            gateway_vm_orphans: None,
             gateway_image_tag_inside_lima: None,
             gateway_image_inside_lima_present: None,
             gateway_image_inside_lima_expected_tag: None,
@@ -3469,7 +3549,9 @@ mod tests {
         #[cfg(target_os = "linux")]
         daemon_dependent.push("C6");
         #[cfg(target_os = "macos")]
-        daemon_dependent.extend(["C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23"]);
+        daemon_dependent.extend([
+            "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C26",
+        ]);
         for id in daemon_dependent {
             let row = rows.iter().find(|r| r.id == id).expect("row present");
             assert!(
@@ -3662,7 +3744,7 @@ mod tests {
                 "C9 (route-helper caps) must be absent on macOS"
             );
             for id in [
-                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C25",
+                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C25", "C26",
             ] {
                 assert!(ids.contains(id), "{id} must be present on macOS");
             }
@@ -3680,7 +3762,7 @@ mod tests {
                 "C9 (route-helper caps) must be present on Linux"
             );
             for id in [
-                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C25",
+                "C16", "C17", "C18", "C19", "C20", "C21", "C22", "C23", "C25", "C26",
             ] {
                 assert!(!ids.contains(id), "{id} must be absent on Linux");
             }
@@ -3815,6 +3897,63 @@ mod tests {
                 assert!(detail.contains("leaked"), "got: {detail}")
             }
             other => panic!("expected Fail on leak, got {other:?}"),
+        }
+    }
+
+    /// An orphan must not be reported the way an absent probe is.
+    ///
+    /// The two collapse easily: a daemon too old to send the field and a host
+    /// with nothing to report both arrive as "no orphans in hand". Rendering
+    /// them alike would make an un-upgraded daemon look like a clean host —
+    /// permanently, and in the direction that says nothing is wrong.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c26_separates_a_clean_host_from_a_probe_that_did_not_answer() {
+        let mut d = diag_default();
+        d.gateway_vm_orphans = Some(vec![]);
+        assert!(matches!(
+            check_gateway_vm_orphans(Some(&d), true).outcome,
+            CheckOutcome::Pass { .. }
+        ));
+
+        // Field absent — an older daemon, not a verdict.
+        let d = diag_default();
+        assert!(matches!(
+            check_gateway_vm_orphans(Some(&d), true).outcome,
+            CheckOutcome::Skip { .. }
+        ));
+    }
+
+    /// The row has to name the VM, because reclaiming it is manual.
+    ///
+    /// The hint is a template — an operator who cannot see which instance it
+    /// refers to has been told to run a command they cannot fill in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c26_names_every_orphan_it_found() {
+        let mut d = diag_default();
+        d.gateway_vm_orphans = Some(vec![
+            "/var/lib/sandboxd/300/528/lima/sandboxd-gateway-528 (uid 528 is no longer in '_sandboxd')"
+                .to_string(),
+            "/var/lib/sandboxd/300/531/lima/sandboxd-gateway-531 (uid 531 no longer resolves to an account)"
+                .to_string(),
+        ]);
+        match check_gateway_vm_orphans(Some(&d), true).outcome {
+            CheckOutcome::Fail { detail, hint } => {
+                assert!(detail.contains("sandboxd-gateway-528"), "got: {detail}");
+                assert!(detail.contains("sandboxd-gateway-531"), "got: {detail}");
+                assert!(detail.contains('2'), "the count is missing: {detail}");
+                let hint = hint.expect("an unreclaimable orphan needs a remedy");
+                assert!(hint.contains("limactl delete"), "got: {hint}");
+                // Stopping precedes deleting: a running orphan is the one
+                // holding a slot fd, and deleting it out from under a live
+                // session is the hazard automatic reclamation was declined for.
+                assert!(
+                    hint.find("limactl stop") < hint.find("limactl delete"),
+                    "the remedy must stop before deleting: {hint}"
+                );
+            }
+            other => panic!("expected Fail with both orphans named, got {other:?}"),
         }
     }
 

@@ -11928,6 +11928,92 @@ async fn version_handler() -> impl IntoResponse {
         .into_response()
 }
 
+/// Per-operator gateway VMs left behind by an operator who is no longer
+/// enrolled, one operator-facing line each.
+///
+/// Nothing on the host reclaims these. The Lima orphan reaper skips the
+/// `sandboxd-gateway-*` grammar deliberately, recovery restarts rather than
+/// deletes, and the only production `delete_instance` is the startup resize
+/// rebuild. Deleting a gateway that may still hold running sessions is not
+/// something to do automatically, so reclamation stays an administrative act —
+/// which leaves this as the thing that has to be *visible*, because a VM with
+/// no owner costs disk and memory indefinitely and nobody goes looking for it.
+///
+/// A directory is scanned rather than `limactl list`: each per-operator subtree
+/// is named by its owner's uid, and the daemon can read the names of its own
+/// base-dir entries without entering an operator-owned tree or running anything
+/// as them.
+///
+/// Not-in-the-group and does-not-resolve are both reported, and the second is
+/// the stronger case — the account itself is gone, so there is no one left to
+/// ask. They are named apart in the line because the remedies differ: one
+/// operator can be re-enrolled, the other cannot.
+#[cfg(target_os = "macos")]
+fn orphaned_gateway_vms(base_dir: &std::path::Path, daemon_uid: u32) -> Vec<String> {
+    let group = broker::sandbox_group_name();
+    orphaned_gateway_vms_with(base_dir, daemon_uid, &group, |uid| {
+        broker::uid_in_sandbox_group(uid, &group)
+    })
+}
+
+/// [`orphaned_gateway_vms`] with the membership lookup supplied rather than
+/// read from Directory Services, so the directory-scan half can be tested
+/// without enrolling or deleting a real account.
+#[cfg(target_os = "macos")]
+fn orphaned_gateway_vms_with<F>(
+    base_dir: &std::path::Path,
+    daemon_uid: u32,
+    group: &str,
+    enrolled: F,
+) -> Vec<String>
+where
+    F: Fn(u32) -> Option<bool>,
+{
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u32, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(uid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        // The daemon's own tree is never an orphan: it holds the gateway that
+        // serves every operator whose own VM is absent, and the daemon is not
+        // enrolled the way an operator is.
+        if uid == daemon_uid {
+            continue;
+        }
+        let instance = entry
+            .path()
+            .join("lima")
+            .join(sandbox_core::gateway_lima::gateway_instance_name(uid));
+        if !instance.is_dir() {
+            continue;
+        }
+        match enrolled(uid) {
+            Some(true) => {}
+            Some(false) => out.push((
+                uid,
+                format!(
+                    "{} (uid {uid} is no longer in '{group}')",
+                    instance.display()
+                ),
+            )),
+            None => out.push((
+                uid,
+                format!(
+                    "{} (uid {uid} no longer resolves to an account)",
+                    instance.display()
+                ),
+            )),
+        }
+    }
+    // Ordered by uid so the rendered row is stable across calls; `read_dir`
+    // yields in directory order, which is not.
+    out.sort_by_key(|(uid, _)| *uid);
+    out.into_iter().map(|(_, line)| line).collect()
+}
+
 /// Diagnostics endpoint: `GET /diagnostics`
 ///
 /// Carries two distinct classes of data:
@@ -12545,6 +12631,21 @@ async fn diagnostics_handler(
         // is a larger probe; here we land the field as an informational
         // marker so the doctor row exists and renders a neutral verdict.
         fields.push(("tcc_workspace_access", serde_json::json!("informational")));
+
+        // Gateway VMs belonging to operators who are no longer enrolled.
+        //
+        // **Host-scoped, not caller-scoped**, and deliberately so: the whole
+        // point is a VM whose operator is gone, which no caller-scoped view can
+        // ever contain. Scoping it to the caller would make it permanently
+        // empty — the exact silence it exists to break.
+        let orphan_base = state.base_dir.clone();
+        let orphan_daemon_uid = state.daemon_uid;
+        let gateway_vm_orphans = tokio::task::spawn_blocking(move || {
+            orphaned_gateway_vms(&orphan_base, orphan_daemon_uid)
+        })
+        .await
+        .unwrap_or_default();
+        fields.push(("gateway_vm_orphans", serde_json::json!(gateway_vm_orphans)));
 
         fields
     };
@@ -16685,6 +16786,116 @@ mod tests {
     fn error_body(err: SandboxError) -> (StatusCode, ApiError) {
         let (status, Json(body)) = error_response(err);
         (status, body)
+    }
+
+    // -----------------------------------------------------------------------
+    // Gateway VMs left behind by de-enrolled operators.
+    // -----------------------------------------------------------------------
+
+    /// Lay out `<base>/<uid>/lima/<gateway-instance-name>` for each uid.
+    ///
+    /// The instance name comes from the same function production uses rather
+    /// than a literal, so the fixture stays correct in both gateway modes
+    /// instead of quietly matching nothing in one of them.
+    #[cfg(target_os = "macos")]
+    fn gateway_tree(base: &std::path::Path, uids: &[u32]) {
+        for &uid in uids {
+            let dir = base
+                .join(uid.to_string())
+                .join("lima")
+                .join(sandbox_core::gateway_lima::gateway_instance_name(uid));
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+        }
+    }
+
+    /// Enrollment is what separates an orphan from an ordinary operator's VM,
+    /// and it is the only thing that does — the two are identical on disk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_enrolled_operators_gateway_is_not_an_orphan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        gateway_tree(tmp.path(), &[501, 528]);
+
+        let found = orphaned_gateway_vms_with(tmp.path(), 300, "_sandboxd", |uid| Some(uid == 501));
+
+        assert_eq!(found.len(), 1, "expected only 528, got: {found:?}");
+        assert!(found[0].contains("528"), "got: {found:?}");
+    }
+
+    /// A departed operator whose account is gone reads as `None` from the
+    /// membership lookup, not as `Some(false)`.
+    ///
+    /// That is the *stronger* orphan — nobody is left to re-enroll — so
+    /// treating the failed lookup as "assume enrolled" would hide exactly the
+    /// case with no other owner to notice it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unresolvable_uid_is_an_orphan_and_says_so() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        gateway_tree(tmp.path(), &[531]);
+
+        let found = orphaned_gateway_vms_with(tmp.path(), 300, "_sandboxd", |_| None);
+
+        assert_eq!(found.len(), 1, "got: {found:?}");
+        assert!(
+            found[0].contains("no longer resolves"),
+            "the two orphan causes need different remedies and must read \
+             differently: {found:?}"
+        );
+    }
+
+    /// The daemon's own tree holds the gateway that serves everyone whose own
+    /// VM is absent. Reporting it would make every host permanently dirty.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_daemons_own_gateway_is_never_an_orphan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        gateway_tree(tmp.path(), &[300]);
+
+        // Membership says "not enrolled" for every uid — the daemon is not
+        // enrolled the way an operator is, so the exclusion cannot rest on
+        // the lookup answering differently for it.
+        let found = orphaned_gateway_vms_with(tmp.path(), 300, "_sandboxd", |_| Some(false));
+
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    /// A per-operator subtree with no gateway VM in it is not a finding.
+    ///
+    /// Every operator has a state dir; only some have a gateway. Keying on the
+    /// directory rather than the VM would report the whole roster.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_state_dir_without_a_gateway_vm_is_not_reported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("528").join("lima")).expect("fixture");
+        // Non-uid entries share the base dir with the per-operator trees.
+        std::fs::create_dir_all(tmp.path().join("sessions")).expect("fixture");
+        std::fs::write(tmp.path().join("sessions.db"), b"x").expect("fixture");
+
+        let found = orphaned_gateway_vms_with(tmp.path(), 300, "_sandboxd", |_| Some(false));
+
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    /// `read_dir` yields in directory order, which is not stable. A row that
+    /// reorders between runs reads as the set having changed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn orphans_are_reported_in_a_stable_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        gateway_tree(tmp.path(), &[900, 528, 701]);
+
+        let found = orphaned_gateway_vms_with(tmp.path(), 300, "_sandboxd", |_| Some(false));
+
+        let uids: Vec<&str> = found
+            .iter()
+            .map(|line| {
+                let (_, rest) = line.split_once("uid ").expect("line names a uid");
+                rest.split_whitespace().next().expect("uid token")
+            })
+            .collect();
+        assert_eq!(uids, ["528", "701", "900"], "got: {found:?}");
     }
 
     // -----------------------------------------------------------------------
