@@ -2035,6 +2035,14 @@ setup-darwin-vmnet-plists: setup-darwin-socket-vmnet-staging setup-darwin-sandbo
 #   2. The daemon is bootstrapped (started).
 #   3. socket_vmnet has created the socket (usually within a second).
 # This target polls for the sockets and fails loudly if they don't appear.
+#
+# The expected socket group is read back out of the plist rather than named as a
+# constant, because on a per-operator pool there is no single right constant —
+# see the check itself for why. The walk over ProgramArguments ends on plutil
+# failing past the last index; the literal 8 is only a runaway bound, well above
+# the 3 elements a slot plist carries (/bin/sh -c <cmd>). A plist that somehow
+# named its group past index 7 leaves the group empty and hard-fails, which is
+# the direction to fail in.
 setup-darwin-vmnet-daemons: setup-darwin-vmnet-plists
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 	  echo "$(GREEN)✓ already configured: setup-darwin-vmnet-daemons skipped (not macOS)$(RESET)"; \
