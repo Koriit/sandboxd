@@ -3,7 +3,7 @@
 	setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir \
 	setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-sandboxd-group setup-darwin-sandboxd-user setup-darwin-operator-group-membership setup-darwin-operator-slot-group \
 	setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-test-sudoers-fragment \
-	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-lite-image \
+	build-route-helper-linux-aarch64 stage-route-helper-linux-aarch64 build-guest-linux-aarch64 stage-gateway-image stage-lite-image \
 	stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test \
 	setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared \
 	codesign-test-bins
@@ -786,7 +786,7 @@ endif
 endif
 
 ifeq ($(HOST_OS),Darwin)
-setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-operator-slot-group setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-lite-image codesign-test-bins
+setup-dev-env: install-guest-prod install-agent-test setup-darwin-sandboxd-user setup-darwin-socket-vmnet-staging setup-darwin-vmnet-plists setup-darwin-vmnet-daemons setup-darwin-state-dirs setup-darwin-operator-group-membership setup-darwin-operator-slot-group setup-darwin-sandboxd-test-group setup-darwin-sandboxd-test-user setup-darwin-sandboxd-test-state-dir setup-darwin-sandboxd-test-operator-group-membership setup-darwin-sandboxd-test-vmnet-group-membership setup-darwin-sandbox-shared setup-darwin-test-sudoers-fragment stage-gateway-image-test stage-lite-image-test stage-route-helper-linux-aarch64-test stage-route-helper-linux-aarch64 stage-gateway-image stage-lite-image codesign-test-bins
 	@echo "$(GREEN)✓ make setup-dev-env complete (Darwin)$(RESET)"
 else
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap install-lima-helper-prod-cap install-lima-helper-test-cap install-guest-prod setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-sandbox-test-user setup-operator-group-membership setup-test-sudoers-fragment setup-sandboxd-state-dir setup-sandboxd-per-uid-state-dir
@@ -1468,6 +1468,7 @@ build-guest-linux-aarch64:
 ifeq ($(SANDBOX_DAEMON_USER),$(DARWIN_SANDBOXD_ACCOUNT))
 stage-route-helper-linux-aarch64: setup-darwin-sandboxd-user
 stage-lite-image: setup-darwin-sandboxd-user
+stage-gateway-image: setup-darwin-sandboxd-user
 endif
 
 # stage-route-helper-linux-aarch64 — copy the Linux aarch64 route-helper into
@@ -1510,22 +1511,98 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 1; \
 	fi; \
+	_daemon_group=$$(id -gn "$$_daemon_user" 2>/dev/null); \
+	if [ -z "$$_daemon_group" ]; then \
+	  echo "ERROR: cannot resolve the primary group of '$$_daemon_user'."; \
+	  exit 1; \
+	fi; \
 	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/sandbox-route-helper-linux-aarch64"; \
 	_staged="/var/lib/sandboxd/$$_daemon_uid/sandbox-route-helper-linux-aarch64"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] mkdir -p $$_lima_home"; \
-	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_user" -m 0750 "$$_lima_home"; \
+	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_group" -m 0750 "$$_lima_home" || exit 1; \
 	fi; \
 	for _target in "$$_dst" "$$_staged"; do \
 	  if sudo -k cmp -s "$$_built" "$$_target" 2>/dev/null; then \
 	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
 	  else \
-	    echo "[sudo] install -m 0755 $$_built $$_target"; \
-	    sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0755 "$$_built" "$$_target"; \
+	    echo "[sudo] install -o $$_daemon_user -g $$_daemon_group -m 0755 $$_built $$_target"; \
+	    sudo -k install -o "$$_daemon_user" -g "$$_daemon_group" -m 0755 "$$_built" "$$_target" || exit 1; \
 	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
 	  fi; \
 	done
+
+# stage-gateway-image — save the sandbox-gateway Docker image as a tarball where
+# `GatewayLimaManager::load_gateway_image_if_needed` can find it when the gateway
+# VM is readied on macOS.
+#
+# Same two destinations and same reason as stage-lite-image below:
+#
+#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/{daemon-uid}/lima/gateway-image.tar  <- primary
+#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/gateway-image.tar                    <- per-daemon
+#
+# On a production install it is install.sh that writes the per-daemon copy; this
+# target is the dev-flow equivalent, and it is the only way to get the tarball to
+# a gateway whose owner is not the daemon itself. Without it, a dev daemon with
+# per-operator gateways boots an operator's VM and then cannot load an image into
+# it.
+#
+# The image must already be built (make gateway-image) — this target does not
+# take that build as a prerequisite, matching stage-gateway-image-test, because
+# it runs inside setup-dev-env where an unconditional ~10-minute image build
+# would be a surprise.
+#
+# Idempotence: saves to a temp file, then skips the sudo install if the
+# destination is byte-identical to the freshly saved tarball.
+# Darwin-only: the gateway VM only exists on macOS.
+stage-gateway-image:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+	  echo "$(GREEN)✓ stage-gateway-image skipped (not macOS)$(RESET)"; \
+	  exit 0; \
+	fi
+	@_gateway_tag="sandbox-gateway:$(GATEWAY_VERSION)"; \
+	if ! docker image inspect "$$_gateway_tag" >/dev/null 2>&1; then \
+	  echo "ERROR: $$_gateway_tag not found in local Docker — run 'make gateway-image' first"; \
+	  exit 1; \
+	fi; \
+	_daemon_user="$(SANDBOX_DAEMON_USER)"; \
+	_daemon_uid="$(SANDBOX_DAEMON_UID)"; \
+	if [ -z "$$_daemon_uid" ]; then \
+	  echo "ERROR: daemon user '$$_daemon_user' does not resolve to a uid; cannot stage the gateway image."; \
+	  echo "  That uid is the staging path, so nothing can be written and the gateway VM has no"; \
+	  echo "  image to load."; \
+	  echo "  For a production install, run 'make setup-darwin-sandboxd-user' to create the"; \
+	  echo "  '$(DARWIN_SANDBOXD_ACCOUNT)' account, then re-run 'make stage-gateway-image'."; \
+	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
+	  exit 1; \
+	fi; \
+	_daemon_group=$$(id -gn "$$_daemon_user" 2>/dev/null); \
+	if [ -z "$$_daemon_group" ]; then \
+	  echo "ERROR: cannot resolve the primary group of '$$_daemon_user'."; \
+	  exit 1; \
+	fi; \
+	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
+	_dst="$$_lima_home/gateway-image.tar"; \
+	_staged="/var/lib/sandboxd/$$_daemon_uid/gateway-image.tar"; \
+	if [ ! -d "$$_lima_home" ]; then \
+	  echo "[sudo] install -d -o $$_daemon_user -g $$_daemon_group -m 0750 $$_lima_home"; \
+	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_group" -m 0750 "$$_lima_home" || exit 1; \
+	fi; \
+	_tmp=/tmp/sandboxd-gateway-stage-$$$$.tar; \
+	echo "docker save $$_gateway_tag -o $$_tmp"; \
+	docker save "$$_gateway_tag" -o "$$_tmp"; \
+	for _target in "$$_dst" "$$_staged"; do \
+	  if sudo -k cmp -s "$$_tmp" "$$_target" 2>/dev/null; then \
+	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
+	  else \
+	    echo "[sudo] install -o $$_daemon_user -g $$_daemon_group -m 0640 $$_tmp $$_target"; \
+	    sudo -k install -o "$$_daemon_user" -g "$$_daemon_group" -m 0640 "$$_tmp" "$$_target" \
+	      || { rm -f "$$_tmp"; exit 1; }; \
+	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
+	  fi; \
+	done; \
+	rm -f "$$_tmp"
 
 # stage-lite-image — save the sandboxd-lite Docker image as a tarball where
 # `GatewayLimaManager::load_lite_image_into_gateway` can find it at lite
@@ -1577,12 +1654,17 @@ stage-lite-image: lite-image
 	  echo "  For an operator-run dev daemon, pass SANDBOX_DAEMON_USER=<your-user> (e.g. \$$(id -un))."; \
 	  exit 1; \
 	fi; \
+	_daemon_group=$$(id -gn "$$_daemon_user" 2>/dev/null); \
+	if [ -z "$$_daemon_group" ]; then \
+	  echo "ERROR: cannot resolve the primary group of '$$_daemon_user'."; \
+	  exit 1; \
+	fi; \
 	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/lite-image.tar"; \
 	_staged="/var/lib/sandboxd/$$_daemon_uid/lite-image.tar"; \
 	if [ ! -d "$$_lima_home" ]; then \
-	  echo "[sudo] install -d -o $$_daemon_user -g $$_daemon_user -m 0750 $$_lima_home"; \
-	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_user" -m 0750 "$$_lima_home"; \
+	  echo "[sudo] install -d -o $$_daemon_user -g $$_daemon_group -m 0750 $$_lima_home"; \
+	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_group" -m 0750 "$$_lima_home" || exit 1; \
 	fi; \
 	_tmp=/tmp/sandboxd-lite-stage-$$$$.tar; \
 	echo "docker save $$_lite_tag -o $$_tmp"; \
@@ -1591,8 +1673,9 @@ stage-lite-image: lite-image
 	  if sudo -k cmp -s "$$_tmp" "$$_target" 2>/dev/null; then \
 	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
 	  else \
-	    echo "[sudo] install -o $$_daemon_user -g $$_daemon_user -m 0640 $$_tmp $$_target"; \
-	    sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0640 "$$_tmp" "$$_target"; \
+	    echo "[sudo] install -o $$_daemon_user -g $$_daemon_group -m 0640 $$_tmp $$_target"; \
+	    sudo -k install -o "$$_daemon_user" -g "$$_daemon_group" -m 0640 "$$_tmp" "$$_target" \
+	      || { rm -f "$$_tmp"; exit 1; }; \
 	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
 	  fi; \
 	done; \
@@ -2517,7 +2600,7 @@ stage-gateway-image-test: setup-darwin-sandboxd-test-user
 	_staged="/var/lib/sandboxd/$$_test_uid/gateway-image.tar"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
-	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
+	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home" || exit 1; \
 	fi; \
 	_tmp=/tmp/sandboxd-gateway-test-stage-$$$$.tar; \
 	echo "docker save $$_gateway_tag -o $$_tmp"; \
@@ -2527,7 +2610,8 @@ stage-gateway-image-test: setup-darwin-sandboxd-test-user
 	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
 	  else \
 	    echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_target"; \
-	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_target"; \
+	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_target" \
+	      || { rm -f "$$_tmp"; exit 1; }; \
 	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
 	  fi; \
 	done; \
@@ -2575,7 +2659,7 @@ stage-lite-image-test: lite-image setup-darwin-sandboxd-test-user
 	_staged="/var/lib/sandboxd/$$_test_uid/lite-image.tar"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
-	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
+	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home" || exit 1; \
 	fi; \
 	_tmp=/tmp/sandboxd-lite-test-stage-$$$$.tar; \
 	echo "docker save $$_lite_tag -o $$_tmp"; \
@@ -2585,7 +2669,8 @@ stage-lite-image-test: lite-image setup-darwin-sandboxd-test-user
 	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
 	  else \
 	    echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_target"; \
-	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_target"; \
+	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_target" \
+	      || { rm -f "$$_tmp"; exit 1; }; \
 	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
 	  fi; \
 	done; \
@@ -2636,14 +2721,14 @@ stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64 setup-da
 	_staged="/var/lib/sandboxd/$$_test_uid/sandbox-route-helper-linux-aarch64"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
-	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
+	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home" || exit 1; \
 	fi; \
 	for _target in "$$_dst" "$$_staged"; do \
 	  if sudo -k cmp -s "$$_built" "$$_target" 2>/dev/null; then \
 	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
 	  else \
 	    echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0755 $$_built $$_target"; \
-	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0755 "$$_built" "$$_target"; \
+	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0755 "$$_built" "$$_target" || exit 1; \
 	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
 	  fi; \
 	done
