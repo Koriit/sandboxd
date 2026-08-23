@@ -1392,6 +1392,25 @@ struct AppState {
     /// there is one instance per owner and one cache behind it.
     #[cfg(target_os = "macos")]
     gateway_lima_managers: Arc<sandbox_core::GatewayLimaManagerRegistry>,
+    /// macOS only: one bring-up latch per gateway-owning uid.
+    ///
+    /// A manager from the registry above is *resolvable* immediately and
+    /// *ready* only once `ensure_ready` has run against it — that call is what
+    /// creates or starts the VM and fills the slot→NIC cache the create path
+    /// reads. With one daemon-owned gateway the startup sequence does it once
+    /// and every later caller inherits a ready manager. With a gateway per
+    /// operator there is no such moment: an operator's VM cannot be brought up
+    /// before that operator's agent checks in, so readiness becomes a
+    /// per-owner event with no fixed place in the daemon's lifecycle.
+    ///
+    /// A `OnceCell` per owner gives both properties that needs. Concurrent
+    /// creates for one operator run `ensure_ready` once and the losers await
+    /// it, rather than racing two bring-ups of the same VM. And a *failed*
+    /// bring-up leaves the cell unset, so the next request retries instead of
+    /// latching a transient failure — an operator who logs in after the first
+    /// attempt failed must not be refused for the daemon's remaining lifetime.
+    #[cfg(target_os = "macos")]
+    gateway_ready: Arc<tokio::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<()>>>>>,
     /// macOS only: in-memory transient networking health per Running Lima session.
     ///
     /// Written by the gateway recovery orchestrator (Pass 2) when a session
@@ -1563,6 +1582,138 @@ impl AppState {
     ) -> Arc<sandbox_core::GatewayLimaManager> {
         self.gateway_lima_managers
             .get_or_create(sandbox_core::gateway_owner_uid(operator_uid))
+    }
+
+    /// Resolve the gateway serving `operator_uid` **and** guarantee its VM is
+    /// up, its image loaded and its slot→NIC map cached.
+    ///
+    /// [`AppState::gateway_lima_manager_for_operator`] answers *which* gateway;
+    /// this answers *which, and it works*. Sites that only read a path or a
+    /// name want the former. Any site whose next step touches the VM wants this
+    /// one — and on the create path it is not optional, because a manager whose
+    /// `nic_map()` is `None` refuses every slot the gateway does in fact carry,
+    /// which reads as a capacity problem rather than as a VM that was never
+    /// started.
+    ///
+    /// With per-operator gateways off this is close to free after startup: the
+    /// daemon's own gateway was readied there, so the latch for the single
+    /// owner is already set and this is a map lookup. With them on it is the
+    /// bring-up itself, and the first caller for an operator pays for it.
+    ///
+    /// The slot set differs by mode and the difference is load-bearing. One
+    /// daemon-owned VM is the macvlan parent for whoever lands on a slot, so it
+    /// carries all of them. A per-operator VM carries exactly its owner's
+    /// share: fewer, and a claim succeeds onto a segment the gateway is not
+    /// attached to; more, and the VM sits on segments its operator can never be
+    /// assigned, which is the isolation the partition exists to create.
+    #[cfg(target_os = "macos")]
+    async fn ready_gateway_for_operator(
+        &self,
+        operator_uid: u32,
+    ) -> Result<Arc<sandbox_core::GatewayLimaManager>, SandboxError> {
+        let owner_uid = sandbox_core::gateway_owner_uid(operator_uid);
+        let manager = self.gateway_lima_managers.get_or_create(owner_uid);
+
+        let cell = {
+            let mut latches = self.gateway_ready.lock().await;
+            Arc::clone(latches.entry(owner_uid).or_default())
+        };
+
+        // `get_or_try_init` leaves the cell unset when the closure errors, so
+        // the refusal below is this attempt's, never a cached one.
+        cell.get_or_try_init(|| async {
+            let slots = self.gateway_slots_for_owner(owner_uid)?;
+            info!(
+                operator_uid,
+                owner_uid,
+                slots = ?slots,
+                "readying the gateway Lima instance for this operator"
+            );
+            let mgr = Arc::clone(&manager);
+            match tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots)).await {
+                Ok(result) => result,
+                Err(e) => Err(SandboxError::Internal(format!(
+                    "gateway ensure_ready task panicked: {e}"
+                ))),
+            }
+        })
+        .await?;
+
+        Ok(manager)
+    }
+
+    /// The slots the gateway owned by `owner_uid` has to carry a NIC on.
+    ///
+    /// One definition, because the two callers must not disagree. Readying a
+    /// gateway verifies its NICs against this set and caches the map; a
+    /// crash-recovery restart re-verifies against it and rebuilds the same map.
+    /// A recovery that re-verified a different set would either fail a restart
+    /// of a VM that was correct when it was readied, or quietly widen one that
+    /// was not.
+    ///
+    /// Takes an **owner** uid, not an operator's. With per-operator gateways on
+    /// the two are the same value and the answer is that operator's assigned
+    /// share; with them off every operator collapses onto the daemon's uid and
+    /// the answer is the whole host pool, because that single VM is the macvlan
+    /// parent for whoever lands on a slot. So the argument is only read on the
+    /// branch where it is an operator uid, which is what makes one signature
+    /// serve both modes.
+    #[cfg(target_os = "macos")]
+    fn gateway_slots_for_owner(&self, owner_uid: u32) -> Result<Vec<u16>, SandboxError> {
+        if sandbox_core::per_operator_gateway_enabled() {
+            self.vmnet_pools.slots_for(owner_uid)
+        } else {
+            Ok(self.vmnet_pools.all_slots())
+        }
+    }
+
+    /// How the gateways this daemon can act on are shared out, right now.
+    ///
+    /// The value [`sandbox_core::partition_by_gateway_owner`] needs, and the
+    /// one place the mode is turned into it. Its documentation is explicit that
+    /// ownership is not the switch — it is a claim about what the caller is
+    /// holding — so this is the site that owes the claim, and it owes it twice
+    /// over because both arms name gateways a pass will try to restart.
+    ///
+    /// Off: one gateway, the daemon's own, brought up at startup. On: one per
+    /// operator, and the set is the operators whose agents are checked in.
+    ///
+    /// Reach is why that is the set, not a broader one. Every `limactl` call
+    /// for an operator's gateway runs inside that operator's agent, so an
+    /// operator with no agent checked in has a gateway this daemon cannot start,
+    /// stop or probe — the same reason the orphan reaper takes its operator list
+    /// from the registry. Enumerating owners from the state tree instead would
+    /// name operators from earlier daemon lifetimes and operators who have a
+    /// Lima home for their sandbox VMs but no gateway at all, and because a
+    /// carried owner is *guaranteed* a shard, each of those would be a restart
+    /// that cannot succeed — leaving every recovery pass permanently owing a
+    /// retry.
+    ///
+    /// The daemon's own uid is deliberately absent from the `PerOperator` arm,
+    /// which is where this set differs from the reaper's. The reaper names the
+    /// daemon unconditionally because it is always reachable; here an owner
+    /// names a gateway that has to *exist*, and in this mode the daemon owns
+    /// none — startup does not bring one up. Naming it would have every
+    /// recovery try to create one.
+    ///
+    /// Nothing is stranded by narrowing it: the partition unions these owners
+    /// with the owners the sessions themselves resolve to, so a `Running`
+    /// session belonging to a logged-out operator still gets a shard, still
+    /// fails its restart, and is still reported degraded rather than silently
+    /// dropped.
+    #[cfg(target_os = "macos")]
+    async fn gateway_ownership(&self) -> sandbox_core::GatewayOwnership {
+        if sandbox_core::per_operator_gateway_enabled() {
+            sandbox_core::GatewayOwnership::PerOperator(
+                self.agent_registry
+                    .connected_uids()
+                    .await
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            sandbox_core::GatewayOwnership::Shared(sandbox_core::gateway_owner_uid(self.daemon_uid))
+        }
     }
 }
 
@@ -2126,6 +2277,27 @@ async fn create_session(
     Extension(operator): Extension<OperatorIdentity>,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
+    // Pre-flight, macOS: bring up the gateway VM serving this operator before
+    // anything asks it a question.
+    //
+    // This has to come first. The image check immediately below talks to that
+    // VM's forwarded Docker socket, and every step after it — the slot claim's
+    // NIC-map read, the gateway container, the routes — assumes the VM is
+    // there. With one daemon-owned gateway startup guaranteed that and the call
+    // is a latch lookup. With a gateway per operator nothing else does: the VM
+    // is created through the operator's own agent, so it cannot exist before
+    // that operator logs in, and this is where the wait for it belongs.
+    //
+    // A logged-out operator therefore fails *here*, with the broker's own
+    // "session agent is not running — the operator must be logged in" text,
+    // rather than several hundred lines later as an unreachable Docker socket
+    // or an empty NIC map. That error is the documented consequence of the
+    // login dependency, and it needs to arrive naming the cause.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = state.ready_gateway_for_operator(operator.uid).await {
+        return error_response(e).into_response();
+    }
+
     // Pre-flight: refuse the request when the daemon-version-tagged
     // gateway image is not present. Both backends spin up a per-session
     // gateway container; without the image every downstream path (Lima or
@@ -6304,7 +6476,17 @@ async fn start_session_macos_lite(
         )))
         .into_response();
     };
-    let gateway_lima = state.gateway_lima_manager_for_operator(operator_uid);
+
+    // Readied rather than merely resolved — see the identical step in
+    // `start_session_macos_lima` for why a restart needs it as much as a
+    // create, and why the uid is the session's rather than the requester's.
+    // The lite path's own dependence is step 1 below: the bridge is created on
+    // this gateway's forwarded Docker socket, which is unreachable until the
+    // VM behind it is up.
+    let gateway_lima = match state.ready_gateway_for_operator(operator_uid).await {
+        Ok(mgr) => mgr,
+        Err(e) => return error_response(e).into_response(),
+    };
     let docker_route = state.docker_route_for_operator(operator_uid);
 
     // Step 1: Recreate the per-session Docker bridge network inside the gateway VM.
@@ -6649,7 +6831,21 @@ async fn start_session_macos_lima(
         )))
         .into_response();
     };
-    let gateway_lima = state.gateway_lima_manager_for_operator(operator_uid);
+
+    // Readied rather than merely resolved, and keyed on the uid just
+    // attributed rather than on the requester's — the same distinction the
+    // resolution above draws, for the same reason: the VM that has to be up is
+    // the one hosting this session, not the one belonging to whoever asked.
+    //
+    // A restart needs this at least as much as a create does. A stopped
+    // session outlives the daemon and outlives its operator's login, so by the
+    // time one is started again its gateway may never have been brought up in
+    // this daemon's lifetime — and the slot re-claim immediately below reads
+    // the NIC map that only readying fills.
+    let gateway_lima = match state.ready_gateway_for_operator(operator_uid).await {
+        Ok(mgr) => mgr,
+        Err(e) => return error_response(e).into_response(),
+    };
     let docker_route = state.docker_route_for_operator(operator_uid);
 
     // A restart re-claims from the session owner's pool, so a range reassigned
@@ -13973,19 +14169,27 @@ async fn gateway_monitor(state: Arc<AppState>) {
 /// re-created against *its own* operator's gateway VM, and one pass over every
 /// session against one VM only happens to be right while there is one VM.
 ///
-/// Ownership is [`sandbox_core::GatewayOwnership::Shared`] here, which yields a
-/// single shard holding every candidate — this runs exactly as it did before
-/// the split existed.
+/// Ownership comes from [`AppState::gateway_ownership`], which is where the
+/// mode is turned into a claim about the gateways this daemon holds. With
+/// per-operator gateways off it is [`sandbox_core::GatewayOwnership::Shared`]
+/// and yields a single shard holding every candidate, exactly as this ran
+/// before the split existed. With them on it is one shard per checked-in
+/// operator, unioned with the owners the sessions themselves resolve to.
 ///
-/// What that is no longer saying is that only one gateway can be driven.
-/// `recover_one_gateway` selects its manager by `shard.owner_uid` and builds its
-/// Docker route per session's operator, so a shard per owner would restart that
-/// owner's own VM rather than the same one repeatedly. The remaining step to
-/// [`sandbox_core::GatewayOwnership::PerOperator`] is supplying the owner set it
-/// carries — deciding which owners this daemon can act on, which
-/// `sandbox_core::lima::enumerate_operator_uids_from_fs` can answer but is not
-/// wired to here — and validating the result against more than one live
-/// gateway. That is a behavioural change, not a one-line switch-over.
+/// ## A pass is still whole-daemon, and that is a cost in the per-operator mode
+///
+/// The loop below drives every shard, and driving a shard force-stops and
+/// restarts its gateway VM. So a pass called in because *one* operator's
+/// gateway went unreachable restarts every other checked-in operator's gateway
+/// too, dropping their sessions' gateway containers for the length of a VM
+/// restart.
+///
+/// This is not the intended end state; it is what falls out of a single
+/// whole-daemon trigger, and `gateway_lima_monitor` is where it is decided.
+/// Making a pass per-owner needs a trigger and a backoff per owner and a way
+/// for a pass to act on one owner without the session union pulling the others
+/// back in — a behavioural change with its own failure modes, not a narrowing
+/// of this function.
 ///
 /// ## What this function does NOT do
 ///
@@ -14020,7 +14224,7 @@ async fn recover_gateway_lima(state: &Arc<AppState>) -> sandbox_core::GatewayRec
     };
     let (shards, declined) = sandbox_core::partition_by_gateway_owner(
         candidates,
-        sandbox_core::GatewayOwnership::Shared(sandbox_core::gateway_owner_uid(state.daemon_uid)),
+        state.gateway_ownership().await,
         &network_for,
         &resolve_name_to_uid,
     )
@@ -14038,7 +14242,10 @@ async fn recover_gateway_lima(state: &Arc<AppState>) -> sandbox_core::GatewayRec
     // answer. A pass with no shards at all drove no gateway and so left none
     // unrestarted — it reports a restarted gateway, which is the accurate
     // answer to the only question the value is asked ("is another attempt
-    // owed?") and is unreachable here, since `Shared` always yields a shard.
+    // owed?"). `Shared` always yields a shard, so that case needs the
+    // per-operator mode: no operator checked in and no candidate session
+    // naming one, which is a daemon with nothing to recover rather than a
+    // recovery that failed.
     let mut outcome = sandbox_core::GatewayRecoveryOutcome::GatewayRestarted;
     for shard in shards {
         if recover_one_gateway(state, &store, shard).await
@@ -14123,12 +14330,30 @@ async fn recover_one_gateway(
     // operator uid and would re-resolve a value that has already been resolved.
     let mgr_restart = state.gateway_lima_managers.get_or_create(shard.owner_uid);
     let mgr_per_session = state.gateway_lima_managers.get_or_create(shard.owner_uid);
-    // One gateway VM serves every operator's sessions and so carries a NIC on
-    // every slot on the host, not on the share of whoever owns it — recovery
-    // must rebuild all of them. A gateway VM per operator would carry NICs on
-    // that operator's slots only, and this would become a per-owner read; the
-    // manager restarted below is what settles which of the two it is.
-    let pool_slots = state.vmnet_pools.host_slots();
+    // The slots this shard's gateway carries — read per owner, from the one
+    // definition that readying it also used, so a restart re-verifies the set
+    // the VM was built against rather than a second opinion about it.
+    //
+    // The two modes give genuinely different answers. One daemon-owned VM is
+    // the macvlan parent for whoever lands on a slot, so it carries every slot
+    // on the host. A per-operator VM carries its owner's share and no more.
+    //
+    // A refusal here is a shard that does not restart, which is the honest
+    // outcome: it means the pool can no longer say which slots this owner
+    // holds, and a VM rebuilt against a guessed set would come back attached
+    // to segments nobody assigned it.
+    let pool_slots = match state.gateway_slots_for_owner(shard.owner_uid) {
+        Ok(slots) => slots,
+        Err(e) => {
+            error!(
+                owner_uid = shard.owner_uid,
+                error = %e,
+                "gateway Lima recovery: cannot determine this owner's slots; its gateway is \
+                 not restarted"
+            );
+            return sandbox_core::GatewayRecoveryOutcome::GatewayNotRestarted;
+        }
+    };
     let image_tag = sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     let pool = format!(
         "{}/{}",
@@ -14147,13 +14372,13 @@ async fn recover_one_gateway(
         state.gateway_recovering.for_owner(shard.owner_uid),
         // restart_gateway: force-stop → start → wait for Docker readiness (blocking).
         // Re-verifying the slot NICs and re-establishing the egress bridge are
-        // performed inside `restart_instance_for_recovery`. The slot set is read
-        // from the live pool at the moment of the call, never from a copy the
-        // manager holds.
+        // performed inside `restart_instance_for_recovery`. The slot set was
+        // read from the live pool when this shard was entered, never from the
+        // copy the manager is holding — which is the copy the restart is there
+        // to rebuild.
         move || async move {
             let result = tokio::task::spawn_blocking(move || {
-                let slots: Vec<u16> = (0..pool_slots).collect();
-                mgr_restart.restart_instance_for_recovery(&slots)
+                mgr_restart.restart_instance_for_recovery(&pool_slots)
             })
             .await;
             match result {
@@ -14374,6 +14599,51 @@ struct GatewayLimaTrigger {
     retry_at: Option<Instant>,
 }
 
+/// What one tick's probes across every gateway the daemon drives amount to.
+///
+/// Separate from `bool` because a tick has three outcomes, not two, and
+/// collapsing the third onto either of the others is a live failure mode: read
+/// as reachable it clears a failure count nothing measured, read as unreachable
+/// it drives a recovery on no evidence.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayProbeVerdict {
+    /// At least one gateway answered and none answered unreachable.
+    AllReachable,
+    /// At least one gateway answered unreachable.
+    SomeUnreachable,
+    /// Nothing was measured: every probe errored, or there was none to run.
+    Indeterminate,
+}
+
+/// Reduce a tick's per-gateway answers to one verdict.
+///
+/// `None` is a probe that produced no answer — an error, or a panicked
+/// blocking task.
+///
+/// A single definite unreachable decides the tick, and it outranks any number
+/// of healthy answers. The alternative — requiring every gateway to be
+/// unreachable, or taking a majority — makes one operator's dead gateway
+/// invisible for as long as somebody else's is up, which is precisely the
+/// failure the per-operator mode makes possible and the shared mode could not
+/// express.
+///
+/// An empty input is [`GatewayProbeVerdict::Indeterminate`] rather than
+/// reachable. No gateway to probe is the honest "nothing was measured", and it
+/// is a state the per-operator mode reaches routinely — a daemon with nobody
+/// logged in. Calling that healthy would have an idle tick clear a failure
+/// count that the probes which set it never retracted.
+#[cfg(target_os = "macos")]
+fn fold_gateway_probes(answers: &[Option<bool>]) -> GatewayProbeVerdict {
+    if answers.contains(&Some(false)) {
+        GatewayProbeVerdict::SomeUnreachable
+    } else if answers.contains(&Some(true)) {
+        GatewayProbeVerdict::AllReachable
+    } else {
+        GatewayProbeVerdict::Indeterminate
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl GatewayLimaTrigger {
     fn new() -> Self {
@@ -14537,58 +14807,76 @@ async fn gateway_lima_monitor(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(poll_interval).await;
 
-        // Resolved through the registry under the same owner uid the recovery
-        // this loop triggers shards on, so the gateway being probed is the one
-        // a threshold breach would act on. Reading a manager the recovery pass
-        // does not use would let the two disagree about which VM is in trouble.
+        // Probed under the same ownership value the recovery this loop triggers
+        // shards on, so the gateways being watched are the ones a threshold
+        // breach would act on. Reading a manager the recovery pass does not use
+        // would let the two disagree about which VM is in trouble — and with
+        // per-operator gateways on, probing the daemon's own uid would watch a
+        // VM that is never brought up in that mode and call a recovery in
+        // forever.
         //
-        // That owner is the daemon's own in both modes, which makes this loop
-        // single-gateway by construction rather than by which handle it holds:
-        // `recover_gateway_lima` passes `GatewayOwnership::Shared`, so there is
-        // one pass covering every shard and nothing for a per-owner trigger to
-        // call. Giving the monitor per-owner probes and per-owner backoff is
-        // therefore blocked on that pass becoming per-owner first, not on
-        // anything here.
-        let mgr = state
-            .gateway_lima_managers
-            .get_or_create(sandbox_core::gateway_owner_uid(state.daemon_uid));
-        let probe_result = tokio::task::spawn_blocking(move || mgr.probe_docker_health()).await;
+        // Re-read every tick rather than once before the loop: who is checked
+        // in changes while the daemon runs, so a set captured at startup would
+        // watch the wrong gateways for the rest of the process.
+        let owners: Vec<u32> = match state.gateway_ownership().await {
+            sandbox_core::GatewayOwnership::Shared(uid) => vec![uid],
+            sandbox_core::GatewayOwnership::PerOperator(owners) => owners.into_iter().collect(),
+        };
 
-        match probe_result {
-            Ok(Ok(true)) => {
-                // Gateway Docker daemon is healthy. This does not discharge a
-                // retry a failed pass owes — see `probe_reachable`.
+        let mut answers: Vec<Option<bool>> = Vec::with_capacity(owners.len());
+        for owner_uid in &owners {
+            let mgr = state.gateway_lima_managers.get_or_create(*owner_uid);
+            answers.push(
+                match tokio::task::spawn_blocking(move || mgr.probe_docker_health()).await {
+                    Ok(Ok(reachable)) => Some(reachable),
+                    Ok(Err(e)) => {
+                        // Unexpected error from the probe — logged but not
+                        // counted as a failure, so a transient spawn error does
+                        // not trigger a full instance recovery.
+                        warn!(
+                            owner_uid,
+                            error = %e,
+                            "gateway Lima monitor: unexpected probe error (not counted as failure)"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        // spawn_blocking join error (thread panicked).
+                        warn!(
+                            owner_uid,
+                            error = %e,
+                            "gateway Lima monitor: spawn_blocking join error on probe (not counted)"
+                        );
+                        None
+                    }
+                },
+            );
+        }
+
+        match fold_gateway_probes(&answers) {
+            GatewayProbeVerdict::AllReachable => {
+                // Every gateway that answered is healthy. This does not
+                // discharge a retry a failed pass owes — see `probe_reachable`.
                 if trigger.consecutive_failures > 0 {
                     debug!(
                         consecutive_failures = trigger.consecutive_failures,
-                        "gateway Lima monitor: probe healthy; resetting failure counter"
+                        "gateway Lima monitor: probes healthy; resetting failure counter"
                     );
                 }
                 trigger.probe_reachable();
             }
-            Ok(Ok(false)) => {
-                // Gateway unreachable — increment the consecutive failure counter.
+            GatewayProbeVerdict::SomeUnreachable => {
                 trigger.probe_unreachable();
                 warn!(
                     consecutive_failures = trigger.consecutive_failures,
                     threshold = failure_threshold,
-                    "gateway Lima monitor: Docker daemon unreachable"
+                    gateways_watched = owners.len(),
+                    "gateway Lima monitor: a gateway's Docker daemon is unreachable"
                 );
             }
-            Ok(Err(e)) => {
-                // Unexpected error from the probe — log but do not count as a
-                // failure to avoid triggering recovery on a transient spawn error.
-                warn!(
-                    error = %e,
-                    "gateway Lima monitor: unexpected probe error (not counted as failure)"
-                );
-            }
-            Err(e) => {
-                // spawn_blocking join error (thread panicked).
-                warn!(
-                    error = %e,
-                    "gateway Lima monitor: spawn_blocking join error on probe (not counted)"
-                );
+            GatewayProbeVerdict::Indeterminate => {
+                // Nothing measured this tick — every probe errored, or there
+                // was no gateway to probe. Neither counts and neither clears.
             }
         }
 
@@ -15342,211 +15630,237 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // ---------------------------------------------------------------------------
         // Step 4 (early): bring the gateway Lima instance up so we can discover
-        // its NIC count. We use a temporary manager sized at config_n; the
-        // pool-resize decision may rebuild the gateway to a different NIC count,
-        // after which we re-discover and build the final pool at effective_n.
+        // its NIC count, and size the pool from what it actually got.
+        //
+        // Both halves of that presuppose a gateway the daemon can start on its
+        // own, and with per-operator gateways there is none. Each operator's VM
+        // is created through that operator's agent, so at startup — before any
+        // agent has checked in — there is nothing to start and nothing to
+        // count. Starting one anyway would boot a VM under the daemon's uid
+        // that no session will ever land on, and holding every slot open on it
+        // is the shared-gateway shape the ownership flip exists to end.
+        //
+        // So the resize decision does not run in that mode, and the pool is
+        // sized from configuration. Nothing is lost that had an owner here: a
+        // per-operator VM verifies its own slots when it is readied, and a
+        // mismatch fails that operator's bring-up — which is a better outcome
+        // than the resize it replaces, because it refuses one operator instead
+        // of resizing a pool every other operator draws from.
         // ---------------------------------------------------------------------------
-        info!("macOS startup: step 4 — gateway Lima instance init");
+        let effective_n: u16 = if sandbox_core::per_operator_gateway_enabled() {
+            info!(
+                config_n,
+                "macOS startup: step 4 deferred — per-operator gateways are on, so each \
+                 operator's gateway VM is brought up when that operator's agent checks in; \
+                 sizing the pool from configuration"
+            );
+            config_n
+        } else {
+            info!("macOS startup: step 4 — gateway Lima instance init");
 
-        // Taken from the registry rather than built here, so the instance this
-        // step readies is the instance every later caller resolves. `daemon_uid`
-        // is passed straight through: it already is a gateway-owner uid, and
-        // `gateway_owner_uid` expects an operator's.
-        let manager_arc = gateway_lima_managers.get_or_create(daemon_uid);
+            // Taken from the registry rather than built here, so the instance
+            // this step readies is the instance every later caller resolves.
+            // `daemon_uid` is passed straight through: it already is a
+            // gateway-owner uid, and `gateway_owner_uid` expects an operator's.
+            let manager_arc = gateway_lima_managers.get_or_create(daemon_uid);
 
-        // The slot set this daemon's gateway instance owns. Supplied on every
-        // call rather than held by the manager, so it can never be a stale copy
-        // of which L2 segments the VM is attached to.
-        let config_slots: Vec<u16> = (0..config_n).collect();
+            // The slot set this daemon's gateway instance owns. Supplied on every
+            // call rather than held by the manager, so it can never be a stale copy
+            // of which L2 segments the VM is attached to.
+            let config_slots: Vec<u16> = (0..config_n).collect();
 
-        {
-            let mgr = manager_arc.clone();
-            let slots = config_slots.clone();
-            let result = tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots)).await;
-            match result {
-                Ok(Ok(())) => {
-                    info!("macOS startup step 4: gateway Lima instance ready");
+            {
+                let mgr = manager_arc.clone();
+                let slots = config_slots.clone();
+                let result = tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots)).await;
+                match result {
+                    Ok(Ok(())) => {
+                        info!("macOS startup step 4: gateway Lima instance ready");
+                    }
+                    Ok(Err(e)) => {
+                        error!(
+                            error = %e,
+                            "macOS startup step 4: gateway Lima ensure_ready failed — \
+                             this is mandatory egress infrastructure; daemon refuses to start."
+                        );
+                        eprintln!("sandboxd: gateway Lima instance init failed: {e}");
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        let msg = format!("gateway Lima ensure_ready task panicked: {e}");
+                        error!("{msg}");
+                        return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                    }
                 }
-                Ok(Err(e)) => {
-                    error!(
-                        error = %e,
-                        "macOS startup step 4: gateway Lima ensure_ready failed — \
-                         this is mandatory egress infrastructure; daemon refuses to start."
+            }
+
+            // Retrieve the discovered NIC count from the cached NIC map.
+            let discovered_nic_count = manager_arc
+                .nic_map()
+                .map(|m| m.discovered_count)
+                .unwrap_or(0);
+
+            // ---------------------------------------------------------------------------
+            // Pool-resize decision: single authority for what to do when discovered NIC
+            // count differs from config_n. Routes through decide_pool_resize and acts on
+            // the result. All non-rebuild arms are always-start (daemon continues). The
+            // rebuild arm is attempted only when safe (running==0 AND daemon_set==config_n).
+            // ---------------------------------------------------------------------------
+            let decision = decide_pool_resize(
+                config_n,
+                discovered_nic_count,
+                daemon_set_n,
+                running_lima_sessions,
+            );
+            info!(
+                config_n,
+                discovered_nic_count,
+                daemon_set_n,
+                running_lima_sessions,
+                decision = ?decision,
+                "macOS startup: pool-resize decision"
+            );
+
+            // Effective pool size after acting on the decision.
+            match &decision {
+                PoolResizeDecision::NoChange { effective_n } => {
+                    info!(
+                        n = effective_n,
+                        "macOS startup: NIC count matches config; no resize needed"
                     );
-                    eprintln!("sandboxd: gateway Lima instance init failed: {e}");
-                    return Err(e.into());
+                    *effective_n
                 }
-                Err(e) => {
-                    let msg = format!("gateway Lima ensure_ready task panicked: {e}");
-                    error!("{msg}");
-                    return Err(sandbox_core::error::SandboxError::Internal(msg).into());
-                }
-            }
-        }
-
-        // Retrieve the discovered NIC count from the cached NIC map.
-        let discovered_nic_count = manager_arc
-            .nic_map()
-            .map(|m| m.discovered_count)
-            .unwrap_or(0);
-
-        // ---------------------------------------------------------------------------
-        // Pool-resize decision: single authority for what to do when discovered NIC
-        // count differs from config_n. Routes through decide_pool_resize and acts on
-        // the result. All non-rebuild arms are always-start (daemon continues). The
-        // rebuild arm is attempted only when safe (running==0 AND daemon_set==config_n).
-        // ---------------------------------------------------------------------------
-        let decision = decide_pool_resize(
-            config_n,
-            discovered_nic_count,
-            daemon_set_n,
-            running_lima_sessions,
-        );
-        info!(
-            config_n,
-            discovered_nic_count,
-            daemon_set_n,
-            running_lima_sessions,
-            decision = ?decision,
-            "macOS startup: pool-resize decision"
-        );
-
-        // Effective pool size after acting on the decision.
-        let effective_n: u16 = match &decision {
-            PoolResizeDecision::NoChange { effective_n } => {
-                info!(
-                    n = effective_n,
-                    "macOS startup: NIC count matches config; no resize needed"
-                );
-                *effective_n
-            }
-            PoolResizeDecision::WarnRunningSessions {
-                effective_n,
-                config_n: new_n,
-                running,
-            } => {
-                warn!(
-                    discovered = effective_n,
-                    config_n = new_n,
-                    running_sessions = running,
-                    "macOS startup: max_macos_sessions changed from {effective_n} to {new_n} \
+                PoolResizeDecision::WarnRunningSessions {
+                    effective_n,
+                    config_n: new_n,
+                    running,
+                } => {
+                    warn!(
+                        discovered = effective_n,
+                        config_n = new_n,
+                        running_sessions = running,
+                        "macOS startup: max_macos_sessions changed from {effective_n} to {new_n} \
                      but {running} session(s) are running. Pool resize requires all sessions \
                      to be stopped. Continuing with the current pool of {effective_n} NIC(s); \
                      pool resize to {new_n} deferred while sessions are running: stop all \
                      sessions and restart sandboxd to apply; if the socket_vmnet daemon set \
                      is not yet sized to {new_n}, also re-run the privileged setup: \
                      make setup-dev-env DARWIN_VMNET_SLOTS={new_n}"
-                );
-                *effective_n
-            }
-            PoolResizeDecision::RefuseNeedsPrivilegedRegen {
-                effective_n,
-                config_n: new_n,
-                daemon_set_n: set_n,
-            } => {
-                warn!(
-                    discovered = effective_n,
-                    config_n = new_n,
-                    daemon_set_n = set_n,
-                    "macOS startup: max_macos_sessions is {new_n} but the gateway has \
+                    );
+                    *effective_n
+                }
+                PoolResizeDecision::RefuseNeedsPrivilegedRegen {
+                    effective_n,
+                    config_n: new_n,
+                    daemon_set_n: set_n,
+                } => {
+                    warn!(
+                        discovered = effective_n,
+                        config_n = new_n,
+                        daemon_set_n = set_n,
+                        "macOS startup: max_macos_sessions is {new_n} but the gateway has \
                      {effective_n} NIC(s) and the socket_vmnet daemon set has {set_n} slot(s). \
                      The vmnet launchd daemon set must be regenerated first (a privileged step): \
                      re-run the privileged socket_vmnet pool setup to provision {new_n} slots: \
                      make setup-dev-env DARWIN_VMNET_SLOTS={new_n} \
                      Continuing with the current pool of {effective_n} NIC(s)."
-                );
-                *effective_n
-            }
-            PoolResizeDecision::Rebuild { target_n } => {
-                let target = *target_n;
-                info!(
-                    from = discovered_nic_count,
-                    to = target,
-                    "macOS startup: rebuilding gateway to match config_n \
+                    );
+                    *effective_n
+                }
+                PoolResizeDecision::Rebuild { target_n } => {
+                    let target = *target_n;
+                    info!(
+                        from = discovered_nic_count,
+                        to = target,
+                        "macOS startup: rebuilding gateway to match config_n \
                      (no sessions running, vmnet daemon set already matches)"
-                );
-                // Rebuild sequence: force-stop → delete → recreate(target_n) →
-                // start → re-discover. On failure, fall back to whatever gateway
-                // is still reachable (re-run ensure_ready) and use the discovered
-                // count — a failed resize is non-fatal (the existing hard-fail
-                // semantics cover only "no gateway at all").
-                let mgr = manager_arc.clone();
-                let slots = config_slots.clone();
-                let rebuild_result = tokio::task::spawn_blocking(move || {
-                    mgr.force_stop_instance()?;
-                    mgr.delete_instance()?;
-                    mgr.ensure_ready(&slots) // creates+starts on config_slots, re-verifies
-                })
-                .await;
+                    );
+                    // Rebuild sequence: force-stop → delete → recreate(target_n) →
+                    // start → re-discover. On failure, fall back to whatever gateway
+                    // is still reachable (re-run ensure_ready) and use the discovered
+                    // count — a failed resize is non-fatal (the existing hard-fail
+                    // semantics cover only "no gateway at all").
+                    let mgr = manager_arc.clone();
+                    let slots = config_slots.clone();
+                    let rebuild_result = tokio::task::spawn_blocking(move || {
+                        mgr.force_stop_instance()?;
+                        mgr.delete_instance()?;
+                        mgr.ensure_ready(&slots) // creates+starts on config_slots, re-verifies
+                    })
+                    .await;
 
-                match rebuild_result {
-                    Ok(Ok(())) => {
-                        // Re-read discovered count after rebuild.
-                        let rebuilt_count = manager_arc
-                            .nic_map()
-                            .map(|m| m.discovered_count as u16)
-                            .unwrap_or(target);
-                        info!(
-                            rebuilt_nic_count = rebuilt_count,
-                            "macOS startup: gateway rebuild successful"
-                        );
-                        rebuilt_count
-                    }
-                    Ok(Err(e)) => {
-                        // Rebuild failed. Attempt to ensure the old gateway (or
-                        // whatever state it's in) is up, then continue with whatever
-                        // NIC count is currently discovered. A failed resize is
-                        // non-fatal; only a total gateway failure stays hard-fail.
-                        warn!(
-                            error = %e,
-                            "macOS startup: gateway rebuild failed; \
-                             attempting to recover the existing gateway"
-                        );
-                        let mgr2 = manager_arc.clone();
-                        let slots2 = config_slots.clone();
-                        let recovery =
-                            tokio::task::spawn_blocking(move || mgr2.ensure_ready(&slots2)).await;
-                        match recovery {
-                            Ok(Ok(())) => {
-                                let fallback_count = manager_arc
-                                    .nic_map()
-                                    .map(|m| m.discovered_count as u16)
-                                    .unwrap_or(discovered_nic_count as u16);
-                                warn!(
-                                    fallback_nic_count = fallback_count,
-                                    "macOS startup: gateway rebuild failed; continuing with \
+                    match rebuild_result {
+                        Ok(Ok(())) => {
+                            // Re-read discovered count after rebuild.
+                            let rebuilt_count = manager_arc
+                                .nic_map()
+                                .map(|m| m.discovered_count as u16)
+                                .unwrap_or(target);
+                            info!(
+                                rebuilt_nic_count = rebuilt_count,
+                                "macOS startup: gateway rebuild successful"
+                            );
+                            rebuilt_count
+                        }
+                        Ok(Err(e)) => {
+                            // Rebuild failed. Attempt to ensure the old gateway (or
+                            // whatever state it's in) is up, then continue with whatever
+                            // NIC count is currently discovered. A failed resize is
+                            // non-fatal; only a total gateway failure stays hard-fail.
+                            warn!(
+                                error = %e,
+                                "macOS startup: gateway rebuild failed; \
+                                 attempting to recover the existing gateway"
+                            );
+                            let mgr2 = manager_arc.clone();
+                            let slots2 = config_slots.clone();
+                            let recovery =
+                                tokio::task::spawn_blocking(move || mgr2.ensure_ready(&slots2))
+                                    .await;
+                            match recovery {
+                                Ok(Ok(())) => {
+                                    let fallback_count = manager_arc
+                                        .nic_map()
+                                        .map(|m| m.discovered_count as u16)
+                                        .unwrap_or(discovered_nic_count as u16);
+                                    warn!(
+                                        fallback_nic_count = fallback_count,
+                                        "macOS startup: gateway rebuild failed; continuing with \
                                      recovered gateway ({fallback_count} NIC(s))"
-                                );
-                                fallback_count
-                            }
-                            Ok(Err(recovery_err)) => {
-                                // Gateway is completely down after a failed rebuild —
-                                // this is the existing hard-fail case.
-                                error!(
-                                    rebuild_error = %e,
-                                    recovery_error = %recovery_err,
-                                    "macOS startup: gateway rebuild failed and recovery also \
-                                     failed — mandatory egress infrastructure unavailable; \
-                                     daemon refuses to start."
-                                );
-                                eprintln!(
-                                    "sandboxd: gateway rebuild and recovery both failed: {recovery_err}"
-                                );
-                                return Err(recovery_err.into());
-                            }
-                            Err(panic_err) => {
-                                let msg = format!(
-                                    "gateway recovery task panicked after rebuild failure: {panic_err}"
-                                );
-                                error!("{msg}");
-                                return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                                    );
+                                    fallback_count
+                                }
+                                Ok(Err(recovery_err)) => {
+                                    // Gateway is completely down after a failed rebuild —
+                                    // this is the existing hard-fail case.
+                                    error!(
+                                        rebuild_error = %e,
+                                        recovery_error = %recovery_err,
+                                        "macOS startup: gateway rebuild failed and recovery also \
+                                         failed — mandatory egress infrastructure unavailable; \
+                                         daemon refuses to start."
+                                    );
+                                    eprintln!(
+                                        "sandboxd: gateway rebuild and recovery both failed: {recovery_err}"
+                                    );
+                                    return Err(recovery_err.into());
+                                }
+                                Err(panic_err) => {
+                                    let msg = format!(
+                                        "gateway recovery task panicked after rebuild failure: {panic_err}"
+                                    );
+                                    error!("{msg}");
+                                    return Err(
+                                        sandbox_core::error::SandboxError::Internal(msg).into()
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(panic_err) => {
-                        let msg = format!("gateway rebuild task panicked: {panic_err}");
-                        error!("{msg}");
-                        return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                        Err(panic_err) => {
+                            let msg = format!("gateway rebuild task panicked: {panic_err}");
+                            error!("{msg}");
+                            return Err(sandbox_core::error::SandboxError::Internal(msg).into());
+                        }
                     }
                 }
             }
@@ -16013,6 +16327,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         gateway_lima_managers,
         #[cfg(target_os = "macos")]
+        gateway_ready: {
+            // Seed the daemon's own latch when startup already readied its
+            // gateway, which it does on exactly the branch that runs step 4.
+            // Leaving it unseeded would be correct but wasteful: `ensure_ready`
+            // on a running instance is still a `limactl list`, a `docker info`
+            // poll, a NIC re-verification and two policy applications, and the
+            // first session create of every daemon lifetime would pay for it.
+            //
+            // The key is `daemon_uid` because that is what `gateway_owner_uid`
+            // collapses every operator to while the switch is off — the same
+            // uid step 4 passed to `get_or_create`.
+            let mut latches = HashMap::new();
+            if !sandbox_core::per_operator_gateway_enabled() {
+                let cell = Arc::new(tokio::sync::OnceCell::new());
+                let _ = cell.set(());
+                latches.insert(daemon_uid, cell);
+            }
+            Arc::new(tokio::sync::Mutex::new(latches))
+        },
+        #[cfg(target_os = "macos")]
         networking_status: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         #[cfg(target_os = "macos")]
         gateway_recovering: Arc::new(sandbox_core::GatewayRecoveryLatches::new()),
@@ -16113,9 +16447,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sharded by gateway owner rather than probing one gateway and applying its
     // answer to every session, so an operator whose gateway is down does not
     // decide the startup health of sessions running through a gateway that is
-    // up. The sharding uses the same primitive and the same `Shared` ownership
-    // the recovery pass does, so with per-operator gateways off there is one
-    // shard and the seeded map is identical to the pre-shard behaviour.
+    // up. The sharding uses the same primitive and the same ownership value the
+    // recovery pass does, so with per-operator gateways off there is one shard
+    // and the seeded map is identical to the pre-shard behaviour.
+    //
+    // With them on, this runs before any agent has had time to check in, so the
+    // carried owner set is usually empty and the shards are whatever the
+    // sessions themselves resolve to. That is the right set to probe here: the
+    // question is which *existing* sessions came back healthy, and an operator
+    // with no session has nothing for this map to say about them.
     //
     // CROSS-PLATFORM NOTE: cfg-gated on macos; Linux unchanged.
     #[cfg(target_os = "macos")]
@@ -16138,9 +16478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let (shards, declined) = sandbox_core::partition_by_gateway_owner(
             running_lima,
-            sandbox_core::GatewayOwnership::Shared(sandbox_core::gateway_owner_uid(
-                state.daemon_uid,
-            )),
+            state.gateway_ownership().await,
             &network_for,
             &resolve_name_to_uid,
         )
@@ -16221,6 +16559,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so any confirmed-dead VMs whose operator was not checked in at startup
     // are detected and their slot-leaks reclaimed.
     //
+    // It also warms that operator's gateway VM. Check-in is the first moment
+    // the daemon can reach an operator-owned gateway at all, and warming here
+    // moves a bring-up that would otherwise run inside the operator's first
+    // create — where it is indistinguishable from a slow create — to the
+    // moment they log in. It is a warm-up and nothing depends on it: the
+    // create path awaits the same latch, so a failure here is retried there
+    // with the operator present to see the error.
+    //
+    // Ordering with reconcile matters and is deliberate. Reconcile reclaims
+    // slots leaked by VMs that died while their operator was logged out, and
+    // bring-up asks the pool which slots this operator owns; running reconcile
+    // first means the warm-up sees the reclaimed state rather than a stale one.
+    //
     // CROSS-PLATFORM NOTE: cfg-gated on macos; Linux unchanged.
     #[cfg(target_os = "macos")]
     {
@@ -16231,6 +16582,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!(op_uid, "broker admit: running operator VM reconcile");
                 reconcile_operator_vms(&reconcile_state, op_uid, ReconcileSource::FreshCheckin)
                     .await;
+                if let Err(e) = reconcile_state.ready_gateway_for_operator(op_uid).await {
+                    warn!(
+                        op_uid,
+                        error = %e,
+                        "broker admit: gateway warm-up failed; the operator's first \
+                         session create will retry it and report the error"
+                    );
+                }
             }
         });
     }
@@ -19845,6 +20204,51 @@ mod tests {
             assert!(
                 report.describe().is_empty(),
                 "a run that declined nothing must clear the previous run's report"
+            );
+        }
+
+        /// One dead gateway is visible however many healthy ones surround it,
+        /// and a tick that measured nothing says so.
+        ///
+        /// The first half is what the per-operator mode newly makes possible:
+        /// with one gateway a tick had one answer, so "some unreachable" and
+        /// "all unreachable" were the same predicate and nothing chose between
+        /// them. With several, a rule that waited for agreement would leave an
+        /// operator's dead gateway unrecovered for as long as anyone else's was
+        /// up.
+        ///
+        /// The second half is the empty case, which that mode reaches whenever
+        /// nobody is logged in. It has to stay distinguishable from health:
+        /// scored reachable, an idle tick would clear a failure count that the
+        /// probes which set it never retracted, and the recovery those probes
+        /// were counting toward would never be called in.
+        #[test]
+        fn a_probe_tick_distinguishes_unreachable_from_unmeasured() {
+            assert_eq!(
+                fold_gateway_probes(&[Some(true), Some(false), Some(true)]),
+                GatewayProbeVerdict::SomeUnreachable,
+                "one unreachable gateway decides the tick, whatever the others say"
+            );
+            assert_eq!(
+                fold_gateway_probes(&[Some(false), None]),
+                GatewayProbeVerdict::SomeUnreachable,
+                "a probe that produced no answer cannot soften one that did"
+            );
+            assert_eq!(
+                fold_gateway_probes(&[Some(true), None]),
+                GatewayProbeVerdict::AllReachable,
+                "nor can it withhold health the answering gateways reported"
+            );
+
+            assert_eq!(
+                fold_gateway_probes(&[]),
+                GatewayProbeVerdict::Indeterminate,
+                "no gateway to probe is nothing measured, not everything healthy"
+            );
+            assert_eq!(
+                fold_gateway_probes(&[None, None]),
+                GatewayProbeVerdict::Indeterminate,
+                "and neither is a tick on which every probe errored"
             );
         }
 

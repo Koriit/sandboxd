@@ -175,6 +175,48 @@ impl VmnetPoolRegistry {
         ))
     }
 
+    /// The slot set `operator_uid` draws from.
+    ///
+    /// The same branch [`Self::pool_for`] takes, answered as the slot set
+    /// rather than as the ledger over it, and refusing on the same condition
+    /// with the same error.
+    ///
+    /// A gateway VM serving this operator has to carry a NIC on every slot
+    /// this returns, and on no other. Carry fewer and a session claims a slot
+    /// whose L2 segment its gateway is not attached to — the claim succeeds
+    /// and the session has no egress. Carry more and the VM is attached to a
+    /// segment its operator can never be assigned, which is the isolation
+    /// property the partition exists to establish.
+    ///
+    /// The two must therefore stay in step, which is what
+    /// `the_slot_set_and_the_pool_agree_on_every_branch` pins: a slot set
+    /// derived independently of the ledger is a divergence nothing else in
+    /// the tree would notice.
+    pub fn slots_for(&self, operator_uid: u32) -> Result<Vec<u16>, SandboxError> {
+        let range = self.assignment.range_for(operator_uid);
+        if !range.is_empty() {
+            return Ok(range);
+        }
+        // `remainder` is `Some` exactly when `legacy_slots()` is non-empty —
+        // it is built from it — so this branch matches `pool_for`'s fallback
+        // arm rather than re-deciding it.
+        match &self.remainder {
+            Some(_) => Ok(self.assignment.legacy_slots()),
+            None => Err(self.no_range_assigned(operator_uid)),
+        }
+    }
+
+    /// Every slot in the host pool, in index order.
+    ///
+    /// What a **single** gateway VM serving every operator must carry, which
+    /// is the daemon-owned shape: that VM is the macvlan parent for whichever
+    /// operator's session lands on a slot, so it cannot be sized to any one
+    /// operator's range. Per-operator gateways use [`Self::slots_for`]
+    /// instead.
+    pub fn all_slots(&self) -> Vec<u16> {
+        (0..self.assignment.host_slots()).collect()
+    }
+
     /// Build the "no range assigned" refusal, and log the part the response
     /// must not carry.
     ///
@@ -679,6 +721,60 @@ mod tests {
             Some(other) => panic!("expected a 409-shaped conflict, got {other:?}"),
             None => panic!("an operator with no range must be refused, not given a pool"),
         }
+    }
+
+    /// The slot set a gateway VM is built over and the ledger a session
+    /// claims from must be the same set on every branch.
+    ///
+    /// They are two answers to one question — which slots are this
+    /// operator's — and nothing downstream compares them. A gateway short a
+    /// NIC produces a session that claims a slot successfully and then has
+    /// no egress on it, which surfaces as a broken sandbox rather than as a
+    /// refused create. So assert the agreement here, over all three branches
+    /// the fallback has: an assigned range, the shared remainder, and no
+    /// share at all.
+    #[test]
+    fn the_slot_set_and_the_pool_agree_on_every_branch() {
+        // Branch 1 — an assigned range, on a host that still has a
+        // remainder, so the fallback is available and must not be taken.
+        let partial = Host::unmigrated(8)
+            .enroll("operator-b", OP_B_GID, OP_B_UID, &[4, 5, 6, 7])
+            .candidate("olek", UNENROLLED_UID)
+            .registry(8);
+        assert_eq!(partial.slots_for(OP_B_UID).unwrap(), vec![4, 5, 6, 7]);
+        assert_eq!(
+            partial.slots_for(OP_B_UID).unwrap(),
+            partial.pool_for(OP_B_UID).unwrap().range(),
+        );
+
+        // Branch 2 — no assigned range, falling back to the remainder.
+        assert_eq!(partial.slots_for(UNENROLLED_UID).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            partial.slots_for(UNENROLLED_UID).unwrap(),
+            partial.pool_for(UNENROLLED_UID).unwrap().range(),
+        );
+
+        // Branch 3 — no range and no remainder: both refuse, with the same
+        // error. A gateway readied over an empty slot set would be a VM with
+        // no segment at all, which is a worse diagnosis than the 409.
+        let full = Host::unmigrated(8)
+            .enroll("operator-b", OP_B_GID, OP_B_UID, &[0, 1, 2, 3])
+            .enroll("operator-c", 312, 529, &[4, 5, 6, 7])
+            .candidate("olek", UNENROLLED_UID)
+            .registry(8);
+        assert!(matches!(
+            full.slots_for(UNENROLLED_UID),
+            Err(SandboxError::Conflict(_))
+        ));
+        assert!(matches!(
+            full.pool_for(UNENROLLED_UID),
+            Err(SandboxError::Conflict(_))
+        ));
+
+        // And the whole-host set, which is what one daemon-owned gateway
+        // carries, is every slot regardless of who holds which.
+        assert_eq!(full.all_slots(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(partial.all_slots(), full.all_slots());
     }
 
     /// Sessions carrying an operator uid land in that operator's pool.
