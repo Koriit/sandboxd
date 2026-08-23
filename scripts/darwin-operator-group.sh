@@ -37,6 +37,14 @@
 #   darwin-operator-group.sh status   [--operator NAME]
 #   darwin-operator-group.sh group-name --operator NAME
 #   darwin-operator-group.sh parse-range RANGE
+#   darwin-operator-group.sh check-holder UID
+#
+# check-holder answers the one question de-enrollment can fail on, on its own
+# and without mutating anything: does a live process of UID still hold a slot
+# socket? It takes a uid rather than a name because that is what identifies a
+# process's owner, and because it is the number a refused de-enrollment has
+# just printed. Run it after stopping what was holding the slot to confirm the
+# sequence can be resumed.
 #
 # Common options:
 #   --dry-run          print the ordered plan; change nothing. Implied by --state-file.
@@ -44,6 +52,10 @@
 #   --state-file FILE  read host state from a fixture instead of Directory Services.
 #                      Forces --dry-run, so the logic is testable with no host state,
 #                      no sudo, and no possibility of a mutation. See FIXTURE FORMAT.
+#   --socket-dir DIR   where the slot sockets live. check-holder only: a de-enrollment
+#                      allowed to aim its residue check at an empty directory would
+#                      answer "no holder" for a pool it never looked at, which is the
+#                      failure this check exists to prevent.
 #
 # enroll and deenroll mutate the host and must run as root (via sudo). Both are
 # idempotent: a second run of either is a no-op, not an error and not a duplicate.
@@ -55,6 +67,9 @@
 #   3  refused: the requested range is held by another operator
 #   4  refused: fail-closed — a slot group's membership makes it unassignable
 #   5  refused: a live process still holds a slot socket after revocation
+#   6  refused: the residue check could not observe the pool, so it certified
+#      nothing. Distinct from 5 because the remedy differs — 5 means stop the
+#      process, 6 means look from somewhere the pool is visible.
 #
 # FIXTURE FORMAT (--state-file), one directive per line, '#' starts a comment:
 #   pool-size N
@@ -124,10 +139,12 @@ usage:
   darwin-operator-group.sh status   [--operator NAME]
   darwin-operator-group.sh group-name --operator NAME
   darwin-operator-group.sh parse-range RANGE
+  darwin-operator-group.sh check-holder UID
 
   --dry-run          print the ordered plan; change nothing
   --pool-size N      slot count (default: the installed io.sandboxd.vmnet.* plists)
   --state-file FILE  read host state from a fixture instead of Directory Services
+  --socket-dir DIR   where the slot sockets live (check-holder only)
                      (forces --dry-run)
 USAGE
     exit 1
@@ -717,8 +734,9 @@ _deenroll() {
         _err "  idle pool. The range is NOT released, because releasing it here would be"
         _err "  certifying an absence that was never observed."
         _err "  Resolve by re-running this command where the socket_vmnet processes are"
-        _err "  visible, then confirm the step reports no holder."
-        exit 5
+        _err "  visible, or probe on its own with:"
+        _err "      darwin-operator-group.sh check-holder $OPERATOR_UID"
+        exit 6
     fi
     if [ "$_holder_rc" -ne 0 ]; then
         _err "a live process owned by uid $OPERATOR_UID still holds a vmnet slot socket."
@@ -912,7 +930,8 @@ OPERATOR=""
 SLOTS=""
 FORCE=0
 KEEP_DAEMON_ACCESS=0
-RANGE_ARG=""
+POSITIONAL=""
+SOCKET_DIR_ARG=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -929,14 +948,31 @@ while [ "$#" -gt 0 ]; do
             DRY_RUN=1
             shift 2
             ;;
+        --socket-dir)
+            [ "$#" -ge 2 ] || _usage
+            SOCKET_DIR_ARG="$2"
+            shift 2
+            ;;
         --dry-run)  DRY_RUN=1; shift ;;
         --force)    FORCE=1; shift ;;
         --keep-daemon-access) KEEP_DAEMON_ACCESS=1; shift ;;
         -h|--help)  _usage ;;
         -*)         _err "unknown option: $1"; _usage ;;
-        *)          RANGE_ARG="$1"; shift ;;
+        *)          POSITIONAL="$1"; shift ;;
     esac
 done
+
+if [ -n "$SOCKET_DIR_ARG" ]; then
+    # Deliberately not honoured by enroll or deenroll. Their residue check is
+    # the last thing standing between a reclaimed range and silent sharing; a
+    # flag that re-aims it at an empty directory would let it answer "no
+    # holder" about a pool it never examined.
+    [ "$CMD" = "check-holder" ] || {
+        _err "--socket-dir applies to check-holder only"
+        exit 1
+    }
+    VMNET_SOCKET_DIR="$SOCKET_DIR_ARG"
+fi
 
 case "$CMD" in
     enroll)
@@ -960,10 +996,34 @@ case "$CMD" in
         printf '%s\n' "$_g"
         ;;
     parse-range)
-        [ -n "$RANGE_ARG" ] || _usage
-        _c=$(_range_canon "$RANGE_ARG" || true)
-        [ -n "$_c" ] || { _err "malformed slot range: '$RANGE_ARG'"; exit 2; }
+        [ -n "$POSITIONAL" ] || _usage
+        _c=$(_range_canon "$POSITIONAL" || true)
+        [ -n "$_c" ] || { _err "malformed slot range: '$POSITIONAL'"; exit 2; }
         printf '%s\n' "$_c"
+        ;;
+    check-holder)
+        [ -n "$POSITIONAL" ] || _usage
+        case "$POSITIONAL" in
+            ''|*[!0-9]*) _err "check-holder takes a uid, not '$POSITIONAL'"; exit 2 ;;
+        esac
+        OPERATOR_UID="$POSITIONAL"
+        _rc=0
+        _no_live_slot_holder || _rc=$?
+        case "$_rc" in
+            0) echo "no live process of uid $OPERATOR_UID holds a slot socket" ;;
+            1)
+                _err "a live process owned by uid $OPERATOR_UID still holds a vmnet slot socket."
+                exit 5
+                ;;
+            *)
+                _err "cannot determine whether uid $OPERATOR_UID holds a vmnet slot socket."
+                _err "  Slot sockets exist under $VMNET_SOCKET_DIR, but no socket_vmnet"
+                _err "  endpoint was visible to this process, so a live holder and an idle"
+                _err "  pool look identical from here. Re-run where those processes are"
+                _err "  visible; this answers nothing as it stands."
+                exit 6
+                ;;
+        esac
         ;;
     *)
         _err "unknown command: $CMD"

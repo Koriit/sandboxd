@@ -285,23 +285,30 @@ sudo scripts/darwin-operator-group.sh status
 `make setup-dev-env` runs the first form for `$USER`; `scripts/install.sh` runs
 it for the installing operator. Both are idempotent — a second run is a no-op.
 
-### What is assigned, and what is not yet enforced
+### What is assigned, and what enforces it
 
-⚠️ **The slot sockets still carry the shared group, so this assignment is an
-audit surface and not an access control.** The daemon's own gateway VM is
-created and started as the daemon uid and holds a NIC on **every** slot, so
-until VM ownership moves to the operator, pointing the sockets at per-operator
-groups would stop the only gateway VM there is. Group creation and range
-assignment ship first because they depend on nothing else and make who-owns-what
-readable immediately; the socket switch ships with ownership.
+The slot socket carries the owning operator's group, so the assignment *is* the
+access control rather than a record of one. A `connect(2)` from an operator
+outside a slot's group fails `EACCES` and the pool logs no accepted connection
+for it. On a two-operator host with slots 0-3 and 4-7 split between them, each
+principal connects on its own range and is refused on the other's, while
+`stat(2)` on both sockets succeeds from both — which is what separates a group
+refusal from a directory-traversal failure, and confirms traversal stays intact
+for every operator. The refusal reaches a VM the same way: a gateway whose
+operator is not in the slot's group dies at its first `socket:` entry with
+`dial unix …/slot-N.sock: connect: permission denied` and never reaches a guest.
 
 Two memberships are deliberate and must not be "tidied up":
 
-- **The daemon account is in every per-operator group.** It has to be — the
+- **Every daemon account is in every per-operator group.** It has to be — the
   gateway VM holds a NIC on every slot, so a daemon outside one operator's group
   fails `limactl start` at the first `socket:` entry, and then no macOS session
   of *any* operator can be created or recovered. This is not a weakening: the
-  daemon is the principal operators are isolated around, not from.
+  daemon is the principal operators are isolated around, not from. Read *every*
+  literally on a host that runs more than one daemon account — the e2e harness
+  account owns a state tree and a gateway beside the production one, and a
+  daemon account left out of the split loses every slot at the moment the
+  sockets move.
 - **Operators stay in the shared `_sandboxd` group.** It gates the daemon socket
   itself, and it owns `/var/run/sandbox/vmnet` (0750) — an operator outside it
   cannot traverse to a slot socket whatever group the socket carries. The
@@ -395,7 +402,15 @@ is therefore:
 1. **Regenerate** the slot plists with their per-operator groups.
 2. **Reload** the pool jobs so the running argv matches what is on disk
    (`make setup-darwin-vmnet-daemons`, then `scripts/darwin-vmnet-drift.sh` per
-   slot to confirm — "loaded" is not "up to date").
+   slot to confirm — "loaded" is not "up to date"). ⚠️ A `bootout` followed
+   immediately by a `bootstrap` of the same label fails with `Bootstrap failed:
+   5: Input/output error`: the bootout takes effect and the bootstrap does not.
+   Looped over eight slots that takes the **whole pool offline** while reporting
+   an errno naming nothing relevant — `plutil -lint` calls the plist fine, so
+   the plist is the wrong place to look. Retrying the failed label seconds later
+   succeeds. Read a slot that is down after a reload as un-bootstrapped rather
+   than as misconfigured, which is why step 2 confirms per slot instead of
+   trusting the reload's exit status.
 3. **Split membership**: enroll each operator into their own group.
 4. **Start the new daemon.**
 

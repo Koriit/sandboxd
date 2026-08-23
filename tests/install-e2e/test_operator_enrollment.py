@@ -32,6 +32,7 @@ here is the decision logic underneath them.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -41,11 +42,20 @@ HERE = Path(__file__).resolve().parent
 SCRIPT = HERE.parent.parent / "scripts" / "darwin-operator-group.sh"
 
 
-def run(*args: str, state: Path | None = None) -> subprocess.CompletedProcess:
+def run(
+    *args: str,
+    state: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     cmd = ["/bin/sh", str(SCRIPT), *args]
     if state is not None:
         cmd += ["--state-file", str(state)]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=None if env is None else {**os.environ, **env},
+    )
 
 
 def steps(out: str) -> list[str]:
@@ -402,16 +412,204 @@ group _sandboxd-op-alice 320 0-7 alice,_sandboxd
 
 
 # ---------------------------------------------------------------------------
-# what this phase deliberately does not do
+# the residue check, against a real lsof shape
+# ---------------------------------------------------------------------------
+#
+# The tests above drive the residue check through the fixture seam, which
+# answers it from a ``slot-holder`` directive and returns before any of the
+# process inspection runs. That leaves the part that actually decides the
+# question on a live host uncovered — and it was wrong: it counted rows of the
+# *operator's* lsof output that mentioned the socket directory, which is a
+# count that cannot rise. The connected end of an AF_UNIX socket carries no
+# path; lsof prints it as a bare ``->0x<peer>``. On a host where one operator's
+# QEMU held four slots, that count was 0.
+#
+# So these drive the live branch with a stand-in ``lsof`` on PATH. The
+# load-bearing property is inverted from what the old code tested: a holder is
+# detected *even though the operator's own output never contains the socket
+# directory anywhere*.
+
+LISTENER_FD = "0x1000000000000001"
+SLOT4 = "0x2d76948ffea8141e"
+SLOT5 = "0x2d76948ffea8141f"
+OTHER = "0xdeadbeefdeadbeef"
+
+
+def fake_lsof(tmp_path: Path, listener: str, clients: dict[str, str]) -> dict[str, str]:
+    """Put a stand-in ``lsof`` on PATH; return an env that finds it first.
+
+    It answers the two queries the check makes — ``-c socket_vmnet`` for the
+    pool's own fds and ``-u UID`` for one operator's — from files, so a test
+    can state exactly what the host looks like.
+    """
+    data = tmp_path / "lsof-data"
+    data.mkdir(exist_ok=True)
+    (data / "listener").write_text(listener)
+    for uid, text in clients.items():
+        (data / f"client-{uid}").write_text(text)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / "lsof"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'd="{data}"\n'
+        'case "$1" in\n'
+        '  -c) cat "$d/listener" ;;\n'
+        '  -u) [ -f "$d/client-$2" ] && cat "$d/client-$2" ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    shim.chmod(0o755)
+    return {"PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin"}
+
+
+def pool(sockdir: Path, *, endpoints: dict[int, str]) -> str:
+    """``lsof -c socket_vmnet`` for a pool: one listening fd, one row per peer."""
+    rows = [
+        f"socket_vmnet 12086 root 3u unix {LISTENER_FD} 0t0 "
+        f"{sockdir}/slot-{slot}.sock"
+        for slot in sorted(endpoints)
+    ]
+    rows += [
+        f"socket_vmnet 12086 root {6 + i}u unix {dev} 0t0 {sockdir}/slot-{slot}.sock"
+        for i, (slot, dev) in enumerate(sorted(endpoints.items()))
+    ]
+    return "".join(row + "\n" for row in rows)
+
+
+def client(uid: str, *, peers: list[str]) -> str:
+    """``lsof -u UID`` for a process holding connected unix sockets."""
+    rows = [f"qemu-syst 44143 {uid} {3 + i}u unix 0x77{i:02d} 0t0 ->{peer}"
+            for i, peer in enumerate(peers)]
+    # Rows the check must ignore: a regular file and a listening socket of its
+    # own. Both are ordinary in a real process's output.
+    rows.append(f"qemu-syst 44143 {uid} 1w REG 1,17 4096 /tmp/serial.log")
+    return "".join(row + "\n" for row in rows)
+
+
+def touch_sockets(sockdir: Path, slots: list[int]) -> None:
+    sockdir.mkdir(parents=True, exist_ok=True)
+    for slot in slots:
+        (sockdir / f"slot-{slot}.sock").write_text("")
+
+
+def test_a_holder_is_found_through_its_peer_address_not_a_path(tmp_path):
+    """The inversion: detected with no socket path anywhere in the client's output.
+
+    This is the whole correction. lsof shows the client only ``->0x<peer>``,
+    so the operator's own rows can never be matched against the socket
+    directory. What does identify the slot is the listener's side: each
+    accepted connection is a row carrying both the path and the address the
+    client peers to, so the two sides join on the address.
+    """
+    sockdir = tmp_path / "vmnet"
+    touch_sockets(sockdir, [4, 5])
+    client_rows = client("528", peers=[SLOT4, SLOT5])
+    assert str(sockdir) not in client_rows, (
+        "the fixture must not leak the socket directory into the client's rows — "
+        "that is exactly the string the broken check looked for"
+    )
+    env = fake_lsof(tmp_path, pool(sockdir, endpoints={4: SLOT4, 5: SLOT5}),
+                    {"528": client_rows})
+
+    r = run("check-holder", "528", "--socket-dir", str(sockdir), env=env)
+    assert r.returncode == 5, r.stdout + r.stderr
+    assert "still holds a vmnet slot socket" in r.stderr
+
+
+def test_an_operator_peering_nothing_in_the_pool_is_clean(tmp_path):
+    """A process with connected unix sockets that are simply not slot sockets."""
+    sockdir = tmp_path / "vmnet"
+    touch_sockets(sockdir, [4, 5])
+    env = fake_lsof(tmp_path, pool(sockdir, endpoints={4: SLOT4, 5: SLOT5}),
+                    {"528": client("528", peers=[OTHER])})
+
+    r = run("check-holder", "528", "--socket-dir", str(sockdir), env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no live process" in r.stdout
+
+
+def test_a_pool_it_cannot_see_is_refused_rather_than_certified(tmp_path):
+    """Absence that was never observed must not be reported as absence.
+
+    Every running slot job holds at least its own listening fd, so zero
+    socket_vmnet rows alongside slot sockets on disk means the view is
+    restricted — not that the pool is idle. Answering 'clean' here is how a
+    range gets released out from under a VM that is still on the segment.
+    """
+    sockdir = tmp_path / "vmnet"
+    touch_sockets(sockdir, [4])
+    env = fake_lsof(tmp_path, "", {"528": client("528", peers=[SLOT4])})
+
+    r = run("check-holder", "528", "--socket-dir", str(sockdir), env=env)
+    assert r.returncode == 6, r.stdout + r.stderr
+    assert "cannot determine" in r.stderr
+    assert "answers nothing" in r.stderr
+
+
+def test_a_directory_with_no_slot_sockets_is_genuinely_clean(tmp_path):
+    """The other reading of an empty listener view, and the one that is benign."""
+    sockdir = tmp_path / "vmnet"
+    sockdir.mkdir(parents=True)
+    env = fake_lsof(tmp_path, "", {"528": client("528", peers=[OTHER])})
+
+    r = run("check-holder", "528", "--socket-dir", str(sockdir), env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_one_operators_holder_is_not_charged_to_another(tmp_path):
+    """Slot occupancy is per-uid, so the answer must differ between operators."""
+    sockdir = tmp_path / "vmnet"
+    touch_sockets(sockdir, [0, 4])
+    env = fake_lsof(
+        tmp_path,
+        pool(sockdir, endpoints={0: SLOT4, 4: SLOT5}),
+        {"528": client("528", peers=[SLOT5]), "501": client("501", peers=[OTHER])},
+    )
+
+    held = run("check-holder", "528", "--socket-dir", str(sockdir), env=env)
+    assert held.returncode == 5, held.stdout + held.stderr
+
+    free = run("check-holder", "501", "--socket-dir", str(sockdir), env=env)
+    assert free.returncode == 0, free.stdout + free.stderr
+
+
+def test_check_holder_takes_a_uid_not_a_name(tmp_path):
+    sockdir = tmp_path / "vmnet"
+    sockdir.mkdir(parents=True)
+    env = fake_lsof(tmp_path, "", {})
+    r = run("check-holder", "bob", "--socket-dir", str(sockdir), env=env)
+    assert r.returncode == 2
+    assert "takes a uid" in r.stderr
+
+
+def test_the_socket_dir_seam_cannot_be_pointed_at_a_mutating_run(tmp_path):
+    """A test seam that reaches deenroll would defeat the check it exists to test.
+
+    Aimed at an empty directory the residue check answers 'no holder' for a
+    pool it never looked at, and the range is released while the departing
+    operator's VM is still on the segment.
+    """
+    state = write_state(tmp_path, DEENROLL + "slot-holder 528\n")
+    r = run("deenroll", "--operator", "bob", "--socket-dir", str(tmp_path),
+            state=state)
+    assert r.returncode == 1
+    assert "check-holder only" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# what this script deliberately does not do
 # ---------------------------------------------------------------------------
 
 def test_nothing_here_moves_a_socket_or_rewrites_a_plist():
-    """Enforcement lands with VM ownership, not with assignment.
+    """Assignment and enforcement are separate programs, and stay separate.
 
-    Until then the daemon's own gateway VM must keep opening every slot, so a
-    host whose sockets still carry the shared group has to keep working
-    unchanged. Any reference here to the socket directory or the launchd plists
-    must therefore be a read.
+    The socket group is enforced by what the plist generator writes into
+    ``--socket-group``; this script decides who owns which slots and maintains
+    the groups that answer that. Keeping the mutation of sockets and plists out
+    of here is what lets the ordering guarantees above be checked in isolation:
+    any reference here to the socket directory or the launchd plists is a read.
     """
     body = SCRIPT.read_text()
     for forbidden in ("chgrp", "chown", "launchctl", "plutil", "install -d"):
