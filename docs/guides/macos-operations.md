@@ -553,8 +553,8 @@ clones share unchanged blocks with the base image at no extra cost.
 | `sandboxd-gateway` Lima VM | ~4–6 GB | One per host; shared across all operators |
 | `sandbox-base` Lima VM (per operator) | ~4–6 GB | One per operator; clones diverge from here |
 | Session VM clone | < 1 GB initially | Grows as the session writes files |
-| Gateway image tarball | ~500 MB | Retained at daemon LIMA_HOME for self-heal |
-| Lite container image | ~300 MB | Retained at daemon LIMA_HOME |
+| Gateway image tarball | ~500 MB | Staged in the daemon base dir; copied into a gateway's LIMA_HOME on first load, so budget for two copies |
+| Lite container image | ~300 MB | Same two-copy pattern as the gateway tarball |
 
 ### APFS accounting notes
 

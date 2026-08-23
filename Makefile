@@ -1473,13 +1473,19 @@ endif
 # stage-route-helper-linux-aarch64 — copy the Linux aarch64 route-helper into
 # the daemon's LIMA_HOME so `ensure_route_helper_in_vm` can find it at startup.
 #
-# The staging path mirrors the daemon's derivation:
+# Two destinations, for the reason spelled out on stage-lite-image: the loader
+# reads a path that moves with the gateway's owner, and staging cannot enumerate
+# owners.
 #   {SANDBOXD_STATE_ROOT}/{daemon-uid}/{daemon-uid}/lima/sandbox-route-helper-linux-aarch64
+#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/sandbox-route-helper-linux-aarch64
 #
 # Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {daemon-uid} is the
 # uid of the daemon user (SANDBOX_DAEMON_UID; defaults to the uid of
 # SANDBOX_DAEMON_USER=_sandboxd for prod, overridable for an operator-run dev
-# daemon). This matches operator_lima_home(daemon_uid) in lima.rs.
+# daemon). The first matches operator_lima_home(daemon_uid) in lima.rs.
+#
+# Mode 0755 on both: `limactl copy` preserves the source's mode, so the bit set
+# here is the one the VM runs the helper under.
 #
 # Idempotence: skipped if the installed binary is byte-identical to the built one.
 # Darwin-only: the gateway VM only exists on macOS.
@@ -1506,29 +1512,46 @@ stage-route-helper-linux-aarch64: build-route-helper-linux-aarch64
 	fi; \
 	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/sandbox-route-helper-linux-aarch64"; \
+	_staged="/var/lib/sandboxd/$$_daemon_uid/sandbox-route-helper-linux-aarch64"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] mkdir -p $$_lima_home"; \
 	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_user" -m 0750 "$$_lima_home"; \
 	fi; \
-	if [ -f "$$_dst" ] && cmp -s "$$_built" "$$_dst"; then \
-	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
-	else \
-	  echo "[sudo] install -m 0755 $$_built $$_dst"; \
-	  sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0755 "$$_built" "$$_dst"; \
-	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
-	fi
+	for _target in "$$_dst" "$$_staged"; do \
+	  if sudo -k cmp -s "$$_built" "$$_target" 2>/dev/null; then \
+	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
+	  else \
+	    echo "[sudo] install -m 0755 $$_built $$_target"; \
+	    sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0755 "$$_built" "$$_target"; \
+	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
+	  fi; \
+	done
 
-# stage-lite-image — save the sandboxd-lite Docker image as a tarball into the
-# daemon's LIMA_HOME so `GatewayLimaManager::load_lite_image_into_gateway` can
-# find it at lite session-create time on macOS.
+# stage-lite-image — save the sandboxd-lite Docker image as a tarball where
+# `GatewayLimaManager::load_lite_image_into_gateway` can find it at lite
+# session-create time on macOS.
 #
-# The staging path mirrors the daemon's derivation:
-#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/{daemon-uid}/lima/lite-image.tar
+# Two destinations, because the loader reads a path that moves with the gateway's
+# owner while the staging cannot:
+#
+#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/{daemon-uid}/lima/lite-image.tar  <- primary
+#   {SANDBOXD_STATE_ROOT}/{daemon-uid}/lite-image.tar                    <- per-daemon
 #
 # Where {SANDBOXD_STATE_ROOT} is /var/lib/sandboxd and {daemon-uid} is the
 # uid of the daemon user (SANDBOX_DAEMON_UID; defaults to the uid of
 # SANDBOX_DAEMON_USER=_sandboxd for prod, overridable for an operator-run dev
-# daemon). This matches operator_lima_home(daemon_uid) in lima.rs.
+# daemon). The primary matches operator_lima_home(daemon_uid) in lima.rs.
+#
+# The primary only serves the gateway the daemon owns itself. With per-operator
+# gateways the loader reads
+# {SANDBOXD_STATE_ROOT}/{daemon-uid}/{operator-uid}/lima/, which no staging step
+# can enumerate — an operator who enrolls later has no directory here yet. The
+# per-daemon copy is the one the daemon copies inward on first use, so it is what
+# makes an operator-owned gateway able to run lite sessions at all.
+#
+# Note for whoever wires per-operator gateways into e2e: the conftest
+# between-session reset keeps {uid}/{uid}/lima/ but wipes top-level base-dir
+# files, so the per-daemon copy does not survive a reset and the primary does.
 #
 # Idempotence: saves to a temp file, then skips the sudo install if the
 # destination is byte-identical to the freshly saved tarball.
@@ -1556,6 +1579,7 @@ stage-lite-image: lite-image
 	fi; \
 	_lima_home="/var/lib/sandboxd/$$_daemon_uid/$$_daemon_uid/lima"; \
 	_dst="$$_lima_home/lite-image.tar"; \
+	_staged="/var/lib/sandboxd/$$_daemon_uid/lite-image.tar"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] install -d -o $$_daemon_user -g $$_daemon_user -m 0750 $$_lima_home"; \
 	  sudo -k install -d -o "$$_daemon_user" -g "$$_daemon_user" -m 0750 "$$_lima_home"; \
@@ -1563,15 +1587,16 @@ stage-lite-image: lite-image
 	_tmp=/tmp/sandboxd-lite-stage-$$$$.tar; \
 	echo "docker save $$_lite_tag -o $$_tmp"; \
 	docker save "$$_lite_tag" -o "$$_tmp"; \
-	if [ -f "$$_dst" ] && cmp -s "$$_tmp" "$$_dst"; then \
-	  rm -f "$$_tmp"; \
-	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
-	else \
-	  echo "[sudo] install -o $$_daemon_user -g $$_daemon_user -m 0640 $$_tmp $$_dst"; \
-	  sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0640 "$$_tmp" "$$_dst"; \
-	  rm -f "$$_tmp"; \
-	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
-	fi
+	for _target in "$$_dst" "$$_staged"; do \
+	  if sudo -k cmp -s "$$_tmp" "$$_target" 2>/dev/null; then \
+	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
+	  else \
+	    echo "[sudo] install -o $$_daemon_user -g $$_daemon_user -m 0640 $$_tmp $$_target"; \
+	    sudo -k install -o "$$_daemon_user" -g "$$_daemon_user" -m 0640 "$$_tmp" "$$_target"; \
+	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
+	  fi; \
+	done; \
+	rm -f "$$_tmp"
 
 # setup-bridge-conf — `/etc/qemu/bridge.conf`. The QEMU bridge helper
 # (qemu-bridge-helper) reads this file to decide which bridges
@@ -2280,8 +2305,9 @@ setup-darwin-sandboxd-test-user: setup-darwin-sandboxd-test-group
 
 # setup-darwin-sandboxd-test-state-dir — create the e2e daemon's per-uid state
 # tree under /var/lib/sandboxd/<uid>/:
-#   /var/lib/sandboxd/<uid>/          — base dir (sessions.db, socket) — 0750
-#   /var/lib/sandboxd/<uid>/<uid>/    — per-operator LIMA_HOME parent  — 0755
+#   /var/lib/sandboxd/<uid>/          — base dir (sessions.db, socket,
+#                                       per-daemon staged artifacts)     — 0750
+#   /var/lib/sandboxd/<uid>/<uid>/    — per-operator LIMA_HOME parent    — 0755
 #
 # The three-level path {state_root}/{daemon_uid}/{op_uid}/lima (lima.rs:198)
 # means the daemon's own LIMA_HOME is {uid}/{uid}/lima. The intermediate
@@ -2441,17 +2467,23 @@ setup-darwin-test-sudoers-fragment:
 	fi
 
 # stage-gateway-image-test — save the sandbox-gateway Docker image as a tarball
-# directly into the e2e test daemon's LIMA_HOME so `load_gateway_image_if_needed`
-# (gateway_lima.rs:958) finds it as the PRIMARY path at daemon startup.
+# where `load_gateway_image_if_needed` can find it at e2e daemon startup.
 #
-# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/<_sandboxd-test-uid>/lima/gateway-image.tar
-#   (daemon_lima_home = operator_lima_home(daemon_uid) = {state_root}/{uid}/{uid}/lima)
+# Two destinations:
+#   /var/lib/sandboxd/<test-uid>/<test-uid>/lima/gateway-image.tar  <- primary
+#   /var/lib/sandboxd/<test-uid>/gateway-image.tar                  <- per-daemon
 #
-# The daemon reads:
-#   {daemon_lima_home}/gateway-image.tar         <- primary (checked first)
-#   {daemon_lima_home}/../../gateway-image.tar   <- self-heal fallback (base dir)
-# Staging to the primary path means the tarball survives the conftest between-session
-# reset, which keeps {uid}/{uid}/lima/ but wipes top-level base-dir files.
+# The primary is daemon_lima_home = operator_lima_home(daemon_uid) =
+# {state_root}/{uid}/{uid}/lima, which is what the loader reads first. It only
+# serves the gateway the daemon owns itself: with per-operator gateways
+# daemon_lima_home becomes {state_root}/{uid}/{operator-uid}/lima, which no
+# staging step can enumerate. The per-daemon copy sits two levels above whichever
+# LIMA_HOME the loader ends up reading, and the daemon copies it inward on first
+# use — see GatewayLimaManager::copy_staged_artifact.
+#
+# Both are staged because they survive differently: the conftest between-session
+# reset keeps {uid}/{uid}/lima/ but wipes top-level base-dir files, so the primary
+# outlives a reset and the per-daemon copy does not.
 # Creates the LIMA_HOME directory when absent (owned _sandboxd-test, mode 0750).
 #
 # The image must already be built (make gateway-image). Darwin-only.
@@ -2482,6 +2514,7 @@ stage-gateway-image-test: setup-darwin-sandboxd-test-user
 	_test_uid=$$(id -u _sandboxd-test); \
 	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
 	_dst="$$_lima_home/gateway-image.tar"; \
+	_staged="/var/lib/sandboxd/$$_test_uid/gateway-image.tar"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
 	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
@@ -2489,27 +2522,30 @@ stage-gateway-image-test: setup-darwin-sandboxd-test-user
 	_tmp=/tmp/sandboxd-gateway-test-stage-$$$$.tar; \
 	echo "docker save $$_gateway_tag -o $$_tmp"; \
 	docker save "$$_gateway_tag" -o "$$_tmp"; \
-	if sudo -k cmp -s "$$_tmp" "$$_dst" 2>/dev/null; then \
-	  rm -f "$$_tmp"; \
-	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
-	else \
-	  echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_dst"; \
-	  sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_dst"; \
-	  rm -f "$$_tmp"; \
-	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
-	fi
+	for _target in "$$_dst" "$$_staged"; do \
+	  if sudo -k cmp -s "$$_tmp" "$$_target" 2>/dev/null; then \
+	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
+	  else \
+	    echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_target"; \
+	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_target"; \
+	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
+	  fi; \
+	done; \
+	rm -f "$$_tmp"
 
 # stage-lite-image-test — save the sandboxd-lite Docker image as a tarball at
 # the e2e test daemon's LIMA_HOME so `load_lite_image_into_gateway` can find it
 # at lite session-create time.
 #
-# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/<_sandboxd-test-uid>/lima/lite-image.tar
-#   (daemon_lima_home = operator_lima_home(daemon_uid) in lima.rs, with daemon_uid=test_uid)
+# Two destinations, the same pair and for the same reason as
+# stage-gateway-image-test:
+#   /var/lib/sandboxd/<test-uid>/<test-uid>/lima/lite-image.tar  <- primary
+#   /var/lib/sandboxd/<test-uid>/lite-image.tar                  <- per-daemon
 #
-# Unlike gateway-image, load_lite_image_into_gateway (gateway_lima.rs:1139-1148)
-# has NO base-dir self-heal — it reads only from daemon_lima_home. The LIMA_HOME
-# directory is created lazily by the daemon, so this target must create it when
-# absent (owned _sandboxd-test, mode 0750).
+# The primary is daemon_lima_home = operator_lima_home(daemon_uid) in lima.rs,
+# with daemon_uid=test_uid. The LIMA_HOME directory is created lazily by the
+# daemon, so this target must create it when absent (owned _sandboxd-test,
+# mode 0750).
 #
 # The image must already be built (make lite-image). Darwin-only.
 # Idempotent: skipped when the destination is byte-identical to the saved tarball.
@@ -2536,6 +2572,7 @@ stage-lite-image-test: lite-image setup-darwin-sandboxd-test-user
 	_test_uid=$$(id -u _sandboxd-test); \
 	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
 	_dst="$$_lima_home/lite-image.tar"; \
+	_staged="/var/lib/sandboxd/$$_test_uid/lite-image.tar"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
 	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
@@ -2543,25 +2580,33 @@ stage-lite-image-test: lite-image setup-darwin-sandboxd-test-user
 	_tmp=/tmp/sandboxd-lite-test-stage-$$$$.tar; \
 	echo "docker save $$_lite_tag -o $$_tmp"; \
 	docker save "$$_lite_tag" -o "$$_tmp"; \
-	if sudo -k cmp -s "$$_tmp" "$$_dst" 2>/dev/null; then \
-	  rm -f "$$_tmp"; \
-	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
-	else \
-	  echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_dst"; \
-	  sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_dst"; \
-	  rm -f "$$_tmp"; \
-	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
-	fi
+	for _target in "$$_dst" "$$_staged"; do \
+	  if sudo -k cmp -s "$$_tmp" "$$_target" 2>/dev/null; then \
+	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
+	  else \
+	    echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0640 $$_tmp $$_target"; \
+	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0640 "$$_tmp" "$$_target"; \
+	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
+	  fi; \
+	done; \
+	rm -f "$$_tmp"
 
 # stage-route-helper-linux-aarch64-test — copy the Linux aarch64 route-helper
-# into the e2e test daemon's LIMA_HOME so `ensure_route_helper_in_vm`
-# (gateway_lima.rs:1670) can install it into the gateway VM at startup.
+# where `ensure_route_helper_in_vm` can find it and install it into the e2e
+# gateway VM at startup.
 #
-# Stage path: /var/lib/sandboxd/<_sandboxd-test-uid>/<_sandboxd-test-uid>/lima/sandbox-route-helper-linux-aarch64
-#   (daemon_lima_home; ROUTE_HELPER_LINUX_BINARY_FILENAME in gateway_lima.rs)
+# Two destinations, the same pair and for the same reason as
+# stage-gateway-image-test:
+#   /var/lib/sandboxd/<test-uid>/<test-uid>/lima/sandbox-route-helper-linux-aarch64
+#   /var/lib/sandboxd/<test-uid>/sandbox-route-helper-linux-aarch64
 #
-# ensure_route_helper_in_vm reads only from daemon_lima_home — no self-heal.
+# The first is daemon_lima_home; the filename is
+# sandbox_invm_argv::route_helper::HOST_BINARY_FILENAME, which both the daemon
+# and the executing agent join onto their own LIMA_HOME.
 # Creates the LIMA_HOME directory when absent (owned _sandboxd-test, mode 0750).
+#
+# Mode 0755 on both: `limactl copy` preserves the source's mode, so the bit set
+# here is the one the VM runs the helper under.
 #
 # Idempotent: skipped when the installed binary is byte-identical to the built one.
 # Darwin-only.
@@ -2588,17 +2633,20 @@ stage-route-helper-linux-aarch64-test: build-route-helper-linux-aarch64 setup-da
 	_test_uid=$$(id -u _sandboxd-test); \
 	_lima_home="/var/lib/sandboxd/$$_test_uid/$$_test_uid/lima"; \
 	_dst="$$_lima_home/sandbox-route-helper-linux-aarch64"; \
+	_staged="/var/lib/sandboxd/$$_test_uid/sandbox-route-helper-linux-aarch64"; \
 	if [ ! -d "$$_lima_home" ]; then \
 	  echo "[sudo] install -d -o _sandboxd-test -g _sandboxd-test -m 0750 $$_lima_home"; \
 	  sudo -k install -d -o _sandboxd-test -g _sandboxd-test -m 0750 "$$_lima_home"; \
 	fi; \
-	if sudo -k cmp -s "$$_built" "$$_dst" 2>/dev/null; then \
-	  echo "$(GREEN)✓ already current: $$_dst$(RESET)"; \
-	else \
-	  echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0755 $$_built $$_dst"; \
-	  sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0755 "$$_built" "$$_dst"; \
-	  echo "$(GREEN)✓ staged: $$_dst$(RESET)"; \
-	fi
+	for _target in "$$_dst" "$$_staged"; do \
+	  if sudo -k cmp -s "$$_built" "$$_target" 2>/dev/null; then \
+	    echo "$(GREEN)✓ already current: $$_target$(RESET)"; \
+	  else \
+	    echo "[sudo] install -o _sandboxd-test -g _sandboxd-test -m 0755 $$_built $$_target"; \
+	    sudo -k install -o _sandboxd-test -g _sandboxd-test -m 0755 "$$_built" "$$_target"; \
+	    echo "$(GREEN)✓ staged: $$_target$(RESET)"; \
+	  fi; \
+	done
 
 # setup-darwin-sandboxd-test-vmnet-group-membership — add `_sandboxd-test` to
 # the vmnet socket group so the daemon (running as `_sandboxd-test`) can reach

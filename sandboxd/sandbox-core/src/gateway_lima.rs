@@ -257,17 +257,21 @@ const NFT_INJECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "macos")]
 const GATEWAY_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Filename of the cached gateway image tarball inside the daemon LIMA_HOME.
-/// The operator populates it via:
-///   make gateway-image && docker save <tag> -o <path>
-/// where <path> is `{daemon_lima_home}/gateway-image.tar`.
+/// Filename of the cached gateway image tarball.
+///
+/// Read at `{daemon_lima_home}/gateway-image.tar`, and staged once per daemon
+/// at the base dir two levels above it — see
+/// [`GatewayLimaManager::copy_staged_artifact`] for why the staging is per
+/// daemon while the read is per owner. The operator populates it via
+/// `make gateway-image && make stage-gateway-image-test`, or install.sh does.
 #[cfg(target_os = "macos")]
 pub const GATEWAY_IMAGE_TARBALL_FILENAME: &str = "gateway-image.tar";
 
-/// Filename of the cached lite image tarball inside the daemon LIMA_HOME.
-/// The operator populates it via:
-///   make lite-image && make stage-lite-image
-/// where the destination path is `{daemon_lima_home}/lite-image.tar`.
+/// Filename of the cached lite image tarball.
+///
+/// Same two locations and the same reason as
+/// [`GATEWAY_IMAGE_TARBALL_FILENAME`]. The operator populates it via
+/// `make lite-image && make stage-lite-image`.
 #[cfg(target_os = "macos")]
 pub const LITE_IMAGE_TARBALL_FILENAME: &str = "lite-image.tar";
 
@@ -1527,7 +1531,7 @@ impl GatewayLimaManager {
 
         let plan = plan_image_load(
             ImagePresence::from_probe(self.gateway_image_present_inside_lima()),
-            || tarball.exists() || self.copy_staged_gateway_tarball(&tarball),
+            || tarball.exists() || self.copy_staged_artifact(GATEWAY_IMAGE_TARBALL_FILENAME),
         );
 
         match plan {
@@ -1583,45 +1587,59 @@ impl GatewayLimaManager {
         }
     }
 
-    /// Copy the install-staged gateway tarball into `daemon_lima_home`.
+    /// Copy a staged artifact from the daemon base dir into `daemon_lima_home`.
     ///
-    /// install.sh stages it at the daemon base dir
-    /// (`{state_root}/{daemon_uid}/gateway-image.tar`), two levels above
-    /// `daemon_lima_home` (`…/{daemon_uid}/{owner_uid}/lima`) whichever uid
-    /// owns the instance — the staged tarball is per daemon, not per owner.
+    /// Three files are read out of `daemon_lima_home` by name — the two image
+    /// tarballs and the Linux route-helper binary — and `daemon_lima_home` is
+    /// `…/{daemon_uid}/{owner_uid}/lima`, so it moves with the owner. Staging
+    /// them per owner would mean re-staging on every enrollment, and would
+    /// leave an operator who enrolled afterwards with a gateway that boots and
+    /// then cannot load an image. So they are staged **once per daemon**, at
+    /// the base dir `{state_root}/{daemon_uid}/`, two levels above
+    /// `daemon_lima_home` whichever uid owns the instance, and copied in from
+    /// there on first use.
     ///
-    /// Returns whether `dest` is now a tarball the load path can read. Every
-    /// failure is a `false` rather than an error: the caller's next move is
-    /// the same either way, and the reason is logged here where the path that
-    /// failed is in hand.
-    fn copy_staged_gateway_tarball(&self, dest: &Path) -> bool {
+    /// The destination is derived here rather than passed in, because the copy
+    /// has to land exactly where the reader looks and a second parameter would
+    /// be a way for the two to disagree.
+    ///
+    /// The source's permission bits come along with it, which is what the
+    /// route-helper binary needs — it is staged executable and has to arrive
+    /// that way.
+    ///
+    /// Returns whether the artifact is now readable at the path the caller
+    /// reads. Every failure is a `false` rather than an error: the caller's
+    /// next move is the same either way, and the reason is logged here where
+    /// the path that failed is in hand.
+    fn copy_staged_artifact(&self, filename: &str) -> bool {
         let Some(staged_path) = self
             .daemon_lima_home
             .parent()
             .and_then(|p| p.parent())
-            .map(|base| base.join(GATEWAY_IMAGE_TARBALL_FILENAME))
+            .map(|base| base.join(filename))
         else {
             return false;
         };
         if !staged_path.exists() {
             return false;
         }
+        let dest = self.daemon_lima_home.join(filename);
         // Ensure daemon_lima_home exists (ensure_ready creates it, but
         // belt-and-suspenders before the copy).
         if let Err(e) = std::fs::create_dir_all(&self.daemon_lima_home) {
             warn!(
                 error = %e,
                 dir = %self.daemon_lima_home.display(),
-                "failed to create daemon_lima_home for tarball copy"
+                "failed to create daemon_lima_home for staged-artifact copy"
             );
             return false;
         }
-        match std::fs::copy(&staged_path, dest) {
+        match std::fs::copy(&staged_path, &dest) {
             Ok(_) => {
                 info!(
                     from = %staged_path.display(),
                     to = %dest.display(),
-                    "gateway image tarball copied from staged location"
+                    "staged artifact copied into this gateway's LIMA_HOME"
                 );
                 true
             }
@@ -1630,7 +1648,7 @@ impl GatewayLimaManager {
                     error = %e,
                     from = %staged_path.display(),
                     to = %dest.display(),
-                    "failed to copy staged gateway tarball"
+                    "failed to copy staged artifact"
                 );
                 false
             }
@@ -1640,8 +1658,9 @@ impl GatewayLimaManager {
     /// Load the lite container image into the gateway VM's Docker daemon
     /// from a cached tarball, if the image is not already present.
     ///
-    /// The tarball lives at `{daemon_lima_home}/lite-image.tar`. The operator
-    /// populates it via:
+    /// The tarball lives at `{daemon_lima_home}/lite-image.tar`, or is copied
+    /// in from the per-daemon staged copy by [`Self::copy_staged_artifact`].
+    /// The operator populates it via:
     ///   make lite-image && make stage-lite-image
     ///
     /// Idempotent: skips the load when the image is already present in the
@@ -1657,22 +1676,9 @@ impl GatewayLimaManager {
         let image_tag = lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
         let tarball = self.daemon_lima_home.join(LITE_IMAGE_TARBALL_FILENAME);
 
-        // No staged-copy fallback here, unlike the gateway tarball, and the
-        // consequence is the part worth knowing: this load succeeds only for
-        // the owner into whose LIMA_HOME the tarball was staged. The staging
-        // target writes into the daemon's own `…/{daemon_uid}/{daemon_uid}/lima`,
-        // so with per-operator gateways on, a gateway owned by anyone else
-        // looks in `…/{daemon_uid}/{owner_uid}/lima`, does not find a tarball,
-        // and fails. Lite is supported against a daemon-owned gateway only.
-        //
-        // Giving this the gateway tarball's two-levels-up fallback does not
-        // fix that. The gateway tarball is staged per daemon, which is why a
-        // fixed offset finds it for any owner; the lite tarball is staged per
-        // owner into one owner's directory, so the same offset would point at
-        // a location nothing writes.
         let plan = plan_image_load(
             ImagePresence::from_probe(self.lite_image_present_inside_lima()),
-            || tarball.exists(),
+            || tarball.exists() || self.copy_staged_artifact(LITE_IMAGE_TARBALL_FILENAME),
         );
 
         match plan {
@@ -2141,16 +2147,17 @@ impl GatewayLimaManager {
     ///
     /// # Provisioning mechanism
     ///
-    /// The daemon LIMA_HOME (`{daemon_lima_home}`) is expected to contain a
+    /// This gateway's LIMA_HOME (`{daemon_lima_home}`) is expected to contain a
     /// pre-staged Linux aarch64 binary at
-    /// `{daemon_lima_home}/sandbox-route-helper-linux-aarch64`.
+    /// `{daemon_lima_home}/sandbox-route-helper-linux-aarch64`, or the
+    /// per-daemon staged copy [`Self::copy_staged_artifact`] pulls in.
     ///
     /// The operator populates this binary via:
     /// ```text
-    /// make build-route-helper-linux-aarch64
+    /// make build-route-helper-linux-aarch64 && make stage-route-helper-linux-aarch64
     /// ```
     /// or by downloading from the release assets and renaming to
-    /// `sandbox-route-helper-linux-aarch64` in the daemon LIMA_HOME.
+    /// `sandbox-route-helper-linux-aarch64` in the daemon base dir.
     ///
     /// If the binary is not found at the host path, this method logs a
     /// warning and returns `Ok(())` — lite-mode sessions will fail at
@@ -2175,14 +2182,21 @@ impl GatewayLimaManager {
 
         // The presence check is deliberately made here rather than by the op:
         // an absent binary is an operator-setup problem worth one clear
-        // warning at startup, not four failing ops. It reads the *daemon's*
-        // LIMA_HOME, which is the same tree the executor resolves the transfer
-        // source against while the gateway VM is the daemon's own. When the VM
-        // becomes the operator's, this check has to move to the side that owns
-        // the file — the op itself already names it rather than pathing to it.
+        // warning at startup, not four failing ops. It reads the LIMA_HOME of
+        // the gateway being readied, which is the same tree the executor
+        // resolves the transfer source against — the op names the binary
+        // rather than pathing to it, and the executing side joins it onto its
+        // own LIMA_HOME, so the two agree by construction whether the VM is
+        // the daemon's or an operator's.
+        //
+        // What does not follow the owner is the staging: the binary is put in
+        // place once per daemon, so for any owner but the daemon's own the
+        // first look finds nothing and the staged copy is pulled in.
         let host_binary = crate::in_vm::route_helper_host_binary(&self.daemon_lima_home);
 
-        if !host_binary.exists() {
+        if !host_binary.exists()
+            && !self.copy_staged_artifact(sandbox_invm_argv::route_helper::HOST_BINARY_FILENAME)
+        {
             warn!(
                 path = %host_binary.display(),
                 "gateway VM route-helper binary not found at staging path; \
@@ -5452,24 +5466,75 @@ mod tests {
         assert!(!msg.contains("is not present"), "{msg}");
     }
 
-    /// The lite loader reads one directory — the LIMA_HOME of the gateway it
-    /// was built for — so a tarball staged anywhere else does not satisfy the
-    /// load. That is what confines lite to a daemon-owned gateway, since the
-    /// staging target writes into the daemon's own home.
+    /// The lite loader reaches the per-daemon staged tarball, the same way the
+    /// gateway loader does.
     ///
-    /// This pins where the loader looks, not a rule that it may never look
-    /// anywhere else. If the staging target is ever made owner-aware, this
-    /// test should move with it rather than read as forbidding the change.
+    /// This test used to assert the opposite — that a tarball outside the
+    /// gateway's own LIMA_HOME did *not* satisfy the load — which was an
+    /// accurate reading of a loader that had no fallback, and which is what
+    /// confined lite sessions to a daemon-owned gateway. The fixture's
+    /// LIMA_HOME belongs to uid 501 under daemon 60, so it is exactly the case
+    /// that used to fail.
     #[cfg(target_os = "macos")]
     #[test]
-    fn lite_load_fails_when_the_tarball_is_outside_the_lima_home_it_reads() {
+    fn lite_loader_falls_back_to_the_staged_tarball() {
         let root = tempfile::tempdir().unwrap();
         let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
-        let (mgr, _home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
         write_tarball(&root.path().join("60").join(LITE_IMAGE_TARBALL_FILENAME));
 
         mgr.load_lite_image_into_gateway()
-            .expect_err("a tarball outside daemon_lima_home does not satisfy the lite load");
-        assert!(!docker.issued_a_load(), "{:?}", docker.ops());
+            .expect("the staged tarball satisfies the load");
+        assert!(docker.issued_a_load(), "{:?}", docker.ops());
+        assert!(
+            home.join(LITE_IMAGE_TARBALL_FILENAME).exists(),
+            "the staged tarball is copied where the load path reads it"
+        );
+    }
+
+    /// A staged artifact arrives with the source's permission bits.
+    ///
+    /// The route-helper binary is the reason this matters: it is staged
+    /// executable and `limactl copy` hands the VM whatever mode the source
+    /// carries, so a copy that dropped the bit would produce a helper the VM
+    /// cannot run — and the failure would surface at route-install time, in a
+    /// container, rather than here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_staged_artifact_keeps_its_mode_across_the_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        let name = sandbox_invm_argv::route_helper::HOST_BINARY_FILENAME;
+        let staged = root.path().join("60").join(name);
+        std::fs::write(&staged, b"#!/bin/sh\n").expect("tempdir is writable");
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .expect("tempdir is writable");
+
+        assert!(mgr.copy_staged_artifact(name), "the staged binary is there");
+        let copied = home.join(name);
+        assert_eq!(
+            copied.metadata().unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the executable bit did not survive the copy"
+        );
+    }
+
+    /// Absence at both locations is a `false`, not a panic or a stale `true`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_staged_artifact_that_was_never_staged_reports_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let docker = ScriptedDockerExecutor::new(InspectAnswer::Absent, true);
+        let (mgr, home) = manager_for_image_load(root.path(), Arc::clone(&docker));
+
+        assert!(!mgr.copy_staged_artifact(LITE_IMAGE_TARBALL_FILENAME));
+        assert!(
+            !home.join(LITE_IMAGE_TARBALL_FILENAME).exists(),
+            "a failed lookup must not leave a truncated file the reader would trust"
+        );
     }
 }
