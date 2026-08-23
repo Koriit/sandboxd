@@ -209,6 +209,15 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
         return BrokerResult::Rejected { reason };
     }
 
+    // The agent runs these as the operator, against the operator's own VM and
+    // Docker socket. Naming the op family once here — the single point every
+    // one-shot op passes through — is what lets an operator see what the daemon
+    // asked their login session to do. Stream-class ops do not come through
+    // this function and log their own line at the point they open the stream.
+    // The label deliberately carries no payload: paths, YAML and argv stay out
+    // of the log.
+    info!(uid = ctx.own_uid, op = op.label(), "running op");
+
     // Step 2: per-op dispatch.
     match op {
         BrokerOp::Create {
