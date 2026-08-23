@@ -1459,6 +1459,11 @@ here, in the place *To verify a fix* designates, because it is the measurement M
 inverted assertion is scored against. Verbatim evidence:
 `.tasks/handoffs/20260809-cross-operator-slot-probe.md` (gitignored, retained locally).
 
+➡️ **This subsection is a pre-fix record and stays one.** The inversion ran on 2026-08-23
+and is recorded at §3.6 assertion 5; §5.4's `Status` row states what it does and does not
+close. Everything below is the *baseline*, unedited — quoting it as current is the mistake
+this pointer exists to prevent.
+
 | | |
 |---|---|
 | **Principal** | `operator-b`, **uid 528** — a freshly created, loginable, non-admin local account, primary group `staff` (20). Not a system account |
@@ -3046,6 +3051,37 @@ evidence M24-S20 must invert, is at §1.6 → *✅ REPRODUCED*; the run summary 
 socket group (`stat -f '%Sg'` the target socket — do not assume the name); `SLOT_A` genuinely
 belongs to A and has A's VM attached, so a success is a *shared segment* and not an unused
 socket; and the `location:` image is readable by B out of B's own cache.
+
+✅ **RUN 2026-08-23, after §1.6's enforcement half. It failed at connect — the inversion.**
+This is the canonical record; read it against §1.6 → *✅ REPRODUCED*, which is the baseline
+it inverts and is not legible from this entry alone.
+
+Configuration: slots 0–3 gid `_sandboxd-op-olek`, slots 4–7 gid `_sandboxd-op-operator-b`,
+both operators' gateway VMs Running and attached. B is `operator-b`, uid 528 — loginable,
+above the broker's floor, in `_sandboxd` and `_sandboxd-op-operator-b`, **not** in
+`_sandboxd-op-olek`. Target: slot 1, A's, with A's VM on it.
+
+| | hostile (slot 1, A's) | control (slot 5, B's own) |
+|---|---|---|
+| Templates | identical but for the slot number — `diff` is two lines | |
+| `connect(2)` | `fd_connect: dial unix /var/run/sandbox/vmnet/slot-1.sock: connect: permission denied` | accepted |
+| Accept-log delta | **0 on all eight slots** | **+1 on slot 5**, 0 elsewhere |
+| Guest NIC | no guest — hostagent exited pre-boot, so there is no `lima1` to look for | `lima5 UP 52:55:55:c2:a2:d5` |
+| `limactl` exit | 1 | 0, `READY` |
+
+Third control, taken at the same instant: slot 1 was still accepting **its own** operator —
+`lima1 UP` in A's gateway VM. Without it a dead pool scores as a pass.
+
+⚠️ **Correction 2 above describes a different failure than the one seen here, and the
+difference is the reason this run is readable.** That trap is about an *unenrolled* B, whose
+`limactl create` fails the socket `stat`, drops the `networks:` entry and boots a networkless
+VM to `READY`. An *enrolled* B has the directory traversal to `stat` the socket, so the entry
+survives into the QEMU invocation and the refusal happens later and louder — in the hostagent,
+at `fd_connect`, with a non-zero exit. **Do not generalize from that to "the exit status is
+now trustworthy."** It was informative in this run and is still not the criterion; the
+accept-log delta and the guest NIC are. Correction 1's boot-hang false-green also never got
+the chance to fire — the hostile VM never booted, and the control reached `READY` with its
+NIC up — so neither correction was exercised and both stand.
 
 #### Explicitly **not** asserted: the deny-event JSONL
 
@@ -4724,6 +4760,29 @@ apart and the second does not shrink the first. **A later reader will blur "an o
 VM enforces egress correctly" into "the escape got smaller." It does not, and it will not until
 the ownership flip actually lands.**
 
+✅ **The prohibition above is discharged — §1.6 has shipped, and the improvement is now
+recordable externally** (2026-08-23). The plist emitters resolve a per-operator socket group
+per slot and the pool carries those gids, so the gateway axis is improved in the sense #82
+claimed, and this paragraph is the authority for saying so. **Do not state it unqualified.**
+Three qualifications travel with the claim and none is optional:
+
+- **It is conditional on the host having been regenerated, not on the version installed.**
+  §1.3's legacy fallback is deliberate and permanent: a slot with no per-operator group claim
+  resolves to the shared group and warns rather than refusing, because refusing would make the
+  migration a flag day. So a host running this code with un-regenerated plists is still in the
+  pre-fix state described above, silently and correctly. The claim is about a pool whose
+  sockets carry per-operator gids — check the gids, not the release.
+- **The measurement is one host, one pool, two operators.** The inverted assertion is recorded
+  at **§3.6 assertion 5** and is the canonical record; the earlier reproduction it inverts is
+  **§1.6 → *✅ REPRODUCED***. Read them as a pair. What was shown is that an *enrolled* second
+  operator is refused at `connect(2)` on a foreign slot while the slot still accepts its own
+  operator — not that every pool on every host is partitioned.
+- **The guard paragraph above still applies to the blast radius, for a different reason.** The
+  ownership flip has landed, so its "not until" clause is spent — but what makes the escape
+  smaller is the *conjunction* of ownership and per-operator groups, and the delta below is
+  unaffected by either. An operator still has root in the VM enforcing egress for all of that
+  operator's sessions. The gateway axis got narrower; the operator-uid axis did not.
+
 **New delta — the operator uid becomes a path into the enforcement plane.**
 
 This is the largest single change in the document's threat picture and it was previously
@@ -4767,7 +4826,7 @@ resolved, so the prohibition on publishing it is lifted: this list may be publis
 
 | # | Claim in #82 | Correction |
 |---|---|---|
-| 1 | "**Narrower on the gateway axis**" | Backwards as written — and ⚠️ **an earlier draft of this row said the improvement is "conditional on slot partitioning", which is exactly the claim §1.2 and §5.1 retracted.** The improvement is conditional on **§1.6's per-operator socket groups**; partitioning the ledger does not partition the kernel's access control. **Until §1.6 ships, do not record a gateway-axis improvement in this issue or anywhere else external** — §5.1 states that prohibition and this row is the one place it could escape the document. |
+| 1 | "**Narrower on the gateway axis**" | Backwards as written — and ⚠️ **an earlier draft of this row said the improvement is "conditional on slot partitioning", which is exactly the claim §1.2 and §5.1 retracted.** The improvement is conditional on **§1.6's per-operator socket groups**; partitioning the ledger does not partition the kernel's access control. **Until §1.6 ships, do not record a gateway-axis improvement in this issue or anywhere else external** — §5.1 states that prohibition and this row is the one place it could escape the document.<br><br>**2026-08-23 — §1.6 has shipped and the prohibition is lifted.** The pool's slot sockets carry per-operator gids, an enrolled second operator is refused at `connect(2)` on a foreign slot, and §5.1's gateway-axis paragraph is now the authority for stating the improvement. **The correction this row asks for is still owed to #82** — nothing external has been edited, because that is not a change this branch can make. When it is made, carry §5.1's three qualifications with it verbatim rather than the headline: the improvement is conditional on the host's plists having been **regenerated** (§1.3's legacy fallback is permanent, so an un-regenerated host is still in the pre-fix state), the evidence is one host with two operators, and the operator-uid delta is untouched by any of it. A bare "narrower on the gateway axis" in the issue would now be true and still misleading, which is the failure mode this row has been warning about in the other direction since it was written. |
 | 2 | "Deliberately out of scope: multi-operator NIC/slot consumption … document it rather than solve it." | Untenable, but for the right reason: partitioning is load-bearing for **addressing** (it removes the `/29` and identifier collision), and the **isolation** claim the issue makes is load-bearing on §1.6. Either way "document it rather than solve it" cannot stand, because what would be documented is an active exploitable defect (§1.6, §5.4). |
 | 3 | "Move the argv builders into the shared protocol crate" | Mechanism right, location wrong. `sandbox-agent` **deliberately does not depend on `sandbox-core`** — a TCB boundary stated at `sandbox-agent/src/handler.rs:37-38` and confirmed by `sandbox-agent/Cargo.toml:36-59`. The Docker argv builders live in `sandbox-core` (`backend/container.rs:751` etc.) and are used **on Linux too**; putting them in the macOS-only `sandbox_agent_protocol` lib would either break Linux or force `sandbox-core → sandbox-agent`, inverting TCB minimalism. Needs a **new zero-dependency leaf crate** depended on by both. |
 | 4 | "the two long-lived streams" | There are **three**. The missed one is the **DNS-gate bridge** (`sandbox-core/src/dns_gate_bridge.rs:164` → `:224` → `:248`), which opens **one `docker exec` per DNS query**. It runs `socat UNIX-LISTEN` **without** `,fork` on purpose (`:30-42`), because `,fork` would multiplex concurrent gate frames onto one stdio stream and corrupt them. It is fail-closed (`:44-54`) and sits on the egress-**allow** critical path — i.e. the core promise. Its open rate interacts directly with §2.5. |
@@ -4860,14 +4919,22 @@ GitHub issue. It was found reviewing this design and deliberately recorded in th
 instead. It is therefore absent from every issue list, triage board and search anyone
 would normally use to find it — **which is exactly why it is repeated here**.
 
+**A fix exists as of 2026-08-23 and the paragraph above still stands as written.** It is
+not a stale sentence to skim past: the fix is in local commits, and shipping it does not
+close the defect on a host whose plists have not been regenerated. **Read the `Status` row
+before drawing any conclusion from this section** — it is the second row of the table
+precisely because "there is a fix" and "this host is safe" are different claims here, and
+the gap between them is the whole migration.
+
 | | |
 |---|---|
 | **What** | Every slot plist hardcodes one socket group (`network.rs:1027`) and enrollment adds every operator to it (`scripts/install.sh:2679`), so any enrolled operator can attach to any operator's vmnet slot socket. |
+| **Status** | ✅ **Remediated in-branch, 2026-08-23.** Both halves of the fix are in: the emitters resolve a per-operator group per slot, and the reference pool's sockets carry those gids. The refusal was measured — see **Test** below. ⚠️ **Three things this does not say, each of which leaves a real host exposed.** (1) **Nothing external is fixed.** These are local commits; anything reachable from `origin` still carries the defect until they are pushed. (2) **An installed host is not fixed by upgrading.** §1.3's legacy fallback is permanent by design — a slot with no per-operator group claim resolves to the shared group and *warns*, because refusing would make the migration a flag day. So an un-regenerated host runs the fixed code in the pre-fix configuration, silently and correctly. The migration is **regenerate → reload → split membership → start**, per §1.6, and only the end of that sequence closes the defect on a given host. (3) **A half-done de-enrollment reopens it in one direction** — a live login session and a detached QEMU both keep access they were granted earlier, because membership is checked at `connect(2)` and not continuously. That residue is why de-enrollment has an ordering, and it is unaffected by the fix. Do not shorten this row to "fixed"; each clause is a host that is still exposed. |
 | **Impact** | The victim's egress policy is void: their traffic can be diverted through the attacker's unfiltered uplink and their TLS terminated, with the daemon and the deny-event stream showing nothing. |
 | **Applies to** | Any host with **two or more enrolled operators**. Single-operator hosts are unaffected in practice. |
 | **Introduced by** | Nothing here — it **predates** this design. |
 | **Fix** | §1.6, in two halves. **Group creation + range assignment: independently shippable**, depends on nothing else here. **Socket enforcement: phase 4**, because the daemon-owned gateway VM must keep opening every slot until ownership flips — shipping that half alone stops the only gateway VM there is. |
-| **Test** | §3.6 assertion 5 (hostile VM). No existing test can detect it — see §1.6. |
+| **Test** | §3.6 assertion 5 (hostile VM). No existing test can detect it — see §1.6. ✅ **Run inverted 2026-08-23**, recorded at §3.6 assertion 5. An enrolled operator (uid 528, above the broker's floor, enrolled by the byte-for-byte `install.sh` command) attaching to a foreign slot dies in the Lima hostagent at `connect: permission denied` before any guest exists; the accept log moves by **zero on all eight slots**; a byte-identical template naming a slot the same operator owns boots and brings its NIC up. Read it against **§1.6 → *✅ REPRODUCED*** — the pre-fix baseline is what gives the inversion its meaning, and neither half is legible alone. |
 | **Record** | §1.6 is the only one. If this design is abandoned, the defect and its analysis must be carried somewhere else before this document is. |
 
 | Issue | Bearing |
