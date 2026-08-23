@@ -2141,7 +2141,10 @@ Three pieces of evidence:
 **per boot** via cloud-init (`default.yaml:282-303`), and sandboxd's netplan script
 truncates with `>` before re-appending per-slot entries
 (`gateway_lima.rs:367-376, 491-510`). The same holds for the IPv6-disable sysctls, the
-`eth0` MTU clamp, the `0666` docker.sock chmod, and the route-helper sudoers drop-in.
+`eth0` MTU clamp, the docker.sock permissioning, and the route-helper sudoers drop-in.
+(That last-but-one was the `0666` chmod when this was written; it is now a
+`root:<login group>` `0660` chown/chmod plus a same-named systemd drop-in — see §5.1's
+amended escape record. The self-correcting property is the point here and is unchanged.)
 
 **It is nonetheless not built here, and the reason is issue #83.** Bouncing an
 operator's gateway VM kills their lite sessions, and container-backend sessions are
@@ -4218,7 +4221,7 @@ preamble. Phase 1 supplies the range.
 | `Makefile:1220, 1268, 1946, 1995, 2042` **and** `scripts/install.sh:3030`, `:3240` | image / route-helper staging gains an operator dimension. **There is no production `stage-gateway-image` make target** — production staging lives in `install.sh`, which an earlier draft's file list omitted |
 | **`sandboxd/src/main.rs` — the daemon-side surface. This phase owns it.** | ⚠️ Named in this phase's preamble and previously owned by no table row: **35 `gateway_docker_socket()` call sites** (26 in `main.rs`, the rest in two integration tests) and roughly **50 `gateway_lima_manager` references** in `main.rs`. Every one of them resolves a singleton today and must resolve per-operator |
 | `sandbox-core/src/network.rs:999-1030` (`generate_vmnet_plist`) | **§1.6 enforcement lands here, not in phase 1** — emit the per-operator `--socket-group`. Sequenced with ownership because until now the daemon's own VM must open every slot |
-| `sandbox-core/src/gateway_lima.rs:429-460` | **remove the `0666` docker.sock** (§5.1's escape record). The ControlPersist group-inheritance constraint that forced it dissolves once the socket is reached by the VM's owner — but confirm that before removing, and replace the socket-forward path if not |
+| `sandbox-core/src/gateway_lima.rs:429-460` | **remove the `0666` docker.sock** (§5.1's escape record). ~~The ControlPersist group-inheritance constraint that forced it dissolves once the socket is reached by the VM's owner~~ — but confirm that before removing, and replace the socket-forward path if not. **Done, and the confirmation came back negative — see the amendment in §5.1.** The constraint does not dissolve: ownership changes who the SSH master authenticates as, not when it is established, so a late-added group stays invisible to the forward. Nor is owner-only access a fix, because the VM's login user carries the operator's own uid — the uid its session containers run at. What shipped: `0660`, owner `root`, group the login user's **primary** gid, probed from the VM |
 | `sandbox-core/src/gateway_lima.rs:672` (`apply_limactl_env`) | ⚠️ **Not an env change.** Its only callers are the four direct `limactl shell\|copy` sites. If phases 2–3 replaced those, **delete it**; if any survive, repointing it does not help, because the daemon still lacks the operator-owned SSH key at `_config/user`. Decide which, and say so |
 | docs | login dependency (§2.3) and the logged-out behaviour (§2.4, §2.9) are user-visible |
 
@@ -4609,6 +4612,28 @@ still no canonicalization, for the reasons stated above; the fix does not add on
 > group problem some other way — so it is not the one-liner it looks like, and pretending
 > otherwise is how it would get deferred again.
 >
+> ⚠️ **Amended — the phase-4 premise is false. Kept as written, because the reasoning above
+> is what had to be tested, and the paragraph is the record of what was tested.** "That
+> constraint **dissolves at phase 4**, when the socket is reached by the operator who owns the
+> VM" does not hold. Ownership changes *who* the SSH master authenticates as; the constraint
+> is about *when* the master is established, and that does not move. Lima brings the
+> ControlPersist master up at VM boot, the forwarded channel's credentials are fixed there,
+> and a group added afterwards is invisible to it whether or not the operator owns the VM. A
+> chgrp-to-a-new-docker-group fix fails at phase 4 for exactly the reason it failed before it.
+>
+> The paragraph's operative instruction was nonetheless the right one and was followed: the
+> phase-4 table row made removal conditional on **confirming the premise first**. It was
+> confirmed, and it came back negative. The fix that shipped routes around the constraint
+> rather than waiting for it to lift — the socket takes the login user's **primary** group,
+> which is already in the master's credentials at establishment and so never has to be added
+> late. Mode `0660`, owner `root`, group that gid, with the gid **probed from the VM** rather
+> than assumed, because the host-side and guest-side values differ.
+>
+> ⚠️ **The `gateway_lima.rs` line numbers throughout this record address the pre-remediation
+> file and no longer resolve.** They are left as written for the same reason the prose is:
+> they are what the record was checked against at the time. Read them as pointers into the
+> file as it stood before the remediation, not as places to look now.
+>
 > **Independently of the socket**, reject `..` and non-canonical paths wherever `shared:` is
 > validated. That closes this variant cheaply and immediately; it does **not** close the
 > symlink variant below.
@@ -4685,6 +4710,20 @@ root. That is the only place the two views cannot disagree.
 - **Remove the `0666` docker.sock** (phase 4, per the escape record above). This is the one
   that removes the *payoff* rather than the path, and it is the fix that does not depend on
   getting path validation exactly right.
+
+  ⚠️ **Amended — true of the replacement that shipped, false of the obvious one.** "Remove
+  the `0666`" names a mode to stop using without naming what to use instead, and that second
+  half is what decides whether the payoff actually goes away. The reading that looks safest —
+  drop the world bits, leave the socket owned by the VM's login user — removes nothing. Lima
+  gives an operator-owned VM a login user with the **same numeric uid** as the operator, and
+  that is the uid every session container runs at (`effective_container_user`). A `0600`
+  socket owned by that user is fully reachable from inside the container: the mode would read
+  as hardened in review and the escape would still land, which is a worse state than the
+  `0666` because it looks closed.
+  Owner bits separate nothing here. Only the **group** does, and only because the host-side
+  and guest-side gids differ while the uids collide. What shipped is `0660`, owner `root`,
+  group the login user's primary gid — so the bullet's claim holds of that specific shape and
+  of nothing weaker than it.
 
 **Evaluate `securityModel: none`, and record why the override exists before changing it.**
 Under `none` a guest symlink becomes a real host symlink, which host `canonicalize` *can*

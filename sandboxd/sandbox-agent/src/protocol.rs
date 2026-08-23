@@ -953,6 +953,34 @@ pub enum InVmOp {
     DockerReady,
     /// The guest's own view of its NICs, as JSON.
     LinkShowJson,
+    /// The numeric primary gid of this VM's login user.
+    ///
+    /// Fieldless: it asks and reports, and decides nothing. The three ops
+    /// starting here are one remediation, and the host cannot skip this step —
+    /// Lima picks the guest user's gid and it is not the operator's.
+    LoginGid,
+    /// Write the `docker.socket` drop-in that makes the narrowed mode survive
+    /// the next `docker.socket` start.
+    ///
+    /// Carries the gid, not the file's text. The content is rendered from the
+    /// `u32` on this side, by the same shared builder the daemon uses — so the
+    /// bytes written into `/etc/systemd/system` are not bytes that crossed the
+    /// wire.
+    WriteDockerSocketDropin { login_gid: u32 },
+    /// Narrow the VM's own running `/var/run/docker.sock` to `login_gid`, and
+    /// report the mode and group it ended up with.
+    ///
+    /// That socket is root over the dockerd running every session container in
+    /// this VM and enforcing their egress, so a container that reaches it has
+    /// escaped its own sandbox and voided its own policy. Older images left it
+    /// mode `0666`.
+    ///
+    /// A `u32` and not a group name. What this field selects is which group
+    /// owns *that* socket, so an arbitrary string here would be the argv
+    /// pass-through this op set exists to prevent; a number cannot render a
+    /// flag, a path, or a metacharacter. See
+    /// [`sandbox_invm_argv::vm::login_gid_argv`].
+    HardenDockerSocket { login_gid: u32 },
     /// Apply the VM's `eth0` default-drop nftables baseline, the ruleset
     /// arriving on `nft`'s standard input.
     ///
@@ -1646,6 +1674,9 @@ pub fn in_vm_shell_steps(op: &InVmOp) -> Option<Vec<Vec<String>>> {
     let steps = match op {
         InVmOp::DockerReady => vec![vm::docker_ready_argv()],
         InVmOp::LinkShowJson => vec![vm::link_show_json_argv()],
+        InVmOp::LoginGid => vec![vm::login_gid_argv()],
+        InVmOp::WriteDockerSocketDropin { .. } => vec![vm::write_docker_socket_dropin_argv()],
+        InVmOp::HardenDockerSocket { login_gid } => vm::harden_docker_socket_argv(*login_gid),
         InVmOp::ApplyNftBaseline { .. } => vec![vm::apply_nft_baseline_argv()],
         InVmOp::RouteHelperProbe => vec![
             route_helper::probe_executable_argv(),
@@ -1738,12 +1769,21 @@ pub enum InVmTransferSource {
 
 /// The artifact an in-VM op writes to the child's standard input, if any.
 ///
-/// Only the nftables baseline has one. Stdin on a `limactl shell` is a pipe
-/// into a VM with passwordless `sudo`; that its single reader is an `nft`
-/// parser is a property worth keeping true.
-pub fn in_vm_stdin_body(op: &InVmOp) -> Option<&str> {
+/// Two ops have one. Stdin on a `limactl shell` is a pipe into a VM with
+/// passwordless `sudo`, so every reader on the far end is worth naming: an
+/// `nft` parser, and an `install` writing one named file.
+///
+/// Only the ruleset is *carried*. The drop-in is rendered here from the op's
+/// `u32`, by the same builder the daemon renders it with — so the agent writes
+/// bytes it computed rather than bytes it was handed, and there is no content
+/// for validation to have to trust. That is what the `Cow` distinguishes:
+/// borrowed is carried, owned is derived.
+pub fn in_vm_stdin_body(op: &InVmOp) -> Option<std::borrow::Cow<'_, str>> {
     match op {
-        InVmOp::ApplyNftBaseline { ruleset } => Some(ruleset),
+        InVmOp::ApplyNftBaseline { ruleset } => Some(std::borrow::Cow::Borrowed(ruleset.as_str())),
+        InVmOp::WriteDockerSocketDropin { login_gid } => Some(std::borrow::Cow::Owned(
+            sandbox_invm_argv::vm::docker_socket_dropin_body(*login_gid),
+        )),
         _ => None,
     }
 }

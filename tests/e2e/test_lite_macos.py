@@ -46,7 +46,12 @@ from typing import Optional
 
 import pytest
 
-from conftest import PLATFORM, _gateway_vm_docker_argv, limactl_cmd
+from conftest import (
+    PLATFORM,
+    SANDBOX_LITE_IMAGE_TAG,
+    _gateway_vm_docker_argv,
+    limactl_cmd,
+)
 
 # ---------------------------------------------------------------------------
 # Platform guard: skip entire file on Linux.
@@ -969,6 +974,116 @@ class TestLiteMacosBypassResistance:
             if created and _session_exists(name):
                 _sandbox("stop", name, check=False)
                 _sandbox("rm", name, check=False)
+
+
+class TestLiteMacosGatewayVmDockerSocket:
+    """The gateway VM's own Docker socket must be unreachable from a container.
+
+    This is the payoff at the end of the ``shared:`` mount-source traversal,
+    and it is the reason that traversal is worth attempting at all. Reaching
+    ``/var/run/docker.sock`` inside the gateway VM is root over the dockerd
+    that runs every session container in it and enforces their egress — an
+    agent that gets there has escaped its own sandbox and voided its own
+    policy, which is the one thing the product promises it cannot do.
+
+    Two earlier shapes of this socket did *not* hold the property, and both
+    looked like they did:
+
+    - ``0666``, which the VM once shipped with, is reachable by anything that
+      can name the path.
+    - ``0600`` owned by the VM's login user is *also* reachable, because Lima
+      gives an operator-owned VM a login user with the same numeric uid as the
+      operator — which is exactly the uid the session containers run as. The
+      owner bits do not separate the two principals at all.
+
+    What holds is group ownership: the socket belongs to the login user's
+    primary group, which a session container does not carry. That is a
+    property of a specific mode-and-owner combination rather than of anything
+    structural, so it is asserted against a live socket instead of being
+    inferred from the provisioning script that sets it.
+    """
+
+    # Long enough that a working connection completes many times over.
+    PROBE_MAX_TIME_S = 8
+
+    @pytest.mark.timeout(300)
+    def test_container_binding_the_vm_runtime_dir_cannot_reach_dockerd(self):
+        """A container at the session identity must not reach the VM's dockerd.
+
+        The container is run at the *production* identity — the operator's
+        ``uid:gid``, which is what ``effective_container_user`` gives every
+        session container — because the whole question is whether that
+        identity is separated from the socket, and a container run as root or
+        as the default image user would answer a different one.
+
+        A failed connection is by itself the weakest evidence available: it
+        looks the same whether access was refused or the bind never happened.
+        So the same container run also reports whether the socket is visible
+        at the bind target at all, and at what mode. A refusal only counts
+        when the socket was demonstrably there to be refused.
+        """
+        docker_argv = _gateway_vm_docker_argv()
+        assert docker_argv is not None, (
+            "no gateway-VM Docker endpoint on this host; this test asserts a "
+            "property of that VM's socket and cannot be satisfied without it"
+        )
+
+        script = (
+            'if [ -S /host-run/docker.sock ]; then\n'
+            '  echo "BIND-OK $(stat -c %a /host-run/docker.sock)"\n'
+            'else\n'
+            '  echo "BIND-MISSING"\n'
+            'fi\n'
+            'if curl -sS --max-time ' + str(self.PROBE_MAX_TIME_S) +
+            ' --unix-socket /host-run/docker.sock http://localhost/version '
+            '>/dev/null 2>/tmp/err; then\n'
+            '  echo "REACHED"\n'
+            'else\n'
+            '  echo "REFUSED $(tr -d \'\\n\' </tmp/err)"\n'
+            'fi\n'
+        )
+
+        proc = subprocess.run(
+            docker_argv + [
+                "run", "--rm",
+                "--user", f"{os.getuid()}:{os.getgid()}",
+                # The bind a traversal would win: the VM's whole runtime dir,
+                # not the socket named directly, because that is the shape a
+                # mount source landing outside the shared root produces.
+                "-v", "/var/run:/host-run",
+                "--entrypoint", "/bin/sh",
+                SANDBOX_LITE_IMAGE_TAG,
+                "-c", script,
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        out = proc.stdout
+
+        assert "BIND-OK" in out, (
+            "the bind did not deliver a socket at /host-run/docker.sock, so a "
+            "refusal below would prove nothing about access control — it "
+            "would only mean there was nothing there.\n"
+            f"stdout: {out!r}\nstderr: {proc.stderr!r}"
+        )
+
+        mode = int(out.split("BIND-OK ", 1)[1].split()[0], 8)
+        assert mode & 0o007 == 0, (
+            "the gateway VM's Docker socket carries access bits for other. "
+            "Neither the owner nor the group excludes a session container "
+            f"(it runs at the operator's own uid), so these bits are the only "
+            f"thing left between it and root over the VM. mode={mode:04o}"
+        )
+
+        assert "REACHED" not in out, (
+            "a container at the session identity reached the gateway VM's "
+            "dockerd through a bind of the VM's runtime directory — that is "
+            "root over every session in the VM and over its egress "
+            f"enforcement.\nstdout: {out!r}"
+        )
+        assert "REFUSED" in out, (
+            "the probe neither reached dockerd nor reported a refusal, so it "
+            f"did not run as intended.\nstdout: {out!r}\nstderr: {proc.stderr!r}"
+        )
 
 
 class TestLiteMacosPoolAccounting:

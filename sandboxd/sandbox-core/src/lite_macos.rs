@@ -233,12 +233,20 @@ pub fn translate_shared_path(
 ///   re-check, retry or narrower window changes it, and containment has to be
 ///   decided in the namespace where the path is used. An agent with write
 ///   access to its own workspace — which is the feature — can plant one.
-/// - **The payoff at the far end.** The gateway VM's `/var/run/docker.sock`
-///   is mode `0666` ([`crate::gateway_lima`]) and that VM is a daemon-owned
-///   singleton shared by every operator, so a mount source landing on it is
-///   root over every concurrent session's egress enforcement. That is what
-///   makes the traversal worth attempting. Removing the mode is a separate
-///   fix with a constraint of its own, documented at that site.
+/// - **The payoff at the far end — the specific one that made this the
+///   headline route — is closed.** The gateway VM's `/var/run/docker.sock`
+///   was mode `0666`, so a mount source landing on it was root over the
+///   dockerd that enforces egress for every session in that VM: an agent
+///   escaping its own sandbox and voiding its own egress policy. It is now
+///   `0660`, owned by `root:<the VM login user's primary group>`
+///   ([`crate::gateway_lima`]), and a sandbox container holds neither that
+///   group nor ownership — so a bind of the VM's runtime directory no longer
+///   yields a usable socket.
+///
+///   Read that narrowly. The traversal is unchanged, this check still does
+///   not close it, and every other in-VM path a mount source can name is
+///   reached exactly as before. What went away is this route's worst
+///   consequence, not the route.
 pub fn validate_shared_path(host_path: &Path, shared_root: &Path) -> Result<(), SharedPathError> {
     if let Some(component) = host_path.components().find_map(|c| match c {
         std::path::Component::ParentDir => Some(".."),

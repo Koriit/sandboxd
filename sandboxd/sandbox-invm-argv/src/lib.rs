@@ -122,6 +122,49 @@ pub fn copy_argv(host_src: &str, vm: &str, vm_dst: &str) -> Vec<String> {
     ]
 }
 
+/// Does this argv invoke a shell?
+///
+/// The predicate behind the no-shell invariant, which three separate
+/// enumerations assert over their own contents: this crate's builders, the
+/// in-VM op set in `sandbox-core`, and the agent's validation. It lives here,
+/// as one function those three share, because three hand-copied `matches!`
+/// arms are three chances to disagree about what "a shell" means — and they
+/// had already drifted from the property in the same way, all three at once.
+///
+/// # What it matches
+///
+/// A word is a shell if its **basename** is one. Comparing the whole word
+/// misses `/bin/sh`, which is the same invocation spelled differently; the
+/// three copies this replaces all missed it.
+///
+/// Every word is checked, not only the first. Nearly every argv here begins
+/// `sudo -n`, so a shell would appear at index 2, not 0.
+///
+/// # What it deliberately does not match
+///
+/// A bare `-c`. The copies this replaces flagged it, and that was a proxy for
+/// the property rather than the property: `-c` is a shell's inline-code flag,
+/// but it is equally `stat`'s output-format flag, and the socket-hardening
+/// op's read-back step is `stat -c '%a %G'`. The proxy therefore failed a
+/// correct argv — and a guard that fails correct work gets edited under
+/// pressure, where the edit that relieves the pressure is rarely the one that
+/// keeps the coverage.
+///
+/// What the `-c` arm caught that the names below do not is a *non-shell*
+/// interpreter taking inline code — `python3 -c`, `perl -e`. That is a real
+/// hazard and it is now uncovered. It is also not currently reachable: no
+/// interpreter appears in any argv this crate builds. If one ever does, the
+/// guard is its name added here, not a flag that unrelated programs share.
+pub fn is_shell_invocation(argv: &[String]) -> bool {
+    argv.iter().any(|word| {
+        let basename = word.rsplit('/').next().unwrap_or(word.as_str());
+        matches!(
+            basename,
+            "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "csh" | "tcsh" | "fish"
+        )
+    })
+}
+
 /// Convenience for building an argv of borrowed string literals.
 fn owned(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_string()).collect()
@@ -160,12 +203,70 @@ mod tests {
     /// No argv this crate builds may invoke a shell. The point is not that
     /// today's set happens to avoid one — it is that a future variant which
     /// reintroduces `bash -c` fails here rather than in review.
+    ///
+    /// **This list is maintained by hand, and that is a known weakness.** A
+    /// builder added to the crate and not added here is not covered, and the
+    /// test still passes — it went green over a `sh -c` builder that existed
+    /// for exactly as long as it took the agent-side guard, which enumerates
+    /// `every_op()` instead of a literal list, to catch it. So a new builder
+    /// belongs in this list, and a reader deciding whether the invariant holds
+    /// should compare the list against the crate's public functions rather
+    /// than trust the green.
+    /// The predicate three guards delegate to. An untested detector makes
+    /// three green tests mean nothing at once, so it is exercised on both
+    /// sides of its boundary here rather than only through its callers —
+    /// where it can only ever be observed saying "no".
+    #[test]
+    fn a_shell_is_recognised_wherever_and_however_it_is_spelled() {
+        for argv in [
+            owned(&["sh", "-c", "echo hi"]),
+            owned(&["/bin/sh", "-c", "echo hi"]),
+            owned(&["/usr/bin/env", "bash", "-c", "echo hi"]),
+            owned(&["sudo", "-n", "zsh", "-c", "echo hi"]),
+            owned(&["/bin/dash"]),
+        ] {
+            assert!(
+                is_shell_invocation(&argv),
+                "{argv:?} invokes a shell and was not recognised"
+            );
+        }
+    }
+
+    /// The false positive that retired the old `-c` arm, plus the argv shapes
+    /// it sits next to. A detector that fires on correct work is the reason
+    /// guards get weakened, so the case that broke it is pinned.
+    #[test]
+    fn a_non_shell_flag_named_c_is_not_a_shell() {
+        for argv in [
+            owned(&["stat", "-c", "%a %G", "/var/run/docker.sock"]),
+            owned(&[
+                "sudo",
+                "-n",
+                "install",
+                "-D",
+                "-m",
+                "0644",
+                "/dev/stdin",
+                "/etc/x.conf",
+            ]),
+            owned(&["sudo", "-n", "systemctl", "daemon-reload"]),
+            owned(&["id", "-g"]),
+        ] {
+            assert!(
+                !is_shell_invocation(&argv),
+                "{argv:?} is not a shell invocation but was flagged as one"
+            );
+        }
+    }
+
     #[test]
     fn no_builder_produces_a_shell_invocation() {
         let mut argvs: Vec<Vec<String>> = vec![
             vm::docker_ready_argv(),
             vm::link_show_json_argv(),
             vm::apply_nft_baseline_argv(),
+            vm::login_gid_argv(),
+            vm::write_docker_socket_dropin_argv(),
             route_helper::make_install_dir_argv(),
             route_helper::probe_executable_argv(),
             route_helper::probe_caps_argv(),
@@ -175,16 +276,15 @@ mod tests {
             route_helper::install_container_route_argv(1234, std::net::Ipv4Addr::new(10, 0, 0, 2)),
         ];
         argvs.extend(route_helper::install_argv());
+        argvs.extend(vm::harden_docker_socket_argv(1000));
         argvs.push(lite_stage::mkdir_argv("/tmp/sandbox-lite/s1"));
         argvs.push(lite_stage::rm_argv("/tmp/sandbox-lite/s1"));
 
         for argv in argvs {
-            for word in &argv {
-                assert!(
-                    !matches!(word.as_str(), "sh" | "bash" | "zsh" | "dash" | "-c"),
-                    "argv {argv:?} contains a shell word"
-                );
-            }
+            assert!(
+                !is_shell_invocation(&argv),
+                "argv {argv:?} contains a shell word"
+            );
         }
     }
 }

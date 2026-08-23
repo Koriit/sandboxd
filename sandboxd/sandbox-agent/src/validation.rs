@@ -1329,7 +1329,7 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
 /// builds any argv from it.
 ///
 /// There is very little to check, and that is the shape working rather than
-/// the check being thin. Eight of the twelve variants carry no daemon-supplied
+/// the check being thin. Nine of the thirteen variants carry no daemon-supplied
 /// value at all — what they do is fixed by the variant and rendered from
 /// constants. What remains is three kinds of value, and each gets the check its
 /// destination needs:
@@ -1377,17 +1377,57 @@ pub fn validate_in_vm_op(op: &crate::protocol::InVmOp) -> Result<(), String> {
         InVmOp::InstallContainerRoute { container_pid, .. } => {
             validate_container_pid(*container_pid)?;
         }
+        InVmOp::WriteDockerSocketDropin { login_gid }
+        | InVmOp::HardenDockerSocket { login_gid } => {
+            validate_socket_group_gid(*login_gid)?;
+        }
         // Nothing daemon-supplied crosses the wire on these. The commands are
         // constants of the argv crate; the ruleset on `ApplyNftBaseline` is
         // content for `nft`'s parser, not a value with a shape to check.
         InVmOp::DockerReady
         | InVmOp::LinkShowJson
+        | InVmOp::LoginGid
         | InVmOp::ApplyNftBaseline { .. }
         | InVmOp::RouteHelperProbe
         | InVmOp::RouteHelperMakeInstallDir
         | InVmOp::RouteHelperStage
         | InVmOp::RouteHelperInstall
         | InVmOp::RouteHelperSetcap => {}
+    }
+    Ok(())
+}
+
+/// The group that will own the VM's Docker socket.
+///
+/// The type has already done most of the work: a `u32` cannot render a leading
+/// `-`, a path, or a shell metacharacter, so nothing here is defending against
+/// injection. What is left is the handful of gids that are *valid* and wrong,
+/// and they are worth refusing on this side because this side is the one that
+/// runs the `chgrp`.
+///
+/// - **0** would give the socket to `root`. Fail-closed rather than dangerous —
+///   the login user loses the socket and Lima's forward stops — but it is a
+///   silent way to break Docker in the VM, and it is never the answer `id -g`
+///   gives for a Lima login user.
+/// - **65534 / 65535** are `nogroup`/`nobody` territory. That one is not
+///   fail-closed: those are the groups unprivileged and identity-squashed
+///   processes land in by default, so handing them a `0660` Docker socket
+///   widens reach instead of narrowing it — the opposite of what this op is
+///   for.
+///
+/// This is a bound on plausibility, not a proof the gid is the right one.
+/// Nothing on this side can establish that; the value is read from the guest by
+/// [`crate::protocol::InVmOp::LoginGid`] moments earlier, and the mode the
+/// caller reads back afterwards is what actually confirms the outcome.
+fn validate_socket_group_gid(gid: u32) -> Result<(), String> {
+    if gid == 0 {
+        return Err("docker socket group gid 0 (root) is never a VM login group".to_string());
+    }
+    if gid >= 65534 {
+        return Err(format!(
+            "docker socket group gid {gid} is nogroup/nobody territory — giving that \
+             group the socket widens reach instead of narrowing it"
+        ));
     }
     Ok(())
 }
@@ -2468,7 +2508,9 @@ user:
 
     /// The gateway template the daemon renders — the verbatim output of
     /// `sandbox_core::gateway_lima::generate_gateway_template(&[0, 1, 2, 3, 4,
-    /// 5, 6, 7])`, the default 8-slot pool, captured on 2026-08-19.
+    /// 5, 6, 7], 501)` — the default 8-slot pool, rendered for login uid 501.
+    /// Captured on 2026-08-19; the docker-socket step re-captured on
+    /// 2026-08-23.
     ///
     /// A copy rather than a call: this crate deliberately does not depend on
     /// `sandbox-core` (see `Cargo.toml`), which is why the pre-existing
@@ -2548,34 +2590,68 @@ provision:
       done
       systemctl enable docker
       systemctl start docker
-      # Make the in-VM Docker socket world-readable/writable.
+      # Restrict the in-VM Docker socket to this VM's login user, by GROUP.
       #
-      # Lima's socket-forward connects to /var/run/docker.sock as the SSH login
-      # user (the operator). The obvious approach — chgrp the 0660 socket to the
-      # docker group and add the operator to that group — does NOT work here:
-      # Lima establishes a persistent ControlPersist SSH master connection at VM
-      # boot, BEFORE this provision runs, so every forwarded channel inherits the
-      # operator's boot-time supplementary groups. The docker group added now is
-      # absent from those channels' credentials (`id` for the operator over the
-      # master shows no docker group despite /etc/group listing it), so the
-      # forward can't read a 0660 socket and the host side sees EOF.
+      # Two constraints have to hold at once, and between them they rule out
+      # every mode that keys on the owner.
       #
-      # 0666 is safe here: the HOST-side forwarded gateway-docker.sock is 0600
-      # (operator-only), the gateway VM is a single-tenant daemon-owned appliance,
-      # and the VM's /var/run/docker.sock is a unix socket that is never
-      # bind-mounted into any lite/gateway container — so no container can reach
-      # it. Widening the in-VM mode does not widen the external attack surface.
+      # The socket-forward has to keep working. Lima connects to
+      # /var/run/docker.sock as the SSH login user, over a ControlPersist SSH
+      # master it establishes at VM boot — BEFORE this provision runs. Every
+      # channel multiplexed over that master carries the login user's
+      # supplementary groups as of the moment the master was established, so
+      # a group added here is absent from the channel's credentials even
+      # though /etc/group and `id -nG <user>` both list it. Measured: over
+      # such a channel the session's own `id` does not show the group that
+      # `id -nG` does. A socket owned by a supplementary group is therefore
+      # unreadable over the forward and the host side sees EOF. The login
+      # user's PRIMARY gid is immune — it is part of the session credentials
+      # from the start, on every channel, whenever the master was made.
       #
-      # The drop-in makes the mode survive docker.socket restarts; the direct
-      # chmod fixes the already-running socket for the current boot (the drop-in
-      # only takes effect on the next docker.socket (re)start, which we must not
-      # force here without disrupting the running dockerd).
-      groupadd -f docker
+      # A container must not be able to use it. Sandbox containers run as the
+      # host operator's uid:gid, and Lima gives this VM a login user with the
+      # SAME numeric uid as that operator. Owner-based modes therefore do not
+      # separate the two at all: a 0600 socket owned by the login user is
+      # just as reachable by a container that bind-mounts this directory —
+      # confirmed against a real container, not inferred from the mode bits.
+      # The gids do differ: the guest login user has its own primary group,
+      # unrelated to the operator's host group. The group is the only axis
+      # that discriminates here.
+      #
+      # Hence root:<login user's primary group> at 0660. The forward matches
+      # on the primary gid, a container matches on neither owner nor group,
+      # and there is no world access to fall back on.
+      #
+      # The login user is named by uid, interpolated here, because that is
+      # the one value the caller genuinely controls: Lima creates the guest
+      # login user with the uid of whoever runs `limactl`, which is the
+      # instance's owner. Reading it out of the guest instead would mean
+      # reading Lima's own cidata env, which Lima warns against depending on.
+      # A stale or wrong uid does not fail open — `id -gn` resolves nothing,
+      # the guard below exits non-zero, and the boot fails with the socket
+      # still owned by root and unreadable by anyone.
+      #
+      # Keep the drop-in FILENAME as it is. Provisioning runs on every boot,
+      # and reusing the name overwrites whatever an earlier image wrote at
+      # that path. A new name would leave the old file in place beside it,
+      # and systemd merges drop-ins in name order — a stale one could win and
+      # silently restore a wider mode.
+      #
+      # The drop-in makes this survive docker.socket restarts; the direct
+      # chown/chmod fixes the already-running socket for the current boot
+      # (the drop-in only takes effect on the next docker.socket (re)start,
+      # which we must not force here without disrupting the running dockerd).
+      login_group=$(id -gn 501)
+      if [ -z "$login_group" ]; then
+        echo "cannot resolve the primary group of uid 501" >&2
+        exit 1
+      fi
       mkdir -p /etc/systemd/system/docker.socket.d
-      printf '[Socket]\nSocketMode=0666\n' \
+      printf '[Socket]\nSocketGroup=%s\nSocketMode=0660\n' "$login_group" \
         > /etc/systemd/system/docker.socket.d/10-socketmode.conf
       systemctl daemon-reload
-      chmod 666 /var/run/docker.sock
+      chown root:"$login_group" /var/run/docker.sock
+      chmod 660 /var/run/docker.sock
   - mode: system
     script: |
       #!/bin/bash
@@ -3491,6 +3567,9 @@ provision:
             vec![
                 InVmOp::DockerReady,
                 InVmOp::LinkShowJson,
+                InVmOp::LoginGid,
+                InVmOp::WriteDockerSocketDropin { login_gid: 1000 },
+                InVmOp::HardenDockerSocket { login_gid: 1000 },
                 InVmOp::ApplyNftBaseline {
                     ruleset: "table inet sandbox_eth0 {\n  chain out { drop }\n}\n".to_string(),
                 },
@@ -3520,7 +3599,7 @@ provision:
         #[test]
         fn every_well_formed_op_is_accepted() {
             let ops = every_op();
-            assert_eq!(ops.len(), 12, "every InVmOp variant must be covered here");
+            assert_eq!(ops.len(), 15, "every InVmOp variant must be covered here");
             for op in ops {
                 assert!(
                     validate_in_vm_op(&op).is_ok(),
@@ -3603,12 +3682,10 @@ provision:
                     continue;
                 };
                 for step in steps {
-                    for word in &step {
-                        assert!(
-                            !matches!(word.as_str(), "sh" | "bash" | "zsh" | "dash" | "-c"),
-                            "{op:?} renders {step:?}, which invokes a shell"
-                        );
-                    }
+                    assert!(
+                        !sandbox_invm_argv::is_shell_invocation(&step),
+                        "{op:?} renders {step:?}, which invokes a shell"
+                    );
                 }
             }
         }
@@ -3624,11 +3701,14 @@ provision:
             }
         }
 
-        /// Only the nftables baseline feeds stdin, and it feeds it verbatim.
-        /// A ruleset that were transformed anywhere between the generator and
-        /// `nft` would be a policy change nobody wrote.
+        /// Two ops feed stdin, and each feeds exactly what it should. The
+        /// ruleset is carried and must arrive verbatim — a transformation
+        /// between the generator and `nft` is a policy change nobody wrote. The
+        /// drop-in is not carried at all: it is rendered here from the op's
+        /// gid, so what this asserts is that the agent writes the file the gid
+        /// implies rather than anything it was handed.
         #[test]
-        fn only_the_nft_baseline_carries_a_body_and_it_is_unmodified() {
+        fn only_the_nft_baseline_and_the_socket_dropin_carry_a_body() {
             let ruleset =
                 "table inet t {\n  chain c { type filter hook output priority 0; drop }\n}\n";
             for op in every_op() {
@@ -3637,13 +3717,61 @@ provision:
                         let op = InVmOp::ApplyNftBaseline {
                             ruleset: ruleset.to_string(),
                         };
-                        assert_eq!(in_vm_stdin_body(&op), Some(ruleset));
+                        assert_eq!(in_vm_stdin_body(&op).as_deref(), Some(ruleset));
+                    }
+                    InVmOp::WriteDockerSocketDropin { .. } => {
+                        let op = InVmOp::WriteDockerSocketDropin { login_gid: 4242 };
+                        assert_eq!(
+                            in_vm_stdin_body(&op).as_deref(),
+                            Some("[Socket]\nSocketGroup=4242\nSocketMode=0660\n")
+                        );
                     }
                     _ => assert!(
                         in_vm_stdin_body(&op).is_none(),
                         "{op:?} unexpectedly carries a stdin body"
                     ),
                 }
+            }
+        }
+
+        /// A body-carrying op must render one step. The handler writes the body
+        /// to every step it runs, so a second step would be handed the first
+        /// one's payload on its own stdin — and nothing downstream reports
+        /// that, because the step simply never reads it.
+        #[test]
+        fn an_op_carrying_a_body_renders_a_single_step() {
+            for op in every_op() {
+                if in_vm_stdin_body(&op).is_none() {
+                    continue;
+                }
+                let steps = in_vm_shell_steps(&op).expect("a body-carrying op is a command");
+                assert_eq!(steps.len(), 1, "{op:?} would replay its body across steps");
+            }
+        }
+
+        /// The gid decides which group owns the Docker socket of the VM that
+        /// runs every session. The type stops it being a flag or a path; these
+        /// are the values that are well-typed and still wrong, and the
+        /// `nogroup` end is the one that matters — it widens reach rather than
+        /// breaking loudly.
+        #[test]
+        fn the_socket_group_gid_refuses_root_and_nogroup() {
+            for bad in [0u32, 65534, 65535, u32::MAX] {
+                for op in [
+                    InVmOp::HardenDockerSocket { login_gid: bad },
+                    InVmOp::WriteDockerSocketDropin { login_gid: bad },
+                ] {
+                    assert!(
+                        validate_in_vm_op(&op).is_err(),
+                        "gid {bad} must be refused: {op:?}"
+                    );
+                }
+            }
+            for ok in [1u32, 20, 1000, 65533] {
+                assert!(
+                    validate_in_vm_op(&InVmOp::HardenDockerSocket { login_gid: ok }).is_ok(),
+                    "gid {ok} is a plausible login group and must be accepted"
+                );
             }
         }
 

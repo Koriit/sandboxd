@@ -2162,6 +2162,13 @@ fn in_vm_op_to_wire(op: &sandbox_core::in_vm::InVmOp) -> sandbox_agent_protocol:
     match op {
         Core::DockerReady => Wire::DockerReady,
         Core::LinkShowJson => Wire::LinkShowJson,
+        Core::LoginGid => Wire::LoginGid,
+        Core::WriteDockerSocketDropin { login_gid } => Wire::WriteDockerSocketDropin {
+            login_gid: *login_gid,
+        },
+        Core::HardenDockerSocket { login_gid } => Wire::HardenDockerSocket {
+            login_gid: *login_gid,
+        },
         Core::ApplyNftBaseline { ruleset } => Wire::ApplyNftBaseline {
             ruleset: ruleset.clone(),
         },
@@ -3192,6 +3199,9 @@ mod tests {
             vec![
                 InVmOp::DockerReady,
                 InVmOp::LinkShowJson,
+                InVmOp::LoginGid,
+                InVmOp::WriteDockerSocketDropin { login_gid: 1000 },
+                InVmOp::HardenDockerSocket { login_gid: 1000 },
                 InVmOp::ApplyNftBaseline {
                     ruleset: hostile_ruleset(),
                 },
@@ -3245,7 +3255,7 @@ mod tests {
         #[test]
         fn the_daemon_and_the_agent_render_the_same_command_for_every_op() {
             let ops = every_op();
-            assert_eq!(ops.len(), 12, "every InVmOp variant must be covered here");
+            assert_eq!(ops.len(), 15, "every InVmOp variant must be covered here");
             for op in ops {
                 let wire = in_vm_op_to_wire(&op);
                 assert_eq!(

@@ -881,8 +881,15 @@ fn gateway_network_entry(slot: u16) -> String {
 /// on purpose: a slot set is the set of L2 segments the VM lands on, and a
 /// stored copy that went stale would be a wrong set of segments rather than a
 /// wrong count. There is no copy to go stale.
+///
+/// `login_uid` is the uid Lima will create the guest login user with — which
+/// is simply the uid that runs `limactl`, i.e. the instance's owner. It is
+/// interpolated into the docker-socket provisioning step, which restricts the
+/// in-VM socket to that user's primary group; see the rationale at that step
+/// for why the group is the only axis that works. Passing the wrong uid does
+/// not widen access: the step exits non-zero and the boot fails.
 #[cfg(target_os = "macos")]
-pub fn generate_gateway_template(slots: &[u16]) -> String {
+pub fn generate_gateway_template(slots: &[u16], login_uid: u32) -> String {
     // Build the networks section: one entry per pool slot, each pinning the
     // in-VM interface name.
     //
@@ -999,34 +1006,68 @@ provision:
       done
       systemctl enable docker
       systemctl start docker
-      # Make the in-VM Docker socket world-readable/writable.
+      # Restrict the in-VM Docker socket to this VM's login user, by GROUP.
       #
-      # Lima's socket-forward connects to /var/run/docker.sock as the SSH login
-      # user (the operator). The obvious approach — chgrp the 0660 socket to the
-      # docker group and add the operator to that group — does NOT work here:
-      # Lima establishes a persistent ControlPersist SSH master connection at VM
-      # boot, BEFORE this provision runs, so every forwarded channel inherits the
-      # operator's boot-time supplementary groups. The docker group added now is
-      # absent from those channels' credentials (`id` for the operator over the
-      # master shows no docker group despite /etc/group listing it), so the
-      # forward can't read a 0660 socket and the host side sees EOF.
+      # Two constraints have to hold at once, and between them they rule out
+      # every mode that keys on the owner.
       #
-      # 0666 is safe here: the HOST-side forwarded gateway-docker.sock is 0600
-      # (operator-only), the gateway VM is a single-tenant daemon-owned appliance,
-      # and the VM's /var/run/docker.sock is a unix socket that is never
-      # bind-mounted into any lite/gateway container — so no container can reach
-      # it. Widening the in-VM mode does not widen the external attack surface.
+      # The socket-forward has to keep working. Lima connects to
+      # /var/run/docker.sock as the SSH login user, over a ControlPersist SSH
+      # master it establishes at VM boot — BEFORE this provision runs. Every
+      # channel multiplexed over that master carries the login user's
+      # supplementary groups as of the moment the master was established, so
+      # a group added here is absent from the channel's credentials even
+      # though /etc/group and `id -nG <user>` both list it. Measured: over
+      # such a channel the session's own `id` does not show the group that
+      # `id -nG` does. A socket owned by a supplementary group is therefore
+      # unreadable over the forward and the host side sees EOF. The login
+      # user's PRIMARY gid is immune — it is part of the session credentials
+      # from the start, on every channel, whenever the master was made.
       #
-      # The drop-in makes the mode survive docker.socket restarts; the direct
-      # chmod fixes the already-running socket for the current boot (the drop-in
-      # only takes effect on the next docker.socket (re)start, which we must not
-      # force here without disrupting the running dockerd).
-      groupadd -f docker
+      # A container must not be able to use it. Sandbox containers run as the
+      # host operator's uid:gid, and Lima gives this VM a login user with the
+      # SAME numeric uid as that operator. Owner-based modes therefore do not
+      # separate the two at all: a 0600 socket owned by the login user is
+      # just as reachable by a container that bind-mounts this directory —
+      # confirmed against a real container, not inferred from the mode bits.
+      # The gids do differ: the guest login user has its own primary group,
+      # unrelated to the operator's host group. The group is the only axis
+      # that discriminates here.
+      #
+      # Hence root:<login user's primary group> at 0660. The forward matches
+      # on the primary gid, a container matches on neither owner nor group,
+      # and there is no world access to fall back on.
+      #
+      # The login user is named by uid, interpolated here, because that is
+      # the one value the caller genuinely controls: Lima creates the guest
+      # login user with the uid of whoever runs `limactl`, which is the
+      # instance's owner. Reading it out of the guest instead would mean
+      # reading Lima's own cidata env, which Lima warns against depending on.
+      # A stale or wrong uid does not fail open — `id -gn` resolves nothing,
+      # the guard below exits non-zero, and the boot fails with the socket
+      # still owned by root and unreadable by anyone.
+      #
+      # Keep the drop-in FILENAME as it is. Provisioning runs on every boot,
+      # and reusing the name overwrites whatever an earlier image wrote at
+      # that path. A new name would leave the old file in place beside it,
+      # and systemd merges drop-ins in name order — a stale one could win and
+      # silently restore a wider mode.
+      #
+      # The drop-in makes this survive docker.socket restarts; the direct
+      # chown/chmod fixes the already-running socket for the current boot
+      # (the drop-in only takes effect on the next docker.socket (re)start,
+      # which we must not force here without disrupting the running dockerd).
+      login_group=$(id -gn {login_uid})
+      if [ -z "$login_group" ]; then
+        echo "cannot resolve the primary group of uid {login_uid}" >&2
+        exit 1
+      fi
       mkdir -p /etc/systemd/system/docker.socket.d
-      printf '[Socket]\nSocketMode=0666\n' \
+      printf '[Socket]\nSocketGroup=%s\nSocketMode=0660\n' "$login_group" \
         > /etc/systemd/system/docker.socket.d/10-socketmode.conf
       systemctl daemon-reload
-      chmod 666 /var/run/docker.sock
+      chown root:"$login_group" /var/run/docker.sock
+      chmod 660 /var/run/docker.sock
   - mode: system
     script: |
       #!/bin/bash
@@ -1462,6 +1503,16 @@ impl GatewayLimaManager {
         // the gateway VM is ready.
         self.wait_docker_ready()?;
 
+        // Step 4d.1: narrow the VM's own Docker socket to its login group.
+        //
+        // Runs on every readiness, not only on the branch that created the
+        // instance, because those are not the same set of VMs: a template is
+        // written only where the instance was absent, so a gateway VM created
+        // by an older daemon keeps its original provisioning across an
+        // upgrade. Doing this only in the template would harden new installs
+        // and leave every existing one exactly as it was.
+        self.harden_docker_socket()?;
+
         // Step 4d.5: load the gateway container image into the gateway VM's
         // Docker daemon if it is not already present. The image is cached as a
         // tarball at `{daemon_lima_home}/gateway-image.tar` (populated via
@@ -1776,7 +1827,7 @@ impl GatewayLimaManager {
     /// `slots` is the slot set the new instance owns — one pinned `networks:`
     /// entry each.
     fn create_instance(&self, slots: &[u16]) -> Result<(), SandboxError> {
-        let template_content = generate_gateway_template(slots);
+        let template_content = generate_gateway_template(slots, self.owner_uid);
 
         // Write the template to a sibling directory of LIMA_HOME — NOT inside
         // LIMA_HOME itself. If the template is written inside LIMA_HOME (e.g.
@@ -2019,6 +2070,133 @@ impl GatewayLimaManager {
         Err(SandboxError::Gateway(format!(
             "gateway: failed to create {EGRESS_BRIDGE_NAME} bridge: {stderr}"
         )))
+    }
+
+    /// Read the numeric primary group of the gateway VM's login user.
+    ///
+    /// # Why this is probed rather than assumed
+    ///
+    /// The host cannot derive it. The login user's uid happens to match the
+    /// operator's on this path — both 501 — but the gid does not follow: the
+    /// VM's user is created inside the guest, and on the measured instance it
+    /// is `uid=501(olek) gid=1000(olek)` against a host `gid=20(staff)`. There
+    /// is no host-side fact that yields 1000, so the only honest source is the
+    /// VM itself.
+    ///
+    /// # Why the primary group
+    ///
+    /// Lima establishes a persistent `ControlPersist` SSH master when the
+    /// instance boots, before provisioning finishes, and the credentials of a
+    /// session multiplexed over that master are fixed at the moment it was
+    /// established. A supplementary group added afterwards — adding the login
+    /// user to `docker`, say — is therefore invisible to every later
+    /// `limactl shell` until something tears the master down. The primary
+    /// group has no such window: it is whatever `id -g` says on the connection
+    /// that just asked.
+    fn vm_login_gid(&self) -> Result<u32, SandboxError> {
+        let op = InVmOp::LoginGid;
+        let label = op.label();
+        let output = self.in_vm.run(op, GATEWAY_SHELL_TIMEOUT, label)?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Gateway(format!(
+                "gateway VM: failed to read the login user's primary group: {stderr}"
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        sandbox_invm_argv::vm::parse_login_gid(&stdout).ok_or_else(|| {
+            SandboxError::Gateway(format!(
+                "gateway VM: the login user's primary group did not read back as a \
+                 number (got {:?}) — the Docker socket cannot be narrowed to a group \
+                 that has not been identified",
+                stdout.trim()
+            ))
+        })
+    }
+
+    /// Narrow the gateway VM's `/var/run/docker.sock` to the VM's login group,
+    /// and verify from the op's own output that it worked.
+    ///
+    /// # Why this is fatal
+    ///
+    /// This socket is root over the dockerd that runs every session container
+    /// in the VM and enforces their egress. A container that reaches it has
+    /// escaped its own sandbox and voided its own policy — the one thing the
+    /// product promises cannot happen. A gateway that came up with the socket
+    /// still open would serve sessions that look contained and are not, and
+    /// nothing later re-checks it, so a warning here would be a warning nobody
+    /// reads on a host that is quietly not delivering the guarantee. Treating
+    /// it like [`Self::apply_eth0_nft_policy`] — refuse to be ready — is the
+    /// only outcome that cannot silently under-deliver.
+    ///
+    /// The verification is deliberately made from the mode the op read back
+    /// off the socket *after* acting, rather than from its exit status. A zero
+    /// exit says the commands ran; only the mode says the socket ended up
+    /// closed, and that is the property being claimed.
+    ///
+    /// # Why it takes three ops
+    ///
+    /// The remediation has to fix two different sockets: the one that exists
+    /// right now, and the one systemd will create on the next start. The
+    /// running socket is fixed in place with `chown`/`chgrp`/`chmod`, because
+    /// restarting `docker.socket` under a live VM would drop every session
+    /// container's connection to the daemon. The next one is fixed by a
+    /// drop-in carrying `SocketGroup=`/`SocketMode=`. Neither half alone
+    /// leaves a host correct both now and after a reboot.
+    ///
+    /// Both halves need the login group, which only the VM can supply
+    /// ([`Self::vm_login_gid`]), and the drop-in is *content* rather than
+    /// argv — so it travels on stdin. The executor replays a stdin body to
+    /// every step it runs, which means an op carrying one must render exactly
+    /// a single step; that is what splits the write away from the four-step
+    /// fix-and-read-back rather than folding it in.
+    fn harden_docker_socket(&self) -> Result<(), SandboxError> {
+        let login_gid = self.vm_login_gid()?;
+
+        let op = InVmOp::WriteDockerSocketDropin { login_gid };
+        let label = op.label();
+        let output = self.in_vm.run(op, GATEWAY_SHELL_TIMEOUT, label)?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Gateway(format!(
+                "gateway VM: failed to write the docker.socket drop-in that keeps \
+                 /var/run/docker.sock off the world across a restart: {stderr}"
+            )));
+        }
+
+        let op = InVmOp::HardenDockerSocket { login_gid };
+        let label = op.label();
+        let output = self.in_vm.run(op, GATEWAY_SHELL_TIMEOUT, label)?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Gateway(format!(
+                "gateway VM: failed to restrict /var/run/docker.sock to the VM's \
+                 login group: {stderr}"
+            )));
+        }
+
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        if !sandbox_invm_argv::vm::docker_socket_is_closed_to_others(stat) {
+            return Err(SandboxError::Gateway(format!(
+                "gateway VM: /var/run/docker.sock is still reachable by other \
+                 after hardening (mode/group: {stat:?}). A sandbox container \
+                 runs at the operator's own uid — the same uid as this VM's \
+                 login user — so the access bits for other are the only thing \
+                 between it and root over the VM's Docker daemon."
+            )));
+        }
+
+        info!(
+            socket = %stat,
+            login_gid,
+            "gateway VM Docker socket restricted to the VM's login group"
+        );
+        Ok(())
     }
 
     /// Apply the baseline default-drop egress nft policy on the gateway VM's
@@ -2933,6 +3111,12 @@ pub fn observe_vmnet_daemon_set(
 mod tests {
     use super::*;
 
+    /// The uid the gateway template's docker-socket step is rendered for in
+    /// tests. Matches the uid the agent-side round-trip fixture was captured
+    /// with, so the generator-side mirror of that fixture compares like for
+    /// like.
+    const TEST_LOGIN_UID: u32 = 501;
+
     /// The generated gateway template must satisfy the rule the agent applies
     /// to a gateway-class create.
     ///
@@ -2949,7 +3133,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn generated_gateway_template_satisfies_the_agent_gateway_rule() {
         let slots = [0u16, 1, 2, 3, 4, 5, 6, 7];
-        let template = generate_gateway_template(&slots);
+        let template = generate_gateway_template(&slots, TEST_LOGIN_UID);
 
         let doc: serde_yaml::Value =
             serde_yaml::from_str(&template).expect("gateway template must parse as YAML");
@@ -3239,7 +3423,7 @@ mod tests {
     #[test]
     fn template_pins_interface_to_its_own_slot_for_every_entry() {
         for slot_set in [slots(1), slots(4), slots(8), vec![4, 5, 6, 7], vec![2, 7]] {
-            let tmpl = generate_gateway_template(&slot_set);
+            let tmpl = generate_gateway_template(&slot_set, TEST_LOGIN_UID);
             let entries = template_network_entries(&tmpl);
             assert_eq!(
                 entries.len(),
@@ -3269,7 +3453,7 @@ mod tests {
     /// stanzas and IPv6-disable lines alike — and never slot 0..n-1.
     #[test]
     fn template_offset_range_renders_its_own_slots() {
-        let tmpl = generate_gateway_template(&[4, 5, 6, 7]);
+        let tmpl = generate_gateway_template(&[4, 5, 6, 7], TEST_LOGIN_UID);
 
         assert_eq!(
             tmpl.matches("  - socket:").count(),
@@ -3316,7 +3500,7 @@ mod tests {
     #[test]
     fn template_provisioning_covers_every_emitted_interface() {
         for slot_set in [slots(3), vec![4, 5, 6, 7], vec![2, 7]] {
-            let tmpl = generate_gateway_template(&slot_set);
+            let tmpl = generate_gateway_template(&slot_set, TEST_LOGIN_UID);
             let entries = template_network_entries(&tmpl);
             assert_eq!(
                 tmpl.matches("printf '    lima").count(),
@@ -3343,7 +3527,7 @@ mod tests {
 
     #[test]
     fn template_contains_qemu_vmtype() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert!(
             tmpl.contains("vmType: \"qemu\""),
             "template must specify vmType qemu"
@@ -3357,7 +3541,7 @@ mod tests {
     /// the resource cap cannot silently drift apart.
     #[test]
     fn template_cpus_and_memory_match_published_constants() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert_eq!(GATEWAY_VM_CPUS, 2);
         assert_eq!(GATEWAY_VM_MEMORY_MB, 2048);
         assert!(
@@ -3372,7 +3556,7 @@ mod tests {
 
     #[test]
     fn template_contains_correct_socket_count() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         // Each slot produces one `- socket:` entry.
         let socket_count = tmpl.matches("  - socket:").count();
         assert_eq!(
@@ -3380,7 +3564,7 @@ mod tests {
             "template must have exactly 4 socket entries for a 4-slot set"
         );
 
-        let tmpl8 = generate_gateway_template(&slots(8));
+        let tmpl8 = generate_gateway_template(&slots(8), TEST_LOGIN_UID);
         let socket_count8 = tmpl8.matches("  - socket:").count();
         assert_eq!(
             socket_count8, 8,
@@ -3390,7 +3574,7 @@ mod tests {
 
     #[test]
     fn template_slot_socket_paths_match_vmnet_pool() {
-        let tmpl = generate_gateway_template(&slots(3));
+        let tmpl = generate_gateway_template(&slots(3), TEST_LOGIN_UID);
         // Verify the socket paths match what VmnetPool::slot_socket_path returns.
         for slot in 0u16..3 {
             let expected = crate::network::vmnet_slot_socket_path(slot);
@@ -3403,7 +3587,7 @@ mod tests {
 
     #[test]
     fn template_has_forwarded_docker_socket() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert!(
             tmpl.contains("guestSocket: \"/var/run/docker.sock\""),
             "template must forward the guest Docker socket"
@@ -3416,33 +3600,77 @@ mod tests {
 
     #[test]
     fn template_has_docker_provision() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert!(
             tmpl.contains("apt-get install -y docker.io"),
             "template must provision docker.io"
         );
-        // The in-VM docker socket must be made world-RW so Lima's
-        // ControlPersist-master socket-forward (whose channels carry the
-        // operator's boot-time groups, missing any docker group added later)
-        // can read it. Persisted via a docker.socket drop-in + chmod for the
-        // current boot.
+        // The in-VM docker socket is reachable by exactly one principal: the
+        // VM's login user, matched on its PRIMARY group. That group is the
+        // only axis that separates the socket-forward (whose channels carry
+        // the login user's groups as of SSH-master establishment, so any
+        // later-added supplementary group is missing) from a sandbox
+        // container (which runs as the same numeric uid as the login user,
+        // so owner bits do not discriminate). Persisted via a docker.socket
+        // drop-in, plus a chown/chmod for the current boot.
         assert!(
-            tmpl.contains("SocketMode=0666"),
-            "template must set the docker socket mode to 0666 via a drop-in"
+            tmpl.contains(&format!("id -gn {TEST_LOGIN_UID}")),
+            "template must resolve the primary group of the login uid it was rendered for"
+        );
+        assert!(
+            !tmpl.contains("LIMA_CIDATA"),
+            "template must not depend on Lima's cidata env, which Lima warns against"
+        );
+        assert!(
+            tmpl.contains("SocketGroup=%s"),
+            "template must set the docker socket group from the login user's primary group"
+        );
+        assert!(
+            tmpl.contains("SocketMode=0660"),
+            "template must set the docker socket mode to 0660 via a drop-in"
         );
         assert!(
             tmpl.contains("/etc/systemd/system/docker.socket.d/10-socketmode.conf"),
-            "template must write the docker.socket drop-in for persistent SocketMode"
+            "template must write the docker.socket drop-in for persistent socket access"
         );
         assert!(
-            tmpl.contains("chmod 666 /var/run/docker.sock"),
+            tmpl.contains("chown root:\"$login_group\" /var/run/docker.sock"),
+            "template must chown the already-running docker socket for the current boot"
+        );
+        assert!(
+            tmpl.contains("chmod 660 /var/run/docker.sock"),
             "template must chmod the already-running docker socket for the current boot"
+        );
+    }
+
+    /// The gateway VM's `/var/run/docker.sock` must never carry access bits
+    /// for "other". A sandbox container that obtains a bind of the VM's
+    /// runtime directory runs as the *same numeric uid* as the VM's login
+    /// user, so neither the owner bits nor the group bits exclude it — the
+    /// world bits are the only ones that do. Reaching that socket is root
+    /// over the dockerd hosting every concurrent session's egress
+    /// enforcement, so this is asserted directly rather than left to follow
+    /// from the mode the provision script happens to set today.
+    #[test]
+    fn template_never_grants_world_access_to_the_docker_socket() {
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        for forbidden in [
+            "0666", "0664", "0662", "0646", "0626", "0606", "a+rw", "a+w", "o+w", "o+rw",
+        ] {
+            assert!(
+                !tmpl.contains(forbidden),
+                "template must not grant world access to the docker socket (found {forbidden:?})"
+            );
+        }
+        assert!(
+            !tmpl.contains("chmod 666"),
+            "template must not chmod anything world-writable"
         );
     }
 
     #[test]
     fn template_has_mtu_clamp() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert!(
             tmpl.contains("mtu: 1280"),
             "template must clamp eth0 MTU to 1280"
@@ -3451,7 +3679,7 @@ mod tests {
 
     #[test]
     fn template_has_no_dhcp_for_lima_nics() {
-        let tmpl = generate_gateway_template(&slots(3));
+        let tmpl = generate_gateway_template(&slots(3), TEST_LOGIN_UID);
         assert!(
             tmpl.contains("dhcp4: no"),
             "template must disable DHCP on limaN NICs"
@@ -3464,7 +3692,7 @@ mod tests {
 
     #[test]
     fn template_has_minimum_lima_version() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert!(
             tmpl.contains(MIN_LIMA_VERSION),
             "template must specify minimumLimaVersion"
@@ -3473,7 +3701,7 @@ mod tests {
 
     #[test]
     fn template_has_ubuntu_noble_image() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert!(
             tmpl.contains(UBUNTU_NOBLE_ARM64_URL),
             "template must reference the Ubuntu 24.04 aarch64 cloud image"
@@ -3482,7 +3710,7 @@ mod tests {
 
     #[test]
     fn template_disables_containerd() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         assert!(
             tmpl.contains("system: false"),
             "template must disable containerd (system)"
@@ -3495,7 +3723,7 @@ mod tests {
 
     #[test]
     fn template_has_lite_shared_root_9p_mounts_stanza() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         // The template must include a mounts: block for lite shared: workspaces.
         assert!(
             tmpl.contains("mounts:"),
@@ -3531,7 +3759,7 @@ mod tests {
 
     #[test]
     fn template_has_route_helper_sudoers_provision() {
-        let tmpl = generate_gateway_template(&slots(4));
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
         // The sudoers entry must be scoped to exactly the route-helper binary path.
         assert!(
             tmpl.contains("/usr/local/libexec/sandboxd/sandbox-route-helper"),
@@ -4788,6 +5016,15 @@ mod tests {
         seen: Mutex<Vec<(u32, InVmOp, Duration, String)>>,
         exit_code: i32,
         stderr: &'static str,
+        /// What each op reads back. A plain `fn` rather than a closure so the
+        /// double stays `Send + Sync` without a second allocation; the tests
+        /// that need different answers spell them as separate free functions.
+        stdout: fn(&InVmOp) -> &'static str,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn no_stdout(_: &InVmOp) -> &'static str {
+        ""
     }
 
     #[cfg(target_os = "macos")]
@@ -4797,6 +5034,7 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 exit_code: 0,
                 stderr: "",
+                stdout: no_stdout,
             })
         }
 
@@ -4805,6 +5043,19 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 exit_code: 1,
                 stderr,
+                stdout: no_stdout,
+            })
+        }
+
+        /// Succeeds, and answers each op from `stdout`. For the paths whose
+        /// outcome is decided by what an op *reported* rather than by whether
+        /// it exited zero.
+        fn answering(stdout: fn(&InVmOp) -> &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                exit_code: 0,
+                stderr: "",
+                stdout,
             })
         }
     }
@@ -4819,6 +5070,7 @@ mod tests {
             label: &str,
         ) -> Result<std::process::Output, SandboxError> {
             use std::os::unix::process::ExitStatusExt;
+            let stdout = (self.stdout)(&op).as_bytes().to_vec();
             self.seen.lock().unwrap_or_else(|e| e.into_inner()).push((
                 op_uid,
                 op,
@@ -4828,10 +5080,155 @@ mod tests {
             Ok(std::process::Output {
                 // Wait-status encoding: the exit code is the high byte.
                 status: std::process::ExitStatus::from_raw(self.exit_code << 8),
-                stdout: Vec::new(),
+                stdout,
                 stderr: self.stderr.as_bytes().to_vec(),
             })
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Docker-socket hardening
+    // -----------------------------------------------------------------------
+
+    /// The VM reports its login group, then reports the socket closed.
+    #[cfg(target_os = "macos")]
+    fn gid_then_closed(op: &InVmOp) -> &'static str {
+        match op {
+            InVmOp::LoginGid => "1000\n",
+            InVmOp::HardenDockerSocket { .. } => "660 olek\n",
+            _ => "",
+        }
+    }
+
+    /// Every step exits zero and the socket is still world-reachable. This is
+    /// the case a status-only check cannot see.
+    #[cfg(target_os = "macos")]
+    fn gid_then_still_open(op: &InVmOp) -> &'static str {
+        match op {
+            InVmOp::LoginGid => "1000\n",
+            InVmOp::HardenDockerSocket { .. } => "666 docker\n",
+            _ => "",
+        }
+    }
+
+    /// `id -g` exits zero and says something that is not a number.
+    #[cfg(target_os = "macos")]
+    fn unparseable_gid(op: &InVmOp) -> &'static str {
+        match op {
+            InVmOp::LoginGid => "olek\n",
+            _ => "",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn manager_with_in_vm(exec: Arc<RecordingInVmExecutor>, owner_uid: u32) -> GatewayLimaManager {
+        GatewayLimaManager::new(
+            PathBuf::from("/var/lib/sandboxd/60/60/lima"),
+            Arc::new(UnusedLimaExecutor),
+            DockerRoute::Host,
+            InVmRoute::new(owner_uid, exec),
+            owner_uid,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ops_seen(exec: &RecordingInVmExecutor) -> Vec<InVmOp> {
+        exec.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, op, _, _)| op.clone())
+            .collect()
+    }
+
+    /// The gid the VM reports is the gid both remediation ops are issued with,
+    /// and all three run as the gateway's owner.
+    ///
+    /// The op sequence is asserted rather than just the `Ok`, because the
+    /// failure this guards against is not an error — it is the socket being
+    /// handed to the wrong group, which succeeds.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_login_group_the_vm_reports_is_the_group_the_socket_is_given() {
+        let exec = RecordingInVmExecutor::answering(gid_then_closed);
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        mgr.harden_docker_socket()
+            .expect("a VM that reports 660 has a closed socket");
+
+        assert_eq!(
+            ops_seen(&exec),
+            vec![
+                InVmOp::LoginGid,
+                InVmOp::WriteDockerSocketDropin { login_gid: 1000 },
+                InVmOp::HardenDockerSocket { login_gid: 1000 },
+            ]
+        );
+        for (op_uid, op, _, _) in exec.seen.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            assert_eq!(*op_uid, 501, "{op:?} ran as the wrong uid");
+        }
+    }
+
+    /// A zero exit is not the property. Every step of the remediation succeeds
+    /// here and the socket is still `666` — which is precisely the state the
+    /// hardening exists to remove, so it must not be reported as ready.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_socket_still_open_to_others_fails_readiness_despite_a_clean_exit() {
+        let exec = RecordingInVmExecutor::answering(gid_then_still_open);
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        let err = mgr
+            .harden_docker_socket()
+            .expect_err("a socket at 666 is not hardened, whatever the exit status");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("666 docker"),
+            "the failure must quote what it read back, got: {msg}"
+        );
+    }
+
+    /// An unreadable login group stops the remediation before it acts.
+    ///
+    /// The op count is the assertion. Proceeding on a failed parse would
+    /// `chgrp` the Docker socket to whatever a fallback happened to be, and
+    /// there is no fallback that is safe: every wrong answer either breaks the
+    /// VM's own access or hands the socket to a wider group than intended.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreadable_login_group_stops_before_touching_the_socket() {
+        let exec = RecordingInVmExecutor::answering(unparseable_gid);
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        mgr.harden_docker_socket()
+            .expect_err("a login group that is not a number cannot be used");
+
+        assert_eq!(
+            ops_seen(&exec),
+            vec![InVmOp::LoginGid],
+            "the socket must not be touched once the group is unknown"
+        );
+    }
+
+    /// A step that fails is fatal, and fails at the step that failed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failing_step_fails_readiness() {
+        let exec = RecordingInVmExecutor::failing("permission denied");
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        let err = mgr
+            .harden_docker_socket()
+            .expect_err("a failing in-VM step must not report a hardened socket");
+        assert!(
+            err.to_string().contains("permission denied"),
+            "the underlying stderr must survive into the error: {err}"
+        );
+        assert_eq!(
+            ops_seen(&exec),
+            vec![InVmOp::LoginGid],
+            "a failed probe must not be followed by the ops that depend on it"
+        );
     }
 
     /// The manager holds a `LimaExecutor` too, and route installation must not

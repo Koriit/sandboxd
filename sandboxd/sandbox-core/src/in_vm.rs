@@ -56,7 +56,7 @@ use crate::error::SandboxError;
 /// Owned rather than borrowed, for the same reason [`crate::docker::DockerOp`]
 /// is: every caller hands an op to `spawn_blocking`, which requires
 /// `'static`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InVmOp {
     // -- VM readiness and topology -------------------------------------------
     /// Is the VM's own Docker daemon answering yet?
@@ -71,6 +71,42 @@ pub enum InVmOp {
     /// Verification input only. The slot→NIC map is built host-side from the
     /// declared slot set; this is what it is checked against.
     LinkShowJson,
+    /// The numeric primary gid of the VM's login user.
+    ///
+    /// Read rather than derived because the host cannot know it: Lima picks
+    /// the guest user's gid, and it is not the operator's. The three ops below
+    /// are one remediation, and this is its first step — see
+    /// [`sandbox_invm_argv::vm::login_gid_argv`] for why the answer must be the
+    /// primary group and why it travels numerically.
+    LoginGid,
+    /// Write the `docker.socket` drop-in that makes the narrowed mode survive
+    /// the next `docker.socket` start.
+    ///
+    /// Carries the gid rather than the drop-in's text: the file's content is
+    /// rendered from the `u32` on whichever side is about to write it, so there
+    /// is no version of it a caller could choose.
+    WriteDockerSocketDropin { login_gid: u32 },
+    /// Narrow the VM's own running `/var/run/docker.sock` to `login_gid`, and
+    /// report the mode and group it ended up with.
+    ///
+    /// **This closes the payoff of the `shared:` mount-source escape.** That
+    /// socket is root over the dockerd running every session container in the
+    /// VM and enforcing their egress, so a container that reaches it has
+    /// escaped its own sandbox and voided its own policy. Older images left it
+    /// mode `0666`, which anything able to name the path can open.
+    ///
+    /// The owner bits cannot be the control here and the group must be: Lima
+    /// gives an operator-owned VM a login user with the *same numeric uid* as
+    /// the operator, and that is exactly the uid session containers run as, so
+    /// owner-based modes do not separate the two principals at all.
+    ///
+    /// The one field is a `u32` for the same reason
+    /// [`InVmOp::InstallContainerRoute`]'s pid is: a number cannot render a
+    /// leading `-`, a path, or a shell metacharacter, and what this field
+    /// selects is which group owns the Docker socket of the VM running every
+    /// session. A group *name* here would be an arbitrary string on the wire
+    /// into that decision.
+    HardenDockerSocket { login_gid: u32 },
 
     // -- The VM's own uplink bound -------------------------------------------
     /// Apply the gateway VM's `eth0` default-drop nftables baseline.
@@ -194,6 +230,11 @@ impl InVmOp {
         let steps = match self {
             InVmOp::DockerReady => vec![vm::docker_ready_argv()],
             InVmOp::LinkShowJson => vec![vm::link_show_json_argv()],
+            InVmOp::LoginGid => vec![vm::login_gid_argv()],
+            InVmOp::WriteDockerSocketDropin { .. } => {
+                vec![vm::write_docker_socket_dropin_argv()]
+            }
+            InVmOp::HardenDockerSocket { login_gid } => vm::harden_docker_socket_argv(*login_gid),
             InVmOp::ApplyNftBaseline { .. } => vec![vm::apply_nft_baseline_argv()],
             InVmOp::RouteHelperProbe => vec![
                 route_helper::probe_executable_argv(),
@@ -244,13 +285,30 @@ impl InVmOp {
 
     /// The artifact this op writes to the child's standard input, if any.
     ///
-    /// Only the nftables baseline has one, and that it is the only one is
-    /// worth keeping true: stdin on a `limactl shell` is a channel into a VM
-    /// with passwordless `sudo`, and the single reader on the far end of it
-    /// today is an `nft` parser.
-    pub fn stdin_body(&self) -> Option<&str> {
+    /// Two ops have one, and the list is worth keeping short: stdin on a
+    /// `limactl shell` is a channel into a VM with passwordless `sudo`, and
+    /// every entry here adds a reader on the far end of it. The readers today
+    /// are an `nft` parser and an `install` writing one named file.
+    ///
+    /// The two bodies differ in where they come from, and only one of them is
+    /// really *carried*. The nftables ruleset is a document the daemon
+    /// compiled and the op holds verbatim. The drop-in is rendered here from
+    /// the op's `u32`, identically on both sides of the seam — so it is not a
+    /// value that crossed the wire, and there is no form of it a caller could
+    /// have selected. That is why the return is a `Cow`: a borrowed body is
+    /// one the op carries, an owned one is derived.
+    ///
+    /// A multi-step op must not have a body. The executors replay it to every
+    /// step, so the second step would receive the first's content on its own
+    /// stdin. Both body-carrying ops render exactly one step.
+    pub fn stdin_body(&self) -> Option<std::borrow::Cow<'_, str>> {
         match self {
-            InVmOp::ApplyNftBaseline { ruleset } => Some(ruleset),
+            InVmOp::ApplyNftBaseline { ruleset } => {
+                Some(std::borrow::Cow::Borrowed(ruleset.as_str()))
+            }
+            InVmOp::WriteDockerSocketDropin { login_gid } => Some(std::borrow::Cow::Owned(
+                sandbox_invm_argv::vm::docker_socket_dropin_body(*login_gid),
+            )),
             _ => None,
         }
     }
@@ -260,6 +318,9 @@ impl InVmOp {
         match self {
             InVmOp::DockerReady => "in-vm: docker readiness",
             InVmOp::LinkShowJson => "in-vm: link show",
+            InVmOp::LoginGid => "in-vm: login gid",
+            InVmOp::WriteDockerSocketDropin { .. } => "in-vm: write docker socket drop-in",
+            InVmOp::HardenDockerSocket { .. } => "in-vm: harden docker socket",
             InVmOp::ApplyNftBaseline { .. } => "in-vm: apply nft baseline",
             InVmOp::RouteHelperProbe => "in-vm: route-helper probe",
             InVmOp::RouteHelperMakeInstallDir => "in-vm: route-helper install dir",
@@ -628,29 +689,73 @@ mod tests {
                 continue;
             };
             for step in steps {
-                for word in &step {
-                    assert!(
-                        !matches!(word.as_str(), "sh" | "bash" | "zsh" | "dash" | "-c"),
-                        "{op:?} renders {step:?}, which invokes a shell"
-                    );
-                }
+                assert!(
+                    !sandbox_invm_argv::is_shell_invocation(&step),
+                    "{op:?} renders {step:?}, which invokes a shell"
+                );
             }
         }
     }
 
-    /// Only the nftables baseline feeds stdin. Stdin on a `limactl shell` is a
-    /// pipe into a VM with passwordless sudo; keeping the reader list at one
-    /// parser is the whole control.
+    /// Exactly two ops feed stdin. Stdin on a `limactl shell` is a pipe into a
+    /// VM with passwordless sudo, so the reader list is the control and the
+    /// point of stating it here is that it stays a list someone has to extend
+    /// on purpose.
     #[test]
-    fn only_the_nft_baseline_carries_a_stdin_body() {
+    fn only_the_nft_baseline_and_the_socket_dropin_carry_a_stdin_body() {
         for op in all_ops() {
-            let expected = matches!(op, InVmOp::ApplyNftBaseline { .. });
+            let expected = matches!(
+                op,
+                InVmOp::ApplyNftBaseline { .. } | InVmOp::WriteDockerSocketDropin { .. }
+            );
             assert_eq!(
                 op.stdin_body().is_some(),
                 expected,
                 "{op:?} disagrees about carrying a stdin body"
             );
         }
+    }
+
+    /// A body-carrying op must render exactly one step.
+    ///
+    /// The executors write the body to **every** step they run, so a two-step
+    /// op with a body hands the second step the first one's payload on its own
+    /// stdin. Nothing downstream would report that: the second step simply
+    /// does not read it, the write fails or is discarded, and the op reports
+    /// the last step's status as though the pairing were fine.
+    #[test]
+    fn an_op_that_carries_a_payload_on_stdin_renders_a_single_step() {
+        for op in all_ops() {
+            if op.stdin_body().is_none() {
+                continue;
+            }
+            let steps = op
+                .shell_steps()
+                .expect("an op carrying a stdin body is a command, not a transfer");
+            assert_eq!(
+                steps.len(),
+                1,
+                "{op:?} carries a stdin body across {} steps; each would receive it",
+                steps.len()
+            );
+        }
+    }
+
+    /// The drop-in's text is derived from the op's gid, not carried by it.
+    /// Both sides of the seam render it from the same `u32`, so there is no
+    /// version of this file a caller could select.
+    #[test]
+    fn the_socket_dropin_body_is_rendered_from_the_gid() {
+        let op = InVmOp::WriteDockerSocketDropin { login_gid: 1000 };
+        assert_eq!(
+            op.stdin_body().as_deref(),
+            Some("[Socket]\nSocketGroup=1000\nSocketMode=0660\n")
+        );
+        let other = InVmOp::WriteDockerSocketDropin { login_gid: 4242 };
+        assert_eq!(
+            other.stdin_body().as_deref(),
+            Some("[Socket]\nSocketGroup=4242\nSocketMode=0660\n")
+        );
     }
 
     /// An op that puts a payload on stdin must never run a `sudo` that could
@@ -661,8 +766,9 @@ mod tests {
     /// password from **the command's stdin**, and for an op carrying a body
     /// that stdin is the payload — so an interactive `sudo` does not hang
     /// waiting for a human, it silently consumes the payload as a credential
-    /// attempt and fails. For the one op in this set that carries a body, the
-    /// payload is the egress baseline.
+    /// attempt and fails. For the two ops in this set that carry a body, the
+    /// payloads are the egress baseline and the drop-in deciding who may reach
+    /// the VM's Docker.
     ///
     /// Asserted across the whole op set, not at the one site that has the
     /// combination today: the failure reappears the moment someone adds a
@@ -703,7 +809,7 @@ mod tests {
         let op = InVmOp::ApplyNftBaseline {
             ruleset: ruleset.to_string(),
         };
-        assert_eq!(op.stdin_body(), Some(ruleset));
+        assert_eq!(op.stdin_body().as_deref(), Some(ruleset));
         assert_eq!(
             op.shell_steps().unwrap(),
             vec![vec!["sudo", "-n", "nft", "-f", "-"]]
@@ -941,10 +1047,26 @@ mod tests {
 
     /// One instance of every variant. A new variant that is not added here
     /// escapes every property test above, so the count is asserted.
+    ///
+    /// **The count catches a variant removed from this list, not one that was
+    /// never added to it** — omit the new variant and the length is unchanged,
+    /// so the assertion passes and the property tests quietly cover one op
+    /// less. That is not hypothetical: this list stayed at twelve across a
+    /// variant that rendered `sh -c`, and `no_op_renders_a_shell_invocation`
+    /// below went green over it.
+    ///
+    /// What actually forces a new variant to be noticed is the exhaustive
+    /// matches it must satisfy to compile at all — [`InVmOp::shell_steps`],
+    /// [`InVmOp::label`], `validate_in_vm_op` in `sandbox-agent`, and
+    /// `in_vm_op_to_wire` in the daemon's broker. Adding one to this list is a
+    /// step in that work, not a thing the tests can demand on their own.
     fn all_ops() -> Vec<InVmOp> {
         let ops = vec![
             InVmOp::DockerReady,
             InVmOp::LinkShowJson,
+            InVmOp::LoginGid,
+            InVmOp::WriteDockerSocketDropin { login_gid: 1000 },
+            InVmOp::HardenDockerSocket { login_gid: 1000 },
             InVmOp::ApplyNftBaseline {
                 ruleset: "table inet t {}\n".to_string(),
             },
@@ -971,7 +1093,7 @@ mod tests {
         ];
         assert_eq!(
             ops.len(),
-            12,
+            15,
             "the in-VM op set changed size; every property test in this module \
              iterates this list, and a variant missing from it is a variant \
              nothing here checks"
