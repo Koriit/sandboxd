@@ -139,23 +139,28 @@ pub const GATEWAY_INSTANCE_NAME: &str = "sandboxd-gateway";
 /// host and an nft table inside the VM. They cannot collide (an owner uid is a
 /// `u32` and can never spell `eth0`), but a bare grep returns both.
 ///
-/// # What must be settled before this is turned on
+/// # How the two halves agree on the name
 ///
 /// Setting this variable moves only the daemon's half of the name. The operator
-/// agent never takes a gateway VM name off the wire — it picks one locally —
-/// and it does not depend on `sandbox-core`, so it cannot read this variable
-/// however it is spelled or exported. There is no mechanism today by which it
-/// learns the mode at all. Turn the switch on and the daemon starts naming a
-/// per-owner instance while the agent's in-VM and Docker paths go on addressing
-/// the unsuffixed name they hold as a constant, which is two halves acting on
-/// different VMs rather than a configuration that fails and says so.
+/// agent never takes a gateway VM name off the wire — it derives one from its
+/// own `getuid()` — and it does not depend on `sandbox-core`, so it cannot read
+/// this variable however it is spelled or exported. It has no mode to be in: the
+/// name it computes always carries its own uid as a suffix.
 ///
-/// What makes that survivable right now is only that the daemon never asks the
-/// agent to create or start a gateway; it still does both through its own
-/// direct path. So the mechanism by which the agent learns the mode has to be
-/// decided and built before this is set anywhere, and before any daemon-side
-/// sender for those ops is wired. The agent records the same prerequisite from
-/// its own side, at the naming divergence documented on its gateway-op helpers.
+/// The halves agree anyway, because which one runs is decided by the same uid
+/// the name is derived from. Every gateway op is dispatched with the *owner*
+/// uid, and the macOS executor runs an op directly when that uid is the
+/// daemon's and brokers it to that uid's agent otherwise. With the switch off
+/// [`gateway_owner_uid`] collapses every operator onto the daemon's own uid, so
+/// gateway ops always take the direct path and no `CreateGateway` or
+/// `StartGateway` ever reaches an agent — the unsuffixed name stays entirely
+/// within the daemon. With it on the owner is the operator, the daemon derives
+/// `sandboxd-gateway-<owner_uid>`, and the agent it brokers to derives the same
+/// string from the same uid. Neither mode has a half naming a suffixed instance
+/// while the other names an unsuffixed one.
+///
+/// The agent states this agreement from its own side, on the function that
+/// derives the name.
 #[cfg(target_os = "macos")]
 pub const PER_OPERATOR_GATEWAY_ENV: &str = "SANDBOX_PER_OPERATOR_GATEWAY";
 
