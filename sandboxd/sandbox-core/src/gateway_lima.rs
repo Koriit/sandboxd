@@ -104,6 +104,8 @@ use crate::lima::{LimaExecutor, LimaOp};
 use crate::process::run_with_timeout;
 #[cfg(target_os = "macos")]
 use sandbox_invm_argv::lite_stage::{LiteStageFile, stage_dir as lite_stage_dir};
+#[cfg(target_os = "macos")]
+use sandbox_invm_argv::workspace;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -916,10 +918,14 @@ pub fn generate_gateway_template(slots: &[u16], login_uid: u32) -> String {
     // identity (no remapping needed). Per-session shared: paths must be
     // validated at create time to fall under this root.
     //
-    // Note: the 9p read is performed by _sandboxd (the gateway VM's user),
-    // NOT the operator. This is the TCC asymmetry: lite shared: gets no
-    // operator TCC consent path. Sources must be readable by _sandboxd and
-    // must not live in TCC-protected directories (Desktop, Documents, Downloads).
+    // Note: the 9p read is performed by whichever account owns this VM, which
+    // by default — per-operator gateways off, see `per_operator_gateway_enabled`
+    // — is _sandboxd and NOT the operator. That default is the TCC asymmetry:
+    // lite shared: gets no operator TCC consent path, so sources must be
+    // readable by _sandboxd and must not live in TCC-protected directories
+    // (Desktop, Documents, Downloads). With per-operator gateways enabled the
+    // read happens as the operator and that asymmetry does not apply; the
+    // export is still VM-wide either way.
     let shared_root = crate::lite_macos::lite_shared_root();
     let mounts_stanza = crate::lite_macos::lite_shared_root_9p_stanza(&shared_root);
 
@@ -986,8 +992,10 @@ portForwards:
 # The shared root is exposed read-write at the same absolute path so the
 # host->VM path translation is an identity. Per-session shared: paths must
 # fall under this root (validated at session-create time).
-# NOTE: reads are performed as _sandboxd (the gateway VM user), not the
-# operator. Sources outside TCC-protected dirs work without consent.
+# NOTE: reads are performed as whoever owns this VM. By default that is
+# _sandboxd, not the operator, and sources outside TCC-protected dirs then
+# work without consent. With per-operator gateways enabled the owner is the
+# operator instead.
 {mounts_stanza}
 containerd:
   system: false
@@ -2427,6 +2435,71 @@ impl GatewayLimaManager {
 
         info!("sandbox-route-helper installed and setcap'd in gateway VM");
         Ok(())
+    }
+
+    /// Resolve an operator-supplied lite `shared:` path **inside the gateway
+    /// VM** and report where it landed relative to the export root.
+    ///
+    /// # Why the host cannot answer this
+    ///
+    /// The export is a 9p mount with `securityModel: mapped-xattr`. A symlink
+    /// created from inside the VM is stored on the host as a *regular file*
+    /// carrying `S_IFLNK` in a `user.virtfs.*` xattr, so the host's
+    /// `canonicalize` walks straight past it while the VM's `dockerd`,
+    /// resolving the same `src=` in the guest, follows it out of the export.
+    /// That is not a race a re-check narrows: the host view is permanently
+    /// blind to it. The only namespace in which the two views cannot disagree
+    /// is the one the path is actually used in.
+    ///
+    /// The lexical checks in [`crate::lite_macos::validate_shared_path`] still
+    /// run first and are still worth running — they refuse a malformed request
+    /// without a VM round trip — but they are a necessary condition, not the
+    /// containment decision.
+    ///
+    /// # What the caller does with the answer
+    ///
+    /// [`Containment::Inside`] carries the symlink-free spelling, and that is
+    /// the path to bind — binding the *requested* spelling would re-open the
+    /// component the resolution just walked. [`Containment::Outside`] carries
+    /// where the path actually went, so the refusal can name it.
+    ///
+    /// An answer that is not a single well-formed path is an error rather than
+    /// a verdict; see [`workspace::parse_resolution`] for the cases and why a
+    /// filename containing a newline makes them real.
+    pub fn resolve_shared_path(
+        &self,
+        shared_root: &str,
+        requested_path: &str,
+    ) -> Result<workspace::Containment, SandboxError> {
+        let op = InVmOp::ResolveSharedPath {
+            shared_root: shared_root.to_string(),
+            requested_path: requested_path.to_string(),
+        };
+        let label = op.label();
+        let output = self.in_vm.run(op, GATEWAY_SHELL_TIMEOUT, label)?;
+
+        if !output.status.success() {
+            // `realpath -e` exits non-zero when a component does not exist,
+            // which is the ordinary "you named a path that is not there" case
+            // and not a fault of the VM. Report it as a bad request so the
+            // caller does not present it as a gateway failure.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::InvalidArgument(format!(
+                "lite shared: path {requested_path} could not be resolved inside the \
+                 gateway VM: {}",
+                stderr.trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        workspace::parse_resolution(shared_root, &stdout).ok_or_else(|| {
+            SandboxError::Gateway(format!(
+                "gateway VM: resolving lite shared: path {requested_path} produced an \
+                 answer that is not a single usable path (got {:?}) — the path is \
+                 refused rather than bound on an answer that cannot be read",
+                stdout.trim()
+            ))
+        })
     }
 
     /// Stage a session's lite-container provisioning files into a per-session,
@@ -5228,6 +5301,123 @@ mod tests {
             ops_seen(&exec),
             vec![InVmOp::LoginGid],
             "a failed probe must not be followed by the ops that depend on it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared-workspace resolution
+    // -----------------------------------------------------------------------
+
+    /// The path resolves to somewhere inside the export.
+    #[cfg(target_os = "macos")]
+    fn resolves_inside(_: &InVmOp) -> &'static str {
+        "proj/src\n"
+    }
+
+    /// The path resolves out of the export — the guest-symlink escape.
+    #[cfg(target_os = "macos")]
+    fn resolves_outside(_: &InVmOp) -> &'static str {
+        "/run/docker.sock\n"
+    }
+
+    /// A zero exit whose output is not a single usable path.
+    #[cfg(target_os = "macos")]
+    fn resolves_ambiguously(_: &InVmOp) -> &'static str {
+        "proj/one\nproj/two\n"
+    }
+
+    /// The verdict comes back with the spelling that may be bound, and both
+    /// caller words cross the seam unaltered.
+    ///
+    /// The op is asserted, not just the `Ok`: a resolution issued with the
+    /// wrong root would answer confidently about the wrong export.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_contained_path_resolves_to_the_spelling_that_gets_bound() {
+        let exec = RecordingInVmExecutor::answering(resolves_inside);
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        let verdict = mgr
+            .resolve_shared_path("/tmp/sandbox-shared", "/tmp/sandbox-shared/proj/src")
+            .expect("a path that resolves under the root is contained");
+
+        assert_eq!(
+            verdict,
+            workspace::Containment::Inside {
+                resolved: "/tmp/sandbox-shared/proj/src".to_string()
+            }
+        );
+        assert_eq!(
+            ops_seen(&exec),
+            vec![InVmOp::ResolveSharedPath {
+                shared_root: "/tmp/sandbox-shared".to_string(),
+                requested_path: "/tmp/sandbox-shared/proj/src".to_string(),
+            }]
+        );
+    }
+
+    /// The escape the op exists for. `realpath` exits **zero** here — the path
+    /// is perfectly resolvable, it just lands outside — so a caller that read
+    /// only the exit status would bind `/run`. The verdict has to come from the
+    /// output.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_guest_symlink_out_of_the_export_resolves_to_where_it_went() {
+        let exec = RecordingInVmExecutor::answering(resolves_outside);
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        let verdict = mgr
+            .resolve_shared_path("/tmp/sandbox-shared", "/tmp/sandbox-shared/escape")
+            .expect("resolving an escaped path succeeds; the verdict is what differs");
+
+        assert_eq!(
+            verdict,
+            workspace::Containment::Outside {
+                resolved: "/run/docker.sock".to_string()
+            },
+            "a zero exit is not containment"
+        );
+    }
+
+    /// An answer that cannot be read as one path is an error, not a verdict.
+    /// Guessing which line to bind is the failure mode; a filename may legally
+    /// contain a newline, so the ambiguity is real rather than defensive.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreadable_answer_refuses_rather_than_picking_a_line() {
+        let exec = RecordingInVmExecutor::answering(resolves_ambiguously);
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        let err = mgr
+            .resolve_shared_path("/tmp/sandbox-shared", "/tmp/sandbox-shared/proj")
+            .expect_err("two candidate answers is not an answer");
+        assert!(
+            matches!(err, SandboxError::Gateway(_)),
+            "an unreadable answer is a gateway fault, got: {err:?}"
+        );
+    }
+
+    /// A path that is not there fails `realpath -e`, and that is the operator's
+    /// mistake rather than the gateway's. The distinction is load-bearing: a
+    /// `Gateway` error invites the reader to go looking at the VM.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_missing_path_is_reported_as_a_bad_request_not_a_gateway_fault() {
+        let exec = RecordingInVmExecutor::failing(
+            "realpath: /tmp/sandbox-shared/absent: No such file or directory",
+        );
+        let mgr = manager_with_in_vm(Arc::clone(&exec), 501);
+
+        let err = mgr
+            .resolve_shared_path("/tmp/sandbox-shared", "/tmp/sandbox-shared/absent")
+            .expect_err("a path that is not there cannot be bound");
+        assert!(
+            matches!(err, SandboxError::InvalidArgument(_)),
+            "a missing path is the caller's error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("No such file or directory"),
+            "the underlying reason must survive into the message: {err}"
         );
     }
 

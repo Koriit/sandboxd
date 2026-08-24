@@ -51,13 +51,30 @@
 //! - the choice of one of **four staged filenames**, drawn from a closed enum;
 //! - a **container pid** and a **gateway address**, which are a `u32` and an
 //!   [`std::net::Ipv4Addr`] rather than strings, so the words they render into
-//!   cannot be flags, paths, or anything with a metacharacter in it.
+//!   cannot be flags, paths, or anything with a metacharacter in it;
+//! - an **export root and a path under it**, the one genuinely free-form pair,
+//!   carried by [`workspace::resolve_argv`] alone.
 //!
-//! The last of those is the only one whose *correctness* — as opposed to its
+//! The pid/address pair is the only one whose *correctness* — as opposed to its
 //! shape — is not decided anywhere in this crate or on the calling side. It
 //! cannot be: the question "is this the right gateway for that container?" is
 //! answerable only from inside the container's network namespace. See
 //! [`route_helper::install_container_route_argv`].
+//!
+//! The last entry is the one that most looks like the pass-through the rest of
+//! the list exists to refuse, so it is worth saying exactly why it is not. What
+//! makes the other values safe is that they cannot be *made into* anything: a
+//! `u32` has no metacharacter, a session id is charset-checked, a ruleset never
+//! reaches an argv. A workspace path cannot be constrained that way — a
+//! directory may legitimately be called `my project` or `$(id)` — so its safety
+//! rests on two different properties. It cannot be re-split into words, because
+//! `limactl` shell-quotes each element (see below); and it cannot become a
+//! flag, because `--` precedes it. Beyond shape, the *authority* question is
+//! answered on the executing side, which will only resolve a path already
+//! lexically inside a declared root that is not `/` — so the op reads
+//! somewhere in an export or it does not run. It grants no write, no exec and
+//! no privilege; contrast [`route_helper`]'s staging op, which refuses a source
+//! path precisely because that one does.
 //!
 //! # No shell — and exactly where the one that exists lives
 //!
@@ -88,6 +105,7 @@
 pub mod lite_stage;
 pub mod route_helper;
 pub mod vm;
+pub mod workspace;
 
 /// The Lima CLI. Resolved to an absolute path by whichever side runs it —
 /// this constant only names the program.
@@ -279,6 +297,19 @@ mod tests {
         argvs.extend(vm::harden_docker_socket_argv(1000));
         argvs.push(lite_stage::mkdir_argv("/tmp/sandbox-lite/s1"));
         argvs.push(lite_stage::rm_argv("/tmp/sandbox-lite/s1"));
+        // The one builder taking a free-form path. It is entered here with a
+        // representative value, and that is all this enumeration can do for
+        // it: `is_shell_invocation` matches a **basename** in any position, so
+        // a legitimate workspace directory called `sh` would be reported as a
+        // shell invocation by a detector that is looking at an operand of
+        // `realpath`. The property that actually holds for every value the
+        // field can take — the command word does not depend on the path — is
+        // asserted directly, in `workspace`'s
+        // `the_command_word_does_not_depend_on_the_path`.
+        argvs.push(workspace::resolve_argv(
+            "/tmp/sandbox-shared",
+            "/tmp/sandbox-shared/proj",
+        ));
 
         for argv in argvs {
             assert!(

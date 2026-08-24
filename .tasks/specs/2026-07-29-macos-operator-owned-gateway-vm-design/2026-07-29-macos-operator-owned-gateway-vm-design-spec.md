@@ -4735,6 +4735,28 @@ guest's view. **That trade is already exposed to operators on the full backend**
 sufficient by itself — the resolve/use gap remains — but it removes the blindness that makes
 the gap undetectable.
 
+⚠️ **Corrected — the cost is stated backwards, and the correction inverts what the option is
+bad at.** "Guest ownership and mode are applied to host inodes … host-side files reflect the
+guest's view" describes **`passthrough`**, not `none`. `none` *is* passthrough with the
+strict error reporting removed, and that removal is the whole difference. The QEMU serving
+this export runs as an ordinary user, so a guest `chown` to another uid, a `mknod`, or a
+setuid bit is something it cannot honour — and under `none` those calls **silently succeed
+with no underlying effect**. The guest is told the operation worked; the host inode is
+unchanged. Host-side files therefore do *not* reflect the guest's view; the guest is misled
+about its own writes. `passthrough`, which would make the claim true, is unavailable for a
+separate and stronger reason: honouring those ops needs root or
+`CAP_CHOWN`+`CAP_FOWNER`+`CAP_DAC_OVERRIDE` on the QEMU process, which hands a compromised
+in-VM agent a host-side ownership-and-mode primitive. That is settled by the prior 9p
+security-model spec (§ *Why we did not choose `passthrough`*, § *What `none` actually gets
+us*) and is not re-derived here.
+
+This changes the conclusion, not just the wording. The paragraph above reads as "`none` costs
+you fidelity you may not need"; what it actually costs is a **silent-lie surface** — the one
+failure mode that the ownership-pinning criterion in §4 Phase 5 has to be able to trust.
+Weighed against a containment check that is made inside the VM and is therefore correct under
+either model, `none` retires nothing and adds that surface. **Decision: stay on
+`mapped-xattr`.** Recorded, with this reasoning, on `lite_shared_root_9p_stanza`.
+
 **And state the comparison honestly.** Per-session subtree export bounds this **by
 construction**: there is nothing outside the export for a link to reach, in either view. It
 was rejected for its per-create bounce (#83), which is a real cost. The honest framing of the

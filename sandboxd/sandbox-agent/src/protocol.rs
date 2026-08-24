@@ -1067,6 +1067,33 @@ pub enum InVmOp {
         container_pid: u32,
         gateway_ip: std::net::Ipv4Addr,
     },
+    /// Resolve an operator-supplied `shared:` workspace path inside the VM and
+    /// report where it lands relative to the declared export root.
+    ///
+    /// The containment decision for the lite workspace bind, and it has to be
+    /// taken in the guest: a symlink created inside the VM is stored host-side
+    /// as a regular file carrying `S_IFLNK` in a `user.virtfs.*` xattr, so a
+    /// host-side `canonicalize` walks past it while the VM's `dockerd` — which
+    /// resolves the bind's `src=` in the guest — follows it out.
+    ///
+    /// **The only variant carrying a free-form string that reaches an argv.** A
+    /// workspace path cannot be charset-checked the way `session_id` is; a
+    /// directory may legitimately be called `my project`. Two other things
+    /// stand in for that: `limactl` shell-quotes every argv element before the
+    /// guest login shell sees it, so the value cannot be re-split into words,
+    /// and `--` precedes it, so it cannot be read as a flag.
+    ///
+    /// What makes it permissible is that it grants nothing — it runs `realpath`
+    /// and reports a path. Contrast [`InVmOp::RouteHelperStage`], which refuses
+    /// a source path because that would name a file to copy into a VM about to
+    /// be handed `cap_net_admin`. Whether the daemon may ask about *this* path
+    /// is decided here, in validation: a `shared_root` of `/` is refused, and a
+    /// `requested_path` not already lexically inside the root is refused. The
+    /// answer is only ever about somewhere in a declared export.
+    ResolveSharedPath {
+        shared_root: String,
+        requested_path: String,
+    },
 }
 
 /// The four files a lite session stages into its VM directory.
@@ -1669,7 +1696,7 @@ pub fn docker_stream_argv(op: &DockerStreamOp, socket: Option<&std::path::Path>)
 /// same builders, which is what keeps the daemon's idea of an op and the
 /// agent's from drifting.
 pub fn in_vm_shell_steps(op: &InVmOp) -> Option<Vec<Vec<String>>> {
-    use sandbox_invm_argv::{lite_stage, route_helper, vm};
+    use sandbox_invm_argv::{lite_stage, route_helper, vm, workspace};
 
     let steps = match op {
         InVmOp::DockerReady => vec![vm::docker_ready_argv()],
@@ -1700,6 +1727,10 @@ pub fn in_vm_shell_steps(op: &InVmOp) -> Option<Vec<Vec<String>>> {
             *container_pid,
             *gateway_ip,
         )],
+        InVmOp::ResolveSharedPath {
+            shared_root,
+            requested_path,
+        } => vec![workspace::resolve_argv(shared_root, requested_path)],
         InVmOp::RouteHelperStage | InVmOp::LiteStageWrite { .. } => return None,
     };
     Some(steps)

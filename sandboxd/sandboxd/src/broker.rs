@@ -2199,6 +2199,13 @@ fn in_vm_op_to_wire(op: &sandbox_core::in_vm::InVmOp) -> sandbox_agent_protocol:
             container_pid: *container_pid,
             gateway_ip: *gateway_ip,
         },
+        Core::ResolveSharedPath {
+            shared_root,
+            requested_path,
+        } => Wire::ResolveSharedPath {
+            shared_root: shared_root.clone(),
+            requested_path: requested_path.clone(),
+        },
     }
 }
 
@@ -3225,7 +3232,22 @@ mod tests {
                     container_pid: 4242,
                     gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
                 },
+                InVmOp::ResolveSharedPath {
+                    shared_root: "/tmp/sandbox-shared".to_string(),
+                    requested_path: hostile_workspace_path(),
+                },
             ]
+        }
+
+        /// A workspace path a caller could legitimately create — a space, a
+        /// quote, a `$(…)`, a `;` — that is nonetheless inside the export root.
+        ///
+        /// The other free-form field in this fixture is content on stdin; this
+        /// one is a **word in an argv**, and the two sides render it through
+        /// different code paths that must agree character for character. A
+        /// sanitised path would let a divergence in either one go unseen.
+        fn hostile_workspace_path() -> String {
+            r#"/tmp/sandbox-shared/my project; $(id) `id` 'q' "q" \b"#.to_string()
         }
 
         /// A body built to break anything that reinterprets it between the
@@ -3255,7 +3277,7 @@ mod tests {
         #[test]
         fn the_daemon_and_the_agent_render_the_same_command_for_every_op() {
             let ops = every_op();
-            assert_eq!(ops.len(), 15, "every InVmOp variant must be covered here");
+            assert_eq!(ops.len(), 16, "every InVmOp variant must be covered here");
             for op in ops {
                 let wire = in_vm_op_to_wire(&op);
                 assert_eq!(

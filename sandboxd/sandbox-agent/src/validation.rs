@@ -1329,10 +1329,11 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
 /// builds any argv from it.
 ///
 /// There is very little to check, and that is the shape working rather than
-/// the check being thin. Nine of the thirteen variants carry no daemon-supplied
-/// value at all — what they do is fixed by the variant and rendered from
-/// constants. What remains is three kinds of value, and each gets the check its
-/// destination needs:
+/// the check being thin. Most variants — the ones gathered into the last match
+/// arm below, counted there rather than here so the number cannot go stale —
+/// carry no daemon-supplied value at all: what they do is fixed by the variant
+/// and rendered from constants. What remains is four kinds of value, and each
+/// gets the check its destination needs:
 ///
 /// - **The session identifier**, which is joined onto a constant root to name
 ///   a directory that is created, written into and eventually `rm -rf`'d. A
@@ -1345,6 +1346,12 @@ pub fn validate_docker_op(op: &crate::protocol::DockerOp) -> Result<(), String> 
 ///   what the policy says, and the one that matters is `nft`'s. What makes
 ///   them safe is where they go — a parser's stdin and a file's contents —
 ///   not what they look like.
+/// - **The export root and the workspace path** on
+///   [`crate::protocol::InVmOp::ResolveSharedPath`], the one pair that cannot
+///   be charset-checked — a workspace directory may legitimately be called
+///   `my project`. See [`validate_shared_resolution`] for what stands in for a
+///   charset, and why the check that matters is a containment one rather than a
+///   shape one.
 /// - **The container pid and gateway address** on
 ///   [`crate::protocol::InVmOp::InstallContainerRoute`], where almost all of
 ///   the checking was done by the types before this function ran. An
@@ -1376,6 +1383,12 @@ pub fn validate_in_vm_op(op: &crate::protocol::InVmOp) -> Result<(), String> {
         }
         InVmOp::InstallContainerRoute { container_pid, .. } => {
             validate_container_pid(*container_pid)?;
+        }
+        InVmOp::ResolveSharedPath {
+            shared_root,
+            requested_path,
+        } => {
+            validate_shared_resolution(shared_root, requested_path)?;
         }
         InVmOp::WriteDockerSocketDropin { login_gid }
         | InVmOp::HardenDockerSocket { login_gid } => {
@@ -1458,6 +1471,80 @@ fn validate_container_pid(pid: u32) -> Result<(), String> {
         return Err(format!(
             "container pid {pid} exceeds the maximum a pid can be ({})",
             i32::MAX
+        ));
+    }
+    Ok(())
+}
+
+/// The export root and the workspace path a resolve op asks about.
+///
+/// # Why there is no charset here
+///
+/// Every other string this module admits is checked against a charset. This
+/// pair cannot be: a workspace directory may legitimately be called
+/// `my project`, and refusing a space would refuse a real operator's real
+/// directory. Two things stand in for the charset, and neither is a property of
+/// the value:
+///
+/// - **It cannot be re-split into words.** `limactl` shell-quotes every argv
+///   element before the guest login shell parses the line, so a space, a `;` or
+///   a `$(…)` arrives at `realpath` as part of one word.
+/// - **It cannot be read as a flag.** [`sandbox_invm_argv::workspace`] emits
+///   `--` before it.
+///
+/// So what is left to decide is not *shape* but *authority*: whether the daemon
+/// may ask this question about this path at all. That is what the checks below
+/// are, and they are the reason a path may be a field on this op when
+/// [`crate::protocol::InVmOp::RouteHelperStage`] refuses one — the answer here
+/// is only ever about somewhere inside a declared export, and it grants no
+/// write, no exec and no privilege.
+///
+/// - **The root must be a directory that could be an export root.** Absolute,
+///   no `..`, no `.`, and **not `/`** — a root of `/` would make the containment
+///   question vacuous and turn the op into a general existence probe over the
+///   whole VM filesystem.
+/// - **The requested path must already be lexically inside it.** This is the
+///   authority check. It is deliberately *lexical*: whether the path is
+///   *really* inside the root after symlinks is the question the op exists to
+///   answer, and answering it here would be answering it on the blind side.
+/// - **Neither may carry a control character.** Not because the word would be
+///   unsafe — quoting handles that — but because the answer would be
+///   unreadable: `realpath` terminates its answer with a newline, so a path
+///   containing one yields output whose end this side cannot locate.
+///   [`sandbox_invm_argv::workspace::parse_resolution`] refuses such an answer;
+///   refusing the question gets the operator an error that names the cause.
+fn validate_shared_resolution(shared_root: &str, requested_path: &str) -> Result<(), String> {
+    for (field, value) in [
+        ("shared_root", shared_root),
+        ("requested_path", requested_path),
+    ] {
+        validate_path_arg(field, value)?;
+        if let Some(ch) = value.chars().find(|c| c.is_control()) {
+            return Err(format!(
+                "{field}: {value:?} contains {ch:?}; realpath's answer is \
+                 newline-terminated, so a path carrying a control character has \
+                 no readable answer"
+            ));
+        }
+        if value.split('/').any(|component| component == ".") {
+            return Err(format!(
+                "{field}: {value:?} contains a '.' component; the export root and \
+                 the path under it are compared as text, and a path that has not \
+                 been spelled out plainly cannot be compared that way"
+            ));
+        }
+    }
+    if shared_root.trim_end_matches('/').is_empty() {
+        return Err(
+            "shared_root: '/' is not an export root; a containment question about \
+             the whole filesystem has no answer worth having"
+                .to_string(),
+        );
+    }
+    if !sandbox_invm_argv::workspace::path_is_within(shared_root, requested_path) {
+        return Err(format!(
+            "requested_path: {requested_path:?} is not under the export root \
+             {shared_root:?}"
         ));
     }
     Ok(())
@@ -3593,13 +3680,20 @@ provision:
                     container_pid: 4242,
                     gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
                 },
+                InVmOp::ResolveSharedPath {
+                    shared_root: "/tmp/sandbox-shared".to_string(),
+                    // Well-formed, and deliberately not tidy: the validator
+                    // admits a path a real operator could really have made, so
+                    // the well-formed case has to look like one.
+                    requested_path: r#"/tmp/sandbox-shared/my project; $(id) 'q'"#.to_string(),
+                },
             ]
         }
 
         #[test]
         fn every_well_formed_op_is_accepted() {
             let ops = every_op();
-            assert_eq!(ops.len(), 15, "every InVmOp variant must be covered here");
+            assert_eq!(ops.len(), 16, "every InVmOp variant must be covered here");
             for op in ops {
                 assert!(
                     validate_in_vm_op(&op).is_ok(),
@@ -3921,6 +4015,162 @@ provision:
         fn a_negative_container_pid_does_not_deserialize() {
             let json = r#"{"in_vm_op":"install_container_route","container_pid":-1,"gateway_ip":"10.0.0.2"}"#;
             assert!(serde_json::from_str::<InVmOp>(json).is_err());
+        }
+
+        // -- the resolve op's two paths --------------------------------------
+
+        fn resolve(shared_root: &str, requested_path: &str) -> InVmOp {
+            InVmOp::ResolveSharedPath {
+                shared_root: shared_root.to_string(),
+                requested_path: requested_path.to_string(),
+            }
+        }
+
+        /// The op answers a containment question, so the question itself must
+        /// already be about somewhere in the export. Without this the op is a
+        /// general existence-and-canonicalisation probe over the VM's whole
+        /// filesystem, run as a login user with passwordless sudo.
+        ///
+        /// The sibling case is the one a prefix comparison written in a hurry
+        /// gets wrong: `/tmp/sandbox-shared-evil` starts with the root as a
+        /// string and is not under it as a path.
+        #[test]
+        fn a_resolve_op_refuses_a_path_that_is_not_already_under_the_root() {
+            for bad in [
+                "/etc/passwd",
+                "/tmp",
+                "/tmp/sandbox-shared-evil/proj",
+                "/tmp/sandbox-sharedx",
+                "/",
+                "relative/path",
+                "/tmp/sandbox-shared/../../etc",
+            ] {
+                assert!(
+                    validate_in_vm_op(&resolve("/tmp/sandbox-shared", bad)).is_err(),
+                    "{bad:?} is not under the export root and must be refused"
+                );
+            }
+        }
+
+        /// The root itself and anything genuinely beneath it are the questions
+        /// this op exists for — including spellings that look hostile and are
+        /// not, which is the whole reason the field has no charset.
+        #[test]
+        fn a_resolve_op_admits_the_root_and_the_paths_beneath_it() {
+            for ok in [
+                "/tmp/sandbox-shared",
+                "/tmp/sandbox-shared/proj",
+                "/tmp/sandbox-shared/a/b/c",
+                "/tmp/sandbox-shared/my project",
+                "/tmp/sandbox-shared/$(id); rm -rf /",
+                "/tmp/sandbox-shared/-rf",
+                "/tmp/sandbox-shared/--version",
+                "/tmp/sandbox-shared/naïve — 日本語",
+            ] {
+                assert!(
+                    validate_in_vm_op(&resolve("/tmp/sandbox-shared", ok)).is_ok(),
+                    "{ok:?} is a legitimate workspace path and must be accepted: {:?}",
+                    validate_in_vm_op(&resolve("/tmp/sandbox-shared", ok)).err()
+                );
+            }
+        }
+
+        /// A root of `/` makes every path "contained" and turns the op into
+        /// that general probe. The daemon has no reason to send it, which is
+        /// exactly why the agent should refuse it rather than assume so.
+        #[test]
+        fn the_filesystem_root_is_not_an_export_root() {
+            for root in ["/", "//", "/////"] {
+                assert!(
+                    validate_in_vm_op(&resolve(root, "/etc/shadow")).is_err(),
+                    "an export root of {root:?} must be refused"
+                );
+            }
+        }
+
+        /// A malformed root is refused on its own terms, before the containment
+        /// question is asked — a relative or traversing root would make the
+        /// lexical comparison meaningless in a way that reads as a pass.
+        #[test]
+        fn a_root_that_is_not_a_plain_absolute_directory_is_refused() {
+            for root in [
+                "tmp/sandbox-shared",
+                "",
+                "/tmp/../tmp/sandbox-shared",
+                "/tmp/./sandbox-shared",
+                "-rf",
+            ] {
+                let under = format!("{root}/proj");
+                assert!(
+                    validate_in_vm_op(&resolve(root, &under)).is_err(),
+                    "export root {root:?} must be refused even with a path under it"
+                );
+            }
+        }
+
+        /// `realpath` terminates its answer with a newline, so a path carrying
+        /// one produces output whose end this side cannot find. Refused at the
+        /// question rather than left to fail as an unreadable answer — the
+        /// operator gets a message naming the cause either way, but only this
+        /// way does it name *their* path.
+        #[test]
+        fn a_control_character_in_either_path_is_refused() {
+            for bad in [
+                "/tmp/sandbox-shared/two\nlines",
+                "/tmp/sandbox-shared/tab\there",
+                "/tmp/sandbox-shared/bell\u{7}",
+            ] {
+                assert!(
+                    validate_in_vm_op(&resolve("/tmp/sandbox-shared", bad)).is_err(),
+                    "{bad:?} has no readable answer and must be refused"
+                );
+            }
+            assert!(
+                validate_in_vm_op(&resolve(
+                    "/tmp/sandbox\nshared",
+                    "/tmp/sandbox\nshared/proj"
+                ))
+                .is_err(),
+                "a root carrying a control character must be refused too"
+            );
+        }
+
+        /// What an accepted op actually runs. The two fields are free-form, so
+        /// the property that matters is that neither can reach the part of the
+        /// argv that decides *what runs* — the command and its flags are the
+        /// same words whatever the caller sent, and both caller words land
+        /// after the `--`.
+        ///
+        /// `no_op_renders_a_shell_invocation` above cannot see this: it matches
+        /// basenames anywhere in an argv, so it would equally accept a
+        /// rendering that had put the path first.
+        #[test]
+        fn an_accepted_resolve_op_puts_both_caller_words_after_the_separator() {
+            for (root, path) in [
+                ("/tmp/sandbox-shared", "/tmp/sandbox-shared/proj"),
+                ("/tmp/sandbox-shared", "/tmp/sandbox-shared/-rf"),
+                ("/var/x", "/var/x/a b; $(id)"),
+            ] {
+                let op = resolve(root, path);
+                validate_in_vm_op(&op).expect("well-formed");
+                let steps = in_vm_shell_steps(&op).expect("a command, not a transfer");
+                assert_eq!(steps.len(), 1, "the answer is the last step's output");
+                let argv = &steps[0];
+                assert_eq!(argv[0], "realpath", "the command word must be invariant");
+                let separator = argv
+                    .iter()
+                    .position(|w| w == "--")
+                    .expect("the path must follow a `--`");
+                assert_eq!(
+                    argv.iter().position(|w| w == path),
+                    Some(separator + 1),
+                    "the requested path must be the word after the separator: {argv:?}"
+                );
+                assert!(
+                    argv[..separator].iter().all(|w| !w.contains(path)),
+                    "no word before the separator may carry the requested path: {argv:?}"
+                );
+            }
         }
     }
 

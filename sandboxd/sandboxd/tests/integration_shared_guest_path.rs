@@ -530,27 +530,33 @@ async fn http_post_json(
 }
 
 /// HTTP-boundary pin for the container backend shared bind-mount
-/// rejection: the container backend has no 9p layer, so
-/// any operator-supplied `:<security_model>` token (e.g.
+/// rejection: an operator-supplied `:<security_model>` token (e.g.
 /// `shared:/tmp:none`) must be refused with 400 +
-/// `SandboxError::InvalidArgument`. The mapper at
+/// `SandboxError::InvalidArgument`. The mapper in
 /// `sandboxd/src/main.rs::create_session` enforces this; a regression
 /// that drops the gate would let the request reach
 /// `runtime.register_session` with an inert `security_model` value,
 /// silently degrading the operator's request rather than failing
 /// loudly.
 ///
+/// The test asserts the *refusal*, not the reason, and that is deliberate:
+/// the two container paths refuse on different grounds. On Linux, which is
+/// where this test runs, the bind-mount genuinely has no 9p layer. On macOS
+/// lite one exists — the gateway VM's export — and the refusal there rests
+/// on the export being VM-wide rather than per-session. Pinning a shared
+/// wording would force one of the two messages to be false.
+///
 /// Body shape mirrors `integration_create_session_rejects_no_gitignore_with_non_local_workspace`
 /// — minimum valid container request plus the offending
 /// `workspace: "shared:/tmp:none"` field. The host's already-loaded
-/// production gateway image satisfies the pre-flight probe at
-/// `sandboxd/src/main.rs:1372-1394`, the parser at `:1399` accepts
-/// `shared:/tmp:none` (`Shared { host_path: "/tmp", guest_path: "/tmp",
-/// security_model: Some(NoneMapping) }`), and the request then
-/// proceeds through CA + network allocation before the container
-/// branch's rejection fires at `:1908`. The `cleanup_net_ca_and_return!`
-/// macro on that branch tears down the per-session network + CA the
-/// daemon allocated, so the test leaks no resources on success.
+/// production gateway image satisfies the create path's pre-flight image
+/// probe, the workspace parser accepts `shared:/tmp:none` (`Shared {
+/// host_path: "/tmp", guest_path: "/tmp", security_model:
+/// Some(NoneMapping) }`), and the request then proceeds through CA +
+/// network allocation before the container branch's rejection fires. The
+/// `cleanup_net_ca_and_return!` macro on that branch tears down the
+/// per-session network + CA the daemon allocated, so the test leaks no
+/// resources on success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_container_rejects_security_model() {
     // Distinct /24 from other integration tests (10.97.x — local
@@ -568,9 +574,8 @@ async fn integration_container_rejects_security_model() {
     assert_eq!(
         status,
         hyper::StatusCode::BAD_REQUEST,
-        "container backend must refuse a request carrying a 9p :<security_model> \
-         token (the bind-mount has no 9p layer); expected 400, got {status}. \
-         body={}",
+        "container backend must refuse a request carrying a :<security_model> \
+         token; expected 400, got {status}. body={}",
         String::from_utf8_lossy(&body_bytes)
     );
 
@@ -583,9 +588,9 @@ async fn integration_container_rejects_security_model() {
             panic!("rejection body must have a top-level `error` string; got: {parsed}")
         });
 
-    // The container backend has no 9p layer, so the rejection
-    // message must name the offending field so the operator can map
-    // the error back to their `--workspace shared:…:<model>` invocation.
+    // Whatever the reason, the rejection must name the offending field so
+    // the operator can map the error back to their
+    // `--workspace shared:…:<model>` invocation.
     assert!(
         error_msg.contains("security_model"),
         "rejection body must contain the literal field name `security_model`; got: {error_msg}"

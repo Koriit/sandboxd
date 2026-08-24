@@ -560,6 +560,26 @@ A reader who takes "the warning is genuinely absent" at face value will go
 looking for a bug that was removed intentionally. This entry is the correction
 to that reading, not a softening of it.
 
+**Resolved since the baseline.** The remedy above was taken: the test now
+asserts on a slice of the line the daemon actually emits, copied from the emit
+site rather than transcribed. It was renamed in the same change —
+`test_shared_workspace_tcc_warning` →
+`test_shared_workspace_under_root_is_accepted_and_names_its_reader` — because
+the old name described an assertion that no longer exists. Position 51 in the
+table below still carries the old name: it is the measurement, and renaming a
+recorded observation would make the baseline unreproducible.
+
+One quoted string above did **not** survive to the fix, and it is worth being
+explicit about which. The surviving line is no longer `host-side access runs as
+the sandboxd daemon user (gateway VM owner), not the operator`. That wording
+stated a mode-dependent fact flatly: the reading account is `_sandboxd` only
+while per-operator gateways are off, and is the operator's own account when
+they are on. It now reads `lite shared: workspace — the host side is read by
+the gateway VM's owner, not necessarily by the operator`, and carries the
+reading uid as a structured `reader_uid` field so the identity is observable
+rather than asserted. Quote the emit site, not this paragraph — that is exactly
+the failure mode that produced D9.
+
 ### D14 — CoreDNS log missing `example.com` (1)
 
 The gateway's CoreDNS log does not contain the queried name. Stable at 1 in
@@ -698,6 +718,20 @@ rename them — the signatures and positions are what carry the information.
 
 All 85 failures, so a fix can be checked against the tests it should turn green.
 
+**Compare the set, never the total.** A later run that also reports 85 has not
+reproduced this baseline — it has reported the same cardinality, which is the
+one quantity a swap cannot move. A run measured 181 commits after `436ce35`
+matched at 85 while differing in both directions: position 51 had been fixed
+and passed, and `test_policy_survives_daemon_restart[container]` — passing
+here — had failed. Either one alone would have shifted the total and been
+noticed; together they cancelled. Diff the names.
+
+That comparison is what this table is for, so two things about its shape
+matter. Names are abbreviated where they were long (`test_discovery…closes_them`),
+so matching is prefix-and-suffix, not equality; and the positions are ordinals
+from the recorded run's collection order, not stable identifiers — a run with
+different collection cannot be aligned to them positionally.
+
 ### Positions 1–62
 
 | pos | test | class | assertion |
@@ -716,7 +750,7 @@ All 85 failures, so a fix can be checked against the tests it should turn green.
 | 35 | `test_lite_git_remote_sandbox` | D4 | `empty session name in URL` |
 | 37 | `test_lite_workspace_uid_alignment` | D8 | `shared:` path outside the shared root |
 | 39 | `test_lite_orphan_cleanup_on_daemon_restart` | D6 | plain `docker ps -a` → host Docker |
-| 51 | `TestLiteMacosWorkspace.test_shared_workspace_tcc_warning` | D9 | TCC warning absent from the daemon log |
+| 51 | `TestLiteMacosWorkspace.test_shared_workspace_tcc_warning` (renamed since — see D9) | D9 | TCC warning absent from the daemon log |
 | 52 | `test_gateway_traffic_flow[lima]` | D6 | gateway container "not running" per host Docker |
 | 53 | `test_gateway_traffic_flow[container]` | D6 | ″ |
 | 54 | `test_denied_traffic[lima]` | D6 | `No such container: sandbox-gw-…` |

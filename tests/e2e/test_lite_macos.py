@@ -47,9 +47,12 @@ from typing import Optional
 import pytest
 
 from conftest import (
+    DAEMON_LIMA_HOME,
+    OP_LIMA_HOME,
     PLATFORM,
     SANDBOX_LITE_IMAGE_TAG,
     _gateway_vm_docker_argv,
+    gateway_limactl_cmd,
     limactl_cmd,
 )
 
@@ -266,35 +269,16 @@ def _timed_curl(session_name: str, url: str, max_time: int) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def _operator_gateway_instance() -> Optional[str]:
-    """Name this operator's own gateway Lima instance, or ``None`` if absent.
-
-    Candidates are discovered from the operator's registry rather than assumed
-    into existence, then disambiguated by owner — both halves are load-bearing.
-    Discovery means this can only ever name a VM that actually exists in this
-    operator's ``LIMA_HOME``; the disambiguation means it names the right one.
-
-    A bare prefix match is **not** sufficient, which is measurable rather than
-    theoretical: when the daemon uid and the operator uid coincide, one registry
-    holds both ``sandboxd-gateway`` (the shared, daemon-owned instance) and
-    ``sandboxd-gateway-<op_uid>`` (this operator's own). Taking the first match
-    there silently addresses whichever limactl happened to list first. So the
-    owner-suffixed form is preferred, and the unsuffixed form accepted only in
-    its absence — that ordering also spans the revert, where an operator's tree
-    legitimately holds only the shared instance.
-
-    An instance matching the prefix but neither form is *not* returned. It
-    belongs to some other owner, and driving another operator's VM from this
-    harness is the failure this function exists to make impossible.
-    """
+def _gateway_registry_names(cmd_builder) -> set[str]:
+    """Instance names visible in one Lima registry, empty if unreadable."""
     result = subprocess.run(
-        limactl_cmd("list", "--json"),
+        cmd_builder("list", "--json"),
         capture_output=True,
         text=True,
         timeout=30,
     )
     if result.returncode != 0:
-        return None
+        return set()
     names: set[str] = set()
     for line in (result.stdout or "").strip().splitlines():
         try:
@@ -304,11 +288,58 @@ def _operator_gateway_instance() -> Optional[str]:
         name = entry.get("name") or ""
         if name:
             names.add(name)
-    # Owner-suffixed first, shared instance second, nothing otherwise.
-    for candidate in (f"sandboxd-gateway-{os.getuid()}", "sandboxd-gateway"):
-        if candidate in names:
-            return candidate
+    return names
+
+
+def _discover_gateway() -> Optional[tuple[str, object]]:
+    """Locate the gateway Lima VM serving this operator's lite sessions.
+
+    Returns ``(instance_name, cmd_builder)`` — the builder is what must be
+    used to address that instance, because *which registry the VM was found
+    in determines how it is reached*. Returning a bare name would be a trap:
+    the caller would have to guess a credential, and guessing wrong reads as
+    "no such VM" rather than "wrong LIMA_HOME".
+
+    **Two registries, because the daemon supports two modes.** Per-operator
+    gateways (``SANDBOX_PER_OPERATOR_GATEWAY``) put a uid-suffixed instance in
+    the operator's own ``LIMA_HOME``, which the test process reads directly as
+    itself. With the setting off — the default, and what this harness
+    configures — the daemon creates one shared, unsuffixed instance inside its
+    *own* subtree, readable only by pivoting to the daemon test user. Probing
+    only the operator's registry finds nothing in the default mode, which is
+    not a detectable error: it is indistinguishable from having no gateway at
+    all, so every dependent test skips while the VM sits there Running.
+
+    Candidates are discovered rather than assumed into existence, then
+    disambiguated by owner — both halves are load-bearing. A bare prefix match
+    is **not** sufficient, which is measurable rather than theoretical: one
+    registry can hold both ``sandboxd-gateway`` (shared, daemon-owned) and
+    ``sandboxd-gateway-<op_uid>`` (this operator's own), and taking the first
+    match silently addresses whichever limactl happened to list first. So the
+    owner-suffixed form is preferred within each registry, and the operator's
+    registry is searched before the daemon's — an operator-owned VM, where one
+    exists, is the one serving this operator's sessions.
+
+    An instance matching the prefix but neither form is *not* returned. It
+    belongs to some other owner, and driving another operator's VM from this
+    harness is the failure this function exists to make impossible.
+    """
+    for cmd_builder in (limactl_cmd, gateway_limactl_cmd):
+        names = _gateway_registry_names(cmd_builder)
+        for candidate in (f"sandboxd-gateway-{os.getuid()}", "sandboxd-gateway"):
+            if candidate in names:
+                return candidate, cmd_builder
     return None
+
+
+def _operator_gateway_instance() -> Optional[str]:
+    """Name the gateway Lima instance, or ``None`` if none is discoverable.
+
+    For skip/failure messages. Callers that need to *address* the VM must use
+    ``_discover_gateway`` and shell it with the builder it returns.
+    """
+    found = _discover_gateway()
+    return None if found is None else found[0]
 
 
 def _operator_gateway_sees_path(host_path: str) -> bool:
@@ -340,17 +371,19 @@ def _operator_gateway_sees_path(host_path: str) -> bool:
     actionable reason) rather than letting a VM-lifecycle state be reported as
     a product regression.
 
-    What ownership *does* change is how the VM is reached. It lives in this
-    operator's own ``LIMA_HOME``, so the test process — which is the operator —
-    shells it directly. No pivot to the daemon user, and no ``sudo``: the
-    privilege that made the old daemon-owned probe necessary is exactly what
-    the operator-owned VM no longer requires.
+    What ownership changes is how the VM is reached, and that is settled by
+    ``_discover_gateway`` rather than assumed here: an operator-owned gateway
+    is shelled directly by the test process, while the default shared instance
+    requires a pivot to the daemon test user that owns it. This function uses
+    whichever builder the discovery returned, so it cannot address the right
+    instance through the wrong credential.
     """
-    instance = _operator_gateway_instance()
-    if instance is None:
+    found = _discover_gateway()
+    if found is None:
         return False
+    instance, cmd_builder = found
     result = subprocess.run(
-        limactl_cmd("shell", instance, "--", "test", "-d", host_path),
+        cmd_builder("shell", instance, "--", "test", "-d", host_path),
         capture_output=True,
         text=True,
         timeout=30,
@@ -1353,9 +1386,11 @@ class TestLiteMacosWorkspace:
                 _sandbox("stop", name, check=False)
                 _sandbox("rm", name, check=False)
 
-    def test_shared_workspace_tcc_warning(self, sandbox_daemon, tmp_path):
-        """``shared:`` workspace on lite emits a TCC-asymmetry warning AND is
-        accepted when the source is under the configured shared root.
+    def test_shared_workspace_under_root_is_accepted_and_names_its_reader(
+        self, sandbox_daemon, tmp_path
+    ):
+        """``shared:`` workspace on lite is accepted when the source is under
+        the configured shared root, and the daemon records who reads it.
 
         On macOS lite the sandbox container's Docker runs *inside* the daemon's
         ``sandboxd-gateway`` Lima VM, so a ``shared:`` bind source resolves
@@ -1369,28 +1404,35 @@ class TestLiteMacosWorkspace:
         in the create handler — and (b) be surfaced to the VM by a *live* 9p
         export.
 
-        The gateway VM reads the shared path as ``_sandboxd`` (the gateway VM
-        user), not the operator, so the daemon warns operators about the TCC
-        asymmetry at create time. For a source *under* the configured shared
-        root the daemon logs an informational ``warn!`` and proceeds — it does
-        NOT reject the path (rejection is reserved for sources outside the root).
+        The host side of that mount is read by whichever account owns the
+        gateway VM — the daemon user by default, the operator when per-operator
+        gateways are enabled — so the daemon records the reading uid at create
+        time rather than asserting a name. For a source *under* the configured
+        shared root the daemon logs that line and proceeds; it does NOT reject
+        the path (rejection is reserved for sources outside the root, and for
+        the guest-planted-symlink case the next test covers).
 
         This test asserts BOTH halves of that contract:
 
         1. ``sandbox create`` returns 0 (accepted), and the session reaches
            Running; and
-        2. the daemon tracing log contains the TCC-asymmetry warning line the
-           create handler emits.
+        2. the daemon tracing log contains the reader-identity line the create
+           handler emits.
 
-        The warning goes to the daemon tracing log, not the CLI output, so we
-        read ``<base_dir>/sandboxd.log`` (via the daemon test user). Because we
+        The line goes to the daemon tracing log, not the CLI output, so we read
+        ``<base_dir>/sandboxd.log`` (via the daemon test user). Because we
         assert on ``returncode == 0`` explicitly, this test can no longer pass
         silently when create fails — a create failure fails the first
-        assertion, and a missing warning fails the second.
+        assertion, and a missing log line fails the second.
 
-        The distinctive substring asserted is a stable, em-dash-free slice of
-        the source ``warn!`` message in ``sandboxd/src/main.rs``:
-        "access runs as _sandboxd (gateway VM user)".
+        The substring asserted is a stable, em-dash-free slice of the ``debug!``
+        message in ``sandboxd/src/main.rs``. It is deliberately *not* the phrase
+        this test used to look for: the previous needle ("access runs as
+        _sandboxd (gateway VM user)") matched no string the daemon has ever
+        emitted, so the assertion could only ever fail — it is position 51 in
+        the recorded macOS baseline. A needle that no source string contains is
+        not a weak test, it is a permanently red one, so keep this slice
+        copy-pasted from the emit site.
 
         Live-export guard: macOS clears ``/private/tmp`` (``/tmp`` symlinks to
         it) on reboot / periodically, so if this operator's gateway VM out-lived
@@ -1422,23 +1464,27 @@ class TestLiteMacosWorkspace:
             instance = _operator_gateway_instance()
             pytest.skip(
                 "lite shared: source is provisioned on the host under "
-                f"{shared_root} but this operator's gateway VM ({instance!r}) "
+                f"{shared_root} but the gateway VM ({instance!r}) "
                 f"cannot see it via 9p ({workspace!r} is absent inside the VM). "
-                "Either the operator has no gateway VM at all (instance None), "
+                "Either no gateway VM was discoverable at all (instance None) "
+                f"in either registry — the operator's {OP_LIMA_HOME} or the "
+                f"daemon's own {DAEMON_LIMA_HOME}, the latter holding the "
+                "shared instance created when per-operator gateways are off — "
                 "or its QEMU virtfs export is stale: macOS cleared /private/tmp "
                 "(/tmp -> /private/tmp) after that VM booted, so QEMU holds a "
                 "handle to the deleted boot-time /tmp/sandbox-shared inode. "
                 "docker-create in the VM would fail with 'bind source path does "
                 "not exist'. Fix: ensure /tmp/sandbox-shared exists, then restart "
-                "this operator's gateway VM so it rebinds the export to the live "
-                "inode. Only this operator's VM needs restarting — each operator's "
-                "gateway VM binds the shared root independently, so a stale export "
-                "in one says nothing about the others."
+                "the instance named above so it rebinds the export to the live "
+                "inode. How far that reaches depends on the mode: a per-operator "
+                "gateway binds the shared root independently of every other "
+                "operator's, so a stale export in one says nothing about the "
+                "others; the default shared instance serves all of them at once."
             )
 
-        # Distinctive, stable slice of the TCC ``warn!`` message emitted by the
+        # Distinctive, stable slice of the ``debug!`` message emitted by the
         # container create handler for lite shared: sessions under the root.
-        tcc_warning_needle = "access runs as _sandboxd (gateway VM user)"
+        reader_needle = "the host side is read by the gateway VM's owner"
 
         name = f"e2e-lite-shared-{int(time.time())}"
         try:
@@ -1465,14 +1511,20 @@ class TestLiteMacosWorkspace:
                 f"{info['state']!r}"
             )
 
-            # The TCC-asymmetry warning must have been logged during create.
+            # The reader-identity line must have been logged during create.
             log_text = _read_daemon_log(sandbox_daemon)
-            assert tcc_warning_needle in log_text, (
-                "Expected the lite shared: TCC-asymmetry warning "
-                f"({tcc_warning_needle!r}) in the daemon log at "
+            assert reader_needle in log_text, (
+                "Expected the lite shared: reader-identity line "
+                f"({reader_needle!r}) in the daemon log at "
                 f"{_daemon_log_path(sandbox_daemon)}, but it was absent. "
-                "The create handler must warn that lite shared: access runs "
-                "as _sandboxd, not the operator.\n"
+                "The create handler must record that the host side of the 9p "
+                "mount is read by the gateway VM's owner.\n"
+                f"(daemon log length: {len(log_text)} bytes)"
+            )
+            assert "reader_uid=" in log_text, (
+                "The reader-identity line must carry the reading uid as a "
+                "structured field — the whole point of the line is that the "
+                "reader is not a fixed account. Got neither.\n"
                 f"(daemon log length: {len(log_text)} bytes)"
             )
         finally:
@@ -1481,3 +1533,168 @@ class TestLiteMacosWorkspace:
                 _sandbox("rm", name, check=False)
             import shutil as _shutil
             _shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_a_symlink_planted_from_inside_a_session_cannot_be_named_by_another(
+        self, sandbox_daemon
+    ):
+        """A guest-created symlink in the shared export must not be usable as a
+        later session's ``shared:`` source.
+
+        This is the escape the containment work exists to close, run end to end
+        rather than argued from the code. The shared root is exported to the
+        gateway VM as a whole, so **every** session on that VM writes into the
+        same host directory tree. An agent with write access to its own
+        workspace — which is the feature, not a flaw — can therefore leave
+        something behind that a *different* session later names.
+
+        What makes it an escape rather than a nuisance is the 9p security
+        model. Under ``mapped-xattr`` a guest ``ln -s`` is not stored as a host
+        symlink: it lands as a **regular file** whose contents are the target
+        string, with the real ``S_IFLNK`` mode tucked into a
+        ``user.virtfs.mode`` extended attribute. So:
+
+        - the host sees a regular file. ``lstat`` says ``S_IFREG``,
+          ``canonicalize`` walks straight past it, and every host-side
+          containment check it feeds says the path is fine;
+        - the VM's dockerd, which is what actually resolves the ``src=`` of the
+          bind mount, sees a symlink and follows it — out of the export.
+
+        The two views disagree permanently. No retry, tighter window or
+        re-check on the host side closes that, which is why the daemon reads
+        the attribute the host view hides and, independently, resolves the path
+        inside the VM where it is used.
+
+        **The test plants the link from inside a session on purpose.** Creating
+        it with ``os.symlink`` from the test process would make a real host
+        symlink — a different object, caught by different code, and the
+        mapped-xattr blindness would never be exercised. The guest has to be
+        the author for this to be the escape it is named after.
+
+        ``/var/run`` is the target because it exists inside the VM, is outside
+        the export, and is where the gateway's Docker socket lives — the
+        payoff an escape here would be reaching for.
+        """
+        shared_root = "/tmp/sandbox-shared"
+        os.makedirs(shared_root, exist_ok=True)
+        stage = os.path.join(shared_root, f"plant-{int(time.time())}")
+        os.makedirs(stage, exist_ok=True)
+        # The planting session has to be able to write into its own workspace,
+        # or the escape is never staged and the refusal below proves nothing.
+        # The container runs as the operator's uid and the stage dir is
+        # operator-owned, so this should already hold — 0777 removes the
+        # dependency on that rather than relying on it.
+        os.chmod(stage, 0o777)
+
+        if not _operator_gateway_sees_path(stage):
+            pytest.skip(
+                "lite shared: staging dir is provisioned on the host under "
+                f"{shared_root} but the gateway VM "
+                f"({_operator_gateway_instance()!r}) cannot see it via 9p. "
+                "See test_shared_workspace_under_root_is_accepted_and_names_"
+                "its_reader for the stale-export mechanism, the two registries "
+                "searched, and the fix (restart the named instance)."
+            )
+
+        planter = f"e2e-lite-plant-{int(time.time())}"
+        victim = f"e2e-lite-victim-{int(time.time())}"
+        try:
+            # Session A: a normal, accepted shared: session over the staging
+            # directory. Nothing about this create is unusual — that is the
+            # point, the escape is planted by an ordinary session doing an
+            # ordinary write.
+            created = _sandbox(
+                "create", "--lite", "--name", planter,
+                "--workspace", f"shared:{stage}",
+                check=False,
+            )
+            assert created.returncode == 0, (
+                "the planting session must be created normally; a failure here "
+                "means the test never reached the property it is checking.\n"
+                f"stdout: {created.stdout!r}\nstderr: {created.stderr!r}"
+            )
+            _wait_for_running(planter, timeout=60)
+
+            # A `shared:` workspace with no explicit `:<guest>` token mounts at
+            # the SAME path inside the container as on the host — it is not
+            # remapped to /home/sandbox/workspace, which is the clone-mode
+            # target. So `stage` is the guest path too. The host-side existence
+            # check below is what actually holds that equality honest: if the
+            # mount point ever moves, the guest's write lands somewhere else
+            # and that assertion names the problem instead of this one
+            # silently testing an unmounted directory.
+            escape_host_path = os.path.join(stage, "escape")
+            planted = _sandbox(
+                "exec", planter, "--",
+                "ln", "-s", "/var/run", escape_host_path,
+                check=False,
+            )
+            assert planted.returncode == 0, (
+                "the guest must be able to create a symlink in its own "
+                "workspace — if it cannot, the escape this test checks for "
+                "was never staged and a pass would be vacuous.\n"
+                f"stdout: {planted.stdout!r}\nstderr: {planted.stderr!r}"
+            )
+
+            # Control: the host really is blind to it. This is what makes the
+            # refusal below meaningful rather than incidental — if the host saw
+            # a symlink here, ordinary host-side validation would have caught
+            # it and the daemon's attribute read would be untested.
+            assert os.path.lexists(escape_host_path), (
+                f"the planted entry must exist on the host at "
+                f"{escape_host_path}; the 9p export did not carry the guest's "
+                "write through."
+            )
+            assert not os.path.islink(escape_host_path), (
+                "the host must see a REGULAR FILE, not a symlink — that "
+                "blindness is the premise of this test. Seeing a real symlink "
+                "means the export is no longer mapped-xattr, and the daemon's "
+                "containment story needs re-deriving for whatever it is now."
+            )
+
+            # Session B names the planted link. It must be refused.
+            refused = _sandbox(
+                "create", "--lite", "--name", victim,
+                "--workspace", f"shared:{escape_host_path}",
+                check=False,
+            )
+            assert refused.returncode != 0, (
+                "a second session naming a guest-planted symlink as its "
+                f"shared: source must be REFUSED, but create succeeded. The "
+                f"bind would have resolved to /var/run inside the gateway VM, "
+                "outside the export and alongside the Docker socket.\n"
+                f"stdout: {refused.stdout!r}\nstderr: {refused.stderr!r}"
+            )
+
+            # The refusal has to be the *right* one, and it is worth being
+            # precise about why two different refusals would both be "correct"
+            # here. The in-VM resolve would also reject this path — it lands on
+            # /var/run, outside the export — so a passing returncode check
+            # alone does not say which check fired. The host-side attribute
+            # scan is deliberately ordered first, because it is the only one
+            # that can also object to a planted link resolving back *inside*
+            # the export (session A pointing at session B's workspace), which
+            # the resolve correctly calls contained. Pinning the wording pins
+            # that order.
+            message = (refused.stdout + refused.stderr).lower()
+            assert "symbolic link" in message, (
+                "the refusal must say the component is a link created from "
+                "inside a sandbox. Getting the generic outside-the-root "
+                "refusal instead means the attribute scan did not run before "
+                "the in-VM resolve — the outcome is still safe for THIS input, "
+                "but the inside-the-export variant is then unguarded.\n"
+                f"stdout: {refused.stdout!r}\nstderr: {refused.stderr!r}"
+            )
+            assert "user.virtfs.mode" in message, (
+                "the refusal must hand over the command that reveals the "
+                "link — the operator cannot see it with `ls -l`, so without "
+                "the attribute name there is no way to confirm the diagnosis "
+                "or find the other planted links.\n"
+                f"stdout: {refused.stdout!r}\nstderr: {refused.stderr!r}"
+            )
+        finally:
+            for n in (victim, planter):
+                if _session_exists(n):
+                    _sandbox("stop", n, check=False)
+                    _sandbox("rm", n, check=False)
+            import shutil as _shutil
+            _shutil.rmtree(stage, ignore_errors=True)

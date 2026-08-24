@@ -474,6 +474,72 @@ def limactl_cmd(*args: str) -> list[str]:
     return ["env", f"LIMA_HOME={OP_LIMA_HOME}", "limactl", *args]
 
 
+#: Absolute path to the LIMA_HOME the e2e daemon keeps its *own* VMs in.
+#: The daemon builds the same 3-level path as any operator would, naming
+#: itself in the operator position — so this is
+#: /var/lib/sandboxd/<daemon_uid>/<daemon_uid>/lima, not the operator's
+#: subtree.  ``_gateway_vm_docker_argv`` derives the forwarded Docker socket
+#: from the same three components.
+DAEMON_LIMA_HOME: str = f"/var/lib/sandboxd/{_SANDBOX_TEST_UID}/{_SANDBOX_TEST_UID}/lima"
+
+
+def _daemon_rust_log() -> str:
+    """Tracing filter for the e2e daemon, as an ``env``-wrapper assignment.
+
+    The daemon's ``init_tracing`` builds an ``EnvFilter`` from ``RUST_LOG`` and
+    falls back to ``info``.  Under that fallback every ``debug!`` in the daemon
+    is unobservable, which silently caps what the suite can assert about: a
+    test whose needle is copied verbatim from a ``debug!`` emit site is then
+    red for a reason that has nothing to do with the behaviour it checks, and
+    no amount of re-reading the source reveals it — the string is right there.
+
+    ``sandboxd=debug`` widens exactly the daemon binary's own target and leaves
+    everything else at ``info``; the crate has few enough ``debug!`` sites that
+    the extra volume is unremarkable next to per-session container output.
+    Dependency crates stay at ``info`` deliberately — ``debug`` across hyper
+    and friends would bury the daemon's own lines it exists to surface.
+
+    Overridable via ``SANDBOX_E2E_RUST_LOG`` for a debugging run that needs to
+    widen it further, without editing the harness.
+
+    This must be passed through the ``env`` wrapper *after* the sudo user
+    switch: ``RUST_LOG`` is not in the sudoers ``env_keep`` list, so setting it
+    in the ``Popen`` env dict alone would be dropped by ``env_reset``.
+    """
+    return "RUST_LOG=" + os.environ.get("SANDBOX_E2E_RUST_LOG", "info,sandboxd=debug")
+
+
+def gateway_limactl_cmd(*args: str) -> list[str]:
+    """Build a limactl argv that queries the *daemon's* own LIMA_HOME.
+
+    This is the sibling of ``limactl_cmd`` for the other registry, and the
+    difference between them is ownership, not path arithmetic.
+
+    Session VMs are created on the operator's behalf and land in the
+    operator's LIMA_HOME, which the test process — being the operator — reads
+    directly.  A gateway VM is the daemon's own appliance: unless the install
+    enables per-operator gateways, the daemon creates one shared instance in
+    its own subtree, owned by the daemon test user with 0700 directories and
+    a 0600 SSH identity under ``_config/``.  No amount of group membership
+    lets the operator read those, so reaching that registry means pivoting
+    through ``sudo -n -u <daemon test user>`` exactly as
+    ``_gateway_vm_docker_argv`` does for the forwarded Docker socket.
+
+    No ``HOME`` override is passed: sudo's env_reset already sets HOME to the
+    daemon test user's own home directory, which is the state-tree base dir
+    that user owns.
+
+    ``-n`` keeps the failure honest — the harness's NOPASSWD fragment is
+    installed by ``make setup-dev-env``, and if it is missing this fails
+    immediately rather than blocking a headless run on a password prompt.
+    """
+    return [
+        "sudo", "-n", "-u", PLATFORM.daemon_test_user,
+        "env", f"LIMA_HOME={DAEMON_LIMA_HOME}",
+        "limactl", *args,
+    ]
+
+
 #: In-VM home directory for the ``sandbox`` user inside Lima VMs.
 #: Files written here persist across stop/start (non-tmpfs, on the VM's disk).
 LIMA_VM_HOME: str = "/home/sandbox"
@@ -1316,6 +1382,7 @@ def _launch_daemon_as_sandbox_via_sudo(
             "env",
             f"HOME={_SANDBOX_E2E_BASE_DIR}",
             f"DOCKER_CONFIG={_SANDBOX_E2E_BASE_DIR / 'docker'}",
+            _daemon_rust_log(),
             *_macos_env_extras,
             str(staged["sandboxd"]),
             "--socket", str(_SANDBOX_E2E_SOCKET),

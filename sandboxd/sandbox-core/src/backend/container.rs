@@ -374,6 +374,23 @@ pub struct ContainerNetwork {
 /// trait is stateless over [`RuntimeHandle`]. Per-session networking
 /// state is populated via [`Self::register_session`] before
 /// [`SessionRuntime::create`].
+/// Resolves an operator-supplied `shared:` bind source in the namespace the
+/// container's Docker daemon will resolve it in, and reports where it landed.
+///
+/// Takes the operator uid — which selects *whose* VM to ask — and the path as
+/// it stands in the container spec. Blocking: the implementation is a command
+/// run inside that VM, so callers on an async path wrap it.
+///
+/// A function rather than a `GatewayLimaManager` because the manager is macOS
+/// only and this type is not. The daemon supplies a closure that knows both the
+/// export root and which manager serves the operator; the runtime knows
+/// neither.
+pub type SharedPathResolver = Arc<
+    dyn Fn(u32, String) -> Result<sandbox_invm_argv::workspace::Containment, SandboxError>
+        + Send
+        + Sync,
+>;
+
 pub struct ContainerRuntime {
     capabilities: Capabilities,
     image_tag: String,
@@ -430,6 +447,24 @@ pub struct ContainerRuntime {
     /// deliberately non-`cfg` so both shapes stay constructible, and hence
     /// testable, on whichever host runs the tests.
     vm_hosted: bool,
+    /// Re-resolves a `shared:` bind source inside the VM that hosts the
+    /// container, on behalf of the operation's operator. `None` on a
+    /// host-routed runtime, where the daemon and Docker share one filesystem
+    /// view and there is nothing for the two to disagree about.
+    ///
+    /// Held so [`Self::start`] can ask again. Create-time containment is not a
+    /// standing property of a running session: the bind source is fixed in the
+    /// container spec, but the guest re-walks it on every start, and a symlink
+    /// planted into an intermediate component afterwards would be followed then
+    /// rather than now. The host cannot see that link at all — see
+    /// [`sandbox_invm_argv::workspace`] — so the check has to be re-issued into
+    /// the guest rather than re-run here.
+    ///
+    /// Set together with [`Self::route`] and [`Self::vm_hosted`], in the
+    /// constructors and nowhere else, for the reason
+    /// [`Self::route_for_identity`] spells out: a shape that pairs a VM route
+    /// with an absent resolver disables this check with every test still green.
+    shared_resolver: Option<SharedPathResolver>,
     /// Pinned HOME / DOCKER_CONFIG root for the Docker client config dir.
     /// The Docker build client creates its config dir under `$HOME`; a
     /// daemon running as a system user with a non-writable HOME would abort
@@ -482,6 +517,7 @@ impl ContainerRuntime {
             guest_bind_source: guest_bind_source.into(),
             route: Arc::new(|_| DockerRoute::Host),
             vm_hosted: false,
+            shared_resolver: None,
             docker_home: PathBuf::from("/tmp"),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -502,6 +538,13 @@ impl ContainerRuntime {
     /// agent while per-operator gateways are off, and nothing about the
     /// resulting route's shape would say so.
     ///
+    /// `shared_resolver` is mandatory here rather than optional, and that is
+    /// the pairing discipline again: a VM-hosted runtime is exactly the shape
+    /// in which the daemon's filesystem view and the container's disagree, so
+    /// it is the shape that must be able to ask the guest. Making it an
+    /// `Option` would let a caller build the disagreeing configuration and skip
+    /// the check that exists for it.
+    ///
     /// `docker_home` is typically the daemon `base_dir` (`/var/lib/sandboxd/<uid>`),
     /// which is the writable, daemon-owned directory the launchd plist already
     /// pins as `HOME`. This ensures `docker build` can create its config dir
@@ -519,6 +562,7 @@ impl ContainerRuntime {
         user_gid: u32,
         guest_bind_source: impl Into<PathBuf>,
         route: Arc<dyn Fn(u32) -> DockerRoute + Send + Sync>,
+        shared_resolver: SharedPathResolver,
         docker_home: impl Into<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -531,6 +575,7 @@ impl ContainerRuntime {
             guest_bind_source: guest_bind_source.into(),
             route,
             vm_hosted: true,
+            shared_resolver: Some(shared_resolver),
             docker_home: docker_home.into(),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -599,6 +644,88 @@ impl ContainerRuntime {
                  which would run this session's containers in the wrong \
                  operator's VM"
             ))),
+        }
+    }
+
+    /// Refuse to start a container whose `shared:` bind source now resolves out
+    /// of the export, asking the guest rather than the host.
+    ///
+    /// # Why this runs again on every start
+    ///
+    /// The create path already resolved this path and bound the answer. That
+    /// settles where the path pointed *then*. The bind source is a string in
+    /// the container spec and the guest re-walks it on every start, so a
+    /// symlink planted into an intermediate component between two starts is
+    /// followed at the next one — by which time nothing has re-asked.
+    ///
+    /// A host-side re-check would not close it. Under `mapped-xattr` a
+    /// guest-created symlink is stored on the host as a regular file with
+    /// `S_IFLNK` in a `user.virtfs.*` xattr; the host's `canonicalize` walks
+    /// straight past it while the guest's `dockerd` follows it. The host view
+    /// is not stale here, it is blind, so the question has to be re-issued into
+    /// the namespace that can answer it.
+    ///
+    /// Silent no-op on a host-routed runtime and on a session with no bind:
+    /// neither has two views to disagree.
+    async fn reject_an_escaped_workspace_bind(
+        &self,
+        session_id: &SessionId,
+        network: &ContainerNetwork,
+        operator_identity: Option<(u32, u32)>,
+    ) -> Result<(), SandboxError> {
+        let (Some(resolver), Some(bind)) = (
+            self.shared_resolver.as_ref(),
+            network.workspace_bind.as_ref(),
+        ) else {
+            return Ok(());
+        };
+
+        // `start` resolves the route from the same value before reaching here,
+        // so on a VM-hosted runtime this is already known to be present. Read
+        // it rather than assume it: an absent uid names no gateway, and the
+        // only alternative to erroring is to ask some other operator's VM about
+        // this operator's path and believe the answer.
+        let operator_uid = operator_identity.map(|(uid, _)| uid).ok_or_else(|| {
+            SandboxError::Internal(
+                "ContainerRuntime::start: cannot re-check the workspace bind \
+                 without an operator identity to select the VM that resolves it"
+                    .to_string(),
+            )
+        })?;
+
+        let requested = bind.host_path.to_str().ok_or_else(|| {
+            SandboxError::InvalidArgument(format!(
+                "the workspace bind source {} is not valid UTF-8 and cannot be \
+                 resolved inside the VM",
+                bind.host_path.display()
+            ))
+        })?;
+
+        let resolver = Arc::clone(resolver);
+        let requested_owned = requested.to_string();
+        let verdict = tokio::task::spawn_blocking(move || resolver(operator_uid, requested_owned))
+            .await
+            .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))??;
+
+        match verdict {
+            sandbox_invm_argv::workspace::Containment::Inside { .. } => Ok(()),
+            sandbox_invm_argv::workspace::Containment::Outside { resolved } => {
+                warn!(
+                    session_id = %session_id,
+                    host_path = %bind.host_path.display(),
+                    resolved = %resolved,
+                    "refusing to start: the workspace bind source now resolves out \
+                     of the shared root"
+                );
+                Err(SandboxError::InvalidArgument(format!(
+                    "refusing to start session {session_id}: its workspace bind source \
+                     {} now resolves to {resolved} inside the VM, which is outside the \
+                     shared root. A component of the path became a symlink out of the \
+                     export after the session was created. Remove the link, or recreate \
+                     the session against a path that stays inside.",
+                    bind.host_path.display()
+                )))
+            }
         }
     }
 
@@ -1050,6 +1177,9 @@ impl SessionRuntime for ContainerRuntime {
         // wrong VM, and the route helper would then install a default route
         // into some other container's netns.
         let route = self.route_for_identity(args.operator_identity, "ContainerRuntime::start")?;
+
+        self.reject_an_escaped_workspace_bind(&session_id, &network, args.operator_identity)
+            .await?;
 
         run_docker(
             route.clone(),
@@ -2196,6 +2326,17 @@ mod tests {
         Arc::new(unreachable_vm_route)
     }
 
+    /// The resolver a test runtime is built with when the test has no
+    /// workspace bind. Panicking rather than answering makes an unexpected
+    /// resolution a failure here, and pins the complement of the property
+    /// [`the_workspace_recheck_asks_the_guest_before_every_start`] asserts: a
+    /// session with no bind must not consult the guest at all.
+    fn unreachable_shared_resolver() -> SharedPathResolver {
+        Arc::new(|uid, path| {
+            unreachable!("no workspace bind was registered; resolved {path} for uid {uid}")
+        })
+    }
+
     fn test_runtime_macos() -> Arc<ContainerRuntime> {
         ContainerRuntime::with_vm_route(
             DEFAULT_LITE_IMAGE_TAG,
@@ -2205,6 +2346,7 @@ mod tests {
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
             unreachable_vm_route_factory(),
+            unreachable_shared_resolver(),
             "/var/lib/sandboxd/501",
         )
     }
@@ -2326,6 +2468,7 @@ mod tests {
             500,
             "/tmp/guest",
             unreachable_vm_route_factory(),
+            unreachable_shared_resolver(),
             "/tmp/home",
         );
         assert!(rt.is_macos());
@@ -2454,6 +2597,236 @@ mod tests {
             "route helper path must round-trip so start() can invoke it",
         );
         rt.forget_session(&sid);
+    }
+
+    // --- Start-time workspace re-check ---------------------------------------
+    //
+    // These three share one log. Recording the resolver's question and the
+    // Docker op into the same `Vec` is what makes the *ordering* assertable:
+    // two separate counters would each read correctly while the resolution
+    // happened after the container was already running against the escaped
+    // path.
+
+    type CallLog = Arc<Mutex<Vec<String>>>;
+
+    /// A Docker executor that writes down what it was asked to run and
+    /// reports success without reaching a daemon.
+    ///
+    /// Reporting success rather than an error matters: the refusal tests
+    /// below must fail because nothing was ever asked, not because the ask
+    /// itself failed for an unrelated reason.
+    struct RecordingExecutor {
+        log: CallLog,
+    }
+
+    #[async_trait]
+    impl crate::docker::DockerExecutor for RecordingExecutor {
+        fn run(
+            &self,
+            _op_uid: u32,
+            op: DockerOp,
+            _timeout: Duration,
+            _label: &str,
+        ) -> Result<std::process::Output, SandboxError> {
+            let tag = match &op {
+                DockerOp::ContainerStart { .. } => "docker-start",
+                _ => "docker-other",
+            };
+            self.log.lock().unwrap().push(tag.to_string());
+            Ok(std::process::Output {
+                status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+
+        async fn open_stream(
+            &self,
+            _op_uid: u32,
+            _stream: DockerStream,
+        ) -> Result<crate::docker::DockerStreamConn, SandboxError> {
+            unreachable!("start() opens no long-lived stream")
+        }
+    }
+
+    fn recording_resolver(
+        log: &CallLog,
+        verdict: sandbox_invm_argv::workspace::Containment,
+    ) -> SharedPathResolver {
+        let log = Arc::clone(log);
+        Arc::new(move |uid, path| {
+            log.lock().unwrap().push(format!("resolve:{uid}:{path}"));
+            Ok(verdict.clone())
+        })
+    }
+
+    fn recording_runtime(log: &CallLog, resolver: SharedPathResolver) -> Arc<ContainerRuntime> {
+        let log = Arc::clone(log);
+        ContainerRuntime::with_vm_route(
+            DEFAULT_LITE_IMAGE_TAG,
+            2048,
+            2.0,
+            1000,
+            1000,
+            "/var/lib/sandbox/guest/sandbox-guest",
+            Arc::new(move |owner_uid| DockerRoute::Vm {
+                owner_uid,
+                executor: Arc::new(RecordingExecutor {
+                    log: Arc::clone(&log),
+                }),
+            }),
+            resolver,
+            "/var/lib/sandboxd/501",
+        )
+    }
+
+    /// Register a session carrying `bind`, with no route helper so `start`
+    /// stops after the Docker op instead of shelling out to install a route.
+    fn register_bound_session(
+        rt: &ContainerRuntime,
+        bind: Option<WorkspaceBind>,
+    ) -> (SessionId, RuntimeHandle) {
+        let sid = SessionId::generate();
+        rt.register_session(
+            sid,
+            ContainerNetwork {
+                docker_network: "sandbox-net-recheck".into(),
+                container_ip: "10.0.0.3".parse().unwrap(),
+                gateway_ip: "10.0.0.2".parse().unwrap(),
+                workspace_bind: bind,
+                route_helper_path: None,
+                ca_host_path: None,
+                ssh_host_dir: None,
+                operator_identity: Some((501, 20)),
+                owner_pool: None,
+            },
+        );
+        let handle = RuntimeHandle::from_session_id(&sid);
+        (sid, handle)
+    }
+
+    fn start_args() -> RuntimeStartArgs {
+        RuntimeStartArgs {
+            operator_identity: Some((501, 20)),
+            ..Default::default()
+        }
+    }
+
+    /// Every start re-asks the guest where the bind source points, and asks
+    /// before Docker is told to start anything.
+    ///
+    /// Create-time containment settles where the path pointed *then*. The
+    /// bind source stays a string in the container spec and the guest
+    /// re-walks it at each start, so a symlink planted into an intermediate
+    /// component between two starts is followed at the next one. The
+    /// ordering is half the property: an answer that arrives after
+    /// `docker start` describes a container that is already running against
+    /// the escaped path.
+    #[tokio::test]
+    async fn the_workspace_recheck_asks_the_guest_before_every_start() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let rt = recording_runtime(
+            &log,
+            recording_resolver(
+                &log,
+                sandbox_invm_argv::workspace::Containment::Inside {
+                    resolved: "proj/src".to_string(),
+                },
+            ),
+        );
+        let (_sid, handle) = register_bound_session(
+            &rt,
+            Some(WorkspaceBind {
+                host_path: PathBuf::from("/Users/Shared/sandbox/proj/src"),
+                guest_path: PathBuf::from("/home/sandbox/work"),
+            }),
+        );
+
+        rt.start(&handle, &start_args())
+            .await
+            .expect("a contained bind starts");
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                "resolve:501:/Users/Shared/sandbox/proj/src".to_string(),
+                "docker-start".to_string(),
+            ],
+            "start must put the guest's answer ahead of the container, and \
+             must address the question to the operator who owns the VM",
+        );
+    }
+
+    /// A bind source that escaped the export since create is refused, and
+    /// refused before the container exists to be inspected.
+    ///
+    /// The refusal names where the path now lands: an operator who planted
+    /// nothing themselves needs the resolved target to find the link, and
+    /// "outside the shared root" alone does not locate it.
+    #[tokio::test]
+    async fn a_bind_that_escaped_since_create_is_refused_without_starting_it() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let rt = recording_runtime(
+            &log,
+            recording_resolver(
+                &log,
+                sandbox_invm_argv::workspace::Containment::Outside {
+                    resolved: "/run/docker.sock".to_string(),
+                },
+            ),
+        );
+        let (sid, handle) = register_bound_session(
+            &rt,
+            Some(WorkspaceBind {
+                host_path: PathBuf::from("/Users/Shared/sandbox/proj/escape"),
+                guest_path: PathBuf::from("/home/sandbox/work"),
+            }),
+        );
+
+        let err = rt
+            .start(&handle, &start_args())
+            .await
+            .expect_err("an escaped bind must not start");
+
+        match err {
+            SandboxError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("/run/docker.sock") && msg.contains(&sid.to_string()),
+                    "the refusal must name where the path now lands and which \
+                     session it is about; got: {msg}",
+                );
+            }
+            other => panic!("an escaped bind is the operator's input, not a VM fault: {other:?}"),
+        }
+
+        assert!(
+            !log.lock().unwrap().iter().any(|e| e.starts_with("docker")),
+            "the container must not be started before the refusal; log: {:?}",
+            log.lock().unwrap(),
+        );
+    }
+
+    /// A session with no workspace bind does not consult the guest at all.
+    ///
+    /// There is nothing whose two views could disagree, and asking anyway
+    /// would put a VM round-trip on the start path of every session that
+    /// never mounted anything. [`unreachable_shared_resolver`] is what
+    /// enforces this everywhere else in the suite; here it is the assertion.
+    #[tokio::test]
+    async fn a_session_with_no_workspace_bind_never_asks_the_guest() {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let rt = recording_runtime(&log, unreachable_shared_resolver());
+        let (_sid, handle) = register_bound_session(&rt, None);
+
+        rt.start(&handle, &start_args())
+            .await
+            .expect("an unbound session starts");
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["docker-start".to_string()],
+            "an unbound session must reach docker without a resolution step",
+        );
     }
 
     /// `lookup_session` for an unregistered id surfaces an
@@ -3059,6 +3432,7 @@ mod tests {
             1000,
             "/var/lib/sandbox/guest/sandbox-guest",
             unreachable_vm_route_factory(),
+            unreachable_shared_resolver(),
             "/var/lib/sandboxd/501",
         );
 

@@ -23,12 +23,23 @@
 //! # The set is closed
 //!
 //! [`InVmOp`] carries no argv, no shell string, no command name and no path to
-//! run something on. The one path-shaped value in it — a session identifier —
-//! is validated on the executing side before it is joined onto a constant
-//! root, and the one large value — an nftables ruleset — is content delivered
-//! on stdin to a parser, never a command line. Adding a variant that took a
-//! command would make every other variant decorative, because the destination
-//! is a host where `sudo` needs no password.
+//! run something *on*. A session identifier is validated on the executing side
+//! before it is joined onto a constant root, and the one large value — an
+//! nftables ruleset — is content delivered on stdin to a parser, never a
+//! command line. Adding a variant that took a command would make every other
+//! variant decorative, because the destination is a host where `sudo` needs no
+//! password.
+//!
+//! One variant carries a genuinely free-form path, and it is the exception the
+//! rule is written to allow rather than a hole in it:
+//! [`InVmOp::ResolveSharedPath`] hands an operator-supplied workspace path to
+//! `realpath` and reports where it lands. A path that is *read* and a path that
+//! something is *done to* are different asks — compare
+//! [`InVmOp::RouteHelperStage`], which refuses a source path outright because
+//! it would name a file to copy into a VM about to be given `cap_net_admin`.
+//! The safety of the string is argued at that variant; the point for this
+//! section is that the closed set stayed closed over an operation whose whole
+//! purpose is to answer a question about a caller-supplied name.
 //!
 //! The remaining values are a container pid and a gateway address, typed as
 //! `u32` and `Ipv4Addr` so that neither can render an argv word that is a flag,
@@ -212,6 +223,51 @@ pub enum InVmOp {
         container_pid: u32,
         gateway_ip: std::net::Ipv4Addr,
     },
+
+    // -- Workspace containment -----------------------------------------------
+    /// Resolve an operator-supplied `shared:` workspace path **inside the VM**
+    /// and report where it lands relative to the declared export root.
+    ///
+    /// **This is the containment decision for the lite workspace bind, and it
+    /// has to be taken in here.** The host and the guest do not agree about
+    /// what a path in the 9p export resolves to: a symlink created inside the
+    /// VM is stored host-side as a regular file with `S_IFLNK` in a
+    /// `user.virtfs.*` xattr, so a host-side `canonicalize` walks past it and
+    /// the VM's `dockerd` — which resolves the bind's `src=` in the guest —
+    /// follows it out. The host view is not late, it is blind; no re-check on
+    /// that side can see what this one sees.
+    ///
+    /// # The two string fields
+    ///
+    /// This is the only variant carrying a free-form string that reaches an
+    /// argv, so the reason it may is worth stating next to it rather than only
+    /// in the crate that renders it.
+    ///
+    /// A workspace path cannot be charset-checked the way
+    /// [`Self::LiteStageCreate`]'s session identifier is — a directory may
+    /// legitimately be called `my project`. What makes it safe is different:
+    /// `limactl` shell-quotes every argv element before the guest login shell
+    /// sees it, so the value cannot be re-split into words, and `--` precedes
+    /// it, so it cannot be read as a flag.
+    ///
+    /// What makes it *permissible* is that the op grants nothing. It runs
+    /// `realpath` and reports a path. Contrast [`Self::RouteHelperStage`],
+    /// which refuses a source path because that one would be a request to copy
+    /// an arbitrary file into a VM about to be handed `cap_net_admin`. The
+    /// remaining question — whether the daemon may ask about *this* path — is
+    /// answered on the executing side, which refuses a `shared_root` of `/` and
+    /// refuses a `requested_path` that is not already lexically inside it. So
+    /// the answer this op can give is only ever about somewhere in a declared
+    /// export; it is not a general existence probe.
+    ///
+    /// The verdict and the safe spelling both come out of the single rendered
+    /// command — see [`sandbox_invm_argv::workspace`] for why one `realpath`
+    /// answers both, and [`sandbox_invm_argv::workspace::parse_resolution`] for
+    /// the answers that are refused rather than read.
+    ResolveSharedPath {
+        shared_root: String,
+        requested_path: String,
+    },
 }
 
 impl InVmOp {
@@ -225,7 +281,7 @@ impl InVmOp {
     /// [`InVmOp::LiteStageWrite`], which are file transfers rather than
     /// commands — see [`Self::transfer`].
     pub fn shell_steps(&self) -> Option<Vec<Vec<String>>> {
-        use sandbox_invm_argv::{lite_stage, route_helper, vm};
+        use sandbox_invm_argv::{lite_stage, route_helper, vm, workspace};
 
         let steps = match self {
             InVmOp::DockerReady => vec![vm::docker_ready_argv()],
@@ -258,6 +314,10 @@ impl InVmOp {
                 *container_pid,
                 *gateway_ip,
             )],
+            InVmOp::ResolveSharedPath {
+                shared_root,
+                requested_path,
+            } => vec![workspace::resolve_argv(shared_root, requested_path)],
             InVmOp::RouteHelperStage | InVmOp::LiteStageWrite { .. } => return None,
         };
         Some(steps)
@@ -331,6 +391,7 @@ impl InVmOp {
             InVmOp::LiteStageWrite { .. } => "in-vm: lite stage write",
             InVmOp::LiteStageRemove { .. } => "in-vm: lite stage remove",
             InVmOp::InstallContainerRoute { .. } => "in-vm: install container route",
+            InVmOp::ResolveSharedPath { .. } => "in-vm: resolve shared path",
         }
     }
 }
@@ -1090,10 +1151,14 @@ mod tests {
                 container_pid: 4242,
                 gateway_ip: std::net::Ipv4Addr::new(10, 42, 7, 2),
             },
+            InVmOp::ResolveSharedPath {
+                shared_root: "/tmp/sandbox-shared".to_string(),
+                requested_path: "/tmp/sandbox-shared/proj".to_string(),
+            },
         ];
         assert_eq!(
             ops.len(),
-            15,
+            16,
             "the in-VM op set changed size; every property test in this module \
              iterates this list, and a variant missing from it is a variant \
              nothing here checks"

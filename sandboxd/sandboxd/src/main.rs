@@ -1537,6 +1537,83 @@ fn container_docker_route_resolver(
     Arc::new(move |operator_uid| resolve_docker_route(gateway_docker_route.as_ref(), operator_uid))
 }
 
+/// Decide whether a `shared:` bind source is usable, applying both checks that
+/// can see what the host's own `lstat` cannot.
+///
+/// The two are not redundant and neither subsumes the other:
+///
+/// - The **attribute scan** names a component that is a guest-planted symlink.
+///   It is the only one of the two that objects to a link pointing *back
+///   inside* the export — one session linking into another session's
+///   workspace — because that link resolves to `Inside` and the resolve is
+///   right to say so.
+/// - The **in-VM resolve** is the authority on where the path lands, and it is
+///   what bounds an escape out of the export. It sees intermediate components
+///   the attribute scan cannot decode, and it answers in the namespace
+///   `dockerd` will actually walk.
+///
+/// Order matters only for the message: the cheap host-local scan runs first so
+/// the operator gets the refusal that names the offending component instead of
+/// one that names only where the whole path ended up.
+///
+/// Blocking — both halves do I/O. Callers in async contexts wrap it in
+/// `spawn_blocking`.
+#[cfg(target_os = "macos")]
+fn contain_shared_path(
+    manager: &sandbox_core::GatewayLimaManager,
+    shared_root: &std::path::Path,
+    requested_path: &str,
+) -> Result<sandbox_invm_argv::workspace::Containment, SandboxError> {
+    let root = shared_root.to_str().ok_or_else(|| {
+        SandboxError::Internal(format!(
+            "the configured lite shared root {} is not valid UTF-8 and cannot be \
+             resolved inside the gateway VM",
+            shared_root.display()
+        ))
+    })?;
+
+    sandbox_core::lite_macos::reject_guest_planted_symlink(
+        std::path::Path::new(requested_path),
+        shared_root,
+        &sandbox_core::lite_macos::read_virtfs_mode_xattr,
+    )
+    .map_err(|e| SandboxError::InvalidArgument(e.to_string()))?;
+
+    manager.resolve_shared_path(root, requested_path)
+}
+
+/// The workspace-bind resolver [`ContainerRuntime`] is built with: it asks the
+/// gateway VM serving `operator_uid` where a `shared:` bind source actually
+/// lands.
+///
+/// The runtime holds neither the export root nor the manager registry, and it
+/// should not: which VM answers is a property of the operator, and what counts
+/// as "inside" is a daemon-wide configuration. Both are closed over here.
+///
+/// The operator uid is passed to the *registry accessor*, not to
+/// `get_or_create` — the same collapse [`container_docker_route_resolver`]
+/// applies, for the same reason. Asking the wrong gateway would produce a
+/// confident answer about a path in a filesystem that is not the one the
+/// container will resolve against.
+///
+/// Routing this through [`contain_shared_path`] rather than calling
+/// `resolve_shared_path` directly is what makes the start-time re-check the
+/// same check as the create-time one. Two spellings of "is this bind still
+/// safe" would drift, and the one that drifts is the one that runs on every
+/// restart of a session created long ago.
+#[cfg(target_os = "macos")]
+fn container_shared_path_resolver(
+    managers: Arc<sandbox_core::GatewayLimaManagerRegistry>,
+) -> sandbox_core::backend::container::SharedPathResolver {
+    Arc::new(move |operator_uid, requested_path| {
+        contain_shared_path(
+            &managers.get_or_create(sandbox_core::gateway_owner_uid(operator_uid)),
+            &sandbox_core::lite_macos::lite_shared_root(),
+            &requested_path,
+        )
+    })
+}
+
 impl AppState {
     /// The Docker route for the gateway that serves `operator_uid`'s sessions.
     ///
@@ -2943,11 +3020,18 @@ async fn create_session(
             // Some("shared:<host>[:<guest>][:<model>]")`). Other
             // variants don't bind a host path into the container.
             //
-            // `security_model` is meaningless for a Docker bind-mount
-            // (it is a 9p concept on the Lima side); the daemon-side
-            // mapper rejects any `Some(_)` value here so the runtime
-            // stays unaware of the field (container backend has no
-            // 9p security-model concept).
+            // `security_model` is meaningless for a Docker bind-mount:
+            // there is no 9p layer here for a model to describe. The
+            // daemon-side mapper rejects any `Some(_)` value so the
+            // runtime stays unaware of the field.
+            //
+            // This branch is Linux-only in practice — the macOS lite
+            // create path early-returns above it — and the reason
+            // matters, because the macOS refusal cannot use this one.
+            // A macOS lite container mounts through the gateway VM's
+            // 9p export, so a 9p layer does exist there; what does not
+            // exist is a per-session handle on it. Keep the two
+            // messages distinct rather than sharing a constant.
             let workspace_bind = match &config.workspace_mode {
                 Some(sandbox_core::WorkspaceMode::Shared {
                     host_path,
@@ -2960,8 +3044,10 @@ async fn create_session(
                             session_id,
                             error_response(sandbox_core::SandboxError::InvalidArgument(
                                 "security_model is not supported by the container \
-                                 backend (9p-only concept); omit the :<model> token \
-                                 from --workspace shared:…"
+                                 backend: the workspace is a Docker bind-mount, with \
+                                 no 9p layer for a security model to describe. Omit \
+                                 the :<model> token from --workspace shared:… — it \
+                                 applies to the full (VM) backend only."
                                     .to_string(),
                             ))
                             .into_response()
@@ -5624,12 +5710,28 @@ async fn create_session_macos_lite(
             guest_path,
             security_model,
         }) => {
+            // The refusal here cannot borrow the Linux container path's
+            // reason. That one says a bind-mount has no 9p layer; on macOS
+            // lite there is one — this very bind is served through the gateway
+            // VM's 9p export. What is missing is a per-session handle on it:
+            // the export is declared in the VM's template and comes up with
+            // the VM, before any session exists, and every session on that VM
+            // shares it. Honouring a `:<model>` token on one create would
+            // therefore be changing a property of sessions that did not ask.
+            // Say that, rather than a sentence the operator can disprove by
+            // looking at the mount.
             if security_model.is_some() {
                 early_lite_cleanup_and_return!(
                     error_response(SandboxError::InvalidArgument(
-                        "security_model is not supported by the container \
-                     backend (9p-only concept); omit the :<model> token \
-                     from --workspace shared:…"
+                        "security_model cannot be set per session on the lite \
+                         backend. The workspace is served over 9p here — the \
+                         gateway VM exports the shared root — but that export \
+                         belongs to the VM: it is established when the VM starts \
+                         and is shared by every session running on it, so a token \
+                         on one session's --workspace would change the mount other \
+                         sessions are already using. Omit the :<model> token; it \
+                         applies to the full (VM) backend, where each session has \
+                         its own VM and its own export."
                             .to_string(),
                     ))
                     .into_response()
@@ -5641,38 +5743,99 @@ async fn create_session_macos_lite(
             let shared_root = lite_shared_root();
             let hp = std::path::PathBuf::from(host_path);
             if let Err(e) = validate_shared_path(&hp, &shared_root) {
-                // The gateway VM belongs to the daemon user, so the daemon
-                // user — not the operator — reads the host side of the 9p
-                // mount, and it cannot traverse an operator-owned home
-                // directory. `SharedPathError`'s Display carries that
-                // explanation plus the alternatives that do work; the log line
+                // The shared root is the only host directory exported into the
+                // gateway VM, so a source outside it is simply not in the
+                // namespace the container mounts from. `SharedPathError`'s
+                // Display carries that plus the ownership story behind where
+                // the root sits and the alternatives that do work; the log line
                 // stays short and structured.
                 warn!(
                     session_id = %session_id,
                     host_path = %hp.display(),
                     shared_root = %shared_root.display(),
-                    "lite shared: path outside the configured shared root — the gateway \
-                     VM's daemon user cannot read operator-owned paths"
+                    "lite shared: path outside the configured shared root — only the \
+                     root is exported into the gateway VM"
                 );
                 early_lite_cleanup_and_return!(
                     error_response(SandboxError::InvalidArgument(e.to_string())).into_response()
                 );
             }
-            // Record who reads the host side of the mount. This fires only
+            // The lexical checks above are necessary and not sufficient. They
+            // read the *host* view of the export, and that view is permanently
+            // blind to a symlink the guest created: `mapped-xattr` stores one
+            // as a regular file with `S_IFLNK` in a `user.virtfs.*` xattr, so
+            // the host walks past it while the VM's dockerd — which is what
+            // actually resolves this `src=` — follows it out of the export.
+            // Read the attribute the host view hides, then ask the namespace
+            // the path is used in.
+            let glm = Arc::clone(&gateway_lima);
+            let root_owned = shared_root.clone();
+            let requested_owned = host_path.clone();
+            let verdict = match tokio::task::spawn_blocking(move || {
+                contain_shared_path(&glm, &root_owned, &requested_owned)
+            })
+            .await
+            {
+                Ok(Ok(verdict)) => verdict,
+                Ok(Err(e)) => {
+                    early_lite_cleanup_and_return!(error_response(e).into_response())
+                }
+                Err(e) => early_lite_cleanup_and_return!(
+                    error_response(SandboxError::Internal(format!("task join error: {e}")))
+                        .into_response()
+                ),
+            };
+            // Bind the *resolved* spelling. Binding what the operator wrote
+            // would hand dockerd the same components to walk again, which is
+            // the walk the resolution just performed on the daemon's behalf.
+            let resolved = match verdict {
+                sandbox_invm_argv::workspace::Containment::Inside { resolved } => resolved,
+                sandbox_invm_argv::workspace::Containment::Outside { resolved } => {
+                    warn!(
+                        session_id = %session_id,
+                        host_path = %hp.display(),
+                        resolved = %resolved,
+                        shared_root = %shared_root.display(),
+                        "lite shared: path resolves out of the shared root inside the \
+                         gateway VM — a component of it is a symlink the host view \
+                         cannot see"
+                    );
+                    early_lite_cleanup_and_return!(
+                        error_response(SandboxError::InvalidArgument(format!(
+                            "lite shared: path {} resolves to {resolved} inside the \
+                             gateway VM, which is outside the shared root {}. A \
+                             component of the path is a symlink that leads out of the \
+                             export — it is not visible from the host, so this is \
+                             decided where the path is actually used. Point shared: \
+                             at a path whose components all stay under the root, or \
+                             replace the offending link with the real directory.",
+                            hp.display(),
+                            shared_root.display()
+                        )))
+                        .into_response()
+                    );
+                }
+            };
+            // Record who reads the host side of the mount. It is the gateway
+            // VM's owner, which is the daemon user by default and the operator
+            // when per-operator gateways are enabled — so the field carries the
+            // uid rather than a name asserted at compile time. This fires only
             // after the path cleared both halves of `validate_shared_path`
-            // above — the component scan and the root-containment test — so
-            // the source is already somewhere the daemon user can traverse —
-            // there is nothing for the operator to act on here, and naming
+            // above — the component scan and the root-containment test — so the
+            // source is already somewhere that reader can traverse; there is
+            // nothing for the operator to act on here, and naming
             // TCC-protected directories at this point would be misleading
             // (a path under the shared root is not in one).
             debug!(
                 session_id = %session_id,
                 host_path = %hp.display(),
-                "lite shared: workspace — host-side access runs as the sandboxd \
-                 daemon user (gateway VM owner), not the operator"
+                resolved = %resolved,
+                reader_uid = sandbox_core::gateway_owner_uid(operator.uid),
+                "lite shared: workspace — the host side is read by the gateway VM's \
+                 owner, not necessarily by the operator"
             );
             Some(sandbox_core::backend::WorkspaceBind {
-                host_path: hp,
+                host_path: std::path::PathBuf::from(resolved),
                 guest_path: std::path::PathBuf::from(guest_path),
             })
         }
@@ -6234,14 +6397,18 @@ async fn create_session_macos_lite(
     // is handled by the 9p bind, `clone:` runs in the guest agent).
     //
     // Transport: the sandbox container runs inside the gateway VM, reachable
-    // only over the forwarded `_sandboxd`-only Docker socket, so the rsync
-    // `docker exec` must target that socket (`docker -H unix://<sock> exec -i`)
-    // — a host `docker exec` would report "No such container". The forwarded
-    // socket is `_sandboxd`-only; the daemon (`_sandboxd`) is the only principal
-    // that can connect to it, so the push runs as the daemon via the
-    // direct-spawn `run_initial_push` rather than the operator-pivoted helper
-    // path (there is no `sandbox-lima-helper`/setuid on macOS). The host
-    // source is read by `_sandboxd`, same as lite `shared:`.
+    // only over the forwarded Docker socket, so the rsync `docker exec` must
+    // target that socket (`docker -H unix://<sock> exec -i`) — a host `docker
+    // exec` would report "No such container". Who may connect to that socket
+    // depends on who owns the VM: by default the gateway is the daemon's and
+    // the socket is `_sandboxd`-only, so the exec is a direct spawn; with
+    // per-operator gateways the socket is the operator's and the exec goes
+    // through their agent. `docker_route` is what absorbs that difference —
+    // this call site passes it rather than a socket path alone precisely so it
+    // does not have to know. (Neither arm is the Linux operator-pivoted helper
+    // path: there is no `sandbox-lima-helper`/setuid on macOS.) The host source
+    // is read by `_sandboxd` in both, since rsync's source side is the daemon
+    // process itself — same as lite `shared:` under its default.
     //
     // Failure is fatal — fail-closed, matching the generic path (which tears
     // the session down on push failure rather than returning a half-seeded
@@ -13330,8 +13497,13 @@ async fn reconcile_operator_vms(
 /// **Step 6a (unconditional):** for every non-running session, remove its
 /// gateway container + macvlan network (via `teardown_macos_gateway`) and
 /// release its vmnet slot. Remove orphaned gateway containers (no matching
-/// session). Runs regardless of operator login state — gateway infra is
-/// daemon-owned (_sandboxd), reachable without an agent.
+/// session). Runs regardless of operator login state, because in the default
+/// configuration the gateway VM hosting those containers is daemon-owned
+/// (_sandboxd) and is therefore reachable without an agent. Under per-operator
+/// gateways that premise does not hold — the containers are in the operator's
+/// VM — so the individual teardowns for a logged-out operator will fail and be
+/// logged; the step still runs, it just cannot finish that operator's share
+/// until they check in.
 ///
 /// **Step 6b (agent-gated):** for each operator uid in
 /// `agent_registry.connected_uids()`, verify their running
@@ -16085,6 +16257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         container_gid,
         &guest_bind_source,
         container_docker_route_resolver(Arc::clone(&gateway_docker_route)),
+        container_shared_path_resolver(Arc::clone(&gateway_lima_managers)),
         base_dir.clone(),
     );
     #[cfg(not(target_os = "macos"))]
@@ -16508,9 +16681,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // 6a (unconditional): for every non-running session, remove its gateway
     //    container + macvlan network and release its slot. Also remove orphaned
-    //    gateway containers with no matching session. Runs for all operators
-    //    regardless of login state, because the gateway runs as the daemon
-    //    (_sandboxd) and is reachable without an agent.
+    //    gateway containers with no matching session. Attempted for all
+    //    operators regardless of login state, because by default the gateway VM
+    //    is the daemon's (_sandboxd) and is reachable without an agent. With
+    //    per-operator gateways a logged-out operator's teardowns fail and are
+    //    logged — the step is unconditional, its success is not.
     //
     // 6b (agent-gated): for each operator whose agent is checked in, verify
     //    their running sessions' VMs are live (mark error if dead, release slot).
@@ -17007,6 +17182,13 @@ mod tests {
             501,
             "/nonexistent/sandbox-guest",
             container_docker_route_resolver(gateway_docker_route),
+            // These tests register no session and start no container, so the
+            // resolver is never reached. Panicking makes an unexpected
+            // resolution a failure here rather than a shell-out from a unit
+            // test against a VM that does not exist.
+            Arc::new(|uid, path| {
+                unreachable!("no container is started here; resolved {path} for uid {uid}")
+            }),
             "/nonexistent/base",
         )
     }
