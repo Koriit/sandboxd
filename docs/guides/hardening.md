@@ -261,6 +261,14 @@ Set the model at create time via the third colon-segment of the flag value (see 
 
 > **Per-session, and therefore full-backend only.** The token is refused on the lite backend, on both platforms — but for two different reasons, and the distinction is worth keeping straight. On Linux lite the workspace is a Docker bind-mount with no 9p layer at all, so there is nothing for a security model to describe. On macOS lite there *is* a 9p layer — the gateway VM exports one or more roots — but it belongs to the VM rather than to any session: the export list is fixed when the instance is created, and is shared by every session running on it, so honouring a token on one `--workspace` would change a mount the other sessions are already using. Both refusals name their own reason.
 
+### Export roots reach your real working tree (macOS lite)
+
+A gateway VM confined to one fixed shared root structurally bounds what a container escape can touch on the host: whatever else went wrong, the only host content in reach was whatever had been staged under that root. Operator-declared export roots remove that bound deliberately. Letting `shared:` name a real project path is the entire point of the feature, and the consequence is inseparable from it: **an escape that reaches your uid now lands on your actual working tree**, not on a staging copy. Any mechanism that makes lite `shared:` usable for real work has this property — it is not an artefact of this particular design.
+
+What remains yours to decide is the reach. Nothing is exported until you declare it, each root is named explicitly rather than inferred from what a session asks for, and the declaration is a file only you can write. Declaring `/Users/you` because it is convenient and declaring one project directory are the same mechanism with very different blast radii, and the guide does not choose between them for you — see [Shared workspaces on macOS](/sandboxd/guides/lite-mode/#shared-workspaces-on-macos) for the declaration format.
+
+This applies only to macOS lite with per-operator gateways. The daemon-owned gateway keeps its single administrator-set root, and the full backend has always mounted host paths as the operator's own uid.
+
 ### `local:` snapshot workspace
 
 `--workspace local:<path>` seeds the guest with a one-shot `rsync` snapshot of a host directory. Unlike `shared:`, no 9p device is attached and no host directory is bound into the VM:
