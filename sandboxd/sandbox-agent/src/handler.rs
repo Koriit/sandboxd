@@ -278,6 +278,7 @@ pub async fn dispatch_op(ctx: &RunContext, op: BrokerOp) -> BrokerResult {
         BrokerOp::ListJson { op_uid: _ } => handle_list_json(ctx).await,
         BrokerOp::InstallGuestAgent { op_uid: _, vm } => handle_install_guest_agent(ctx, vm).await,
         BrokerOp::ReadUserKey { op_uid: _ } => handle_read_user_key(ctx).await,
+        BrokerOp::ReadExportRoots { op_uid: _ } => handle_read_export_roots(ctx).await,
         BrokerOp::RunRsync {
             op_uid: _,
             backend,
@@ -1552,6 +1553,66 @@ async fn handle_read_user_key(ctx: &RunContext) -> BrokerResult {
         Err(e) => BrokerResult::Failed {
             stdout: String::new(),
             stderr: format!("failed to read {key_path}: {e}"),
+            exit_code: 1,
+        },
+    }
+}
+
+/// Answer [`BrokerOp::ReadExportRoots`] for this agent's own operator.
+///
+/// The home directory comes from `getpwuid_r` on the agent's own uid, never
+/// from `$HOME`: the agent's environment is inherited from launchd and is not
+/// a statement about which account it is. `dispatch_op` has already refused
+/// any request whose `op_uid` is not this uid, so the account read here is
+/// always the one the daemon asked about.
+///
+/// A file that exists but is wrong is a `Failed`, not a `Rejected`: `Rejected`
+/// means the daemon sent something the agent will not do, and this is the
+/// agent doing exactly what was asked and finding the operator's file
+/// unusable. The distinction is what the daemon logs, and it decides whether
+/// the operator or the daemon build is the thing to go look at.
+async fn handle_read_export_roots(ctx: &RunContext) -> BrokerResult {
+    let Some(home) = resolve_op_home(ctx.own_uid).await else {
+        return BrokerResult::Failed {
+            stdout: String::new(),
+            stderr: format!(
+                "could not resolve the home directory of uid {} — no export roots \
+                 can be read without it",
+                ctx.own_uid
+            ),
+            exit_code: 1,
+        };
+    };
+
+    let read = tokio::task::spawn_blocking(move || crate::protocol::read_export_roots(&home)).await;
+
+    let report = match read {
+        Ok(Ok(report)) => report,
+        Ok(Err(reason)) => {
+            return BrokerResult::Failed {
+                stdout: String::new(),
+                stderr: reason,
+                exit_code: 1,
+            };
+        }
+        Err(e) => {
+            return BrokerResult::Failed {
+                stdout: String::new(),
+                stderr: format!("export-roots read task failed: {e}"),
+                exit_code: 1,
+            };
+        }
+    };
+
+    match serde_json::to_string(&report) {
+        Ok(stdout) => BrokerResult::Ok {
+            stdout,
+            stderr: String::new(),
+            exit_code: 0,
+        },
+        Err(e) => BrokerResult::Failed {
+            stdout: String::new(),
+            stderr: format!("failed to serialize the export-roots report: {e}"),
             exit_code: 1,
         },
     }

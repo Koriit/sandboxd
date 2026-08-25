@@ -2573,6 +2573,7 @@ fn lima_op_to_broker_op(
             vm: vm.to_string(),
         },
         LimaOp::ReadUserKey => BrokerOp::ReadUserKey { op_uid },
+        LimaOp::ReadExportRoots => BrokerOp::ReadExportRoots { op_uid },
         LimaOp::RunRsync {
             backend,
             session_name,
@@ -2956,6 +2957,36 @@ fn run_limactl_direct(
                         key_path.display()
                     ))
                 });
+        }
+        LimaOp::ReadExportRoots => {
+            // Same shape as `ReadUserKey` above: a file read, not a limactl
+            // call. The file lives under the *operator's* home, and on this
+            // path the daemon is its own operator, so `home_str` — already
+            // resolved above from this uid's passwd entry — is the right home
+            // to read from.
+            //
+            // An unresolvable home is refused rather than treated as an
+            // absent declaration. `home_str` falls back to the empty string
+            // for limactl's benefit, and `""` would join to
+            // `/.config/sandboxd/export-roots.json`, which is reliably absent
+            // and would therefore report "no roots declared" for a host where
+            // the question was never actually asked.
+            if home_str.is_empty() {
+                return Err(SandboxError::Lima(format!(
+                    "{label}: cannot locate the home directory of uid {op_uid}, so the \
+                     declared export roots cannot be read"
+                )));
+            }
+            let report = sandbox_agent_protocol::read_export_roots(&home_str)
+                .map_err(|e| SandboxError::Lima(format!("{label}: {e}")))?;
+            let stdout = serde_json::to_vec(&report).map_err(|e| {
+                SandboxError::Lima(format!("{label}: failed to serialize export roots: {e}"))
+            })?;
+            return Ok(std::process::Output {
+                status: exit_status_from_code(0),
+                stdout,
+                stderr: Vec::new(),
+            });
         }
         LimaOp::RunRsync {
             backend,

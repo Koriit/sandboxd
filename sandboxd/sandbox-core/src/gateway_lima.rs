@@ -890,8 +890,18 @@ fn gateway_network_entry(slot: u16) -> String {
 /// in-VM socket to that user's primary group; see the rationale at that step
 /// for why the group is the only axis that works. Passing the wrong uid does
 /// not widen access: the step exits non-zero and the boot fails.
+///
+/// `export_roots` is the set of host directories to expose over 9p. Like
+/// `slots`, it is an argument rather than manager state: which directories an
+/// operator is willing to export is a declaration they can change, and a copy
+/// cached at construction would export the set that was declared when the
+/// daemon started rather than the one declared now.
 #[cfg(target_os = "macos")]
-pub fn generate_gateway_template(slots: &[u16], login_uid: u32) -> String {
+pub fn generate_gateway_template(
+    slots: &[u16],
+    login_uid: u32,
+    export_roots: &[PathBuf],
+) -> String {
     // Build the networks section: one entry per pool slot, each pinning the
     // in-VM interface name.
     //
@@ -912,11 +922,11 @@ pub fn generate_gateway_template(slots: &[u16], login_uid: u32) -> String {
         .map(|&slot| gateway_network_entry(slot))
         .collect::<String>();
 
-    // Build the 9p mounts stanza for the lite shared-workspace root.
-    // The shared root is mounted read-write into the gateway VM at the same
+    // Build the 9p mounts stanza for the lite shared-workspace roots.
+    // Each root is mounted read-write into the gateway VM at the same
     // absolute path as the host, so the host→VM path translation is an
     // identity (no remapping needed). Per-session shared: paths must be
-    // validated at create time to fall under this root.
+    // validated at create time to fall under one of these roots.
     //
     // Note: the 9p read is performed by whichever account owns this VM, which
     // by default — per-operator gateways off, see `per_operator_gateway_enabled`
@@ -926,8 +936,7 @@ pub fn generate_gateway_template(slots: &[u16], login_uid: u32) -> String {
     // (Desktop, Documents, Downloads). With per-operator gateways enabled the
     // read happens as the operator and that asymmetry does not apply; the
     // export is still VM-wide either way.
-    let shared_root = crate::lite_macos::lite_shared_root();
-    let mounts_stanza = crate::lite_macos::lite_shared_root_9p_stanza(&shared_root);
+    let mounts_stanza = crate::lite_macos::lite_shared_root_9p_stanza(export_roots);
 
     // Build the no-DHCP netplan printf lines for each limaN NIC.
     // Without this, systemd-networkd tries DHCP on every limaN NIC and
@@ -1476,7 +1485,20 @@ impl GatewayLimaManager {
     /// template gets when the instance is absent, and the interfaces NIC
     /// verification requires when it is present. Callers pass the assignment
     /// that is live at the moment of the call.
-    pub fn ensure_ready(&self, slots: &[u16]) -> Result<(), SandboxError> {
+    ///
+    /// `export_roots` is the declared 9p export set, and it reaches the VM
+    /// only through the template — which is written once, when the instance is
+    /// absent. On an instance that already exists this argument is accepted
+    /// and not applied, because Lima reads `mounts:` at create time. Changing
+    /// an operator's declarations therefore takes effect on the next
+    /// create-from-absent, not on the next `ensure_ready`; the caller is what
+    /// decides whether to recreate, and `docs/guides/lite-mode.md` is where
+    /// that is spelled out for the operator.
+    pub fn ensure_ready(
+        &self,
+        slots: &[u16],
+        export_roots: &[PathBuf],
+    ) -> Result<(), SandboxError> {
         let state = self.query_instance_state()?;
         info!(state = %state, "gateway Lima instance state at startup");
 
@@ -1491,7 +1513,7 @@ impl GatewayLimaManager {
             }
             "None" => {
                 info!("gateway Lima instance absent; creating and starting it");
-                self.create_instance(slots)?;
+                self.create_instance(slots, export_roots)?;
                 self.start_instance()?;
             }
             other => {
@@ -1833,9 +1855,11 @@ impl GatewayLimaManager {
     /// Write the gateway template YAML to a file and run `limactl create`.
     ///
     /// `slots` is the slot set the new instance owns — one pinned `networks:`
-    /// entry each.
-    fn create_instance(&self, slots: &[u16]) -> Result<(), SandboxError> {
-        let template_content = generate_gateway_template(slots, self.owner_uid);
+    /// entry each. `export_roots` is the declared 9p export set; this is the
+    /// only moment either reaches the instance, because Lima reads both out of
+    /// the template at create time.
+    fn create_instance(&self, slots: &[u16], export_roots: &[PathBuf]) -> Result<(), SandboxError> {
+        let template_content = generate_gateway_template(slots, self.owner_uid, export_roots);
 
         // Write the template to a sibling directory of LIMA_HOME — NOT inside
         // LIMA_HOME itself. If the template is written inside LIMA_HOME (e.g.
@@ -2674,6 +2698,46 @@ impl GatewayLimaManager {
         self.query_instance_state()
     }
 
+    /// Ask this gateway's owner which directories they have declared for
+    /// export, and hand back the answer **unparsed**.
+    ///
+    /// The read happens in the owner's own account, because that is the only
+    /// account that can do it: the declaration lives under the owner's home,
+    /// and on a stock macOS install a home is `drwxr-x---`, which the daemon
+    /// account is not a member of. Every question worth asking about a
+    /// declared root — does it exist, is it a directory, can it be read — has
+    /// the same answer only when asked from there.
+    ///
+    /// Returning a `String` rather than a parsed report is the crate boundary
+    /// showing through, and deliberately so. The schema belongs to the broker
+    /// protocol crate, which this crate does not depend on and should not:
+    /// the agent is a privilege boundary kept small enough to review, and an
+    /// edge from here would pull the whole session model into it. So this
+    /// carries the bytes and the daemon — which already depends on both —
+    /// parses them. Duplicating the schema here to return something typed
+    /// would create exactly the drift the single definition exists to prevent.
+    pub fn read_export_roots_json(&self) -> Result<String, SandboxError> {
+        let output = self.executor.run(
+            self.owner_uid,
+            LimaOp::ReadExportRoots,
+            GATEWAY_LIST_TIMEOUT,
+            "gateway: read export roots",
+        )?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "gateway: reading declared export roots failed: {stderr}"
+            )));
+        }
+
+        String::from_utf8(output.stdout).map_err(|e| {
+            SandboxError::Lima(format!(
+                "gateway: declared export roots came back as non-UTF-8: {e}"
+            ))
+        })
+    }
+
     /// Probe whether the gateway Docker daemon is reachable via the forwarded
     /// socket.
     ///
@@ -3206,7 +3270,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn generated_gateway_template_satisfies_the_agent_gateway_rule() {
         let slots = [0u16, 1, 2, 3, 4, 5, 6, 7];
-        let template = generate_gateway_template(&slots, TEST_LOGIN_UID);
+        let template = generate_gateway_template(&slots, TEST_LOGIN_UID, &[]);
 
         let doc: serde_yaml::Value =
             serde_yaml::from_str(&template).expect("gateway template must parse as YAML");
@@ -3496,7 +3560,7 @@ mod tests {
     #[test]
     fn template_pins_interface_to_its_own_slot_for_every_entry() {
         for slot_set in [slots(1), slots(4), slots(8), vec![4, 5, 6, 7], vec![2, 7]] {
-            let tmpl = generate_gateway_template(&slot_set, TEST_LOGIN_UID);
+            let tmpl = generate_gateway_template(&slot_set, TEST_LOGIN_UID, &[]);
             let entries = template_network_entries(&tmpl);
             assert_eq!(
                 entries.len(),
@@ -3526,7 +3590,7 @@ mod tests {
     /// stanzas and IPv6-disable lines alike — and never slot 0..n-1.
     #[test]
     fn template_offset_range_renders_its_own_slots() {
-        let tmpl = generate_gateway_template(&[4, 5, 6, 7], TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&[4, 5, 6, 7], TEST_LOGIN_UID, &[]);
 
         assert_eq!(
             tmpl.matches("  - socket:").count(),
@@ -3573,7 +3637,7 @@ mod tests {
     #[test]
     fn template_provisioning_covers_every_emitted_interface() {
         for slot_set in [slots(3), vec![4, 5, 6, 7], vec![2, 7]] {
-            let tmpl = generate_gateway_template(&slot_set, TEST_LOGIN_UID);
+            let tmpl = generate_gateway_template(&slot_set, TEST_LOGIN_UID, &[]);
             let entries = template_network_entries(&tmpl);
             assert_eq!(
                 tmpl.matches("printf '    lima").count(),
@@ -3600,7 +3664,7 @@ mod tests {
 
     #[test]
     fn template_contains_qemu_vmtype() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains("vmType: \"qemu\""),
             "template must specify vmType qemu"
@@ -3614,7 +3678,7 @@ mod tests {
     /// the resource cap cannot silently drift apart.
     #[test]
     fn template_cpus_and_memory_match_published_constants() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert_eq!(GATEWAY_VM_CPUS, 2);
         assert_eq!(GATEWAY_VM_MEMORY_MB, 2048);
         assert!(
@@ -3629,7 +3693,7 @@ mod tests {
 
     #[test]
     fn template_contains_correct_socket_count() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         // Each slot produces one `- socket:` entry.
         let socket_count = tmpl.matches("  - socket:").count();
         assert_eq!(
@@ -3637,7 +3701,7 @@ mod tests {
             "template must have exactly 4 socket entries for a 4-slot set"
         );
 
-        let tmpl8 = generate_gateway_template(&slots(8), TEST_LOGIN_UID);
+        let tmpl8 = generate_gateway_template(&slots(8), TEST_LOGIN_UID, &[]);
         let socket_count8 = tmpl8.matches("  - socket:").count();
         assert_eq!(
             socket_count8, 8,
@@ -3647,7 +3711,7 @@ mod tests {
 
     #[test]
     fn template_slot_socket_paths_match_vmnet_pool() {
-        let tmpl = generate_gateway_template(&slots(3), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(3), TEST_LOGIN_UID, &[]);
         // Verify the socket paths match what VmnetPool::slot_socket_path returns.
         for slot in 0u16..3 {
             let expected = crate::network::vmnet_slot_socket_path(slot);
@@ -3660,7 +3724,7 @@ mod tests {
 
     #[test]
     fn template_has_forwarded_docker_socket() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains("guestSocket: \"/var/run/docker.sock\""),
             "template must forward the guest Docker socket"
@@ -3673,7 +3737,7 @@ mod tests {
 
     #[test]
     fn template_has_docker_provision() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains("apt-get install -y docker.io"),
             "template must provision docker.io"
@@ -3726,7 +3790,7 @@ mod tests {
     /// from the mode the provision script happens to set today.
     #[test]
     fn template_never_grants_world_access_to_the_docker_socket() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         for forbidden in [
             "0666", "0664", "0662", "0646", "0626", "0606", "a+rw", "a+w", "o+w", "o+rw",
         ] {
@@ -3743,7 +3807,7 @@ mod tests {
 
     #[test]
     fn template_has_mtu_clamp() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains("mtu: 1280"),
             "template must clamp eth0 MTU to 1280"
@@ -3752,7 +3816,7 @@ mod tests {
 
     #[test]
     fn template_has_no_dhcp_for_lima_nics() {
-        let tmpl = generate_gateway_template(&slots(3), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(3), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains("dhcp4: no"),
             "template must disable DHCP on limaN NICs"
@@ -3765,7 +3829,7 @@ mod tests {
 
     #[test]
     fn template_has_minimum_lima_version() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains(MIN_LIMA_VERSION),
             "template must specify minimumLimaVersion"
@@ -3774,7 +3838,7 @@ mod tests {
 
     #[test]
     fn template_has_ubuntu_noble_image() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains(UBUNTU_NOBLE_ARM64_URL),
             "template must reference the Ubuntu 24.04 aarch64 cloud image"
@@ -3783,7 +3847,7 @@ mod tests {
 
     #[test]
     fn template_disables_containerd() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         assert!(
             tmpl.contains("system: false"),
             "template must disable containerd (system)"
@@ -3796,7 +3860,8 @@ mod tests {
 
     #[test]
     fn template_has_lite_shared_root_9p_mounts_stanza() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let roots = [PathBuf::from("/tmp/sandbox-shared")];
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &roots);
         // The template must include a mounts: block for lite shared: workspaces.
         assert!(
             tmpl.contains("mounts:"),
@@ -3832,7 +3897,7 @@ mod tests {
 
     #[test]
     fn template_has_route_helper_sudoers_provision() {
-        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID);
+        let tmpl = generate_gateway_template(&slots(4), TEST_LOGIN_UID, &[]);
         // The sudoers entry must be scoped to exactly the route-helper binary path.
         assert!(
             tmpl.contains("/usr/local/libexec/sandboxd/sandbox-route-helper"),

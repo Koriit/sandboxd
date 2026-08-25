@@ -758,9 +758,11 @@ pub(crate) fn is_workspace_path_char(ch: char) -> bool {
 /// By the can-it-fail test:
 ///
 /// - `..` is refused **twice**, and only on the macOS lite path: here, and
-///   by the component scan. That scan has a single production caller, the
-///   lite session-create handler, so on the Lima and container backends
-///   `..` is refused **once** — here.
+///   by the component scan. That scan is reached from one place — the
+///   daemon's `shared:` containment helper, which both session-create and
+///   session-start route through so the two cannot decide differently — and
+///   that helper exists only on the macOS lite path, so on the Lima and
+///   container backends `..` is refused **once**, here.
 /// - `.` and `//` are refused **once** everywhere, here.
 ///   `Path::components()` normalises them away, so no later layer can
 ///   observe them even in principle.

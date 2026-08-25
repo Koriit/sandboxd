@@ -2892,6 +2892,12 @@ setup-darwin-sandboxd-test-vmnet-group-membership: setup-darwin-sandboxd-test-us
 # /tmp is mode 1777 so any user can create entries there; the 0755 mode makes the
 # directory world-traversable (required for QEMU's VirtFS/9p mount point).
 #
+# This is the daemon-owned gateway's single administrator-set root, so it is what
+# the default configuration needs and what the e2e suite mounts. A per-operator
+# gateway does not use it at all: each operator declares their own export roots in
+# their own home directory, and those are read and checked as that operator. This
+# target stays because the default is the mode that currently runs.
+#
 # Idempotent: mkdir -p is a no-op when the directory exists; chmod is a no-op when
 # the mode is already correct.
 setup-darwin-sandbox-shared:

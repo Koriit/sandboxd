@@ -1000,6 +1000,27 @@ pub enum LimaOp<'a> {
     InstallGuestAgent { vm: &'a str },
     /// `sandbox-lima-helper read-user-key`
     ReadUserKey,
+    /// Read the operator's declared export roots, as that operator.
+    ///
+    /// Answered by the account that owns the gateway — the operator's agent on
+    /// macOS, the daemon itself on the degenerate path where it is its own
+    /// operator. The declaration file lives in the operator's home directory,
+    /// which the daemon account cannot traverse, so this is not a convenience
+    /// routing: the daemon *cannot* read the file, nor answer whether a root in
+    /// it exists, is a directory, or is readable.
+    ///
+    /// Carries no path. The reader derives the file's location from the account
+    /// it already is; a path field would let the requester aim an
+    /// operator-privileged read anywhere that account can reach.
+    ///
+    /// macOS-only in practice, for the same reason as [`LimaOp::CreateGateway`]:
+    /// the Linux gateway is a container with no per-operator VM to export into,
+    /// and `sandbox-lima-helper` has no subcommand for this.
+    ///
+    /// Returns the report as JSON on stdout — see `ExportRootsReport` in the
+    /// broker protocol crate, which owns that schema and this crate
+    /// deliberately does not depend on.
+    ReadExportRoots,
     /// `sandbox-lima-helper run-rsync --op-uid <n> --backend <backend>
     ///   --session-name <name> --host-path <p> --guest-path <p> [--no-gitignore]`
     RunRsync {
@@ -1299,6 +1320,16 @@ impl LimaExecutor for SetuidHelperExecutor {
                 cmd.arg("read-user-key")
                     .arg("--op-uid")
                     .arg(op_uid.to_string());
+            }
+            LimaOp::ReadExportRoots => {
+                // No helper subcommand, and none should exist: operator-declared
+                // export roots are the source of the gateway VM's 9p mounts, and
+                // on Linux the gateway is a container with no such mounts. A
+                // request reaching here is a routing mistake, not a gap.
+                return Err(SandboxError::Internal(format!(
+                    "{label}: read-export-roots has no sandbox-lima-helper subcommand \
+                     (the Linux gateway is a container, not a Lima instance with 9p mounts)"
+                )));
             }
             LimaOp::RunRsync {
                 backend,

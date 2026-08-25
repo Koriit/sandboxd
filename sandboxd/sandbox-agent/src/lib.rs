@@ -44,6 +44,16 @@ pub use protocol::{DockerStreamOp, docker_stream_argv};
 #[cfg(target_os = "macos")]
 pub use protocol::{RESTRICT_MARKER_FILENAME, RESTRICT_ON_MARKER, STREAM_CONNECT_PREFIX};
 
+/// Operator-declared export roots: the file schema, its validation, and the
+/// report the agent answers with. Exported because the daemon both consumes
+/// the report and — on the degenerate path where it is its own operator —
+/// produces one, and the two must agree about what the file means.
+#[cfg(target_os = "macos")]
+pub use protocol::{
+    DeclaredExportRoots, EXPORT_ROOTS_RELATIVE_PATH, ExportRootsReport, MAX_EXPORT_ROOTS,
+    read_export_roots, validate_declared_root, validate_declared_root_set,
+};
+
 #[cfg(target_os = "macos")]
 mod protocol;
 

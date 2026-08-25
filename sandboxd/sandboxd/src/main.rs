@@ -1556,45 +1556,236 @@ fn container_docker_route_resolver(
 /// the operator gets the refusal that names the offending component instead of
 /// one that names only where the whole path ended up.
 ///
+/// # Several roots, one containment question
+///
+/// The VM exports a *set* of roots, and the in-VM resolve answers about one
+/// root at a time. That is not a limitation to work around — it is the right
+/// primitive, and the set is composed here:
+///
+/// 1. **Which root is this request in?** Exactly one can be, because a
+///    declared set is refused if any member nests inside another, so the
+///    lexical containment test has at most one answer. A request in none of
+///    them is refused before the VM is asked anything.
+/// 2. **Where does it land?** Asked against that root, as before.
+/// 3. **Is where it landed still in the export?** An `Outside` verdict is
+///    relative to the one root that was asked about, and a symlink from one of
+///    the operator's declared roots into another lands outside the first and
+///    inside the second. Both are the same operator's directories on the same
+///    VM, so that is not an escape; re-checking the resolved path against the
+///    whole set is what tells the two cases apart. Without this, declaring a
+///    second root would silently break links that cross between them.
+///
+/// The re-check is deliberately on the *resolved* path rather than on the
+/// requested one. `resolved` is symlink-free and absolute, so a link chain
+/// cannot smuggle a landing site past it — which is the whole reason the VM
+/// was asked in the first place.
+///
 /// Blocking — both halves do I/O. Callers in async contexts wrap it in
 /// `spawn_blocking`.
 #[cfg(target_os = "macos")]
 fn contain_shared_path(
     manager: &sandbox_core::GatewayLimaManager,
-    shared_root: &std::path::Path,
+    shared_roots: &[PathBuf],
     requested_path: &str,
 ) -> Result<sandbox_invm_argv::workspace::Containment, SandboxError> {
-    let root = shared_root.to_str().ok_or_else(|| {
-        SandboxError::Internal(format!(
-            "the configured lite shared root {} is not valid UTF-8 and cannot be \
-             resolved inside the gateway VM",
-            shared_root.display()
-        ))
-    })?;
+    use sandbox_invm_argv::workspace::{Containment, path_is_within};
+
+    let roots: Vec<&str> = shared_roots
+        .iter()
+        .map(|root| {
+            root.to_str().ok_or_else(|| {
+                SandboxError::Internal(format!(
+                    "the exported root {} is not valid UTF-8 and cannot be resolved \
+                     inside the gateway VM",
+                    root.display()
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let root = select_export_root(&roots, requested_path)?;
 
     sandbox_core::lite_macos::reject_guest_planted_symlink(
         std::path::Path::new(requested_path),
-        shared_root,
+        std::path::Path::new(root),
         &sandbox_core::lite_macos::read_virtfs_mode_xattr,
     )
     .map_err(|e| SandboxError::InvalidArgument(e.to_string()))?;
 
-    manager.resolve_shared_path(root, requested_path)
+    match manager.resolve_shared_path(root, requested_path)? {
+        Containment::Inside { resolved } => Ok(Containment::Inside { resolved }),
+        Containment::Outside { resolved } => {
+            // Outside the root it was asked about — but the export is the
+            // whole set, so ask the rest before refusing.
+            if roots.iter().any(|other| path_is_within(other, &resolved)) {
+                Ok(Containment::Inside { resolved })
+            } else {
+                Ok(Containment::Outside { resolved })
+            }
+        }
+    }
+}
+
+/// Pick the exported root a `shared:` request belongs to, or produce the
+/// refusal that says why none of them does.
+///
+/// It is the half of [`contain_shared_path`] that decides an operator-facing
+/// outcome without a VM in the loop, which is what lets both of its refusals be
+/// exercised directly. The one thing it reads beyond its arguments is the
+/// gateway mode, and only to choose which mode's advice the refusal carries —
+/// so *which* answer it gives never depends on the environment, only how the
+/// refusal is worded. The wording itself is checked against
+/// [`describe_unexported_path`], where the mode is an argument.
+///
+/// At most one root can match. A declared set is refused if any member nests
+/// inside another, so the lexical containment test has a single answer and
+/// "which root is this in" has no tie to break.
+#[cfg(target_os = "macos")]
+fn select_export_root<'a>(
+    roots: &[&'a str],
+    requested_path: &str,
+) -> Result<&'a str, SandboxError> {
+    use sandbox_invm_argv::workspace::path_is_within;
+
+    let Some(root) = roots
+        .iter()
+        .copied()
+        .find(|root| path_is_within(root, requested_path))
+    else {
+        return Err(SandboxError::InvalidArgument(describe_unexported_path(
+            requested_path,
+            roots,
+            sandbox_core::per_operator_gateway_enabled(),
+        )));
+    };
+
+    // The component scan, run against the root just chosen. It is the half of
+    // `validate_shared_path` that can still fail here — the root-containment
+    // half has already been decided by `path_is_within` and will agree — and
+    // `..` is precisely the input on which the two halves disagree:
+    // `<root>/../../var/run` compares as inside the root, because a lexical
+    // prefix test matches `..` as an ordinary component. The scan is what
+    // makes the selection above sound rather than merely confident.
+    //
+    // This is the second refusal, not the only one: the workspace-path parser
+    // rejects `..` for every backend before a create reaches here. It is kept
+    // because it is the one that survives if the parser is bypassed, and
+    // because the refusal it renders is written for this mount specifically.
+    sandbox_core::lite_macos::validate_shared_path(
+        std::path::Path::new(requested_path),
+        std::path::Path::new(root),
+    )
+    .map_err(|e| SandboxError::InvalidArgument(e.to_string()))?;
+
+    Ok(root)
+}
+
+/// The refusal for a `shared:` path that is in none of the exported roots.
+///
+/// This is the message an operator is most likely to meet on the lite backend,
+/// and it is the one that has to teach rather than just report. It replaces
+/// [`sandbox_core::SharedPathError::OutsideRoot`] on the live path and inherits
+/// that message's bar: name the cause that holds in every configuration, then
+/// name the ways forward. A refusal that only restated the rule would leave the
+/// operator unable to tell a typo from a step they had not taken.
+///
+/// Three things vary, and each is a way the message has been or could be wrong:
+///
+/// - **Whether anything is exported at all.** "Not under any exported root",
+///   with no roots listed, reads as a broken daemon rather than as a
+///   declaration not yet written. The empty case says what to create.
+/// - **How a root is added.** That differs by mode, and the wrong instruction
+///   is worse than none: an operator told to write an `export-roots.json` on an
+///   install where the daemon owns the single gateway would edit a file nothing
+///   reads and conclude the feature is broken.
+/// - **Why the roots are where they are.** With per-operator gateways off, the
+///   VM belongs to the daemon user, and the reason a home directory cannot be
+///   exported is Unix ownership — `_sandboxd` performs the host-side read and
+///   cannot traverse it. That is mode-dependent, so it is stated only in the
+///   mode where it is true.
+///
+/// What does *not* vary is the headline: only the exported directories exist in
+/// the filesystem the container mounts from, so no permission change on the
+/// host makes an unexported path usable.
+///
+/// `per_operator` is a parameter rather than a call to
+/// [`sandbox_core::per_operator_gateway_enabled`] inside the body. The mode is
+/// read from the process environment, so taking it here would make the branch
+/// reachable in a test only by mutating a process-global — and the branch that
+/// is wrong is the one an operator is *not* running, which is exactly the one
+/// an env-reading test would leave uncovered.
+#[cfg(target_os = "macos")]
+fn describe_unexported_path(requested_path: &str, roots: &[&str], per_operator: bool) -> String {
+    // Lima fixes an instance's mount list when the instance is created, so
+    // every "add a root" instruction has to carry the recreate step with it or
+    // it describes a change that appears to be ignored.
+    let how_to_add = if per_operator {
+        format!(
+            "Declare the directories you want reachable from sessions in ~/{path}, as \
+             {{\"roots\": [\"/absolute/path\"]}}, then recreate the gateway VM so the new \
+             set takes effect — Lima fixes an instance's mount list when the instance is \
+             created, so a gateway that is already running keeps the roots it was created \
+             with.",
+            path = sandbox_agent_protocol::EXPORT_ROOTS_RELATIVE_PATH
+        )
+    } else {
+        format!(
+            "This install runs a single gateway VM owned by the sandboxd daemon user, so \
+             which directory it exports is the administrator's to set (via {env}) and not \
+             yours: `_sandboxd` — not you — performs the host-side read, and it cannot \
+             traverse your home directory (owned by you, mode 0750, with `_sandboxd` \
+             outside its group).",
+            env = sandbox_core::LITE_SHARED_ROOT_ENV
+        )
+    };
+
+    let opening = if roots.is_empty() {
+        format!(
+            "lite shared: path {requested_path} cannot be used — this gateway exports no host directories at all"
+        )
+    } else {
+        format!(
+            "lite shared: path {requested_path} is not under any host directory this gateway \
+             exports ({exported})",
+            exported = roots.join(", ")
+        )
+    };
+
+    format!(
+        "{opening}. On the lite backend the sandbox container runs inside a gateway VM, and \
+         only the exported directories exist in the filesystem that container mounts from — a \
+         path outside them is not there to bind, so no change of permissions on the host makes \
+         it usable. {how_to_add} What works instead: \
+         (a) clone:<repo-url> or --repo for a git-backed project — the clone runs inside the \
+         guest and never reads the host filesystem; \
+         (b) `sandbox sync` / `sandbox cp` (and `sandbox workspace push|pull` on a local: \
+         workspace), which run as your own uid over the daemon-mediated SSH proxy and so are \
+         not bound by the export at all; \
+         (c) stage the content under a directory that is already exported and point shared: \
+         there; or \
+         (d) use the full backend (drop --lite), whose per-session VM mounts the host directory \
+         as your own uid and so accepts any path."
+    )
 }
 
 /// The workspace-bind resolver [`ContainerRuntime`] is built with: it asks the
 /// gateway VM serving `operator_uid` where a `shared:` bind source actually
 /// lands.
 ///
-/// The runtime holds neither the export root nor the manager registry, and it
-/// should not: which VM answers is a property of the operator, and what counts
-/// as "inside" is a daemon-wide configuration. Both are closed over here.
+/// The runtime holds neither the export roots nor the manager registry, and it
+/// should not: which VM answers is a property of the operator, and which
+/// directories that VM exports is a property of the operator too once
+/// per-operator gateways are on. Both are resolved here.
 ///
 /// The operator uid is passed to the *registry accessor*, not to
 /// `get_or_create` — the same collapse [`container_docker_route_resolver`]
 /// applies, for the same reason. Asking the wrong gateway would produce a
 /// confident answer about a path in a filesystem that is not the one the
 /// container will resolve against.
+///
+/// The export roots are read from the same manager that is about to be asked
+/// the containment question, so the set the path is checked against and the VM
+/// that answers cannot come from two different operators.
 ///
 /// Routing this through [`contain_shared_path`] rather than calling
 /// `resolve_shared_path` directly is what makes the start-time re-check the
@@ -1606,11 +1797,9 @@ fn container_shared_path_resolver(
     managers: Arc<sandbox_core::GatewayLimaManagerRegistry>,
 ) -> sandbox_core::backend::container::SharedPathResolver {
     Arc::new(move |operator_uid, requested_path| {
-        contain_shared_path(
-            &managers.get_or_create(sandbox_core::gateway_owner_uid(operator_uid)),
-            &sandbox_core::lite_macos::lite_shared_root(),
-            &requested_path,
-        )
+        let manager = managers.get_or_create(sandbox_core::gateway_owner_uid(operator_uid));
+        let roots = gateway_export_roots_blocking(&manager)?;
+        contain_shared_path(&manager, &roots, &requested_path)
     })
 }
 
@@ -1683,6 +1872,14 @@ impl AppState {
     /// share: fewer, and a claim succeeds onto a segment the gateway is not
     /// attached to; more, and the VM sits on segments its operator can never be
     /// assigned, which is the isolation the partition exists to create.
+    ///
+    /// The export roots are resolved here for the same reason and take the
+    /// same shape — read now, per call, never a copy held since the manager
+    /// was built — and by the same mode split, which
+    /// [`gateway_export_roots`] states. They reach the VM only if this call is
+    /// the one that creates it; a declaration changed under a VM that already
+    /// exists is not picked up until it is recreated, which is
+    /// [`sandbox_core::GatewayLimaManager::ensure_ready`]'s to explain.
     #[cfg(target_os = "macos")]
     async fn ready_gateway_for_operator(
         &self,
@@ -1706,8 +1903,10 @@ impl AppState {
                 slots = ?slots,
                 "readying the gateway Lima instance for this operator"
             );
+            let export_roots = gateway_export_roots(&manager).await?;
             let mgr = Arc::clone(&manager);
-            match tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots)).await {
+            match tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots, &export_roots)).await
+            {
                 Ok(result) => result,
                 Err(e) => Err(SandboxError::Internal(format!(
                     "gateway ensure_ready task panicked: {e}"
@@ -1950,6 +2149,108 @@ fn session_spec_from_config(
 fn round_cpus_one_decimal(cpus: f32) -> f32 {
     let scaled = (f64::from(cpus) * 10.0).round() / 10.0;
     scaled as f32
+}
+
+// ---------------------------------------------------------------------------
+// Operator-declared export roots
+// ---------------------------------------------------------------------------
+
+/// The host directories a gateway VM exports to the sessions it serves.
+///
+/// Two modes give two different answers, and the difference is about who is
+/// entitled to decide.
+///
+/// With per-operator gateways **off** there is one gateway VM and every
+/// operator's sessions land on it, so a directory exported there is exported
+/// into all of them. The only account entitled to name one is the
+/// administrator who installed the daemon — hence the single configured root,
+/// unchanged from before operators could declare anything. Unioning operator
+/// declarations here would let any one operator mount a directory into every
+/// other operator's sessions.
+///
+/// With them **on** the VM belongs to one operator and serves only that
+/// operator's sessions, so the reach of a declaration stops at the declarer.
+/// That is what makes the declaration theirs to make, and the read runs in
+/// their account because it is the only one that can traverse their home.
+///
+/// A read that fails is an error rather than an empty set. An operator who
+/// declared a root and silently got a VM without it would find their workspace
+/// missing at the moment they tried to use it, with nothing anywhere saying
+/// why; a refused bring-up says it once, up front.
+/// Blocking — it reads a file, in another account, over the broker channel.
+///
+/// Read on every call rather than cached. The declaration is a file the
+/// operator edits, so a copy taken once would be a snapshot of what they meant
+/// at daemon-start time; and the two callers that matter — bringing a VM up,
+/// and deciding whether a `shared:` path is inside the export — must not be
+/// able to disagree about it.
+#[cfg(target_os = "macos")]
+fn gateway_export_roots_blocking(
+    manager: &sandbox_core::GatewayLimaManager,
+) -> Result<Vec<PathBuf>, SandboxError> {
+    if !sandbox_core::per_operator_gateway_enabled() {
+        return Ok(vec![sandbox_core::lite_shared_root()]);
+    }
+
+    let json = manager.read_export_roots_json()?;
+
+    let report: sandbox_agent_protocol::ExportRootsReport =
+        serde_json::from_str(&json).map_err(|e| {
+            SandboxError::Lima(format!(
+                "the agent's export-roots report did not parse: {e}"
+            ))
+        })?;
+
+    // Re-validated here even though the agent validated before answering. The
+    // agent runs as the operator and is reachable by the operator, so its
+    // report is operator-controlled input; these strings are interpolated into
+    // the gateway's `lima.yaml`, where a quote or a newline stops being a path
+    // and starts being YAML. The operator already decides what their own VM
+    // mounts, so this is not about the directories — it is about everything
+    // else a template can say.
+    sandbox_agent_protocol::validate_declared_root_set(&report.roots)
+        .map_err(|e| SandboxError::Lima(format!("{}: {e}", report.source)))?;
+
+    debug!(
+        source = %report.source,
+        roots = ?report.roots,
+        "resolved the export roots declared for this gateway"
+    );
+
+    Ok(report.roots.into_iter().map(PathBuf::from).collect())
+}
+
+/// Render an export-root set for an operator to read, in a log field or a
+/// refusal.
+///
+/// A set that is empty renders as a word rather than as nothing: an empty
+/// parenthesis in the middle of a sentence reads as a formatting bug and
+/// invites the operator to look for the roots elsewhere, when the point being
+/// made is that there are none.
+#[cfg(target_os = "macos")]
+fn render_export_roots(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        return "none".to_string();
+    }
+    roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`gateway_export_roots_blocking`] for callers on an async path.
+#[cfg(target_os = "macos")]
+async fn gateway_export_roots(
+    manager: &Arc<sandbox_core::GatewayLimaManager>,
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let mgr = Arc::clone(manager);
+    match tokio::task::spawn_blocking(move || gateway_export_roots_blocking(&mgr)).await {
+        Ok(result) => result,
+        Err(e) => Err(SandboxError::Internal(format!(
+            "reading the declared export roots panicked: {e}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5556,7 +5857,6 @@ async fn create_session_macos_lite(
 ) -> axum::response::Response {
     use sandbox_core::backend::inspect_container_pid_on_route;
     use sandbox_core::gateway::gateway_image_tag_for_daemon;
-    use sandbox_core::lite_macos::{lite_shared_root, validate_shared_path};
     use sandbox_core::macos_session::setup_macos_lite_gateway;
 
     // Resolve this operator's pool up front. Failing here is the 409 shape
@@ -5737,47 +6037,47 @@ async fn create_session_macos_lite(
                     .into_response()
                 );
             }
-            // Validate that the host path falls under the configured
-            // lite shared root. The gateway VM only mounts that root via
-            // the 9p stanza added to the gateway template.
-            let shared_root = lite_shared_root();
+            // Decide the mount source against the directories this gateway
+            // actually exports. The set is read now rather than carried from
+            // the manager: it is a *declaration*, made by the operator in their
+            // own account, and the VM this session is about to run on may have
+            // been created from a different one. Reading it per call is what
+            // keeps the refusal below describing the export that exists.
+            //
+            // The whole decision runs in one blocking hop because both halves
+            // must come from the same gateway: a containment answer from one
+            // VM checked against another VM's roots would be confidently wrong.
+            //
+            // The lexical half of that decision is necessary and not
+            // sufficient. It reads the *host* view of the export, and that view
+            // is permanently blind to a symlink the guest created:
+            // `mapped-xattr` stores one as a regular file with `S_IFLNK` in a
+            // `user.virtfs.*` xattr, so the host walks past it while the VM's
+            // dockerd — which is what actually resolves this `src=` — follows
+            // it out of the export. `contain_shared_path` reads the attribute
+            // the host view hides, then asks the namespace the path is used in.
             let hp = std::path::PathBuf::from(host_path);
-            if let Err(e) = validate_shared_path(&hp, &shared_root) {
-                // The shared root is the only host directory exported into the
-                // gateway VM, so a source outside it is simply not in the
-                // namespace the container mounts from. `SharedPathError`'s
-                // Display carries that plus the ownership story behind where
-                // the root sits and the alternatives that do work; the log line
-                // stays short and structured.
-                warn!(
-                    session_id = %session_id,
-                    host_path = %hp.display(),
-                    shared_root = %shared_root.display(),
-                    "lite shared: path outside the configured shared root — only the \
-                     root is exported into the gateway VM"
-                );
-                early_lite_cleanup_and_return!(
-                    error_response(SandboxError::InvalidArgument(e.to_string())).into_response()
-                );
-            }
-            // The lexical checks above are necessary and not sufficient. They
-            // read the *host* view of the export, and that view is permanently
-            // blind to a symlink the guest created: `mapped-xattr` stores one
-            // as a regular file with `S_IFLNK` in a `user.virtfs.*` xattr, so
-            // the host walks past it while the VM's dockerd — which is what
-            // actually resolves this `src=` — follows it out of the export.
-            // Read the attribute the host view hides, then ask the namespace
-            // the path is used in.
             let glm = Arc::clone(&gateway_lima);
-            let root_owned = shared_root.clone();
             let requested_owned = host_path.clone();
-            let verdict = match tokio::task::spawn_blocking(move || {
-                contain_shared_path(&glm, &root_owned, &requested_owned)
+            let (export_roots, verdict) = match tokio::task::spawn_blocking(move || {
+                let roots = gateway_export_roots_blocking(&glm)?;
+                let verdict = contain_shared_path(&glm, &roots, &requested_owned)?;
+                Ok::<_, SandboxError>((roots, verdict))
             })
             .await
             {
-                Ok(Ok(verdict)) => verdict,
+                Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
+                    // `contain_shared_path`'s refusals carry the cause, the
+                    // exported roots and the alternatives that do work; the log
+                    // line stays short and structured.
+                    warn!(
+                        session_id = %session_id,
+                        host_path = %hp.display(),
+                        error = %e,
+                        "lite shared: workspace source rejected against the gateway's \
+                         exported roots"
+                    );
                     early_lite_cleanup_and_return!(error_response(e).into_response())
                 }
                 Err(e) => early_lite_cleanup_and_return!(
@@ -5791,26 +6091,27 @@ async fn create_session_macos_lite(
             let resolved = match verdict {
                 sandbox_invm_argv::workspace::Containment::Inside { resolved } => resolved,
                 sandbox_invm_argv::workspace::Containment::Outside { resolved } => {
+                    let exported = render_export_roots(&export_roots);
                     warn!(
                         session_id = %session_id,
                         host_path = %hp.display(),
                         resolved = %resolved,
-                        shared_root = %shared_root.display(),
-                        "lite shared: path resolves out of the shared root inside the \
-                         gateway VM — a component of it is a symlink the host view \
+                        exported_roots = %exported,
+                        "lite shared: path resolves out of every exported root inside \
+                         the gateway VM — a component of it is a symlink the host view \
                          cannot see"
                     );
                     early_lite_cleanup_and_return!(
                         error_response(SandboxError::InvalidArgument(format!(
                             "lite shared: path {} resolves to {resolved} inside the \
-                             gateway VM, which is outside the shared root {}. A \
-                             component of the path is a symlink that leads out of the \
-                             export — it is not visible from the host, so this is \
-                             decided where the path is actually used. Point shared: \
-                             at a path whose components all stay under the root, or \
-                             replace the offending link with the real directory.",
+                             gateway VM, which is outside every directory this gateway \
+                             exports ({exported}). A component of the path is a symlink \
+                             that leads out of the export — it is not visible from the \
+                             host, so this is decided where the path is actually used. \
+                             Point shared: at a path whose components all stay under an \
+                             exported root, or replace the offending link with the real \
+                             directory.",
                             hp.display(),
-                            shared_root.display()
                         )))
                         .into_response()
                     );
@@ -5820,12 +6121,11 @@ async fn create_session_macos_lite(
             // VM's owner, which is the daemon user by default and the operator
             // when per-operator gateways are enabled — so the field carries the
             // uid rather than a name asserted at compile time. This fires only
-            // after the path cleared both halves of `validate_shared_path`
-            // above — the component scan and the root-containment test — so the
-            // source is already somewhere that reader can traverse; there is
-            // nothing for the operator to act on here, and naming
-            // TCC-protected directories at this point would be misleading
-            // (a path under the shared root is not in one).
+            // after the path cleared root selection and the component scan in
+            // `select_export_root`, so the source is already somewhere that
+            // reader can traverse; there is nothing for the operator to act on
+            // here, and naming TCC-protected directories at this point would be
+            // misleading (a path under an exported root is not in one).
             debug!(
                 session_id = %session_id,
                 host_path = %hp.display(),
@@ -15942,10 +16242,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // of which L2 segments the VM is attached to.
             let config_slots: Vec<u16> = (0..config_n).collect();
 
+            // This whole branch is the per-operator-gateways-off mode, so the
+            // answer here is the single administrator-configured root every
+            // time — no operator is consulted, because this VM serves all of
+            // them. Resolved through the shared helper anyway rather than
+            // named inline, so that if the mode split ever moves, it moves in
+            // one place instead of leaving this site quietly on the old rule.
+            let config_export_roots = gateway_export_roots(&manager_arc).await?;
+
             {
                 let mgr = manager_arc.clone();
                 let slots = config_slots.clone();
-                let result = tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots)).await;
+                let roots = config_export_roots.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || mgr.ensure_ready(&slots, &roots)).await;
                 match result {
                     Ok(Ok(())) => {
                         info!("macOS startup step 4: gateway Lima instance ready");
@@ -16055,10 +16365,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // semantics cover only "no gateway at all").
                     let mgr = manager_arc.clone();
                     let slots = config_slots.clone();
+                    let roots = config_export_roots.clone();
                     let rebuild_result = tokio::task::spawn_blocking(move || {
                         mgr.force_stop_instance()?;
                         mgr.delete_instance()?;
-                        mgr.ensure_ready(&slots) // creates+starts on config_slots, re-verifies
+                        // Creates+starts on config_slots, re-verifies. This is
+                        // the one call in the branch that does write a fresh
+                        // template, the instance having just been deleted —
+                        // so the roots matter here in a way they do not above.
+                        mgr.ensure_ready(&slots, &roots)
                     })
                     .await;
 
@@ -16087,9 +16402,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             let mgr2 = manager_arc.clone();
                             let slots2 = config_slots.clone();
-                            let recovery =
-                                tokio::task::spawn_blocking(move || mgr2.ensure_ready(&slots2))
-                                    .await;
+                            let roots2 = config_export_roots.clone();
+                            let recovery = tokio::task::spawn_blocking(move || {
+                                mgr2.ensure_ready(&slots2, &roots2)
+                            })
+                            .await;
                             match recovery {
                                 Ok(Ok(())) => {
                                     let fallback_count = manager_arc
@@ -21314,5 +21631,210 @@ mod tests {
             SessionState::Error,
             "reconciliation must complete and mark the VM-less session Error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `shared:` paths against the gateway's exported roots.
+    //
+    // These are the halves of the containment decision that need no VM: which
+    // root a request belongs to, and what an operator is told when none of
+    // them does. The half that does need one — asking the gateway where the
+    // path actually resolves, which is the only way to see a guest-planted
+    // symlink — is exercised where a VM is available.
+    // -----------------------------------------------------------------------
+
+    /// Unwrap the message from the one error variant these helpers produce, so
+    /// a wrong-variant regression fails with the variant it got rather than
+    /// with a substring miss on an empty string.
+    #[cfg(target_os = "macos")]
+    fn refusal_message(err: SandboxError) -> String {
+        match err {
+            SandboxError::InvalidArgument(msg) => msg,
+            other => panic!("expected InvalidArgument, got: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shared_path_selects_the_root_that_contains_it() {
+        let roots = ["/exports/alpha", "/exports/beta", "/opt/shared"];
+
+        let root = select_export_root(&roots, "/exports/beta/project/src")
+            .expect("a path under a declared root is in it");
+
+        assert_eq!(root, "/exports/beta");
+    }
+
+    /// The root itself is inside the root. An operator pointing `shared:` at a
+    /// whole export is asking for the ordinary thing, and a containment test
+    /// that required a strict descendant would refuse it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shared_path_equal_to_a_root_is_inside_it() {
+        let roots = ["/exports/alpha"];
+
+        let root = select_export_root(&roots, "/exports/alpha").expect("a root contains itself");
+
+        assert_eq!(root, "/exports/alpha");
+    }
+
+    /// A shared string prefix is not a shared subtree. `/exports/alphabet` is
+    /// not in `/exports/alpha`, and selecting it would bind a directory the
+    /// operator never exported.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sibling_sharing_a_string_prefix_is_not_selected() {
+        let roots = ["/exports/alpha"];
+
+        let err = select_export_root(&roots, "/exports/alphabet/src")
+            .expect_err("a string prefix is not containment");
+
+        assert!(
+            refusal_message(err).contains("/exports/alphabet/src"),
+            "the refusal must name the path that was asked for"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_path_under_no_declared_root_is_refused_and_the_roots_are_listed() {
+        let roots = ["/exports/alpha", "/exports/beta"];
+
+        let err = select_export_root(&roots, "/Users/alice/elsewhere")
+            .expect_err("a path under no root is refused");
+
+        let msg = refusal_message(err);
+        assert!(msg.contains("/exports/alpha"), "got: {msg}");
+        assert!(msg.contains("/exports/beta"), "got: {msg}");
+    }
+
+    /// The soundness test for selecting a root before scanning components.
+    ///
+    /// `path_is_within` is lexical and matches `..` as an ordinary component,
+    /// so this path *compares* as inside the root and is duly selected. What
+    /// makes the selection sound is the scan that runs afterwards against the
+    /// root just chosen: without it, the daemon would hand dockerd a `src=`
+    /// that resolves out of the export inside the VM.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dot_dot_escape_is_refused_after_the_root_is_selected() {
+        let roots = ["/exports/alpha"];
+
+        let err = select_export_root(&roots, "/exports/alpha/../../etc")
+            .expect_err("`..` must not survive root selection");
+
+        let msg = refusal_message(err);
+        assert!(
+            msg.contains("`..` component"),
+            "the refusal must be the component scan's, not the not-exported one: {msg}"
+        );
+        assert!(
+            msg.contains("/exports/alpha"),
+            "the scan's message names the root it ran against, which must be a \
+             real one: {msg}"
+        );
+    }
+
+    /// The empty set is not the not-under-any-root case with an empty list. It
+    /// gets its own opening because "not under any exported root ()" reads as a
+    /// broken daemon rather than as a declaration not yet written.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_gateway_that_exports_nothing_says_so_rather_than_listing_nothing() {
+        let err = select_export_root(&[], "/Users/alice/project")
+            .expect_err("nothing is inside an empty set");
+
+        let msg = refusal_message(err);
+        assert!(
+            msg.contains("exports no host directories at all"),
+            "got: {msg}"
+        );
+    }
+
+    /// The mode-dependent half of the refusal, in the mode where the operator
+    /// owns the gateway: tell them the file to write, and the recreate step
+    /// without which writing it looks like it was ignored.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_per_operator_refusal_names_the_declaration_file_and_the_recreate_step() {
+        let msg = describe_unexported_path("/Users/alice/project", &["/exports/alpha"], true);
+
+        assert!(
+            msg.contains(sandbox_agent_protocol::EXPORT_ROOTS_RELATIVE_PATH),
+            "got: {msg}"
+        );
+        assert!(msg.contains("recreate the gateway VM"), "got: {msg}");
+        assert!(
+            !msg.contains(sandbox_core::LITE_SHARED_ROOT_ENV),
+            "an operator who owns their gateway must not be pointed at the \
+             administrator's variable: {msg}"
+        );
+    }
+
+    /// The same half in the mode where the daemon owns the single gateway.
+    /// Naming the operator's declaration file here would send them to edit a
+    /// file nothing reads — worse than saying nothing, because they would
+    /// conclude the feature is broken.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_daemon_owned_refusal_names_the_administrator_variable_and_not_the_file() {
+        let msg = describe_unexported_path("/Users/alice/project", &["/exports/alpha"], false);
+
+        assert!(
+            msg.contains(sandbox_core::LITE_SHARED_ROOT_ENV),
+            "got: {msg}"
+        );
+        assert!(
+            !msg.contains(sandbox_agent_protocol::EXPORT_ROOTS_RELATIVE_PATH),
+            "the operator's declaration file is not read in this mode: {msg}"
+        );
+        assert!(
+            msg.contains("_sandboxd"),
+            "the reason the root is where it is holds only in this mode, and is \
+             what distinguishes a refusal from a rule restated: {msg}"
+        );
+    }
+
+    /// This message replaced `SharedPathError::OutsideRoot` on the live path
+    /// and inherits its bar: whatever else varies, an operator must be left
+    /// with the ways forward, in every mode and whether or not anything is
+    /// exported.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_form_of_the_refusal_carries_the_alternatives() {
+        for (roots, per_operator) in [
+            (&["/exports/alpha"][..], true),
+            (&["/exports/alpha"][..], false),
+            (&[][..], true),
+            (&[][..], false),
+        ] {
+            let msg = describe_unexported_path("/Users/alice/project", roots, per_operator);
+            for alternative in ["clone:<repo-url>", "sandbox sync", "(c)", "drop --lite"] {
+                assert!(
+                    msg.contains(alternative),
+                    "roots={roots:?} per_operator={per_operator} lost {alternative:?}: {msg}"
+                );
+            }
+        }
+    }
+
+    /// An empty set renders as a word, not as nothing. An empty parenthesis
+    /// mid-sentence reads as a formatting bug and invites the operator to look
+    /// for the roots elsewhere, when the point is that there are none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_empty_export_set_renders_as_a_word() {
+        assert_eq!(render_export_roots(&[]), "none");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exported_roots_render_as_a_readable_list() {
+        let roots = [
+            PathBuf::from("/exports/alpha"),
+            PathBuf::from("/exports/beta"),
+        ];
+
+        assert_eq!(render_export_roots(&roots), "/exports/alpha, /exports/beta");
     }
 }

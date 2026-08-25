@@ -96,16 +96,25 @@ pub fn lite_shared_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_LITE_SHARED_ROOT))
 }
 
-/// Generate the Lima `mounts:` 9p stanza for the lite shared-workspace root.
+/// Generate the Lima `mounts:` 9p stanza for the lite shared-workspace roots.
 ///
-/// The stanza exposes `shared_root` read-write into the gateway Lima VM at
-/// the same absolute path (identity mount), using the `mapped-xattr` 9p
-/// security model (consistent with per-session VM mounts). The `mmap` cache
-/// mode matches the existing per-session precedent in `lima.rs`.
+/// The stanza exposes each root read-write into the gateway Lima VM at the
+/// same absolute path (identity mount), using the `mapped-xattr` 9p security
+/// model (consistent with per-session VM mounts). The `mmap` cache mode
+/// matches the existing per-session precedent in `lima.rs`.
 ///
 /// The returned string is a YAML fragment intended to be inserted between the
 /// `portForwards:` block and the `containerd:` block in the gateway Lima
 /// template.
+///
+/// # An empty set is an empty string, not an empty `mounts:`
+///
+/// A gateway with nothing to export must emit no `mountType:` and no
+/// `mounts:` at all. `mounts:` with no items parses as a null value rather
+/// than an empty list, and `mountType: "9p"` with nothing to mount states a
+/// mount type for mounts that do not exist. Both are avoidable by emitting
+/// nothing, and nothing is what the default configuration produces once a
+/// root set is a declaration rather than a constant.
 ///
 /// # Format
 ///
@@ -119,6 +128,11 @@ pub fn lite_shared_root() -> PathBuf {
 /// mountType: "9p"
 /// mounts:
 ///   - location: "/tmp/sandbox-shared"
+///     writable: true
+///     9p:
+///       securityModel: "mapped-xattr"
+///       cache: "mmap"
+///   - location: "/Users/alice/src"
 ///     writable: true
 ///     9p:
 ///       securityModel: "mapped-xattr"
@@ -163,11 +177,20 @@ pub fn lite_shared_root() -> PathBuf {
 /// metadata operation worked when it did not. That is a worse trade than the
 /// one it replaces, and the migration would also change the meaning of every
 /// file already staged under an existing export.
-pub fn lite_shared_root_9p_stanza(shared_root: &Path) -> String {
-    format!(
-        "mountType: \"9p\"\nmounts:\n  - location: \"{location}\"\n    writable: true\n    9p:\n      securityModel: \"mapped-xattr\"\n      cache: \"mmap\"\n",
-        location = shared_root.display()
-    )
+pub fn lite_shared_root_9p_stanza(shared_roots: &[PathBuf]) -> String {
+    if shared_roots.is_empty() {
+        return String::new();
+    }
+    let entries = shared_roots
+        .iter()
+        .map(|root| {
+            format!(
+                "  - location: \"{location}\"\n    writable: true\n    9p:\n      securityModel: \"mapped-xattr\"\n      cache: \"mmap\"\n",
+                location = root.display()
+            )
+        })
+        .collect::<String>();
+    format!("mountType: \"9p\"\nmounts:\n{entries}")
 }
 
 // ---------------------------------------------------------------------------
@@ -201,9 +224,10 @@ pub fn lite_shared_root_9p_stanza(shared_root: &Path) -> String {
 /// empty and the join returns `<shared_root>/` with a trailing separator.
 /// The two compare equal because `Path` compares components, but a caller
 /// that formatted the result into a string would not get back what it passed
-/// in. The live path calls [`validate_shared_path`] and then uses the host
-/// path directly (`sandboxd/src/main.rs`, lite session create), which is the
-/// same result without the round trip.
+/// in. The live path reaches [`validate_shared_path`] through the daemon's
+/// `shared:` containment helper and then binds the spelling the gateway VM
+/// resolved, which under an identity mount is this function's result without
+/// the round trip.
 ///
 /// It is kept, not deleted, for one reason: it is where a non-identity
 /// mapping would go if the mount ever stopped being an identity mount — a
@@ -545,13 +569,24 @@ pub enum SharedPathError {
 }
 
 impl std::fmt::Display for SharedPathError {
-    /// The `OutsideRoot` rendering is the operator-facing explanation for this
-    /// refusal, so it names the real cause and the alternatives rather than
-    /// only restating the rule. Callers surface this verbatim (see the lite
-    /// `shared:` validation in the daemon's macOS create path) — keep it
-    /// self-contained.
+    /// Every rendering here is surfaced to an operator verbatim, so each names
+    /// the real cause and the alternatives rather than only restating the rule.
+    /// Keep them self-contained.
     ///
-    /// Two causes, and they are stated in that order deliberately. The first is
+    /// # `OutsideRoot` is no longer the outside-the-export refusal
+    ///
+    /// It was, while a gateway exported exactly one root. A gateway now exports
+    /// a *set*, and "outside the export" is a question about the whole set —
+    /// which this type cannot ask, because it is handed one root. The daemon
+    /// therefore decides it before calling in, and renders its own refusal
+    /// naming every exported root and how to add one. This variant survives as
+    /// the single-root answer for [`translate_shared_path`] and as the
+    /// unreachable arm of [`validate_shared_path`] once the daemon has already
+    /// selected a containing root — not as the message an operator meets.
+    ///
+    /// Read the rest of this paragraph as the *bar* that message has to clear
+    /// rather than as a description of where it is now written. Two causes, and
+    /// they are stated in that order deliberately. The first is
     /// unconditional: the shared root is the *only* host path exported into the
     /// gateway VM, so a path outside it does not exist in the namespace the
     /// container mounts from — no permission change on the host can make it
@@ -958,8 +993,8 @@ mod tests {
 
     #[test]
     fn lite_shared_root_9p_stanza_is_well_formed() {
-        let root = Path::new("/tmp/sandbox-shared");
-        let stanza = lite_shared_root_9p_stanza(root);
+        let roots = [PathBuf::from("/tmp/sandbox-shared")];
+        let stanza = lite_shared_root_9p_stanza(&roots);
         // mountType is a top-level Lima key (sibling of mounts:), so the stanza
         // must begin with it — not with `mounts:`.
         assert!(
@@ -1000,9 +1035,59 @@ mod tests {
 
     #[test]
     fn lite_shared_root_9p_stanza_custom_root() {
-        let root = Path::new("/Users/alice/workspaces");
-        let stanza = lite_shared_root_9p_stanza(root);
+        let roots = [PathBuf::from("/Users/alice/workspaces")];
+        let stanza = lite_shared_root_9p_stanza(&roots);
         assert!(stanza.contains("/Users/alice/workspaces"));
+    }
+
+    #[test]
+    fn lite_shared_root_9p_stanza_is_empty_for_an_empty_root_set() {
+        // Not `mounts:` with no items — that parses as a null value, and a
+        // `mountType:` naming a type for mounts that do not exist is a claim
+        // about nothing. A gateway with nothing to export emits neither key.
+        assert_eq!(lite_shared_root_9p_stanza(&[]), "");
+    }
+
+    #[test]
+    fn lite_shared_root_9p_stanza_emits_one_entry_per_root() {
+        let roots = [
+            PathBuf::from("/tmp/sandbox-shared"),
+            PathBuf::from("/Users/alice/src"),
+            PathBuf::from("/Users/alice/scratch"),
+        ];
+        let stanza = lite_shared_root_9p_stanza(&roots);
+
+        // One top-level `mountType:` and one top-level `mounts:` for the whole
+        // set — emitting them per entry is the silent-fallback bug the format
+        // note on the generator describes.
+        assert_eq!(stanza.matches("mountType:").count(), 1, "{stanza}");
+        assert_eq!(stanza.matches("mounts:").count(), 1, "{stanza}");
+        assert_eq!(stanza.matches("- location:").count(), 3, "{stanza}");
+
+        // Declaration order is preserved, so the template a reader compares
+        // against the declaration file reads in the same order as the file.
+        let positions: Vec<usize> = roots
+            .iter()
+            .map(|r| {
+                stanza
+                    .find(&format!("location: \"{}\"", r.display()))
+                    .unwrap_or_else(|| panic!("{} missing from {stanza}", r.display()))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "roots must appear in declaration order: {positions:?} in {stanza}"
+        );
+
+        // Every entry carries its own options block; a root that inherited
+        // nothing would mount with Lima's defaults instead.
+        assert_eq!(stanza.matches("writable: true").count(), 3, "{stanza}");
+        assert_eq!(
+            stanza.matches("securityModel: \"mapped-xattr\"").count(),
+            3,
+            "{stanza}"
+        );
+        assert_eq!(stanza.matches("cache: \"mmap\"").count(), 3, "{stanza}");
     }
 
     // -- Host→VM path translation --------------------------------------------

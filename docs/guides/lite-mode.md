@@ -69,23 +69,15 @@ On macOS, the lite and Lima backends expose `shared:` workspaces through differe
 
 **Lima backend.** The VM mounts the host directory directly via a 9p stanza that Lima provisions on behalf of the operator. Access to the host filesystem runs as the operator's uid, so any path the operator can read works — including paths under the operator's home directory. macOS TCC (Transparency, Consent, and Control) is the only additional gate, and the grants the operator has given cover the mount.
 
-**Lite backend.** Sandbox containers run inside a persistent gateway Lima VM — `sandboxd-gateway` in the default configuration, one per operator and suffixed with their uid under the mode described below. The host directory reaches the sandbox container via a double-hop: the host 9p-mounts the shared root into the gateway VM, and the gateway VM bind-mounts that path into the sandbox container. The host-side read is performed by whoever owns that VM — by default the `_sandboxd` daemon user, not you. Ordinary Unix ownership then decides what is reachable, and a home directory is not: `/Users/<you>` is owned by you with mode 0750, and `_sandboxd` is not in its group, so the daemon user cannot even traverse into it. A directory that your own processes read freely is simply unreadable over this path.
+**Lite backend.** Sandbox containers run inside a persistent gateway Lima VM. The host directory reaches the sandbox container via a double-hop: the host 9p-mounts an *exported root* into the gateway VM, and the gateway VM bind-mounts a path under that root into the sandbox container. Only the exported roots exist in the filesystem the container mounts from — a path outside them is not there to bind, so no change of permissions on the host makes it usable.
 
-> **Which account reads the host side depends on a mode.** Everything below names `_sandboxd` because that is the default and the shipping configuration. With per-operator gateways enabled (`SANDBOX_PER_OPERATOR_GATEWAY=1` in the daemon's environment) each operator gets their own gateway VM running under their own uid, and the host-side read is then performed by *you* — so the home-directory constraint in this section does not apply to that install. Everything else here — that the shared root is the only exported directory, and the containment checks below — holds in both modes. The setting belongs to the daemon, not to your shell, so it is the daemon's service environment that decides; ask whoever administers the install if you do not know.
+> **One mode decides two things: who owns the gateway VM, and who chooses what it exports.** They are the same question, because the account that owns the VM is the account that performs the host-side read. `SANDBOX_PER_OPERATOR_GATEWAY=1` in the *daemon's* environment turns per-operator gateways on. The setting belongs to the daemon, not to your shell, so it is the daemon's service environment that decides; ask whoever administers the install if you do not know. The two modes are described below, and the containment checks after them hold in both.
 
-### What this means in practice
+### Default: one gateway VM, owned by the daemon
 
-The load-bearing constraint is ownership, not privacy consent: **nothing under your home directory is reachable by `_sandboxd`**, whether or not it sits in a TCC-protected location. TCC (Desktop, Documents, Downloads, `~/Library`) is a second gate layered on top, and it only becomes relevant once the ownership gate is passed.
+The instance is named `sandboxd-gateway`, it is shared by every operator on the host, and the host-side read is performed by the `_sandboxd` daemon user — not by you. Because a directory exported there is exported into *everyone's* sessions, which directory that is belongs to whoever installed the daemon: a single root, set with `SANDBOX_LITE_SHARED_ROOT` in the daemon's environment and defaulting to `/tmp/sandbox-shared`.
 
-The default lite shared root is `/tmp/sandbox-shared`, which `_sandboxd` can traverse because `/tmp` is world-traversable. Per-session `shared:` paths must be under this root, and the daemon checks that three ways before it will mount one — the first at the level of spelling, the other two at the level of what the path actually is.
-
-1. **Lexical.** The spelling must fall under the root. This compares components on the host and never touches the filesystem, because the workspace directory is allowed not to exist yet. `..` components are refused outright rather than resolved, because to a component-wise comparison a `..` looks like an ordinary directory name and would pass.
-2. **Attribute.** Every component is checked for a guest-created symlink. This needs its own check because the host cannot see one by looking: under the default `mapped-xattr` 9p model a link made inside a sandbox is stored as an ordinary file with its real type in an extended attribute, so the host's own path resolution walks straight past it while the gateway VM follows it. The daemon reads the attribute directly.
-3. **Resolution.** The path is resolved *inside the gateway VM* — the namespace where the mount source is actually interpreted — and refused unless it lands under the root there.
-
-Checks 2 and 3 overlap but neither subsumes the other. The VM-side resolution is the authority on a path that leaves the export; the attribute check is the only one that objects to a planted link pointing back *inside* the root, at another session's workspace, which the resolution correctly reports as contained.
-
-What none of this changes: the shared root is content you have chosen to expose. A sandbox with write access to its workspace can leave files there, and a later session pointed at them reads them — that is ordinary shared-directory behaviour, not something a containment check is meant to stop. What the checks refuse is a session *redirecting* a path, by planting a link, at somewhere it was not offered.
+Ordinary Unix ownership then decides what is reachable, and a home directory is not: `/Users/<you>` is owned by you with mode 0750, and `_sandboxd` is not in its group, so the daemon user cannot even traverse into it. A directory that your own processes read freely is simply unreadable over this path. The load-bearing constraint is ownership, not privacy consent: **nothing under your home directory is reachable by `_sandboxd`**, whether or not it sits in a TCC-protected location. TCC (Desktop, Documents, Downloads, `~/Library`) is a second gate layered on top, and it only becomes relevant once the ownership gate is passed. The default root works because `/tmp` is world-traversable.
 
 ```bash
 # Works — /tmp is world-traversable, so _sandboxd can read the shared root.
@@ -97,14 +89,47 @@ sandbox create --lite --name dev \
     --workspace "shared:$HOME/Projects/myproject"
 ```
 
-If your workspace lives outside `/tmp/sandbox-shared`, you have these options:
+### Per-operator gateways: you own the VM, so you declare what it exports
 
-1. **Stage the project under `/tmp/sandbox-shared`.** The simplest fix for a single project. A symlink is not enough — the shared root is 9p-mounted into the gateway VM, so the content itself must live under it.
-2. **Set `SANDBOX_LITE_SHARED_ROOT` to a different root.** The daemon picks up this environment variable at startup and uses it as the 9p-mounted root instead of the default. It must be a directory `_sandboxd` can actually traverse — pointing it at a parent inside your home directory passes the daemon's path check but still fails at mount time.
+With `SANDBOX_PER_OPERATOR_GATEWAY=1` each operator gets their own gateway VM, named `sandboxd-gateway-<your-uid>`, running under their own uid. The host-side read is then performed by *you*, so the home-directory constraint above does not apply — and because the VM serves only your sessions, the reach of an export stops at you. That is what makes the choice yours to make.
+
+Declare the directories you want reachable from your sessions in `~/.config/sandboxd/export-roots.json`:
+
+```json
+{ "roots": ["/Users/alice/Projects", "/Users/alice/scratch"] }
+```
+
+The file is read in your own account — which is the only account that can traverse your home directory. Its location is your home directory as the account database reports it, not `$HOME` and not `$XDG_CONFIG_HOME`: the agent that reads it runs under launchd, whose environment says nothing about which account it belongs to. Refusals name the absolute path that was actually opened, so a file written somewhere else shows up as a path you do not recognise rather than as a silently empty root set.
+
+Each declaration is checked before it is used:
+
+- **Each root** must be an absolute path that is not `/`, spelled plainly (no `.`, `..` or empty components) and free of `,` `=` `"` `\` and control characters, because the spelling is interpolated into a docker `--mount` value and into the gateway's Lima template. It must also exist, be a directory you can read, and be its own resolved path — a root reached through a symlink is refused, because it would export one subtree while every containment check compares against the other.
+- **The set** may hold at most 8 roots (each is a separate 9p mount on the VM), with no duplicates and no root nested inside another. Nesting is refused rather than deduplicated: the fix is always to drop the inner root, which the outer already covers.
+
+No file means no exported directories — a normal state, not a misconfiguration, and `shared:` will simply say so. A file that exists but does not parse, or that names a root failing any check above, is an **error**: the gateway refuses to come up rather than starting with a root set you did not ask for. A typo must not read as "declared nothing", because that is indistinguishable from success.
+
+> **Changing the file takes effect when the VM is next created, not when it is next started.** Lima fixes an instance's `mounts:` list at create time, so a gateway that already exists keeps the roots it was created with. Worse, the `shared:` containment check reads your *current* declaration rather than the running VM's mount list — so a root you have added but not yet exported passes the check and then gives you an empty workspace, because the bind source does not exist inside the VM and is created empty. After editing the file, stop your lite sessions and delete the gateway instance (`limactl delete --force sandboxd-gateway-<your-uid>`, with `LIMA_HOME` set to your per-operator Lima home — see [Per-operator LIMA_HOME](/sandboxd/guides/per-operator-lima-home/)); the next session create brings it back with the new mount set.
+
+### How a `shared:` path is checked
+
+Whatever the mode, a per-session `shared:` path must fall under one of the exported roots, and the daemon checks that three ways before it will mount one — the first at the level of spelling, the other two at the level of what the path actually is.
+
+1. **Lexical.** The spelling must fall under one of the roots. This compares components on the host and never touches the filesystem, because the workspace directory is allowed not to exist yet. At most one root can match, since nesting is refused at declaration time. `..` components are refused outright rather than resolved, because to a component-wise comparison a `..` looks like an ordinary directory name and would pass.
+2. **Attribute.** Every component is checked for a guest-created symlink. This needs its own check because the host cannot see one by looking: under the default `mapped-xattr` 9p model a link made inside a sandbox is stored as an ordinary file with its real type in an extended attribute, so the host's own path resolution walks straight past it while the gateway VM follows it. The daemon reads the attribute directly.
+3. **Resolution.** The path is resolved *inside the gateway VM* — the namespace where the mount source is actually interpreted — and refused unless it lands under one of the roots there. A link that crosses from one of your roots into another of your own roots is not an escape and is not refused; a link that leaves the export entirely is.
+
+Checks 2 and 3 overlap but neither subsumes the other. The VM-side resolution is the authority on a path that leaves the export; the attribute check is the only one that objects to a planted link pointing back *inside* a root, at another session's workspace, which the resolution correctly reports as contained.
+
+What none of this changes: an exported root is content you have chosen to expose. A sandbox with write access to its workspace can leave files there, and a later session pointed at them reads them — that is ordinary shared-directory behaviour, not something a containment check is meant to stop. What the checks refuse is a session *redirecting* a path, by planting a link, at somewhere it was not offered.
+
+### If your workspace is not under an exported root
+
+1. **Add or change a root.** With per-operator gateways on, declare it in `~/.config/sandboxd/export-roots.json` and recreate the VM as described above. On the default single-gateway install this is the administrator's `SANDBOX_LITE_SHARED_ROOT`, not yours — and it must name a directory `_sandboxd` can actually traverse, so pointing it inside a home directory passes the daemon's path check and still fails at mount time.
+2. **Stage the project under a root that is already exported.** The simplest fix for a single project. A symlink is not enough — the root is 9p-mounted into the gateway VM, so the content itself must live under it.
 3. **Use `clone:` or `--repo` instead of `shared:`.** The clone runs inside the guest and never touches the host filesystem, so no host-side access identity is involved at all. This is the cleanest fit for a git-backed project.
-4. **Move files explicitly with `sandbox sync` or `sandbox cp`.** These run on the CLI side as your own uid, over the daemon-mediated SSH proxy, so they read paths `_sandboxd` cannot. The same applies to `sandbox workspace push` / `pull` on a `local:` workspace. You give up live bidirectional visibility, but for workloads where the agent reads the workspace once and you sync results back explicitly, this is a clean fit.
+4. **Move files explicitly with `sandbox sync` or `sandbox cp`.** These run on the CLI side as your own uid, over the daemon-mediated SSH proxy, so they are not bound by the export at all. The same applies to `sandbox workspace push` / `pull` on a `local:` workspace. You give up live bidirectional visibility, but for workloads where the agent reads the workspace once and you sync results back explicitly, this is a clean fit.
 
-> **`local:` carries the same host-side constraint on macOS lite.** The create-time `local:` push is run by the daemon (there is no setuid pivot to the operator on macOS), so its host source must be readable by `_sandboxd` just like a `shared:` source. The operator-driven `sandbox workspace push` / `pull` and `sandbox sync` are the parts that run as your uid.
+> **`local:` carries the same host-side constraint on macOS lite.** The create-time `local:` push is run by the daemon (there is no setuid pivot to the operator on macOS), so on the default single-gateway install its host source must be readable by `_sandboxd` just like a `shared:` source. The operator-driven `sandbox workspace push` / `pull` and `sandbox sync` are the parts that run as your uid.
 
 > On Lima sessions (full backend) there is no `_sandboxd` intermediary — the VM mounts the host directory on behalf of the operator, so `shared:` accepts any path you can read and this restriction does not apply.
 

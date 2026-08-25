@@ -228,6 +228,18 @@ fn run_limactl_direct(
                 stderr: Vec::new(),
             });
         }
+        LimaOp::ReadExportRoots => {
+            // Refused rather than answered with an empty success: an empty
+            // stdout is not a well-formed report, so a caller that got one
+            // would fail while parsing rather than here. Integration tests
+            // build the manager directly and pass the root set to
+            // `ensure_ready`, so nothing routes this op through here.
+            return Err(SandboxError::Internal(
+                "DirectLimaExecutor: ReadExportRoots not supported in integration tests \
+                 (pass the root set to ensure_ready instead)"
+                    .into(),
+            ));
+        }
         LimaOp::RunRsync { .. } => {
             return Err(SandboxError::Internal(
                 "DirectLimaExecutor: RunRsync not supported in integration tests".into(),

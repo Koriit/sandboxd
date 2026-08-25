@@ -20,6 +20,7 @@
 // build clean.
 #[cfg(target_os = "macos")]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -178,6 +179,16 @@ mod tests {
         (0..n).collect()
     }
 
+    /// The export roots these tests declare: none.
+    ///
+    /// Declared roots become 9p mounts, and Lima reads `mounts:` at create
+    /// time only — so varying them would mean deleting and re-provisioning the
+    /// instance per case, which is exactly the cost these tests are written to
+    /// share. What they do verify (NIC discovery, the egress bridge, the eth0
+    /// baseline policy, and the recovery primitives) is the same whether the
+    /// VM exports a host directory or not.
+    const NO_EXPORT_ROOTS: &[PathBuf] = &[];
+
     // ------------------------------------------------------------------
     // Live integration tests (require a real Lima/QEMU environment)
     // ------------------------------------------------------------------
@@ -202,7 +213,7 @@ mod tests {
         let slots = slots(MAX_SLOTS);
 
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("gateway ensure_ready failed");
 
         // Verify NIC map was populated.
@@ -269,7 +280,7 @@ mod tests {
         // Verify idempotency: a second ensure_ready (simulating daemon restart
         // against the still-running gateway VM) must not fail.
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("second ensure_ready (daemon restart simulation) failed");
 
         // No teardown: leave the gateway VM running so subsequent integration
@@ -287,7 +298,9 @@ mod tests {
         const MAX_SLOTS: u16 = 2;
         let manager = build_test_manager();
         let slots = slots(MAX_SLOTS);
-        manager.ensure_ready(&slots).expect("ensure_ready failed");
+        manager
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
+            .expect("ensure_ready failed");
 
         let nic_map = manager.nic_map().expect("NIC map should be populated");
         assert_eq!(
@@ -311,7 +324,9 @@ mod tests {
     fn integration_gateway_lima_egress_bridge_accessible() {
         let manager = build_test_manager();
         let slots = slots(2);
-        manager.ensure_ready(&slots).expect("ensure_ready failed");
+        manager
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
+            .expect("ensure_ready failed");
 
         let socket_str = format!("unix://{}", manager.gateway_docker_socket().display());
         let output = std::process::Command::new("docker")
@@ -330,7 +345,9 @@ mod tests {
     fn integration_gateway_lima_eth0_nft_policy_applied() {
         let manager = build_test_manager();
         let slots = slots(2);
-        manager.ensure_ready(&slots).expect("ensure_ready failed");
+        manager
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
+            .expect("ensure_ready failed");
 
         let daemon_uid = Uid::current().as_raw();
         let lima_home = operator_lima_home(daemon_uid);
@@ -410,7 +427,7 @@ mod tests {
 
         // ensure_ready should succeed even with the mismatch (logs a warning).
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("ensure_ready should not fail on NIC count mismatch");
 
         let nic_map = manager.nic_map().expect("NIC map should be populated");
@@ -438,10 +455,10 @@ mod tests {
         let slots = slots(2);
 
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("first ensure_ready failed");
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("second ensure_ready failed (idempotent)");
     }
 
@@ -480,7 +497,7 @@ mod tests {
 
         // Ensure the gateway is up before probing.
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("ensure_ready failed before probe test");
 
         // Healthy instance → probe must return Ok(true).
@@ -527,7 +544,7 @@ mod tests {
 
         // Ensure the gateway is running first so the first stop is meaningful.
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("ensure_ready failed in idempotent stop test");
 
         // First stop.
@@ -567,7 +584,7 @@ mod tests {
 
         // Bring the gateway up so we start from a known state.
         manager
-            .ensure_ready(&slots)
+            .ensure_ready(&slots, NO_EXPORT_ROOTS)
             .expect("ensure_ready failed before recovery restart test");
 
         // Simulate a crash by force-stopping the instance.

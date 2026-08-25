@@ -394,6 +394,18 @@ pub enum BrokerOp {
     InstallGuestAgent { op_uid: u32, vm: String },
     /// Read the operator's Lima SSH private key from `{lima_home}/_config/user`.
     ReadUserKey { op_uid: u32 },
+    /// Read and validate the operator's declared export roots.
+    ///
+    /// Carries no path, for the same reason [`BrokerOp::ReadUserKey`] carries
+    /// none: the file's location is derived on the agent side from the
+    /// account the agent already is (`getpwuid_r` on its own uid, then
+    /// [`EXPORT_ROOTS_RELATIVE_PATH`]). A path field here would be a
+    /// pass-through that let the daemon aim an operator-privileged read at
+    /// any file that account can open.
+    ///
+    /// The answer is an [`ExportRootsReport`] serialized into
+    /// `BrokerResult::Ok`'s `stdout`.
+    ReadExportRoots { op_uid: u32 },
     /// Run rsync to push a host workspace into the VM (or container).
     RunRsync {
         op_uid: u32,
@@ -1570,6 +1582,7 @@ impl BrokerOp {
             | BrokerOp::ListJson { op_uid }
             | BrokerOp::InstallGuestAgent { op_uid, .. }
             | BrokerOp::ReadUserKey { op_uid }
+            | BrokerOp::ReadExportRoots { op_uid }
             | BrokerOp::RunRsync { op_uid, .. }
             | BrokerOp::ReadOwnerMarker { op_uid, .. }
             | BrokerOp::GuestSocat { op_uid, .. }
@@ -1607,6 +1620,7 @@ impl BrokerOp {
             | BrokerOp::ListJson { .. }
             | BrokerOp::InstallGuestAgent { .. }
             | BrokerOp::ReadUserKey { .. }
+            | BrokerOp::ReadExportRoots { .. }
             | BrokerOp::RunRsync { .. }
             | BrokerOp::ReadOwnerMarker { .. }
             | BrokerOp::RestrictOnVerify { .. }
@@ -1629,6 +1643,7 @@ impl BrokerOp {
             BrokerOp::ListJson { .. } => "list-json",
             BrokerOp::InstallGuestAgent { .. } => "install-guest-agent",
             BrokerOp::ReadUserKey { .. } => "read-user-key",
+            BrokerOp::ReadExportRoots { .. } => "read-export-roots",
             BrokerOp::RunRsync { .. } => "run-rsync",
             BrokerOp::ReadOwnerMarker { .. } => "read-owner-marker",
             BrokerOp::GuestSocat { .. } => "guest-socat",
@@ -1907,4 +1922,288 @@ pub fn docker_argv(op: &crate::protocol::DockerOp) -> Result<Vec<String>, String
         DockerOp::DaemonInfo => image::daemon_info_argv(),
     };
     Ok(argv)
+}
+
+// ---------------------------------------------------------------------------
+// Operator-declared export roots
+// ---------------------------------------------------------------------------
+
+/// Location of the declared-roots file, relative to the operator's home
+/// directory as `getpwuid_r` reports it.
+///
+/// `~/.config/sandboxd/` is where this project already keeps operator-owned
+/// configuration — the CLI resolves it for `config.json` and `presets/` — so a
+/// third sibling needs no new directory, no new permissions story, and no new
+/// place for an operator to look.
+///
+/// The choice of an operator-home path is not cosmetic. The file says which of
+/// the operator's own directories may be exported into a VM, so it has to be
+/// writable by that operator and by nobody else who could aim the export
+/// somewhere they cannot otherwise read. A home directory is already exactly
+/// that on a stock macOS install (`drwxr-x---`, owner-writable), which means
+/// the property holds because of the OS's own account layout rather than
+/// because of an ACL this codebase installs and has to keep correct.
+///
+/// The same permissions are why the daemon account cannot do this read itself.
+/// `_sandboxd` is not in the operator's group and cannot traverse a `0750`
+/// home, so it can neither read the file nor answer whether a declared root
+/// exists, is a directory, or is readable. Every one of those questions is
+/// answerable only from inside the operator's own account, which is what
+/// [`BrokerOp::ReadExportRoots`] is for.
+pub const EXPORT_ROOTS_RELATIVE_PATH: &str = ".config/sandboxd/export-roots.json";
+
+/// Ceiling on the number of roots one operator may declare.
+///
+/// Each root becomes a 9p `mounts:` entry on the gateway VM, i.e. a virtio
+/// device and a mount at boot. The bound is not a security limit — an operator
+/// declaring their own directories is not an adversary here — it is what keeps
+/// a typo'd or generated file from producing a VM that fails to boot with an
+/// error about device limits rather than about the file that caused it.
+pub const MAX_EXPORT_ROOTS: usize = 8;
+
+/// The operator-authored file at [`EXPORT_ROOTS_RELATIVE_PATH`].
+///
+/// An object with a `roots` array rather than a bare array: a bare array has
+/// nowhere to add a second field later, and every addition to this file is
+/// read by whatever daemon version happens to be installed. `#[serde(default)]`
+/// on the one field means a file written as `{}` is a valid declaration of
+/// nothing, which is the same answer as an absent file.
+///
+/// `deny_unknown_fields` is deliberately **absent**. This is the one struct in
+/// this module a human types by hand, and a typo'd or newer-schema key should
+/// not invalidate the roots that are spelled correctly — the roots themselves
+/// are each validated on their own, so an ignored key cannot widen anything.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeclaredExportRoots {
+    /// Absolute host directories the operator is willing to have exported into
+    /// the gateway VM that runs their sessions.
+    #[serde(default)]
+    pub roots: Vec<String>,
+}
+
+/// The agent's answer to [`BrokerOp::ReadExportRoots`].
+///
+/// `source` is the absolute path the agent actually opened. It is on the wire
+/// so that a divergence between where the operator wrote the file and where
+/// the agent looked for it surfaces as a visible mismatch in a refusal message
+/// instead of as an empty root set that reads exactly like "declared nothing".
+/// The two locations are derived independently — the CLI resolves the config
+/// directory through `$XDG_CONFIG_HOME`, the agent through `getpwuid_r` — so
+/// they can drift, and the failure mode of a silent drift is an operator whose
+/// declarations are ignored with no error anywhere.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExportRootsReport {
+    /// The absolute path the agent read, whether or not it existed.
+    pub source: String,
+    /// The validated roots, in declaration order. Empty when the file is
+    /// absent — an operator who declares nothing exports nothing.
+    pub roots: Vec<String>,
+}
+
+/// Validate one declared root, in isolation from the others.
+///
+/// The rules and what each is for:
+///
+/// - **Absolute.** A relative root has no meaning: the agent, the daemon and
+///   the VM would each resolve it against a different working directory.
+/// - **Not `/`.** Exporting the whole filesystem is not a root declaration,
+///   and `root_spelling` in the containment check collapses `/` to the empty
+///   string, so a containment test against it answers `false` for every path.
+///   Refusing it here is what keeps that collapse from reading as "nothing is
+///   inside this root" at a site far from the declaration.
+/// - **No `.`, `..` or empty components.** The declared spelling is compared
+///   against resolved paths component-wise; a form that is not already
+///   normalised compares unequal to the same directory spelled plainly.
+/// - **No `,` or `=`.** The root is interpolated into a docker `--mount`
+///   option list, which reads both as syntax — the same rule
+///   [`crate::validation::validate_mount_path`] applies to every other path
+///   that reaches that argument, stated here so a root is refused at
+///   declaration time rather than at the container start that first uses it.
+/// - **No `"` or `\`.** The root is also interpolated into a double-quoted
+///   YAML scalar in the gateway Lima template, where both are escape syntax.
+/// - **No control characters.** They survive JSON, and a newline inside a
+///   `mounts:` entry ends the entry.
+pub fn validate_declared_root(raw: &str) -> Result<(), String> {
+    if !raw.starts_with('/') {
+        return Err(format!("{raw:?} is not an absolute path"));
+    }
+    if raw.trim_end_matches('/').is_empty() {
+        return Err(
+            "\"/\" cannot be declared as an export root — it would export the entire \
+             filesystem into the VM"
+                .to_string(),
+        );
+    }
+    for component in raw.trim_end_matches('/').split('/').skip(1) {
+        match component {
+            "" => return Err(format!("{raw:?} has an empty path component")),
+            "." | ".." => {
+                return Err(format!(
+                    "{raw:?} contains a {component:?} component — declare the \
+                     directory by its plain absolute path"
+                ));
+            }
+            _ => {}
+        }
+    }
+    if let Some(ch) = raw.chars().find(|c| matches!(c, ',' | '=')) {
+        return Err(format!(
+            "{raw:?} contains {ch:?}, which docker reads as option-list syntax \
+             inside a --mount value"
+        ));
+    }
+    if let Some(ch) = raw.chars().find(|c| matches!(c, '"' | '\\')) {
+        return Err(format!(
+            "{raw:?} contains {ch:?}, which is escape syntax inside the gateway \
+             template's quoted YAML scalar"
+        ));
+    }
+    if let Some(ch) = raw.chars().find(|c| c.is_control()) {
+        return Err(format!("{raw:?} contains the control character {ch:?}"));
+    }
+    Ok(())
+}
+
+/// Validate a declared set completely: every member through
+/// [`validate_declared_root`], then the properties only the set has.
+///
+/// Two members can each be fine and still be wrong together:
+///
+/// - **Duplicates** would produce two 9p mounts of one directory at one
+///   mountpoint.
+/// - **Nesting** — one root inside another — makes "which root contains this
+///   path" ambiguous at the containment check, and mounts the inner subtree
+///   twice. The outer declaration already covers the inner one, so the fix is
+///   always to drop the inner, which the message says.
+///
+/// The per-member pass is folded in rather than left to the caller so that
+/// this one call is the whole check. [`read_export_roots`] still validates
+/// each member itself, earlier, because it interleaves the filesystem probes
+/// and wants a syntax complaint to come out as one rather than as "not
+/// usable" — this re-run of an already-passed check costs nothing. The caller
+/// it protects is the other one: a consumer re-validating a report that
+/// arrived over the wire has no loop to fold the member check into, and
+/// calling only the set half would leave exactly the characters this refuses
+/// to interpolate.
+pub fn validate_declared_root_set(roots: &[String]) -> Result<(), String> {
+    for root in roots {
+        validate_declared_root(root)?;
+    }
+    if roots.len() > MAX_EXPORT_ROOTS {
+        return Err(format!(
+            "{} export roots declared, but at most {MAX_EXPORT_ROOTS} are supported \
+             (each root is a separate 9p mount on the gateway VM)",
+            roots.len()
+        ));
+    }
+    for (i, outer) in roots.iter().enumerate() {
+        for inner in roots.iter().skip(i + 1) {
+            if outer.trim_end_matches('/') == inner.trim_end_matches('/') {
+                return Err(format!("{outer:?} is declared twice"));
+            }
+            let (containing, contained) =
+                if sandbox_invm_argv::workspace::path_is_within(outer, inner) {
+                    (outer, inner)
+                } else if sandbox_invm_argv::workspace::path_is_within(inner, outer) {
+                    (inner, outer)
+                } else {
+                    continue;
+                };
+            return Err(format!(
+                "{contained:?} is inside {containing:?} — declaring both would mount \
+                 the same subtree twice; drop the inner one, which the outer already \
+                 covers"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read, parse and fully validate the declared-roots file for the account
+/// whose home directory is `home`.
+///
+/// # Why this does I/O, in a module that otherwise does none
+///
+/// Two callers run it: the agent, answering
+/// [`BrokerOp::ReadExportRoots`] for its own operator, and the daemon's
+/// `op_uid == daemon_uid` degenerate path, answering for itself. Both must
+/// give the same answer to the same file — including for the cases where the
+/// answer is *not* a value, which is where two independent implementations
+/// would drift first: an absent file is a declaration of nothing, and a
+/// malformed one is an error. Getting that pair backwards fails open, and
+/// nothing downstream can tell the two apart after the fact. So the read lives
+/// beside the schema rather than twice beside its callers.
+///
+/// # Absent versus malformed
+///
+/// A missing file yields an empty root set and no error: an operator who has
+/// never declared anything exports nothing, and that is a normal state, not a
+/// misconfiguration. Anything that exists but does not parse, or parses to a
+/// root that fails validation, is an error — a typo in this file must not read
+/// as "declared nothing", because that is indistinguishable from success and
+/// the operator would see only sessions that mysteriously refuse their paths.
+///
+/// # Per-root filesystem checks
+///
+/// Each root must exist, be a directory, be readable, and be its own canonical
+/// form. The last one refuses a root reached through a symlink: the gateway
+/// template mounts the declared spelling and every containment check compares
+/// against the declared spelling, so a root that is a link exports one subtree
+/// while being reasoned about as another. The refusal names both spellings, so
+/// the fix — declare the target — is in the message.
+///
+/// All four are answerable only from an account that can traverse the
+/// directory, which is why this runs as the operator and never as the daemon.
+pub fn read_export_roots(home: &str) -> Result<ExportRootsReport, String> {
+    let source = format!(
+        "{}/{EXPORT_ROOTS_RELATIVE_PATH}",
+        home.trim_end_matches('/')
+    );
+
+    let contents = match std::fs::read_to_string(&source) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExportRootsReport {
+                source,
+                roots: Vec::new(),
+            });
+        }
+        Err(e) => return Err(format!("failed to read {source}: {e}")),
+    };
+
+    let declared: DeclaredExportRoots = serde_json::from_str(&contents)
+        .map_err(|e| format!("{source} is not valid export-roots JSON: {e}"))?;
+
+    for root in &declared.roots {
+        validate_declared_root(root).map_err(|e| format!("{source}: {e}"))?;
+        let canonical = std::fs::canonicalize(root)
+            .map_err(|e| format!("{source}: declared root {root:?} is not usable: {e}"))?;
+        let canonical = canonical.to_str().ok_or_else(|| {
+            format!("{source}: declared root {root:?} resolves to a non-UTF-8 path")
+        })?;
+        if canonical != root.trim_end_matches('/') {
+            return Err(format!(
+                "{source}: declared root {root:?} resolves to {canonical:?} — declare \
+                 the resolved path instead, so the directory that is exported and the \
+                 one that is checked are the same one"
+            ));
+        }
+        let meta = std::fs::metadata(root)
+            .map_err(|e| format!("{source}: declared root {root:?} is not usable: {e}"))?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "{source}: declared root {root:?} is not a directory"
+            ));
+        }
+        std::fs::read_dir(root).map_err(|e| {
+            format!("{source}: declared root {root:?} is not readable by this account: {e}")
+        })?;
+    }
+
+    validate_declared_root_set(&declared.roots).map_err(|e| format!("{source}: {e}"))?;
+
+    Ok(ExportRootsReport {
+        source,
+        roots: declared.roots,
+    })
 }
